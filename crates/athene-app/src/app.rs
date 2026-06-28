@@ -61,6 +61,7 @@ pub enum Message {
     TerminalInput { session_id: SessionId, bytes: Vec<u8> },
     SelectOrchestrator(Option<OrchestratorId>),
     DismissNotification(String),
+    SpawnSession,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +127,11 @@ impl App {
                 state.notifications.retain(|n| n.id != id);
                 Task::none()
             }
+
+            Message::SpawnSession => {
+                // Spawn UI to be implemented in a later task.
+                Task::none()
+            }
         }
     }
 
@@ -181,10 +187,52 @@ impl App {
         Task::none()
     }
 
-    /// View stub — returns a placeholder until Tasks 10-12 fill in the UI.
+    /// View — sidebar + fleet board or session detail.
     pub fn iced_view(state: &Self) -> Element<'_, Message> {
-        let _ = state;
-        iced::widget::text("Athene loading...").into()
+        use iced::widget::{column, container, row};
+        use crate::components::{
+            fleet_board::fleet_board,
+            session_detail::session_detail,
+            sidebar::sidebar,
+        };
+        use crate::theme::{BG_BASE, BG_SURFACE, TEXT_MUTED};
+        use iced::{Background, Border, Length};
+
+        let titlebar = container(
+            iced::widget::text("⬡ Athene")
+                .size(13)
+                .color(TEXT_MUTED),
+        )
+        .padding([6, 16])
+        .width(Length::Fill)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(BG_SURFACE)),
+            border: Border {
+                color: crate::theme::BORDER,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            ..Default::default()
+        });
+
+        let main: Element<Message> = match &state.view {
+            View::FleetBoard { scope } => fleet_board(state, scope.as_ref()),
+            View::SessionDetail(session_id) => session_detail(state, session_id),
+        };
+
+        container(
+            column![
+                titlebar,
+                row![sidebar(state), main].height(Length::Fill),
+            ]
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(BG_BASE)),
+            ..Default::default()
+        })
+        .into()
     }
 
     /// Subscription that drives `Message::EngineEvent` from the engine broadcast channel.
