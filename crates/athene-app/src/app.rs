@@ -7,7 +7,7 @@ use athene_core::{
 use iced::{Element, Subscription, Task, Theme};
 use tokio::sync::broadcast;
 
-use crate::components::terminal::TerminalState;
+use crate::components::{session_detail::DetailPanel, terminal::TerminalState};
 
 const MAX_NOTIFICATIONS: usize = 50;
 
@@ -23,7 +23,7 @@ pub struct SidebarState {
 #[derive(Debug, Clone)]
 pub enum View {
     FleetBoard { scope: Option<OrchestratorId> },
-    SessionDetail(SessionId),
+    SessionDetail { session_id: SessionId, panel: DetailPanel },
 }
 
 impl Default for View {
@@ -108,7 +108,7 @@ impl App {
             }
 
             Message::NavigateSession(id) => {
-                state.view = View::SessionDetail(id);
+                state.view = View::SessionDetail { session_id: id, panel: DetailPanel::default() };
                 Task::none()
             }
 
@@ -118,8 +118,11 @@ impl App {
             }
 
             Message::TerminalInput { session_id, bytes } => {
-                // Will be wired to PTY in Task 11.
-                let _ = (session_id, bytes);
+                if let Some(term) = state.terminals.get(&session_id) {
+                    if let Some(sender) = &term.pty_sender {
+                        let _ = sender.send(bytes);
+                    }
+                }
                 Task::none()
             }
 
@@ -217,7 +220,7 @@ impl App {
 
         let main: Element<Message> = match &state.view {
             View::FleetBoard { scope } => fleet_board(state, scope.as_ref()),
-            View::SessionDetail(session_id) => session_detail(state, session_id),
+            View::SessionDetail { session_id, panel } => session_detail(state, session_id, panel),
         };
 
         container(

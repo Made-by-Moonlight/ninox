@@ -162,7 +162,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
 
 fn worker_row<'a>(app: &'a App, session: &'a athene_core::types::Session) -> Element<'a, Message> {
     let is_selected = app.sidebar.selected_orchestrator.is_none()
-        && matches!(&app.view, crate::app::View::SessionDetail(id) if id == &session.id);
+        && matches!(&app.view, crate::app::View::SessionDetail { session_id: id, .. } if id == &session.id);
 
     let color = status_color_for(&session.status);
     let bg = if is_selected {

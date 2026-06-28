@@ -32,6 +32,7 @@ impl Default for DetailPanel {
 pub fn session_detail<'a>(
     app: &'a App,
     session_id: &str,
+    panel: &DetailPanel,
 ) -> Element<'a, Message> {
     let Some(session) = app.sessions.get(session_id) else {
         return container(
@@ -167,20 +168,18 @@ pub fn session_detail<'a>(
     })
     .into();
 
-    // Split view: terminal (2/3) + info (1/3).
-    let content: Element<Message> = row![
-        container(terminal_pane)
-            .width(Length::FillPortion(2))
+    // Panel routing: Terminal = full terminal, Info = full info, default = split 2/3 + 1/3.
+    let content: Element<Message> = match panel {
+        DetailPanel::Terminal => container(terminal_pane)
+            .width(Length::Fill)
             .height(Length::Fill)
             .style(|_theme| container::Style {
                 background: Some(Background::Color(iced::Color::from_rgb8(0x28, 0x28, 0x28))),
                 ..Default::default()
-            }),
-        info_pane,
-    ]
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into();
+            })
+            .into(),
+        DetailPanel::Info => info_pane,
+    };
 
     column![header, content]
         .width(Length::Fill)
