@@ -3,6 +3,10 @@ name    = "athene-app"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "athene-app"
+path = "src/main.rs"
+
 [dependencies]
 athene-core   = { path = "../athene-core" }
 athene-server = { path = "../athene-server" }
@@ -10,3 +14,6 @@ tokio         = { workspace = true }
 anyhow        = { workspace = true }
 tracing       = { workspace = true }
 tracing-subscriber = { workspace = true }
+tokio-util    = { workspace = true }
+clap          = { version = "4", features = ["derive"] }
+dirs          = { workspace = true }
