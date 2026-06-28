@@ -69,5 +69,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn has_display() -> bool {
+    #[cfg(target_os = "macos")]
+    { return true; }
     std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok()
 }
