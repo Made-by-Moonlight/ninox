@@ -1,0 +1,13 @@
+[package]
+name    = "athene-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+athene-core = { path = "../athene-core" }
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+axum        = { workspace = true }
+anyhow      = { workspace = true }
+tracing     = { workspace = true }
