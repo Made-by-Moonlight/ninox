@@ -7,9 +7,6 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
-// SAFETY: Connection is !Sync because it uses RefCell internally, but we
-// wrap it in a Mutex so all access is serialized across threads.
-unsafe impl Sync for Store {}
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
