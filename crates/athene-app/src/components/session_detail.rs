@@ -5,7 +5,7 @@ use iced::{
 
 use crate::{
     app::{App, Message},
-    components::terminal::TerminalWidget,
+    components::{info_panel::info_panel, terminal::TerminalWidget},
     theme::{
         ACCENT_AMBER, BG_ELEVATED, BG_SURFACE, BORDER, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
     },
@@ -147,16 +147,18 @@ pub fn session_detail<'a>(
         .into()
     };
 
-    // --- Info stub (for future Task 12) ---
+    // --- Info panel (Task 12) ---
+    let pr = session.pr_id.and_then(|id| app.prs.get(&id));
+    let ci = pr.and_then(|p| app.ci_status.get(&p.id));
+    let comments = pr
+        .and_then(|p| app.review_threads.get(&p.id))
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
     let info_pane: Element<Message> = container(
-        text("Info panel — Task 12")
-            .size(13)
-            .color(TEXT_MUTED),
+        info_panel(session, pr, ci, comments),
     )
     .width(Length::FillPortion(1))
     .height(Length::Fill)
-    .center_x(Length::Fill)
-    .center_y(Length::Fill)
     .style(|_theme| container::Style {
         background: Some(Background::Color(BG_SURFACE)),
         border: Border {

@@ -181,10 +181,19 @@ impl App {
             }
 
             Event::Notification(n) => {
-                if state.notifications.len() >= MAX_NOTIFICATIONS {
+                // Spawn OS notification on a background thread so we never block the UI.
+                let title = n.title.clone();
+                let body = n.body.clone();
+                std::thread::spawn(move || {
+                    let _ = notify_rust::Notification::new()
+                        .summary(&title)
+                        .body(&body)
+                        .show();
+                });
+                state.notifications.push_back(n);
+                if state.notifications.len() > MAX_NOTIFICATIONS {
                     state.notifications.pop_front();
                 }
-                state.notifications.push_back(n);
             }
         }
         Task::none()
