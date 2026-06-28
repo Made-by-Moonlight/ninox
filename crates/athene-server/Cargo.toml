@@ -4,10 +4,18 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-athene-core = { path = "../athene-core" }
-tokio       = { workspace = true }
-serde       = { workspace = true }
-serde_json  = { workspace = true }
-axum        = { workspace = true }
-anyhow      = { workspace = true }
-tracing     = { workspace = true }
+athene-core  = { path = "../athene-core" }
+tokio        = { workspace = true }
+axum         = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+anyhow       = { workspace = true }
+tracing      = { workspace = true }
+tower-http   = { version = "0.5", features = ["cors"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures      = "0.3"
+
+[dev-dependencies]
+tower    = { version = "0.4", features = ["util"] }
+http     = "1"
+tempfile = "3"

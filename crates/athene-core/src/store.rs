@@ -1,11 +1,15 @@
 use crate::types::*;
 use anyhow::Result;
 use rusqlite::{params, Connection};
-use std::path::Path;
+use std::{path::Path, sync::Mutex};
 
 pub struct Store {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
+
+// SAFETY: Connection is !Sync because it uses RefCell internally, but we
+// wrap it in a Mutex so all access is serialized across threads.
+unsafe impl Sync for Store {}
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -24,12 +28,13 @@ impl Store {
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL
             );
         ")?;
-        Ok(Self { conn })
+        Ok(Self { conn: Mutex::new(conn) })
     }
 
     pub fn upsert_session(&self, s: &Session) -> Result<()> {
         let status = serde_json::to_string(&s.status)?.replace('"', "");
-        self.conn.execute(
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
             "INSERT INTO sessions (id,orchestrator_id,name,repo,status,agent_type,
              cost_usd,started_at,pr_number,pr_id,workspace_path,pid)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
@@ -47,7 +52,8 @@ impl Store {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid
              FROM sessions ORDER BY started_at DESC",
@@ -82,7 +88,8 @@ impl Store {
     }
 
     pub fn upsert_orchestrator(&self, o: &Orchestrator) -> Result<()> {
-        self.conn.execute(
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
             "INSERT INTO orchestrators(id,name,created_at) VALUES(?1,?2,?3)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name",
             params![o.id, o.name, o.created_at],
@@ -91,7 +98,8 @@ impl Store {
     }
 
     pub fn list_orchestrators(&self) -> Result<Vec<Orchestrator>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT id,name,created_at FROM orchestrators ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
