@@ -1,6 +1,6 @@
 use iced::{
     widget::{button, column, container, row, text, Space},
-    Alignment, Background, Border, Element, Length,
+    Alignment, Background, Border, Color, Element, Length,
 };
 
 use crate::{
@@ -15,10 +15,35 @@ fn repo_short(repo: &str) -> &str {
     repo.rsplit('/').next().unwrap_or(repo)
 }
 
+fn panel_btn<'a>(label: &'static str, target: DetailPanel, active: DetailPanel) -> Element<'a, Message> {
+    let is_active = target == active;
+    button(
+        text(label).size(11).color(if is_active { Color::WHITE } else { TEXT_SECONDARY }),
+    )
+    .on_press(Message::SwitchDetailPanel(target))
+    .padding([3, 8])
+    .style(move |_theme, _status| button::Style {
+        background: if is_active {
+            Some(Background::Color(ACCENT_AMBER))
+        } else {
+            Some(Background::Color(BG_ELEVATED))
+        },
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+        text_color: if is_active { Color::WHITE } else { TEXT_SECONDARY },
+        ..Default::default()
+    })
+    .into()
+}
+
 /// Panel selection — which view is active in session detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailPanel {
     Terminal,
+    Split,
     Info,
 }
 
@@ -79,6 +104,15 @@ pub fn session_detail<'a>(
         ..Default::default()
     });
 
+    let panel_toggles = row![
+        panel_btn("Terminal", DetailPanel::Terminal, *panel),
+        Space::new(4, 0),
+        panel_btn("Split", DetailPanel::Split, *panel),
+        Space::new(4, 0),
+        panel_btn("Info", DetailPanel::Info, *panel),
+    ]
+    .align_y(Alignment::Center);
+
     let header = container(
         row![
             back_btn,
@@ -90,6 +124,8 @@ pub fn session_detail<'a>(
             text(repo_short(&session.repo))
                 .size(13)
                 .color(ACCENT_AMBER),
+            Space::new(Length::Fill, 0),
+            panel_toggles,
             Space::new(Length::Fill, 0),
             status_dot,
             Space::new(6, 0),
@@ -170,7 +206,7 @@ pub fn session_detail<'a>(
     })
     .into();
 
-    // Panel routing: Terminal = full terminal, Info = full info, default = split 2/3 + 1/3.
+    // Panel routing: Terminal = full terminal, Split = 2/3 terminal + 1/3 info, Info = full info.
     let content: Element<Message> = match panel {
         DetailPanel::Terminal => container(terminal_pane)
             .width(Length::Fill)
@@ -180,6 +216,18 @@ pub fn session_detail<'a>(
                 ..Default::default()
             })
             .into(),
+        DetailPanel::Split => row![
+            container(terminal_pane)
+                .width(Length::FillPortion(2))
+                .height(Length::Fill)
+                .style(|_theme| container::Style {
+                    background: Some(Background::Color(iced::Color::from_rgb8(0x28, 0x28, 0x28))),
+                    ..Default::default()
+                }),
+            info_pane,
+        ]
+        .height(Length::Fill)
+        .into(),
         DetailPanel::Info => info_pane,
     };
 

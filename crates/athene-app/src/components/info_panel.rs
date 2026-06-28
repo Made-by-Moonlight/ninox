@@ -60,8 +60,8 @@ pub fn info_panel<'a>(
 
             // PR body (truncated at 300 chars)
             if !pr.body.is_empty() {
-                let body_text = if pr.body.len() > 300 {
-                    format!("{}…", &pr.body[..300])
+                let body_text = if pr.body.chars().count() > 300 {
+                    format!("{}…", pr.body.chars().take(300).collect::<String>())
                 } else {
                     pr.body.clone()
                 };

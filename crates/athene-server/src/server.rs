@@ -10,7 +10,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tower_http::cors::CorsLayer;
 
 pub async fn start(engine: Arc<Engine>, port: u16) -> anyhow::Result<()> {
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let app = Router::new()
         .nest("/api/v1/sessions", sessions_router(engine.clone()))
         .nest("/api/v1/sessions", terminal_router(engine.clone()))

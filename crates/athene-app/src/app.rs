@@ -62,6 +62,7 @@ pub enum Message {
     SelectOrchestrator(Option<OrchestratorId>),
     DismissNotification(String),
     SpawnSession,
+    SwitchDetailPanel(crate::components::session_detail::DetailPanel),
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +134,13 @@ impl App {
 
             Message::SpawnSession => {
                 // Spawn UI to be implemented in a later task.
+                Task::none()
+            }
+
+            Message::SwitchDetailPanel(new_panel) => {
+                if let View::SessionDetail { panel, .. } = &mut state.view {
+                    *panel = new_panel;
+                }
                 Task::none()
             }
         }
