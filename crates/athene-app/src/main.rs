@@ -1,3 +1,7 @@
+mod app;
+mod components;
+mod theme;
+
 use athene_core::{config::AppConfig, events::Engine, lifecycle::poller::Poller, store::Store};
 use clap::Parser;
 use std::{path::PathBuf, sync::Arc};
@@ -55,9 +59,11 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Iced UI added in M3 (Task 9)
-    tracing::info!("native UI not yet implemented — running headless");
-    tokio::signal::ctrl_c().await?;
+    iced::application("Athene", app::App::iced_update, app::App::iced_view)
+        .subscription(app::App::subscription)
+        .theme(app::App::theme)
+        .run_with(move || app::App::new(engine))?;
+
     token.cancel();
     Ok(())
 }
