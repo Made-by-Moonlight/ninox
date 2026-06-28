@@ -7,4 +7,5 @@ pub mod types;
 
 pub use config::AppConfig;
 pub use events::{Engine, Event};
+pub use store::Store;
 pub use types::*;
