@@ -148,44 +148,97 @@ impl App {
 
             Message::SpawnFormConfirm => {
                 if let Some(form) = state.spawn_modal.take() {
-                    let name = form.name.trim().to_string();
-                    if !name.is_empty() {
-                        let ts = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis();
-                        let orch = Orchestrator {
-                            id:         format!("orch-{ts}"),
-                            name:       name.clone(),
-                            created_at: ts as i64,
-                        };
-                        let _ = state.engine.store.upsert_orchestrator(&orch);
-                        state.orchestrators.push(orch.clone());
-                        state.engine.emit(Event::OrchestratorSpawned(orch.clone()));
+                    let name      = form.name.trim().to_string();
+                    let workspace = form.workspace.trim().to_string();
+                    if name.is_empty() || workspace.is_empty() {
+                        return Task::none();
+                    }
 
-                        // Create the orchestrator's own Claude Code session and open its terminal.
-                        let session = Session {
-                            id:              orch.id.clone(),
+                    let ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+
+                    let orch = Orchestrator {
+                        id:         format!("orch-{ts}"),
+                        name:       name.clone(),
+                        created_at: ts as i64,
+                    };
+                    let _ = state.engine.store.upsert_orchestrator(&orch);
+                    state.orchestrators.push(orch.clone());
+                    state.engine.emit(Event::OrchestratorSpawned(orch.clone()));
+
+                    let session = Session {
+                        id:              orch.id.clone(),
+                        orchestrator_id: None,
+                        name:            name.clone(),
+                        repo:            String::new(),
+                        status:          SessionStatus::Working,
+                        agent_type:      "claude-code".into(),
+                        cost_usd:        0.0,
+                        started_at:      ts as i64,
+                        pr_number:       None,
+                        pr_id:           None,
+                        workspace_path:  Some(workspace.clone()),
+                        pid:             None,
+                    };
+                    let _ = state.engine.store.upsert_session(&session);
+                    state.sessions.insert(session.id.clone(), session.clone());
+                    state.engine.emit(Event::SessionSpawned(session));
+
+                    state.view = View::SessionDetail {
+                        session_id: orch.id.clone(),
+                        panel:      DetailPanel::Terminal,
+                    };
+
+                    // Capture values for the async task.
+                    let engine  = state.engine.clone();
+                    let tmux_id = orch.id.clone();
+                    let sid     = orch.id.clone();
+                    let ws      = workspace;
+                    let nm      = name;
+                    let ts_i64  = ts as i64;
+
+                    return Task::future(async move {
+                        use athene_core::{pty, tmux, Event as CoreEvent, Session, SessionStatus};
+
+                        if let Err(e) = tmux::create_session(&tmux_id, &ws, "claude", &[]).await {
+                            tracing::error!("tmux create failed for {sid}: {e}");
+                            return Message::Noop;
+                        }
+
+                        // Give the shell a moment to set up the TTY before we open it.
+                        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+                        let pid = tmux::list_sessions()
+                            .await
+                            .ok()
+                            .and_then(|ss| ss.into_iter().find(|s| s.id == tmux_id))
+                            .and_then(|s| s.pid);
+
+                        let updated = Session {
+                            id:              sid.clone(),
                             orchestrator_id: None,
-                            name,
+                            name:            nm,
                             repo:            String::new(),
                             status:          SessionStatus::Working,
                             agent_type:      "claude-code".into(),
                             cost_usd:        0.0,
-                            started_at:      ts as i64,
+                            started_at:      ts_i64,
                             pr_number:       None,
                             pr_id:           None,
-                            workspace_path:  None,
-                            pid:             None,
+                            workspace_path:  Some(ws),
+                            pid,
                         };
-                        let _ = state.engine.store.upsert_session(&session);
-                        state.sessions.insert(session.id.clone(), session.clone());
-                        state.engine.emit(Event::SessionSpawned(session));
-                        state.view = View::SessionDetail {
-                            session_id: orch.id,
-                            panel:      DetailPanel::Terminal,
-                        };
-                    }
+                        let _ = engine.store.upsert_session(&updated);
+
+                        if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &tmux_id).await {
+                            tracing::error!("pty setup failed for {sid}: {e}");
+                        }
+
+                        engine.emit(CoreEvent::SessionUpdated(updated));
+                        Message::Noop
+                    });
                 }
                 Task::none()
             }
