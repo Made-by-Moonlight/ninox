@@ -67,6 +67,7 @@ pub enum Message {
     SpawnFormConfirm,
     SpawnFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
+    TerminateSession(SessionId),
     Noop,
 }
 
@@ -303,6 +304,16 @@ impl App {
                     *panel = new_panel;
                 }
                 Task::none()
+            }
+
+            Message::TerminateSession(id) => {
+                let engine = state.engine.clone();
+                Task::future(async move {
+                    if let Err(e) = engine.terminate_session(&id).await {
+                        tracing::error!("terminate {id}: {e}");
+                    }
+                    Message::Noop
+                })
             }
 
             Message::Noop => Task::none(),
