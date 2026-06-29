@@ -63,9 +63,12 @@ pub enum Message {
     SelectOrchestrator(Option<OrchestratorId>),
     SpawnSession,
     SpawnFormName(String),
+    SpawnFormWorkspace(String),
     SpawnFormConfirm,
     SpawnFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
+    TerminateSession(SessionId),
+    Noop,
 }
 
 // ---------------------------------------------------------------------------
@@ -74,10 +77,21 @@ pub enum Message {
 
 impl App {
     pub fn new(engine: Arc<Engine>) -> (Self, Task<Message>) {
+        // Synchronously load persisted state from the DB so the UI isn't empty
+        // on startup.
+        let orchestrators = engine.store.list_orchestrators().unwrap_or_default();
+        let sessions: HashMap<SessionId, Session> = engine
+            .store
+            .list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect();
+
         let app = Self {
-            engine,
-            orchestrators:  vec![],
-            sessions:       HashMap::new(),
+            engine:         engine.clone(),
+            orchestrators,
+            sessions,
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
@@ -87,7 +101,51 @@ impl App {
             terminals:      HashMap::new(),
             spawn_modal:    None,
         };
-        (app, Task::none())
+
+        // Asynchronously reconnect PTY streams for sessions whose tmux sessions
+        // are still live, and mark dead sessions as Terminated.
+        let task = Task::future(async move {
+            use athene_core::{pty, tmux, Event as CoreEvent, SessionStatus};
+
+            let sessions = match engine.store.list_sessions() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("restore: list_sessions: {e}");
+                    return Message::Noop;
+                }
+            };
+
+            for session in sessions {
+                if matches!(
+                    session.status,
+                    SessionStatus::Done | SessionStatus::Terminated
+                ) {
+                    continue;
+                }
+
+                if tmux::has_session(&session.id).await {
+                    if let Err(e) = pty::start_streaming(
+                        engine.clone(),
+                        session.id.clone(),
+                        &session.id,
+                    )
+                    .await
+                    {
+                        tracing::warn!("reconnect pty {}: {e}", session.id);
+                    }
+                } else {
+                    // Session is no longer running — mark it terminated.
+                    let mut dead = session.clone();
+                    dead.status = SessionStatus::Terminated;
+                    let _ = engine.store.upsert_session(&dead);
+                    engine.emit(CoreEvent::SessionUpdated(dead));
+                }
+            }
+
+            Message::Noop
+        });
+
+        (app, task)
     }
 
     /// Iced-compatible mutable update — passed to `iced::application()`.
@@ -134,6 +192,11 @@ impl App {
                 Task::none()
             }
 
+            Message::SpawnFormWorkspace(v) => {
+                if let Some(f) = &mut state.spawn_modal { f.workspace = v; }
+                Task::none()
+            }
+
             Message::SpawnFormCancel => {
                 state.spawn_modal = None;
                 Task::none()
@@ -141,44 +204,97 @@ impl App {
 
             Message::SpawnFormConfirm => {
                 if let Some(form) = state.spawn_modal.take() {
-                    let name = form.name.trim().to_string();
-                    if !name.is_empty() {
-                        let ts = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis();
-                        let orch = Orchestrator {
-                            id:         format!("orch-{ts}"),
-                            name:       name.clone(),
-                            created_at: ts as i64,
-                        };
-                        let _ = state.engine.store.upsert_orchestrator(&orch);
-                        state.orchestrators.push(orch.clone());
-                        state.engine.emit(Event::OrchestratorSpawned(orch.clone()));
+                    let name      = form.name.trim().to_string();
+                    let workspace = form.workspace.trim().to_string();
+                    if name.is_empty() || workspace.is_empty() {
+                        return Task::none();
+                    }
 
-                        // Create the orchestrator's own Claude Code session and open its terminal.
-                        let session = Session {
-                            id:              orch.id.clone(),
+                    let ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+
+                    let orch = Orchestrator {
+                        id:         format!("orch-{ts}"),
+                        name:       name.clone(),
+                        created_at: ts as i64,
+                    };
+                    let _ = state.engine.store.upsert_orchestrator(&orch);
+                    state.orchestrators.push(orch.clone());
+                    state.engine.emit(Event::OrchestratorSpawned(orch.clone()));
+
+                    let session = Session {
+                        id:              orch.id.clone(),
+                        orchestrator_id: None,
+                        name:            name.clone(),
+                        repo:            String::new(),
+                        status:          SessionStatus::Working,
+                        agent_type:      "claude-code".into(),
+                        cost_usd:        0.0,
+                        started_at:      ts as i64,
+                        pr_number:       None,
+                        pr_id:           None,
+                        workspace_path:  Some(workspace.clone()),
+                        pid:             None,
+                    };
+                    let _ = state.engine.store.upsert_session(&session);
+                    state.sessions.insert(session.id.clone(), session.clone());
+                    state.engine.emit(Event::SessionSpawned(session));
+
+                    state.view = View::SessionDetail {
+                        session_id: orch.id.clone(),
+                        panel:      DetailPanel::Terminal,
+                    };
+
+                    // Capture values for the async task.
+                    let engine  = state.engine.clone();
+                    let tmux_id = orch.id.clone();
+                    let sid     = orch.id.clone();
+                    let ws      = workspace;
+                    let nm      = name;
+                    let ts_i64  = ts as i64;
+
+                    return Task::future(async move {
+                        use athene_core::{pty, tmux, Event as CoreEvent, Session, SessionStatus};
+
+                        if let Err(e) = tmux::create_session(&tmux_id, &ws, "claude", &[]).await {
+                            tracing::error!("tmux create failed for {sid}: {e}");
+                            return Message::Noop;
+                        }
+
+                        // Give the shell a moment to set up the TTY before we open it.
+                        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+                        let pid = tmux::list_sessions()
+                            .await
+                            .ok()
+                            .and_then(|ss| ss.into_iter().find(|s| s.id == tmux_id))
+                            .and_then(|s| s.pid);
+
+                        let updated = Session {
+                            id:              sid.clone(),
                             orchestrator_id: None,
-                            name,
+                            name:            nm,
                             repo:            String::new(),
                             status:          SessionStatus::Working,
                             agent_type:      "claude-code".into(),
                             cost_usd:        0.0,
-                            started_at:      ts as i64,
+                            started_at:      ts_i64,
                             pr_number:       None,
                             pr_id:           None,
-                            workspace_path:  None,
-                            pid:             None,
+                            workspace_path:  Some(ws),
+                            pid,
                         };
-                        let _ = state.engine.store.upsert_session(&session);
-                        state.sessions.insert(session.id.clone(), session.clone());
-                        state.engine.emit(Event::SessionSpawned(session));
-                        state.view = View::SessionDetail {
-                            session_id: orch.id,
-                            panel:      DetailPanel::Terminal,
-                        };
-                    }
+                        let _ = engine.store.upsert_session(&updated);
+
+                        if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &tmux_id).await {
+                            tracing::error!("pty setup failed for {sid}: {e}");
+                        }
+
+                        engine.emit(CoreEvent::SessionUpdated(updated));
+                        Message::Noop
+                    });
                 }
                 Task::none()
             }
@@ -189,6 +305,18 @@ impl App {
                 }
                 Task::none()
             }
+
+            Message::TerminateSession(id) => {
+                let engine = state.engine.clone();
+                Task::future(async move {
+                    if let Err(e) = engine.terminate_session(&id).await {
+                        tracing::error!("terminate {id}: {e}");
+                    }
+                    Message::Noop
+                })
+            }
+
+            Message::Noop => Task::none(),
         }
     }
 
@@ -427,6 +555,8 @@ mod tests {
 
         let (next, _) = m.update(Message::SpawnFormName("my-feature".into()));
         m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace("/tmp".into()));
+        m = next;
         let (next, _) = m.update(Message::SpawnFormConfirm);
         m = next;
 
@@ -452,5 +582,26 @@ mod tests {
         m = next;
         assert!(m.spawn_modal.is_none());
         assert!(m.orchestrators.is_empty());
+    }
+
+    #[test]
+    fn new_loads_sessions_and_orchestrators_from_db() {
+        let store = Arc::new(
+            Store::open(tempdir().unwrap().keep().join("t.db")).unwrap(),
+        );
+        store.upsert_orchestrator(&Orchestrator {
+            id: "o1".into(), name: "test-orch".into(), created_at: 0,
+        }).unwrap();
+        store.upsert_session(&Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+        }).unwrap();
+        let engine = Engine::new(store);
+        let (app, _task) = App::new(engine);
+        assert_eq!(app.orchestrators.len(), 1);
+        assert_eq!(app.sessions.len(), 1);
+        assert!(app.sessions.contains_key("s1"));
     }
 }

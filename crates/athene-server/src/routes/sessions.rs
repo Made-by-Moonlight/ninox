@@ -22,10 +22,16 @@ async fn list_sessions(State(e): State<Arc<Engine>>) -> Result<Json<Vec<Session>
 }
 
 async fn terminate_session(
-    State(_e): State<Arc<Engine>>,
-    Path(_id): Path<String>,
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
 ) -> StatusCode {
-    StatusCode::NO_CONTENT
+    match e.terminate_session(&id).await {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(err) => {
+            tracing::error!("terminate {id}: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 #[cfg(test)]
@@ -94,5 +100,38 @@ mod tests {
         let sessions: Vec<Session> = serde_json::from_slice(&body).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "s1");
+    }
+
+    #[tokio::test]
+    async fn delete_returns_no_content() {
+        let engine = test_engine();
+        engine
+            .store
+            .upsert_session(&Session {
+                id: "s1".into(),
+                orchestrator_id: None,
+                name: "w".into(),
+                repo: "r".into(),
+                status: SessionStatus::Working,
+                agent_type: "c".into(),
+                cost_usd: 0.0,
+                started_at: 0,
+                pr_number: None,
+                pr_id: None,
+                workspace_path: None,
+                pid: None,
+            })
+            .unwrap();
+        let response = sessions_router(engine)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/s1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 }

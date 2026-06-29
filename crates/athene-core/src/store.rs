@@ -84,6 +84,44 @@ impl Store {
         .collect()
     }
 
+    pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
+             started_at,pr_number,pr_id,workspace_path,pid
+             FROM sessions WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, f64>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, Option<u64>>(8)?,
+                r.get::<_, Option<i64>>(9)?,
+                r.get::<_, Option<String>>(10)?,
+                r.get::<_, Option<u32>>(11)?,
+            ))
+        })?;
+        match rows.next() {
+            None => Ok(None),
+            Some(r) => {
+                let (id, orchestrator_id, name, repo, status_str, agent_type,
+                     cost_usd, started_at, pr_number, pr_id, workspace_path, pid) = r?;
+                let status = serde_json::from_str(&format!("\"{status_str}\""))
+                    .unwrap_or(SessionStatus::Working);
+                Ok(Some(Session {
+                    id, orchestrator_id, name, repo, status, agent_type,
+                    cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
+                }))
+            }
+        }
+    }
+
     pub fn upsert_orchestrator(&self, o: &Orchestrator) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -153,5 +191,21 @@ mod tests {
         let list = store.list_sessions().unwrap();
         assert_eq!(list.len(), 1);
         assert!(matches!(list[0].status, SessionStatus::Done));
+    }
+
+    #[test]
+    fn get_session_by_id() {
+        let store = test_store();
+        let s = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+        };
+        store.upsert_session(&s).unwrap();
+        let found = store.get_session("s1").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "w");
+        assert!(store.get_session("missing").unwrap().is_none());
     }
 }
