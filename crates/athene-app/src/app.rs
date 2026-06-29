@@ -76,10 +76,21 @@ pub enum Message {
 
 impl App {
     pub fn new(engine: Arc<Engine>) -> (Self, Task<Message>) {
+        // Synchronously load persisted state from the DB so the UI isn't empty
+        // on startup.
+        let orchestrators = engine.store.list_orchestrators().unwrap_or_default();
+        let sessions: HashMap<SessionId, Session> = engine
+            .store
+            .list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect();
+
         let app = Self {
-            engine,
-            orchestrators:  vec![],
-            sessions:       HashMap::new(),
+            engine:         engine.clone(),
+            orchestrators,
+            sessions,
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
@@ -89,7 +100,51 @@ impl App {
             terminals:      HashMap::new(),
             spawn_modal:    None,
         };
-        (app, Task::none())
+
+        // Asynchronously reconnect PTY streams for sessions whose tmux sessions
+        // are still live, and mark dead sessions as Terminated.
+        let task = Task::future(async move {
+            use athene_core::{pty, tmux, Event as CoreEvent, SessionStatus};
+
+            let sessions = match engine.store.list_sessions() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("restore: list_sessions: {e}");
+                    return Message::Noop;
+                }
+            };
+
+            for session in sessions {
+                if matches!(
+                    session.status,
+                    SessionStatus::Done | SessionStatus::Terminated
+                ) {
+                    continue;
+                }
+
+                if tmux::has_session(&session.id).await {
+                    if let Err(e) = pty::start_streaming(
+                        engine.clone(),
+                        session.id.clone(),
+                        &session.id,
+                    )
+                    .await
+                    {
+                        tracing::warn!("reconnect pty {}: {e}", session.id);
+                    }
+                } else {
+                    // Session is no longer running — mark it terminated.
+                    let mut dead = session.clone();
+                    dead.status = SessionStatus::Terminated;
+                    let _ = engine.store.upsert_session(&dead);
+                    engine.emit(CoreEvent::SessionUpdated(dead));
+                }
+            }
+
+            Message::Noop
+        });
+
+        (app, task)
     }
 
     /// Iced-compatible mutable update — passed to `iced::application()`.
@@ -516,5 +571,26 @@ mod tests {
         m = next;
         assert!(m.spawn_modal.is_none());
         assert!(m.orchestrators.is_empty());
+    }
+
+    #[test]
+    fn new_loads_sessions_and_orchestrators_from_db() {
+        let store = Arc::new(
+            Store::open(tempdir().unwrap().keep().join("t.db")).unwrap(),
+        );
+        store.upsert_orchestrator(&Orchestrator {
+            id: "o1".into(), name: "test-orch".into(), created_at: 0,
+        }).unwrap();
+        store.upsert_session(&Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+        }).unwrap();
+        let engine = Engine::new(store);
+        let (app, _task) = App::new(engine);
+        assert_eq!(app.orchestrators.len(), 1);
+        assert_eq!(app.sessions.len(), 1);
+        assert!(app.sessions.contains_key("s1"));
     }
 }
