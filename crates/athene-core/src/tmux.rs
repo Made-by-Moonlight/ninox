@@ -26,8 +26,21 @@ async fn run(args: &[&str]) -> Result<String> {
 }
 
 /// Run tmux; swallow errors and return empty string on failure.
+/// Logs warnings for debugging; does not propagate errors.
 async fn run_best_effort(args: &[&str]) -> String {
-    run(args).await.unwrap_or_default()
+    match run(args).await {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::warn!("tmux {:?} failed (ignored): {}", args, e);
+            String::new()
+        }
+    }
+}
+
+/// Shell-quote a string to prevent injection in tmux commands.
+/// Wraps the string in single quotes and escapes interior single quotes.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Create a detached tmux session.  Kills a stale session with the same name
@@ -61,7 +74,9 @@ pub async fn create_session(
     }
 
     // Best-effort: hide the tmux status bar so the terminal widget isn't cluttered.
-    let _ = run(&["set-option", "-t", id, "status", "off"]).await;
+    if let Err(e) = run(&["set-option", "-t", id, "status", "off"]).await {
+        tracing::warn!("failed to hide tmux status bar: {}", e);
+    }
     Ok(())
 }
 
@@ -69,13 +84,18 @@ pub async fn create_session(
 pub async fn kill_session(id: &str) -> Result<()> {
     match run(&["kill-session", "-t", id]).await {
         Ok(_) => Ok(()),
-        Err(e)
-            if e.to_string().contains("no server running")
-                || e.to_string().contains("can't find session") =>
-        {
-            Ok(())
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("no server running")
+                || msg.contains("can't find session")
+                || msg.contains("session not found")
+                || msg.contains("no sessions")
+            {
+                Ok(())
+            } else {
+                Err(e)
+            }
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -119,7 +139,7 @@ pub async fn get_pane_tty(id: &str) -> Result<Option<String>> {
 /// Start piping pane output to `dest_path` (regular file, not FIFO).
 /// The flag `-o` means "only start a new pipe if none is running".
 pub async fn pipe_pane(id: &str, dest_path: &str) -> Result<()> {
-    run(&["pipe-pane", "-o", "-t", id, &format!("cat > {dest_path}")]).await?;
+    run(&["pipe-pane", "-o", "-t", id, &format!("cat > {}", shell_quote(dest_path))]).await?;
     Ok(())
 }
 
