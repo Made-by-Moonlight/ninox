@@ -3,6 +3,7 @@ pub mod events;
 pub mod lifecycle;
 pub mod plugin;
 pub mod store;
+pub mod tmux;
 pub mod types;
 
 pub use config::AppConfig;
