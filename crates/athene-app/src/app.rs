@@ -63,9 +63,11 @@ pub enum Message {
     SelectOrchestrator(Option<OrchestratorId>),
     SpawnSession,
     SpawnFormName(String),
+    SpawnFormWorkspace(String),
     SpawnFormConfirm,
     SpawnFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
+    Noop,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +136,11 @@ impl App {
                 Task::none()
             }
 
+            Message::SpawnFormWorkspace(v) => {
+                if let Some(f) = &mut state.spawn_modal { f.workspace = v; }
+                Task::none()
+            }
+
             Message::SpawnFormCancel => {
                 state.spawn_modal = None;
                 Task::none()
@@ -189,6 +196,8 @@ impl App {
                 }
                 Task::none()
             }
+
+            Message::Noop => Task::none(),
         }
     }
 
@@ -426,6 +435,8 @@ mod tests {
         assert!(m.spawn_modal.is_some());
 
         let (next, _) = m.update(Message::SpawnFormName("my-feature".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace("/tmp".into()));
         m = next;
         let (next, _) = m.update(Message::SpawnFormConfirm);
         m = next;
