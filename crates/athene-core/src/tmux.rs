@@ -52,9 +52,14 @@ pub async fn create_session(
     env:       &[(&str, &str)],
 ) -> Result<()> {
     // Build -e KEY=VALUE pairs
-    let env_pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let mut env_pairs: Vec<String> = Vec::new();
+    for (k, v) in env {
+        anyhow::ensure!(!k.contains('='), "env key must not contain '=': {k}");
+        env_pairs.push(format!("{k}={v}"));
+    }
     let mut extra: Vec<&str> = Vec::new();
     for pair in &env_pairs {
+        // Values are passed as separate argv tokens via execve — no shell quoting needed.
         extra.push("-e");
         extra.push(pair.as_str());
     }
