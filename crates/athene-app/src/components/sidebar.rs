@@ -4,7 +4,7 @@ use iced::{
 };
 
 use crate::{
-    app::{App, Message},
+    app::{App, Message, View},
     theme::{
         ACCENT_AMBER, BG_SIDEBAR, BG_SURFACE, BORDER, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
     },
@@ -81,30 +81,38 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
         let toggle_icon = if is_expanded { "▼" } else { "▶" };
         let orch_id = orch.id.clone();
 
-        let orch_row = button(
-            row![
-                text(toggle_icon).size(10).color(TEXT_MUTED),
-                Space::new(4, 0),
-                text(&orch.name).size(13).color(TEXT_PRIMARY),
-            ]
-            .spacing(4)
-            .align_y(Alignment::Center),
-        )
-        .on_press(Message::SelectOrchestrator(if is_expanded {
-            None
-        } else {
-            Some(orch_id.clone())
-        }))
-        .style(|_theme, _status| button::Style {
-            background: None,
-            text_color: TEXT_PRIMARY,
-            border: Border::default(),
-            ..Default::default()
-        })
-        .padding([6, 12])
-        .width(Length::Fill);
+        let is_viewing = matches!(&app.view, View::SessionDetail { session_id, .. } if session_id == &orch.id);
 
-        items.push(orch_row.into());
+        let chevron = button(text(toggle_icon).size(10).color(TEXT_MUTED))
+            .on_press(Message::SelectOrchestrator(if is_expanded {
+                None
+            } else {
+                Some(orch_id.clone())
+            }))
+            .style(|_theme, _status| button::Style {
+                background: None,
+                border: Border::default(),
+                ..Default::default()
+            })
+            .padding([6, 8]);
+
+        let name_btn = button(text(&orch.name).size(13).color(TEXT_PRIMARY))
+            .on_press(Message::NavigateSession(orch_id.clone()))
+            .style(move |_theme, _status| button::Style {
+                background: if is_viewing { Some(Background::Color(BG_SURFACE)) } else { None },
+                text_color: TEXT_PRIMARY,
+                border: Border::default(),
+                ..Default::default()
+            })
+            .padding([6, 4])
+            .width(Length::Fill);
+
+        let orch_row: Element<Message> = row![chevron, name_btn]
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
+            .into();
+
+        items.push(orch_row);
 
         if is_expanded {
             let workers: Vec<&athene_core::types::Session> = app

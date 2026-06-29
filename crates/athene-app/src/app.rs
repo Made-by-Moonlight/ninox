@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, VecDeque}, sync::Arc};
+use std::{collections::{HashMap, VecDeque}, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 
 use athene_core::{
     events::{Engine, Event},
@@ -7,7 +7,7 @@ use athene_core::{
 use iced::{Element, Subscription, Task, Theme};
 use tokio::sync::broadcast;
 
-use crate::components::{session_detail::DetailPanel, terminal::TerminalState};
+use crate::components::{session_detail::DetailPanel, spawn_modal::SpawnForm, terminal::TerminalState};
 
 const MAX_NOTIFICATIONS: usize = 50;
 
@@ -47,6 +47,7 @@ pub struct App {
     pub sidebar:         SidebarState,
     pub view:            View,
     pub terminals:       HashMap<SessionId, TerminalState>,
+    pub spawn_modal:     Option<SpawnForm>,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,8 +61,10 @@ pub enum Message {
     NavigateSession(SessionId),
     TerminalInput { session_id: SessionId, bytes: Vec<u8> },
     SelectOrchestrator(Option<OrchestratorId>),
-    DismissNotification(String),
     SpawnSession,
+    SpawnFormName(String),
+    SpawnFormConfirm,
+    SpawnFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
 }
 
@@ -82,15 +85,9 @@ impl App {
             sidebar:        SidebarState::default(),
             view:           View::default(),
             terminals:      HashMap::new(),
+            spawn_modal:    None,
         };
         (app, Task::none())
-    }
-
-    /// Elm-style consuming update — used by unit tests.
-    pub fn update(self, message: Message) -> (Self, Task<Message>) {
-        let mut state = self;
-        let task = Self::apply(&mut state, message);
-        (state, task)
     }
 
     /// Iced-compatible mutable update — passed to `iced::application()`.
@@ -127,13 +124,62 @@ impl App {
                 Task::none()
             }
 
-            Message::DismissNotification(id) => {
-                state.notifications.retain(|n| n.id != id);
+            Message::SpawnSession => {
+                state.spawn_modal = Some(SpawnForm::default());
                 Task::none()
             }
 
-            Message::SpawnSession => {
-                // Spawn UI to be implemented in a later task.
+            Message::SpawnFormName(v) => {
+                if let Some(f) = &mut state.spawn_modal { f.name = v; }
+                Task::none()
+            }
+
+            Message::SpawnFormCancel => {
+                state.spawn_modal = None;
+                Task::none()
+            }
+
+            Message::SpawnFormConfirm => {
+                if let Some(form) = state.spawn_modal.take() {
+                    let name = form.name.trim().to_string();
+                    if !name.is_empty() {
+                        let ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        let orch = Orchestrator {
+                            id:         format!("orch-{ts}"),
+                            name:       name.clone(),
+                            created_at: ts as i64,
+                        };
+                        let _ = state.engine.store.upsert_orchestrator(&orch);
+                        state.orchestrators.push(orch.clone());
+                        state.engine.emit(Event::OrchestratorSpawned(orch.clone()));
+
+                        // Create the orchestrator's own Claude Code session and open its terminal.
+                        let session = Session {
+                            id:              orch.id.clone(),
+                            orchestrator_id: None,
+                            name,
+                            repo:            String::new(),
+                            status:          SessionStatus::Working,
+                            agent_type:      "claude-code".into(),
+                            cost_usd:        0.0,
+                            started_at:      ts as i64,
+                            pr_number:       None,
+                            pr_id:           None,
+                            workspace_path:  None,
+                            pid:             None,
+                        };
+                        let _ = state.engine.store.upsert_session(&session);
+                        state.sessions.insert(session.id.clone(), session.clone());
+                        state.engine.emit(Event::SessionSpawned(session));
+                        state.view = View::SessionDetail {
+                            session_id: orch.id,
+                            panel:      DetailPanel::Terminal,
+                        };
+                    }
+                }
                 Task::none()
             }
 
@@ -148,6 +194,12 @@ impl App {
 
     fn handle_engine_event(state: &mut Self, event: Event) -> Task<Message> {
         match event {
+            Event::OrchestratorSpawned(orch) => {
+                if !state.orchestrators.iter().any(|o| o.id == orch.id) {
+                    state.orchestrators.push(orch);
+                }
+            }
+
             Event::SessionSpawned(session) => {
                 state.sessions.insert(session.id.clone(), session);
             }
@@ -189,7 +241,6 @@ impl App {
             }
 
             Event::Notification(n) => {
-                // Spawn OS notification on a background thread so we never block the UI.
                 let title = n.title.clone();
                 let body = n.body.clone();
                 std::thread::spawn(move || {
@@ -214,6 +265,7 @@ impl App {
             fleet_board::fleet_board,
             session_detail::session_detail,
             sidebar::sidebar,
+            spawn_modal::spawn_modal,
         };
         use crate::theme::{BG_BASE, BG_SURFACE, TEXT_MUTED};
         use iced::{Background, Border, Length};
@@ -240,7 +292,7 @@ impl App {
             View::SessionDetail { session_id, panel } => session_detail(state, session_id, panel),
         };
 
-        container(
+        let base: Element<Message> = container(
             column![
                 titlebar,
                 row![sidebar(state), main].height(Length::Fill),
@@ -252,7 +304,13 @@ impl App {
             background: Some(Background::Color(BG_BASE)),
             ..Default::default()
         })
-        .into()
+        .into();
+
+        if let Some(form) = &state.spawn_modal {
+            iced::widget::stack![base, spawn_modal(form)].into()
+        } else {
+            base
+        }
     }
 
     /// Subscription that drives `Message::EngineEvent` from the engine broadcast channel.
@@ -283,6 +341,15 @@ impl App {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+impl App {
+    pub fn update(self, message: Message) -> (Self, Task<Message>) {
+        let mut state = self;
+        let task = Self::apply(&mut state, message);
+        (state, task)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use athene_core::{events::Engine, store::Store};
@@ -307,6 +374,7 @@ mod tests {
             sidebar:        SidebarState::default(),
             view:           View::FleetBoard { scope: None },
             terminals:      HashMap::new(),
+            spawn_modal:    None,
         }
     }
 
@@ -347,5 +415,42 @@ mod tests {
             m = next;
         }
         assert_eq!(m.notifications.len(), 50);
+    }
+
+    #[test]
+    fn spawn_form_confirm_inserts_orchestrator_and_navigates() {
+        let e = test_engine();
+        let mut m = base(e);
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        assert!(m.spawn_modal.is_some());
+
+        let (next, _) = m.update(Message::SpawnFormName("my-feature".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        assert!(m.spawn_modal.is_none());
+        assert_eq!(m.orchestrators.len(), 1);
+        assert_eq!(m.orchestrators[0].name, "my-feature");
+
+        // A session with the orchestrator's ID must exist for the terminal view
+        let orch_id = &m.orchestrators[0].id;
+        assert!(m.sessions.contains_key(orch_id));
+
+        // View should be the session detail for that orchestrator
+        assert!(matches!(&m.view, View::SessionDetail { session_id, .. } if session_id == orch_id));
+    }
+
+    #[test]
+    fn spawn_form_cancel_clears_modal() {
+        let e = test_engine();
+        let mut m = base(e);
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormCancel);
+        m = next;
+        assert!(m.spawn_modal.is_none());
+        assert!(m.orchestrators.is_empty());
     }
 }

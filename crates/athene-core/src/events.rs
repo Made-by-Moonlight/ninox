@@ -4,6 +4,7 @@ use tokio::sync::{broadcast, Mutex};
 
 #[derive(Debug, Clone)]
 pub enum Event {
+    OrchestratorSpawned(Orchestrator),
     SessionUpdated(Session),
     SessionSpawned(Session),
     SessionDone(SessionId),

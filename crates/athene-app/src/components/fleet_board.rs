@@ -156,12 +156,14 @@ pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Eleme
         })
         .collect();
 
-    let board = scrollable(
+    // Use with_direction directly: calling scrollable() defaults to vertical and
+    // validates immediately, panicking because the row's height is Fill (from
+    // kanban columns with height(Fill)).
+    let board = scrollable::Scrollable::with_direction(
         row(kanban_cols).spacing(12).padding(20u16),
+        scrollable::Direction::Horizontal(scrollable::Scrollbar::default()),
     )
-    .direction(scrollable::Direction::Horizontal(
-        scrollable::Scrollbar::default(),
-    ));
+    .width(Length::Fill);
 
     column![header, board]
         .width(Length::Fill)

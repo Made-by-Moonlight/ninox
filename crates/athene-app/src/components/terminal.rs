@@ -29,18 +29,6 @@ pub struct TerminalState {
 }
 
 impl TerminalState {
-    pub fn new(cols: u16, rows: u16) -> Self {
-        use alacritty_terminal::term::{Config, test::TermSize};
-        let size = TermSize::new(cols as usize, rows as usize);
-        let term = Term::new(Config::default(), &size, EventProxy);
-        Self {
-            term,
-            pty_sender: None,
-            cache: Cache::new(),
-            parser: Processor::new(),
-        }
-    }
-
     /// Feed raw bytes from the PTY into the VTE parser → terminal state.
     pub fn process(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
@@ -261,6 +249,21 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+impl TerminalState {
+    pub fn new(cols: u16, rows: u16) -> Self {
+        use alacritty_terminal::term::{Config, test::TermSize};
+        let size = TermSize::new(cols as usize, rows as usize);
+        let term = Term::new(Config::default(), &size, EventProxy);
+        Self {
+            term,
+            pty_sender: None,
+            cache: Cache::new(),
+            parser: Processor::new(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
