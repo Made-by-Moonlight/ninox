@@ -64,9 +64,19 @@ pub async fn create_session(
         extra.push(pair.as_str());
     }
 
-    let mut base = vec!["new-session", "-d", "-s", id, "-c", workspace];
+    // Wrap the command in a login shell so the full user PATH is available.
+    // tmux sessions do not inherit shell rc files, so tools installed via
+    // nvm / cargo / homebrew etc. would not be found otherwise.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let shell_cmd = format!("{shell} -l -c {}", shell_quote(cmd));
+
+    // Fix the terminal dimensions to match the canvas.  The canvas is roughly
+    // (window_width - 220px sidebar) / 7.8px_per_col ≈ 135 cols on a 1280-wide
+    // window.  Use 140 as a safe default; too-wide values push Claude Code's
+    // centered content off-screen.
+    let mut base = vec!["new-session", "-d", "-s", id, "-x", "140", "-y", "50", "-c", workspace];
     base.extend_from_slice(&extra);
-    base.push(cmd);
+    base.push(&shell_cmd);
 
     for attempt in 0..2u8 {
         match run(&base).await {
@@ -142,10 +152,29 @@ pub async fn get_pane_tty(id: &str) -> Result<Option<String>> {
 }
 
 /// Start piping pane output to `dest_path` (regular file, not FIFO).
-/// The flag `-o` means "only start a new pipe if none is running".
+/// Does NOT use `-o` so it force-restarts any existing pipe — required for reconnect.
 pub async fn pipe_pane(id: &str, dest_path: &str) -> Result<()> {
-    run(&["pipe-pane", "-o", "-t", id, &format!("cat > {}", shell_quote(dest_path))]).await?;
+    run(&["pipe-pane", "-t", id, &format!("cat > {}", shell_quote(dest_path))]).await?;
     Ok(())
+}
+
+/// Resize a tmux window to the given dimensions.
+pub async fn resize_window(id: &str, cols: u16, rows: u16) -> Result<()> {
+    run(&[
+        "resize-window", "-t", id,
+        "-x", &cols.to_string(),
+        "-y", &rows.to_string(),
+    ]).await?;
+    Ok(())
+}
+
+/// Capture the current visible content of a pane with escape sequences.
+/// Used to replay initial output that was emitted before the FIFO pipe connected.
+pub async fn capture_pane(id: &str) -> Vec<u8> {
+    run(&["capture-pane", "-t", id, "-p", "-e"])
+        .await
+        .map(|s| s.into_bytes())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

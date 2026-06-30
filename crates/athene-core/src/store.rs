@@ -132,6 +132,18 @@ impl Store {
         Ok(())
     }
 
+    pub fn sessions_by_orchestrator(&self, orchestrator_id: &str) -> Result<Vec<Session>> {
+        let sessions = self.list_sessions()?;
+        Ok(sessions.into_iter().filter(|s| s.orchestrator_id.as_deref() == Some(orchestrator_id)).collect())
+    }
+
+    pub fn delete_orchestrator(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM sessions WHERE orchestrator_id = ?1", [id])?;
+        conn.execute("DELETE FROM orchestrators WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
     pub fn list_orchestrators(&self) -> Result<Vec<Orchestrator>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

@@ -34,6 +34,14 @@ impl TerminalState {
         self.parser.advance(&mut self.term, bytes);
         self.cache.clear();
     }
+
+    /// Resize the terminal grid to match a new canvas size.
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        use alacritty_terminal::term::test::TermSize;
+        let size = TermSize::new(cols as usize, rows as usize);
+        self.term.resize(size);
+        self.cache.clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,22 +148,14 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
         use iced::keyboard::Event as KeyEvent;
         use iced::widget::canvas::Event;
 
-        let Event::Keyboard(KeyEvent::KeyPressed { text, .. }) = event else {
+        // Emit RawKey so the handler can apply APP_CURSOR-aware conversion.
+        let Event::Keyboard(KeyEvent::KeyPressed { key, modifiers, text, .. }) = event else {
             return (iced::widget::canvas::event::Status::Ignored, None);
         };
-
-        let Some(text) = text else {
-            return (iced::widget::canvas::event::Status::Ignored, None);
-        };
-
-        let bytes = text.as_bytes().to_vec();
-        if bytes.is_empty() {
-            return (iced::widget::canvas::event::Status::Ignored, None);
-        }
-
-        let msg = Message::TerminalInput {
-            session_id: self.session_id.clone(),
-            bytes,
+        let msg = Message::RawKey {
+            key,
+            modifiers,
+            text: text.map(|t| t.as_str().to_string()),
         };
         (iced::widget::canvas::event::Status::Captured, Some(msg))
     }
@@ -250,7 +250,6 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
 impl TerminalState {
     pub fn new(cols: u16, rows: u16) -> Self {
         use alacritty_terminal::term::{Config, test::TermSize};

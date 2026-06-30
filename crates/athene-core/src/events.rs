@@ -5,6 +5,7 @@ use tokio::sync::{broadcast, Mutex};
 #[derive(Debug, Clone)]
 pub enum Event {
     OrchestratorSpawned(Orchestrator),
+    OrchestratorRemoved(OrchestratorId),
     SessionUpdated(Session),
     SessionSpawned(Session),
     SessionDone(SessionId),
@@ -48,6 +49,22 @@ impl Engine {
         session_id: &str,
     ) -> Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>> {
         self.pty_writers.lock().await.get(session_id).cloned()
+    }
+
+    /// Kill all worker sessions belonging to an orchestrator, delete from DB, emit events.
+    pub async fn remove_orchestrator(&self, orchestrator_id: &str) -> anyhow::Result<()> {
+        let workers = self.store.sessions_by_orchestrator(orchestrator_id)?;
+        for session in &workers {
+            let _ = crate::tmux::kill_session(&session.id).await;
+        }
+        // Also kill the orchestrator's own tmux session (same id as orchestrator).
+        let _ = crate::tmux::kill_session(orchestrator_id).await;
+        self.store.delete_orchestrator(orchestrator_id)?;
+        for session in workers {
+            self.emit(Event::SessionDone(session.id));
+        }
+        self.emit(Event::OrchestratorRemoved(orchestrator_id.to_string()));
+        Ok(())
     }
 
     /// Kill the tmux session, mark it Terminated in the DB, and emit SessionUpdated.
