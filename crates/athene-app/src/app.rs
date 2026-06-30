@@ -48,6 +48,10 @@ pub struct App {
     pub view:            View,
     pub terminals:       HashMap<SessionId, TerminalState>,
     pub spawn_modal:     Option<SpawnForm>,
+    /// Current terminal canvas dimensions, kept in sync by WindowResized.
+    /// Used as the source of truth for all start_streaming + TerminalState::new calls.
+    pub terminal_cols:   u16,
+    pub terminal_rows:   u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -59,15 +63,12 @@ pub enum Message {
     EngineEvent(Event),
     NavigateFleet { scope: Option<OrchestratorId> },
     NavigateSession(SessionId),
-    TerminalInput { session_id: SessionId, bytes: Vec<u8> },
     SelectOrchestrator(Option<OrchestratorId>),
     SpawnSession,
     SpawnFormName(String),
-    SpawnFormWorkspace(String),
     SpawnFormConfirm,
     SpawnFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
-    TerminateSession(SessionId),
     RemoveOrchestrator(OrchestratorId),
     // Raw key event from the global subscription — bytes are computed in the handler
     // where we have access to the terminal mode (APP_CURSOR changes arrow sequences).
@@ -77,7 +78,6 @@ pub enum Message {
         text:      Option<String>,
     },
     WindowResized(iced::Size),
-    TerminalResized { session_id: SessionId, cols: u16, rows: u16 },
     Noop,
 }
 
@@ -200,7 +200,15 @@ impl App {
             view:           View::default(),
             terminals:      HashMap::new(),
             spawn_modal:    None,
+            terminal_cols:  140,
+            terminal_rows:  50,
         };
+
+        // Capture terminal size for the async task (App::new runs before any
+        // WindowResized; the default 140×50 is used here and corrected once
+        // the first resize event fires).
+        let init_cols = app.terminal_cols;
+        let init_rows = app.terminal_rows;
 
         // Asynchronously reconnect PTY streams for sessions whose tmux sessions
         // are still live, and mark dead sessions as Terminated.
@@ -228,7 +236,7 @@ impl App {
                         engine.clone(),
                         session.id.clone(),
                         &session.id,
-                        140, 50,
+                        init_cols, init_rows,
                     )
                     .await
                     {
@@ -298,16 +306,6 @@ impl App {
                 Task::none()
             }
 
-            Message::TerminalInput { session_id, bytes } => {
-                let engine = state.engine.clone();
-                Task::future(async move {
-                    if let Some(sender) = engine.get_pty_writer(&session_id).await {
-                        let _ = sender.send(bytes);
-                    }
-                    Message::Noop
-                })
-            }
-
             Message::SpawnSession => {
                 state.spawn_modal = Some(SpawnForm::default());
                 Task::none()
@@ -315,11 +313,6 @@ impl App {
 
             Message::SpawnFormName(v) => {
                 if let Some(f) = &mut state.spawn_modal { f.name = v; }
-                Task::none()
-            }
-
-            Message::SpawnFormWorkspace(v) => {
-                if let Some(f) = &mut state.spawn_modal { f.workspace = v; }
                 Task::none()
             }
 
@@ -390,6 +383,10 @@ impl App {
                     let ws      = workspace;
                     let nm      = name;
                     let ts_i64  = ts as i64;
+                    // Use the authoritative size so the new session matches any
+                    // resize that happened before the spawn confirmed.
+                    let t_cols  = state.terminal_cols;
+                    let t_rows  = state.terminal_rows;
 
                     return Task::future(async move {
                         use athene_core::{pty, tmux, Event as CoreEvent, Session, SessionStatus};
@@ -424,7 +421,7 @@ impl App {
                         };
                         let _ = engine.store.upsert_session(&updated);
 
-                        if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &tmux_id, 140, 50).await {
+                        if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &tmux_id, t_cols, t_rows).await {
                             tracing::error!("pty setup failed for {sid}: {e}");
                         }
 
@@ -440,16 +437,6 @@ impl App {
                     *panel = new_panel;
                 }
                 Task::none()
-            }
-
-            Message::TerminateSession(id) => {
-                let engine = state.engine.clone();
-                Task::future(async move {
-                    if let Err(e) = engine.terminate_session(&id).await {
-                        tracing::error!("terminate {id}: {e}");
-                    }
-                    Message::Noop
-                })
             }
 
             Message::RemoveOrchestrator(id) => {
@@ -507,6 +494,11 @@ impl App {
                 let cols = ((size.width  - sidebar_w).max(200.0) / cell_w) as u16;
                 let rows = ((size.height - header_h ).max(100.0) / cell_h) as u16;
 
+                // Keep the authoritative terminal size up to date so new sessions
+                // spawned after this resize use the correct dimensions.
+                state.terminal_cols = cols;
+                state.terminal_rows = rows;
+
                 let session_ids: Vec<SessionId> = state.terminals.keys().cloned().collect();
                 for sid in &session_ids {
                     if let Some(term) = state.terminals.get_mut(sid) {
@@ -516,7 +508,6 @@ impl App {
                 if session_ids.is_empty() {
                     return Task::none();
                 }
-                let engine = state.engine.clone();
                 Task::future(async move {
                     for sid in session_ids {
                         let _ = athene_core::tmux::resize_window(&sid, cols, rows).await;
@@ -525,12 +516,6 @@ impl App {
                 })
             }
 
-            Message::TerminalResized { session_id, cols, rows } => {
-                if let Some(term) = state.terminals.get_mut(&session_id) {
-                    term.resize(cols, rows);
-                }
-                Task::none()
-            }
 
             Message::Noop => Task::none(),
         }
@@ -567,7 +552,9 @@ impl App {
             Event::TerminalOutput { session_id, bytes } => {
                 let term = state.terminals
                     .entry(session_id)
-                    .or_insert_with(|| crate::components::terminal::TerminalState::new(140, 50));
+                    .or_insert_with(|| crate::components::terminal::TerminalState::new(
+                        state.terminal_cols, state.terminal_rows,
+                    ));
                 term.process(&bytes);
             }
 
@@ -732,6 +719,8 @@ mod tests {
             view:           View::FleetBoard { scope: None },
             terminals:      HashMap::new(),
             spawn_modal:    None,
+            terminal_cols:  140,
+            terminal_rows:  50,
         }
     }
 
@@ -783,8 +772,6 @@ mod tests {
         assert!(m.spawn_modal.is_some());
 
         let (next, _) = m.update(Message::SpawnFormName("my-feature".into()));
-        m = next;
-        let (next, _) = m.update(Message::SpawnFormWorkspace("/tmp".into()));
         m = next;
         let (next, _) = m.update(Message::SpawnFormConfirm);
         m = next;

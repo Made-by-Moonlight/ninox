@@ -161,7 +161,6 @@ pub fn session_detail<'a>(
         iced::widget::Canvas::new(TerminalWidget {
             state: term_state,
             font_size: 13.0,
-            session_id: session_id.to_string(),
         })
         .width(Length::Fill)
         .height(Length::Fill)

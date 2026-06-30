@@ -23,7 +23,6 @@ impl alacritty_terminal::event::EventListener for EventProxy {
 
 pub struct TerminalState {
     pub term: Term<EventProxy>,
-    pub pty_sender: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     pub cache: Cache,
     parser: Processor,
 }
@@ -132,7 +131,6 @@ pub fn ansi_to_iced(
 pub struct TerminalWidget<'a> {
     pub state: &'a TerminalState,
     pub font_size: f32,
-    pub session_id: String,
 }
 
 impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
@@ -257,7 +255,6 @@ impl TerminalState {
         let term = Term::new(Config::default(), &size, EventProxy);
         Self {
             term,
-            pty_sender: None,
             cache: Cache::new(),
             parser: Processor::new(),
         }
