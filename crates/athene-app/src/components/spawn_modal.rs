@@ -15,8 +15,7 @@ pub struct SpawnForm {
 }
 
 pub fn spawn_modal(form: &SpawnForm) -> Element<'_, Message> {
-    let can_submit =
-        !form.name.trim().is_empty() && !form.workspace.trim().is_empty();
+    let can_submit = !form.name.trim().is_empty();
 
     let dialog = container(
         column![
@@ -27,16 +26,6 @@ pub fn spawn_modal(form: &SpawnForm) -> Element<'_, Message> {
                 Space::new(0, 4),
                 text_input("e.g. my-feature", &form.name)
                     .on_input(Message::SpawnFormName)
-                    .on_submit_maybe(can_submit.then_some(Message::SpawnFormConfirm))
-                    .padding(8)
-                    .size(13),
-            ]
-            .spacing(0),
-            column![
-                text("Workspace").size(11).color(TEXT_MUTED),
-                Space::new(0, 4),
-                text_input("~/projects/my-repo", &form.workspace)
-                    .on_input(Message::SpawnFormWorkspace)
                     .on_submit_maybe(can_submit.then_some(Message::SpawnFormConfirm))
                     .padding(8)
                     .size(13),

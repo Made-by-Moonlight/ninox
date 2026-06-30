@@ -107,7 +107,17 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
             .padding([6, 4])
             .width(Length::Fill);
 
-        let orch_row: Element<Message> = row![chevron, name_btn]
+        let remove_id = orch.id.clone();
+        let remove_btn = button(text("×").size(12).color(TEXT_MUTED))
+            .on_press(Message::RemoveOrchestrator(remove_id))
+            .style(|_theme, _status| button::Style {
+                background: None,
+                border: Border::default(),
+                ..Default::default()
+            })
+            .padding([6, 8]);
+
+        let orch_row: Element<Message> = row![chevron, name_btn, remove_btn]
             .align_y(Alignment::Center)
             .width(Length::Fill)
             .into();
@@ -124,27 +134,6 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
             for session in workers {
                 items.push(worker_row(app, session));
             }
-        }
-    }
-
-    // Standalone workers (no orchestrator_id)
-    let standalone: Vec<&athene_core::types::Session> = app
-        .sessions
-        .values()
-        .filter(|s| s.orchestrator_id.is_none())
-        .collect();
-
-    if !standalone.is_empty() {
-        if !app.orchestrators.is_empty() {
-            // Divider label
-            items.push(
-                container(text("Workers").size(11).color(TEXT_MUTED))
-                    .padding([8u16, 12])
-                    .into(),
-            );
-        }
-        for session in standalone {
-            items.push(worker_row(app, session));
         }
     }
 

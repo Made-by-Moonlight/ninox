@@ -48,6 +48,10 @@ pub struct App {
     pub view:            View,
     pub terminals:       HashMap<SessionId, TerminalState>,
     pub spawn_modal:     Option<SpawnForm>,
+    /// Current terminal canvas dimensions, kept in sync by WindowResized.
+    /// Used as the source of truth for all start_streaming + TerminalState::new calls.
+    pub terminal_cols:   u16,
+    pub terminal_rows:   u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -59,16 +63,112 @@ pub enum Message {
     EngineEvent(Event),
     NavigateFleet { scope: Option<OrchestratorId> },
     NavigateSession(SessionId),
-    TerminalInput { session_id: SessionId, bytes: Vec<u8> },
     SelectOrchestrator(Option<OrchestratorId>),
     SpawnSession,
     SpawnFormName(String),
-    SpawnFormWorkspace(String),
     SpawnFormConfirm,
     SpawnFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
-    TerminateSession(SessionId),
+    RemoveOrchestrator(OrchestratorId),
+    // Raw key event from the global subscription — bytes are computed in the handler
+    // where we have access to the terminal mode (APP_CURSOR changes arrow sequences).
+    RawKey {
+        key:       iced::keyboard::Key,
+        modifiers: iced::keyboard::Modifiers,
+        text:      Option<String>,
+    },
+    WindowResized(iced::Size),
     Noop,
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Keyboard → terminal byte conversion (static fn — no captures allowed by listen_with)
+// ---------------------------------------------------------------------------
+
+fn global_event_handler(
+    event: iced::Event,
+    status: iced::event::Status,
+    _id: iced::window::Id,
+) -> Option<Message> {
+    // Window resize — always handle regardless of captured status.
+    if let iced::Event::Window(iced::window::Event::Resized(size)) = &event {
+        return Some(Message::WindowResized(*size));
+    }
+    // Keyboard — only handle Ignored events (not already captured by a widget).
+    if status == iced::event::Status::Captured {
+        return None;
+    }
+    let iced::Event::Keyboard(
+        iced::keyboard::Event::KeyPressed { key, modifiers, text, .. }
+    ) = event else {
+        return None;
+    };
+    Some(Message::RawKey {
+        key,
+        modifiers,
+        text: text.map(|t| t.as_str().to_string()),
+    })
+}
+
+/// Convert a key event to terminal bytes.
+/// `app_cursor`: true when the terminal has APP_CURSOR mode set — arrow keys
+/// use `\x1bO[ABCD]` instead of `\x1b[[ABCD]` in that mode.
+fn key_to_terminal_bytes(
+    key: &iced::keyboard::Key,
+    modifiers: iced::keyboard::Modifiers,
+    text: Option<&str>,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
+    use iced::keyboard::key::Named;
+    use iced::keyboard::Key;
+
+    // Ctrl+letter → caret notation (Ctrl+A=0x01 … Ctrl+Z=0x1A, Ctrl+[=ESC)
+    if modifiers.control() {
+        match key {
+            Key::Character(c) => {
+                if let Some(ch) = c.chars().next() {
+                    let b = match ch {
+                        'a'..='z' => Some(vec![(ch as u8) - b'a' + 1]),
+                        'A'..='Z' => Some(vec![(ch as u8) - b'A' + 1]),
+                        '[' => Some(b"\x1b".to_vec()),
+                        '\\' => Some(b"\x1c".to_vec()),
+                        ']' => Some(b"\x1d".to_vec()),
+                        '^' | '6' => Some(b"\x1e".to_vec()),
+                        '_' => Some(b"\x1f".to_vec()),
+                        _ => None,
+                    };
+                    if b.is_some() { return b; }
+                }
+            }
+            Key::Named(Named::Enter) => return Some(b"\r".to_vec()),
+            _ => {}
+        }
+    }
+
+    // Arrow keys: mode-sensitive
+    let arr = if app_cursor { ("OA","OB","OC","OD") } else { ("[A","[B","[C","[D") };
+    let esc = |s: &str| -> Vec<u8> { let mut v = b"\x1b".to_vec(); v.extend(s.as_bytes()); v };
+
+    let bytes: Vec<u8> = match key {
+        Key::Named(Named::Enter)      => b"\r".to_vec(),
+        Key::Named(Named::Escape)     => b"\x1b".to_vec(),
+        Key::Named(Named::Backspace)  => b"\x7f".to_vec(),
+        Key::Named(Named::Delete)     => b"\x1b[3~".to_vec(),
+        Key::Named(Named::Tab) if modifiers.shift() => b"\x1b[Z".to_vec(),
+        Key::Named(Named::Tab)        => b"\t".to_vec(),
+        Key::Named(Named::ArrowUp)    => esc(arr.0),
+        Key::Named(Named::ArrowDown)  => esc(arr.1),
+        Key::Named(Named::ArrowRight) => esc(arr.2),
+        Key::Named(Named::ArrowLeft)  => esc(arr.3),
+        Key::Named(Named::Home)       => b"\x1b[H".to_vec(),
+        Key::Named(Named::End)        => b"\x1b[F".to_vec(),
+        Key::Named(Named::PageUp)     => b"\x1b[5~".to_vec(),
+        Key::Named(Named::PageDown)   => b"\x1b[6~".to_vec(),
+        Key::Character(c)             => c.as_str().as_bytes().to_vec(),
+        _ => text.map(|t| t.as_bytes().to_vec()).unwrap_or_default(),
+    };
+    if bytes.is_empty() { None } else { Some(bytes) }
 }
 
 // ---------------------------------------------------------------------------
@@ -100,7 +200,15 @@ impl App {
             view:           View::default(),
             terminals:      HashMap::new(),
             spawn_modal:    None,
+            terminal_cols:  140,
+            terminal_rows:  50,
         };
+
+        // Capture terminal size for the async task (App::new runs before any
+        // WindowResized; the default 140×50 is used here and corrected once
+        // the first resize event fires).
+        let init_cols = app.terminal_cols;
+        let init_rows = app.terminal_rows;
 
         // Asynchronously reconnect PTY streams for sessions whose tmux sessions
         // are still live, and mark dead sessions as Terminated.
@@ -128,6 +236,7 @@ impl App {
                         engine.clone(),
                         session.id.clone(),
                         &session.id,
+                        init_cols, init_rows,
                     )
                     .await
                     {
@@ -164,21 +273,36 @@ impl App {
             }
 
             Message::NavigateSession(id) => {
-                state.view = View::SessionDetail { session_id: id, panel: DetailPanel::default() };
-                Task::none()
+                state.view = View::SessionDetail {
+                    session_id: id.clone(),
+                    panel: DetailPanel::default(),
+                };
+                // Capture current terminal dimensions (if a TerminalState exists) so
+                // start_streaming can resize tmux to match before calling capture_pane.
+                let (cols, rows) = state.terminals.get(&id)
+                    .map(|t| {
+                        use alacritty_terminal::grid::Dimensions;
+                        (
+                            t.term.grid().columns() as u16,
+                            t.term.grid().screen_lines() as u16,
+                        )
+                    })
+                    .unwrap_or((140, 50));
+                let engine = state.engine.clone();
+                Task::future(async move {
+                    if athene_core::tmux::has_session(&id).await {
+                        if let Err(e) =
+                            athene_core::pty::start_streaming(engine.clone(), id.clone(), &id, cols, rows).await
+                        {
+                            tracing::warn!("PTY (re)connect for {id}: {e}");
+                        }
+                    }
+                    Message::Noop
+                })
             }
 
             Message::SelectOrchestrator(id) => {
                 state.sidebar.selected_orchestrator = id;
-                Task::none()
-            }
-
-            Message::TerminalInput { session_id, bytes } => {
-                if let Some(term) = state.terminals.get(&session_id) {
-                    if let Some(sender) = &term.pty_sender {
-                        let _ = sender.send(bytes);
-                    }
-                }
                 Task::none()
             }
 
@@ -192,11 +316,6 @@ impl App {
                 Task::none()
             }
 
-            Message::SpawnFormWorkspace(v) => {
-                if let Some(f) = &mut state.spawn_modal { f.workspace = v; }
-                Task::none()
-            }
-
             Message::SpawnFormCancel => {
                 state.spawn_modal = None;
                 Task::none()
@@ -204,11 +323,21 @@ impl App {
 
             Message::SpawnFormConfirm => {
                 if let Some(form) = state.spawn_modal.take() {
-                    let name      = form.name.trim().to_string();
-                    let workspace = form.workspace.trim().to_string();
-                    if name.is_empty() || workspace.is_empty() {
+                    let name = form.name.trim().to_string();
+                    if name.is_empty() {
                         return Task::none();
                     }
+                    let workspace = {
+                        let w = form.workspace.trim().to_string();
+                        if w.is_empty() {
+                            dirs::home_dir()
+                                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                                .to_string_lossy()
+                                .to_string()
+                        } else {
+                            w
+                        }
+                    };
 
                     let ts = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -254,6 +383,10 @@ impl App {
                     let ws      = workspace;
                     let nm      = name;
                     let ts_i64  = ts as i64;
+                    // Use the authoritative size so the new session matches any
+                    // resize that happened before the spawn confirmed.
+                    let t_cols  = state.terminal_cols;
+                    let t_rows  = state.terminal_rows;
 
                     return Task::future(async move {
                         use athene_core::{pty, tmux, Event as CoreEvent, Session, SessionStatus};
@@ -288,7 +421,7 @@ impl App {
                         };
                         let _ = engine.store.upsert_session(&updated);
 
-                        if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &tmux_id).await {
+                        if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &tmux_id, t_cols, t_rows).await {
                             tracing::error!("pty setup failed for {sid}: {e}");
                         }
 
@@ -306,15 +439,83 @@ impl App {
                 Task::none()
             }
 
-            Message::TerminateSession(id) => {
+            Message::RemoveOrchestrator(id) => {
+                // Navigate away if we're viewing this orchestrator.
+                if matches!(&state.view, View::SessionDetail { session_id, .. } if session_id == &id)
+                    || matches!(&state.view, View::FleetBoard { scope: Some(s) } if s == &id)
+                {
+                    state.view = View::FleetBoard { scope: None };
+                }
+                // Remove from in-memory state immediately.
+                state.orchestrators.retain(|o| o.id != id);
+                state.sessions.retain(|_, s| s.orchestrator_id.as_deref() != Some(id.as_str()));
+                if state.sidebar.selected_orchestrator.as_deref() == Some(id.as_str()) {
+                    state.sidebar.selected_orchestrator = None;
+                }
                 let engine = state.engine.clone();
                 Task::future(async move {
-                    if let Err(e) = engine.terminate_session(&id).await {
-                        tracing::error!("terminate {id}: {e}");
+                    if let Err(e) = engine.remove_orchestrator(&id).await {
+                        tracing::error!("remove orchestrator {id}: {e}");
                     }
                     Message::Noop
                 })
             }
+
+            Message::RawKey { key, modifiers, text } => {
+                if let View::SessionDetail {
+                    session_id,
+                    panel: crate::components::session_detail::DetailPanel::Terminal,
+                } = &state.view {
+                    let app_cursor = state.terminals.get(session_id)
+                        .map(|t| t.term.mode().contains(
+                            alacritty_terminal::term::TermMode::APP_CURSOR
+                        ))
+                        .unwrap_or(false);
+                    let Some(bytes) = key_to_terminal_bytes(&key, modifiers, text.as_deref(), app_cursor)
+                        else { return Task::none(); };
+                    let session_id = session_id.clone();
+                    let engine = state.engine.clone();
+                    return Task::future(async move {
+                        if let Some(sender) = engine.get_pty_writer(&session_id).await {
+                            let _ = sender.send(bytes);
+                        }
+                        Message::Noop
+                    });
+                }
+                Task::none()
+            }
+
+            Message::WindowResized(size) => {
+                let font_size = 13.0f32;
+                let cell_w    = font_size * 0.6;
+                let cell_h    = font_size * 1.4;
+                let sidebar_w = 220.0f32;
+                let header_h  = 80.0f32;
+                let cols = ((size.width  - sidebar_w).max(200.0) / cell_w) as u16;
+                let rows = ((size.height - header_h ).max(100.0) / cell_h) as u16;
+
+                // Keep the authoritative terminal size up to date so new sessions
+                // spawned after this resize use the correct dimensions.
+                state.terminal_cols = cols;
+                state.terminal_rows = rows;
+
+                let session_ids: Vec<SessionId> = state.terminals.keys().cloned().collect();
+                for sid in &session_ids {
+                    if let Some(term) = state.terminals.get_mut(sid) {
+                        term.resize(cols, rows);
+                    }
+                }
+                if session_ids.is_empty() {
+                    return Task::none();
+                }
+                Task::future(async move {
+                    for sid in session_ids {
+                        let _ = athene_core::tmux::resize_window(&sid, cols, rows).await;
+                    }
+                    Message::Noop
+                })
+            }
+
 
             Message::Noop => Task::none(),
         }
@@ -326,6 +527,11 @@ impl App {
                 if !state.orchestrators.iter().any(|o| o.id == orch.id) {
                     state.orchestrators.push(orch);
                 }
+            }
+
+            Event::OrchestratorRemoved(id) => {
+                state.orchestrators.retain(|o| o.id != id);
+                state.sessions.retain(|_, s| s.orchestrator_id.as_deref() != Some(id.as_str()));
             }
 
             Event::SessionSpawned(session) => {
@@ -344,9 +550,12 @@ impl App {
             }
 
             Event::TerminalOutput { session_id, bytes } => {
-                if let Some(term) = state.terminals.get_mut(&session_id) {
-                    term.process(&bytes);
-                }
+                let term = state.terminals
+                    .entry(session_id)
+                    .or_insert_with(|| crate::components::terminal::TerminalState::new(
+                        state.terminal_cols, state.terminal_rows,
+                    ));
+                term.process(&bytes);
             }
 
             Event::CiUpdated { pr_id, status } => {
@@ -444,7 +653,7 @@ impl App {
     /// Subscription that drives `Message::EngineEvent` from the engine broadcast channel.
     pub fn subscription(state: &Self) -> Subscription<Message> {
         let mut rx: broadcast::Receiver<Event> = state.engine.subscribe();
-        Subscription::run_with_id(
+        let engine_sub = Subscription::run_with_id(
             "engine-events",
             async_stream::stream! {
                 loop {
@@ -455,7 +664,14 @@ impl App {
                     }
                 }
             },
-        )
+        );
+
+        // Global keyboard subscription for the active terminal.
+        // listen_with takes a fn pointer (no captures), so we emit RawKey / WindowResized
+        // for all Ignored key events and route to the active session in the handler.
+        let keyboard_sub = iced::event::listen_with(global_event_handler);
+
+        Subscription::batch([engine_sub, keyboard_sub])
     }
 
     /// Theme accessor for the iced `.theme()` builder.
@@ -503,6 +719,8 @@ mod tests {
             view:           View::FleetBoard { scope: None },
             terminals:      HashMap::new(),
             spawn_modal:    None,
+            terminal_cols:  140,
+            terminal_rows:  50,
         }
     }
 
@@ -554,8 +772,6 @@ mod tests {
         assert!(m.spawn_modal.is_some());
 
         let (next, _) = m.update(Message::SpawnFormName("my-feature".into()));
-        m = next;
-        let (next, _) = m.update(Message::SpawnFormWorkspace("/tmp".into()));
         m = next;
         let (next, _) = m.update(Message::SpawnFormConfirm);
         m = next;

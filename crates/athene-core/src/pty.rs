@@ -20,10 +20,19 @@ fn fifo_path(session_id: &str) -> String {
 /// 5. Opens the pane's TTY device for writing.
 /// 6. Spawns a task that forwards bytes from the mpsc input channel to the TTY.
 /// 7. Registers the input sender with the engine so the WebSocket terminal can use it.
+/// Wire up PTY streaming for an already-running tmux session.
+///
+/// `cols` and `rows` must match the caller's `TerminalState` dimensions.
+/// The tmux session is resized to these dimensions before `capture_pane` so
+/// the captured escape sequences reference the same column positions as the
+/// TerminalState grid — mismatches cause text to appear at wrong horizontal
+/// offsets.
 pub async fn start_streaming(
     engine:     Arc<Engine>,
     session_id: SessionId,
     tmux_id:    &str,
+    cols:       u16,
+    rows:       u16,
 ) -> Result<()> {
     let path = fifo_path(&session_id);
 
@@ -49,6 +58,20 @@ pub async fn start_streaming(
 
     // Tell tmux to stream pane output into the FIFO.
     tmux::pipe_pane(tmux_id, &path).await?;
+
+    // Resize tmux to the target dimensions BEFORE capture_pane.
+    // capture_pane -e emits absolute cursor positions for the current tmux
+    // width; if that differs from our TerminalState's cols, text renders at
+    // wrong horizontal offsets.  Resizing first also sends SIGWINCH to the
+    // running process (Claude Code), triggering a redraw at the correct size.
+    let _ = tmux::resize_window(tmux_id, cols, rows).await;
+    // Give the process a moment to redraw before capturing the screen.
+    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+    let initial = tmux::capture_pane(tmux_id).await;
+    if !initial.is_empty() {
+        engine.emit(Event::TerminalOutput { session_id: session_id.clone(), bytes: initial });
+    }
 
     // --- Output task: FIFO → Event::TerminalOutput ---
     let engine_out = engine.clone();
@@ -95,32 +118,34 @@ pub async fn start_streaming(
         tracing::info!("PTY stream ended for {sid_out}");
     });
 
-    // --- Input task: mpsc channel → TTY write ---
-    let tty_path = tmux::get_pane_tty(tmux_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no TTY found for tmux session {tmux_id}"))?;
-
+    // --- Input task: mpsc channel → tmux paste-buffer (master PTY path) ---
+    // Writing to the slave TTY sends data as application OUTPUT, not as INPUT.
+    // To send INPUT to the process running in the pane we must go through
+    // tmux's master PTY fd, which we can't open directly.  `paste-buffer`
+    // is the supported tmux mechanism: it writes bytes to the master fd
+    // exactly as if the user typed them.  Two tmux commands are issued in one
+    // invocation via `\;` to keep subprocess overhead to a single fork.
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     engine.register_pty_writer(session_id.clone(), input_tx).await;
 
+    let tmux_id_input = tmux_id.to_string();
     tokio::spawn(async move {
+        let mut counter = 0u64;
         while let Some(bytes) = input_rx.recv().await {
-            let tty = tty_path.clone();
-            // Open fresh each write: TTY file is tiny, handles are cheap,
-            // and keeping one open risks SIGPIPE if the pane restarts.
-            tokio::task::spawn_blocking(move || {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_NOCTTY)
-                    .open(&tty)
-                {
-                    let _ = f.write_all(&bytes);
-                }
-            })
-            .await
-            .ok();
+            let buf  = format!("ath-in-{}-{counter}", &tmux_id_input);
+            let tmp  = format!("/tmp/ath-in-{}-{counter}.tmp", &tmux_id_input);
+            counter += 1;
+
+            if std::fs::write(&tmp, &bytes).is_err() { continue; }
+
+            let _ = tokio::process::Command::new("tmux")
+                .args(["load-buffer", "-b", &buf, &tmp, ";",
+                       "paste-buffer", "-b", &buf, "-t", &tmux_id_input, "-d"])
+                .kill_on_drop(true)
+                .output()
+                .await;
+
+            let _ = std::fs::remove_file(&tmp);
         }
     });
 
@@ -159,6 +184,30 @@ mod tests {
         Engine::new(store)
     }
 
+    async fn collect_output(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::events::Event>,
+        session_id: &str,
+        timeout_ms: u64,
+    ) -> Vec<u8> {
+        let sid = session_id.to_string();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let mut all = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() { break; }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(crate::events::Event::TerminalOutput { session_id, bytes }))
+                    if session_id == sid =>
+                {
+                    all.extend_from_slice(&bytes);
+                }
+                Ok(_) => {}
+                Err(_) => break, // deadline reached
+            }
+        }
+        all
+    }
+
     #[tokio::test]
     async fn streaming_round_trip() {
         if !tmux_available() { return; }
@@ -168,34 +217,46 @@ mod tests {
         let mut rx = engine.subscribe();
 
         tmux::create_session(&id, "/tmp", "bash", &[]).await.unwrap();
-        // Give bash a moment to start before piping.
         sleep(Duration::from_millis(300)).await;
-        start_streaming(engine.clone(), id.clone(), &id).await.unwrap();
-
-        // Send a command through the PTY writer.
+        start_streaming(engine.clone(), id.clone(), &id, 80, 24).await.unwrap();
         sleep(Duration::from_millis(200)).await;
+
         if let Some(w) = engine.get_pty_writer(&id).await {
-            let _ = w.send(b"echo athene-test\n".to_vec());
+            let _ = w.send(b"echo athene-test\r".to_vec());
         }
 
-        // Wait up to 3 s for TerminalOutput containing "athene-test".
-        let found = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if let Ok(crate::events::Event::TerminalOutput { session_id, bytes }) =
-                    rx.recv().await
-                {
-                    if session_id == id
-                        && bytes.windows(11).any(|w| w == b"athene-test")
-                    {
-                        return true;
-                    }
-                }
-            }
-        })
-        .await
-        .unwrap_or(false);
-
+        let out = collect_output(&mut rx, &id, 3000).await;
         tmux::kill_session(&id).await.unwrap();
-        assert!(found, "never received 'athene-test' in TerminalOutput");
+        assert!(out.windows(11).any(|w| w == b"athene-test"), "output: {:?}", String::from_utf8_lossy(&out));
+    }
+
+    /// Verifies that input sent via the PTY writer reaches the running process
+    /// and causes visible output — specifically testing the paste-buffer path
+    /// used for TUI interaction (Enter, arrow keys, selection menus).
+    #[tokio::test]
+    async fn tui_input_interaction() {
+        if !tmux_available() { return; }
+
+        let id     = unique_id();
+        let engine = test_engine();
+        let mut rx = engine.subscribe();
+
+        // Run a simple bash select menu to simulate TUI interaction.
+        // `select` displays numbered options and reads a number from stdin.
+        let cmd = "bash -c 'select x in yes no; do echo \"chose:$x\"; break; done'";
+        tmux::create_session(&id, "/tmp", cmd, &[]).await.unwrap();
+        sleep(Duration::from_millis(400)).await;
+        start_streaming(engine.clone(), id.clone(), &id, 80, 24).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        // Send "1\r" to select option 1 ("yes")
+        if let Some(w) = engine.get_pty_writer(&id).await {
+            let _ = w.send(b"1\r".to_vec());
+        }
+
+        let out = collect_output(&mut rx, &id, 4000).await;
+        tmux::kill_session(&id).await.unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("chose:yes"), "TUI selection via paste-buffer failed. output: {text}");
     }
 }
