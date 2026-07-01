@@ -1,6 +1,6 @@
 use iced::{
-    widget::{column, container, row, scrollable, text, Space},
-    Background, Border, Element, Length,
+    widget::{column, container, scrollable, text, Space},
+    Background, Element, Length,
 };
 
 use crate::{app::{App, Message}, theme::ColorScheme};
