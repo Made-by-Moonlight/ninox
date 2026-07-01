@@ -100,18 +100,6 @@ impl Poller {
 
             let pr_id: PrId = pr_number as i64;
 
-            // Upsert PR record
-            let pr = PR {
-                id:         pr_id,
-                number:     pr_number,
-                title:      pr_status.title.clone(),
-                url:        format!("https://github.com/{owner}/{repo}/pull/{pr_number}"),
-                body:       String::new(),
-                session_id: session.id.clone(),
-            };
-            let _ = self.engine.store.upsert_pr(&pr);
-            self.engine.emit(Event::PrOpened { session_id: session.id.clone(), pr });
-
             // -- Merge detection — handle before CI (no point polling CI on merged PR) --
             if pr_status.merged && !matches!(session.status, SessionStatus::Done) {
                 self.engine.emit(Event::Notification(Notification {
@@ -132,8 +120,22 @@ impl Poller {
                 continue; // skip further enrichment for this session
             }
 
+            // Upsert PR record — only when not merged (merged sessions stay Done after cleanup)
+            {
+                let pr = PR {
+                    id:         pr_id,
+                    number:     pr_number,
+                    title:      pr_status.title.clone(),
+                    url:        format!("https://github.com/{owner}/{repo}/pull/{pr_number}"),
+                    body:       String::new(),
+                    session_id: session.id.clone(),
+                };
+                let _ = self.engine.store.upsert_pr(&pr);
+                self.engine.emit(Event::PrOpened { session_id: session.id.clone(), pr });
+            }
+
             // -- CI checks --
-            let checks = match gh.get_ci_checks(&owner, &repo, pr_number).await {
+            let checks = match gh.get_ci_checks(&owner, &repo, &pr_status.head_sha).await {
                 Ok(c)  => c,
                 Err(e) => { tracing::warn!("github ci checks: {e}"); vec![] }
             };
@@ -321,7 +323,7 @@ mod tests {
     fn derive_status_merged_becomes_done() {
         let pr = crate::github::PrStatus {
             merged: true, state: "closed".into(), mergeable: None,
-            title: "t".into(), number: 1,
+            title: "t".into(), number: 1, head_sha: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 0, failing: 0, passing: 0, pending: 0 };
         let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, false);
@@ -332,7 +334,7 @@ mod tests {
     fn derive_status_ci_failure_overrides_open() {
         let pr = crate::github::PrStatus {
             merged: false, state: "open".into(), mergeable: Some(true),
-            title: "t".into(), number: 1,
+            title: "t".into(), number: 1, head_sha: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 3, failing: 1, passing: 2, pending: 0 };
         let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, false);
@@ -343,7 +345,7 @@ mod tests {
     fn derive_status_all_green_becomes_mergeable() {
         let pr = crate::github::PrStatus {
             merged: false, state: "open".into(), mergeable: Some(true),
-            title: "t".into(), number: 1,
+            title: "t".into(), number: 1, head_sha: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 3, failing: 0, passing: 3, pending: 0 };
         let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, false);
@@ -354,7 +356,7 @@ mod tests {
     fn derive_status_preserves_done() {
         let pr = crate::github::PrStatus {
             merged: false, state: "open".into(), mergeable: Some(true),
-            title: "t".into(), number: 1,
+            title: "t".into(), number: 1, head_sha: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 0, failing: 0, passing: 0, pending: 0 };
         let s  = derive_session_status(&SessionStatus::Done, &pr, &ci, false);
@@ -365,7 +367,7 @@ mod tests {
     fn derive_status_preserves_terminated() {
         let pr = crate::github::PrStatus {
             merged: true, state: "closed".into(), mergeable: None,   // merged=true!
-            title: "t".into(), number: 1,
+            title: "t".into(), number: 1, head_sha: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 0, failing: 0, passing: 0, pending: 0 };
         let s  = derive_session_status(&SessionStatus::Terminated, &pr, &ci, false);
@@ -376,7 +378,7 @@ mod tests {
     fn derive_status_changes_requested_becomes_review_pending() {
         let pr = crate::github::PrStatus {
             merged: false, state: "open".into(), mergeable: Some(true),
-            title: "t".into(), number: 1,
+            title: "t".into(), number: 1, head_sha: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 3, failing: 0, passing: 3, pending: 0 };
         let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, true);

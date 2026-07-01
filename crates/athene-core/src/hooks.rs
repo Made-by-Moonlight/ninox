@@ -68,15 +68,20 @@ if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
                     '. + {"agentReportedPrUrl": $url, "agentReportedPrNumber": $num, "agentReportedState": "pr_created"}' \
                     > "$_tmp" && mv "$_tmp" "$_meta_file"
             else
-                # Fallback: node (likely available alongside gh)
-                node -e "
+                # Fallback: node (likely available alongside gh).
+                # PR URL and number are passed via env vars, not interpolated into the
+                # script string, to avoid shell injection from external GitHub output.
+                ATHENE_PR_URL="$_pr_url" ATHENE_PR_NUM="$_pr_num" node -e "
                     const fs = require('fs');
-                    const m = JSON.parse(fs.existsSync('$_meta_file') ? fs.readFileSync('$_meta_file','utf8') : '{}');
-                    m.agentReportedPrUrl = '$_pr_url';
-                    m.agentReportedPrNumber = '$_pr_num';
+                    const url = process.env.ATHENE_PR_URL;
+                    const num = process.env.ATHENE_PR_NUM;
+                    const f = '${_meta_file}';
+                    const m = JSON.parse(fs.existsSync(f) ? fs.readFileSync(f,'utf8') : '{}');
+                    m.agentReportedPrUrl = url;
+                    m.agentReportedPrNumber = num;
                     m.agentReportedState = 'pr_created';
-                    fs.writeFileSync('${_meta_file}.tmp.$$', JSON.stringify(m,null,2));
-                    fs.renameSync('${_meta_file}.tmp.$$', '$_meta_file');
+                    fs.writeFileSync(f + '.tmp.\$\$', JSON.stringify(m,null,2));
+                    fs.renameSync(f + '.tmp.\$\$', f);
                 " 2>/dev/null || true
             fi
         fi

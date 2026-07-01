@@ -13,6 +13,7 @@ pub struct PrStatus {
     pub mergeable: Option<bool>,
     pub title:     String,
     pub number:    u64,
+    pub head_sha:  String,
 }
 
 #[derive(Debug, Clone)]
@@ -37,12 +38,18 @@ pub struct ReviewThread {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
+struct GhPrHead {
+    sha: String,
+}
+
+#[derive(Deserialize)]
 struct GhPr {
     number:    u64,
     title:     String,
     state:     String,
     merged:    bool,
     mergeable: Option<bool>,
+    head:      GhPrHead,
 }
 
 #[derive(Deserialize)]
@@ -134,6 +141,7 @@ impl GitHubClient {
             mergeable: gh.mergeable,
             title:     gh.title,
             number:    gh.number,
+            head_sha:  gh.head.sha,
         })
     }
 
@@ -141,29 +149,10 @@ impl GitHubClient {
         &self,
         owner: &str,
         repo: &str,
-        pr_number: u64,
+        head_sha: &str,
     ) -> Result<Vec<CheckRun>> {
-        // Fetch the commit SHA from the PR first
-        let pr_url = format!(
-            "https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
-        );
-        #[derive(Deserialize)]
-        struct PrHead { sha: String }
-        #[derive(Deserialize)]
-        struct PrForSha { head: PrHead }
-        let pr: PrForSha = self
-            .http
-            .get(&pr_url)
-            .header(header::AUTHORIZATION, self.auth())
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let sha = pr.head.sha;
-
         let url = format!(
-            "https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page=100"
+            "https://api.github.com/repos/{owner}/{repo}/commits/{head_sha}/check-runs?per_page=100"
         );
         let resp: GhCheckRunsResponse = self
             .http
