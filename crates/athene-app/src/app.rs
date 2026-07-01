@@ -606,17 +606,68 @@ impl App {
             }
 
             Message::PollSessions => {
-                let sessions = state.engine.store.list_sessions().unwrap_or_default();
-                let orchestrators = state.engine.store.list_orchestrators().unwrap_or_default();
-                for o in orchestrators {
+                let db_sessions   = state.engine.store.list_sessions().unwrap_or_default();
+                let db_orchestrators = state.engine.store.list_orchestrators().unwrap_or_default();
+
+                for o in db_orchestrators {
                     if !state.orchestrators.iter().any(|existing| existing.id == o.id) {
                         state.orchestrators.push(o);
                     }
                 }
-                for session in sessions {
-                    state.sessions.entry(session.id.clone()).or_insert(session);
+
+                // Collect IDs of orchestrators for orphan detection.
+                let orch_ids: std::collections::HashSet<&str> =
+                    state.orchestrators.iter().map(|o| o.id.as_str()).collect();
+
+                // Remove standalone terminated/done sessions from state and DB —
+                // these are orphaned leftovers that no longer need to be visible.
+                let to_clean: Vec<SessionId> = state.sessions.values()
+                    .filter(|s| {
+                        matches!(s.status, SessionStatus::Done | SessionStatus::Terminated)
+                        && s.orchestrator_id.is_none()
+                        && !orch_ids.contains(s.id.as_str())
+                    })
+                    .map(|s| s.id.clone())
+                    .collect();
+                for id in &to_clean {
+                    state.sessions.remove(id);
+                    state.terminals.remove(id);
                 }
-                Task::none()
+                let engine_clean = state.engine.clone();
+                let to_clean_clone = to_clean.clone();
+
+                // Add genuinely new active sessions (spawned by athene spawn).
+                let engine_pty = state.engine.clone();
+                let cols = state.terminal_cols;
+                let rows = state.terminal_rows;
+                let mut new_ids: Vec<SessionId> = Vec::new();
+                for session in db_sessions {
+                    if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
+                        continue;
+                    }
+                    if !state.sessions.contains_key(&session.id) {
+                        new_ids.push(session.id.clone());
+                        state.sessions.insert(session.id.clone(), session);
+                    }
+                }
+
+                Task::future(async move {
+                    // Delete cleaned-up orphans from DB.
+                    for id in to_clean_clone {
+                        let _ = engine_clean.store.delete_session(&id);
+                    }
+                    // Start PTY streaming for newly discovered sessions.
+                    for id in new_ids {
+                        if athene_core::tmux::has_session(&id).await {
+                            if let Err(e) = athene_core::pty::start_streaming(
+                                engine_pty.clone(), id.clone(), &id, cols, rows,
+                            ).await {
+                                tracing::warn!("poll: pty connect for {id}: {e}");
+                            }
+                        }
+                    }
+                    Message::Noop
+                })
             }
 
             Message::Noop => Task::none(),
