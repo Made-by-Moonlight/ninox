@@ -1311,4 +1311,27 @@ mod tests {
         let (m2, _) = m.update(Message::DismissAllNotifications);
         assert!(m2.notifications.is_empty());
     }
+
+    #[test]
+    fn attention_count_detects_ci_failures() {
+        use crate::components::fleet_board::attention_count;
+        let e = test_engine();
+        let mut m = base(e);
+        for (id, status) in [
+            ("s1", SessionStatus::CiFailed),
+            ("s2", SessionStatus::ReviewPending),
+            ("s3", SessionStatus::Working),
+        ] {
+            let s = Session {
+                id: id.into(), orchestrator_id: None, name: id.into(),
+                repo: "r".into(), status,
+                agent_type: "c".into(), cost_usd: 0.0,
+                started_at: 0, pr_number: None, pr_id: None,
+                workspace_path: None, pid: None,
+            };
+            let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+            m = next;
+        }
+        assert_eq!(attention_count(&m), 2); // ci_failed + review_pending
+    }
 }
