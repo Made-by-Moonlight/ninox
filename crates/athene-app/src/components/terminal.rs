@@ -6,6 +6,13 @@ use iced::{Color as IcedColor, Rectangle, Size, Theme};
 
 use crate::app::Message;
 
+const NERD_FONT: iced::Font = iced::Font {
+    family: iced::font::Family::Name("Symbols Nerd Font Mono"),
+    weight: iced::font::Weight::Normal,
+    stretch: iced::font::Stretch::Normal,
+    style: iced::font::Style::Normal,
+};
+
 // ---------------------------------------------------------------------------
 // EventProxy
 // ---------------------------------------------------------------------------
@@ -362,18 +369,24 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                             ansi_to_iced(cell.fg, colors, term_bg, term_fg)
                         };
 
+                        let cp = ch as u32;
+                        let font = if (0xE000..=0xF8FF).contains(&cp) {
+                            NERD_FONT
+                        } else {
+                            iced::Font::MONOSPACE
+                        };
                         frame.fill_text(iced::widget::canvas::Text {
                             content: ch.to_string(),
                             position: iced::Point::new(x, y),
                             color: fg,
                             size: iced::Pixels(self.font_size),
-                            font: iced::Font::MONOSPACE,
+                            font,
                             horizontal_alignment: iced::alignment::Horizontal::Left,
                             vertical_alignment: iced::alignment::Vertical::Top,
                             line_height: iced::widget::text::LineHeight::Relative(
                                 cell_h / self.font_size,
                             ),
-                            shaping: iced::widget::text::Shaping::Basic,
+                            shaping: iced::widget::text::Shaping::Advanced,
                         });
                     }
                 }

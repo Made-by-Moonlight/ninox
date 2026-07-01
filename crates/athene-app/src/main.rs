@@ -261,10 +261,14 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
     #[cfg(not(target_os = "macos"))]
     let window_settings = iced::window::Settings::default();
 
+    const SYMBOLS_NERD_FONT_MONO: &[u8] =
+        include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
+
     iced::application("Athene", app::App::iced_update, app::App::iced_view)
         .subscription(app::App::subscription)
         .theme(app::App::theme)
         .window(window_settings)
+        .font(SYMBOLS_NERD_FONT_MONO)
         .run_with(move || app::App::new(engine, orchestrator_root, orchestrator_agent))?;
 
     token.cancel();
