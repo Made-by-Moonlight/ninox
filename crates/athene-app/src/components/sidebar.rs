@@ -6,6 +6,7 @@ use iced::{
 
 use crate::{
     app::{App, Message, View},
+    components::notification_panel::notification_panel,
     theme::ColorScheme,
 };
 
@@ -52,10 +53,44 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     let header_padding = Padding { top: 12.0, right: 12.0, bottom: 12.0, left: 12.0 };
 
     // ── Header ────────────────────────────────────────────────────────────────
+    let unread = app.notifications.len();
+    let bell_label = if unread > 0 {
+        format!("🔔 {}", unread.min(99))
+    } else {
+        "🔔".to_string()
+    };
+
+    let pr_count = app.prs.len();
+    let prs_label = if pr_count > 0 {
+        format!("PRs ({})", pr_count)
+    } else {
+        "PRs".to_string()
+    };
+
     let header = container(
         row![
             text("⬡ Athene").size(13).color(s.text_primary),
             Space::new(Length::Fill, 0),
+            button(text(bell_label.clone()).size(11).color(
+                if unread > 0 { s.accent } else { s.text_muted }
+            ))
+            .on_press(Message::ToggleNotifications)
+            .style(move |_theme, _status| button::Style {
+                background: None,
+                text_color: if unread > 0 { s.accent } else { s.text_muted },
+                border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 4.0.into() },
+                ..Default::default()
+            })
+            .padding([2, 4]),
+            button(text(prs_label.clone()).size(11).color(s.text_secondary))
+                .on_press(Message::NavigatePrList)
+                .style(move |_theme, _status| button::Style {
+                    background: None,
+                    text_color: s.text_secondary,
+                    border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
+                    ..Default::default()
+                })
+                .padding([2, 8]),
             button(text("+ Spawn").size(11).color(s.accent))
                 .on_press(Message::SpawnSession)
                 .style(move |_theme, _status| button::Style {
@@ -162,7 +197,15 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     // ── Footer: theme popout ──────────────────────────────────────────────────
     let footer = theme_footer(app, s);
 
-    container(column![header, list, footer].spacing(0))
+    // ── Notification panel (conditional overlay between header and list) ──────
+    let mut col_items: Vec<Element<Message>> = vec![header.into()];
+    if app.sidebar.show_notifications {
+        col_items.push(notification_panel(app));
+    }
+    col_items.push(list.into());
+    col_items.push(footer.into());
+
+    container(column(col_items).spacing(0))
         .width(Length::Fixed(app.sidebar_width))
         .height(Length::Fill)
         .style(move |_theme| container::Style {
@@ -357,3 +400,4 @@ fn theme_footer<'a>(app: &'a App, s: &'a ColorScheme) -> Element<'a, Message> {
         })
         .into()
 }
+

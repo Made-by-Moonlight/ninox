@@ -135,6 +135,10 @@ pub struct AppConfig {
     /// Agent harness and model for worker sessions spawned by `athene spawn`.
     #[serde(default)]
     pub worker: AgentConfig,
+    /// GitHub personal access token. If absent, falls back to GITHUB_TOKEN env var.
+    /// Requires `repo` scope for private repos, `public_repo` for public.
+    #[serde(default)]
+    pub github_token: Option<String>,
     /// Knowledge base (brain) configuration.
     #[serde(default)]
     pub brain: BrainConfig,
@@ -149,6 +153,7 @@ impl Default for AppConfig {
             orchestrator_root: None,
             orchestrator:     AgentConfig::default(),
             worker:           AgentConfig::default(),
+            github_token:     None,
             brain:            BrainConfig::default(),
         }
     }
@@ -179,6 +184,24 @@ impl AppConfig {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("athene")
             .join("config.toml")
+    }
+
+    /// Directory for Athene-managed shell wrappers prepended to agent PATH.
+    /// Default: `~/.config/athene/bin/`
+    pub fn athene_bin_dir() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("athene")
+            .join("bin")
+    }
+
+    /// Directory where per-session metadata JSON files are written by wrapper hooks.
+    /// Default: `~/.config/athene/sessions/`
+    pub fn sessions_dir() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("athene")
+            .join("sessions")
     }
 
     fn path() -> PathBuf { Self::config_path() }

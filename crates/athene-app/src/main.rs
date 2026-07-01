@@ -5,6 +5,7 @@ mod theme;
 use athene_core::{
     config::{AgentConfig, AppConfig},
     events::Engine,
+    github::resolve_token,
     lifecycle::poller::Poller,
     store::Store,
     tmux,
@@ -78,6 +79,10 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
+    if let Err(e) = athene_core::hooks::install_wrappers() {
+        tracing::warn!("failed to install wrapper hooks: {e}");
+    }
+
     let db_path = args.db.unwrap_or_else(default_db_path);
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let store = Arc::new(Store::open(&db_path)?);
@@ -131,7 +136,23 @@ async fn run_spawn(
     println!("spawned {}", session.id);
 
     let cmd = agent.worker_cmd(&prompt);
-    tmux::create_session(&id, &workspace, &cmd, &[]).await?;
+
+    let sessions_dir = athene_core::config::AppConfig::sessions_dir();
+    std::fs::create_dir_all(&sessions_dir).ok();
+    let sessions_dir_str = sessions_dir.to_string_lossy().to_string();
+
+    let athene_bin = athene_core::config::AppConfig::athene_bin_dir();
+    let path_with_wrappers = format!(
+        "{}:{}",
+        athene_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    tmux::create_session(&id, &workspace, &cmd, &[
+        ("ATHENE_SESSION",  &id),
+        ("ATHENE_DATA_DIR", &sessions_dir_str),
+        ("PATH",            &path_with_wrappers),
+    ]).await?;
 
     Ok(())
 }
@@ -185,7 +206,10 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
     }
 
     let brain = Arc::new(BrainIndex::open(&brain_path)?);
-    let engine = Engine::new(store);
+    let engine = match resolve_token(config.github_token.clone()) {
+        Some(token) => Engine::new_with_github(Arc::clone(&store), token),
+        None        => Engine::new(Arc::clone(&store)),
+    };
     let token = CancellationToken::new();
 
     let poller = Poller::new(engine.clone());

@@ -23,12 +23,19 @@ const MAX_NOTIFICATIONS: usize = 50;
 pub struct SidebarState {
     pub selected_orchestrator: Option<OrchestratorId>,
     pub show_theme_popout:     bool,
+    pub show_notifications:    bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FleetFilter {
+    pub query: String,
 }
 
 #[derive(Debug, Clone)]
 pub enum View {
     FleetBoard { scope: Option<OrchestratorId> },
     SessionDetail { session_id: SessionId, panel: DetailPanel },
+    PrList,
 }
 
 impl Default for View {
@@ -66,6 +73,7 @@ pub struct App {
     pub sidebar_width:   f32,
     pub info_width:      f32,
     pub drag:            Option<DragTarget>,
+    pub fleet_filter:    FleetFilter,
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +111,13 @@ pub enum Message {
     MouseReleased,
     CopyToClipboard(String),
     PollSessions,
+    NavigatePrList,
+    ToggleNotifications,
+    DismissNotification(String),
+    DismissAllNotifications,
+    NavigateNotification(SessionId),
+    FleetFilterQuery(String),
+    ClearFleetFilter,
     Noop,
 }
 
@@ -251,6 +266,7 @@ impl App {
             sidebar_width:  220.0,
             info_width:     300.0,
             drag:           None,
+            fleet_filter:   FleetFilter::default(),
         };
 
         // Asynchronously mark dead sessions as Terminated.
@@ -701,6 +717,44 @@ impl App {
                 })
             }
 
+            Message::NavigatePrList => {
+                state.view = View::PrList;
+                Task::none()
+            }
+
+            Message::ToggleNotifications => {
+                state.sidebar.show_notifications = !state.sidebar.show_notifications;
+                Task::none()
+            }
+
+            Message::DismissNotification(id) => {
+                state.notifications.retain(|n| n.id != id);
+                Task::none()
+            }
+
+            Message::DismissAllNotifications => {
+                state.notifications.clear();
+                Task::none()
+            }
+
+            Message::NavigateNotification(session_id) => {
+                state.sidebar.show_notifications = false;
+                state.view = View::SessionDetail {
+                    session_id,
+                    panel: crate::components::session_detail::DetailPanel::Terminal,
+                };
+                Task::none()
+            }
+
+            Message::FleetFilterQuery(q) => {
+                state.fleet_filter.query = q;
+                Task::none()
+            }
+            Message::ClearFleetFilter => {
+                state.fleet_filter = FleetFilter::default();
+                Task::none()
+            }
+
             Message::Noop => Task::none(),
         }
     }
@@ -800,6 +854,7 @@ impl App {
         use iced::widget::{container, row};
         use crate::components::{
             fleet_board::fleet_board,
+            pr_list::pr_list,
             session_detail::session_detail,
             sidebar::sidebar,
             spawn_modal::spawn_modal,
@@ -810,6 +865,7 @@ impl App {
         let main: Element<Message> = match &state.view {
             View::FleetBoard { scope } => fleet_board(state, scope.as_ref()),
             View::SessionDetail { session_id, panel } => session_detail(state, session_id, panel),
+            View::PrList => pr_list(state),
         };
 
         let base: Element<Message> = container(
@@ -1081,6 +1137,11 @@ mod tests {
             spawn_modal:    None,
             terminal_cols:  140,
             terminal_rows:  50,
+            window_width:   0.0,
+            sidebar_width:  0.0,
+            info_width:     0.0,
+            drag:           None,
+            fleet_filter:   FleetFilter::default(),
         }
     }
 
@@ -1179,5 +1240,139 @@ mod tests {
         assert_eq!(app.orchestrators.len(), 1);
         assert_eq!(app.sessions.len(), 1);
         assert!(app.sessions.contains_key("s1"));
+    }
+
+    #[test]
+    fn terminated_session_visible_in_board() {
+        use crate::components::fleet_board::board_sessions;
+        let e = test_engine();
+        let mut m = base(e);
+        let s = Session {
+            id: "t1".into(), orchestrator_id: None, name: "ended".into(),
+            repo: "r".into(), status: SessionStatus::Terminated,
+            agent_type: "c".into(), cost_usd: 0.42,
+            started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None,
+        };
+        let (m2, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        m = m2;
+        // board_sessions(app, status, scope) returns sessions with that status
+        let terminated = board_sessions(&m, &SessionStatus::Terminated, None);
+        assert_eq!(terminated.len(), 1);
+        assert_eq!(terminated[0].id, "t1");
+    }
+
+    #[test]
+    fn navigate_pr_list_sets_view() {
+        let e = test_engine();
+        let m = base(e);
+        let (m2, _) = m.update(Message::NavigatePrList);
+        assert!(matches!(m2.view, View::PrList));
+    }
+
+    #[test]
+    fn toggle_notifications_flips_show_flag() {
+        let e = test_engine();
+        let m = base(e);
+        assert!(!m.sidebar.show_notifications);
+        let (m2, _) = m.update(Message::ToggleNotifications);
+        assert!(m2.sidebar.show_notifications);
+        let (m3, _) = m2.update(Message::ToggleNotifications);
+        assert!(!m3.sidebar.show_notifications);
+    }
+
+    #[test]
+    fn dismiss_notification_removes_by_id() {
+        let e = test_engine();
+        let mut m = base(e);
+        for id in ["n1", "n2", "n3"] {
+            let (next, _) = m.update(Message::EngineEvent(Event::Notification(Notification {
+                id: id.into(), kind: NotificationKind::WorkerDone,
+                title: "t".into(), body: "b".into(), session_id: None,
+            })));
+            m = next;
+        }
+        assert_eq!(m.notifications.len(), 3);
+        let (m2, _) = m.update(Message::DismissNotification("n2".into()));
+        assert_eq!(m2.notifications.len(), 2);
+        assert!(!m2.notifications.iter().any(|n| n.id == "n2"));
+    }
+
+    #[test]
+    fn switch_to_inspector_panel() {
+        use crate::components::session_detail::DetailPanel;
+        let e = test_engine();
+        let mut m = base(e);
+        let s = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 1.23,
+            started_at: 0, pr_number: Some(42), pr_id: None,
+            workspace_path: Some("/tmp/w".into()), pid: Some(1234),
+        };
+        let (mut m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (m2, _) = m.update(Message::NavigateSession("s1".into()));
+        let (m3, _) = m2.update(Message::SwitchDetailPanel(DetailPanel::Inspector));
+        assert!(matches!(&m3.view, View::SessionDetail { panel: DetailPanel::Inspector, .. }));
+    }
+
+    #[test]
+    fn dismiss_all_clears_notifications() {
+        let e = test_engine();
+        let mut m = base(e);
+        for id in ["a", "b"] {
+            let (next, _) = m.update(Message::EngineEvent(Event::Notification(Notification {
+                id: id.into(), kind: NotificationKind::WorkerDone,
+                title: "t".into(), body: "b".into(), session_id: None,
+            })));
+            m = next;
+        }
+        let (m2, _) = m.update(Message::DismissAllNotifications);
+        assert!(m2.notifications.is_empty());
+    }
+
+    #[test]
+    fn attention_count_detects_ci_failures() {
+        use crate::components::fleet_board::attention_count;
+        let e = test_engine();
+        let mut m = base(e);
+        for (id, status) in [
+            ("s1", SessionStatus::CiFailed),
+            ("s2", SessionStatus::ReviewPending),
+            ("s3", SessionStatus::Working),
+        ] {
+            let s = Session {
+                id: id.into(), orchestrator_id: None, name: id.into(),
+                repo: "r".into(), status,
+                agent_type: "c".into(), cost_usd: 0.0,
+                started_at: 0, pr_number: None, pr_id: None,
+                workspace_path: None, pid: None,
+            };
+            let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+            m = next;
+        }
+        assert_eq!(attention_count(&m), 2); // ci_failed + review_pending
+    }
+
+    #[test]
+    fn fleet_filter_matches_session_name() {
+        use crate::components::fleet_board::filtered_sessions;
+        let e = test_engine();
+        let mut m = base(e);
+        for (id, name) in [("s1", "auth-fix"), ("s2", "payment-bug"), ("s3", "auth-refactor")] {
+            let s = Session {
+                id: id.into(), orchestrator_id: None, name: name.into(),
+                repo: "r".into(), status: SessionStatus::Working,
+                agent_type: "c".into(), cost_usd: 0.0,
+                started_at: 0, pr_number: None, pr_id: None,
+                workspace_path: None, pid: None,
+            };
+            let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+            m = next;
+        }
+        let (m2, _) = m.update(Message::FleetFilterQuery("auth".into()));
+        let sessions = filtered_sessions(&m2);
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().all(|s| s.name.contains("auth")));
     }
 }

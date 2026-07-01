@@ -1,4 +1,4 @@
-use crate::{store::Store, types::*};
+use crate::{github::GitHubClient, store::Store, types::*};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{broadcast, Mutex};
 
@@ -23,6 +23,8 @@ pub struct Engine {
     /// Per-session cancellation senders for active FIFO reader tasks.
     /// Sending () to the stored sender stops the running reader immediately.
     stream_cancel: Mutex<HashMap<SessionId, tokio::sync::oneshot::Sender<()>>>,
+    /// Optional GitHub API client. None when no token is configured.
+    pub github: Option<GitHubClient>,
 }
 
 impl Engine {
@@ -33,6 +35,19 @@ impl Engine {
             tx,
             pty_writers:   Mutex::new(HashMap::new()),
             stream_cancel: Mutex::new(HashMap::new()),
+            github:        None,
+        })
+    }
+
+    pub fn new_with_github(store: Arc<Store>, token: String) -> Arc<Self> {
+        let (tx, _) = broadcast::channel(256);
+        let github = GitHubClient::new(token).ok();
+        Arc::new(Self {
+            store,
+            tx,
+            pty_writers:   Mutex::new(HashMap::new()),
+            stream_cancel: Mutex::new(HashMap::new()),
+            github,
         })
     }
 
@@ -99,6 +114,14 @@ impl Engine {
         Ok(())
     }
 
+    /// Send a text message to the agent running in a session's tmux window.
+    /// The message is injected as keyboard input — the agent sees it as typed text.
+    /// Returns Ok(()) if the tmux send succeeded; returns an error if the session
+    /// has no active tmux window or tmux is unavailable.
+    pub async fn send_to_session(&self, session_id: &str, message: &str) -> anyhow::Result<()> {
+        crate::tmux::send_keys(session_id, message).await
+    }
+
     /// Kill the tmux session, mark it Terminated in the DB, and emit SessionUpdated.
     pub async fn terminate_session(&self, session_id: &str) -> anyhow::Result<()> {
         // Best-effort tmux kill (session may already be dead).
@@ -106,6 +129,20 @@ impl Engine {
 
         if let Some(mut session) = self.store.get_session(session_id)? {
             session.status = crate::types::SessionStatus::Terminated;
+            self.store.upsert_session(&session)?;
+            self.emit(Event::SessionUpdated(session));
+        }
+        Ok(())
+    }
+
+    /// Kill the tmux session (best-effort) and mark it Done in the DB.
+    /// Called automatically when a PR is merged. Emits SessionUpdated.
+    pub async fn cleanup_session(&self, session_id: &str) -> anyhow::Result<()> {
+        // Best-effort tmux kill — session may already be dead.
+        let _ = crate::tmux::kill_session(session_id).await;
+
+        if let Some(mut session) = self.store.get_session(session_id)? {
+            session.status = crate::types::SessionStatus::Done;
             self.store.upsert_session(&session)?;
             self.emit(Event::SessionUpdated(session));
         }
@@ -147,6 +184,32 @@ mod tests {
         let evt = rx.recv().await.unwrap();
         if let Event::SessionUpdated(s) = evt {
             assert!(matches!(s.status, crate::types::SessionStatus::Terminated));
+        } else {
+            panic!("expected SessionUpdated");
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_session_sets_done_status() {
+        let store = Arc::new(
+            Store::open(tempdir().unwrap().keep().join("t.db")).unwrap()
+        );
+        let session = crate::types::Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: crate::types::SessionStatus::PrOpen,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: Some(1), pr_id: Some(1),
+            workspace_path: None, pid: None,
+        };
+        store.upsert_session(&session).unwrap();
+        let engine = Engine::new(Arc::clone(&store));
+        let mut rx = engine.subscribe();
+
+        engine.cleanup_session("s1").await.unwrap();
+
+        let evt = rx.recv().await.unwrap();
+        if let Event::SessionUpdated(s) = evt {
+            assert!(matches!(s.status, crate::types::SessionStatus::Done));
         } else {
             panic!("expected SessionUpdated");
         }

@@ -24,6 +24,21 @@ impl Store {
             CREATE TABLE IF NOT EXISTS orchestrators (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS prs (
+                id INTEGER PRIMARY KEY, number INTEGER NOT NULL,
+                title TEXT NOT NULL, url TEXT NOT NULL,
+                body TEXT NOT NULL, session_id TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ci_status (
+                pr_id INTEGER PRIMARY KEY, total INTEGER NOT NULL,
+                passing INTEGER NOT NULL, failing INTEGER NOT NULL,
+                pending INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS review_comments (
+                id INTEGER PRIMARY KEY, pr_id INTEGER NOT NULL,
+                author TEXT NOT NULL, body TEXT NOT NULL,
+                path TEXT, line INTEGER, created_at INTEGER NOT NULL
+            );
         ")?;
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -148,6 +163,39 @@ impl Store {
         conn.execute("DELETE FROM sessions WHERE orchestrator_id = ?1", [id])?;
         conn.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         conn.execute("DELETE FROM orchestrators WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn upsert_pr(&self, pr: &PR) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO prs
+             (id, number, title, url, body, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![pr.id, pr.number, pr.title, pr.url, pr.body, pr.session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_ci_status(&self, ci: &CIStatus) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO ci_status
+             (pr_id, total, passing, failing, pending)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![ci.pr_id, ci.total, ci.passing, ci.failing, ci.pending],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_comment(&self, c: &Comment) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO review_comments
+             (id, pr_id, author, body, path, line, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![c.id, c.pr_id, c.author, c.body, c.path, c.line, c.created_at],
+        )?;
         Ok(())
     }
 

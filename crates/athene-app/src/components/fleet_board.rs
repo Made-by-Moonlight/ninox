@@ -4,6 +4,7 @@ use iced::{
 };
 
 use crate::app::{App, Message};
+use crate::components::filter_bar::filter_bar;
 use athene_core::types::{OrchestratorId, Session, SessionStatus};
 
 fn repo_short(repo: &str) -> &str {
@@ -34,7 +35,34 @@ const COLUMNS: &[Column] = &[
     Column { label: "Review",    status: SessionStatus::ReviewPending },
     Column { label: "Mergeable", status: SessionStatus::Mergeable },
     Column { label: "Done",      status: SessionStatus::Done },
+    Column { label: "Terminated", status: SessionStatus::Terminated },
 ];
+
+pub fn filtered_sessions<'a>(app: &'a App) -> Vec<&'a Session> {
+    let q = app.fleet_filter.query.to_lowercase();
+    app.sessions.values().filter(|s| {
+        q.is_empty()
+            || s.name.to_lowercase().contains(&q)
+            || s.repo.to_lowercase().contains(&q)
+    }).collect()
+}
+
+pub fn board_sessions<'a>(
+    app: &'a App,
+    status: &SessionStatus,
+    scope: Option<&str>,
+) -> Vec<&'a Session> {
+    let q = app.fleet_filter.query.to_lowercase();
+    let mut sessions: Vec<&Session> = app.sessions.values().filter(|s| {
+        &s.status == status
+            && scope.map_or(true, |oid| s.orchestrator_id.as_deref() == Some(oid))
+            && (q.is_empty()
+                || s.name.to_lowercase().contains(&q)
+                || s.repo.to_lowercase().contains(&q))
+    }).collect();
+    sessions.sort_by(|a, b| a.name.cmp(&b.name));
+    sessions
+}
 
 fn session_card<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
     let s = &app.scheme;
@@ -97,6 +125,70 @@ fn kanban_column<'a>(app: &'a App, label: &'static str, cards: Vec<Element<'a, M
         .into()
 }
 
+pub fn attention_count(app: &App) -> usize {
+    app.sessions.values().filter(|s| {
+        matches!(s.status, SessionStatus::CiFailed | SessionStatus::ReviewPending)
+    }).count()
+}
+
+fn attention_banner<'a>(app: &'a App) -> Option<Element<'a, Message>> {
+    let s = &app.scheme;
+    let ci_count = app.sessions.values()
+        .filter(|s| matches!(s.status, SessionStatus::CiFailed))
+        .count();
+    let review_count = app.sessions.values()
+        .filter(|s| matches!(s.status, SessionStatus::ReviewPending))
+        .count();
+
+    if ci_count == 0 && review_count == 0 {
+        return None;
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if ci_count > 0 {
+        parts.push(format!("{ci_count} CI failure{}", if ci_count == 1 { "" } else { "s" }));
+    }
+    if review_count > 0 {
+        parts.push(format!("{review_count} awaiting review"));
+    }
+    let message = parts.join("  ·  ");
+
+    Some(
+        container(
+            row![
+                container(Space::new(0, 0))
+                    .width(Length::Fixed(8.0))
+                    .height(Length::Fixed(8.0))
+                    .style(move |_| container::Style {
+                        background: Some(Background::Color(s.status_red)),
+                        border: Border { radius: 4.0.into(), ..Default::default() },
+                        ..Default::default()
+                    }),
+                Space::new(8, 0),
+                text(message).size(12).color(s.status_red),
+            ]
+            .align_y(Alignment::Center)
+        )
+        .padding([8, 16])
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(Color {
+                r: s.status_red.r,
+                g: s.status_red.g,
+                b: s.status_red.b,
+                a: 0.08,
+            })),
+            border: Border {
+                color: Color { a: 0.2, ..s.status_red },
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+    )
+}
+
 pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Element<'a, Message> {
     let s = &app.scheme;
 
@@ -128,9 +220,9 @@ pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Eleme
     let kanban_cols: Vec<Element<Message>> = COLUMNS
         .iter()
         .map(|col| {
-            let cards: Vec<Element<Message>> = sessions
+            let col_sessions = board_sessions(app, &col.status, scope.map(|s| s.as_str()));
+            let cards: Vec<Element<Message>> = col_sessions
                 .iter()
-                .filter(|s| s.status == col.status)
                 .map(|s| session_card(app, s))
                 .collect();
             kanban_column(app, col.label, cards)
@@ -143,7 +235,17 @@ pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Eleme
     )
     .width(Length::Fill);
 
-    column![header, board]
+    let banner = attention_banner(app);
+    let bar = filter_bar(app);
+    let mut col_children: Vec<Element<Message>> = Vec::new();
+    col_children.push(header.into());
+    if let Some(b) = banner {
+        col_children.push(b);
+    }
+    col_children.push(bar);
+    col_children.push(board.into());
+
+    column(col_children)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()

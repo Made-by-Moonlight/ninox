@@ -1,5 +1,9 @@
+pub mod filter_bar;
 pub mod fleet_board;
 pub mod info_panel;
+pub mod inspector_panel;
+pub mod notification_panel;
+pub mod pr_list;
 pub mod session_detail;
 pub mod sidebar;
 pub mod spawn_modal;

@@ -1,6 +1,8 @@
 pub mod brain;
 pub mod config;
 pub mod events;
+pub mod github;
+pub mod hooks;
 pub mod lifecycle;
 pub mod plugin;
 pub mod pty;
