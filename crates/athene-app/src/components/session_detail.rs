@@ -44,7 +44,7 @@ pub enum DetailPanel {
 
 impl Default for DetailPanel {
     fn default() -> Self {
-        DetailPanel::Terminal
+        DetailPanel::Split
     }
 }
 
