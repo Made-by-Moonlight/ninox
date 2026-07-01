@@ -71,18 +71,18 @@ fn rgb_to_iced(rgb: Rgb) -> IcedColor {
     IcedColor::from_rgb8(rgb.r, rgb.g, rgb.b)
 }
 
-fn named_to_iced(named: NamedColor) -> IcedColor {
+fn named_to_iced(named: NamedColor, bg: IcedColor, fg: IcedColor) -> IcedColor {
     // Use our default palette for the first 16 named colors.
     let idx = named as usize;
     if idx < DEFAULT_PALETTE.len() {
         let (r, g, b) = DEFAULT_PALETTE[idx];
         return IcedColor::from_rgb8(r, g, b);
     }
-    // Foreground / Background fallbacks.
+    // Foreground / Background fallbacks use the active theme colors.
     match named {
-        NamedColor::Foreground | NamedColor::BrightForeground => IcedColor::from_rgb8(0xeb, 0xdb, 0xb2),
-        NamedColor::Background => IcedColor::from_rgb8(0x28, 0x28, 0x28),
-        _ => IcedColor::from_rgb8(0xeb, 0xdb, 0xb2),
+        NamedColor::Foreground | NamedColor::BrightForeground => fg,
+        NamedColor::Background => bg,
+        _ => fg,
     }
 }
 
@@ -91,6 +91,8 @@ fn named_to_iced(named: NamedColor) -> IcedColor {
 pub fn ansi_to_iced(
     color: Color,
     colors: &alacritty_terminal::term::color::Colors,
+    bg: IcedColor,
+    fg: IcedColor,
 ) -> IcedColor {
     match color {
         Color::Named(named) => {
@@ -98,7 +100,7 @@ pub fn ansi_to_iced(
             if let Some(rgb) = colors[named] {
                 return rgb_to_iced(rgb);
             }
-            named_to_iced(named)
+            named_to_iced(named, bg, fg)
         }
         Color::Spec(rgb) => rgb_to_iced(rgb),
         Color::Indexed(idx) => {
@@ -165,6 +167,9 @@ impl SelectionState {
 pub struct TerminalWidget<'a> {
     pub state: &'a TerminalState,
     pub font_size: f32,
+    pub terminal_bg: IcedColor,
+    pub terminal_fg: IcedColor,
+    pub cursor_color: IcedColor,
     /// Known session IDs — a single click on a matching word navigates to that session.
     pub session_ids: Vec<String>,
 }
@@ -276,10 +281,14 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
         let rows = grid.screen_lines();
         let cursor_point = grid.cursor.point;
 
+        let term_bg = self.terminal_bg;
+        let term_fg = self.terminal_fg;
+        let cursor_color = self.cursor_color;
+
         let geometry = self.state.cache.draw(renderer, bounds.size(), |frame: &mut Frame| {
             // Background fill.
             let bg_all = Path::rectangle(iced::Point::ORIGIN, bounds.size());
-            frame.fill(&bg_all, IcedColor::from_rgb8(0x28, 0x28, 0x28));
+            frame.fill(&bg_all, term_bg);
 
             // Render each cell.
             for row in 0..rows {
@@ -294,8 +303,7 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                     let y = row as f32 * cell_h;
 
                     // Background.
-                    let bg = ansi_to_iced(cell.bg, colors);
-                    let default_bg = IcedColor::from_rgb8(0x28, 0x28, 0x28);
+                    let bg = ansi_to_iced(cell.bg, colors, term_bg, term_fg);
                     let is_cursor = cursor_point.line == line && cursor_point.column == column;
 
                     let is_selected = sel.range().map(|((sc, sr), (ec, er))| {
@@ -318,8 +326,8 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                             iced::Point::new(x, y),
                             Size::new(cell_w, cell_h),
                         );
-                        frame.fill(&cursor_rect, IcedColor::from_rgb8(0xd4, 0xa8, 0x43));
-                    } else if bg != default_bg {
+                        frame.fill(&cursor_rect, cursor_color);
+                    } else if bg != term_bg {
                         let bg_rect = Path::rectangle(
                             iced::Point::new(x, y),
                             Size::new(cell_w, cell_h),
@@ -331,9 +339,9 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                     let ch = cell.c;
                     if ch != ' ' && ch != '\0' {
                         let fg = if is_cursor {
-                            IcedColor::from_rgb8(0x28, 0x28, 0x28)
+                            term_bg
                         } else {
-                            ansi_to_iced(cell.fg, colors)
+                            ansi_to_iced(cell.fg, colors, term_bg, term_fg)
                         };
 
                         frame.fill_text(iced::widget::canvas::Text {

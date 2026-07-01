@@ -62,11 +62,18 @@ pub struct App {
     /// Used as the source of truth for all start_streaming + TerminalState::new calls.
     pub terminal_cols:   u16,
     pub terminal_rows:   u16,
+    pub window_width:    f32,
+    pub sidebar_width:   f32,
+    pub info_width:      f32,
+    pub drag:            Option<DragTarget>,
 }
 
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+pub enum DragTarget { Sidebar, InfoPanel }
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -91,6 +98,9 @@ pub enum Message {
         text:      Option<String>,
     },
     WindowResized(iced::Size),
+    StartDrag(DragTarget),
+    MouseMoved(iced::Point),
+    MouseReleased,
     CopyToClipboard(String),
     PollSessions,
     Noop,
@@ -109,6 +119,13 @@ fn global_event_handler(
     // Window resize — always handle regardless of captured status.
     if let iced::Event::Window(iced::window::Event::Resized(size)) = &event {
         return Some(Message::WindowResized(*size));
+    }
+    // Mouse tracking for drag-resize handles.
+    if let iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) = event {
+        return Some(Message::MouseMoved(position));
+    }
+    if let iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) = event {
+        return Some(Message::MouseReleased);
     }
     // Keyboard — only handle Ignored events (not already captured by a widget).
     if status == iced::event::Status::Captured {
@@ -230,6 +247,10 @@ impl App {
             spawn_modal:    None,
             terminal_cols:  140,
             terminal_rows:  50,
+            window_width:   1200.0,
+            sidebar_width:  220.0,
+            info_width:     300.0,
+            drag:           None,
         };
 
         // Asynchronously mark dead sessions as Terminated.
@@ -545,10 +566,11 @@ impl App {
             }
 
             Message::WindowResized(size) => {
+                state.window_width = size.width;
                 let font_size = 13.0f32;
                 let cell_w    = font_size * 0.6;
                 let cell_h    = font_size * 1.4;
-                let sidebar_w = 220.0f32;
+                let sidebar_w = state.sidebar_width + 5.0; // +5 for drag handle
                 let header_h  = 80.0f32;
                 // iced_winit converts Resized to logical pixels before emitting,
                 // so size.width/height are already in logical (device-independent) pixels.
@@ -588,9 +610,36 @@ impl App {
                 state.scheme = from_variant(variant);
                 state.config.theme = variant;
                 state.sidebar.show_theme_popout = false;
+                for term in state.terminals.values_mut() {
+                    term.cache.clear();
+                }
                 if let Err(e) = state.config.save() {
                     tracing::error!("failed to save theme config: {e}");
                 }
+                Task::none()
+            }
+
+            Message::StartDrag(target) => {
+                state.drag = Some(target);
+                Task::none()
+            }
+
+            Message::MouseMoved(position) => {
+                match state.drag {
+                    Some(DragTarget::Sidebar) => {
+                        state.sidebar_width = position.x.clamp(150.0, 400.0);
+                    }
+                    Some(DragTarget::InfoPanel) => {
+                        let available = state.window_width - state.sidebar_width - 10.0;
+                        state.info_width = (state.window_width - position.x).clamp(200.0, available.max(200.0));
+                    }
+                    None => {}
+                }
+                Task::none()
+            }
+
+            Message::MouseReleased => {
+                state.drag = None;
                 Task::none()
             }
 
@@ -730,6 +779,22 @@ impl App {
         Task::none()
     }
 
+    /// A 5px drag handle strip between resizable panels.
+    pub fn drag_handle<'a>(target: DragTarget, border: iced::Color) -> Element<'a, Message> {
+        use iced::widget::{container, mouse_area, Space};
+        use iced::{Background, Length};
+        mouse_area(
+            container(Space::new(5, 0))
+                .height(Length::Fill)
+                .style(move |_theme| container::Style {
+                    background: Some(Background::Color(border)),
+                    ..Default::default()
+                }),
+        )
+        .on_press(Message::StartDrag(target))
+        .into()
+    }
+
     /// View — sidebar + fleet board or session detail.
     pub fn iced_view(state: &Self) -> Element<'_, Message> {
         use iced::widget::{container, row};
@@ -748,7 +813,11 @@ impl App {
         };
 
         let base: Element<Message> = container(
-            row![sidebar(state), main].height(Length::Fill),
+            row![
+                sidebar(state),
+                App::drag_handle(DragTarget::Sidebar, state.scheme.border),
+                main,
+            ].height(Length::Fill),
         )
         .width(Length::Fill)
         .height(Length::Fill)

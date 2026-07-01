@@ -1,7 +1,7 @@
 use athene_core::config::ThemeVariant;
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
-    Alignment, Background, Border, Color, Element, Length,
+    Alignment, Background, Border, Color, Element, Length, Padding,
 };
 
 use crate::{
@@ -44,6 +44,13 @@ fn theme_swatch(color: Color) -> Element<'static, Message> {
 pub fn sidebar(app: &App) -> Element<'_, Message> {
     let s = &app.scheme;
 
+    // On macOS with fullsize_content_view the traffic lights sit at the top-left
+    // (~y=28px). Extra top padding clears them so content doesn't clip under.
+    #[cfg(target_os = "macos")]
+    let header_padding = Padding { top: 36.0, right: 12.0, bottom: 12.0, left: 12.0 };
+    #[cfg(not(target_os = "macos"))]
+    let header_padding = Padding { top: 12.0, right: 12.0, bottom: 12.0, left: 12.0 };
+
     // ── Header ────────────────────────────────────────────────────────────────
     let header = container(
         row![
@@ -62,7 +69,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
         .spacing(8)
         .align_y(Alignment::Center),
     )
-    .padding([12, 12])
+    .padding(header_padding)
     .width(Length::Fill)
     .style(move |_theme| container::Style {
         background: Some(Background::Color(s.bg_sidebar)),
@@ -156,7 +163,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     let footer = theme_footer(app, s);
 
     container(column![header, list, footer].spacing(0))
-        .width(Length::Fixed(220.0))
+        .width(Length::Fixed(app.sidebar_width))
         .height(Length::Fill)
         .style(move |_theme| container::Style {
             background: Some(Background::Color(s.bg_sidebar)),
