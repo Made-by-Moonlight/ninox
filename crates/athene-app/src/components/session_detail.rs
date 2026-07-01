@@ -6,34 +6,28 @@ use iced::{
 use crate::{
     app::{App, Message},
     components::{info_panel::info_panel, terminal::TerminalWidget},
-    theme::{
-        ACCENT_AMBER, BG_ELEVATED, BG_SURFACE, BORDER, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
-    },
 };
 
 fn repo_short(repo: &str) -> &str {
     repo.rsplit('/').next().unwrap_or(repo)
 }
 
-fn panel_btn<'a>(label: &'static str, target: DetailPanel, active: DetailPanel) -> Element<'a, Message> {
+fn panel_btn<'a>(app: &'a App, label: &'static str, target: DetailPanel, active: DetailPanel) -> Element<'a, Message> {
+    let s = &app.scheme;
     let is_active = target == active;
     button(
-        text(label).size(11).color(if is_active { Color::WHITE } else { TEXT_SECONDARY }),
+        text(label).size(11).color(if is_active { Color::WHITE } else { s.text_secondary }),
     )
     .on_press(Message::SwitchDetailPanel(target))
     .padding([3, 8])
     .style(move |_theme, _status| button::Style {
         background: if is_active {
-            Some(Background::Color(ACCENT_AMBER))
+            Some(Background::Color(s.accent))
         } else {
-            Some(Background::Color(BG_ELEVATED))
+            Some(Background::Color(s.bg_elevated))
         },
-        border: Border {
-            color: BORDER,
-            width: 1.0,
-            radius: 3.0.into(),
-        },
-        text_color: if is_active { Color::WHITE } else { TEXT_SECONDARY },
+        border: Border { color: s.border, width: 1.0, radius: 3.0.into() },
+        text_color: if is_active { Color::WHITE } else { s.text_secondary },
         ..Default::default()
     })
     .into()
@@ -59,11 +53,11 @@ pub fn session_detail<'a>(
     session_id: &str,
     panel: &DetailPanel,
 ) -> Element<'a, Message> {
+    let s = &app.scheme;
+
     let Some(session) = app.sessions.get(session_id) else {
         return container(
-            text("Session not found")
-                .size(14)
-                .color(TEXT_MUTED),
+            text("Session not found").size(14).color(s.text_muted),
         )
         .width(Length::Fill)
         .height(Length::Fill)
@@ -71,45 +65,34 @@ pub fn session_detail<'a>(
         .into();
     };
 
-    let color = crate::theme::status_color(&session.status);
+    let color = s.status_color(&session.status);
     let cost = format!("${:.4}", session.cost_usd);
-    let pr_label = session
-        .pr_number
-        .map(|n| format!("PR #{n}"))
-        .unwrap_or_default();
+    let pr_label = session.pr_number.map(|n| format!("PR #{n}")).unwrap_or_default();
 
-    // --- Header bar ---
+    // ── Header ────────────────────────────────────────────────────────────────
     let status_dot = container(Space::new(0, 0))
         .width(Length::Fixed(8.0))
         .height(Length::Fixed(8.0))
         .style(move |_theme| container::Style {
             background: Some(Background::Color(color)),
-            border: Border {
-                color: iced::Color::TRANSPARENT,
-                width: 0.0,
-                radius: 4.0.into(),
-            },
+            border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 4.0.into() },
             ..Default::default()
         });
 
-    let back_btn = button(
-        text("← Fleet")
-            .size(12)
-            .color(TEXT_SECONDARY),
-    )
-    .on_press(Message::NavigateFleet { scope: None })
-    .style(|_theme, _status| button::Style {
-        background: None,
-        text_color: TEXT_SECONDARY,
-        ..Default::default()
-    });
+    let back_btn = button(text("← Fleet").size(12).color(s.text_secondary))
+        .on_press(Message::NavigateFleet { scope: None })
+        .style(|_theme, _status| button::Style {
+            background: None,
+            text_color: s.text_secondary,
+            ..Default::default()
+        });
 
     let panel_toggles = row![
-        panel_btn("Terminal", DetailPanel::Terminal, *panel),
+        panel_btn(app, "Terminal", DetailPanel::Terminal, *panel),
         Space::new(4, 0),
-        panel_btn("Split", DetailPanel::Split, *panel),
+        panel_btn(app, "Split", DetailPanel::Split, *panel),
         Space::new(4, 0),
-        panel_btn("Info", DetailPanel::Info, *panel),
+        panel_btn(app, "Info", DetailPanel::Info, *panel),
     ]
     .align_y(Alignment::Center);
 
@@ -117,24 +100,22 @@ pub fn session_detail<'a>(
         row![
             back_btn,
             Space::new(16, 0),
-            text(&session.name).size(14).color(TEXT_PRIMARY),
+            text(&session.name).size(14).color(s.text_primary),
             Space::new(8, 0),
-            text("·").size(14).color(TEXT_MUTED),
+            text("·").size(14).color(s.text_muted),
             Space::new(8, 0),
-            text(repo_short(&session.repo))
-                .size(13)
-                .color(ACCENT_AMBER),
+            text(repo_short(&session.repo)).size(13).color(s.accent),
             Space::new(Length::Fill, 0),
             panel_toggles,
             Space::new(Length::Fill, 0),
             status_dot,
             Space::new(6, 0),
-            text(cost).size(12).color(TEXT_MUTED),
+            text(cost).size(12).color(s.text_muted),
             if !pr_label.is_empty() {
                 Element::from(
                     row![
                         Space::new(12, 0),
-                        text(pr_label.clone()).size(12).color(TEXT_SECONDARY),
+                        text(pr_label.clone()).size(12).color(s.text_secondary),
                     ]
                     .align_y(Alignment::Center),
                 )
@@ -146,17 +127,14 @@ pub fn session_detail<'a>(
     )
     .padding([10, 16])
     .width(Length::Fill)
-    .style(|_theme| container::Style {
-        background: Some(Background::Color(BG_SURFACE)),
-        border: Border {
-            color: BORDER,
-            width: 1.0,
-            radius: 0.0.into(),
-        },
+    .style(move |_theme| container::Style {
+        background: Some(Background::Color(s.bg_surface)),
+        border: Border { color: s.border, width: 1.0, radius: 0.0.into() },
         ..Default::default()
     });
 
-    // --- Terminal canvas or placeholder ---
+    // ── Terminal pane ─────────────────────────────────────────────────────────
+    let terminal_bg = s.terminal_bg;
     let terminal_pane: Element<Message> = if let Some(term_state) = app.terminals.get(session_id) {
         iced::widget::Canvas::new(TerminalWidget {
             state: term_state,
@@ -167,51 +145,46 @@ pub fn session_detail<'a>(
         .into()
     } else {
         container(
-            text("Terminal connecting…")
-                .size(13)
-                .color(TEXT_MUTED),
+            text("Terminal connecting…").size(13).color(s.text_muted),
         )
         .width(Length::Fill)
         .height(Length::Fill)
         .center_x(Length::Fill)
         .center_y(Length::Fill)
-        .style(|_theme| container::Style {
-            background: Some(Background::Color(BG_ELEVATED)),
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(terminal_bg)),
             ..Default::default()
         })
         .into()
     };
 
-    // --- Info panel (Task 12) ---
+    // ── Info pane ─────────────────────────────────────────────────────────────
     let pr = session.pr_id.and_then(|id| app.prs.get(&id));
     let ci = pr.and_then(|p| app.ci_status.get(&p.id));
     let comments = pr
         .and_then(|p| app.review_threads.get(&p.id))
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
+
     let info_pane: Element<Message> = container(
-        info_panel(session, pr, ci, comments),
+        info_panel(session, pr, ci, comments, s),
     )
     .width(Length::FillPortion(1))
     .height(Length::Fill)
-    .style(|_theme| container::Style {
-        background: Some(Background::Color(BG_SURFACE)),
-        border: Border {
-            color: BORDER,
-            width: 1.0,
-            radius: 0.0.into(),
-        },
+    .style(move |_theme| container::Style {
+        background: Some(Background::Color(s.bg_surface)),
+        border: Border { color: s.border, width: 1.0, radius: 0.0.into() },
         ..Default::default()
     })
     .into();
 
-    // Panel routing: Terminal = full terminal, Split = 2/3 terminal + 1/3 info, Info = full info.
+    // ── Panel routing ─────────────────────────────────────────────────────────
     let content: Element<Message> = match panel {
         DetailPanel::Terminal => container(terminal_pane)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_theme| container::Style {
-                background: Some(Background::Color(iced::Color::from_rgb8(0x28, 0x28, 0x28))),
+            .style(move |_theme| container::Style {
+                background: Some(Background::Color(terminal_bg)),
                 ..Default::default()
             })
             .into(),
@@ -219,8 +192,8 @@ pub fn session_detail<'a>(
             container(terminal_pane)
                 .width(Length::FillPortion(2))
                 .height(Length::Fill)
-                .style(|_theme| container::Style {
-                    background: Some(Background::Color(iced::Color::from_rgb8(0x28, 0x28, 0x28))),
+                .style(move |_theme| container::Style {
+                    background: Some(Background::Color(terminal_bg)),
                     ..Default::default()
                 }),
             info_pane,

@@ -3,10 +3,7 @@ use iced::{
     Alignment, Background, Border, Color, Element, Length,
 };
 
-use crate::{
-    app::Message,
-    theme::{ACCENT_AMBER, BG_ELEVATED, BG_SURFACE, BORDER, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY},
-};
+use crate::{app::Message, theme::ColorScheme};
 
 #[derive(Debug, Clone, Default)]
 pub struct SpawnForm {
@@ -14,15 +11,15 @@ pub struct SpawnForm {
     pub workspace: String,
 }
 
-pub fn spawn_modal(form: &SpawnForm) -> Element<'_, Message> {
+pub fn spawn_modal<'a>(form: &'a SpawnForm, s: &'a ColorScheme) -> Element<'a, Message> {
     let can_submit = !form.name.trim().is_empty();
 
     let dialog = container(
         column![
-            text("Spawn Orchestrator").size(16).color(TEXT_PRIMARY),
+            text("Spawn Orchestrator").size(16).color(s.text_primary),
             Space::new(0, 4),
             column![
-                text("Name").size(11).color(TEXT_MUTED),
+                text("Name").size(11).color(s.text_muted),
                 Space::new(0, 4),
                 text_input("e.g. my-feature", &form.name)
                     .on_input(Message::SpawnFormName)
@@ -33,12 +30,12 @@ pub fn spawn_modal(form: &SpawnForm) -> Element<'_, Message> {
             .spacing(0),
             Space::new(0, 4),
             row![
-                button(text("Cancel").size(12).color(TEXT_SECONDARY))
+                button(text("Cancel").size(12).color(s.text_secondary))
                     .on_press(Message::SpawnFormCancel)
-                    .style(|_theme, _status| button::Style {
+                    .style(move |_theme, _status| button::Style {
                         background: None,
-                        text_color: TEXT_SECONDARY,
-                        border: Border { color: BORDER, width: 1.0, radius: 4.0.into() },
+                        text_color: s.text_secondary,
+                        border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
                         ..Default::default()
                     })
                     .padding([5, 12]),
@@ -46,15 +43,15 @@ pub fn spawn_modal(form: &SpawnForm) -> Element<'_, Message> {
                 button(
                     text("Spawn")
                         .size(12)
-                        .color(if can_submit { Color::WHITE } else { TEXT_MUTED }),
+                        .color(if can_submit { Color::WHITE } else { s.text_muted }),
                 )
                 .on_press_maybe(can_submit.then_some(Message::SpawnFormConfirm))
                 .style(move |_theme, _status| button::Style {
                     background: Some(Background::Color(
-                        if can_submit { ACCENT_AMBER } else { BG_ELEVATED },
+                        if can_submit { s.accent } else { s.bg_elevated },
                     )),
-                    border: Border { color: BORDER, width: 1.0, radius: 4.0.into() },
-                    text_color: if can_submit { Color::WHITE } else { TEXT_MUTED },
+                    border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
+                    text_color: if can_submit { Color::WHITE } else { s.text_muted },
                     ..Default::default()
                 })
                 .padding([5, 16]),
@@ -65,9 +62,9 @@ pub fn spawn_modal(form: &SpawnForm) -> Element<'_, Message> {
         .padding(20),
     )
     .width(Length::Fixed(340.0))
-    .style(|_| container::Style {
-        background: Some(Background::Color(BG_SURFACE)),
-        border: Border { color: BORDER, width: 1.0, radius: 8.0.into() },
+    .style(move |_| container::Style {
+        background: Some(Background::Color(s.bg_surface)),
+        border: Border { color: s.border, width: 1.0, radius: 8.0.into() },
         ..Default::default()
     });
 
