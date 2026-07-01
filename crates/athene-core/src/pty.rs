@@ -59,13 +59,24 @@ pub async fn start_streaming(
     // Tell tmux to stream pane output into the FIFO.
     tmux::pipe_pane(tmux_id, &path).await?;
 
-    // Resize tmux and send SIGWINCH so the running process redraws at the
-    // correct size.  The full repaint (clear + cursor-home + content) flows
-    // through the FIFO reader below — no capture_pane needed.  capture_pane
-    // was removed because it captures a potentially partial redraw and feeds
-    // escape sequences into a fresh TerminalState at wrong cursor positions,
-    // producing the "garbled on navigate" visual artifact.
+    // Resize tmux to target dimensions before capture_pane so the escape
+    // sequences in the capture reference the same column positions as the
+    // TerminalState grid.  Resizing also sends SIGWINCH to the running
+    // process, triggering a full screen redraw.
+    //
+    // The NavigateSession handler clears the TerminalState before calling
+    // start_streaming, so capture_pane always lands on a clean slate —
+    // the garbled-on-navigate issue no longer applies.
+    //
+    // Wait 500ms for the process to finish redrawing before capture_pane.
+    // 150ms was too short for Claude Code's TUI on slower machines.
     let _ = tmux::resize_window(tmux_id, cols, rows).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let initial = tmux::capture_pane(tmux_id).await;
+    if !initial.is_empty() {
+        engine.emit(Event::TerminalOutput { session_id: session_id.clone(), bytes: initial });
+    }
 
     // --- Output task: FIFO → Event::TerminalOutput ---
     let engine_out = engine.clone();
