@@ -91,6 +91,8 @@ pub enum Message {
         text:      Option<String>,
     },
     WindowResized(iced::Size),
+    CopyToClipboard(String),
+    PollSessions,
     Noop,
 }
 
@@ -596,6 +598,27 @@ impl App {
                 Task::none()
             }
 
+            Message::CopyToClipboard(text) => {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(text);
+                }
+                Task::none()
+            }
+
+            Message::PollSessions => {
+                let sessions = state.engine.store.list_sessions().unwrap_or_default();
+                let orchestrators = state.engine.store.list_orchestrators().unwrap_or_default();
+                for o in orchestrators {
+                    if !state.orchestrators.iter().any(|existing| existing.id == o.id) {
+                        state.orchestrators.push(o);
+                    }
+                }
+                for session in sessions {
+                    state.sessions.entry(session.id.clone()).or_insert(session);
+                }
+                Task::none()
+            }
+
             Message::Noop => Task::none(),
         }
     }
@@ -730,7 +753,17 @@ impl App {
         // for all Ignored key events and route to the active session in the handler.
         let keyboard_sub = iced::event::listen_with(global_event_handler);
 
-        Subscription::batch([engine_sub, keyboard_sub])
+        let poll_sub = Subscription::run_with_id(
+            "db-poll",
+            async_stream::stream! {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    yield Message::PollSessions;
+                }
+            },
+        );
+
+        Subscription::batch([engine_sub, keyboard_sub, poll_sub])
     }
 
     /// Theme accessor for the iced `.theme()` builder.

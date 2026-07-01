@@ -87,14 +87,19 @@ pub fn session_detail<'a>(
             ..Default::default()
         });
 
-    let panel_toggles = row![
-        panel_btn(app, "Terminal", DetailPanel::Terminal, *panel),
-        Space::new(4, 0),
-        panel_btn(app, "Split", DetailPanel::Split, *panel),
-        Space::new(4, 0),
-        panel_btn(app, "Info", DetailPanel::Info, *panel),
-    ]
-    .align_y(Alignment::Center);
+    let is_orchestrator = app.orchestrators.iter().any(|o| o.id == session_id);
+    let panel_toggles = if is_orchestrator {
+        row![].align_y(Alignment::Center)
+    } else {
+        row![
+            panel_btn(app, "Terminal", DetailPanel::Terminal, *panel),
+            Space::new(4, 0),
+            panel_btn(app, "Split", DetailPanel::Split, *panel),
+            Space::new(4, 0),
+            panel_btn(app, "Info", DetailPanel::Info, *panel),
+        ]
+        .align_y(Alignment::Center)
+    };
 
     let header = container(
         row![
@@ -179,7 +184,8 @@ pub fn session_detail<'a>(
     .into();
 
     // ── Panel routing ─────────────────────────────────────────────────────────
-    let content: Element<Message> = match panel {
+    let effective_panel = if is_orchestrator { &DetailPanel::Terminal } else { panel };
+    let content: Element<Message> = match effective_panel {
         DetailPanel::Terminal => container(terminal_pane)
             .width(Length::Fill)
             .height(Length::Fill)

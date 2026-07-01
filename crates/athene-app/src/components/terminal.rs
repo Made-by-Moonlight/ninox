@@ -124,6 +124,38 @@ pub fn ansi_to_iced(
 }
 
 // ---------------------------------------------------------------------------
+// SelectionState — tracks mouse drag selection within the canvas
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Clone)]
+pub struct SelectionState {
+    /// Anchor cell (col, row) where the drag started.
+    anchor: Option<(usize, usize)>,
+    /// Current end cell while dragging.
+    end: Option<(usize, usize)>,
+    dragging: bool,
+}
+
+impl SelectionState {
+    /// Normalised (start, end) in reading order, or None if no selection.
+    fn range(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (a_col, a_row) = self.anchor?;
+        let (e_col, e_row) = self.end?;
+        if a_row < e_row || (a_row == e_row && a_col <= e_col) {
+            Some(((a_col, a_row), (e_col, e_row)))
+        } else {
+            Some(((e_col, e_row), (a_col, a_row)))
+        }
+    }
+
+    fn pixel_to_cell(x: f32, y: f32, cell_w: f32, cell_h: f32, cols: usize, rows: usize) -> (usize, usize) {
+        let col = ((x / cell_w) as usize).min(cols.saturating_sub(1));
+        let row = ((y / cell_h) as usize).min(rows.saturating_sub(1));
+        (col, row)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TerminalWidget — iced canvas Program
 // ---------------------------------------------------------------------------
 
@@ -134,33 +166,74 @@ pub struct TerminalWidget<'a> {
 }
 
 impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
-    type State = ();
+    type State = SelectionState;
 
     fn update(
         &self,
-        _state: &mut Self::State,
+        state: &mut Self::State,
         event: iced::widget::canvas::Event,
-        _bounds: Rectangle,
-        _cursor: iced::mouse::Cursor,
+        bounds: Rectangle,
+        cursor: iced::mouse::Cursor,
     ) -> (iced::widget::canvas::event::Status, Option<Message>) {
         use iced::keyboard::Event as KeyEvent;
+        use iced::mouse::{Button, Event as MouseEvent};
         use iced::widget::canvas::Event;
 
-        // Emit RawKey so the handler can apply APP_CURSOR-aware conversion.
-        let Event::Keyboard(KeyEvent::KeyPressed { key, modifiers, text, .. }) = event else {
-            return (iced::widget::canvas::event::Status::Ignored, None);
-        };
-        let msg = Message::RawKey {
-            key,
-            modifiers,
-            text: text.map(|t| t.as_str().to_string()),
-        };
-        (iced::widget::canvas::event::Status::Captured, Some(msg))
+        let cell_w = self.font_size * 0.6;
+        let cell_h = self.font_size * 1.4;
+        let cols = self.state.term.grid().columns();
+        let rows = self.state.term.grid().screen_lines();
+
+        match &event {
+            Event::Mouse(MouseEvent::ButtonPressed(Button::Left)) => {
+                if let Some(pos) = cursor.position_in(bounds) {
+                    let cell = SelectionState::pixel_to_cell(pos.x, pos.y, cell_w, cell_h, cols, rows);
+                    state.anchor   = Some(cell);
+                    state.end      = Some(cell);
+                    state.dragging = true;
+                }
+                return (iced::widget::canvas::event::Status::Captured, None);
+            }
+
+            Event::Mouse(MouseEvent::CursorMoved { .. }) if state.dragging => {
+                if let Some(pos) = cursor.position_in(bounds) {
+                    state.end = Some(SelectionState::pixel_to_cell(pos.x, pos.y, cell_w, cell_h, cols, rows));
+                    self.state.cache.clear();
+                }
+                return (iced::widget::canvas::event::Status::Captured, None);
+            }
+
+            Event::Mouse(MouseEvent::ButtonReleased(Button::Left)) if state.dragging => {
+                state.dragging = false;
+                let text = state.range().map(|((sc, sr), (ec, er))| {
+                    extract_selection(&self.state.term, sc, sr, ec, er)
+                });
+                if let Some(t) = text.filter(|s| !s.trim().is_empty()) {
+                    return (iced::widget::canvas::event::Status::Captured,
+                            Some(Message::CopyToClipboard(t)));
+                }
+                return (iced::widget::canvas::event::Status::Captured, None);
+            }
+
+            // Emit RawKey so the handler can apply APP_CURSOR-aware conversion.
+            Event::Keyboard(KeyEvent::KeyPressed { key, modifiers, text, .. }) => {
+                let msg = Message::RawKey {
+                    key: key.clone(),
+                    modifiers: *modifiers,
+                    text: text.as_ref().map(|t| t.as_str().to_string()),
+                };
+                return (iced::widget::canvas::event::Status::Captured, Some(msg));
+            }
+
+            _ => {}
+        }
+
+        (iced::widget::canvas::event::Status::Ignored, None)
     }
 
     fn draw(
         &self,
-        _state: &Self::State,
+        sel: &Self::State,
         renderer: &iced::Renderer,
         _theme: &Theme,
         bounds: Rectangle,
@@ -199,7 +272,22 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                     let default_bg = IcedColor::from_rgb8(0x28, 0x28, 0x28);
                     let is_cursor = cursor_point.line == line && cursor_point.column == column;
 
-                    if is_cursor {
+                    let is_selected = sel.range().map(|((sc, sr), (ec, er))| {
+                        let in_row = row >= sr && row <= er;
+                        if !in_row { return false; }
+                        if sr == er { col >= sc && col <= ec }
+                        else if row == sr { col >= sc }
+                        else if row == er { col <= ec }
+                        else { true }
+                    }).unwrap_or(false);
+
+                    if is_selected {
+                        let sel_rect = Path::rectangle(
+                            iced::Point::new(x, y),
+                            Size::new(cell_w, cell_h),
+                        );
+                        frame.fill(&sel_rect, IcedColor { r: 0.27, g: 0.52, b: 0.80, a: 0.5 });
+                    } else if is_cursor {
                         let cursor_rect = Path::rectangle(
                             iced::Point::new(x, y),
                             Size::new(cell_w, cell_h),
@@ -242,6 +330,39 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
 
         vec![geometry]
     }
+}
+
+// ---------------------------------------------------------------------------
+// Text extraction
+// ---------------------------------------------------------------------------
+
+pub fn extract_selection(
+    term: &Term<EventProxy>,
+    start_col: usize, start_row: usize,
+    end_col: usize,   end_row: usize,
+) -> String {
+    use alacritty_terminal::index::{Column, Line};
+
+    let grid = term.grid();
+    let cols = grid.columns();
+    let rows = grid.screen_lines();
+    let mut out = String::new();
+
+    for row in start_row..=end_row.min(rows.saturating_sub(1)) {
+        let col_start = if row == start_row { start_col } else { 0 };
+        let col_end   = if row == end_row   { end_col   } else { cols.saturating_sub(1) };
+
+        let mut line_text = String::new();
+        for col in col_start..=col_end.min(cols.saturating_sub(1)) {
+            let cell = &grid[Line(row as i32)][Column(col)];
+            line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
+        }
+        // Strip trailing spaces from each line.
+        let trimmed = line_text.trim_end();
+        out.push_str(trimmed);
+        if row < end_row { out.push('\n'); }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
