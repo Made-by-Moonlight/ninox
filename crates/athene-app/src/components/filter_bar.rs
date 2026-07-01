@@ -11,7 +11,7 @@ pub fn filter_bar<'a>(app: &'a App) -> Element<'a, Message> {
 
     let input = text_input("Filter sessions...", &app.fleet_filter.query)
         .on_input(Message::FleetFilterQuery)
-        .padding([6, 10])
+        .padding([4, 8])
         .size(12)
         .width(Length::Fixed(220.0));
 
