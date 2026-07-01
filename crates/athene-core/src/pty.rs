@@ -34,20 +34,22 @@ pub async fn start_streaming(
     cols:       u16,
     rows:       u16,
 ) -> Result<()> {
-    let path = fifo_path(&session_id);
+    // Cancel any previous FIFO reader for this session before setting up a new
+    // one.  This prevents the old reader from emitting stale events after the
+    // TerminalState has been cleared, which caused the garbled-terminal bug on
+    // every re-navigation.
+    let cancel_rx = engine.register_stream(session_id.clone()).await;
 
-    // Remove stale FIFO from a previous session with this ID.
+    // ── FIFO setup ────────────────────────────────────────────────────────────
+    let path = fifo_path(&session_id);
     let _ = std::fs::remove_file(&path);
 
-    // Create the FIFO.
     let status = tokio::process::Command::new("mkfifo")
         .arg(&path)
         .status()
         .await?;
     anyhow::ensure!(status.success(), "mkfifo {path} failed");
 
-    // Open the FIFO for non-blocking read.  O_NONBLOCK means `open()` returns
-    // immediately even though tmux hasn't opened the write end yet.
     let fifo_file = {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
@@ -56,22 +58,21 @@ pub async fn start_streaming(
             .open(&path)?
     };
 
-    // Tell tmux to stream pane output into the FIFO.
     tmux::pipe_pane(tmux_id, &path).await?;
 
-    // Resize tmux to the target dimensions BEFORE capture_pane.
-    // capture_pane -e emits absolute cursor positions for the current tmux
-    // width; if that differs from our TerminalState's cols, text renders at
-    // wrong horizontal offsets.  Resizing first also sends SIGWINCH to the
-    // running process (Claude Code), triggering a redraw at the correct size.
+    // ── Force SIGWINCH via bounce resize ──────────────────────────────────────
+    // Unlike Zed (which owns a direct PTY stream and never needs a snapshot),
+    // we reconnect to an already-running tmux session.  We must force a full
+    // repaint so the FIFO receives a clean screen — no capture_pane needed.
+    //
+    // A "bounce" resize (cols→cols-1→cols) guarantees SIGWINCH even when the
+    // terminal was already at `cols` rows.  The process redraws twice and
+    // settles at the correct size.  The FIFO stream is the single source of
+    // truth for the TerminalState — no snapshot races, no ordering conflicts.
+    let bounce = cols.saturating_sub(1).max(2);
+    let _ = tmux::resize_window(tmux_id, bounce, rows).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     let _ = tmux::resize_window(tmux_id, cols, rows).await;
-    // Give the process a moment to redraw before capturing the screen.
-    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-
-    let initial = tmux::capture_pane(tmux_id).await;
-    if !initial.is_empty() {
-        engine.emit(Event::TerminalOutput { session_id: session_id.clone(), bytes: initial });
-    }
 
     // --- Output task: FIFO → Event::TerminalOutput ---
     let engine_out = engine.clone();
@@ -90,28 +91,37 @@ pub async fn start_streaming(
             };
 
         let mut buf = vec![0u8; 4096];
+        // Pin cancel_rx so we can use it in select! across iterations.
+        tokio::pin!(cancel_rx);
         loop {
-            let mut guard = match async_fd.readable().await {
-                Ok(g) => g,
-                Err(_) => break,
-            };
-            let result = guard.try_io(|inner| {
-                use std::io::Read;
-                inner.get_ref().read(&mut buf)
-            });
-            match result {
-                Ok(Ok(0)) => break, // EOF: tmux session died / pipe-pane stopped
-                Ok(Ok(n)) => {
-                    engine_out.emit(Event::TerminalOutput {
-                        session_id: sid_out.clone(),
-                        bytes:      buf[..n].to_vec(),
+            tokio::select! {
+                biased;
+                // Stop immediately when a new start_streaming is called for this session.
+                _ = &mut cancel_rx => break,
+                guard_result = async_fd.readable() => {
+                    let mut guard = match guard_result {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+                    let result = guard.try_io(|inner| {
+                        use std::io::Read;
+                        inner.get_ref().read(&mut buf)
                     });
+                    match result {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => {
+                            engine_out.emit(Event::TerminalOutput {
+                                session_id: sid_out.clone(),
+                                bytes:      buf[..n].to_vec(),
+                            });
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!("FIFO read {sid_out}: {e}");
+                            break;
+                        }
+                        Err(_would_block) => {}
+                    }
                 }
-                Ok(Err(e)) => {
-                    tracing::error!("FIFO read {sid_out}: {e}");
-                    break;
-                }
-                Err(_would_block) => {} // guard cleared; wait for next readable()
             }
         }
         let _ = std::fs::remove_file(&path_out);

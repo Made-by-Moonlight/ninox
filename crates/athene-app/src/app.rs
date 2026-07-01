@@ -80,6 +80,7 @@ pub enum Message {
     SpawnFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
     RemoveOrchestrator(OrchestratorId),
+    RemoveSession(SessionId),
     SwitchTheme(ThemeVariant),
     ToggleThemePopout,
     // Raw key event from the global subscription — bytes are computed in the handler
@@ -90,6 +91,8 @@ pub enum Message {
         text:      Option<String>,
     },
     WindowResized(iced::Size),
+    CopyToClipboard(String),
+    PollSessions,
     Noop,
 }
 
@@ -177,7 +180,11 @@ fn key_to_terminal_bytes(
         Key::Named(Named::End)        => b"\x1b[F".to_vec(),
         Key::Named(Named::PageUp)     => b"\x1b[5~".to_vec(),
         Key::Named(Named::PageDown)   => b"\x1b[6~".to_vec(),
-        Key::Character(c)             => c.as_str().as_bytes().to_vec(),
+        // Prefer `text` (the actual typed character, shift-resolved) over `c`
+        // (the base logical key). On some platforms Key::Character holds the
+        // unshifted key, so Shift+backtick would give c="`" instead of "~".
+        Key::Character(c)             => text.map(|t| t.as_bytes().to_vec())
+                                             .unwrap_or_else(|| c.as_str().as_bytes().to_vec()),
         _ => text.map(|t| t.as_bytes().to_vec()).unwrap_or_default(),
     };
     if bytes.is_empty() { None } else { Some(bytes) }
@@ -225,16 +232,14 @@ impl App {
             terminal_rows:  50,
         };
 
-        // Capture terminal size for the async task (App::new runs before any
-        // WindowResized; the default 140×50 is used here and corrected once
-        // the first resize event fires).
-        let init_cols = app.terminal_cols;
-        let init_rows = app.terminal_rows;
-
-        // Asynchronously reconnect PTY streams for sessions whose tmux sessions
-        // are still live, and mark dead sessions as Terminated.
+        // Asynchronously mark dead sessions as Terminated.
+        // PTY streaming is NOT started here — we stream on demand when the user
+        // navigates to a session (NavigateSession).  Eagerly streaming at startup
+        // with the wrong default dimensions (140×50) creates competing FIFO readers
+        // that race with NavigateSession and re-populate state.terminals with
+        // wrong-dimension content, causing the garbled-terminal bug.
         let task = Task::future(async move {
-            use athene_core::{pty, tmux, Event as CoreEvent, SessionStatus};
+            use athene_core::{tmux, Event as CoreEvent, SessionStatus};
 
             let sessions = match engine.store.list_sessions() {
                 Ok(s) => s,
@@ -252,19 +257,7 @@ impl App {
                     continue;
                 }
 
-                if tmux::has_session(&session.id).await {
-                    if let Err(e) = pty::start_streaming(
-                        engine.clone(),
-                        session.id.clone(),
-                        &session.id,
-                        init_cols, init_rows,
-                    )
-                    .await
-                    {
-                        tracing::warn!("reconnect pty {}: {e}", session.id);
-                    }
-                } else {
-                    // Session is no longer running — mark it terminated.
+                if !tmux::has_session(&session.id).await {
                     let mut dead = session.clone();
                     dead.status = SessionStatus::Terminated;
                     let _ = engine.store.upsert_session(&dead);
@@ -298,8 +291,8 @@ impl App {
                     session_id: id.clone(),
                     panel: DetailPanel::default(),
                 };
-                // Capture current terminal dimensions (if a TerminalState exists) so
-                // start_streaming can resize tmux to match before calling capture_pane.
+                // Capture current terminal dimensions before resetting so start_streaming
+                // resizes tmux to match.
                 let (cols, rows) = state.terminals.get(&id)
                     .map(|t| {
                         use alacritty_terminal::grid::Dimensions;
@@ -308,7 +301,11 @@ impl App {
                             t.term.grid().screen_lines() as u16,
                         )
                     })
-                    .unwrap_or((140, 50));
+                    .unwrap_or((state.terminal_cols, state.terminal_rows));
+                // Reset the terminal grid so capture_pane output is applied to a clean
+                // slate. Without this, capture_pane (which has no cursor-home sequence)
+                // renders on top of stale cursor state and garbles the output.
+                state.terminals.remove(&id);
                 let engine = state.engine.clone();
                 Task::future(async move {
                     if athene_core::tmux::has_session(&id).await {
@@ -316,6 +313,14 @@ impl App {
                             athene_core::pty::start_streaming(engine.clone(), id.clone(), &id, cols, rows).await
                         {
                             tracing::warn!("PTY (re)connect for {id}: {e}");
+                        }
+                    } else {
+                        // Session's tmux process is gone — mark it terminated so the
+                        // UI shows "Session exited" instead of "Terminal connecting…".
+                        if let Ok(Some(mut s)) = engine.store.get_session(&id) {
+                            s.status = athene_core::types::SessionStatus::Terminated;
+                            let _ = engine.store.upsert_session(&s);
+                            engine.emit(athene_core::events::Event::SessionUpdated(s));
                         }
                     }
                     Message::Noop
@@ -482,9 +487,12 @@ impl App {
                 {
                     state.view = View::FleetBoard { scope: None };
                 }
-                // Remove from in-memory state immediately.
+                // Remove the orchestrator, its workers, and its own session from in-memory state.
                 state.orchestrators.retain(|o| o.id != id);
-                state.sessions.retain(|_, s| s.orchestrator_id.as_deref() != Some(id.as_str()));
+                state.sessions.retain(|k, s| {
+                    k != &id && s.orchestrator_id.as_deref() != Some(id.as_str())
+                });
+                state.terminals.remove(&id);
                 if state.sidebar.selected_orchestrator.as_deref() == Some(id.as_str()) {
                     state.sidebar.selected_orchestrator = None;
                 }
@@ -492,6 +500,21 @@ impl App {
                 Task::future(async move {
                     if let Err(e) = engine.remove_orchestrator(&id).await {
                         tracing::error!("remove orchestrator {id}: {e}");
+                    }
+                    Message::Noop
+                })
+            }
+
+            Message::RemoveSession(id) => {
+                if matches!(&state.view, View::SessionDetail { session_id, .. } if session_id == &id) {
+                    state.view = View::FleetBoard { scope: None };
+                }
+                state.sessions.remove(&id);
+                state.terminals.remove(&id);
+                let engine = state.engine.clone();
+                Task::future(async move {
+                    if let Err(e) = engine.remove_session(&id).await {
+                        tracing::error!("remove session {id}: {e}");
                     }
                     Message::Noop
                 })
@@ -527,6 +550,8 @@ impl App {
                 let cell_h    = font_size * 1.4;
                 let sidebar_w = 220.0f32;
                 let header_h  = 80.0f32;
+                // iced_winit converts Resized to logical pixels before emitting,
+                // so size.width/height are already in logical (device-independent) pixels.
                 let cols = ((size.width  - sidebar_w).max(200.0) / cell_w) as u16;
                 let rows = ((size.height - header_h ).max(100.0) / cell_h) as u16;
 
@@ -567,6 +592,64 @@ impl App {
                     tracing::error!("failed to save theme config: {e}");
                 }
                 Task::none()
+            }
+
+            Message::CopyToClipboard(text) => {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(text);
+                }
+                Task::none()
+            }
+
+            Message::PollSessions => {
+                let db_sessions   = state.engine.store.list_sessions().unwrap_or_default();
+                let db_orchestrators = state.engine.store.list_orchestrators().unwrap_or_default();
+
+                for o in db_orchestrators {
+                    if !state.orchestrators.iter().any(|existing| existing.id == o.id) {
+                        state.orchestrators.push(o);
+                    }
+                }
+
+                // Collect IDs of orchestrators for orphan detection.
+                let orch_ids: std::collections::HashSet<&str> =
+                    state.orchestrators.iter().map(|o| o.id.as_str()).collect();
+
+                // Remove standalone terminated/done sessions from state and DB —
+                // these are orphaned leftovers that no longer need to be visible.
+                let to_clean: Vec<SessionId> = state.sessions.values()
+                    .filter(|s| {
+                        matches!(s.status, SessionStatus::Done | SessionStatus::Terminated)
+                        && s.orchestrator_id.is_none()
+                        && !orch_ids.contains(s.id.as_str())
+                    })
+                    .map(|s| s.id.clone())
+                    .collect();
+                for id in &to_clean {
+                    state.sessions.remove(id);
+                    state.terminals.remove(id);
+                }
+                let engine_clean = state.engine.clone();
+                let to_clean_clone = to_clean.clone();
+
+                // Add genuinely new active sessions (spawned by athene spawn).
+                // PTY streaming is NOT started here — NavigateSession handles that
+                // on demand with the correct window dimensions.
+                for session in db_sessions {
+                    if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
+                        continue;
+                    }
+                    if !state.sessions.contains_key(&session.id) {
+                        state.sessions.insert(session.id.clone(), session);
+                    }
+                }
+
+                Task::future(async move {
+                    for id in to_clean_clone {
+                        let _ = engine_clean.store.delete_session(&id);
+                    }
+                    Message::Noop
+                })
             }
 
             Message::Noop => Task::none(),
@@ -703,7 +786,17 @@ impl App {
         // for all Ignored key events and route to the active session in the handler.
         let keyboard_sub = iced::event::listen_with(global_event_handler);
 
-        Subscription::batch([engine_sub, keyboard_sub])
+        let poll_sub = Subscription::run_with_id(
+            "db-poll",
+            async_stream::stream! {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    yield Message::PollSessions;
+                }
+            },
+        );
+
+        Subscription::batch([engine_sub, keyboard_sub, poll_sub])
     }
 
     /// Theme accessor for the iced `.theme()` builder.

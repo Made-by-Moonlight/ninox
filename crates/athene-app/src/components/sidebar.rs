@@ -133,15 +133,18 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
         }
     }
 
-    // Standalone workers (no orchestrator) — no section label
+    // Standalone workers (no orchestrator, and not an orchestrator session itself)
     let standalone: Vec<&athene_core::types::Session> = app
         .sessions
         .values()
-        .filter(|s| s.orchestrator_id.is_none())
+        .filter(|s| {
+            s.orchestrator_id.is_none()
+                && !app.orchestrators.iter().any(|o| o.id == s.id)
+        })
         .collect();
 
     for session in standalone {
-        items.push(worker_row(app, session));
+        items.push(standalone_row(app, session));
     }
 
     let list = scrollable(
@@ -197,6 +200,56 @@ fn worker_row<'a>(app: &'a App, session: &'a athene_core::types::Session) -> Ele
     .padding(iced::Padding { top: 5.0, right: 12.0, bottom: 5.0, left: 26.0 })
     .width(Length::Fill)
     .into()
+}
+
+fn standalone_row<'a>(app: &'a App, session: &'a athene_core::types::Session) -> Element<'a, Message> {
+    let s = &app.scheme;
+    let is_selected = matches!(
+        &app.view,
+        View::SessionDetail { session_id: id, .. } if id == &session.id
+    );
+
+    let color = s.status_color(&session.status);
+    let bg = if is_selected { Some(Background::Color(s.bg_surface)) } else { None };
+    let nav_id = session.id.clone();
+    let remove_id = session.id.clone();
+
+    let content_btn = button(
+        row![
+            status_dot(color),
+            Space::new(6, 0),
+            column![
+                text(&session.name).size(12).color(s.text_primary),
+                text(repo_short(&session.repo)).size(10).color(s.text_secondary),
+            ]
+            .spacing(1),
+        ]
+        .spacing(0)
+        .align_y(Alignment::Center),
+    )
+    .on_press(Message::NavigateSession(nav_id))
+    .style(move |_theme, _status| button::Style {
+        background: bg,
+        text_color: s.text_primary,
+        border: Border::default(),
+        ..Default::default()
+    })
+    .padding(iced::Padding { top: 5.0, right: 4.0, bottom: 5.0, left: 26.0 })
+    .width(Length::Fill);
+
+    let remove_btn = button(text("×").size(12).color(s.text_muted))
+        .on_press(Message::RemoveSession(remove_id))
+        .style(|_theme, _status| button::Style {
+            background: None,
+            border: Border::default(),
+            ..Default::default()
+        })
+        .padding([6, 8]);
+
+    row![content_btn, remove_btn]
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .into()
 }
 
 fn theme_footer<'a>(app: &'a App, s: &'a ColorScheme) -> Element<'a, Message> {

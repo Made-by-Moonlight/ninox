@@ -19,13 +19,37 @@ pub enum Event {
 pub struct Engine {
     pub store: Arc<Store>,
     tx: broadcast::Sender<Event>,
-    pty_writers: Mutex<HashMap<SessionId, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
+    pty_writers:  Mutex<HashMap<SessionId, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
+    /// Per-session cancellation senders for active FIFO reader tasks.
+    /// Sending () to the stored sender stops the running reader immediately.
+    stream_cancel: Mutex<HashMap<SessionId, tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl Engine {
     pub fn new(store: Arc<Store>) -> Arc<Self> {
         let (tx, _) = broadcast::channel(256);
-        Arc::new(Self { store, tx, pty_writers: Mutex::new(HashMap::new()) })
+        Arc::new(Self {
+            store,
+            tx,
+            pty_writers:   Mutex::new(HashMap::new()),
+            stream_cancel: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Cancel any running FIFO reader for `session_id` and return a fresh
+    /// cancellation receiver for the new reader.  Call this at the top of
+    /// every `start_streaming` invocation.
+    pub async fn register_stream(
+        &self,
+        session_id: SessionId,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let mut map = self.stream_cancel.lock().await;
+        if let Some(old_tx) = map.remove(&session_id) {
+            let _ = old_tx.send(());
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        map.insert(session_id, tx);
+        rx
     }
 
     pub fn emit(&self, event: Event) {
@@ -64,6 +88,14 @@ impl Engine {
             self.emit(Event::SessionDone(session.id));
         }
         self.emit(Event::OrchestratorRemoved(orchestrator_id.to_string()));
+        Ok(())
+    }
+
+    /// Kill the tmux session and delete it from the DB entirely.
+    pub async fn remove_session(&self, session_id: &str) -> anyhow::Result<()> {
+        let _ = crate::tmux::kill_session(session_id).await;
+        self.store.delete_session(session_id)?;
+        self.emit(Event::SessionDone(session_id.to_string()));
         Ok(())
     }
 
