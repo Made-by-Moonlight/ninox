@@ -107,6 +107,15 @@ fn shell_quote(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Brain configuration
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BrainConfig {
+    pub path: Option<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
 // App configuration
 // ---------------------------------------------------------------------------
 
@@ -130,6 +139,9 @@ pub struct AppConfig {
     /// Requires `repo` scope for private repos, `public_repo` for public.
     #[serde(default)]
     pub github_token: Option<String>,
+    /// Knowledge base (brain) configuration.
+    #[serde(default)]
+    pub brain: BrainConfig,
 }
 
 impl Default for AppConfig {
@@ -142,11 +154,22 @@ impl Default for AppConfig {
             orchestrator:     AgentConfig::default(),
             worker:           AgentConfig::default(),
             github_token:     None,
+            brain:            BrainConfig::default(),
         }
     }
 }
 
 impl AppConfig {
+    pub fn resolved_brain_path(&self) -> PathBuf {
+        if let Some(ref p) = self.brain.path {
+            return p.clone();
+        }
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("athene")
+            .join("brain")
+    }
+
     pub fn resolved_orchestrator_root(&self) -> PathBuf {
         self.orchestrator_root.clone().unwrap_or_else(|| {
             dirs::config_dir()

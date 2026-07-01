@@ -1,21 +1,23 @@
 use crate::routes::{
+    brain::brain_router,
     events::events_router,
     orchestrators::orchestrators_router,
     sessions::sessions_router,
     terminal::terminal_router,
 };
-use athene_core::events::Engine;
+use athene_core::{events::Engine, BrainIndex};
 use axum::Router;
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::cors::CorsLayer;
 
-pub async fn start(engine: Arc<Engine>, port: u16) -> anyhow::Result<()> {
+pub async fn start(engine: Arc<Engine>, brain: Arc<BrainIndex>, port: u16) -> anyhow::Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let app = Router::new()
         .nest("/api/v1/sessions", sessions_router(engine.clone()))
         .nest("/api/v1/sessions", terminal_router(engine.clone()))
         .nest("/api/v1/orchestrators", orchestrators_router(engine.clone()))
         .nest("/api/v1/events", events_router(engine.clone()))
+        .nest("/api/brain", brain_router(brain))
         .layer(CorsLayer::permissive());
     tracing::info!("athene listening on {addr}");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
