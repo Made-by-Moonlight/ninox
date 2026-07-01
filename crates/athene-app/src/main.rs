@@ -5,6 +5,7 @@ mod theme;
 use athene_core::{
     config::{AgentConfig, AppConfig},
     events::Engine,
+    github::resolve_token,
     lifecycle::poller::Poller,
     store::Store,
     tmux,
@@ -141,7 +142,10 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
         tracing::warn!("orchestrator root setup failed: {e}");
     }
 
-    let engine = Engine::new(store);
+    let engine = match resolve_token(config.github_token.clone()) {
+        Some(token) => Engine::new_with_github(Arc::clone(&store), token),
+        None        => Engine::new(Arc::clone(&store)),
+    };
     let token = CancellationToken::new();
 
     let poller = Poller::new(engine.clone());

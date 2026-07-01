@@ -1,4 +1,4 @@
-use crate::{store::Store, types::*};
+use crate::{github::GitHubClient, store::Store, types::*};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{broadcast, Mutex};
 
@@ -23,6 +23,8 @@ pub struct Engine {
     /// Per-session cancellation senders for active FIFO reader tasks.
     /// Sending () to the stored sender stops the running reader immediately.
     stream_cancel: Mutex<HashMap<SessionId, tokio::sync::oneshot::Sender<()>>>,
+    /// Optional GitHub API client. None when no token is configured.
+    pub github: Option<GitHubClient>,
 }
 
 impl Engine {
@@ -33,6 +35,19 @@ impl Engine {
             tx,
             pty_writers:   Mutex::new(HashMap::new()),
             stream_cancel: Mutex::new(HashMap::new()),
+            github:        None,
+        })
+    }
+
+    pub fn new_with_github(store: Arc<Store>, token: String) -> Arc<Self> {
+        let (tx, _) = broadcast::channel(256);
+        let github = GitHubClient::new(token).ok();
+        Arc::new(Self {
+            store,
+            tx,
+            pty_writers:   Mutex::new(HashMap::new()),
+            stream_cancel: Mutex::new(HashMap::new()),
+            github,
         })
     }
 
