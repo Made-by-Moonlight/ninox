@@ -134,6 +134,8 @@ pub struct SelectionState {
     /// Current end cell while dragging.
     end: Option<(usize, usize)>,
     dragging: bool,
+    /// Whether the cursor moved after the press (distinguishes click from drag).
+    moved: bool,
 }
 
 impl SelectionState {
@@ -163,6 +165,8 @@ impl SelectionState {
 pub struct TerminalWidget<'a> {
     pub state: &'a TerminalState,
     pub font_size: f32,
+    /// Known session IDs — a single click on a matching word navigates to that session.
+    pub session_ids: Vec<String>,
 }
 
 impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
@@ -191,13 +195,18 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                     state.anchor   = Some(cell);
                     state.end      = Some(cell);
                     state.dragging = true;
+                    state.moved    = false;
                 }
                 return (iced::widget::canvas::event::Status::Captured, None);
             }
 
             Event::Mouse(MouseEvent::CursorMoved { .. }) if state.dragging => {
                 if let Some(pos) = cursor.position_in(bounds) {
-                    state.end = Some(SelectionState::pixel_to_cell(pos.x, pos.y, cell_w, cell_h, cols, rows));
+                    let cell = SelectionState::pixel_to_cell(pos.x, pos.y, cell_w, cell_h, cols, rows);
+                    if state.anchor != Some(cell) {
+                        state.moved = true;
+                    }
+                    state.end = Some(cell);
                     self.state.cache.clear();
                 }
                 return (iced::widget::canvas::event::Status::Captured, None);
@@ -205,6 +214,23 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
 
             Event::Mouse(MouseEvent::ButtonReleased(Button::Left)) if state.dragging => {
                 state.dragging = false;
+                if !state.moved {
+                    // Single click — check for a session ID under the cursor.
+                    if let (Some((col, row)), Some(pos)) = (state.anchor, cursor.position_in(bounds)) {
+                        let _ = pos; // bounds-checked via anchor
+                        let word = word_at(self.state.term.grid(), col, row);
+                        if self.session_ids.iter().any(|id| id == &word) {
+                            state.anchor = None;
+                            state.end    = None;
+                            return (iced::widget::canvas::event::Status::Captured,
+                                    Some(Message::NavigateSession(word)));
+                        }
+                    }
+                    state.anchor = None;
+                    state.end    = None;
+                    return (iced::widget::canvas::event::Status::Captured, None);
+                }
+                // Drag — copy the selection.
                 let text = state.range().map(|((sc, sr), (ec, er))| {
                     extract_selection(&self.state.term, sc, sr, ec, er)
                 });
@@ -335,6 +361,36 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
 // ---------------------------------------------------------------------------
 // Text extraction
 // ---------------------------------------------------------------------------
+
+/// Extract the word (alphanumeric + hyphen) under a cell — used to detect
+/// session IDs like `worker-1782906415516` for click-to-navigate.
+pub fn word_at(grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>, col: usize, row: usize) -> String {
+    use alacritty_terminal::index::{Column, Line};
+
+    let cols = grid.columns();
+    let rows = grid.screen_lines();
+    if row >= rows || col >= cols { return String::new(); }
+
+    let is_word = |c: char| c.is_alphanumeric() || c == '-';
+
+    let mut start = col;
+    while start > 0 {
+        let c = grid[Line(row as i32)][Column(start - 1)].c;
+        if !is_word(c) && c != '\0' { break; }
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < cols {
+        let c = grid[Line(row as i32)][Column(end + 1)].c;
+        if !is_word(c) && c != '\0' { break; }
+        end += 1;
+    }
+
+    (start..=end).map(|c| {
+        let ch = grid[Line(row as i32)][Column(c)].c;
+        if ch == '\0' { ' ' } else { ch }
+    }).collect::<String>().trim().to_string()
+}
 
 pub fn extract_selection(
     term: &Term<EventProxy>,

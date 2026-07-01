@@ -140,17 +140,24 @@ pub fn session_detail<'a>(
 
     // ── Terminal pane ─────────────────────────────────────────────────────────
     let terminal_bg = s.terminal_bg;
+    let session_ids: Vec<String> = app.sessions.keys().cloned().collect();
     let terminal_pane: Element<Message> = if let Some(term_state) = app.terminals.get(session_id) {
         iced::widget::Canvas::new(TerminalWidget {
             state: term_state,
             font_size: 13.0,
+            session_ids,
         })
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
     } else {
+        use athene_core::types::SessionStatus;
+        let placeholder = match session.status {
+            SessionStatus::Terminated | SessionStatus::Done => "Session exited",
+            _ => "Terminal connecting…",
+        };
         container(
-            text("Terminal connecting…").size(13).color(s.text_muted),
+            text(placeholder).size(13).color(s.text_muted),
         )
         .width(Length::Fill)
         .height(Length::Fill)

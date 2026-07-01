@@ -328,6 +328,14 @@ impl App {
                         {
                             tracing::warn!("PTY (re)connect for {id}: {e}");
                         }
+                    } else {
+                        // Session's tmux process is gone — mark it terminated so the
+                        // UI shows "Session exited" instead of "Terminal connecting…".
+                        if let Ok(Some(mut s)) = engine.store.get_session(&id) {
+                            s.status = athene_core::types::SessionStatus::Terminated;
+                            let _ = engine.store.upsert_session(&s);
+                            engine.emit(athene_core::events::Event::SessionUpdated(s));
+                        }
                     }
                     Message::Noop
                 })
@@ -663,6 +671,12 @@ impl App {
                                 engine_pty.clone(), id.clone(), &id, cols, rows,
                             ).await {
                                 tracing::warn!("poll: pty connect for {id}: {e}");
+                            }
+                        } else {
+                            if let Ok(Some(mut s)) = engine_pty.store.get_session(&id) {
+                                s.status = athene_core::types::SessionStatus::Terminated;
+                                let _ = engine_pty.store.upsert_session(&s);
+                                engine_pty.emit(athene_core::events::Event::SessionUpdated(s));
                             }
                         }
                     }
