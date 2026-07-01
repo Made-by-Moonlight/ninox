@@ -126,6 +126,10 @@ pub struct AppConfig {
     /// Agent harness and model for worker sessions spawned by `athene spawn`.
     #[serde(default)]
     pub worker: AgentConfig,
+    /// GitHub personal access token. If absent, falls back to GITHUB_TOKEN env var.
+    /// Requires `repo` scope for private repos, `public_repo` for public.
+    #[serde(default)]
+    pub github_token: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -137,6 +141,7 @@ impl Default for AppConfig {
             orchestrator_root: None,
             orchestrator:     AgentConfig::default(),
             worker:           AgentConfig::default(),
+            github_token:     None,
         }
     }
 }
