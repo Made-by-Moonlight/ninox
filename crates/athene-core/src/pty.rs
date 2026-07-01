@@ -34,20 +34,21 @@ pub async fn start_streaming(
     cols:       u16,
     rows:       u16,
 ) -> Result<()> {
-    let path = fifo_path(&session_id);
+    // Cancel any previous FIFO reader for this session before setting up a new
+    // one.  This prevents the old reader from emitting stale events after the
+    // TerminalState has been cleared, which caused the garbled-terminal bug on
+    // every re-navigation.
+    let cancel_rx = engine.register_stream(session_id.clone()).await;
 
-    // Remove stale FIFO from a previous session with this ID.
+    let path = fifo_path(&session_id);
     let _ = std::fs::remove_file(&path);
 
-    // Create the FIFO.
     let status = tokio::process::Command::new("mkfifo")
         .arg(&path)
         .status()
         .await?;
     anyhow::ensure!(status.success(), "mkfifo {path} failed");
 
-    // Open the FIFO for non-blocking read.  O_NONBLOCK means `open()` returns
-    // immediately even though tmux hasn't opened the write end yet.
     let fifo_file = {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
@@ -56,27 +57,19 @@ pub async fn start_streaming(
             .open(&path)?
     };
 
-    // Tell tmux to stream pane output into the FIFO.
     tmux::pipe_pane(tmux_id, &path).await?;
 
-    // Resize tmux to target dimensions before capture_pane so the escape
-    // sequences in the capture reference the same column positions as the
-    // TerminalState grid.  Resizing also sends SIGWINCH to the running
-    // process, triggering a full screen redraw.
-    //
-    // The NavigateSession handler clears the TerminalState before calling
-    // start_streaming, so capture_pane always lands on a clean slate —
-    // the garbled-on-navigate issue no longer applies.
-    //
-    // Wait 500ms for the process to finish redrawing before capture_pane.
-    // 150ms was too short for Claude Code's TUI on slower machines.
+    // Resize + redraw.  500ms gives Claude Code's TUI time to finish repainting
+    // before capture_pane is called.
     let _ = tmux::resize_window(tmux_id, cols, rows).await;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let initial = tmux::capture_pane(tmux_id).await;
-    if !initial.is_empty() {
-        engine.emit(Event::TerminalOutput { session_id: session_id.clone(), bytes: initial });
-    }
+    // Emit clear-screen + capture so the TerminalState starts from a known-good
+    // snapshot.  The CLEAR ensures any residual content is wiped first.
+    let pane = tmux::capture_pane(tmux_id).await;
+    let mut initial = b"\x1b[2J\x1b[H".to_vec();
+    initial.extend_from_slice(&pane);
+    engine.emit(Event::TerminalOutput { session_id: session_id.clone(), bytes: initial });
 
     // --- Output task: FIFO → Event::TerminalOutput ---
     let engine_out = engine.clone();
@@ -95,28 +88,37 @@ pub async fn start_streaming(
             };
 
         let mut buf = vec![0u8; 4096];
+        // Pin cancel_rx so we can use it in select! across iterations.
+        tokio::pin!(cancel_rx);
         loop {
-            let mut guard = match async_fd.readable().await {
-                Ok(g) => g,
-                Err(_) => break,
-            };
-            let result = guard.try_io(|inner| {
-                use std::io::Read;
-                inner.get_ref().read(&mut buf)
-            });
-            match result {
-                Ok(Ok(0)) => break, // EOF: tmux session died / pipe-pane stopped
-                Ok(Ok(n)) => {
-                    engine_out.emit(Event::TerminalOutput {
-                        session_id: sid_out.clone(),
-                        bytes:      buf[..n].to_vec(),
+            tokio::select! {
+                biased;
+                // Stop immediately when a new start_streaming is called for this session.
+                _ = &mut cancel_rx => break,
+                guard_result = async_fd.readable() => {
+                    let mut guard = match guard_result {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+                    let result = guard.try_io(|inner| {
+                        use std::io::Read;
+                        inner.get_ref().read(&mut buf)
                     });
+                    match result {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => {
+                            engine_out.emit(Event::TerminalOutput {
+                                session_id: sid_out.clone(),
+                                bytes:      buf[..n].to_vec(),
+                            });
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!("FIFO read {sid_out}: {e}");
+                            break;
+                        }
+                        Err(_would_block) => {}
+                    }
                 }
-                Ok(Err(e)) => {
-                    tracing::error!("FIFO read {sid_out}: {e}");
-                    break;
-                }
-                Err(_would_block) => {} // guard cleared; wait for next readable()
             }
         }
         let _ = std::fs::remove_file(&path_out);
