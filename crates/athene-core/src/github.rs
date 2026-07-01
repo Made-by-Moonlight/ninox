@@ -241,9 +241,20 @@ pub fn split_repo(s: &str) -> Option<(String, String)> {
     Some((owner, repo))
 }
 
-/// Resolve GitHub token: prefer explicit config value, fall back to env var.
+/// Resolve GitHub token: config value → GITHUB_TOKEN env → `gh auth token`.
 pub fn resolve_token(config_token: Option<String>) -> Option<String> {
-    config_token.or_else(|| std::env::var("GITHUB_TOKEN").ok())
+    config_token
+        .or_else(|| std::env::var("GITHUB_TOKEN").ok())
+        .or_else(|| {
+            std::process::Command::new("gh")
+                .args(["auth", "token"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
 }
 
 #[cfg(test)]

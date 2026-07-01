@@ -139,23 +139,27 @@ async fn run_spawn(
     store.upsert_session(&session)?;
     println!("spawned {}", session.id);
 
-    let cmd = agent.worker_cmd(&prompt);
-
     let sessions_dir = athene_core::config::AppConfig::sessions_dir();
     std::fs::create_dir_all(&sessions_dir).ok();
     let sessions_dir_str = sessions_dir.to_string_lossy().to_string();
 
     let athene_bin = athene_core::config::AppConfig::athene_bin_dir();
-    let path_with_wrappers = format!(
-        "{}:{}",
-        athene_bin.display(),
-        std::env::var("PATH").unwrap_or_default()
+    let athene_bin_str = athene_bin.display().to_string();
+
+    // Prepend the athene bin dir inside the shell command rather than via tmux
+    // -e PATH=..., because the login shell (-l) sources rc files that may
+    // re-prepend Homebrew or nvm directories, pushing our wrapper behind the
+    // real `gh`. By exporting PATH here we win the race after rc files run.
+    let cmd_base = agent.worker_cmd(&prompt);
+    let cmd = format!(
+        "export PATH='{}':\"$PATH\"; {}",
+        athene_bin_str.replace('\'', "'\\''"),
+        cmd_base,
     );
 
     tmux::create_session(&id, &workspace, &cmd, &[
         ("ATHENE_SESSION",  &id),
         ("ATHENE_DATA_DIR", &sessions_dir_str),
-        ("PATH",            &path_with_wrappers),
     ]).await?;
 
     Ok(())
