@@ -30,6 +30,7 @@ pub struct SidebarState {
 pub enum View {
     FleetBoard { scope: Option<OrchestratorId> },
     SessionDetail { session_id: SessionId, panel: DetailPanel },
+    PrList,
 }
 
 impl Default for View {
@@ -104,6 +105,7 @@ pub enum Message {
     MouseReleased,
     CopyToClipboard(String),
     PollSessions,
+    NavigatePrList,
     ToggleNotifications,
     DismissNotification(String),
     DismissAllNotifications,
@@ -706,6 +708,11 @@ impl App {
                 })
             }
 
+            Message::NavigatePrList => {
+                state.view = View::PrList;
+                Task::none()
+            }
+
             Message::ToggleNotifications => {
                 state.sidebar.show_notifications = !state.sidebar.show_notifications;
                 Task::none()
@@ -829,6 +836,7 @@ impl App {
         use iced::widget::{container, row};
         use crate::components::{
             fleet_board::fleet_board,
+            pr_list::pr_list,
             session_detail::session_detail,
             sidebar::sidebar,
             spawn_modal::spawn_modal,
@@ -839,6 +847,7 @@ impl App {
         let main: Element<Message> = match &state.view {
             View::FleetBoard { scope } => fleet_board(state, scope.as_ref()),
             View::SessionDetail { session_id, panel } => session_detail(state, session_id, panel),
+            View::PrList => pr_list(state),
         };
 
         let base: Element<Message> = container(
@@ -1232,6 +1241,14 @@ mod tests {
         let terminated = board_sessions(&m, &SessionStatus::Terminated, None);
         assert_eq!(terminated.len(), 1);
         assert_eq!(terminated[0].id, "t1");
+    }
+
+    #[test]
+    fn navigate_pr_list_sets_view() {
+        let e = test_engine();
+        let m = base(e);
+        let (m2, _) = m.update(Message::NavigatePrList);
+        assert!(matches!(m2.view, View::PrList));
     }
 
     #[test]

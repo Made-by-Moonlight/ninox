@@ -79,6 +79,13 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
         "🔔".to_string()
     };
 
+    let pr_count = app.prs.len();
+    let prs_label = if pr_count > 0 {
+        format!("PRs ({})", pr_count)
+    } else {
+        "PRs".to_string()
+    };
+
     let header = container(
         row![
             text("⬡ Athene").size(13).color(s.text_primary),
@@ -94,6 +101,15 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
                 ..Default::default()
             })
             .padding([2, 4]),
+            button(text(prs_label.clone()).size(11).color(s.text_secondary))
+                .on_press(Message::NavigatePrList)
+                .style(move |_theme, _status| button::Style {
+                    background: None,
+                    text_color: s.text_secondary,
+                    border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
+                    ..Default::default()
+                })
+                .padding([2, 8]),
             button(text("+ Spawn").size(11).color(s.accent))
                 .on_press(Message::SpawnSession)
                 .style(move |_theme, _status| button::Style {
