@@ -232,16 +232,14 @@ impl App {
             terminal_rows:  50,
         };
 
-        // Capture terminal size for the async task (App::new runs before any
-        // WindowResized; the default 140×50 is used here and corrected once
-        // the first resize event fires).
-        let init_cols = app.terminal_cols;
-        let init_rows = app.terminal_rows;
-
-        // Asynchronously reconnect PTY streams for sessions whose tmux sessions
-        // are still live, and mark dead sessions as Terminated.
+        // Asynchronously mark dead sessions as Terminated.
+        // PTY streaming is NOT started here — we stream on demand when the user
+        // navigates to a session (NavigateSession).  Eagerly streaming at startup
+        // with the wrong default dimensions (140×50) creates competing FIFO readers
+        // that race with NavigateSession and re-populate state.terminals with
+        // wrong-dimension content, causing the garbled-terminal bug.
         let task = Task::future(async move {
-            use athene_core::{pty, tmux, Event as CoreEvent, SessionStatus};
+            use athene_core::{tmux, Event as CoreEvent, SessionStatus};
 
             let sessions = match engine.store.list_sessions() {
                 Ok(s) => s,
@@ -259,19 +257,7 @@ impl App {
                     continue;
                 }
 
-                if tmux::has_session(&session.id).await {
-                    if let Err(e) = pty::start_streaming(
-                        engine.clone(),
-                        session.id.clone(),
-                        &session.id,
-                        init_cols, init_rows,
-                    )
-                    .await
-                    {
-                        tracing::warn!("reconnect pty {}: {e}", session.id);
-                    }
-                } else {
-                    // Session is no longer running — mark it terminated.
+                if !tmux::has_session(&session.id).await {
                     let mut dead = session.clone();
                     dead.status = SessionStatus::Terminated;
                     let _ = engine.store.upsert_session(&dead);
@@ -645,40 +631,20 @@ impl App {
                 let to_clean_clone = to_clean.clone();
 
                 // Add genuinely new active sessions (spawned by athene spawn).
-                let engine_pty = state.engine.clone();
-                let cols = state.terminal_cols;
-                let rows = state.terminal_rows;
-                let mut new_ids: Vec<SessionId> = Vec::new();
+                // PTY streaming is NOT started here — NavigateSession handles that
+                // on demand with the correct window dimensions.
                 for session in db_sessions {
                     if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
                         continue;
                     }
                     if !state.sessions.contains_key(&session.id) {
-                        new_ids.push(session.id.clone());
                         state.sessions.insert(session.id.clone(), session);
                     }
                 }
 
                 Task::future(async move {
-                    // Delete cleaned-up orphans from DB.
                     for id in to_clean_clone {
                         let _ = engine_clean.store.delete_session(&id);
-                    }
-                    // Start PTY streaming for newly discovered sessions.
-                    for id in new_ids {
-                        if athene_core::tmux::has_session(&id).await {
-                            if let Err(e) = athene_core::pty::start_streaming(
-                                engine_pty.clone(), id.clone(), &id, cols, rows,
-                            ).await {
-                                tracing::warn!("poll: pty connect for {id}: {e}");
-                            }
-                        } else {
-                            if let Ok(Some(mut s)) = engine_pty.store.get_session(&id) {
-                                s.status = athene_core::types::SessionStatus::Terminated;
-                                let _ = engine_pty.store.upsert_session(&s);
-                                engine_pty.emit(athene_core::events::Event::SessionUpdated(s));
-                            }
-                        }
                     }
                     Message::Noop
                 })
