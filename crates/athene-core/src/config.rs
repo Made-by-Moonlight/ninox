@@ -61,14 +61,32 @@ impl AgentConfig {
         }
     }
 
-    /// Non-interactive command for a worker session.
+    /// Launch command for a worker session.
     pub fn worker_cmd(&self, prompt: &str) -> String {
         let binary = harness_binary(&self.harness);
         let quoted = shell_quote(prompt);
-        let flag   = print_flag(&self.harness);
-        match &self.model {
-            Some(m) => format!("{binary} --model {m} {flag} {quoted}"),
-            None    => format!("{binary} {flag} {quoted}"),
+        match self.harness.as_str() {
+            "claude-code" => {
+                // Interactive mode with positional prompt: the full agent TUI is
+                // visible in the terminal and the agent runs autonomously.
+                // --dangerously-skip-permissions allows tool calls without approval.
+                let model_part = self.model.as_deref()
+                    .map(|m| format!(" --model {}", shell_quote(m)))
+                    .unwrap_or_default();
+                format!("{binary} --dangerously-skip-permissions{model_part} -- {quoted}")
+            }
+            "aider" => {
+                let model_part = self.model.as_deref()
+                    .map(|m| format!(" --model {}", shell_quote(m)))
+                    .unwrap_or_default();
+                format!("{binary}{model_part} --message {quoted}")
+            }
+            _ => {
+                let model_part = self.model.as_deref()
+                    .map(|m| format!(" --model {}", shell_quote(m)))
+                    .unwrap_or_default();
+                format!("{binary}{model_part} -p {quoted}")
+            }
         }
     }
 }
@@ -83,12 +101,6 @@ fn harness_binary(harness: &str) -> &str {
     }
 }
 
-fn print_flag(harness: &str) -> &str {
-    match harness {
-        "aider"  => "--message",
-        _        => "-p",
-    }
-}
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -209,7 +221,19 @@ mod tests {
     #[test]
     fn worker_cmd_codex() {
         let cfg = AgentConfig { harness: "codex".into(), model: Some("gpt-4o".into()) };
-        assert_eq!(cfg.worker_cmd("do the thing"), "codex --model gpt-4o -p 'do the thing'");
+        assert_eq!(cfg.worker_cmd("do the thing"), "codex --model 'gpt-4o' -p 'do the thing'");
+    }
+
+    #[test]
+    fn worker_cmd_claude_code() {
+        let cfg = AgentConfig { harness: "claude-code".into(), model: None };
+        assert_eq!(cfg.worker_cmd("Fix the bug"), "claude --dangerously-skip-permissions -- 'Fix the bug'");
+    }
+
+    #[test]
+    fn worker_cmd_claude_code_with_model() {
+        let cfg = AgentConfig { harness: "claude-code".into(), model: Some("claude-opus-4-5".into()) };
+        assert_eq!(cfg.worker_cmd("do task"), "claude --dangerously-skip-permissions --model 'claude-opus-4-5' -- 'do task'");
     }
 
     #[test]
