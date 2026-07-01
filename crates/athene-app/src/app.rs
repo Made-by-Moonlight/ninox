@@ -80,6 +80,7 @@ pub enum Message {
     SpawnFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
     RemoveOrchestrator(OrchestratorId),
+    RemoveSession(SessionId),
     SwitchTheme(ThemeVariant),
     ToggleThemePopout,
     // Raw key event from the global subscription — bytes are computed in the handler
@@ -482,9 +483,12 @@ impl App {
                 {
                     state.view = View::FleetBoard { scope: None };
                 }
-                // Remove from in-memory state immediately.
+                // Remove the orchestrator, its workers, and its own session from in-memory state.
                 state.orchestrators.retain(|o| o.id != id);
-                state.sessions.retain(|_, s| s.orchestrator_id.as_deref() != Some(id.as_str()));
+                state.sessions.retain(|k, s| {
+                    k != &id && s.orchestrator_id.as_deref() != Some(id.as_str())
+                });
+                state.terminals.remove(&id);
                 if state.sidebar.selected_orchestrator.as_deref() == Some(id.as_str()) {
                     state.sidebar.selected_orchestrator = None;
                 }
@@ -492,6 +496,21 @@ impl App {
                 Task::future(async move {
                     if let Err(e) = engine.remove_orchestrator(&id).await {
                         tracing::error!("remove orchestrator {id}: {e}");
+                    }
+                    Message::Noop
+                })
+            }
+
+            Message::RemoveSession(id) => {
+                if matches!(&state.view, View::SessionDetail { session_id, .. } if session_id == &id) {
+                    state.view = View::FleetBoard { scope: None };
+                }
+                state.sessions.remove(&id);
+                state.terminals.remove(&id);
+                let engine = state.engine.clone();
+                Task::future(async move {
+                    if let Err(e) = engine.remove_session(&id).await {
+                        tracing::error!("remove session {id}: {e}");
                     }
                     Message::Noop
                 })

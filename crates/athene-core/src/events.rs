@@ -67,6 +67,14 @@ impl Engine {
         Ok(())
     }
 
+    /// Kill the tmux session and delete it from the DB entirely.
+    pub async fn remove_session(&self, session_id: &str) -> anyhow::Result<()> {
+        let _ = crate::tmux::kill_session(session_id).await;
+        self.store.delete_session(session_id)?;
+        self.emit(Event::SessionDone(session_id.to_string()));
+        Ok(())
+    }
+
     /// Kill the tmux session, mark it Terminated in the DB, and emit SessionUpdated.
     pub async fn terminate_session(&self, session_id: &str) -> anyhow::Result<()> {
         // Best-effort tmux kill (session may already be dead).
