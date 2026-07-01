@@ -34,7 +34,17 @@ const COLUMNS: &[Column] = &[
     Column { label: "Review",    status: SessionStatus::ReviewPending },
     Column { label: "Mergeable", status: SessionStatus::Mergeable },
     Column { label: "Done",      status: SessionStatus::Done },
+    Column { label: "Terminated", status: SessionStatus::Terminated },
 ];
+
+pub fn board_sessions<'a>(app: &'a App, status: &SessionStatus) -> Vec<&'a Session> {
+    let mut sessions: Vec<&Session> = app.sessions
+        .values()
+        .filter(|s| &s.status == status)
+        .collect();
+    sessions.sort_by(|a, b| a.name.cmp(&b.name));
+    sessions
+}
 
 fn session_card<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
     let s = &app.scheme;
@@ -128,9 +138,9 @@ pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Eleme
     let kanban_cols: Vec<Element<Message>> = COLUMNS
         .iter()
         .map(|col| {
-            let cards: Vec<Element<Message>> = sessions
+            let col_sessions = board_sessions(app, &col.status);
+            let cards: Vec<Element<Message>> = col_sessions
                 .iter()
-                .filter(|s| s.status == col.status)
                 .map(|s| session_card(app, s))
                 .collect();
             kanban_column(app, col.label, cards)

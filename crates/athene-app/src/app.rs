@@ -1081,6 +1081,10 @@ mod tests {
             spawn_modal:    None,
             terminal_cols:  140,
             terminal_rows:  50,
+            window_width:   0.0,
+            sidebar_width:  0.0,
+            info_width:     0.0,
+            drag:           None,
         }
     }
 
@@ -1179,5 +1183,25 @@ mod tests {
         assert_eq!(app.orchestrators.len(), 1);
         assert_eq!(app.sessions.len(), 1);
         assert!(app.sessions.contains_key("s1"));
+    }
+
+    #[test]
+    fn terminated_session_visible_in_board() {
+        use crate::components::fleet_board::board_sessions;
+        let e = test_engine();
+        let mut m = base(e);
+        let s = Session {
+            id: "t1".into(), orchestrator_id: None, name: "ended".into(),
+            repo: "r".into(), status: SessionStatus::Terminated,
+            agent_type: "c".into(), cost_usd: 0.42,
+            started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None,
+        };
+        let (m2, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        m = m2;
+        // board_sessions(app, status) returns sessions with that status
+        let terminated = board_sessions(&m, &SessionStatus::Terminated);
+        assert_eq!(terminated.len(), 1);
+        assert_eq!(terminated[0].id, "t1");
     }
 }
