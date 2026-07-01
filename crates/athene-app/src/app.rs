@@ -698,12 +698,11 @@ impl App {
                 let orch_ids: std::collections::HashSet<&str> =
                     state.orchestrators.iter().map(|o| o.id.as_str()).collect();
 
-                // Remove standalone terminated/done sessions from state and DB —
-                // these are orphaned leftovers that no longer need to be visible.
+                // Remove terminated/done sessions from state and DB — includes
+                // both standalone sessions and workers under orchestrators.
                 let to_clean: Vec<SessionId> = state.sessions.values()
                     .filter(|s| {
                         matches!(s.status, SessionStatus::Done | SessionStatus::Terminated)
-                        && s.orchestrator_id.is_none()
                         && !orch_ids.contains(s.id.as_str())
                     })
                     .map(|s| s.id.clone())
@@ -1306,6 +1305,36 @@ mod tests {
         let terminated = board_sessions(&m, &SessionStatus::Terminated, None);
         assert_eq!(terminated.len(), 1);
         assert_eq!(terminated[0].id, "t1");
+    }
+
+    #[test]
+    fn poll_sessions_removes_done_worker_from_sidebar() {
+        let e = test_engine();
+        let mut m = base(e);
+
+        // Set up an orchestrator
+        let o = Orchestrator { id: "o1".into(), name: "orch".into(), created_at: 0 };
+        let _ = m.engine.store.upsert_orchestrator(&o);
+        let (next, _) = m.update(Message::EngineEvent(Event::OrchestratorSpawned(o)));
+        m = next;
+
+        // Worker session under the orchestrator, already Done
+        let worker = Session {
+            id: "w1".into(), orchestrator_id: Some("o1".into()), name: "worker".into(),
+            repo: "r".into(), status: SessionStatus::Done,
+            agent_type: "c".into(), cost_usd: 0.0,
+            started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None,
+        };
+        let _ = m.engine.store.upsert_session(&worker);
+        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(worker)));
+        m = next;
+        assert!(m.sessions.contains_key("w1"), "worker should be present before poll");
+
+        // PollSessions should clean up the done worker
+        let (next, _) = m.update(Message::PollSessions);
+        m = next;
+        assert!(!m.sessions.contains_key("w1"), "done worker must be removed by PollSessions");
     }
 
     #[test]
