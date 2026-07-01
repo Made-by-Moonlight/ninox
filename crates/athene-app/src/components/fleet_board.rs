@@ -4,6 +4,7 @@ use iced::{
 };
 
 use crate::app::{App, Message};
+use crate::components::filter_bar::filter_bar;
 use athene_core::types::{OrchestratorId, Session, SessionStatus};
 
 fn repo_short(repo: &str) -> &str {
@@ -37,20 +38,28 @@ const COLUMNS: &[Column] = &[
     Column { label: "Terminated", status: SessionStatus::Terminated },
 ];
 
+pub fn filtered_sessions<'a>(app: &'a App) -> Vec<&'a Session> {
+    let q = app.fleet_filter.query.to_lowercase();
+    app.sessions.values().filter(|s| {
+        q.is_empty()
+            || s.name.to_lowercase().contains(&q)
+            || s.repo.to_lowercase().contains(&q)
+    }).collect()
+}
+
 pub fn board_sessions<'a>(
     app: &'a App,
     status: &SessionStatus,
     scope: Option<&str>,
 ) -> Vec<&'a Session> {
-    let mut sessions: Vec<&Session> = app.sessions
-        .values()
-        .filter(|s| {
-            &s.status == status
-                && scope.map_or(true, |oid| {
-                    s.orchestrator_id.as_deref() == Some(oid)
-                })
-        })
-        .collect();
+    let q = app.fleet_filter.query.to_lowercase();
+    let mut sessions: Vec<&Session> = app.sessions.values().filter(|s| {
+        &s.status == status
+            && scope.map_or(true, |oid| s.orchestrator_id.as_deref() == Some(oid))
+            && (q.is_empty()
+                || s.name.to_lowercase().contains(&q)
+                || s.repo.to_lowercase().contains(&q))
+    }).collect();
     sessions.sort_by(|a, b| a.name.cmp(&b.name));
     sessions
 }
@@ -227,11 +236,13 @@ pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Eleme
     .width(Length::Fill);
 
     let banner = attention_banner(app);
+    let bar = filter_bar(app);
     let mut col_children: Vec<Element<Message>> = Vec::new();
     col_children.push(header.into());
     if let Some(b) = banner {
         col_children.push(b);
     }
+    col_children.push(bar);
     col_children.push(board.into());
 
     column(col_children)

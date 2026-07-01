@@ -26,6 +26,11 @@ pub struct SidebarState {
     pub show_notifications:    bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct FleetFilter {
+    pub query: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum View {
     FleetBoard { scope: Option<OrchestratorId> },
@@ -68,6 +73,7 @@ pub struct App {
     pub sidebar_width:   f32,
     pub info_width:      f32,
     pub drag:            Option<DragTarget>,
+    pub fleet_filter:    FleetFilter,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +116,8 @@ pub enum Message {
     DismissNotification(String),
     DismissAllNotifications,
     NavigateNotification(SessionId),
+    FleetFilterQuery(String),
+    ClearFleetFilter,
     Noop,
 }
 
@@ -258,6 +266,7 @@ impl App {
             sidebar_width:  220.0,
             info_width:     300.0,
             drag:           None,
+            fleet_filter:   FleetFilter::default(),
         };
 
         // Asynchronously mark dead sessions as Terminated.
@@ -737,6 +746,15 @@ impl App {
                 Task::none()
             }
 
+            Message::FleetFilterQuery(q) => {
+                state.fleet_filter.query = q;
+                Task::none()
+            }
+            Message::ClearFleetFilter => {
+                state.fleet_filter = FleetFilter::default();
+                Task::none()
+            }
+
             Message::Noop => Task::none(),
         }
     }
@@ -1123,6 +1141,7 @@ mod tests {
             sidebar_width:  0.0,
             info_width:     0.0,
             drag:           None,
+            fleet_filter:   FleetFilter::default(),
         }
     }
 
@@ -1333,5 +1352,27 @@ mod tests {
             m = next;
         }
         assert_eq!(attention_count(&m), 2); // ci_failed + review_pending
+    }
+
+    #[test]
+    fn fleet_filter_matches_session_name() {
+        use crate::components::fleet_board::filtered_sessions;
+        let e = test_engine();
+        let mut m = base(e);
+        for (id, name) in [("s1", "auth-fix"), ("s2", "payment-bug"), ("s3", "auth-refactor")] {
+            let s = Session {
+                id: id.into(), orchestrator_id: None, name: name.into(),
+                repo: "r".into(), status: SessionStatus::Working,
+                agent_type: "c".into(), cost_usd: 0.0,
+                started_at: 0, pr_number: None, pr_id: None,
+                workspace_path: None, pid: None,
+            };
+            let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+            m = next;
+        }
+        let (m2, _) = m.update(Message::FleetFilterQuery("auth".into()));
+        let sessions = filtered_sessions(&m2);
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().all(|s| s.name.contains("auth")));
     }
 }
