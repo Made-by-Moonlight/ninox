@@ -134,6 +134,20 @@ impl Engine {
         }
         Ok(())
     }
+
+    /// Kill the tmux session (best-effort) and mark it Done in the DB.
+    /// Called automatically when a PR is merged. Emits SessionUpdated.
+    pub async fn cleanup_session(&self, session_id: &str) -> anyhow::Result<()> {
+        // Best-effort tmux kill — session may already be dead.
+        let _ = crate::tmux::kill_session(session_id).await;
+
+        if let Some(mut session) = self.store.get_session(session_id)? {
+            session.status = crate::types::SessionStatus::Done;
+            self.store.upsert_session(&session)?;
+            self.emit(Event::SessionUpdated(session));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +184,32 @@ mod tests {
         let evt = rx.recv().await.unwrap();
         if let Event::SessionUpdated(s) = evt {
             assert!(matches!(s.status, crate::types::SessionStatus::Terminated));
+        } else {
+            panic!("expected SessionUpdated");
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_session_sets_done_status() {
+        let store = Arc::new(
+            Store::open(tempdir().unwrap().keep().join("t.db")).unwrap()
+        );
+        let session = crate::types::Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: crate::types::SessionStatus::PrOpen,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: Some(1), pr_id: Some(1),
+            workspace_path: None, pid: None,
+        };
+        store.upsert_session(&session).unwrap();
+        let engine = Engine::new(Arc::clone(&store));
+        let mut rx = engine.subscribe();
+
+        engine.cleanup_session("s1").await.unwrap();
+
+        let evt = rx.recv().await.unwrap();
+        if let Event::SessionUpdated(s) = evt {
+            assert!(matches!(s.status, crate::types::SessionStatus::Done));
         } else {
             panic!("expected SessionUpdated");
         }

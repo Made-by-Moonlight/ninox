@@ -112,6 +112,26 @@ impl Poller {
             let _ = self.engine.store.upsert_pr(&pr);
             self.engine.emit(Event::PrOpened { session_id: session.id.clone(), pr });
 
+            // -- Merge detection — handle before CI (no point polling CI on merged PR) --
+            if pr_status.merged && !matches!(session.status, SessionStatus::Done) {
+                self.engine.emit(Event::Notification(Notification {
+                    id:         format!("merged-{}", session.id),
+                    kind:       NotificationKind::WorkerDone,
+                    title:      format!("PR merged — {}", session.name),
+                    body:       format!("#{} merged successfully", pr_number),
+                    session_id: Some(session.id.clone()),
+                }));
+                if let Err(e) = self.engine.cleanup_session(&session.id).await {
+                    tracing::warn!("cleanup_session {}: {e}", session.id);
+                }
+                // Remove enrichment state for this session — it's done
+                {
+                    let mut cache = self.enrichment_cache.lock().unwrap();
+                    cache.remove(&session.id);
+                }
+                continue; // skip further enrichment for this session
+            }
+
             // -- CI checks --
             let checks = match gh.get_ci_checks(&owner, &repo, pr_number).await {
                 Ok(c)  => c,
