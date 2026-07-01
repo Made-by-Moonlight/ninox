@@ -1,13 +1,17 @@
 use std::{collections::{HashMap, VecDeque}, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 
 use athene_core::{
+    config::{AppConfig, ThemeVariant},
     events::{Engine, Event},
     types::*,
 };
 use iced::{Element, Subscription, Task, Theme};
 use tokio::sync::broadcast;
 
-use crate::components::{session_detail::DetailPanel, spawn_modal::SpawnForm, terminal::TerminalState};
+use crate::{
+    components::{session_detail::DetailPanel, spawn_modal::SpawnForm, terminal::TerminalState},
+    theme::{from_variant, ColorScheme},
+};
 
 const MAX_NOTIFICATIONS: usize = 50;
 
@@ -18,6 +22,7 @@ const MAX_NOTIFICATIONS: usize = 50;
 #[derive(Debug, Clone, Default)]
 pub struct SidebarState {
     pub selected_orchestrator: Option<OrchestratorId>,
+    pub show_theme_popout:     bool,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +43,9 @@ impl Default for View {
 
 pub struct App {
     pub engine:          Arc<Engine>,
+    pub config:          AppConfig,
+    pub scheme:          ColorScheme,
+    pub active_variant:  ThemeVariant,
     pub orchestrators:   Vec<Orchestrator>,
     pub sessions:        HashMap<SessionId, Session>,
     pub prs:             HashMap<PrId, PR>,
@@ -70,6 +78,8 @@ pub enum Message {
     SpawnFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
     RemoveOrchestrator(OrchestratorId),
+    SwitchTheme(ThemeVariant),
+    ToggleThemePopout,
     // Raw key event from the global subscription — bytes are computed in the handler
     // where we have access to the terminal mode (APP_CURSOR changes arrow sequences).
     RawKey {
@@ -188,8 +198,15 @@ impl App {
             .map(|s| (s.id.clone(), s))
             .collect();
 
+        let config = AppConfig::load().unwrap_or_default();
+        let scheme = from_variant(config.theme);
+        let active_variant = config.theme;
+
         let app = Self {
             engine:         engine.clone(),
+            config,
+            scheme,
+            active_variant,
             orchestrators,
             sessions,
             prs:            HashMap::new(),
@@ -517,6 +534,22 @@ impl App {
             }
 
 
+            Message::ToggleThemePopout => {
+                state.sidebar.show_theme_popout = !state.sidebar.show_theme_popout;
+                Task::none()
+            }
+
+            Message::SwitchTheme(variant) => {
+                state.active_variant = variant;
+                state.scheme = from_variant(variant);
+                state.config.theme = variant;
+                state.sidebar.show_theme_popout = false;
+                if let Err(e) = state.config.save() {
+                    tracing::error!("failed to save theme config: {e}");
+                }
+                Task::none()
+            }
+
             Message::Noop => Task::none(),
         }
     }
@@ -597,54 +630,34 @@ impl App {
 
     /// View — sidebar + fleet board or session detail.
     pub fn iced_view(state: &Self) -> Element<'_, Message> {
-        use iced::widget::{column, container, row};
+        use iced::widget::{container, row};
         use crate::components::{
             fleet_board::fleet_board,
             session_detail::session_detail,
             sidebar::sidebar,
             spawn_modal::spawn_modal,
         };
-        use crate::theme::{BG_BASE, BG_SURFACE, TEXT_MUTED};
-        use iced::{Background, Border, Length};
+        use iced::{Background, Length};
 
-        let titlebar = container(
-            iced::widget::text("⬡ Athene")
-                .size(13)
-                .color(TEXT_MUTED),
-        )
-        .padding([6, 16])
-        .width(Length::Fill)
-        .style(move |_theme| container::Style {
-            background: Some(Background::Color(BG_SURFACE)),
-            border: Border {
-                color: crate::theme::BORDER,
-                width: 0.0,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        });
-
+        let bg = state.scheme.bg_base;
         let main: Element<Message> = match &state.view {
             View::FleetBoard { scope } => fleet_board(state, scope.as_ref()),
             View::SessionDetail { session_id, panel } => session_detail(state, session_id, panel),
         };
 
         let base: Element<Message> = container(
-            column![
-                titlebar,
-                row![sidebar(state), main].height(Length::Fill),
-            ]
+            row![sidebar(state), main].height(Length::Fill),
         )
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(Background::Color(BG_BASE)),
+            background: Some(Background::Color(bg)),
             ..Default::default()
         })
         .into();
 
         if let Some(form) = &state.spawn_modal {
-            iced::widget::stack![base, spawn_modal(form)].into()
+            iced::widget::stack![base, spawn_modal(form, &state.scheme)].into()
         } else {
             base
         }
@@ -675,8 +688,8 @@ impl App {
     }
 
     /// Theme accessor for the iced `.theme()` builder.
-    pub fn theme(_state: &Self) -> Theme {
-        crate::theme::athene_theme()
+    pub fn theme(state: &Self) -> Theme {
+        state.scheme.iced_theme()
     }
 }
 
@@ -709,6 +722,9 @@ mod tests {
     fn base(engine: Arc<Engine>) -> App {
         App {
             engine,
+            config:         AppConfig::default(),
+            scheme:         from_variant(ThemeVariant::Dark),
+            active_variant: ThemeVariant::Dark,
             orchestrators:  vec![],
             sessions:       HashMap::new(),
             prs:            HashMap::new(),

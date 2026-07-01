@@ -3,12 +3,7 @@ use iced::{
     Alignment, Background, Border, Color, Element, Length,
 };
 
-use crate::{
-    app::{App, Message},
-    theme::{
-        BG_ELEVATED, BG_SURFACE, BORDER, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
-    },
-};
+use crate::app::{App, Message};
 use athene_core::types::{OrchestratorId, Session, SessionStatus};
 
 fn repo_short(repo: &str) -> &str {
@@ -21,11 +16,7 @@ fn status_dot(color: Color) -> Element<'static, Message> {
         .height(Length::Fixed(8.0))
         .style(move |_theme| container::Style {
             background: Some(Background::Color(color)),
-            border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius: 4.0.into(),
-            },
+            border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 4.0.into() },
             ..Default::default()
         })
         .into()
@@ -37,16 +28,17 @@ struct Column {
 }
 
 const COLUMNS: &[Column] = &[
-    Column { label: "Working",    status: SessionStatus::Working },
-    Column { label: "PR Open",    status: SessionStatus::PrOpen },
-    Column { label: "CI Failed",  status: SessionStatus::CiFailed },
-    Column { label: "Review",     status: SessionStatus::ReviewPending },
-    Column { label: "Mergeable",  status: SessionStatus::Mergeable },
-    Column { label: "Done",       status: SessionStatus::Done },
+    Column { label: "Working",   status: SessionStatus::Working },
+    Column { label: "PR Open",   status: SessionStatus::PrOpen },
+    Column { label: "CI Failed", status: SessionStatus::CiFailed },
+    Column { label: "Review",    status: SessionStatus::ReviewPending },
+    Column { label: "Mergeable", status: SessionStatus::Mergeable },
+    Column { label: "Done",      status: SessionStatus::Done },
 ];
 
-fn session_card<'a>(session: &'a Session) -> Element<'a, Message> {
-    let color = crate::theme::status_color(&session.status);
+fn session_card<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
+    let s = &app.scheme;
+    let color = s.status_color(&session.status);
     let session_id = session.id.clone();
     let cost = format!("${:.2}", session.cost_usd);
 
@@ -55,39 +47,34 @@ fn session_card<'a>(session: &'a Session) -> Element<'a, Message> {
             row![
                 status_dot(color),
                 Space::new(6, 0),
-                text(&session.name).size(12).color(TEXT_PRIMARY),
+                text(&session.name).size(12).color(s.text_primary),
             ]
             .align_y(Alignment::Center),
-            text(repo_short(&session.repo))
-                .size(11)
-                .color(TEXT_SECONDARY),
-            text(cost).size(11).color(TEXT_MUTED),
+            text(repo_short(&session.repo)).size(11).color(s.text_secondary),
+            text(cost).size(11).color(s.text_muted),
         ]
         .spacing(3)
         .padding(8),
     )
     .on_press(Message::NavigateSession(session_id))
-    .style(|_theme, _status| button::Style {
-        background: Some(Background::Color(BG_ELEVATED)),
-        text_color: TEXT_PRIMARY,
-        border: Border {
-            color: BORDER,
-            width: 1.0,
-            radius: 6.0.into(),
-        },
+    .style(move |_theme, _status| button::Style {
+        background: Some(Background::Color(s.bg_elevated)),
+        text_color: s.text_primary,
+        border: Border { color: s.border, width: 1.0, radius: 6.0.into() },
         ..Default::default()
     })
     .width(Length::Fixed(180.0))
     .into()
 }
 
-fn kanban_column<'a>(label: &'static str, cards: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+fn kanban_column<'a>(app: &'a App, label: &'static str, cards: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+    let s = &app.scheme;
     let count = cards.len();
     let header = container(
         row![
-            text(label).size(12).color(TEXT_MUTED),
+            text(label).size(12).color(s.text_muted),
             Space::new(Length::Fill, 0),
-            text(count.to_string()).size(11).color(TEXT_MUTED),
+            text(count.to_string()).size(11).color(s.text_muted),
         ]
         .align_y(Alignment::Center),
     )
@@ -102,20 +89,17 @@ fn kanban_column<'a>(label: &'static str, cards: Vec<Element<'a, Message>>) -> E
     container(column![header, body])
         .width(Length::Fixed(200.0))
         .height(Length::Fill)
-        .style(|_theme| container::Style {
-            background: Some(Background::Color(BG_SURFACE)),
-            border: Border {
-                color: BORDER,
-                width: 1.0,
-                radius: 8.0.into(),
-            },
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(s.bg_surface)),
+            border: Border { color: s.border, width: 1.0, radius: 8.0.into() },
             ..Default::default()
         })
         .into()
 }
 
 pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Element<'a, Message> {
-    // Filter sessions by scope
+    let s = &app.scheme;
+
     let sessions: Vec<&Session> = app
         .sessions
         .values()
@@ -132,33 +116,27 @@ pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Eleme
 
     let header = container(
         row![
-            text(scope_label).size(16).color(TEXT_PRIMARY),
+            text(scope_label).size(16).color(s.text_primary),
             Space::new(8, 0),
-            text(format!("({} workers)", sessions.len()))
-                .size(13)
-                .color(TEXT_MUTED),
+            text(format!("({} workers)", sessions.len())).size(13).color(s.text_muted),
         ]
         .align_y(Alignment::Center),
     )
     .padding([14, 20])
     .width(Length::Fill);
 
-    // Build kanban columns
     let kanban_cols: Vec<Element<Message>> = COLUMNS
         .iter()
         .map(|col| {
             let cards: Vec<Element<Message>> = sessions
                 .iter()
                 .filter(|s| s.status == col.status)
-                .map(|s| session_card(s))
+                .map(|s| session_card(app, s))
                 .collect();
-            kanban_column(col.label, cards)
+            kanban_column(app, col.label, cards)
         })
         .collect();
 
-    // Use with_direction directly: calling scrollable() defaults to vertical and
-    // validates immediately, panicking because the row's height is Fill (from
-    // kanban columns with height(Fill)).
     let board = scrollable::Scrollable::with_direction(
         row(kanban_cols).spacing(12).padding(20u16),
         scrollable::Direction::Horizontal(scrollable::Scrollbar::default()),

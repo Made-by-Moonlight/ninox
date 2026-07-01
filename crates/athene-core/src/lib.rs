@@ -7,7 +7,7 @@ pub mod store;
 pub mod tmux;
 pub mod types;
 
-pub use config::AppConfig;
+pub use config::{AppConfig, ThemeVariant};
 pub use events::{Engine, Event};
 pub use store::Store;
 pub use types::*;
