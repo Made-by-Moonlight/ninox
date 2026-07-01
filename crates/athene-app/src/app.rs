@@ -550,6 +550,8 @@ impl App {
                 let cell_h    = font_size * 1.4;
                 let sidebar_w = 220.0f32;
                 let header_h  = 80.0f32;
+                // iced_winit converts Resized to logical pixels before emitting,
+                // so size.width/height are already in logical (device-independent) pixels.
                 let cols = ((size.width  - sidebar_w).max(200.0) / cell_w) as u16;
                 let rows = ((size.height - header_h ).max(100.0) / cell_h) as u16;
 
