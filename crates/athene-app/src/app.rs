@@ -118,6 +118,7 @@ pub enum Message {
     NavigateNotification(SessionId),
     FleetFilterQuery(String),
     ClearFleetFilter,
+    ScrollTerminal { session_id: SessionId, delta: i32 },
     Noop,
 }
 
@@ -560,7 +561,8 @@ impl App {
             Message::RawKey { key, modifiers, text } => {
                 if let View::SessionDetail {
                     session_id,
-                    panel: crate::components::session_detail::DetailPanel::Terminal,
+                    panel: crate::components::session_detail::DetailPanel::Terminal
+                        | crate::components::session_detail::DetailPanel::Split,
                 } = &state.view {
                     let app_cursor = state.terminals.get(session_id)
                         .map(|t| t.term.mode().contains(
@@ -752,6 +754,13 @@ impl App {
             }
             Message::ClearFleetFilter => {
                 state.fleet_filter = FleetFilter::default();
+                Task::none()
+            }
+
+            Message::ScrollTerminal { session_id, delta } => {
+                if let Some(term) = state.terminals.get_mut(&session_id) {
+                    term.scroll(delta);
+                }
                 Task::none()
             }
 

@@ -146,10 +146,11 @@ pub fn session_detail<'a>(
     let session_ids: Vec<String> = app.sessions.keys().cloned().collect();
     let terminal_pane: Element<Message> = if let Some(term_state) = app.terminals.get(session_id) {
         iced::widget::Canvas::new(TerminalWidget {
-            state: term_state,
-            font_size: 13.0,
-            terminal_bg: s.terminal_bg,
-            terminal_fg: s.terminal_fg,
+            state:        term_state,
+            session_id:   session_id.to_string(),
+            font_size:    13.0,
+            terminal_bg:  s.terminal_bg,
+            terminal_fg:  s.terminal_fg,
             cursor_color: s.accent,
             session_ids,
         })

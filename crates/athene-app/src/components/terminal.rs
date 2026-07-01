@@ -165,8 +165,9 @@ impl SelectionState {
 
 /// A view of a `TerminalState` that can be used as an iced Canvas widget.
 pub struct TerminalWidget<'a> {
-    pub state: &'a TerminalState,
-    pub font_size: f32,
+    pub state:       &'a TerminalState,
+    pub session_id:  String,
+    pub font_size:   f32,
     pub terminal_bg: IcedColor,
     pub terminal_fg: IcedColor,
     pub cursor_color: IcedColor,
@@ -256,6 +257,21 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                 return (iced::widget::canvas::event::Status::Captured, Some(msg));
             }
 
+            Event::Mouse(MouseEvent::WheelScrolled { delta }) => {
+                use iced::mouse::ScrollDelta;
+                // Positive y = scroll up (into history). Convert to integer line delta.
+                let lines = match delta {
+                    ScrollDelta::Lines { y, .. }  => (*y * 3.0) as i32,
+                    ScrollDelta::Pixels { y, .. } => (*y / cell_h) as i32,
+                };
+                if lines != 0 {
+                    return (
+                        iced::widget::canvas::event::Status::Captured,
+                        Some(Message::ScrollTerminal { session_id: self.session_id.clone(), delta: lines }),
+                    );
+                }
+            }
+
             _ => {}
         }
 
@@ -279,7 +295,8 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
         let colors = term.colors();
         let cols = grid.columns();
         let rows = grid.screen_lines();
-        let cursor_point = grid.cursor.point;
+        let cursor_point   = grid.cursor.point;
+        let display_offset = grid.display_offset() as i32;
 
         let term_bg = self.terminal_bg;
         let term_fg = self.terminal_fg;
@@ -290,12 +307,13 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
             let bg_all = Path::rectangle(iced::Point::ORIGIN, bounds.size());
             frame.fill(&bg_all, term_bg);
 
-            // Render each cell.
+            // Render each cell. When scrolled into history, shift line indices by
+            // display_offset so Line(0 - offset) accesses the history buffer.
             for row in 0..rows {
                 for col in 0..cols {
                     use alacritty_terminal::index::{Column, Line};
 
-                    let line = Line(row as i32);
+                    let line   = Line(row as i32 - display_offset);
                     let column = Column(col);
                     let cell = &grid[line][column];
 
@@ -443,6 +461,13 @@ impl TerminalState {
             cache: Cache::new(),
             parser: Processor::new(),
         }
+    }
+
+    /// Scroll the terminal display by `delta` lines (positive = up into history).
+    pub fn scroll(&mut self, delta: i32) {
+        use alacritty_terminal::grid::Scroll;
+        self.term.grid_mut().scroll_display(Scroll::Delta(delta));
+        self.cache.clear();
     }
 }
 
