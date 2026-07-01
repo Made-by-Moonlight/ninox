@@ -40,17 +40,7 @@ pub async fn start_streaming(
     // every re-navigation.
     let cancel_rx = engine.register_stream(session_id.clone()).await;
 
-    // ── Phase 1: resize + snapshot ────────────────────────────────────────────
-    // Do this BEFORE setting up the FIFO so the FIFO only captures output that
-    // arrives AFTER the snapshot.  Without this ordering, pre-SIGWINCH output
-    // buffered in the FIFO (at old dimensions) is applied on top of the snapshot
-    // and garbles the terminal.
-    let _ = tmux::resize_window(tmux_id, cols, rows).await;
-    // Give Claude Code's TUI time to finish its SIGWINCH-triggered full repaint.
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    let pane = tmux::capture_pane(tmux_id).await;
-
-    // ── Phase 2: FIFO setup ───────────────────────────────────────────────────
+    // ── FIFO setup ────────────────────────────────────────────────────────────
     let path = fifo_path(&session_id);
     let _ = std::fs::remove_file(&path);
 
@@ -68,15 +58,21 @@ pub async fn start_streaming(
             .open(&path)?
     };
 
-    // pipe_pane set up after the snapshot: FIFO receives only new incremental output.
     tmux::pipe_pane(tmux_id, &path).await?;
 
-    // ── Phase 3: emit snapshot ────────────────────────────────────────────────
-    // CLEAR + capture lands on the fresh TerminalState; any residual content from
-    // a cancelled old reader is wiped before the snapshot is applied.
-    let mut initial = b"\x1b[2J\x1b[H".to_vec();
-    initial.extend_from_slice(&pane);
-    engine.emit(Event::TerminalOutput { session_id: session_id.clone(), bytes: initial });
+    // ── Force SIGWINCH via bounce resize ──────────────────────────────────────
+    // Unlike Zed (which owns a direct PTY stream and never needs a snapshot),
+    // we reconnect to an already-running tmux session.  We must force a full
+    // repaint so the FIFO receives a clean screen — no capture_pane needed.
+    //
+    // A "bounce" resize (cols→cols-1→cols) guarantees SIGWINCH even when the
+    // terminal was already at `cols` rows.  The process redraws twice and
+    // settles at the correct size.  The FIFO stream is the single source of
+    // truth for the TerminalState — no snapshot races, no ordering conflicts.
+    let bounce = cols.saturating_sub(1).max(2);
+    let _ = tmux::resize_window(tmux_id, bounce, rows).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    let _ = tmux::resize_window(tmux_id, cols, rows).await;
 
     // --- Output task: FIFO → Event::TerminalOutput ---
     let engine_out = engine.clone();
