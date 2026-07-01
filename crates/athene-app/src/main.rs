@@ -117,11 +117,15 @@ async fn run_spawn(
     let orchestrator_id = orchestrator_id
         .or_else(|| std::env::var("ATHENE_ORCHESTRATOR_ID").ok());
 
+    // Derive the GitHub repo slug from the workspace's git remote so that
+    // poll_github can call the GitHub API with the correct owner/repo.
+    let repo = repo_from_workspace(&workspace).unwrap_or_default();
+
     let session = Session {
         id:              id.clone(),
         orchestrator_id,
         name,
-        repo:            workspace.clone(),
+        repo,
         status:          SessionStatus::Working,
         agent_type:      agent.harness.clone(),
         cost_usd:        0.0,
@@ -256,6 +260,21 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
 
     token.cancel();
     Ok(())
+}
+
+/// Read `git remote get-url origin` from the workspace and parse it as a
+/// GitHub slug (`owner/repo`). Returns `None` if git fails or the URL is not
+/// a recognisable GitHub remote.
+fn repo_from_workspace(workspace: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["-C", workspace, "remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    athene_core::github::split_repo(&url).map(|(o, r)| format!("{o}/{r}"))
 }
 
 fn default_db_path() -> PathBuf {

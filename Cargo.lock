@@ -411,6 +411,7 @@ dependencies = [
  "clap",
  "dirs 5.0.1",
  "iced",
+ "libc",
  "notify-rust",
  "serde_json",
  "tempfile",
