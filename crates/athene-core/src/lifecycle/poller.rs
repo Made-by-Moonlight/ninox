@@ -86,7 +86,7 @@ impl Poller {
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
 
         for session in sessions {
-            if matches!(session.status, SessionStatus::Terminated) {
+            if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
                 continue;
             }
             let Some(pr_number) = session.pr_number else { continue };
@@ -122,12 +122,11 @@ impl Poller {
             self.engine.emit(Event::CiUpdated { pr_id, status: ci.clone() });
 
             // -- Detect CI transition and update session status --
-            let new_status = derive_session_status(&session.status, &pr_status, &ci);
             let (newly_failing, ci_reaction_already_sent) = {
                 let mut cache = self.enrichment_cache.lock().unwrap();
                 let state = cache.entry(session.id.clone()).or_default();
 
-                let newly_failing = (state.prev_failing == Some(0))
+                let newly_failing = state.prev_failing.map_or(true, |p| p == 0)
                     && ci.failing > 0;
                 state.prev_failing = Some(ci.failing);
 
@@ -151,19 +150,13 @@ impl Poller {
                 }));
             }
 
-            // Update session status in DB
-            let mut updated = session.clone();
-            updated.status = new_status;
-            if updated.status != session.status {
-                let _ = self.engine.store.upsert_session(&updated);
-                self.engine.emit(Event::SessionUpdated(updated.clone()));
-            }
-
             // -- Review threads (throttled via seen_comment_ids) --
             let threads = match gh.get_review_threads(&owner, &repo, pr_number).await {
                 Ok(t)  => t,
                 Err(e) => { tracing::warn!("github review threads: {e}"); vec![] }
             };
+
+            let has_changes_requested = threads.iter().any(|t| t.state == "CHANGES_REQUESTED");
 
             let (has_new, review_reaction_already_sent) = {
                 let mut cache = self.enrichment_cache.lock().unwrap();
@@ -195,12 +188,20 @@ impl Poller {
                     state.review_reaction_sent = true;
                 }
                 // Reset when all CHANGES_REQUESTED are resolved
-                let has_pending = threads.iter().any(|t| t.state == "CHANGES_REQUESTED");
-                if !has_pending {
+                if !has_changes_requested {
                     state.review_reaction_sent = false;
                 }
                 (has_new, already_sent)
             };
+
+            // Update session status in DB (after review threads so has_changes_requested is known)
+            let new_status = derive_session_status(&session.status, &pr_status, &ci, has_changes_requested);
+            let mut updated = session.clone();
+            updated.status = new_status;
+            if updated.status != session.status {
+                let _ = self.engine.store.upsert_session(&updated);
+                self.engine.emit(Event::SessionUpdated(updated.clone()));
+            }
 
             if has_new && !review_reaction_already_sent {
                 self.engine.emit(Event::Notification(Notification {
@@ -231,18 +232,23 @@ fn summarize_checks(pr_id: PrId, checks: &[CheckRun]) -> CIStatus {
 }
 
 fn derive_session_status(
-    current:   &SessionStatus,
-    pr_status: &crate::github::PrStatus,
-    ci:        &CIStatus,
+    current:               &SessionStatus,
+    pr_status:             &crate::github::PrStatus,
+    ci:                    &CIStatus,
+    has_changes_requested: bool,
 ) -> SessionStatus {
-    if pr_status.merged {
-        return SessionStatus::Done;
-    }
+    // Terminal states are never overwritten.
     if matches!(current, SessionStatus::Done | SessionStatus::Terminated) {
         return current.clone();
     }
+    if pr_status.merged {
+        return SessionStatus::Done;
+    }
     if ci.failing > 0 {
         return SessionStatus::CiFailed;
+    }
+    if has_changes_requested {
+        return SessionStatus::ReviewPending;
     }
     if pr_status.mergeable == Some(true) && ci.failing == 0 && ci.pending == 0 {
         return SessionStatus::Mergeable;
@@ -276,7 +282,7 @@ mod tests {
             title: "t".into(), number: 1,
         };
         let ci = CIStatus { pr_id: 1, total: 0, failing: 0, passing: 0, pending: 0 };
-        let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci);
+        let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, false);
         assert!(matches!(s, SessionStatus::Done));
     }
 
@@ -287,7 +293,7 @@ mod tests {
             title: "t".into(), number: 1,
         };
         let ci = CIStatus { pr_id: 1, total: 3, failing: 1, passing: 2, pending: 0 };
-        let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci);
+        let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, false);
         assert!(matches!(s, SessionStatus::CiFailed));
     }
 
@@ -298,7 +304,7 @@ mod tests {
             title: "t".into(), number: 1,
         };
         let ci = CIStatus { pr_id: 1, total: 3, failing: 0, passing: 3, pending: 0 };
-        let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci);
+        let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, false);
         assert!(matches!(s, SessionStatus::Mergeable));
     }
 
@@ -309,18 +315,29 @@ mod tests {
             title: "t".into(), number: 1,
         };
         let ci = CIStatus { pr_id: 1, total: 0, failing: 0, passing: 0, pending: 0 };
-        let s  = derive_session_status(&SessionStatus::Done, &pr, &ci);
+        let s  = derive_session_status(&SessionStatus::Done, &pr, &ci, false);
         assert!(matches!(s, SessionStatus::Done));
     }
 
     #[test]
     fn derive_status_preserves_terminated() {
         let pr = crate::github::PrStatus {
-            merged: false, state: "open".into(), mergeable: None,
+            merged: true, state: "closed".into(), mergeable: None,   // merged=true!
             title: "t".into(), number: 1,
         };
-        let ci = CIStatus { pr_id: 1, total: 0, failing: 5, passing: 0, pending: 0 };
-        let s  = derive_session_status(&SessionStatus::Terminated, &pr, &ci);
-        assert!(matches!(s, SessionStatus::Terminated));
+        let ci = CIStatus { pr_id: 1, total: 0, failing: 0, passing: 0, pending: 0 };
+        let s  = derive_session_status(&SessionStatus::Terminated, &pr, &ci, false);
+        assert!(matches!(s, SessionStatus::Terminated));  // must not become Done
+    }
+
+    #[test]
+    fn derive_status_changes_requested_becomes_review_pending() {
+        let pr = crate::github::PrStatus {
+            merged: false, state: "open".into(), mergeable: Some(true),
+            title: "t".into(), number: 1,
+        };
+        let ci = CIStatus { pr_id: 1, total: 3, failing: 0, passing: 3, pending: 0 };
+        let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, true);
+        assert!(matches!(s, SessionStatus::ReviewPending));
     }
 }
