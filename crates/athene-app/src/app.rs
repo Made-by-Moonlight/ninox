@@ -178,7 +178,11 @@ fn key_to_terminal_bytes(
         Key::Named(Named::End)        => b"\x1b[F".to_vec(),
         Key::Named(Named::PageUp)     => b"\x1b[5~".to_vec(),
         Key::Named(Named::PageDown)   => b"\x1b[6~".to_vec(),
-        Key::Character(c)             => c.as_str().as_bytes().to_vec(),
+        // Prefer `text` (the actual typed character, shift-resolved) over `c`
+        // (the base logical key). On some platforms Key::Character holds the
+        // unshifted key, so Shift+backtick would give c="`" instead of "~".
+        Key::Character(c)             => text.map(|t| t.as_bytes().to_vec())
+                                             .unwrap_or_else(|| c.as_str().as_bytes().to_vec()),
         _ => text.map(|t| t.as_bytes().to_vec()).unwrap_or_default(),
     };
     if bytes.is_empty() { None } else { Some(bytes) }
@@ -299,8 +303,8 @@ impl App {
                     session_id: id.clone(),
                     panel: DetailPanel::default(),
                 };
-                // Capture current terminal dimensions (if a TerminalState exists) so
-                // start_streaming can resize tmux to match before calling capture_pane.
+                // Capture current terminal dimensions before resetting so start_streaming
+                // resizes tmux to match.
                 let (cols, rows) = state.terminals.get(&id)
                     .map(|t| {
                         use alacritty_terminal::grid::Dimensions;
@@ -310,6 +314,10 @@ impl App {
                         )
                     })
                     .unwrap_or((state.terminal_cols, state.terminal_rows));
+                // Reset the terminal grid so capture_pane output is applied to a clean
+                // slate. Without this, capture_pane (which has no cursor-home sequence)
+                // renders on top of stale cursor state and garbles the output.
+                state.terminals.remove(&id);
                 let engine = state.engine.clone();
                 Task::future(async move {
                     if athene_core::tmux::has_session(&id).await {
