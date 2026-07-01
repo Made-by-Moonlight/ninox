@@ -4,7 +4,7 @@ use iced::{
 };
 
 use crate::{
-    app::{App, Message},
+    app::{App, DragTarget, Message},
     components::{info_panel::info_panel, terminal::TerminalWidget},
 };
 
@@ -139,6 +139,9 @@ pub fn session_detail<'a>(
         iced::widget::Canvas::new(TerminalWidget {
             state: term_state,
             font_size: 13.0,
+            terminal_bg: s.terminal_bg,
+            terminal_fg: s.terminal_fg,
+            cursor_color: s.accent,
         })
         .width(Length::Fill)
         .height(Length::Fill)
@@ -166,10 +169,11 @@ pub fn session_detail<'a>(
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
 
+    let info_width = app.info_width;
     let info_pane: Element<Message> = container(
         info_panel(session, pr, ci, comments, s),
     )
-    .width(Length::FillPortion(1))
+    .width(Length::Fixed(info_width))
     .height(Length::Fill)
     .style(move |_theme| container::Style {
         background: Some(Background::Color(s.bg_surface)),
@@ -190,12 +194,13 @@ pub fn session_detail<'a>(
             .into(),
         DetailPanel::Split => row![
             container(terminal_pane)
-                .width(Length::FillPortion(2))
+                .width(Length::Fill)
                 .height(Length::Fill)
                 .style(move |_theme| container::Style {
                     background: Some(Background::Color(terminal_bg)),
                     ..Default::default()
                 }),
+            App::drag_handle(DragTarget::InfoPanel, s.border),
             info_pane,
         ]
         .height(Length::Fill)

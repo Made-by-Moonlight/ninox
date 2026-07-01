@@ -59,9 +59,22 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    #[cfg(target_os = "macos")]
+    let window_settings = iced::window::Settings {
+        platform_specific: iced::window::settings::PlatformSpecific {
+            title_hidden: true,
+            titlebar_transparent: true,
+            fullsize_content_view: true,
+        },
+        ..Default::default()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let window_settings = iced::window::Settings::default();
+
     iced::application("Athene", app::App::iced_update, app::App::iced_view)
         .subscription(app::App::subscription)
         .theme(app::App::theme)
+        .window(window_settings)
         .run_with(move || app::App::new(engine))?;
 
     token.cancel();
