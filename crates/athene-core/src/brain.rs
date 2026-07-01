@@ -347,8 +347,8 @@ fn parse_frontmatter(text: &str) -> Frontmatter {
                 let mut seq = Vec::new();
                 while let Some(next) = lines.peek() {
                     let t = next.trim();
-                    if t.starts_with("- ") {
-                        seq.push(t[2..].trim().to_string());
+                    if let Some(stripped) = t.strip_prefix("- ") {
+                        seq.push(stripped.trim().to_string());
                         lines.next();
                     } else {
                         break;

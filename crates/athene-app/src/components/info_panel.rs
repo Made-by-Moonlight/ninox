@@ -1,5 +1,5 @@
 use iced::{
-    widget::{column, container, scrollable, text, Space},
+    widget::{column, container, rich_text, scrollable, span, text, Space},
     Background, Border, Element, Length,
 };
 
@@ -32,7 +32,13 @@ pub fn info_panel<'a>(
                     column![
                         text(pr_title).size(14).color(s.text_primary),
                         Space::new(0, 4),
-                        text(pr.url.as_str()).size(11).color(s.accent),
+                        rich_text![
+                            span(pr.url.as_str())
+                                .color(s.accent)
+                                .underline(true)
+                                .link(Message::OpenUrl(pr.url.to_string()))
+                        ]
+                        .size(11),
                     ],
                 )
                 .width(Length::Fill)

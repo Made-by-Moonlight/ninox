@@ -38,7 +38,8 @@ const COLUMNS: &[Column] = &[
     Column { label: "Terminated", status: SessionStatus::Terminated },
 ];
 
-pub fn filtered_sessions<'a>(app: &'a App) -> Vec<&'a Session> {
+#[cfg(test)]
+pub fn filtered_sessions(app: &App) -> Vec<&Session> {
     let q = app.fleet_filter.query.to_lowercase();
     app.sessions.values().filter(|s| {
         q.is_empty()
@@ -53,15 +54,38 @@ pub fn board_sessions<'a>(
     scope: Option<&str>,
 ) -> Vec<&'a Session> {
     let q = app.fleet_filter.query.to_lowercase();
+    let orch_ids: std::collections::HashSet<&str> =
+        app.orchestrators.iter().map(|o| o.id.as_str()).collect();
     let mut sessions: Vec<&Session> = app.sessions.values().filter(|s| {
         &s.status == status
-            && scope.map_or(true, |oid| s.orchestrator_id.as_deref() == Some(oid))
+            && !orch_ids.contains(s.id.as_str())
+            && scope.is_none_or(|oid| s.orchestrator_id.as_deref() == Some(oid))
             && (q.is_empty()
                 || s.name.to_lowercase().contains(&q)
                 || s.repo.to_lowercase().contains(&q))
     }).collect();
     sessions.sort_by(|a, b| a.name.cmp(&b.name));
     sessions
+}
+
+fn tab_chip<'a>(app: &'a App, label: &'a str, msg: Message, is_active: bool) -> Element<'a, Message> {
+    let s = &app.scheme;
+    let accent       = s.accent;
+    let bg_elevated  = s.bg_elevated;
+    let border       = s.border;
+    let text_secondary = s.text_secondary;
+    button(
+        text(label).size(12).color(if is_active { Color::WHITE } else { text_secondary })
+    )
+    .on_press(msg)
+    .padding([4, 10])
+    .style(move |_theme, _status| button::Style {
+        background: Some(Background::Color(if is_active { accent } else { bg_elevated })),
+        text_color: if is_active { Color::WHITE } else { text_secondary },
+        border: Border { color: border, width: 1.0, radius: 4.0.into() },
+        ..Default::default()
+    })
+    .into()
 }
 
 fn session_card<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
@@ -132,6 +156,9 @@ pub fn attention_count(app: &App) -> usize {
 }
 
 fn attention_banner<'a>(app: &'a App) -> Option<Element<'a, Message>> {
+    if attention_count(app) == 0 {
+        return None;
+    }
     let s = &app.scheme;
     let ci_count = app.sessions.values()
         .filter(|s| matches!(s.status, SessionStatus::CiFailed))
@@ -139,10 +166,6 @@ fn attention_banner<'a>(app: &'a App) -> Option<Element<'a, Message>> {
     let review_count = app.sessions.values()
         .filter(|s| matches!(s.status, SessionStatus::ReviewPending))
         .count();
-
-    if ci_count == 0 && review_count == 0 {
-        return None;
-    }
 
     let mut parts: Vec<String> = Vec::new();
     if ci_count > 0 {
@@ -192,30 +215,49 @@ fn attention_banner<'a>(app: &'a App) -> Option<Element<'a, Message>> {
 pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Element<'a, Message> {
     let s = &app.scheme;
 
-    let sessions: Vec<&Session> = app
-        .sessions
-        .values()
-        .filter(|s| match scope {
-            Some(orch_id) => s.orchestrator_id.as_ref() == Some(orch_id),
-            None => true,
-        })
-        .collect();
-
-    let scope_label = scope
-        .and_then(|id| app.orchestrators.iter().find(|o| &o.id == id))
-        .map(|o| o.name.as_str())
-        .unwrap_or("All workers");
+    let orch_ids: std::collections::HashSet<&str> =
+        app.orchestrators.iter().map(|o| o.id.as_str()).collect();
+    let worker_count = app.sessions.values().filter(|sess| {
+        !orch_ids.contains(sess.id.as_str())
+            && match scope {
+                Some(oid) => sess.orchestrator_id.as_ref() == Some(oid),
+                None => true,
+            }
+    }).count();
 
     let header = container(
         row![
-            text(scope_label).size(16).color(s.text_primary),
+            text("Fleet").size(16).color(s.text_primary),
             Space::new(8, 0),
-            text(format!("({} workers)", sessions.len())).size(13).color(s.text_muted),
+            text(format!("({} workers)", worker_count)).size(13).color(s.text_muted),
         ]
         .align_y(Alignment::Center),
     )
     .padding([14, 20])
     .width(Length::Fill);
+
+    // Orchestrator filter tabs — only render when there are orchestrators
+    let tabs: Option<Element<Message>> = if !app.orchestrators.is_empty() {
+        let mut chips: Vec<Element<Message>> = Vec::new();
+        chips.push(tab_chip(app, "All", Message::NavigateFleet { scope: None }, scope.is_none()));
+        for orch in &app.orchestrators {
+            let is_active = scope.map(|id| id == &orch.id).unwrap_or(false);
+            chips.push(tab_chip(
+                app,
+                &orch.name,
+                Message::NavigateFleet { scope: Some(orch.id.clone()) },
+                is_active,
+            ));
+        }
+        Some(
+            container(row(chips).spacing(6))
+                .padding([4, 20])
+                .width(Length::Fill)
+                .into(),
+        )
+    } else {
+        None
+    };
 
     let kanban_cols: Vec<Element<Message>> = COLUMNS
         .iter()
@@ -239,6 +281,9 @@ pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Eleme
     let bar = filter_bar(app);
     let mut col_children: Vec<Element<Message>> = Vec::new();
     col_children.push(header.into());
+    if let Some(t) = tabs {
+        col_children.push(t);
+    }
     if let Some(b) = banner {
         col_children.push(b);
     }

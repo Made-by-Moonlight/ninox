@@ -34,18 +34,13 @@ fn panel_btn<'a>(app: &'a App, label: &'static str, target: DetailPanel, active:
 }
 
 /// Panel selection — which view is active in session detail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DetailPanel {
     Terminal,
+    #[default]
     Split,
     Info,
     Inspector,
-}
-
-impl Default for DetailPanel {
-    fn default() -> Self {
-        DetailPanel::Split
-    }
 }
 
 /// Session detail view — header + panel toggle + terminal canvas.
@@ -80,8 +75,9 @@ pub fn session_detail<'a>(
             ..Default::default()
         });
 
+    let back_scope = app.last_fleet_scope.clone();
     let back_btn = button(text("← Fleet").size(12).color(s.text_secondary))
-        .on_press(Message::NavigateFleet { scope: None })
+        .on_press(Message::NavigateFleet { scope: back_scope })
         .style(|_theme, _status| button::Style {
             background: None,
             text_color: s.text_secondary,
@@ -242,7 +238,7 @@ pub fn session_detail<'a>(
         .height(Length::Fill)
         .into(),
         DetailPanel::Info => info_pane,
-        DetailPanel::Inspector => inspector_panel(app, session).into(),
+        DetailPanel::Inspector => inspector_panel(app, session),
     };
 
     column![header, content]

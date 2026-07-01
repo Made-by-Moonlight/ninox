@@ -191,7 +191,7 @@ mod tests {
 
     fn test_engine() -> Arc<Engine> {
         let store =
-            Arc::new(Store::open(tempdir().unwrap().into_path().join("t.db")).unwrap());
+            Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
         Engine::new(store)
     }
 

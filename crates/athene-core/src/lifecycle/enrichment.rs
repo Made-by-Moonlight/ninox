@@ -44,15 +44,13 @@ mod tests {
 
     #[test]
     fn ci_transition_detected() {
-        let mut state = EnrichmentState::default();
-        // First cycle: 0 failures
-        state.prev_failing = Some(0);
+        let mut state = EnrichmentState { prev_failing: Some(0), ..Default::default() };
         // Second cycle: 2 failures — this is a new failure
-        let is_new_failure = state.prev_failing.map_or(false, |prev| prev == 0) && 2 > 0;
+        let is_new_failure = (state.prev_failing == Some(0)) && 2 > 0;
         assert!(is_new_failure);
         state.prev_failing = Some(2);
         // Third cycle: still 2 failures — not a new failure
-        let is_new_failure2 = state.prev_failing.map_or(false, |prev| prev == 0) && 2 > 0;
+        let is_new_failure2 = (state.prev_failing == Some(0)) && 2 > 0;
         assert!(!is_new_failure2);
     }
 }

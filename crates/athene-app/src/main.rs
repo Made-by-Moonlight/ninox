@@ -7,6 +7,7 @@ use athene_core::{
     events::Engine,
     github::resolve_token,
     lifecycle::poller::Poller,
+    slugify,
     store::Store,
     tmux,
     types::{Session, SessionStatus},
@@ -44,6 +45,13 @@ enum Command {
         /// Orchestrator session ID (read from ATHENE_ORCHESTRATOR_ID if not supplied)
         #[arg(long)]
         orchestrator_id: Option<String>,
+    },
+    /// Send a text message to a session's terminal (injected as keyboard input)
+    Send {
+        /// Target session ID
+        session_id: String,
+        /// Message text to inject (Enter is sent automatically)
+        message: String,
     },
     /// Knowledge base operations
     Brain {
@@ -97,6 +105,9 @@ async fn main() -> anyhow::Result<()> {
             let config = AppConfig::load().unwrap_or_default();
             run_spawn(store, config.worker, prompt, workspace, name, orchestrator_id).await
         }
+        Some(Command::Send { session_id, message }) => {
+            athene_core::tmux::send_keys(&session_id, &message).await
+        }
         Some(Command::Brain { action }) => {
             run_brain(action).await
         }
@@ -117,32 +128,30 @@ async fn run_spawn(
         .unwrap_or_default()
         .as_millis() as i64;
 
-    let id = format!("worker-{ts}");
-    let name = name.unwrap_or_else(|| first_words(&prompt, 4));
+    // Use the supplied name (slugified) as the session ID so orchestrators can
+    // address workers directly by a human-readable name (e.g. "ath-123-auth").
+    // Falls back to a timestamp-based ID when no name is provided.
+    let id = name.as_deref()
+        .map(slugify)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("worker-{ts}"));
+    let display_name = name.unwrap_or_else(|| first_words(&prompt, 4));
     let orchestrator_id = orchestrator_id
         .or_else(|| std::env::var("ATHENE_ORCHESTRATOR_ID").ok());
+
+    // Create an isolated git worktree so workers don't share a branch.
+    // Falls back to the shared workspace if the repo check fails (e.g. not git).
+    let effective_workspace = match create_worker_worktree(&workspace, &id).await {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!("worktree creation failed for {id}, using shared workspace: {e}");
+            workspace.clone()
+        }
+    };
 
     // Derive the GitHub repo slug from the workspace's git remote so that
     // poll_github can call the GitHub API with the correct owner/repo.
     let repo = repo_from_workspace(&workspace).unwrap_or_default();
-
-    let session = Session {
-        id:              id.clone(),
-        orchestrator_id,
-        name,
-        repo,
-        status:          SessionStatus::Working,
-        agent_type:      agent.harness.clone(),
-        cost_usd:        0.0,
-        started_at:      ts,
-        pr_number:       None,
-        pr_id:           None,
-        workspace_path:  Some(workspace.clone()),
-        pid:             None,
-    };
-
-    store.upsert_session(&session)?;
-    println!("spawned {}", session.id);
 
     let sessions_dir = athene_core::config::AppConfig::sessions_dir();
     std::fs::create_dir_all(&sessions_dir).ok();
@@ -151,21 +160,64 @@ async fn run_spawn(
     let athene_bin = athene_core::config::AppConfig::athene_bin_dir();
     let athene_bin_str = athene_bin.display().to_string();
 
+    let orch_id_env = orchestrator_id.as_deref().unwrap_or("").to_string();
+
+    // Append worker context so every agent knows its session ID, its
+    // orchestrator's ID, and how to communicate back when done or stuck.
+    let mut effective_prompt = prompt;
+    if !orch_id_env.is_empty() {
+        effective_prompt.push_str(&format!(
+            "\n\n---\n\
+             Athene session `{id}` · orchestrator `{orch_id}`\n\n\
+             **Goal:** complete the task and open a pull request.\n\n\
+             To message the orchestrator (e.g. when stuck or when the PR is open):\n\
+             ```bash\n\
+             {bin} send {orch_id} \"<your message>\"\n\
+             ```\n\
+             Report back when: (a) you are blocked and need a decision, \
+             or (b) the PR is open and the task is done.",
+            orch_id = orch_id_env,
+            bin = athene_bin_str,
+        ));
+    }
+
+    let session = Session {
+        id:              id.clone(),
+        orchestrator_id,
+        name:            display_name,
+        repo,
+        status:          SessionStatus::Working,
+        agent_type:      agent.harness.clone(),
+        cost_usd:        0.0,
+        started_at:      ts,
+        pr_number:       None,
+        pr_id:           None,
+        workspace_path:  Some(effective_workspace.clone()),
+        pid:             None,
+    };
+
+    store.upsert_session(&session)?;
+    println!("spawned {}", session.id);
+
     // Prepend the athene bin dir inside the shell command rather than via tmux
     // -e PATH=..., because the login shell (-l) sources rc files that may
     // re-prepend Homebrew or nvm directories, pushing our wrapper behind the
     // real `gh`. By exporting PATH here we win the race after rc files run.
-    let cmd_base = agent.worker_cmd(&prompt);
+    let cmd_base = agent.worker_cmd(&effective_prompt);
     let cmd = format!(
         "export PATH='{}':\"$PATH\"; {}",
         athene_bin_str.replace('\'', "'\\''"),
         cmd_base,
     );
 
-    tmux::create_session(&id, &workspace, &cmd, &[
+    let mut env_vec: Vec<(&str, &str)> = vec![
         ("ATHENE_SESSION",  &id),
         ("ATHENE_DATA_DIR", &sessions_dir_str),
-    ]).await?;
+    ];
+    if !orch_id_env.is_empty() {
+        env_vec.push(("ATHENE_ORCHESTRATOR_ID", &orch_id_env));
+    }
+    tmux::create_session(&id, &effective_workspace, &cmd, &env_vec).await?;
 
     Ok(())
 }
@@ -303,7 +355,51 @@ fn first_words(s: &str, n: usize) -> String {
 
 fn has_display() -> bool {
     #[cfg(target_os = "macos")]
-    { return true; }
+    { true }
     #[cfg(not(target_os = "macos"))]
     { std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok() }
+}
+
+/// Create an isolated git worktree for a worker session at
+/// `{repo}/.claude/worktrees/{session_id}` on a new branch `{session_id}`.
+///
+/// Returns the worktree path on success. If the branch name already exists
+/// (e.g. a previous run with the same name), the existing branch is checked
+/// out rather than creating a new one.
+async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Result<String> {
+    use tokio::process::Command;
+    use anyhow::Context as _;
+
+    let worktree_path = std::path::Path::new(repo)
+        .join(".claude")
+        .join("worktrees")
+        .join(session_id);
+    let worktree_str = worktree_path.to_string_lossy().to_string();
+
+    // Attempt 1: create a fresh branch named after the session.
+    let out = Command::new("git")
+        .args(["-C", repo, "worktree", "add", &worktree_str, "-b", session_id])
+        .output()
+        .await
+        .context("git worktree add")?;
+
+    if out.status.success() {
+        return Ok(worktree_str);
+    }
+
+    // Attempt 2: branch already exists — check it out without -b.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("already exists") {
+        let out2 = Command::new("git")
+            .args(["-C", repo, "worktree", "add", &worktree_str, session_id])
+            .output()
+            .await
+            .context("git worktree add (existing branch)")?;
+        if out2.status.success() {
+            return Ok(worktree_str);
+        }
+        anyhow::bail!("{}", String::from_utf8_lossy(&out2.stderr).trim());
+    }
+
+    anyhow::bail!("{}", stderr.trim());
 }

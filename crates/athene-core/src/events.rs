@@ -95,6 +95,9 @@ impl Engine {
         let workers = self.store.sessions_by_orchestrator(orchestrator_id)?;
         for session in &workers {
             let _ = crate::tmux::kill_session(&session.id).await;
+            if let Some(ref wp) = session.workspace_path {
+                remove_worker_worktree(wp, &session.id).await;
+            }
         }
         // Also kill the orchestrator's own tmux session (same id as orchestrator).
         let _ = crate::tmux::kill_session(orchestrator_id).await;
@@ -109,6 +112,11 @@ impl Engine {
     /// Kill the tmux session and delete it from the DB entirely.
     pub async fn remove_session(&self, session_id: &str) -> anyhow::Result<()> {
         let _ = crate::tmux::kill_session(session_id).await;
+        if let Ok(Some(session)) = self.store.get_session(session_id) {
+            if let Some(ref wp) = session.workspace_path {
+                remove_worker_worktree(wp, session_id).await;
+            }
+        }
         self.store.delete_session(session_id)?;
         self.emit(Event::SessionDone(session_id.to_string()));
         Ok(())
@@ -150,6 +158,26 @@ impl Engine {
     }
 }
 
+/// Remove an Athene-managed git worktree (best-effort, never propagates errors).
+///
+/// Only acts on paths that match the `.claude/worktrees/{session_id}` pattern
+/// so it never touches unrelated directories.
+async fn remove_worker_worktree(workspace_path: &str, session_id: &str) {
+    let suffix = format!("/.claude/worktrees/{session_id}");
+    if !workspace_path.ends_with(&suffix) {
+        return; // Not an Athene worktree — leave it alone.
+    }
+    // Derive the repo root by stripping the worktree suffix.
+    let repo_root = &workspace_path[..workspace_path.len() - suffix.len()];
+    if repo_root.is_empty() {
+        return;
+    }
+    let _ = tokio::process::Command::new("git")
+        .args(["-C", repo_root, "worktree", "remove", "--force", workspace_path])
+        .output()
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,7 +186,7 @@ mod tests {
 
     #[tokio::test]
     async fn emit_received_by_subscriber() {
-        let store = Arc::new(Store::open(tempdir().unwrap().into_path().join("t.db")).unwrap());
+        let store = Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
         let engine = Engine::new(store);
         let mut rx = engine.subscribe();
         engine.emit(Event::SessionDone("s1".into()));
@@ -213,5 +241,14 @@ mod tests {
         } else {
             panic!("expected SessionUpdated");
         }
+    }
+
+    #[tokio::test]
+    async fn remove_worker_worktree_ignores_non_athene_paths() {
+        // Should be a no-op for paths that don't match .claude/worktrees/{id}.
+        // We just verify it doesn't panic or error.
+        remove_worker_worktree("/some/random/path", "s1").await;
+        remove_worker_worktree("/repo/.claude/worktrees/other-id", "s1").await;
+        remove_worker_worktree("", "s1").await;
     }
 }

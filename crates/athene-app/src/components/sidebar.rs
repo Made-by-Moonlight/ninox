@@ -203,7 +203,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
         col_items.push(notification_panel(app));
     }
     col_items.push(list.into());
-    col_items.push(footer.into());
+    col_items.push(footer);
 
     container(column(col_items).spacing(0))
         .width(Length::Fixed(app.sidebar_width))

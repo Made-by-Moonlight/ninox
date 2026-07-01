@@ -37,7 +37,22 @@ pub struct TerminalState {
 impl TerminalState {
     /// Feed raw bytes from the PTY into the VTE parser → terminal state.
     pub fn process(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.term, bytes);
+        // ESC[2J (erase entire screen) on the primary screen calls clear_viewport()
+        // which scrolls the current viewport into scrollback history. TUI apps like
+        // Claude Code send ESC[2J on every full-screen redraw, flooding scrollback
+        // with repeated copies of the TUI chrome.
+        //
+        // Replace ESC[2J with ESC[H (cursor home) + ESC[0J (erase below cursor).
+        // ESC[0J uses reset_region() internally — same visual result, no scrollback push.
+        //
+        // Note: split sequences across chunk boundaries are not handled here; in
+        // practice tmux pipe-pane delivers complete sequences in single 4 KiB reads.
+        if bytes.windows(4).any(|w| w == b"\x1b[2J") {
+            let filtered = replace_clear_screen(bytes);
+            self.parser.advance(&mut self.term, &filtered);
+        } else {
+            self.parser.advance(&mut self.term, bytes);
+        }
         self.cache.clear();
     }
 
@@ -461,6 +476,33 @@ pub fn extract_selection(
 }
 
 // ---------------------------------------------------------------------------
+// Byte-stream filters
+// ---------------------------------------------------------------------------
+
+/// Replace every ESC[2J with ESC[H ESC[0J.
+///
+/// ESC[H moves the cursor to the home position; ESC[0J erases from cursor to
+/// end of screen using reset_region() (no scrollback push), unlike ESC[2J
+/// which uses clear_viewport() → scroll_up() and pollutes scrollback.
+fn replace_clear_screen(bytes: &[u8]) -> Vec<u8> {
+    const NEEDLE: &[u8] = b"\x1b[2J";
+    const REPLACE: &[u8] = b"\x1b[H\x1b[0J";
+
+    let mut out = Vec::with_capacity(bytes.len() + 4);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(NEEDLE) {
+            out.extend_from_slice(REPLACE);
+            i += NEEDLE.len();
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -500,5 +542,46 @@ mod tests {
     fn process_ansi_no_panic() {
         let mut s = TerminalState::new(80, 24);
         s.process(b"\x1b[31mred\x1b[0m");
+    }
+
+    #[test]
+    fn replace_clear_screen_substitutes_esc2j() {
+        let input = b"before\x1b[2Jafter";
+        let out = replace_clear_screen(input);
+        assert_eq!(out, b"before\x1b[H\x1b[0Jafter");
+    }
+
+    #[test]
+    fn replace_clear_screen_multiple_occurrences() {
+        let input = b"\x1b[2J\x1b[2J";
+        let out = replace_clear_screen(input);
+        assert_eq!(out, b"\x1b[H\x1b[0J\x1b[H\x1b[0J");
+    }
+
+    #[test]
+    fn replace_clear_screen_no_match_is_identity() {
+        let input = b"\x1b[H\x1b[0J plain text";
+        let out = replace_clear_screen(input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn clear_screen_does_not_add_scrollback() {
+        // Fill the first 24 lines with content so clear_viewport would have
+        // something to push into scrollback if ESC[2J were passed through.
+        let mut s = TerminalState::new(80, 24);
+        for _ in 0..24 {
+            s.process(b"hello world\r\n");
+        }
+        let history_before = s.term.grid().history_size();
+
+        // ESC[2J should NOT add scrollback lines thanks to the filter.
+        s.process(b"\x1b[2J");
+
+        assert_eq!(
+            s.term.grid().history_size(),
+            history_before,
+            "ESC[2J must not push viewport content into scrollback"
+        );
     }
 }

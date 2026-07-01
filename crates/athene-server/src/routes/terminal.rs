@@ -45,7 +45,7 @@ async fn handle(socket: WebSocket, session_id: String, engine: Arc<Engine>) {
     loop {
         match event_rx.recv().await {
             Ok(Event::TerminalOutput { session_id: sid, bytes }) if sid == session_id => {
-                if tx.send(Message::Binary(bytes.into())).await.is_err() {
+                if tx.send(Message::Binary(bytes)).await.is_err() {
                     break;
                 }
             }

@@ -86,7 +86,7 @@ pub fn pr_list(app: &App) -> Element<'_, Message> {
 
     // Sort PRs by number descending
     let mut prs: Vec<&PR> = app.prs.values().collect();
-    prs.sort_by(|a, b| b.number.cmp(&a.number));
+    prs.sort_by_key(|b| std::cmp::Reverse(b.number));
 
     let back_btn = button(
         text("← Fleet").size(12).color(s.text_secondary)
