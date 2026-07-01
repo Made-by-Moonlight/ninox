@@ -26,13 +26,22 @@ A SQLite full-text index sits alongside the files at `{brain_path}/.index.db`. I
 
 ## Configuration
 
-The brain path resolves in order:
+By default, all orchestrators share a single global brain. This is intentional — knowledge discovered in one project is available to every other orchestrator without any configuration.
 
-1. `brain.path` in the project's `athene.toml` — for project-specific knowledge
-2. `brain.path` in `~/.config/athene/config.toml` — the user's default brain
-3. `~/.config/athene/brain/` — built-in fallback
+To use a different brain for a specific project, set `brain.path` in that project's `athene.toml`:
 
-Each orchestrator uses exactly one brain. Brains are never merged — this preserves clean boundaries between accounts, clients, and projects.
+```toml
+[brain]
+path = "./docs/brain"
+```
+
+The full resolution order is:
+
+1. `brain.path` in the project's `athene.toml` — overrides the shared brain for this project only
+2. `brain.path` in `~/.config/athene/config.toml` — changes the default for all orchestrators
+3. `~/.config/athene/brain/` — the shared brain used when nothing is configured
+
+Each orchestrator uses exactly one brain. Brains are never merged — when a project specifies its own brain, it is fully isolated from the global one. This preserves clean boundaries between accounts, clients, and projects where knowledge should not cross over.
 
 ## CLI
 
