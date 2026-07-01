@@ -17,6 +17,7 @@ tracing-subscriber = { workspace = true }
 tokio-util    = { workspace = true }
 clap          = { version = "4", features = ["derive"] }
 dirs          = { workspace = true }
+serde_json    = { workspace = true }
 iced = { version = "0.13", features = ["tokio", "canvas", "advanced", "wgpu"] }
 notify-rust = "4"
 alacritty_terminal = "0.26"
