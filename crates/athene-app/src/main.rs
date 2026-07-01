@@ -82,6 +82,11 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = athene_core::hooks::install_wrappers() {
         tracing::warn!("failed to install wrapper hooks: {e}");
     }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Err(e) = athene_core::hooks::install_self_shim(&exe) {
+            tracing::warn!("failed to install athene self-shim: {e}");
+        }
+    }
 
     let db_path = args.db.unwrap_or_else(default_db_path);
     std::fs::create_dir_all(db_path.parent().unwrap())?;

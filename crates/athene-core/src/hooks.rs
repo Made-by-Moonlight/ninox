@@ -156,6 +156,22 @@ pub fn install_wrappers() -> Result<()> {
     install_wrappers_to(&crate::config::AppConfig::athene_bin_dir())
 }
 
+/// Write a thin `athene` shim to the Athene bin dir that forwards all arguments
+/// to the currently-running executable. This ensures that when an orchestrator
+/// runs `athene spawn` (and `~/.config/athene/bin` is first in PATH), it always
+/// invokes the same build that is currently running — not a stale system install.
+pub fn install_self_shim(current_exe: &Path) -> Result<()> {
+    let bin_dir = crate::config::AppConfig::athene_bin_dir();
+    std::fs::create_dir_all(&bin_dir)?;
+    let exe = current_exe.to_string_lossy().replace('\'', "'\\''");
+    let script = format!(
+        "#!/usr/bin/env bash\nexec '{}' \"$@\"\n",
+        exe
+    );
+    write_executable(bin_dir.join("athene"), &script)?;
+    Ok(())
+}
+
 /// Read session metadata from `{dir}/{session_id}.json`.
 /// Returns empty `SessionMetadata` if the file does not exist or is malformed.
 pub fn read_session_metadata(dir: &Path, session_id: &str) -> Result<SessionMetadata> {

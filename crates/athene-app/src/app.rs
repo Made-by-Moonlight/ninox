@@ -470,7 +470,16 @@ impl App {
                             ("ATHENE_CALLER_TYPE",     "orchestrator"),
                         ];
 
-                        let launch_cmd = orch_agent.interactive_cmd();
+                        // Prepend athene bin dir inside the shell command so the
+                        // `athene` shim (which points to the current binary) is found
+                        // first — even after login-shell rc files reorder PATH.
+                        let athene_bin_dir = athene_core::config::AppConfig::athene_bin_dir();
+                        let athene_bin_dir_str = athene_bin_dir.display().to_string()
+                            .replace('\'', "'\\''");
+                        let base_cmd = orch_agent.interactive_cmd();
+                        let launch_cmd = format!(
+                            "export PATH='{athene_bin_dir_str}':\"$PATH\"; {base_cmd}"
+                        );
                         if let Err(e) = tmux::create_session(&tmux_id, &ws, &launch_cmd, &env).await {
                             tracing::error!("tmux create failed for {sid}: {e}");
                             return Message::Noop;

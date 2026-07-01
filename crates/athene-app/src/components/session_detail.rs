@@ -104,6 +104,23 @@ pub fn session_detail<'a>(
         .align_y(Alignment::Center)
     };
 
+    let kill_color = iced::Color::from_rgb8(0xcc, 0x24, 0x1d);
+    let kill_btn: Element<Message> = if !is_orchestrator {
+        let sid = session_id.to_string();
+        button(text("Kill").size(11).color(kill_color))
+            .on_press(Message::RemoveSession(sid))
+            .style(move |_theme, _status| button::Style {
+                background: None,
+                border: Border { color: kill_color, width: 1.0, radius: 3.0.into() },
+                text_color: kill_color,
+                ..Default::default()
+            })
+            .padding([3, 8])
+            .into()
+    } else {
+        Space::new(0, 0).into()
+    };
+
     let header = container(
         row![
             back_btn,
@@ -116,6 +133,8 @@ pub fn session_detail<'a>(
             Space::new(Length::Fill, 0),
             panel_toggles,
             Space::new(Length::Fill, 0),
+            kill_btn,
+            Space::new(12, 0),
             status_dot,
             Space::new(6, 0),
             text(cost).size(12).color(s.text_muted),
