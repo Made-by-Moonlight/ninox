@@ -1,5 +1,7 @@
 use crate::{
+    config::AppConfig,
     events::{Engine, Event},
+    hooks,
     lifecycle::probe::is_pid_alive,
     types::SessionStatus,
 };
@@ -38,6 +40,26 @@ impl Poller {
                     session.status = SessionStatus::Terminated;
                     let _ = self.engine.store.upsert_session(&session);
                     self.engine.emit(Event::SessionUpdated(session));
+                    continue;
+                }
+            }
+
+            // Poll metadata files for PR number on working sessions that have none yet.
+            if matches!(session.status, SessionStatus::Working | SessionStatus::Spawning)
+                && session.pr_number.is_none()
+            {
+                let sessions_dir = AppConfig::sessions_dir();
+                if let Ok(meta) = hooks::read_session_metadata(&sessions_dir, &session.id) {
+                    if let Some(pr_num) = meta.pr_number {
+                        session.pr_number = Some(pr_num);
+                        session.status    = SessionStatus::PrOpen;
+                        let _ = self.engine.store.upsert_session(&session);
+                        self.engine.emit(Event::SessionUpdated(session.clone()));
+                        tracing::info!(
+                            "session {} PR #{pr_num} detected via metadata hook",
+                            session.id
+                        );
+                    }
                 }
             }
         }

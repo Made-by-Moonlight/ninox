@@ -163,6 +163,24 @@ impl AppConfig {
             .join("config.toml")
     }
 
+    /// Directory for Athene-managed shell wrappers prepended to agent PATH.
+    /// Default: `~/.config/athene/bin/`
+    pub fn athene_bin_dir() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("athene")
+            .join("bin")
+    }
+
+    /// Directory where per-session metadata JSON files are written by wrapper hooks.
+    /// Default: `~/.config/athene/sessions/`
+    pub fn sessions_dir() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("athene")
+            .join("sessions")
+    }
+
     fn path() -> PathBuf { Self::config_path() }
 
     pub fn load() -> Result<Self> {
