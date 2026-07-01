@@ -1199,8 +1199,8 @@ mod tests {
         };
         let (m2, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         m = m2;
-        // board_sessions(app, status) returns sessions with that status
-        let terminated = board_sessions(&m, &SessionStatus::Terminated);
+        // board_sessions(app, status, scope) returns sessions with that status
+        let terminated = board_sessions(&m, &SessionStatus::Terminated, None);
         assert_eq!(terminated.len(), 1);
         assert_eq!(terminated[0].id, "t1");
     }

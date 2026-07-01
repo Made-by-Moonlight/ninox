@@ -37,10 +37,19 @@ const COLUMNS: &[Column] = &[
     Column { label: "Terminated", status: SessionStatus::Terminated },
 ];
 
-pub fn board_sessions<'a>(app: &'a App, status: &SessionStatus) -> Vec<&'a Session> {
+pub fn board_sessions<'a>(
+    app: &'a App,
+    status: &SessionStatus,
+    scope: Option<&str>,
+) -> Vec<&'a Session> {
     let mut sessions: Vec<&Session> = app.sessions
         .values()
-        .filter(|s| &s.status == status)
+        .filter(|s| {
+            &s.status == status
+                && scope.map_or(true, |oid| {
+                    s.orchestrator_id.as_deref() == Some(oid)
+                })
+        })
         .collect();
     sessions.sort_by(|a, b| a.name.cmp(&b.name));
     sessions
@@ -138,7 +147,7 @@ pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Eleme
     let kanban_cols: Vec<Element<Message>> = COLUMNS
         .iter()
         .map(|col| {
-            let col_sessions = board_sessions(app, &col.status);
+            let col_sessions = board_sessions(app, &col.status, scope.map(|s| s.as_str()));
             let cards: Vec<Element<Message>> = col_sessions
                 .iter()
                 .map(|s| session_card(app, s))
