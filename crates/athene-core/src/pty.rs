@@ -20,6 +20,7 @@ fn fifo_path(session_id: &str) -> String {
 /// 5. Opens the pane's TTY device for writing.
 /// 6. Spawns a task that forwards bytes from the mpsc input channel to the TTY.
 /// 7. Registers the input sender with the engine so the WebSocket terminal can use it.
+///
 /// Wire up PTY streaming for an already-running tmux session.
 ///
 /// `cols` and `rows` must match the caller's `TerminalState` dimensions.

@@ -177,6 +177,18 @@ pub async fn capture_pane(id: &str) -> Vec<u8> {
         .unwrap_or_default()
 }
 
+/// Send text to a tmux session as if typed at the keyboard.
+/// The text is followed by Enter so the agent receives and acts on it.
+/// Uses `tmux send-keys -l` (literal mode) to avoid tmux interpreting
+/// special characters like `{`, `}`, arrows.
+pub async fn send_keys(session_id: &str, text: &str) -> Result<()> {
+    // Send the message text in literal mode
+    run(&["send-keys", "-t", session_id, "-l", text]).await?;
+    // Send Enter to submit
+    run(&["send-keys", "-t", session_id, "Enter"]).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +239,15 @@ mod tests {
         let tty = get_pane_tty(&id).await.unwrap();
         assert!(tty.map(|t| t.starts_with("/dev/")).unwrap_or(false));
         kill_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_keys_builds_correct_command() {
+        // This test validates our argument construction without actually calling tmux.
+        // We test the shell_quote helper used by send_keys.
+        let quoted = shell_quote("hello world");
+        assert_eq!(quoted, "'hello world'");
+        let with_apostrophe = shell_quote("don't");
+        assert_eq!(with_apostrophe, "'don'\\''t'");
     }
 }

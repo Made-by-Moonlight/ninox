@@ -114,6 +114,14 @@ impl Engine {
         Ok(())
     }
 
+    /// Send a text message to the agent running in a session's tmux window.
+    /// The message is injected as keyboard input — the agent sees it as typed text.
+    /// Returns Ok(()) if the tmux send succeeded; returns an error if the session
+    /// has no active tmux window or tmux is unavailable.
+    pub async fn send_to_session(&self, session_id: &str, message: &str) -> anyhow::Result<()> {
+        crate::tmux::send_keys(session_id, message).await
+    }
+
     /// Kill the tmux session, mark it Terminated in the DB, and emit SessionUpdated.
     pub async fn terminate_session(&self, session_id: &str) -> anyhow::Result<()> {
         // Best-effort tmux kill (session may already be dead).

@@ -126,7 +126,7 @@ impl Poller {
                 let mut cache = self.enrichment_cache.lock().unwrap();
                 let state = cache.entry(session.id.clone()).or_default();
 
-                let newly_failing = state.prev_failing.map_or(true, |p| p == 0)
+                let newly_failing = state.prev_failing.is_none_or(|p| p == 0)
                     && ci.failing > 0;
                 state.prev_failing = Some(ci.failing);
 
@@ -148,6 +148,18 @@ impl Poller {
                     body:       format!("{}/{} checks failing", ci.failing, ci.total),
                     session_id: Some(session.id.clone()),
                 }));
+                // Send reaction to the agent in the tmux session
+                let failing_names: Vec<String> = checks.iter()
+                    .filter(|c| c.conclusion.as_deref() == Some("failure")
+                             || c.conclusion.as_deref() == Some("timed_out"))
+                    .map(|c| c.name.clone())
+                    .collect();
+                let msg = crate::lifecycle::reactions::format_ci_reaction(
+                    &session, &ci, &failing_names
+                );
+                if let Err(e) = self.engine.send_to_session(&session.id, &msg).await {
+                    tracing::warn!("send ci reaction to {}: {e}", session.id);
+                }
             }
 
             // -- Review threads (throttled via seen_comment_ids) --
@@ -158,10 +170,11 @@ impl Poller {
 
             let has_changes_requested = threads.iter().any(|t| t.state == "CHANGES_REQUESTED");
 
-            let (has_new, review_reaction_already_sent) = {
+            let (has_new, review_reaction_already_sent, new_comments) = {
                 let mut cache = self.enrichment_cache.lock().unwrap();
                 let state = cache.entry(session.id.clone()).or_default();
                 let mut has_new = false;
+                let mut new_comments: Vec<Comment> = Vec::new();
 
                 for thread in &threads {
                     if thread.state == "CHANGES_REQUESTED"
@@ -179,7 +192,8 @@ impl Poller {
                             created_at: 0,
                         };
                         let _ = self.engine.store.upsert_comment(&comment);
-                        self.engine.emit(Event::ReviewComment { pr_id, comment });
+                        self.engine.emit(Event::ReviewComment { pr_id, comment: comment.clone() });
+                        new_comments.push(comment);
                     }
                 }
 
@@ -191,7 +205,7 @@ impl Poller {
                 if !has_changes_requested {
                     state.review_reaction_sent = false;
                 }
-                (has_new, already_sent)
+                (has_new, already_sent, new_comments)
             };
 
             // Update session status in DB (after review threads so has_changes_requested is known)
@@ -211,6 +225,14 @@ impl Poller {
                     body:       "Changes requested on your PR".to_string(),
                     session_id: Some(session.id.clone()),
                 }));
+                if !new_comments.is_empty() {
+                    let msg = crate::lifecycle::reactions::format_review_reaction(
+                        &session, &new_comments
+                    );
+                    if let Err(e) = self.engine.send_to_session(&session.id, &msg).await {
+                        tracing::warn!("send review reaction to {}: {e}", session.id);
+                    }
+                }
             }
         }
     }
