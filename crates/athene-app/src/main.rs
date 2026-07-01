@@ -85,7 +85,7 @@ async fn run_spawn(
         id:              id.clone(),
         orchestrator_id,
         name,
-        repo:            String::new(),
+        repo:            workspace.clone(),
         status:          SessionStatus::Working,
         agent_type:      agent.harness.clone(),
         cost_usd:        0.0,
