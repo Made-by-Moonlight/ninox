@@ -391,6 +391,7 @@ dependencies = [
  "dirs 5.0.1",
  "iced",
  "notify-rust",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",

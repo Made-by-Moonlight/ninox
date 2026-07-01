@@ -42,11 +42,13 @@ impl Default for View {
 // ---------------------------------------------------------------------------
 
 pub struct App {
-    pub engine:          Arc<Engine>,
-    pub config:          AppConfig,
-    pub scheme:          ColorScheme,
-    pub active_variant:  ThemeVariant,
-    pub orchestrators:   Vec<Orchestrator>,
+    pub engine:             Arc<Engine>,
+    pub config:             AppConfig,
+    pub scheme:             ColorScheme,
+    pub active_variant:     ThemeVariant,
+    pub orchestrator_root:  std::path::PathBuf,
+    pub orchestrator_agent: athene_core::config::AgentConfig,
+    pub orchestrators:      Vec<Orchestrator>,
     pub sessions:        HashMap<SessionId, Session>,
     pub prs:             HashMap<PrId, PR>,
     pub ci_status:       HashMap<PrId, CIStatus>,
@@ -186,7 +188,7 @@ fn key_to_terminal_bytes(
 // ---------------------------------------------------------------------------
 
 impl App {
-    pub fn new(engine: Arc<Engine>) -> (Self, Task<Message>) {
+    pub fn new(engine: Arc<Engine>, orchestrator_root: std::path::PathBuf, orchestrator_agent: athene_core::config::AgentConfig) -> (Self, Task<Message>) {
         // Synchronously load persisted state from the DB so the UI isn't empty
         // on startup.
         let orchestrators = engine.store.list_orchestrators().unwrap_or_default();
@@ -203,10 +205,12 @@ impl App {
         let active_variant = config.theme;
 
         let app = Self {
-            engine:         engine.clone(),
+            engine:             engine.clone(),
             config,
             scheme,
             active_variant,
+            orchestrator_root,
+            orchestrator_agent,
             orchestrators,
             sessions,
             prs:            HashMap::new(),
@@ -344,17 +348,6 @@ impl App {
                     if name.is_empty() {
                         return Task::none();
                     }
-                    let workspace = {
-                        let w = form.workspace.trim().to_string();
-                        if w.is_empty() {
-                            dirs::home_dir()
-                                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                                .to_string_lossy()
-                                .to_string()
-                        } else {
-                            w
-                        }
-                    };
 
                     let ts = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -366,6 +359,14 @@ impl App {
                         name:       name.clone(),
                         created_at: ts as i64,
                     };
+
+                    // Each orchestrator gets its own subdirectory under the root.
+                    // AGENTS.md/CLAUDE.md and hooks live in the root and are inherited.
+                    let ws = state.orchestrator_root
+                        .join(&orch.id)
+                        .to_string_lossy()
+                        .to_string();
+
                     let _ = state.engine.store.upsert_orchestrator(&orch);
                     state.orchestrators.push(orch.clone());
                     state.engine.emit(Event::OrchestratorSpawned(orch.clone()));
@@ -376,12 +377,12 @@ impl App {
                         name:            name.clone(),
                         repo:            String::new(),
                         status:          SessionStatus::Working,
-                        agent_type:      "claude-code".into(),
+                        agent_type:      state.orchestrator_agent.harness.clone(),
                         cost_usd:        0.0,
                         started_at:      ts as i64,
                         pr_number:       None,
                         pr_id:           None,
-                        workspace_path:  Some(workspace.clone()),
+                        workspace_path:  Some(ws.clone()),
                         pid:             None,
                     };
                     let _ = state.engine.store.upsert_session(&session);
@@ -393,27 +394,45 @@ impl App {
                         panel:      DetailPanel::Terminal,
                     };
 
-                    // Capture values for the async task.
-                    let engine  = state.engine.clone();
-                    let tmux_id = orch.id.clone();
-                    let sid     = orch.id.clone();
-                    let ws      = workspace;
-                    let nm      = name;
-                    let ts_i64  = ts as i64;
-                    // Use the authoritative size so the new session matches any
-                    // resize that happened before the spawn confirmed.
-                    let t_cols  = state.terminal_cols;
-                    let t_rows  = state.terminal_rows;
+                    let engine     = state.engine.clone();
+                    let tmux_id    = orch.id.clone();
+                    let sid        = orch.id.clone();
+                    let nm         = name;
+                    let ts_i64     = ts as i64;
+                    let orch_agent = state.orchestrator_agent.clone();
+                    let t_cols     = state.terminal_cols;
+                    let t_rows     = state.terminal_rows;
 
                     return Task::future(async move {
                         use athene_core::{pty, tmux, Event as CoreEvent, Session, SessionStatus};
 
-                        if let Err(e) = tmux::create_session(&tmux_id, &ws, "claude", &[]).await {
+                        if let Err(e) = tokio::fs::create_dir_all(&ws).await {
+                            tracing::error!("mkdir orchestrator workspace {ws}: {e}");
+                        }
+
+                        let athene_bin = std::env::current_exe()
+                            .ok()
+                            .and_then(|p| p.to_str().map(str::to_string))
+                            .unwrap_or_else(|| "athene".to_string());
+
+                        let athene_config = athene_core::config::AppConfig::config_path()
+                            .to_string_lossy()
+                            .to_string();
+
+                        let env = [
+                            ("ATHENE_BIN",            athene_bin.as_str()),
+                            ("ATHENE_CONFIG",          athene_config.as_str()),
+                            ("ATHENE_ORCHESTRATOR_ID", sid.as_str()),
+                            ("AO_CALLER_TYPE",         "orchestrator"),
+                            ("ATHENE_CALLER_TYPE",     "orchestrator"),
+                        ];
+
+                        let launch_cmd = orch_agent.interactive_cmd();
+                        if let Err(e) = tmux::create_session(&tmux_id, &ws, &launch_cmd, &env).await {
                             tracing::error!("tmux create failed for {sid}: {e}");
                             return Message::Noop;
                         }
 
-                        // Give the shell a moment to set up the TTY before we open it.
                         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
                         let pid = tmux::list_sessions()
@@ -428,7 +447,7 @@ impl App {
                             name:            nm,
                             repo:            String::new(),
                             status:          SessionStatus::Working,
-                            agent_type:      "claude-code".into(),
+                            agent_type:      orch_agent.harness.clone(),
                             cost_usd:        0.0,
                             started_at:      ts_i64,
                             pr_number:       None,
@@ -694,6 +713,167 @@ impl App {
 }
 
 // ---------------------------------------------------------------------------
+// Orchestrator root setup
+// ---------------------------------------------------------------------------
+
+/// Seeds `~/.config/athene/orchestrator/` (or the configured root) with the
+/// files that orchestrator sessions need: AGENTS.md (canonical, CLAUDE.md
+/// symlinks to it), spawn-worker skill, set-agent-config skill, and the
+/// subagent-blocker PreToolUse hook.
+///
+/// AGENTS.md and settings.json are skipped if already present (user-editable).
+/// Skill files and the blocker are always overwritten to stay in sync.
+pub async fn setup_orchestrator_root(
+    root: &std::path::Path,
+    athene_bin: &str,
+    config_path: &str,
+) -> anyhow::Result<()> {
+    use tokio::fs;
+
+    let claude_dir       = root.join(".claude");
+    let spawn_skill_dir  = root.join("skills").join("spawn-worker");
+    let config_skill_dir = root.join("skills").join("set-agent-config");
+    fs::create_dir_all(&claude_dir).await?;
+    fs::create_dir_all(&spawn_skill_dir).await?;
+    fs::create_dir_all(&config_skill_dir).await?;
+
+    let spawn_skill_path  = spawn_skill_dir.join("SKILL.md");
+    let config_skill_path = config_skill_dir.join("SKILL.md");
+
+    // AGENTS.md is canonical; CLAUDE.md symlinks to it.
+    let agents_md_path = root.join("AGENTS.md");
+    if !agents_md_path.exists() {
+        let body = format!(
+            "# Athene Orchestrator\n\n\
+             Before doing anything else, read and follow: `{spawn_skill}`\n\n\
+             ## Available Skills\n\n\
+             - `{spawn_skill}` — spawning worker sessions\n\
+             - `{config_skill}` — changing agent harness or model\n",
+            spawn_skill  = spawn_skill_path.display(),
+            config_skill = config_skill_path.display(),
+        );
+        fs::write(&agents_md_path, body).await?;
+    }
+    let claude_md_path = root.join("CLAUDE.md");
+    if !claude_md_path.exists() {
+        #[cfg(unix)]
+        tokio::fs::symlink("AGENTS.md", &claude_md_path).await?;
+        #[cfg(not(unix))]
+        {
+            let body = fs::read_to_string(&agents_md_path).await?;
+            fs::write(&claude_md_path, body).await?;
+        }
+    }
+
+    // spawn-worker skill — always overwritten.
+    let spawn_skill_content = format!(
+        r#"# Spawn a Worker, Not a Subagent
+
+You are an **Athene orchestrator agent**. You coordinate — you do not implement.
+
+## Your Role
+
+- Spawn worker sessions for all implementation tasks
+- Monitor worker progress; direct workers when they are stuck
+- Never implement code, run tests, or create PRs yourself
+
+## Spawning Workers
+
+```bash
+{athene_bin} spawn \
+  --prompt "Complete task description with acceptance criteria, repo path, and branch" \
+  --workspace /absolute/path/to/repo
+```
+
+`ATHENE_ORCHESTRATOR_ID` is set in your environment and picked up automatically.
+
+## The Rule
+
+**Never use the Agent tool for implementation work.** All implementation goes
+through `{athene_bin} spawn`. Read-only Explore/Plan agents are permitted.
+
+| Thought | Reality |
+|---|---|
+| "The task is small" | Size doesn't matter. Workers handle small tasks fine. |
+| "I'm already mid-context" | Offload work to preserve orchestrator context. |
+| "It's just a push/PR" | Pushes need auth wiring subagents don't have. |
+| "The Agent tool is easier" | It's always easier. That's why this rule exists. |
+"#,
+        athene_bin = athene_bin,
+    );
+    fs::write(&spawn_skill_path, spawn_skill_content).await?;
+
+    // set-agent-config skill — always overwritten.
+    let config_skill_content = format!(
+        r#"# Set Athene Agent Config
+
+Use this skill when the user asks to change the agent harness or model.
+
+## Config file
+
+```
+{config_path}
+```
+
+## Format
+
+```toml
+[orchestrator]
+harness = "claude-code"   # claude-code | codex | aider | opencode
+model = "model-name"      # omit to use the harness default
+
+[worker]
+harness = "claude-code"
+model = "model-name"
+```
+
+Use the Edit tool to update the relevant field. Changes take effect on the next spawn.
+"#,
+        config_path = config_path,
+    );
+    fs::write(&config_skill_path, config_skill_content).await?;
+
+    // subagent-blocker hook — always overwritten.
+    let blocker = r#"#!/usr/bin/env node
+const { readFileSync } = require("node:fs");
+const callerType = process.env.ATHENE_CALLER_TYPE || process.env.AO_CALLER_TYPE || "";
+if (callerType !== "orchestrator") process.exit(0);
+let raw = "";
+try { raw = readFileSync(0, "utf-8"); } catch { process.exit(0); }
+let payload;
+try { payload = JSON.parse(raw || "{}"); } catch { process.exit(0); }
+const toolName = typeof payload.tool_name === "string" ? payload.tool_name : "";
+if (toolName !== "Task" && toolName !== "Agent") process.exit(0);
+const sub = (payload.tool_input?.subagent_type || "").toLowerCase();
+if (sub === "explore" || sub === "plan") process.exit(0);
+process.stdout.write(JSON.stringify({
+  hookSpecificOutput: {
+    hookEventName: "PreToolUse",
+    permissionDecision: "deny",
+    permissionDecisionReason: "Use `${ATHENE_BIN:-athene} spawn` instead of native subagents.",
+  },
+}) + "\n");
+process.exit(0);
+"#;
+    fs::write(claude_dir.join("subagent-blocker.cjs"), blocker).await?;
+
+    let settings_path = claude_dir.join("settings.json");
+    if !settings_path.exists() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Task|Agent",
+                    "hooks": [{"type": "command", "command": "node .claude/subagent-blocker.cjs", "timeout": 2000}]
+                }]
+            }
+        });
+        fs::write(&settings_path, serde_json::to_string_pretty(&settings)?).await?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -722,10 +902,12 @@ mod tests {
     fn base(engine: Arc<Engine>) -> App {
         App {
             engine,
-            config:         AppConfig::default(),
-            scheme:         from_variant(ThemeVariant::Dark),
-            active_variant: ThemeVariant::Dark,
-            orchestrators:  vec![],
+            config:             AppConfig::default(),
+            scheme:             from_variant(ThemeVariant::Dark),
+            active_variant:     ThemeVariant::Dark,
+            orchestrator_root:  std::path::PathBuf::from("/tmp"),
+            orchestrator_agent: athene_core::config::AgentConfig::default(),
+            orchestrators:      vec![],
             sessions:       HashMap::new(),
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
@@ -831,7 +1013,7 @@ mod tests {
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
         }).unwrap();
         let engine = Engine::new(store);
-        let (app, _task) = App::new(engine);
+        let (app, _task) = App::new(engine, std::path::PathBuf::from("/tmp"), athene_core::config::AgentConfig::default());
         assert_eq!(app.orchestrators.len(), 1);
         assert_eq!(app.sessions.len(), 1);
         assert!(app.sessions.contains_key("s1"));
