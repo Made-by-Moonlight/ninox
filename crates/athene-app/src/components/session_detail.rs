@@ -5,7 +5,7 @@ use iced::{
 
 use crate::{
     app::{App, DragTarget, Message},
-    components::{info_panel::info_panel, terminal::TerminalWidget},
+    components::{info_panel::info_panel, inspector_panel::inspector_panel, terminal::TerminalWidget},
 };
 
 fn repo_short(repo: &str) -> &str {
@@ -39,6 +39,7 @@ pub enum DetailPanel {
     Terminal,
     Split,
     Info,
+    Inspector,
 }
 
 impl Default for DetailPanel {
@@ -97,6 +98,8 @@ pub fn session_detail<'a>(
             panel_btn(app, "Split", DetailPanel::Split, *panel),
             Space::new(4, 0),
             panel_btn(app, "Info", DetailPanel::Info, *panel),
+            Space::new(4, 0),
+            panel_btn(app, "Inspector", DetailPanel::Inspector, *panel),
         ]
         .align_y(Alignment::Center)
     };
@@ -219,6 +222,7 @@ pub fn session_detail<'a>(
         .height(Length::Fill)
         .into(),
         DetailPanel::Info => info_pane,
+        DetailPanel::Inspector => inspector_panel(app, session).into(),
     };
 
     column![header, content]

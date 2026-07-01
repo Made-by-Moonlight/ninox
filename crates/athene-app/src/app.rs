@@ -1280,6 +1280,24 @@ mod tests {
     }
 
     #[test]
+    fn switch_to_inspector_panel() {
+        use crate::components::session_detail::DetailPanel;
+        let e = test_engine();
+        let mut m = base(e);
+        let s = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 1.23,
+            started_at: 0, pr_number: Some(42), pr_id: None,
+            workspace_path: Some("/tmp/w".into()), pid: Some(1234),
+        };
+        let (mut m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (m2, _) = m.update(Message::NavigateSession("s1".into()));
+        let (m3, _) = m2.update(Message::SwitchDetailPanel(DetailPanel::Inspector));
+        assert!(matches!(&m3.view, View::SessionDetail { panel: DetailPanel::Inspector, .. }));
+    }
+
+    #[test]
     fn dismiss_all_clears_notifications() {
         let e = test_engine();
         let mut m = base(e);
