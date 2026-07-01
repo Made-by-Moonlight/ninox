@@ -133,11 +133,14 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
         }
     }
 
-    // Standalone workers (no orchestrator) — no section label
+    // Standalone workers (no orchestrator, and not an orchestrator session itself)
     let standalone: Vec<&athene_core::types::Session> = app
         .sessions
         .values()
-        .filter(|s| s.orchestrator_id.is_none())
+        .filter(|s| {
+            s.orchestrator_id.is_none()
+                && !app.orchestrators.iter().any(|o| o.id == s.id)
+        })
         .collect();
 
     for session in standalone {

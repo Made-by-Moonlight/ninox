@@ -308,7 +308,7 @@ impl App {
                             t.term.grid().screen_lines() as u16,
                         )
                     })
-                    .unwrap_or((140, 50));
+                    .unwrap_or((state.terminal_cols, state.terminal_rows));
                 let engine = state.engine.clone();
                 Task::future(async move {
                     if athene_core::tmux::has_session(&id).await {
