@@ -436,6 +436,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "walkdir",
 ]
 
 [[package]]

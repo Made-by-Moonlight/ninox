@@ -107,6 +107,15 @@ fn shell_quote(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Brain configuration
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BrainConfig {
+    pub path: Option<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
 // App configuration
 // ---------------------------------------------------------------------------
 
@@ -126,6 +135,9 @@ pub struct AppConfig {
     /// Agent harness and model for worker sessions spawned by `athene spawn`.
     #[serde(default)]
     pub worker: AgentConfig,
+    /// Knowledge base (brain) configuration.
+    #[serde(default)]
+    pub brain: BrainConfig,
 }
 
 impl Default for AppConfig {
@@ -137,11 +149,22 @@ impl Default for AppConfig {
             orchestrator_root: None,
             orchestrator:     AgentConfig::default(),
             worker:           AgentConfig::default(),
+            brain:            BrainConfig::default(),
         }
     }
 }
 
 impl AppConfig {
+    pub fn resolved_brain_path(&self) -> PathBuf {
+        if let Some(ref p) = self.brain.path {
+            return p.clone();
+        }
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("athene")
+            .join("brain")
+    }
+
     pub fn resolved_orchestrator_root(&self) -> PathBuf {
         self.orchestrator_root.clone().unwrap_or_else(|| {
             dirs::config_dir()
