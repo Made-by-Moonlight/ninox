@@ -7,8 +7,7 @@ use crate::{app::Message, theme::ColorScheme};
 
 #[derive(Debug, Clone, Default)]
 pub struct SpawnForm {
-    pub name:      String,
-    pub workspace: String,
+    pub name: String,
 }
 
 pub fn spawn_modal<'a>(form: &'a SpawnForm, s: &'a ColorScheme) -> Element<'a, Message> {

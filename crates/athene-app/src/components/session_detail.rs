@@ -87,14 +87,19 @@ pub fn session_detail<'a>(
             ..Default::default()
         });
 
-    let panel_toggles = row![
-        panel_btn(app, "Terminal", DetailPanel::Terminal, *panel),
-        Space::new(4, 0),
-        panel_btn(app, "Split", DetailPanel::Split, *panel),
-        Space::new(4, 0),
-        panel_btn(app, "Info", DetailPanel::Info, *panel),
-    ]
-    .align_y(Alignment::Center);
+    let is_orchestrator = app.orchestrators.iter().any(|o| o.id == session_id);
+    let panel_toggles = if is_orchestrator {
+        row![].align_y(Alignment::Center)
+    } else {
+        row![
+            panel_btn(app, "Terminal", DetailPanel::Terminal, *panel),
+            Space::new(4, 0),
+            panel_btn(app, "Split", DetailPanel::Split, *panel),
+            Space::new(4, 0),
+            panel_btn(app, "Info", DetailPanel::Info, *panel),
+        ]
+        .align_y(Alignment::Center)
+    };
 
     let header = container(
         row![
@@ -135,6 +140,7 @@ pub fn session_detail<'a>(
 
     // ── Terminal pane ─────────────────────────────────────────────────────────
     let terminal_bg = s.terminal_bg;
+    let session_ids: Vec<String> = app.sessions.keys().cloned().collect();
     let terminal_pane: Element<Message> = if let Some(term_state) = app.terminals.get(session_id) {
         iced::widget::Canvas::new(TerminalWidget {
             state: term_state,
@@ -142,13 +148,19 @@ pub fn session_detail<'a>(
             terminal_bg: s.terminal_bg,
             terminal_fg: s.terminal_fg,
             cursor_color: s.accent,
+            session_ids,
         })
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
     } else {
+        use athene_core::types::SessionStatus;
+        let placeholder = match session.status {
+            SessionStatus::Terminated | SessionStatus::Done => "Session exited",
+            _ => "Terminal connecting…",
+        };
         container(
-            text("Terminal connecting…").size(13).color(s.text_muted),
+            text(placeholder).size(13).color(s.text_muted),
         )
         .width(Length::Fill)
         .height(Length::Fill)
@@ -183,7 +195,8 @@ pub fn session_detail<'a>(
     .into();
 
     // ── Panel routing ─────────────────────────────────────────────────────────
-    let content: Element<Message> = match panel {
+    let effective_panel = if is_orchestrator { &DetailPanel::Terminal } else { panel };
+    let content: Element<Message> = match effective_panel {
         DetailPanel::Terminal => container(terminal_pane)
             .width(Length::Fill)
             .height(Length::Fill)
