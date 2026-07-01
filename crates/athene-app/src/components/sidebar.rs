@@ -1,4 +1,4 @@
-use athene_core::config::ThemeVariant;
+use athene_core::{config::ThemeVariant, types::NotificationKind};
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
     Alignment, Background, Border, Color, Element, Length, Padding,
@@ -8,6 +8,26 @@ use crate::{
     app::{App, Message, View},
     theme::ColorScheme,
 };
+
+fn kind_label(kind: &NotificationKind) -> &'static str {
+    match kind {
+        NotificationKind::CiFailure        => "CI",
+        NotificationKind::AgentStuck       => "Stuck",
+        NotificationKind::PrNeedsAttention => "PR",
+        NotificationKind::MergeConflict    => "Conflict",
+        NotificationKind::WorkerDone       => "Done",
+    }
+}
+
+fn kind_color(kind: &NotificationKind, s: &ColorScheme) -> Color {
+    match kind {
+        NotificationKind::CiFailure        => s.status_red,
+        NotificationKind::AgentStuck       => s.status_yellow,
+        NotificationKind::PrNeedsAttention => s.status_blue,
+        NotificationKind::MergeConflict    => s.status_red,
+        NotificationKind::WorkerDone       => s.status_grey,
+    }
+}
 
 fn repo_short(repo: &str) -> &str {
     repo.rsplit('/').next().unwrap_or(repo)
@@ -52,10 +72,28 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     let header_padding = Padding { top: 12.0, right: 12.0, bottom: 12.0, left: 12.0 };
 
     // ── Header ────────────────────────────────────────────────────────────────
+    let unread = app.notifications.len();
+    let bell_label = if unread > 0 {
+        format!("🔔 {}", unread.min(99))
+    } else {
+        "🔔".to_string()
+    };
+
     let header = container(
         row![
             text("⬡ Athene").size(13).color(s.text_primary),
             Space::new(Length::Fill, 0),
+            button(text(bell_label.clone()).size(11).color(
+                if unread > 0 { s.accent } else { s.text_muted }
+            ))
+            .on_press(Message::ToggleNotifications)
+            .style(move |_theme, _status| button::Style {
+                background: None,
+                text_color: if unread > 0 { s.accent } else { s.text_muted },
+                border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 4.0.into() },
+                ..Default::default()
+            })
+            .padding([2, 4]),
             button(text("+ Spawn").size(11).color(s.accent))
                 .on_press(Message::SpawnSession)
                 .style(move |_theme, _status| button::Style {
@@ -162,7 +200,15 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     // ── Footer: theme popout ──────────────────────────────────────────────────
     let footer = theme_footer(app, s);
 
-    container(column![header, list, footer].spacing(0))
+    // ── Notification panel (conditional overlay between header and list) ──────
+    let mut col_items: Vec<Element<Message>> = vec![header.into()];
+    if app.sidebar.show_notifications {
+        col_items.push(notification_panel(app));
+    }
+    col_items.push(list.into());
+    col_items.push(footer.into());
+
+    container(column(col_items).spacing(0))
         .width(Length::Fixed(app.sidebar_width))
         .height(Length::Fill)
         .style(move |_theme| container::Style {
@@ -356,4 +402,97 @@ fn theme_footer<'a>(app: &'a App, s: &'a ColorScheme) -> Element<'a, Message> {
             ..Default::default()
         })
         .into()
+}
+
+pub fn notification_panel<'a>(app: &'a App) -> Element<'a, Message> {
+    let s = &app.scheme;
+
+    let header = row![
+        text("Notifications").size(12).color(s.text_primary),
+        Space::new(Length::Fill, 0),
+        button(text("Clear all").size(10).color(s.text_muted))
+            .on_press(Message::DismissAllNotifications)
+            .style(|_t, _s| button::Style {
+                background: None,
+                border: Border::default(),
+                ..Default::default()
+            })
+            .padding([2, 4]),
+    ]
+    .align_y(Alignment::Center)
+    .padding([8, 12]);
+
+    let items: Vec<Element<Message>> = if app.notifications.is_empty() {
+        vec![
+            container(
+                text("No notifications").size(12).color(s.text_muted),
+            )
+            .padding([12, 16])
+            .into()
+        ]
+    } else {
+        app.notifications.iter().map(|n| {
+            let n_id = n.id.clone();
+            let sess_id = n.session_id.clone();
+            let label_color = kind_color(&n.kind, s);
+            let row_content = column![
+                row![
+                    container(Space::new(0, 0))
+                        .width(Length::Fixed(6.0))
+                        .height(Length::Fixed(6.0))
+                        .style(move |_| container::Style {
+                            background: Some(Background::Color(label_color)),
+                            border: Border { radius: 3.0.into(), ..Default::default() },
+                            ..Default::default()
+                        }),
+                    Space::new(6, 0),
+                    text(kind_label(&n.kind)).size(10).color(label_color),
+                    Space::new(Length::Fill, 0),
+                    button(text("×").size(12).color(s.text_muted))
+                        .on_press(Message::DismissNotification(n_id))
+                        .style(|_t, _s| button::Style {
+                            background: None,
+                            border: Border::default(),
+                            ..Default::default()
+                        })
+                        .padding([0, 4]),
+                ]
+                .align_y(Alignment::Center),
+                text(&n.title).size(12).color(s.text_primary),
+                text(&n.body).size(11).color(s.text_secondary),
+            ]
+            .spacing(2);
+
+            let mut btn = button(row_content)
+                .style(move |_t, _s| button::Style {
+                    background: Some(Background::Color(s.bg_elevated)),
+                    border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
+                    ..Default::default()
+                })
+                .padding([8, 12]);
+
+            if let Some(sid) = sess_id {
+                btn = btn.on_press(Message::NavigateNotification(sid));
+            }
+
+            container(btn)
+                .width(Length::Fill)
+                .padding(Padding { top: 0.0, right: 8.0, bottom: 4.0, left: 8.0 })
+                .into()
+        }).collect()
+    };
+
+    container(
+        column![
+            header,
+            scrollable(column(items).spacing(0)).height(Length::Fixed(300.0)),
+        ]
+    )
+    .width(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(Background::Color(s.bg_surface)),
+        border: Border { color: s.border, width: 1.0, radius: 6.0.into() },
+        ..Default::default()
+    })
+    .into()
 }

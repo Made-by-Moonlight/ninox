@@ -23,6 +23,7 @@ const MAX_NOTIFICATIONS: usize = 50;
 pub struct SidebarState {
     pub selected_orchestrator: Option<OrchestratorId>,
     pub show_theme_popout:     bool,
+    pub show_notifications:    bool,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +104,10 @@ pub enum Message {
     MouseReleased,
     CopyToClipboard(String),
     PollSessions,
+    ToggleNotifications,
+    DismissNotification(String),
+    DismissAllNotifications,
+    NavigateNotification(SessionId),
     Noop,
 }
 
@@ -701,6 +706,30 @@ impl App {
                 })
             }
 
+            Message::ToggleNotifications => {
+                state.sidebar.show_notifications = !state.sidebar.show_notifications;
+                Task::none()
+            }
+
+            Message::DismissNotification(id) => {
+                state.notifications.retain(|n| n.id != id);
+                Task::none()
+            }
+
+            Message::DismissAllNotifications => {
+                state.notifications.clear();
+                Task::none()
+            }
+
+            Message::NavigateNotification(session_id) => {
+                state.sidebar.show_notifications = false;
+                state.view = View::SessionDetail {
+                    session_id,
+                    panel: crate::components::session_detail::DetailPanel::Terminal,
+                };
+                Task::none()
+            }
+
             Message::Noop => Task::none(),
         }
     }
@@ -1203,5 +1232,48 @@ mod tests {
         let terminated = board_sessions(&m, &SessionStatus::Terminated, None);
         assert_eq!(terminated.len(), 1);
         assert_eq!(terminated[0].id, "t1");
+    }
+
+    #[test]
+    fn toggle_notifications_flips_show_flag() {
+        let e = test_engine();
+        let m = base(e);
+        assert!(!m.sidebar.show_notifications);
+        let (m2, _) = m.update(Message::ToggleNotifications);
+        assert!(m2.sidebar.show_notifications);
+        let (m3, _) = m2.update(Message::ToggleNotifications);
+        assert!(!m3.sidebar.show_notifications);
+    }
+
+    #[test]
+    fn dismiss_notification_removes_by_id() {
+        let e = test_engine();
+        let mut m = base(e);
+        for id in ["n1", "n2", "n3"] {
+            let (next, _) = m.update(Message::EngineEvent(Event::Notification(Notification {
+                id: id.into(), kind: NotificationKind::WorkerDone,
+                title: "t".into(), body: "b".into(), session_id: None,
+            })));
+            m = next;
+        }
+        assert_eq!(m.notifications.len(), 3);
+        let (m2, _) = m.update(Message::DismissNotification("n2".into()));
+        assert_eq!(m2.notifications.len(), 2);
+        assert!(!m2.notifications.iter().any(|n| n.id == "n2"));
+    }
+
+    #[test]
+    fn dismiss_all_clears_notifications() {
+        let e = test_engine();
+        let mut m = base(e);
+        for id in ["a", "b"] {
+            let (next, _) = m.update(Message::EngineEvent(Event::Notification(Notification {
+                id: id.into(), kind: NotificationKind::WorkerDone,
+                title: "t".into(), body: "b".into(), session_id: None,
+            })));
+            m = next;
+        }
+        let (m2, _) = m.update(Message::DismissAllNotifications);
+        assert!(m2.notifications.is_empty());
     }
 }
