@@ -71,6 +71,7 @@ pub struct App {
     pub terminal_cols:   u16,
     pub terminal_rows:   u16,
     pub window_width:    f32,
+    pub window_height:   f32,
     pub sidebar_width:   f32,
     pub info_width:      f32,
     pub drag:            Option<DragTarget>,
@@ -247,7 +248,7 @@ impl App {
         let scheme = from_variant(config.theme);
         let active_variant = config.theme;
 
-        let app = Self {
+        let mut app = Self {
             engine:             engine.clone(),
             config,
             scheme,
@@ -264,15 +265,20 @@ impl App {
             view:           View::default(),
             terminals:      HashMap::new(),
             spawn_modal:    None,
+            // Placeholders — corrected below by resize_terminals() using the
+            // real default window size, so this never drifts out of sync with
+            // main.rs's iced::window::Settings::default() (1024x768).
             terminal_cols:  140,
             terminal_rows:  50,
-            window_width:   1200.0,
+            window_width:   1024.0,
+            window_height:  768.0,
             sidebar_width:  220.0,
             info_width:     300.0,
             drag:            None,
             fleet_filter:    FleetFilter::default(),
             last_fleet_scope: None,
         };
+        Self::resize_terminals(&mut app);
 
         // Asynchronously mark dead sessions as Terminated.
         // PTY streaming is NOT started here — we stream on demand when the user
@@ -316,6 +322,46 @@ impl App {
     /// Iced-compatible mutable update — passed to `iced::application()`.
     pub fn iced_update(state: &mut Self, message: Message) -> Task<Message> {
         Self::apply(state, message)
+    }
+
+    /// Recompute terminal cols/rows from the current window, sidebar, and
+    /// (when the Split panel is active) info-panel width, then push the new
+    /// size into every live `TerminalState`'s grid so rendering reflows to
+    /// fit the actual visible canvas area instead of being clipped.
+    ///
+    /// Returns the session IDs that need their backing tmux pane resized to
+    /// match — callers decide whether/when to do that (e.g. immediately for
+    /// a window resize, or once at drag-release rather than every frame).
+    fn resize_terminals(state: &mut Self) -> Vec<SessionId> {
+        let font_size = 13.0f32;
+        let cell_w    = font_size * 0.6;
+        let cell_h    = font_size * 1.4;
+        let sidebar_w = state.sidebar_width + 5.0; // +5 for drag handle
+        let header_h  = 80.0f32;
+
+        // The info panel only eats into the terminal's width when the Split
+        // panel is actually showing it side-by-side with the terminal.
+        let info_w = match &state.view {
+            View::SessionDetail {
+                panel: crate::components::session_detail::DetailPanel::Split,
+                ..
+            } => state.info_width + 5.0, // +5 for drag handle
+            _ => 0.0,
+        };
+
+        let cols = ((state.window_width - sidebar_w - info_w).max(200.0) / cell_w) as u16;
+        let rows = ((state.window_height - header_h).max(100.0) / cell_h) as u16;
+
+        state.terminal_cols = cols;
+        state.terminal_rows = rows;
+
+        let session_ids: Vec<SessionId> = state.terminals.keys().cloned().collect();
+        for sid in &session_ids {
+            if let Some(term) = state.terminals.get_mut(sid) {
+                term.resize(cols, rows);
+            }
+        }
+        session_ids
     }
 
     /// Shared mutation logic.
@@ -531,7 +577,20 @@ impl App {
                 if let View::SessionDetail { panel, .. } = &mut state.view {
                     *panel = new_panel;
                 }
-                Task::none()
+                // Entering/leaving Split changes how much width the terminal
+                // canvas actually has, so the grid must be reflowed to match.
+                let session_ids = Self::resize_terminals(state);
+                if session_ids.is_empty() {
+                    return Task::none();
+                }
+                let cols = state.terminal_cols;
+                let rows = state.terminal_rows;
+                Task::future(async move {
+                    for sid in session_ids {
+                        let _ = ninox_core::tmux::resize_window(&sid, cols, rows).await;
+                    }
+                    Message::Noop
+                })
             }
 
             Message::RemoveOrchestrator(id) => {
@@ -600,31 +659,19 @@ impl App {
             }
 
             Message::WindowResized(size) => {
-                state.window_width = size.width;
-                let font_size = 13.0f32;
-                let cell_w    = font_size * 0.6;
-                let cell_h    = font_size * 1.4;
-                let sidebar_w = state.sidebar_width + 5.0; // +5 for drag handle
-                let header_h  = 80.0f32;
                 // iced_winit converts Resized to logical pixels before emitting,
                 // so size.width/height are already in logical (device-independent) pixels.
-                let cols = ((size.width  - sidebar_w).max(200.0) / cell_w) as u16;
-                let rows = ((size.height - header_h ).max(100.0) / cell_h) as u16;
+                state.window_width  = size.width;
+                state.window_height = size.height;
 
                 // Keep the authoritative terminal size up to date so new sessions
                 // spawned after this resize use the correct dimensions.
-                state.terminal_cols = cols;
-                state.terminal_rows = rows;
-
-                let session_ids: Vec<SessionId> = state.terminals.keys().cloned().collect();
-                for sid in &session_ids {
-                    if let Some(term) = state.terminals.get_mut(sid) {
-                        term.resize(cols, rows);
-                    }
-                }
+                let session_ids = Self::resize_terminals(state);
                 if session_ids.is_empty() {
                     return Task::none();
                 }
+                let cols = state.terminal_cols;
+                let rows = state.terminal_rows;
                 Task::future(async move {
                     for sid in session_ids {
                         let _ = ninox_core::tmux::resize_window(&sid, cols, rows).await;
@@ -662,10 +709,15 @@ impl App {
                 match state.drag {
                     Some(DragTarget::Sidebar) => {
                         state.sidebar_width = position.x.clamp(150.0, 400.0);
+                        // Reflow the grid locally for live visual feedback; the
+                        // backing tmux pane is synced once on MouseReleased
+                        // rather than on every drag frame.
+                        Self::resize_terminals(state);
                     }
                     Some(DragTarget::InfoPanel) => {
                         let available = state.window_width - state.sidebar_width - 10.0;
                         state.info_width = (state.window_width - position.x).clamp(200.0, available.max(200.0));
+                        Self::resize_terminals(state);
                     }
                     None => {}
                 }
@@ -673,7 +725,21 @@ impl App {
             }
 
             Message::MouseReleased => {
+                let was_dragging = state.drag.is_some();
                 state.drag = None;
+                if was_dragging {
+                    let session_ids = Self::resize_terminals(state);
+                    if !session_ids.is_empty() {
+                        let cols = state.terminal_cols;
+                        let rows = state.terminal_rows;
+                        return Task::future(async move {
+                            for sid in session_ids {
+                                let _ = ninox_core::tmux::resize_window(&sid, cols, rows).await;
+                            }
+                            Message::Noop
+                        });
+                    }
+                }
                 Task::none()
             }
 
@@ -1182,6 +1248,7 @@ mod tests {
             terminal_cols:  140,
             terminal_rows:  50,
             window_width:   0.0,
+            window_height:  0.0,
             sidebar_width:  0.0,
             info_width:     0.0,
             drag:            None,
@@ -1389,6 +1456,44 @@ mod tests {
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
         let (m3, _) = m2.update(Message::SwitchDetailPanel(DetailPanel::Inspector));
         assert!(matches!(&m3.view, View::SessionDetail { panel: DetailPanel::Inspector, .. }));
+    }
+
+    #[test]
+    fn switch_to_split_panel_resizes_terminal_to_fit_narrower_area() {
+        use crate::components::session_detail::DetailPanel;
+        let e = test_engine();
+        let mut m = base(e);
+        m.window_width  = 1200.0;
+        m.window_height = 800.0;
+        m.sidebar_width = 220.0;
+        m.info_width    = 300.0;
+
+        let s = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0,
+            started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None,
+        };
+        let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        // Set the view to SessionDetail via NavigateSession, then attach a
+        // terminal directly rather than relying on the async PTY task.
+        let (mut m, _) = m.update(Message::NavigateSession("s1".into()));
+        let full_width_cols = m.terminal_cols;
+        m.terminals.insert(
+            "s1".into(),
+            crate::components::terminal::TerminalState::new(full_width_cols, m.terminal_rows),
+        );
+
+        let (m2, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Split));
+
+        assert!(
+            m2.terminal_cols < full_width_cols,
+            "opening the Split panel should narrow the terminal grid to fit the remaining space"
+        );
+        use alacritty_terminal::grid::Dimensions;
+        let term = m2.terminals.get("s1").unwrap();
+        assert_eq!(term.term.grid().columns(), m2.terminal_cols as usize);
     }
 
     #[test]
