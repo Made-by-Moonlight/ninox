@@ -11,16 +11,22 @@ name: Publish to crates.io
 # released.
 #
 # One-time setup per crate (crates.io Trusted Publishing):
-#   1. From https://crates.io/crates/new, add a "pending" trusted publisher
-#      for each crate name (ninox-core, ninox-server, ninox) — this works
-#      even before the crate has ever been published.
-#   2. For each, configure a GitHub publisher:
+# Unlike PyPI, crates.io has no "pending publisher" for crates that have
+# never been published — Trusted Publishing can only be configured by an
+# existing owner from a crate's own settings page, so the very first
+# publish of each crate must happen manually.
+#   1. Publish each crate manually once, in dependency order, using a
+#      personal API token (`cargo login`, then `cargo publish -p ninox-core`,
+#      wait for it to appear on crates.io, then `-p ninox-server`, then
+#      `-p ninox`). This makes you the crate's owner.
+#   2. For each crate, go to https://crates.io/crates/<crate-name>/settings,
+#      find "Trusted Publishing", and add a GitHub publisher:
 #        Repository owner:  Made-by-Moonlight
 #        Repository name:   ninox
 #        Workflow filename: publish.yml
 #        Environment:       (leave blank)
-#   3. The account that configures this becomes the crate owner on first
-#      successful publish from this workflow.
+#   3. After that, this workflow publishes all subsequent version bumps via
+#      OIDC — no token needed.
 #
 # Publish order matters: ninox-server depends on ninox-core, and ninox
 # depends on both. Each step waits for its crate to become visible in the
