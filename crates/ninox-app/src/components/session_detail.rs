@@ -5,7 +5,7 @@ use iced::{
 
 use crate::{
     app::{App, DragTarget, Message},
-    components::{info_panel::info_panel, inspector_panel::inspector_panel, terminal::TerminalWidget},
+    components::{info_panel::info_panel, inspector_panel::inspector_panel, terminal::{TerminalWidget, FONT_SIZE}},
 };
 
 fn repo_short(repo: &str) -> &str {
@@ -163,7 +163,7 @@ pub fn session_detail<'a>(
         iced::widget::Canvas::new(TerminalWidget {
             state:        term_state,
             session_id:   session_id.to_string(),
-            font_size:    13.0,
+            font_size:    FONT_SIZE,
             terminal_bg:  s.terminal_bg,
             terminal_fg:  s.terminal_fg,
             cursor_color: s.accent,

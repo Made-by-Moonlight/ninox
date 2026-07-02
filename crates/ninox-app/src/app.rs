@@ -329,39 +329,64 @@ impl App {
     /// size into every live `TerminalState`'s grid so rendering reflows to
     /// fit the actual visible canvas area instead of being clipped.
     ///
-    /// Returns the session IDs that need their backing tmux pane resized to
-    /// match — callers decide whether/when to do that (e.g. immediately for
-    /// a window resize, or once at drag-release rather than every frame).
-    fn resize_terminals(state: &mut Self) -> Vec<SessionId> {
-        let font_size = 13.0f32;
-        let cell_w    = font_size * 0.6;
-        let cell_h    = font_size * 1.4;
+    /// `DetailPanel::default()` is Split, so any session — active or
+    /// backgrounded — shows the Split panel unless it's the one currently
+    /// being viewed *and* the user has switched it to a different panel.
+    /// Background sessions are therefore always sized as if Split were
+    /// showing (the width they'll actually get next time they're
+    /// navigated to); only the active session is sized for whatever panel
+    /// it's actually displaying right now. Without this distinction, the
+    /// active session's own panel choice (e.g. switching to the full-width
+    /// Terminal tab) would leak into every other open session's real tmux
+    /// pane, resizing sessions the user isn't even looking at.
+    ///
+    /// Returns `(session_id, cols, rows)` for every session whose backing
+    /// tmux pane needs resizing to match — callers decide whether/when to
+    /// do that (e.g. immediately for a window resize, or once at
+    /// drag-release rather than every frame).
+    fn resize_terminals(state: &mut Self) -> Vec<(SessionId, u16, u16)> {
+        let (cell_w, cell_h) = crate::components::terminal::cell_size(
+            crate::components::terminal::FONT_SIZE,
+        );
         let sidebar_w = state.sidebar_width + 5.0; // +5 for drag handle
         let header_h  = 80.0f32;
+        let info_w    = state.info_width + 5.0; // +5 for drag handle
 
-        // The info panel only eats into the terminal's width when the Split
-        // panel is actually showing it side-by-side with the terminal.
-        let info_w = match &state.view {
-            View::SessionDetail {
-                panel: crate::components::session_detail::DetailPanel::Split,
-                ..
-            } => state.info_width + 5.0, // +5 for drag handle
-            _ => 0.0,
+        // Background sizing: what any session shows once Split (the default
+        // panel) is active — this is also the authoritative size recorded on
+        // `state` for sessions that don't have a `TerminalState` yet.
+        let bg_cols = ((state.window_width - sidebar_w - info_w).max(200.0) / cell_w) as u16;
+        let bg_rows = ((state.window_height - header_h).max(100.0) / cell_h) as u16;
+        state.terminal_cols = bg_cols;
+        state.terminal_rows = bg_rows;
+
+        // The actively-viewed session uses whatever panel it's actually
+        // showing — only Split narrows the width; every other panel uses
+        // the full (non-info-panel) width.
+        let active = match &state.view {
+            View::SessionDetail { session_id, panel: crate::components::session_detail::DetailPanel::Split } => {
+                Some((session_id.clone(), bg_cols, bg_rows))
+            }
+            View::SessionDetail { session_id, .. } => {
+                let cols = ((state.window_width - sidebar_w).max(200.0) / cell_w) as u16;
+                Some((session_id.clone(), cols, bg_rows))
+            }
+            _ => None,
         };
 
-        let cols = ((state.window_width - sidebar_w - info_w).max(200.0) / cell_w) as u16;
-        let rows = ((state.window_height - header_h).max(100.0) / cell_h) as u16;
-
-        state.terminal_cols = cols;
-        state.terminal_rows = rows;
-
         let session_ids: Vec<SessionId> = state.terminals.keys().cloned().collect();
-        for sid in &session_ids {
-            if let Some(term) = state.terminals.get_mut(sid) {
+        let mut resized = Vec::with_capacity(session_ids.len());
+        for sid in session_ids {
+            let (cols, rows) = match &active {
+                Some((active_id, cols, rows)) if active_id == &sid => (*cols, *rows),
+                _ => (bg_cols, bg_rows),
+            };
+            if let Some(term) = state.terminals.get_mut(&sid) {
                 term.resize(cols, rows);
             }
+            resized.push((sid, cols, rows));
         }
-        session_ids
+        resized
     }
 
     /// Shared mutation logic.
@@ -380,6 +405,12 @@ impl App {
                     session_id: id.clone(),
                     panel: DetailPanel::default(),
                 };
+                // `id` is now the active (Split-by-default) session, so reflow
+                // every terminal: `id` gets sized for the panel it's about to
+                // show, and whatever session was active before (if any) falls
+                // back to the background/default-panel size instead of being
+                // left at whatever width its old panel happened to need.
+                let resized = Self::resize_terminals(state);
                 // Capture current terminal dimensions before resetting so start_streaming
                 // resizes tmux to match.
                 let (cols, rows) = state.terminals.get(&id)
@@ -396,7 +427,14 @@ impl App {
                 // renders on top of stale cursor state and garbles the output.
                 state.terminals.remove(&id);
                 let engine = state.engine.clone();
+                // Sync tmux for every *other* session resize_terminals just
+                // touched — `id`'s own pane is resized below via start_streaming.
+                let other_sessions: Vec<(SessionId, u16, u16)> =
+                    resized.into_iter().filter(|(sid, ..)| sid != &id).collect();
                 Task::future(async move {
+                    for (sid, cols, rows) in other_sessions {
+                        let _ = ninox_core::tmux::resize_window(&sid, cols, rows).await;
+                    }
                     if ninox_core::tmux::has_session(&id).await {
                         if let Err(e) =
                             ninox_core::pty::start_streaming(engine.clone(), id.clone(), &id, cols, rows).await
@@ -579,14 +617,12 @@ impl App {
                 }
                 // Entering/leaving Split changes how much width the terminal
                 // canvas actually has, so the grid must be reflowed to match.
-                let session_ids = Self::resize_terminals(state);
-                if session_ids.is_empty() {
+                let resized = Self::resize_terminals(state);
+                if resized.is_empty() {
                     return Task::none();
                 }
-                let cols = state.terminal_cols;
-                let rows = state.terminal_rows;
                 Task::future(async move {
-                    for sid in session_ids {
+                    for (sid, cols, rows) in resized {
                         let _ = ninox_core::tmux::resize_window(&sid, cols, rows).await;
                     }
                     Message::Noop
@@ -666,14 +702,12 @@ impl App {
 
                 // Keep the authoritative terminal size up to date so new sessions
                 // spawned after this resize use the correct dimensions.
-                let session_ids = Self::resize_terminals(state);
-                if session_ids.is_empty() {
+                let resized = Self::resize_terminals(state);
+                if resized.is_empty() {
                     return Task::none();
                 }
-                let cols = state.terminal_cols;
-                let rows = state.terminal_rows;
                 Task::future(async move {
-                    for sid in session_ids {
+                    for (sid, cols, rows) in resized {
                         let _ = ninox_core::tmux::resize_window(&sid, cols, rows).await;
                     }
                     Message::Noop
@@ -728,12 +762,10 @@ impl App {
                 let was_dragging = state.drag.is_some();
                 state.drag = None;
                 if was_dragging {
-                    let session_ids = Self::resize_terminals(state);
-                    if !session_ids.is_empty() {
-                        let cols = state.terminal_cols;
-                        let rows = state.terminal_rows;
+                    let resized = Self::resize_terminals(state);
+                    if !resized.is_empty() {
                         return Task::future(async move {
-                            for sid in session_ids {
+                            for (sid, cols, rows) in resized {
                                 let _ = ninox_core::tmux::resize_window(&sid, cols, rows).await;
                             }
                             Message::Noop
@@ -1459,8 +1491,59 @@ mod tests {
     }
 
     #[test]
+    fn navigating_away_reverts_the_outgoing_session_to_background_width() {
+        use crate::components::session_detail::DetailPanel;
+        use alacritty_terminal::grid::Dimensions;
+        let e = test_engine();
+        let mut m = base(e);
+        m.window_width  = 1200.0;
+        m.window_height = 800.0;
+        m.sidebar_width = 220.0;
+        m.info_width    = 300.0;
+
+        for id in ["s1", "s2"] {
+            let s = Session {
+                id: id.into(), orchestrator_id: None, name: "w".into(),
+                repo: "r".into(), status: SessionStatus::Working,
+                agent_type: "claude-code".into(), cost_usd: 0.0,
+                started_at: 0, pr_number: None, pr_id: None,
+                workspace_path: None, pid: None,
+            };
+            let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+            m = next;
+        }
+
+        // s1 becomes active and switches off Split to the full-width Terminal
+        // panel, so its terminal is wider than the Split-assumed background size.
+        let (m, _) = m.update(Message::NavigateSession("s1".into()));
+        let background_cols = m.terminal_cols;
+        let (mut m, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
+        m.terminals.insert(
+            "s1".into(),
+            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows),
+        );
+        let (m, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
+        let wide_cols = m.terminals.get("s1").unwrap().term.grid().columns();
+        assert!(wide_cols > background_cols as usize);
+
+        // Navigating away to s2 must revert s1 — now backgrounded — back to
+        // the Split-assumed width instead of leaving it at its old, wider
+        // active-panel size (which would corrupt s1's real tmux pane size
+        // for as long as it sits in the background).
+        let (m2, _) = m.update(Message::NavigateSession("s2".into()));
+        let s1_term = m2.terminals.get("s1").unwrap();
+        assert_eq!(
+            s1_term.term.grid().columns(),
+            background_cols as usize,
+            "a session that just became backgrounded must be resized back to the \
+             Split-assumed width, not left at its old active-panel size"
+        );
+    }
+
+    #[test]
     fn switch_to_split_panel_resizes_terminal_to_fit_narrower_area() {
         use crate::components::session_detail::DetailPanel;
+        use alacritty_terminal::grid::Dimensions;
         let e = test_engine();
         let mut m = base(e);
         m.window_width  = 1200.0;
@@ -1476,24 +1559,86 @@ mod tests {
             workspace_path: None, pid: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
-        // Set the view to SessionDetail via NavigateSession, then attach a
-        // terminal directly rather than relying on the async PTY task.
-        let (mut m, _) = m.update(Message::NavigateSession("s1".into()));
-        let full_width_cols = m.terminal_cols;
+        // NavigateSession defaults to the Split panel, so switch to Terminal
+        // first to establish the full-width baseline, then attach a terminal
+        // directly rather than relying on the async PTY task.
+        let (m, _) = m.update(Message::NavigateSession("s1".into()));
+        let (mut m, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
         m.terminals.insert(
             "s1".into(),
-            crate::components::terminal::TerminalState::new(full_width_cols, m.terminal_rows),
+            crate::components::terminal::TerminalState::new(m.terminal_cols, m.terminal_rows),
         );
+        // Re-apply Terminal now that a terminal exists, so it's sized as the
+        // active (full-width) session rather than left at its initial size.
+        let (m, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
+        let full_width_cols = m.terminals.get("s1").unwrap().term.grid().columns();
 
         let (m2, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Split));
 
+        let term = m2.terminals.get("s1").unwrap();
         assert!(
-            m2.terminal_cols < full_width_cols,
+            term.term.grid().columns() < full_width_cols,
             "opening the Split panel should narrow the terminal grid to fit the remaining space"
         );
-        use alacritty_terminal::grid::Dimensions;
-        let term = m2.terminals.get("s1").unwrap();
         assert_eq!(term.term.grid().columns(), m2.terminal_cols as usize);
+    }
+
+    #[test]
+    fn active_sessions_non_split_panel_does_not_widen_background_sessions() {
+        use crate::components::session_detail::DetailPanel;
+        use alacritty_terminal::grid::Dimensions;
+        let e = test_engine();
+        let mut m = base(e);
+        m.window_width  = 1200.0;
+        m.window_height = 800.0;
+        m.sidebar_width = 220.0;
+        m.info_width    = 300.0;
+
+        for id in ["s1", "s2"] {
+            let s = Session {
+                id: id.into(), orchestrator_id: None, name: "w".into(),
+                repo: "r".into(), status: SessionStatus::Working,
+                agent_type: "claude-code".into(), cost_usd: 0.0,
+                started_at: 0, pr_number: None, pr_id: None,
+                workspace_path: None, pid: None,
+            };
+            let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+            m = next;
+        }
+
+        // s1 becomes the active session; DetailPanel::default() is Split, so
+        // its terminal (and the still-terminal-less s2's authoritative size)
+        // both start out at the narrow, Split-assumed background width.
+        let (mut m, _) = m.update(Message::NavigateSession("s1".into()));
+        let background_cols = m.terminal_cols;
+        m.terminals.insert(
+            "s1".into(),
+            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows),
+        );
+        // s2 is backgrounded at the same Split-assumed width every session
+        // not currently in view is expected to sit at.
+        m.terminals.insert(
+            "s2".into(),
+            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows),
+        );
+
+        // s1 switches away from Split to a full-width panel while it's the
+        // one being viewed — this must widen s1 only, not backgrounded s2,
+        // which will show Split (the default) again next time it's viewed.
+        let (m2, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
+
+        let s1_term = m2.terminals.get("s1").unwrap();
+        let s2_term = m2.terminals.get("s2").unwrap();
+        assert!(
+            s1_term.term.grid().columns() > background_cols as usize,
+            "the actively-viewed session should widen when it switches off the Split panel"
+        );
+        assert_eq!(
+            s2_term.term.grid().columns(),
+            background_cols as usize,
+            "a backgrounded session must stay at the Split-assumed width — it isn't shown by \
+             the panel change and will default back to Split next time it's navigated to"
+        );
     }
 
     #[test]

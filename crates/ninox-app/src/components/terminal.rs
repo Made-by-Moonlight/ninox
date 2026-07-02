@@ -13,6 +13,18 @@ const NERD_FONT: iced::Font = iced::Font {
     style: iced::font::Style::Normal,
 };
 
+/// The single source of truth for the terminal's font size — every layout
+/// computation (canvas rendering, mouse hit-testing, and the tmux grid
+/// sizing in `app::App::resize_terminals`) must derive cell dimensions from
+/// this constant via `cell_size()` so they can never drift apart.
+pub const FONT_SIZE: f32 = 13.0;
+
+/// Monospace cell size (width, height) in pixels for a given font size —
+/// the same approximation used everywhere a terminal cell is measured.
+pub fn cell_size(font_size: f32) -> (f32, f32) {
+    (font_size * 0.6, font_size * 1.4)
+}
+
 // ---------------------------------------------------------------------------
 // EventProxy
 // ---------------------------------------------------------------------------
@@ -211,8 +223,7 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
         use iced::mouse::{Button, Event as MouseEvent};
         use iced::widget::canvas::Event;
 
-        let cell_w = self.font_size * 0.6;
-        let cell_h = self.font_size * 1.4;
+        let (cell_w, cell_h) = cell_size(self.font_size);
         let cols = self.state.term.grid().columns();
         let rows = self.state.term.grid().screen_lines();
 
@@ -309,8 +320,7 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
         _cursor: iced::mouse::Cursor,
     ) -> Vec<Geometry> {
         // Cell dimensions based on font_size (monospace approximation).
-        let cell_w = self.font_size * 0.6;
-        let cell_h = self.font_size * 1.4;
+        let (cell_w, cell_h) = cell_size(self.font_size);
 
         let term = &self.state.term;
         let grid = term.grid();
