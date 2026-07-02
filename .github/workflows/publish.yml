@@ -1,0 +1,109 @@
+name: Publish to crates.io
+
+# Publishes athene-core, athene-server, and athene-app to crates.io in
+# dependency order using crates.io Trusted Publishing (OIDC) — no
+# long-lived CARGO_REGISTRY_TOKEN secret required.
+#
+# Trigger: push a tag matching `v*` (e.g. v0.1.0), or run manually via
+# workflow_dispatch.
+#
+# One-time setup per crate (crates.io Trusted Publishing):
+#   1. From https://crates.io/crates/new, add a "pending" trusted publisher
+#      for each crate name (athene-core, athene-server, athene-app) — this
+#      works even before the crate has ever been published.
+#   2. For each, configure a GitHub publisher:
+#        Repository owner:  Made-by-Moonlight
+#        Repository name:   ninox
+#        Workflow filename: publish.yml
+#        Environment:       (leave blank)
+#   3. The account that configures this becomes the crate owner on first
+#      successful publish from this workflow.
+#
+# Publish order matters: athene-server depends on athene-core, and
+# athene-app depends on both. Each step waits for its crate to become
+# visible in the crates.io index before the next dependent crate publishes.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write # crates.io trusted publishing via OIDC
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            pkg-config
+
+      - name: Install wait-for-crate helper
+        run: |
+          cat <<'SCRIPT' > /tmp/wait-for-crate.sh
+          #!/usr/bin/env bash
+          set -euo pipefail
+          crate="$1"
+          version="$2"
+          for i in $(seq 1 30); do
+            if curl -sf "https://crates.io/api/v1/crates/${crate}/${version}" > /dev/null; then
+              echo "${crate} ${version} is live."
+              exit 0
+            fi
+            echo "Waiting for ${crate} ${version} to appear (attempt ${i})..."
+            sleep 10
+          done
+          echo "Timed out waiting for ${crate} ${version}." >&2
+          exit 1
+          SCRIPT
+          chmod +x /tmp/wait-for-crate.sh
+
+      - name: Authenticate to crates.io (athene-core)
+        id: auth-core
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        with:
+          crate: athene-core
+
+      - name: Publish athene-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-core.outputs.token }}
+        run: |
+          cargo publish -p athene-core
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="athene-core") | .version')
+          /tmp/wait-for-crate.sh athene-core "$version"
+
+      - name: Authenticate to crates.io (athene-server)
+        id: auth-server
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        with:
+          crate: athene-server
+
+      - name: Publish athene-server
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-server.outputs.token }}
+        run: |
+          cargo publish -p athene-server
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="athene-server") | .version')
+          /tmp/wait-for-crate.sh athene-server "$version"
+
+      - name: Authenticate to crates.io (athene-app)
+        id: auth-app
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        with:
+          crate: athene-app
+
+      - name: Publish athene-app
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-app.outputs.token }}
+        run: cargo publish -p athene-app

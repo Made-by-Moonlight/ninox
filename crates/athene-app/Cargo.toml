@@ -1,15 +1,18 @@
 [package]
-name    = "athene-app"
-version = "0.1.0"
-edition = "2021"
+name        = "athene-app"
+version     = "0.1.0"
+edition     = "2021"
+description = "Ninox native desktop app: GPU-accelerated Rust/Iced UI for the Athene orchestrator engine."
+license     = "MIT"
+repository  = "https://github.com/Made-by-Moonlight/ninox"
 
 [[bin]]
 name = "athene-app"
 path = "src/main.rs"
 
 [dependencies]
-athene-core   = { path = "../athene-core" }
-athene-server = { path = "../athene-server" }
+athene-core   = { path = "../athene-core", version = "0.1.0" }
+athene-server = { path = "../athene-server", version = "0.1.0" }
 tokio         = { workspace = true }
 anyhow        = { workspace = true }
 tracing       = { workspace = true }

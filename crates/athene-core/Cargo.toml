@@ -1,7 +1,10 @@
 [package]
-name    = "athene-core"
-version = "0.1.0"
-edition = "2021"
+name        = "athene-core"
+version     = "0.1.0"
+edition     = "2021"
+description = "Engine core for the Ninox native app: session lifecycle, config, and storage."
+license     = "MIT"
+repository  = "https://github.com/Made-by-Moonlight/ninox"
 
 [dependencies]
 tokio      = { workspace = true }
