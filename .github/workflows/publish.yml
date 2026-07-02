@@ -37,6 +37,10 @@ permissions:
   contents: read
   id-token: write # crates.io trusted publishing via OIDC
 
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 jobs:
   publish:
     name: Publish
@@ -61,7 +65,7 @@ jobs:
           crate="$1"
           version="$2"
           for i in $(seq 1 30); do
-            if curl -sf "https://crates.io/api/v1/crates/${crate}/${version}" > /dev/null; then
+            if curl -sf -A "ninox-ci-publish-workflow" "https://crates.io/api/v1/crates/${crate}/${version}" > /dev/null; then
               echo "${crate} ${version} is live."
               exit 0
             fi
@@ -83,7 +87,7 @@ jobs:
             crate="${entry##*:}"
             version=$(echo "$metadata" | jq -r --arg n "$crate" '.packages[] | select(.name==$n) | .version')
             echo "${key}_version=${version}" >> "$GITHUB_OUTPUT"
-            if curl -sf "https://crates.io/api/v1/crates/${crate}/${version}" > /dev/null; then
+            if curl -sf -A "ninox-ci-publish-workflow" "https://crates.io/api/v1/crates/${crate}/${version}" > /dev/null; then
               echo "${crate} ${version} is already published — skipping."
               echo "${key}_publish=false" >> "$GITHUB_OUTPUT"
             else
