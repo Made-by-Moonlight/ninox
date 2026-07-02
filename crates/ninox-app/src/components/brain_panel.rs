@@ -56,7 +56,7 @@ fn section<'a>(app: &'a App, entry_type: &str, entries: Vec<&'a BrainEntry>) -> 
     )
     .padding([6, 12])
     .width(Length::Fill)
-    .style(move |_| container::Style {
+    .style(move |_theme| container::Style {
         background: Some(Background::Color(s.bg_elevated)),
         ..Default::default()
     });
@@ -103,7 +103,7 @@ pub fn brain_panel(app: &App) -> Element<'_, Message> {
     )
     .padding([12, 20])
     .width(Length::Fill)
-    .style(move |_| container::Style {
+    .style(move |_theme| container::Style {
         background: Some(Background::Color(s.bg_base)),
         border: Border { color: s.border, width: 0.0, radius: 0.0.into() },
         ..Default::default()
@@ -118,7 +118,7 @@ pub fn brain_panel(app: &App) -> Element<'_, Message> {
     )
     .padding([8, 20])
     .width(Length::Fill)
-    .style(move |_| container::Style {
+    .style(move |_theme| container::Style {
         background: Some(Background::Color(s.bg_base)),
         border: Border { color: s.border, width: 0.0, radius: 0.0.into() },
         ..Default::default()
@@ -163,7 +163,7 @@ pub fn brain_panel(app: &App) -> Element<'_, Message> {
     let left = container(list)
         .width(Length::Fixed(280.0))
         .height(Length::Fill)
-        .style(move |_| container::Style {
+        .style(move |_theme| container::Style {
             background: Some(Background::Color(s.bg_surface)),
             border: Border { color: s.border, width: 1.0, radius: 0.0.into() },
             ..Default::default()
@@ -242,7 +242,7 @@ fn detail_pane(app: &App) -> Element<'_, Message> {
                 Space::new(0, 8),
                 column(meta_rows).spacing(4),
                 Space::new(0, 16),
-                container(Space::new(Length::Fill, 1)).width(Length::Fill).style(move |_| {
+                container(Space::new(Length::Fill, 1)).width(Length::Fill).style(move |_theme| {
                     container::Style { background: Some(Background::Color(s.border)), ..Default::default() }
                 }),
                 Space::new(0, 16),
@@ -256,7 +256,7 @@ fn detail_pane(app: &App) -> Element<'_, Message> {
     container(scrollable(content).height(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(move |_| container::Style {
+        .style(move |_theme| container::Style {
             background: Some(Background::Color(s.bg_base)),
             ..Default::default()
         })

@@ -1227,6 +1227,10 @@ mod tests {
 
     fn base(engine: Arc<Engine>) -> App {
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
+        base_with_brain(engine, brain)
+    }
+
+    fn base_with_brain(engine: Arc<Engine>, brain: Arc<BrainIndex>) -> App {
         App {
             engine,
             config:             AppConfig::default(),
@@ -1411,6 +1415,64 @@ mod tests {
         let m = base(e);
         let (m2, _) = m.update(Message::NavigatePrList);
         assert!(matches!(m2.view, View::PrList));
+    }
+
+    #[test]
+    fn navigate_brain_sets_view_and_loads_entries() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("concepts")).unwrap();
+        std::fs::write(
+            brain_dir.join("concepts").join("note.md"),
+            "---\nname: Note\n---\nSome body text.",
+        )
+        .unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        assert!(!m.brain_view.loaded);
+
+        let (m2, _) = m.update(Message::NavigateBrain);
+        assert!(matches!(m2.view, View::Brain));
+        assert!(m2.brain_view.loaded);
+        assert_eq!(m2.brain_view.entries.len(), 1);
+        assert_eq!(m2.brain_view.entries[0].name, "Note");
+    }
+
+    #[test]
+    fn brain_select_entry_sets_selected() {
+        let e = test_engine();
+        let m = base(e);
+        let (m2, _) = m.update(Message::BrainSelectEntry("concepts/note.md".into()));
+        assert_eq!(m2.brain_view.selected.as_deref(), Some("concepts/note.md"));
+    }
+
+    #[test]
+    fn brain_filter_query_sets_filter() {
+        let e = test_engine();
+        let m = base(e);
+        let (m2, _) = m.update(Message::BrainFilterQuery("rust".into()));
+        assert_eq!(m2.brain_view.filter, "rust");
+    }
+
+    #[test]
+    fn brain_reindex_reloads_entries_from_disk() {
+        let brain_dir = tempdir().unwrap().keep();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m2, _) = m.update(Message::NavigateBrain);
+        assert!(m2.brain_view.entries.is_empty());
+
+        // A file appears on disk after the initial load (e.g. hand-edited outside the app).
+        std::fs::create_dir_all(brain_dir.join("repos")).unwrap();
+        std::fs::write(brain_dir.join("repos").join("ninox.md"), "Ninox repo notes.").unwrap();
+
+        let (m3, _) = m2.update(Message::BrainReindex);
+        assert_eq!(m3.brain_view.entries.len(), 1);
+        assert_eq!(m3.brain_view.entries[0].id, "repos/ninox.md");
     }
 
     #[test]
