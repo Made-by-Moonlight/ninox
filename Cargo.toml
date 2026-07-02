@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "crates/athene-core",
-    "crates/athene-server",
-    "crates/athene-app",
+    "crates/ninox-core",
+    "crates/ninox-server",
+    "crates/ninox-app",
 ]
 resolver = "2"
 
