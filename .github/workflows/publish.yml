@@ -4,8 +4,11 @@ name: Publish to crates.io
 # to crates.io in dependency order using crates.io Trusted Publishing (OIDC)
 # — no long-lived CARGO_REGISTRY_TOKEN secret required.
 #
-# Trigger: push a tag matching `v*` (e.g. v0.1.0), or run manually via
-# workflow_dispatch.
+# Trigger: every push to main (i.e. on merge), a `v*` tag push, or manual
+# workflow_dispatch. Each crate is only actually published if its current
+# Cargo.toml version isn't already live on crates.io, so merges that don't
+# bump a version are a no-op — bump a crate's version in the PR you want
+# released.
 #
 # One-time setup per crate (crates.io Trusted Publishing):
 #   1. From https://crates.io/crates/new, add a "pending" trusted publisher
@@ -26,6 +29,7 @@ name: Publish to crates.io
 on:
   workflow_dispatch:
   push:
+    branches: [main]
     tags:
       - 'v*'
 
@@ -69,41 +73,64 @@ jobs:
           SCRIPT
           chmod +x /tmp/wait-for-crate.sh
 
+      - name: Determine publish plan
+        id: plan
+        run: |
+          set -euo pipefail
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          for entry in core:ninox-core server:ninox-server app:ninox; do
+            key="${entry%%:*}"
+            crate="${entry##*:}"
+            version=$(echo "$metadata" | jq -r --arg n "$crate" '.packages[] | select(.name==$n) | .version')
+            echo "${key}_version=${version}" >> "$GITHUB_OUTPUT"
+            if curl -sf "https://crates.io/api/v1/crates/${crate}/${version}" > /dev/null; then
+              echo "${crate} ${version} is already published — skipping."
+              echo "${key}_publish=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "${crate} ${version} is not yet published — will publish."
+              echo "${key}_publish=true" >> "$GITHUB_OUTPUT"
+            fi
+          done
+
       - name: Authenticate to crates.io (ninox-core)
         id: auth-core
+        if: steps.plan.outputs.core_publish == 'true'
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         with:
           crate: ninox-core
 
       - name: Publish ninox-core
+        if: steps.plan.outputs.core_publish == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth-core.outputs.token }}
         run: |
           cargo publish -p ninox-core
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="ninox-core") | .version')
-          /tmp/wait-for-crate.sh ninox-core "$version"
+          /tmp/wait-for-crate.sh ninox-core "${{ steps.plan.outputs.core_version }}"
 
       - name: Authenticate to crates.io (ninox-server)
         id: auth-server
+        if: steps.plan.outputs.server_publish == 'true'
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         with:
           crate: ninox-server
 
       - name: Publish ninox-server
+        if: steps.plan.outputs.server_publish == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth-server.outputs.token }}
         run: |
           cargo publish -p ninox-server
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="ninox-server") | .version')
-          /tmp/wait-for-crate.sh ninox-server "$version"
+          /tmp/wait-for-crate.sh ninox-server "${{ steps.plan.outputs.server_version }}"
 
       - name: Authenticate to crates.io (ninox)
         id: auth-app
+        if: steps.plan.outputs.app_publish == 'true'
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         with:
           crate: ninox
 
       - name: Publish ninox
+        if: steps.plan.outputs.app_publish == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth-app.outputs.token }}
         run: cargo publish -p ninox
