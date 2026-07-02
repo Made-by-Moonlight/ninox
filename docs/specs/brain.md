@@ -14,15 +14,15 @@ Each orchestrator uses exactly **one** brain. Brains are never merged — they m
 
 Resolution order:
 
-1. `brain.path` in the project-level `athene.toml` — project-specific brain
-2. `brain.path` in `~/.config/athene/config.toml` — user-configured global default
-3. `~/.config/athene/brain/` — built-in fallback
+1. `brain.path` in the project-level `ninox.toml` — project-specific brain
+2. `brain.path` in `~/.config/ninox/config.toml` — user-configured global default
+3. `~/.config/ninox/brain/` — built-in fallback
 
 ---
 
 ## Configuration
 
-### Global (`~/.config/athene/config.toml`)
+### Global (`~/.config/ninox/config.toml`)
 
 ```toml
 [brain]
@@ -46,14 +46,14 @@ pub struct AppConfig {
 
 `AppConfig::resolved_brain_path()` implements the resolution order above, using `dirs::config_dir()` for the fallback.
 
-### Per-project (`athene.toml`)
+### Per-project (`ninox.toml`)
 
 ```toml
 [brain]
 path = "./docs/brain"   # optional — use a project-local brain
 ```
 
-The project config is looked up by walking up from cwd, finding the nearest `athene.toml`. If absent, the global config is used.
+The project config is looked up by walking up from cwd, finding the nearest `ninox.toml`. If absent, the global config is used.
 
 ---
 
@@ -100,7 +100,7 @@ The index is **derived** from the files — the files are the source of truth. I
 
 ### Implementation
 
-A `BrainIndex` struct lives in `crates/athene-core/src/brain.rs`, separate from `Store`. It follows the same patterns as `Store`: `Mutex<Connection>`, WAL mode, `anyhow::Result`.
+A `BrainIndex` struct lives in `crates/ninox-core/src/brain.rs`, separate from `Store`. It follows the same patterns as `Store`: `Mutex<Connection>`, WAL mode, `anyhow::Result`.
 
 ```rust
 pub struct BrainIndex {
@@ -160,7 +160,7 @@ A `.gitignore` entry for `.index.db` is written to the brain root on first `rebu
 
 ## Server Routes
 
-New routes added to `crates/athene-server/src/routes/brain.rs`:
+New routes added to `crates/ninox-server/src/routes/brain.rs`:
 
 ```
 POST /api/brain/index          — rebuild index (triggers BrainIndex::rebuild)
@@ -168,21 +168,21 @@ GET  /api/brain/query?q=&type=&tag=  — search entries
 GET  /api/brain/entry/*path    — fetch a single entry by relative path
 ```
 
-The `AppState` in `athene-server` gains a `brain: Arc<BrainIndex>` field, initialised on server startup using the resolved brain path from `AppConfig`.
+The `AppState` in `ninox-server` gains a `brain: Arc<BrainIndex>` field, initialised on server startup using the resolved brain path from `AppConfig`.
 
 ---
 
 ## CLI Commands
 
-CLI subcommands added to `crates/athene-app`:
+CLI subcommands added to `crates/ninox-app`:
 
 ```
-athene brain index              # rebuild index for the active brain
-athene brain index --watch      # rebuild on file change (notify crate)
-athene brain query <text>       # full-text search
-athene brain query --type repo  # filter by section
-athene brain query --tag auth   # filter by tag
-athene brain show <path>        # print a single entry to stdout
+ninox brain index              # rebuild index for the active brain
+ninox brain index --watch      # rebuild on file change (notify crate)
+ninox brain query <text>       # full-text search
+ninox brain query --type repo  # filter by section
+ninox brain query --tag auth   # filter by tag
+ninox brain show <path>        # print a single entry to stdout
 ```
 
 ---
@@ -196,7 +196,7 @@ The skill at `skills/brain/SKILL.md` (in the TypeScript monorepo's `skills/` dir
 Before recording a new fact, check whether it already exists:
 
 ```
-athene brain query "<name or concept>"
+ninox brain query "<name or concept>"
 ```
 
 If a relevant entry exists, update it rather than creating a duplicate.
@@ -206,7 +206,7 @@ If a relevant entry exists, update it rather than creating a duplicate.
 Create or update a Markdown file in the appropriate section. Follow the frontmatter schema. Keep the body concise — facts over prose. Then rebuild the index:
 
 ```
-athene brain index
+ninox brain index
 ```
 
 ### 3. Read for context
@@ -214,8 +214,8 @@ athene brain index
 When starting work in an unfamiliar area, query the brain first:
 
 ```
-athene brain query --type architecture
-athene brain query --type repo <name>
+ninox brain query --type architecture
+ninox brain query --type repo <name>
 ```
 
 Follow the returned path to read the full file.
@@ -224,7 +224,7 @@ Follow the returned path to read the full file.
 
 ## Import
 
-Pointing `brain.path` at an existing Obsidian vault or Markdown knowledge base and running `athene brain index` is sufficient to make it queryable. Entries without Athene frontmatter are indexed by filename and body text only.
+Pointing `brain.path` at an existing Obsidian vault or Markdown knowledge base and running `ninox brain index` is sufficient to make it queryable. Entries without Ninox frontmatter are indexed by filename and body text only.
 
 ---
 

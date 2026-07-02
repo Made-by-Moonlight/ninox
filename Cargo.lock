@@ -399,67 +399,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "athene-app"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "arboard",
- "async-stream",
- "athene-core",
- "athene-server",
- "clap",
- "dirs 5.0.1",
- "iced",
- "notify-rust",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "athene-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dirs 5.0.1",
- "libc",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-test",
- "tokio-util",
- "toml",
- "tracing",
- "walkdir",
-]
-
-[[package]]
-name = "athene-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "athene-core",
- "axum",
- "futures",
- "http",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tower 0.4.13",
- "tower-http 0.5.2",
- "tracing",
-]
-
-[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2692,6 +2631,67 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "ninox"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "arboard",
+ "async-stream",
+ "clap",
+ "dirs 5.0.1",
+ "iced",
+ "ninox-core",
+ "ninox-server",
+ "notify-rust",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ninox-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 5.0.1",
+ "libc",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
+name = "ninox-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures",
+ "http",
+ "ninox-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "tracing",
 ]
 
 [[package]]

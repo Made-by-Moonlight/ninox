@@ -1,16 +1,16 @@
 name: Publish to crates.io
 
-# Publishes athene-core, athene-server, and athene-app to crates.io in
-# dependency order using crates.io Trusted Publishing (OIDC) — no
-# long-lived CARGO_REGISTRY_TOKEN secret required.
+# Publishes ninox-core, ninox-server, and ninox (the native app binary crate)
+# to crates.io in dependency order using crates.io Trusted Publishing (OIDC)
+# — no long-lived CARGO_REGISTRY_TOKEN secret required.
 #
 # Trigger: push a tag matching `v*` (e.g. v0.1.0), or run manually via
 # workflow_dispatch.
 #
 # One-time setup per crate (crates.io Trusted Publishing):
 #   1. From https://crates.io/crates/new, add a "pending" trusted publisher
-#      for each crate name (athene-core, athene-server, athene-app) — this
-#      works even before the crate has ever been published.
+#      for each crate name (ninox-core, ninox-server, ninox) — this works
+#      even before the crate has ever been published.
 #   2. For each, configure a GitHub publisher:
 #        Repository owner:  Made-by-Moonlight
 #        Repository name:   ninox
@@ -19,9 +19,9 @@ name: Publish to crates.io
 #   3. The account that configures this becomes the crate owner on first
 #      successful publish from this workflow.
 #
-# Publish order matters: athene-server depends on athene-core, and
-# athene-app depends on both. Each step waits for its crate to become
-# visible in the crates.io index before the next dependent crate publishes.
+# Publish order matters: ninox-server depends on ninox-core, and ninox
+# depends on both. Each step waits for its crate to become visible in the
+# crates.io index before the next dependent crate publishes.
 
 on:
   workflow_dispatch:
@@ -69,41 +69,41 @@ jobs:
           SCRIPT
           chmod +x /tmp/wait-for-crate.sh
 
-      - name: Authenticate to crates.io (athene-core)
+      - name: Authenticate to crates.io (ninox-core)
         id: auth-core
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         with:
-          crate: athene-core
+          crate: ninox-core
 
-      - name: Publish athene-core
+      - name: Publish ninox-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth-core.outputs.token }}
         run: |
-          cargo publish -p athene-core
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="athene-core") | .version')
-          /tmp/wait-for-crate.sh athene-core "$version"
+          cargo publish -p ninox-core
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="ninox-core") | .version')
+          /tmp/wait-for-crate.sh ninox-core "$version"
 
-      - name: Authenticate to crates.io (athene-server)
+      - name: Authenticate to crates.io (ninox-server)
         id: auth-server
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         with:
-          crate: athene-server
+          crate: ninox-server
 
-      - name: Publish athene-server
+      - name: Publish ninox-server
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth-server.outputs.token }}
         run: |
-          cargo publish -p athene-server
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="athene-server") | .version')
-          /tmp/wait-for-crate.sh athene-server "$version"
+          cargo publish -p ninox-server
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="ninox-server") | .version')
+          /tmp/wait-for-crate.sh ninox-server "$version"
 
-      - name: Authenticate to crates.io (athene-app)
+      - name: Authenticate to crates.io (ninox)
         id: auth-app
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         with:
-          crate: athene-app
+          crate: ninox
 
-      - name: Publish athene-app
+      - name: Publish ninox
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth-app.outputs.token }}
-        run: cargo publish -p athene-app
+        run: cargo publish -p ninox

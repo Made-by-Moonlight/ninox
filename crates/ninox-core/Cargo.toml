@@ -1,0 +1,25 @@
+[package]
+name        = "ninox-core"
+version     = "0.1.0"
+edition     = "2021"
+description = "Engine core for the Ninox native app: session lifecycle, config, and storage."
+license     = "MIT"
+repository  = "https://github.com/Made-by-Moonlight/ninox"
+
+[dependencies]
+tokio      = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+rusqlite   = { workspace = true }
+anyhow     = { workspace = true }
+toml       = { workspace = true }
+dirs       = { workspace = true }
+tracing    = { workspace = true }
+tokio-util = { workspace = true }
+libc       = { workspace = true }
+reqwest    = { workspace = true }
+walkdir    = { workspace = true }
+
+[dev-dependencies]
+tempfile   = "3"
+tokio-test = "0.4"
