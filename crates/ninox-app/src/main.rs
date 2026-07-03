@@ -315,12 +315,25 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
 
     const SYMBOLS_NERD_FONT_MONO: &[u8] =
         include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
+    const FONT_NEWSREADER: &[u8] =
+        include_bytes!("../assets/fonts/Newsreader[opsz,wght].ttf");
+    const FONT_NEWSREADER_ITALIC: &[u8] =
+        include_bytes!("../assets/fonts/Newsreader-Italic[opsz,wght].ttf");
+    const FONT_ARCHIVO: &[u8] =
+        include_bytes!("../assets/fonts/Archivo[wdth,wght].ttf");
+    const FONT_SPLINE_SANS_MONO: &[u8] =
+        include_bytes!("../assets/fonts/SplineSansMono[wght].ttf");
 
     iced::application("Ninox", app::App::iced_update, app::App::iced_view)
         .subscription(app::App::subscription)
         .theme(app::App::theme)
         .window(window_settings)
         .font(SYMBOLS_NERD_FONT_MONO)
+        .font(FONT_NEWSREADER)
+        .font(FONT_NEWSREADER_ITALIC)
+        .font(FONT_ARCHIVO)
+        .font(FONT_SPLINE_SANS_MONO)
+        .default_font(iced::Font::with_name("Archivo"))
         .run_with(move || app::App::new(engine, orchestrator_root, orchestrator_agent, brain))?;
 
     token.cancel();
