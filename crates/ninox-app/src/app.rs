@@ -77,6 +77,19 @@ pub struct App {
     pub sidebar:         SidebarState,
     pub view:            View,
     pub terminals:       HashMap<SessionId, TerminalState>,
+    /// One hidden tmux client per on-screen session (the "view"). Dropping
+    /// an entry kills the client process; the session itself stays detached
+    /// and running.
+    clients: HashMap<SessionId, ninox_core::client::AttachedClient>,
+    /// Sessions that already burned their one automatic reattach after an
+    /// unexpected ClientClosed. Cleared on navigation.
+    reattach_attempted: std::collections::HashSet<SessionId>,
+    /// Monotonically increasing identity handed to every spawned
+    /// `AttachedClient`. Lets `Event::ClientOutput`/`ClientClosed` handlers
+    /// tell a stale client's events (from one that lost a concurrent-attach
+    /// race, or was superseded by a fresh NavigateSession) apart from the
+    /// currently-live client for the same session_id.
+    next_client_generation: u64,
     pub spawn_modal:     Option<SpawnForm>,
     /// Current terminal canvas dimensions, kept in sync by WindowResized.
     /// Used as the source of truth for all start_streaming + TerminalState::new calls.
@@ -103,6 +116,8 @@ pub enum Message {
     EngineEvent(Event),
     NavigateFleet { scope: Option<OrchestratorId> },
     NavigateSession(SessionId),
+    /// Attach argv resolved — spawn the hidden tmux client for this session.
+    ClientAttach { session_id: SessionId, argv: Vec<String> },
     SelectOrchestrator(Option<OrchestratorId>),
     SpawnSession,
     SpawnFormName(String),
@@ -138,6 +153,15 @@ pub enum Message {
     FleetFilterQuery(String),
     ClearFleetFilter,
     ScrollTerminal { session_id: SessionId, delta: i32 },
+    JumpToLatest { session_id: SessionId },
+    /// A chunk of tmux pane history came back from `capture-pane` for a
+    /// scrolled-back terminal.
+    HistoryFetched {
+        session_id: SessionId,
+        bytes: Vec<u8>,
+        fetched_to: i64,
+        top_reached: bool,
+    },
     OpenUrl(String),
     Noop,
 }
@@ -177,70 +201,6 @@ fn global_event_handler(
         modifiers,
         text: text.map(|t| t.as_str().to_string()),
     })
-}
-
-/// Convert a key event to terminal bytes.
-/// `app_cursor`: true when the terminal has APP_CURSOR mode set — arrow keys
-/// use `\x1bO[ABCD]` instead of `\x1b[[ABCD]` in that mode.
-fn key_to_terminal_bytes(
-    key: &iced::keyboard::Key,
-    modifiers: iced::keyboard::Modifiers,
-    text: Option<&str>,
-    app_cursor: bool,
-) -> Option<Vec<u8>> {
-    use iced::keyboard::key::Named;
-    use iced::keyboard::Key;
-
-    // Ctrl+letter → caret notation (Ctrl+A=0x01 … Ctrl+Z=0x1A, Ctrl+[=ESC)
-    if modifiers.control() {
-        match key {
-            Key::Character(c) => {
-                if let Some(ch) = c.chars().next() {
-                    let b = match ch {
-                        'a'..='z' => Some(vec![(ch as u8) - b'a' + 1]),
-                        'A'..='Z' => Some(vec![(ch as u8) - b'A' + 1]),
-                        '[' => Some(b"\x1b".to_vec()),
-                        '\\' => Some(b"\x1c".to_vec()),
-                        ']' => Some(b"\x1d".to_vec()),
-                        '^' | '6' => Some(b"\x1e".to_vec()),
-                        '_' => Some(b"\x1f".to_vec()),
-                        _ => None,
-                    };
-                    if b.is_some() { return b; }
-                }
-            }
-            Key::Named(Named::Enter) => return Some(b"\r".to_vec()),
-            _ => {}
-        }
-    }
-
-    // Arrow keys: mode-sensitive
-    let arr = if app_cursor { ("OA","OB","OC","OD") } else { ("[A","[B","[C","[D") };
-    let esc = |s: &str| -> Vec<u8> { let mut v = b"\x1b".to_vec(); v.extend(s.as_bytes()); v };
-
-    let bytes: Vec<u8> = match key {
-        Key::Named(Named::Enter)      => b"\r".to_vec(),
-        Key::Named(Named::Escape)     => b"\x1b".to_vec(),
-        Key::Named(Named::Backspace)  => b"\x7f".to_vec(),
-        Key::Named(Named::Delete)     => b"\x1b[3~".to_vec(),
-        Key::Named(Named::Tab) if modifiers.shift() => b"\x1b[Z".to_vec(),
-        Key::Named(Named::Tab)        => b"\t".to_vec(),
-        Key::Named(Named::ArrowUp)    => esc(arr.0),
-        Key::Named(Named::ArrowDown)  => esc(arr.1),
-        Key::Named(Named::ArrowRight) => esc(arr.2),
-        Key::Named(Named::ArrowLeft)  => esc(arr.3),
-        Key::Named(Named::Home)       => b"\x1b[H".to_vec(),
-        Key::Named(Named::End)        => b"\x1b[F".to_vec(),
-        Key::Named(Named::PageUp)     => b"\x1b[5~".to_vec(),
-        Key::Named(Named::PageDown)   => b"\x1b[6~".to_vec(),
-        // Prefer `text` (the actual typed character, shift-resolved) over `c`
-        // (the base logical key). On some platforms Key::Character holds the
-        // unshifted key, so Shift+backtick would give c="`" instead of "~".
-        Key::Character(c)             => text.map(|t| t.as_bytes().to_vec())
-                                             .unwrap_or_else(|| c.as_str().as_bytes().to_vec()),
-        _ => text.map(|t| t.as_bytes().to_vec()).unwrap_or_default(),
-    };
-    if bytes.is_empty() { None } else { Some(bytes) }
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +247,9 @@ impl App {
             sidebar:        SidebarState::default(),
             view:           View::default(),
             terminals:      HashMap::new(),
+            clients:        HashMap::new(),
+            reattach_attempted: std::collections::HashSet::new(),
+            next_client_generation: 0,
             spawn_modal:    None,
             // Placeholders — corrected below by resize_terminals() using the
             // real default window size, so this never drifts out of sync with
@@ -420,6 +383,8 @@ impl App {
             Message::NavigateFleet { scope } => {
                 state.last_fleet_scope = scope.clone();
                 state.view = View::FleetBoard { scope };
+                // Off-screen sessions keep running detached; drop their view clients.
+                state.clients.clear();
                 Task::none()
             }
 
@@ -428,53 +393,76 @@ impl App {
                     session_id: id.clone(),
                     panel: DetailPanel::default(),
                 };
-                // `id` is now the active (Split-by-default) session, so reflow
-                // every terminal: `id` gets sized for the panel it's about to
-                // show, and whatever session was active before (if any) falls
-                // back to the background/default-panel size instead of being
-                // left at whatever width its old panel happened to need.
-                let resized = Self::resize_terminals(state);
-                // Capture current terminal dimensions before resetting so start_streaming
-                // resizes tmux to match.
-                let (cols, rows) = state.terminals.get(&id)
-                    .map(|t| {
-                        use alacritty_terminal::grid::Dimensions;
-                        (
-                            t.term.grid().columns() as u16,
-                            t.term.grid().screen_lines() as u16,
-                        )
-                    })
-                    .unwrap_or((state.terminal_cols, state.terminal_rows));
-                // Reset the terminal grid so capture_pane output is applied to a clean
-                // slate. Without this, capture_pane (which has no cursor-home sequence)
-                // renders on top of stale cursor state and garbles the output.
+                // Drop every client that is no longer on screen — the tmux
+                // sessions stay detached and running.
+                state.clients.retain(|sid, _| sid == &id);
+                state.reattach_attempted.clear();
+                // Fresh view: kill any previous client + emulator for this
+                // session; attach repaints the whole screen into clean state.
+                state.clients.remove(&id);
                 state.terminals.remove(&id);
+                Self::resize_terminals(state);
+
                 let engine = state.engine.clone();
-                // Sync tmux for every *other* session resize_terminals just
-                // touched — `id`'s own pane is resized below via start_streaming.
-                let other_sessions: Vec<(SessionId, u16, u16)> =
-                    resized.into_iter().filter(|(sid, ..)| sid != &id).collect();
                 Task::future(async move {
-                    for (sid, cols, rows) in other_sessions {
-                        let _ = ninox_core::tmux::resize_window(&sid, cols, rows).await;
-                    }
-                    if ninox_core::tmux::has_session(&id).await {
-                        if let Err(e) =
-                            ninox_core::pty::start_streaming(engine.clone(), id.clone(), &id, cols, rows).await
-                        {
-                            tracing::warn!("PTY (re)connect for {id}: {e}");
-                        }
-                    } else {
-                        // Session's tmux process is gone — mark it terminated so the
-                        // UI shows "Session exited" instead of "Terminal connecting…".
+                    if !ninox_core::tmux::has_session(&id).await {
                         if let Ok(Some(mut s)) = engine.store.get_session(&id) {
                             s.status = ninox_core::types::SessionStatus::Terminated;
                             let _ = engine.store.upsert_session(&s);
                             engine.emit(ninox_core::events::Event::SessionUpdated(s));
                         }
+                        return Message::Noop;
                     }
-                    Message::Noop
+                    // Keep the pipe-pane tap alive for the WS route/monitoring.
+                    if let Err(e) = ninox_core::pty::start_streaming(engine.clone(), id.clone(), &id).await {
+                        tracing::warn!("pipe-pane tap for {id}: {e}");
+                    }
+                    let argv = ninox_core::tmux::attach_args(&id).await;
+                    Message::ClientAttach { session_id: id, argv }
                 })
+            }
+
+            Message::ClientAttach { session_id, argv } => {
+                // Only attach if the user is still looking at this session.
+                let viewing = matches!(&state.view,
+                    View::SessionDetail { session_id: sid, .. } if sid == &session_id);
+                if !viewing { return Task::none(); }
+                // A live client already exists for this session — a
+                // concurrent attach (e.g. a re-navigate that fired its own
+                // ClientAttach) already won the race. Spawning another
+                // would orphan two AttachedClients pointed at the same
+                // session_id, one of which is stray.
+                if state.clients.contains_key(&session_id) { return Task::none(); }
+
+                let (cols, rows) = (state.terminal_cols, state.terminal_rows);
+                let generation = state.next_client_generation;
+                state.next_client_generation += 1;
+                match ninox_core::client::AttachedClient::spawn(
+                    state.engine.clone(), session_id.clone(), argv, cols, rows, generation,
+                ) {
+                    Ok(client) => {
+                        // Fresh emulator wired to the client so query replies
+                        // (DSR/DA/kitty) flow back to tmux.
+                        state.terminals.insert(
+                            session_id.clone(),
+                            crate::components::terminal::TerminalState::new(
+                                cols, rows, Some(client.input_sender()),
+                            ),
+                        );
+                        state.clients.insert(session_id.clone(), client);
+                        // The client was spawned at the background size; the
+                        // active panel may want a different one — reflow and
+                        // push the real size to the client PTY.
+                        let resized = Self::resize_terminals(state);
+                        if let Some((_, c, r)) = resized.iter().find(|(sid, ..)| sid == &session_id) {
+                            if let Some(client) = state.clients.get(&session_id) {
+                                client.resize(*c, *r);
+                            }
+                        }
+                    }
+                    Err(e) => tracing::error!("attach client for {session_id}: {e}"),
+                }
+                Task::none()
             }
 
             Message::SelectOrchestrator(id) => {
@@ -557,8 +545,6 @@ impl App {
                     let nm         = name;
                     let ts_i64     = ts as i64;
                     let orch_agent = state.orchestrator_agent.clone();
-                    let t_cols     = state.terminal_cols;
-                    let t_rows     = state.terminal_rows;
 
                     return Task::future(async move {
                         use ninox_core::{pty, tmux, Event as CoreEvent, Session, SessionStatus};
@@ -623,12 +609,16 @@ impl App {
                         };
                         let _ = engine.store.upsert_session(&updated);
 
-                        if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &tmux_id, t_cols, t_rows).await {
+                        if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &tmux_id).await {
                             tracing::error!("pty setup failed for {sid}: {e}");
                         }
 
                         engine.emit(CoreEvent::SessionUpdated(updated));
-                        Message::Noop
+                        // Attach a hidden tmux client so the freshly-spawned
+                        // session's view renders immediately (mirrors
+                        // NavigateSession's attach flow).
+                        let argv = tmux::attach_args(&tmux_id).await;
+                        Message::ClientAttach { session_id: sid, argv }
                     });
                 }
                 Task::none()
@@ -641,15 +631,12 @@ impl App {
                 // Entering/leaving Split changes how much width the terminal
                 // canvas actually has, so the grid must be reflowed to match.
                 let resized = Self::resize_terminals(state);
-                if resized.is_empty() {
-                    return Task::none();
-                }
-                Task::future(async move {
-                    for (sid, cols, rows) in resized {
-                        let _ = ninox_core::tmux::resize_window(&sid, cols, rows).await;
+                for (sid, cols, rows) in resized {
+                    if let Some(client) = state.clients.get(&sid) {
+                        client.resize(cols, rows);
                     }
-                    Message::Noop
-                })
+                }
+                Task::none()
             }
 
             Message::RemoveOrchestrator(id) => {
@@ -665,6 +652,9 @@ impl App {
                     k != &id && s.orchestrator_id.as_deref() != Some(id.as_str())
                 });
                 state.terminals.remove(&id);
+                // Drop clients for the orchestrator itself and any worker
+                // sessions removed above — only surviving sessions keep theirs.
+                state.clients.retain(|sid, _| state.sessions.contains_key(sid));
                 if state.sidebar.selected_orchestrator.as_deref() == Some(id.as_str()) {
                     state.sidebar.selected_orchestrator = None;
                 }
@@ -683,6 +673,7 @@ impl App {
                 }
                 state.sessions.remove(&id);
                 state.terminals.remove(&id);
+                state.clients.remove(&id);
                 let engine = state.engine.clone();
                 Task::future(async move {
                     if let Err(e) = engine.remove_session(&id).await {
@@ -698,21 +689,32 @@ impl App {
                     panel: crate::components::session_detail::DetailPanel::Terminal
                         | crate::components::session_detail::DetailPanel::Split,
                 } = &state.view {
-                    let app_cursor = state.terminals.get(session_id)
-                        .map(|t| t.term.mode().contains(
-                            alacritty_terminal::term::TermMode::APP_CURSOR
-                        ))
-                        .unwrap_or(false);
-                    let Some(bytes) = key_to_terminal_bytes(&key, modifiers, text.as_deref(), app_cursor)
-                        else { return Task::none(); };
                     let session_id = session_id.clone();
-                    let engine = state.engine.clone();
-                    return Task::future(async move {
-                        if let Some(sender) = engine.get_pty_writer(&session_id).await {
-                            let _ = sender.send(bytes);
+                    let mode = state.terminals.get(&session_id)
+                        .map(|t| *t.term.mode())
+                        .unwrap_or_else(alacritty_terminal::term::TermMode::empty);
+
+                    // Paste: Cmd+V (macOS) / Ctrl+Shift+V.
+                    let is_paste = matches!(&key, iced::keyboard::Key::Character(c)
+                            if c.as_str().eq_ignore_ascii_case("v"))
+                        && (modifiers.logo() || (modifiers.control() && modifiers.shift()));
+                    if is_paste {
+                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                            if let Ok(pasted) = cb.get_text() {
+                                let payload = crate::input::encode_paste(&pasted, &mode);
+                                if let Some(client) = state.clients.get(&session_id) {
+                                    client.write(payload);
+                                }
+                            }
                         }
-                        Message::Noop
-                    });
+                        return Task::none();
+                    }
+                    let Some(bytes) = crate::input::encode_key(&key, modifiers, text.as_deref(), &mode)
+                        else { return Task::none(); };
+                    if let Some(client) = state.clients.get(&session_id) {
+                        client.write(bytes);
+                    }
+                    return Task::none();
                 }
                 Task::none()
             }
@@ -726,15 +728,12 @@ impl App {
                 // Keep the authoritative terminal size up to date so new sessions
                 // spawned after this resize use the correct dimensions.
                 let resized = Self::resize_terminals(state);
-                if resized.is_empty() {
-                    return Task::none();
-                }
-                Task::future(async move {
-                    for (sid, cols, rows) in resized {
-                        let _ = ninox_core::tmux::resize_window(&sid, cols, rows).await;
+                for (sid, cols, rows) in resized {
+                    if let Some(client) = state.clients.get(&sid) {
+                        client.resize(cols, rows);
                     }
-                    Message::Noop
-                })
+                }
+                Task::none()
             }
 
 
@@ -786,13 +785,10 @@ impl App {
                 state.drag = None;
                 if was_dragging {
                     let resized = Self::resize_terminals(state);
-                    if !resized.is_empty() {
-                        return Task::future(async move {
-                            for (sid, cols, rows) in resized {
-                                let _ = ninox_core::tmux::resize_window(&sid, cols, rows).await;
-                            }
-                            Message::Noop
-                        });
+                    for (sid, cols, rows) in resized {
+                        if let Some(client) = state.clients.get(&sid) {
+                            client.resize(cols, rows);
+                        }
                     }
                 }
                 Task::none()
@@ -857,6 +853,8 @@ impl App {
 
             Message::NavigatePrList => {
                 state.view = View::PrList;
+                // No session is on screen in the PR list; drop all view clients.
+                state.clients.clear();
                 Task::none()
             }
 
@@ -916,11 +914,15 @@ impl App {
 
             Message::NavigateNotification(session_id) => {
                 state.sidebar.show_notifications = false;
-                state.view = View::SessionDetail {
-                    session_id,
-                    panel: crate::components::session_detail::DetailPanel::Terminal,
-                };
-                Task::none()
+                // Route through the same attach path as NavigateSession —
+                // this view previously set state.view directly and never
+                // attached a client or created a TerminalState, permanently
+                // stranding the panel at "Terminal connecting…".
+                let task = Self::apply(state, Message::NavigateSession(session_id));
+                if let View::SessionDetail { panel, .. } = &mut state.view {
+                    *panel = crate::components::session_detail::DetailPanel::Terminal;
+                }
+                task
             }
 
             Message::FleetFilterQuery(q) => {
@@ -934,7 +936,54 @@ impl App {
 
             Message::ScrollTerminal { session_id, delta } => {
                 if let Some(term) = state.terminals.get_mut(&session_id) {
-                    term.scroll(delta);
+                    let mode = *term.term.mode();
+                    if let Some(bytes) = crate::input::encode_wheel(delta, 0, 0, &mode) {
+                        if let Some(client) = state.clients.get(&session_id) {
+                            for _ in 0..delta.unsigned_abs() { client.write(bytes.clone()); }
+                        }
+                    } else if term.scroll(delta) {
+                        // Cache edge hit while more history may exist —
+                        // fetch the next chunk from tmux (the source of
+                        // truth for scrollback; the live grid holds none).
+                        term.scrollback.fetch_pending = true;
+                        let from = term.scrollback.fetched_to; // 0 on first fetch
+                        let sid = session_id.clone();
+                        return Task::future(async move {
+                            use crate::components::scrollback::FETCH_CHUNK;
+                            let total = ninox_core::tmux::history_size(&sid).await;
+                            let end = from - 1; // next line above cache
+                            let start = (from - FETCH_CHUNK).max(-total);
+                            if end < -total || total == 0 {
+                                return Message::HistoryFetched {
+                                    session_id: sid, bytes: Vec::new(),
+                                    fetched_to: from, top_reached: true,
+                                };
+                            }
+                            let bytes = ninox_core::tmux::capture_history(&sid, start, end).await;
+                            Message::HistoryFetched {
+                                session_id: sid, bytes,
+                                fetched_to: start, top_reached: start <= -total,
+                            }
+                        });
+                    }
+                }
+                Task::none()
+            }
+
+            Message::JumpToLatest { session_id } => {
+                if let Some(term) = state.terminals.get_mut(&session_id) {
+                    term.scroll_to_bottom();
+                }
+                Task::none()
+            }
+
+            Message::HistoryFetched { session_id, bytes, fetched_to, top_reached } => {
+                if let Some(term) = state.terminals.get_mut(&session_id) {
+                    use alacritty_terminal::grid::Dimensions;
+                    let cols = term.term.grid().columns() as u16;
+                    let lines = crate::components::scrollback::parse_capture(&bytes, cols);
+                    term.scrollback.absorb(lines, fetched_to, top_reached);
+                    term.cache.clear();
                 }
                 Task::none()
             }
@@ -954,19 +1003,23 @@ impl App {
                 if !state.orchestrators.iter().any(|o| o.id == orch.id) {
                     state.orchestrators.push(orch);
                 }
+                Task::none()
             }
 
             Event::OrchestratorRemoved(id) => {
                 state.orchestrators.retain(|o| o.id != id);
                 state.sessions.retain(|_, s| s.orchestrator_id.as_deref() != Some(id.as_str()));
+                Task::none()
             }
 
             Event::SessionSpawned(session) => {
                 state.sessions.insert(session.id.clone(), session);
+                Task::none()
             }
 
             Event::SessionUpdated(session) => {
                 state.sessions.insert(session.id.clone(), session);
+                Task::none()
             }
 
             Event::SessionDone(id) => {
@@ -974,19 +1027,64 @@ impl App {
                     s.status = SessionStatus::Done;
                 }
                 state.terminals.remove(&id);
+                // A done session is definitionally not viewable.
+                state.clients.remove(&id);
+                Task::none()
             }
 
-            Event::TerminalOutput { session_id, bytes } => {
-                let term = state.terminals
-                    .entry(session_id)
-                    .or_insert_with(|| crate::components::terminal::TerminalState::new(
-                        state.terminal_cols, state.terminal_rows,
-                    ));
-                term.process(&bytes);
+            Event::TerminalOutput { .. } => {
+                // Raw pane tap — consumed by the browser WS route, not the app.
+                Task::none()
+            }
+
+            Event::ClientOutput { session_id, generation, bytes } => {
+                // A stale client (superseded by a fresh attach) may still
+                // have a reader thread draining its last buffered output —
+                // only apply it if it's still the client on record.
+                let current = state.clients.get(&session_id).map(|c| c.generation);
+                if current != Some(generation) {
+                    return Task::none();
+                }
+                if let Some(term) = state.terminals.get_mut(&session_id) {
+                    term.process(&bytes);
+                }
+                Task::none()
+            }
+
+            Event::ClientClosed { session_id, generation } => {
+                // Ignore a close from a client generation that is no longer
+                // the one on record — e.g. a deliberately dropped old
+                // client (NavigateSession re-click) whose ClientClosed
+                // arrives after a fresh client has already been attached.
+                // Acting on it would strand the new client by removing it
+                // and its terminal out from under the view.
+                let current = state.clients.get(&session_id).map(|c| c.generation);
+                if current != Some(generation) {
+                    return Task::none();
+                }
+
+                let viewing = matches!(&state.view,
+                    View::SessionDetail { session_id: sid, .. } if sid == &session_id);
+                state.clients.remove(&session_id);
+                state.terminals.remove(&session_id);
+                // One automatic reattach for unexpected deaths (tmux server
+                // restart); repeated failures fall through to the
+                // "Terminal connecting…" placeholder.
+                if viewing && state.reattach_attempted.insert(session_id.clone()) {
+                    return Task::future(async move {
+                        if !ninox_core::tmux::has_session(&session_id).await {
+                            return Message::Noop;
+                        }
+                        let argv = ninox_core::tmux::attach_args(&session_id).await;
+                        Message::ClientAttach { session_id, argv }
+                    });
+                }
+                Task::none()
             }
 
             Event::CiUpdated { pr_id, status } => {
                 state.ci_status.insert(pr_id, status);
+                Task::none()
             }
 
             Event::PrOpened { session_id, pr } => {
@@ -995,6 +1093,7 @@ impl App {
                     s.pr_id     = Some(pr.id);
                 }
                 state.prs.insert(pr.id, pr);
+                Task::none()
             }
 
             Event::ReviewComment { pr_id, comment } => {
@@ -1002,6 +1101,7 @@ impl App {
                     .entry(pr_id)
                     .or_default()
                     .push(comment);
+                Task::none()
             }
 
             Event::Notification(n) => {
@@ -1017,9 +1117,9 @@ impl App {
                 if state.notifications.len() > MAX_NOTIFICATIONS {
                     state.notifications.pop_front();
                 }
+                Task::none()
             }
         }
-        Task::none()
     }
 
     /// A 5px drag handle strip between resizable panels.
@@ -1347,6 +1447,9 @@ mod tests {
             sidebar:        SidebarState::default(),
             view:           View::FleetBoard { scope: None },
             terminals:      HashMap::new(),
+            clients:        HashMap::new(),
+            reattach_attempted: std::collections::HashSet::new(),
+            next_client_generation: 0,
             spawn_modal:    None,
             terminal_cols:  140,
             terminal_rows:  50,
@@ -1517,6 +1620,35 @@ mod tests {
     }
 
     #[test]
+    fn navigate_notification_routes_through_the_session_attach_path() {
+        // NavigateNotification used to set state.view directly and never
+        // attach a client or create a TerminalState, permanently stranding
+        // the panel at "Terminal connecting…". It must now delegate to the
+        // same attach path as NavigateSession — reattach_attempted.clear()
+        // and the Terminal/Split client-retention side effects are unique
+        // to that path, so seeing them here proves delegation happened.
+        use crate::components::session_detail::DetailPanel;
+        let e = test_engine();
+        let mut m = base(e);
+        m.reattach_attempted.insert("s1".into());
+        m.sidebar.show_notifications = true;
+
+        let (m2, _) = m.update(Message::NavigateNotification("s1".into()));
+
+        assert!(!m2.sidebar.show_notifications);
+        assert!(
+            matches!(&m2.view, View::SessionDetail { session_id, panel: DetailPanel::Terminal }
+                if session_id == "s1"),
+            "must land on the session's Terminal panel"
+        );
+        assert!(
+            !m2.reattach_attempted.contains("s1"),
+            "must go through NavigateSession's attach path (which clears reattach_attempted), \
+             not set the view directly"
+        );
+    }
+
+    #[test]
     fn navigate_brain_sets_view_and_loads_entries() {
         let brain_dir = tempdir().unwrap().keep();
         std::fs::create_dir_all(brain_dir.join("concepts")).unwrap();
@@ -1650,7 +1782,7 @@ mod tests {
         let (mut m, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
         m.terminals.insert(
             "s1".into(),
-            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows),
+            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows, None),
         );
         let (m, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
         let wide_cols = m.terminals.get("s1").unwrap().term.grid().columns();
@@ -1696,7 +1828,7 @@ mod tests {
         let (mut m, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
         m.terminals.insert(
             "s1".into(),
-            crate::components::terminal::TerminalState::new(m.terminal_cols, m.terminal_rows),
+            crate::components::terminal::TerminalState::new(m.terminal_cols, m.terminal_rows, None),
         );
         // Re-apply Terminal now that a terminal exists, so it's sized as the
         // active (full-width) session rather than left at its initial size.
@@ -1743,13 +1875,13 @@ mod tests {
         let background_cols = m.terminal_cols;
         m.terminals.insert(
             "s1".into(),
-            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows),
+            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows, None),
         );
         // s2 is backgrounded at the same Split-assumed width every session
         // not currently in view is expected to sit at.
         m.terminals.insert(
             "s2".into(),
-            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows),
+            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows, None),
         );
 
         // s1 switches away from Split to a full-width panel while it's the
@@ -1807,6 +1939,74 @@ mod tests {
             m = next;
         }
         assert_eq!(attention_count(&m), 2); // ci_failed + review_pending
+    }
+
+    #[tokio::test]
+    async fn stale_client_closed_does_not_strand_a_freshly_reattached_session() {
+        // Reproduces the critical bug: NavigateSession re-clicked on the
+        // currently-viewed session drops the OLD AttachedClient (killing
+        // its process) and attaches a fresh one. The OLD client's reader
+        // thread still surfaces exactly one ClientClosed once the killed
+        // process actually exits — carrying the OLD generation. Without
+        // generation tagging, that stale event would remove the NEW
+        // client + terminal out from under the view, and after the
+        // one-shot reattach budget burns, strand it at "Terminal
+        // connecting…" permanently.
+        fn tmux_available() -> bool {
+            std::process::Command::new("tmux").args(["-V"]).output()
+                .map(|o| o.status.success()).unwrap_or(false)
+        }
+        if !tmux_available() { return; }
+
+        let e = test_engine();
+        let m = base(e);
+        let sid = format!(
+            "app-gen-test-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+        );
+        ninox_core::tmux::create_session(&sid, "/tmp", "sleep 30", &[]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Navigate to the session and attach the first (OLD) client.
+        let (mut m, _) = m.update(Message::NavigateSession(sid.clone()));
+        let argv = ninox_core::tmux::attach_args(&sid).await;
+        let (m2, _) = m.update(Message::ClientAttach { session_id: sid.clone(), argv });
+        m = m2;
+        assert!(m.clients.contains_key(&sid), "first attach must succeed");
+        let old_generation = m.clients.get(&sid).unwrap().generation;
+
+        // Re-click the same session: NavigateSession drops the OLD client
+        // synchronously (dropping AttachedClient kills its process) and
+        // clears the terminal, mirroring the real re-click flow.
+        let (m3, _) = m.update(Message::NavigateSession(sid.clone()));
+        m = m3;
+        assert!(!m.clients.contains_key(&sid), "NavigateSession must drop the old client");
+
+        // The fresh (NEW) client attaches — different generation.
+        let argv2 = ninox_core::tmux::attach_args(&sid).await;
+        let (m4, _) = m.update(Message::ClientAttach { session_id: sid.clone(), argv: argv2 });
+        m = m4;
+        assert!(m.clients.contains_key(&sid), "second attach must succeed");
+        let new_generation = m.clients.get(&sid).unwrap().generation;
+        assert_ne!(old_generation, new_generation, "the two attaches must not share a generation");
+
+        // The OLD client's reader thread now surfaces its terminal
+        // ClientClosed, tagged with the OLD generation. This must be
+        // ignored — the currently-live client must survive intact.
+        let (m5, _) = m.update(Message::EngineEvent(Event::ClientClosed {
+            session_id: sid.clone(),
+            generation: old_generation,
+        }));
+        m = m5;
+
+        assert!(m.clients.contains_key(&sid), "a stale ClientClosed must not remove the current client");
+        assert!(m.terminals.contains_key(&sid), "the terminal entry must remain intact");
+        assert_eq!(
+            m.clients.get(&sid).unwrap().generation, new_generation,
+            "the surviving client must still be the new generation"
+        );
+
+        ninox_core::tmux::kill_session(&sid).await.unwrap();
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod app;
 mod components;
+mod input;
 mod theme;
 
 use ninox_core::{
@@ -86,6 +87,10 @@ enum BrainAction {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+
+    if let Err(e) = tmux::write_server_config() {
+        eprintln!("failed to write tmux config: {e}");
+    }
 
     if let Err(e) = ninox_core::hooks::install_wrappers() {
         tracing::warn!("failed to install wrapper hooks: {e}");
@@ -301,6 +306,11 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
         return Ok(());
     }
 
+    if let Err(e) = tmux::require_version().await {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+
     #[cfg(target_os = "macos")]
     let window_settings = iced::window::Settings {
         platform_specific: iced::window::settings::PlatformSpecific {
@@ -321,6 +331,10 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
         .theme(app::App::theme)
         .window(window_settings)
         .font(SYMBOLS_NERD_FONT_MONO)
+        .font(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf").as_slice())
+        .font(include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf").as_slice())
+        .font(include_bytes!("../assets/fonts/JetBrainsMono-Italic.ttf").as_slice())
+        .font(include_bytes!("../assets/fonts/JetBrainsMono-BoldItalic.ttf").as_slice())
         .run_with(move || app::App::new(engine, orchestrator_root, orchestrator_agent, brain))?;
 
     token.cancel();

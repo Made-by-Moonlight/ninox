@@ -44,6 +44,8 @@ fn event_to_json(event: &Event) -> Option<String> {
         }
         Event::Notification(n) => serde_json::json!({"type": "notification", "payload": n}),
         Event::TerminalOutput { .. } => return None,
+        Event::ClientOutput { .. } => return None,
+        Event::ClientClosed { .. } => return None,
     };
     serde_json::to_string(&v).ok()
 }
