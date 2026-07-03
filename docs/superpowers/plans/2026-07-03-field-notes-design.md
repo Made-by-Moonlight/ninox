@@ -1719,7 +1719,14 @@ git commit -m "feat(native-app): enriched spawn modal (repo, attach, agent, task
 
 ---
 
-### Task 11: Brain view scaffold — mode toggle, folio, wikilink helpers
+### Task 11: Brain view scaffold — mode toggle, folio, catalogues, wikilink helpers
+
+**USER ADDITION — multi-catalogue support (approved design, see spec "Multiple catalogues" + mockup volume plate):**
+- App state: `catalogues: Vec<ninox_core::config::CatalogueRef>` (from `config.catalogue_options()` — landed with the spawn-modal task) and `active_catalogue: usize` (default 0). `App.brain: Arc<BrainIndex>` stays but is REPLACED when switching.
+- New message `BrainSwitchCatalogue(usize)`: `BrainIndex::open(&catalogues[i].path)` (on error: `tracing::warn!` + keep current), replace `state.brain`, reset `brain_view` (entries reloaded via the NavigateBrain query, `loaded=false`, `selected=None`, `markdown.clear()`, `open_drawers.clear()`), set `active_catalogue = i`.
+- **Volume plate** UI at the HEAD of the left rail (Pinboard) and drawers cabinet (Catalogue mode) — NOT in the folio bar: paper_2 strip, bottom rule_dark 1px, `CATALOGUE` micro-label 8.5 left, mono 11 `⌂ {name}` right, ▾ faint; hover turns the name accent. When `catalogues.len() > 1` it is a pick_list (or cycles on click if pick_list styling fights the plate look); with one catalogue it renders inert.
+- Test: switching catalogues resets selection state and active index (seed two tempdir brains via `BrainIndex::open` in the test).
+
 
 **IMPORTANT — main already has a brain browser (PR #5).** `View::Brain`, `components/brain_panel.rs` (list + `detail_pane`), `BrainViewState { entries, loaded, selected, filter }`, messages `NavigateBrain`/`BrainSelectEntry(String)`/`BrainFilterQuery(String)`/`BrainReindex`, and `App.brain: Arc<BrainIndex>` all exist. This task EXTENDS them — do not create parallel state or duplicate messages. Read `brain_panel.rs` and the brain arms in `app.rs` before writing anything.
 
