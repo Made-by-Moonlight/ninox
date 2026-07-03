@@ -852,11 +852,15 @@ impl App {
 
             Message::NavigateNotification(session_id) => {
                 state.sidebar.show_notifications = false;
-                state.view = View::SessionDetail {
-                    session_id,
-                    panel: crate::components::session_detail::DetailPanel::Terminal,
-                };
-                Task::none()
+                // Route through the same attach path as NavigateSession —
+                // this view previously set state.view directly and never
+                // attached a client or created a TerminalState, permanently
+                // stranding the panel at "Terminal connecting…".
+                let task = Self::apply(state, Message::NavigateSession(session_id));
+                if let View::SessionDetail { panel, .. } = &mut state.view {
+                    *panel = crate::components::session_detail::DetailPanel::Terminal;
+                }
+                task
             }
 
             Message::FleetFilterQuery(q) => {
@@ -1541,6 +1545,35 @@ mod tests {
         let m = base(e);
         let (m2, _) = m.update(Message::NavigatePrList);
         assert!(matches!(m2.view, View::PrList));
+    }
+
+    #[test]
+    fn navigate_notification_routes_through_the_session_attach_path() {
+        // NavigateNotification used to set state.view directly and never
+        // attach a client or create a TerminalState, permanently stranding
+        // the panel at "Terminal connecting…". It must now delegate to the
+        // same attach path as NavigateSession — reattach_attempted.clear()
+        // and the Terminal/Split client-retention side effects are unique
+        // to that path, so seeing them here proves delegation happened.
+        use crate::components::session_detail::DetailPanel;
+        let e = test_engine();
+        let mut m = base(e);
+        m.reattach_attempted.insert("s1".into());
+        m.sidebar.show_notifications = true;
+
+        let (m2, _) = m.update(Message::NavigateNotification("s1".into()));
+
+        assert!(!m2.sidebar.show_notifications);
+        assert!(
+            matches!(&m2.view, View::SessionDetail { session_id, panel: DetailPanel::Terminal }
+                if session_id == "s1"),
+            "must land on the session's Terminal panel"
+        );
+        assert!(
+            !m2.reattach_attempted.contains("s1"),
+            "must go through NavigateSession's attach path (which clears reattach_attempted), \
+             not set the view directly"
+        );
     }
 
     #[test]
