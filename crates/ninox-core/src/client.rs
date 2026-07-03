@@ -36,12 +36,33 @@ impl AttachedClient {
         cmd.args(&argv[1..]);
         cmd.env("TERM", "xterm-256color");
         let mut child = pair.slave.spawn_command(cmd).context("spawn tmux attach")?;
-        let killer = child.clone_killer();
+        let mut killer = child.clone_killer();
         drop(pair.slave);
+
+        // Acquire both PTY handles before spawning any thread. Once a
+        // thread exists it owns `child` and is the sole emitter of the
+        // exactly-once `ClientClosed` event; if we spawned the reader
+        // first and then failed to get the writer, a caller retry after
+        // our Err would leave that thread running and orphan a second
+        // reader on top of it. So: get both handles, and if either is
+        // missing, kill+reap the child ourselves since no thread exists
+        // yet to do it.
+        let reader = pair.master.try_clone_reader();
+        let writer = pair.master.take_writer();
+        let (mut reader, mut writer) = match (reader, writer) {
+            (Ok(r), Ok(w)) => (r, w),
+            (r, w) => {
+                // Never leak the attach process: no thread owns it yet.
+                let _ = killer.kill();
+                let _ = child.wait();
+                r.context("clone PTY reader")?;
+                w.context("take PTY writer")?;
+                unreachable!("one of reader/writer must have errored");
+            }
+        };
 
         // Reader thread: PTY master → ClientOutput events. Blocking reads on
         // a dedicated thread; Engine::emit is sync so no runtime needed here.
-        let mut reader = pair.master.try_clone_reader().context("clone PTY reader")?;
         let engine_out = engine.clone();
         let sid = session_id.clone();
         std::thread::spawn(move || {
@@ -60,7 +81,6 @@ impl AttachedClient {
         });
 
         // Writer thread: mpsc → PTY master (real keyboard input path).
-        let mut writer = pair.master.take_writer().context("take PTY writer")?;
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         std::thread::spawn(move || {
             use std::io::Write;
