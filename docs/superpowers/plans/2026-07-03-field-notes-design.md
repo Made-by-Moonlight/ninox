@@ -2202,6 +2202,8 @@ cargo run -p ninox
 
 Manual checklist, BOTH themes (`t` to toggle): sidebar TOC + tree + theme dots · fleet folio/banner/ledger/cards · card hover shadow grows · session tabs ×4 + terminal chrome + Marginalia + inspector · PR ledger rows navigate · spawn modal all fields + Esc + spawn works · brain pinboard + catalogue + wikilink navigation · keys 1/2/3/4/t · terminal typing still works and `1` in a shell types a `1`.
 
+**Resize sweep (user directive):** the window is resizable — drag it small (≲900×600) and large; every view must stay usable: main areas are `Fill`-based, long content scrolls, the terminal reflows (WindowResized→resize_terminals), sidebar/info drag handles still work, nothing overflows or clips into oblivion. Fixed pixel widths are legitimate ONLY where the design intends them (sidebar default 258, brain rail 215 / drawers 272, modal 470, PR grid columns); exact pixel dimensions are NOT the acceptance metric — fluid behavior is.
+
 - [ ] **Step 5: Commit**
 
 ```bash
