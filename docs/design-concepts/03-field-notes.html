@@ -319,7 +319,14 @@ body.dark .drawers,body.dark .reading{box-shadow:4px 5px 0 rgba(0,0,0,.55)}
 body.dark .brain-mode{box-shadow:2px 2px 0 rgba(0,0,0,.5)}
 .brain-rail{width:215px;min-width:215px;border:1px solid var(--rule-dark);border-radius:2px;
   background:var(--card);box-shadow:2px 3px 0 rgba(33,29,22,.12);padding:14px 0;overflow-y:auto}
-.brain-rail .h{font-family:"Newsreader",serif;font-style:italic;font-size:14px;color:var(--faint);padding:0 16px 10px}
+.brain-rail .h{font-family:"Newsreader",serif;font-style:italic;font-size:14px;color:var(--faint);padding:10px 16px 10px}
+/* volume plate — catalogue switcher at the head of the specimen rail/drawers */
+.volplate{display:flex;align-items:baseline;gap:8px;padding:10px 14px;cursor:pointer;
+  border-bottom:1px solid var(--rule-dark);background:var(--paper-2)}
+.volplate .lbl{font-size:8.5px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--faint)}
+.volplate .nm{font-family:"Spline Sans Mono",monospace;font-size:11px;color:var(--ink);margin-left:auto}
+.volplate .car{color:var(--faint);font-size:10px}
+.volplate:hover .nm{color:var(--accent)}
 .bcat{display:flex;align-items:center;gap:10px;padding:5px 16px;font-size:12px;color:var(--ink-2);cursor:pointer}
 .bcat:hover{color:var(--ink)}
 .bcat i{width:9px;height:9px;border-radius:50%;background:currentColor}
@@ -598,6 +605,8 @@ $ <span class="cursor"></span></pre>
       </div>
       <div class="brain-body" id="brain-pinboard">
         <div class="brain-rail">
+          <!-- volume plate: which catalogue is open (config [[brain.catalogues]]) -->
+          <div class="volplate"><span class="lbl">Catalogue</span><span class="nm">⌂ default</span><span class="car">▾</span></div>
           <div class="h">brain/ — taxonomy</div>
           <div class="bcat" style="color:var(--s-propen)"><i></i><span style="color:var(--ink-2)">repos</span><span class="n">6</span></div>
           <div class="bcat" style="color:var(--s-working)"><i></i><span style="color:var(--ink-2)">symbols</span><span class="n">41</span></div>
@@ -621,6 +630,7 @@ $ <span class="cursor"></span></pre>
       <!-- catalogue mode: the directory view -->
       <div class="cat-body" id="brain-catalogue">
         <div class="drawers">
+          <div class="volplate" style="border-bottom:1px solid var(--rule)"><span class="lbl">Catalogue</span><span class="nm">⌂ default</span><span class="car">▾</span></div>
           <div class="drawer">
             <div class="drawer-h" style="color:var(--s-propen)"><span class="car">▸</span><i></i><span style="color:inherit">repos</span><span class="n">6</span><span class="pull"></span></div>
             <div class="drawer-list"></div>
@@ -707,10 +717,21 @@ $ <span class="cursor"></span></pre>
           <span class="no">ENTRY № 9</span>
         </div>
         <div class="modal-b">
+          <div class="field"><label>Entry type</label>
+            <div class="brain-mode" style="display:inline-flex;margin-top:4px">
+              <button class="bm on" data-kind="orch">⬡ Orchestrator</button>
+              <button class="bm" data-kind="worker">Standalone</button>
+            </div>
+          </div>
           <div class="field"><label>Name</label><input value="theme-tokens" /></div>
-          <div class="two">
-            <div class="field"><label>Repository</label><div class="select"><span>slievr/ninox</span><span class="car">▾</span></div></div>
-            <div class="field"><label>Attach to</label><div class="select"><span>atlas (orchestrator)</span><span class="car">▾</span></div></div>
+          <!-- standalone only: where it works; repo derives from the dir's git remote.
+               workers are NOT spawned here — orchestrators spawn their own via `ninox spawn` -->
+          <div id="kind-worker" style="display:none">
+            <div class="field"><label>Workspace</label><input value="~/proj/ninox" style="font-family:'Spline Sans Mono',monospace;font-size:13px" /></div>
+          </div>
+          <!-- both kinds: which brain this session thinks with -->
+          <div id="kind-orch" style="display:block">
+            <div class="field"><label>Catalogue</label><div class="select"><span>default — ~/.config/ninox/brain</span><span class="car">▾</span></div></div>
           </div>
           <div class="field"><label>Agent · Model</label>
             <div class="chips">
@@ -718,9 +739,6 @@ $ <span class="cursor"></span></pre>
               <span class="chip">claude · opus-4.8</span>
               <span class="chip">claude · haiku-4.5</span>
             </div>
-          </div>
-          <div class="field"><label>Task</label>
-            <textarea rows="3">Extract the three theme palettes into a shared token system; update all components to read tokens instead of hard-coded colors.</textarea>
           </div>
         </div>
         <div class="modal-f">
@@ -759,6 +777,14 @@ document.querySelectorAll('.sd-tab').forEach(t=>{
 document.getElementById('spawn-open').addEventListener('click', ()=>document.getElementById('spawn-modal').classList.add('open'));
 document.getElementById('spawn-close').addEventListener('click', ()=>document.getElementById('spawn-modal').classList.remove('open'));
 
+/* spawn kind: orchestrator ⇄ standalone — only the Workspace field toggles;
+   Catalogue applies to both kinds */
+document.querySelectorAll('[data-kind]').forEach(b=>b.addEventListener('click', ()=>{
+  document.querySelectorAll('[data-kind]').forEach(x=>x.classList.toggle('on', x===b));
+  document.getElementById('kind-worker').style.display =
+    b.dataset.kind==='worker' ? 'block' : 'none';
+}));
+
 /* theme switching — light / dark ("t" toggles too) */
 const themeDots = document.querySelectorAll('.theme-dots i');
 function setTheme(dark){
@@ -773,12 +799,12 @@ addEventListener('keydown', e=>{ if(e.key==='t') setTheme(!document.body.classLi
 
 /* brain: pinboard ⇄ catalogue */
 function setBrainMode(mode){
-  document.querySelectorAll('.bm').forEach(b=>b.classList.toggle('on', b.dataset.bm===mode));
+  document.querySelectorAll('[data-bm]').forEach(b=>b.classList.toggle('on', b.dataset.bm===mode));
   document.getElementById('brain-pinboard').classList.toggle('off', mode==='catalogue');
   document.getElementById('brain-catalogue').classList.toggle('on', mode==='catalogue');
   window.dispatchEvent(new Event('resize'));
 }
-document.querySelectorAll('.bm').forEach(b=>b.addEventListener('click', ()=>setBrainMode(b.dataset.bm)));
+document.querySelectorAll('[data-bm]').forEach(b=>b.addEventListener('click', ()=>setBrainMode(b.dataset.bm)));
 document.querySelectorAll('.drawer-h').forEach(h=>h.addEventListener('click', ()=>h.parentElement.classList.toggle('open')));
 document.querySelectorAll('.dentry').forEach(d=>d.addEventListener('click', ()=>{
   document.querySelectorAll('.dentry').forEach(x=>x.classList.remove('sel'));
@@ -790,6 +816,8 @@ const hash = location.hash.slice(1).split(',');
 if(hash.includes('dark')) setTheme(true);
 if(hash.includes('brain')) go('brain');
 if(hash.includes('catalogue')){ go('brain'); setBrainMode('catalogue'); }
+if(hash.includes('spawn')) document.getElementById('spawn-modal').classList.add('open');
+if(hash.includes('worker')) document.querySelector('[data-kind="worker"]').click();
 
 /* brain — ink-and-pin specimen board */
 const canvas = document.getElementById('sky');

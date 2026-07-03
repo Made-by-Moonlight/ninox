@@ -125,7 +125,25 @@ Fixed left sidebar (258px, resizable) + main content, one view at a time.
 - One ledger table in a heavy 2px ink frame: № (mono, vermilion) · Title (serif) ·
   Session (dot + name) · Repo (mono) · CI (stamp) · Cost (mono). Row click → Session.
 
-### IV. Brain — one dataset, two modes (toggle in the folio bar)
+### IV. Brain — catalogues of specimens, two modes (toggle in the folio bar)
+
+**Multiple catalogues:** the app can hold several brains ("catalogues"), configured in
+`config.toml` and viewed one at a time. The switcher is a **volume plate** at the head
+of the left rail (Pinboard) / drawers cabinet (Catalogue mode): a paper-2 strip with a
+CATALOGUE micro-label and the mono name (`⌂ default ▾`) — like choosing which volume of
+the journal is open on the desk. It must NOT live in the folio bar (crowds the mode
+toggle). Switching reopens the index for that catalogue and reloads the view. Sessions
+choose their catalogue at spawn time (see Spawn modal).
+
+```toml
+# config.toml
+[[brain.catalogues]]
+name = "default"          # implicit; resolves to brain.path / the standard location
+[[brain.catalogues]]
+name = "ninox-dev"
+path = "~/proj/ninox/.brain"
+```
+
 - **✦ Pinboard** (graph): specimen board — nodes are ink-outlined dots colored by
   category, wikilink edges are dashed threads; search hits get a vermilion ring;
   preview card is a tilted (1deg) paper slip. Left rail lists the taxonomy w/ counts.
@@ -141,9 +159,23 @@ Fixed left sidebar (258px, resizable) + main content, one view at a time.
 
 ### Spawn modal (enriched — closes the brief's "name-only" gap)
 Centered over a dimmed blurred backdrop: journal-entry header ("Spawn a *session*",
-`ENTRY № n`), fields as underlined serif inputs — Name · Repository picker ·
-Attach-to-orchestrator picker · Agent/Model chips · Task textarea — cost estimate,
-Cancel ghost + vermilion "Spawn ⬡" with offset shadow. Esc closes.
+`ENTRY № n`). First field is an **Entry type** selector (joined ink-fill segments):
+`⬡ Orchestrator · Standalone` — humans spawn orchestrators or standalone sessions;
+workers are spawned BY orchestrators themselves (via `ninox spawn` / NINOX_BIN), never
+from this modal.
+
+- **Orchestrator** (default): Name · Catalogue picker · Agent/Model chips.
+  No repository field, no attachment — orchestrators own their workspace.
+- **Standalone**: Name · Workspace (mono path input — the directory it works in; its
+  repo derives from that directory's git remote; no orchestrator attachment, no
+  report-back instructions injected) · Catalogue picker · Agent/Model chips.
+
+The **Catalogue** picker (both kinds) chooses which brain the session thinks with,
+from `[[brain.catalogues]]`, exported to the session as `NINOX_BRAIN`. There is **no
+Task field** — sessions are interactive; spawning drops you into the session terminal.
+
+Fields as underlined serif inputs; cost estimate, Cancel ghost + vermilion "Spawn ⬡"
+with offset shadow. Esc closes.
 
 ## 6. Interaction inventory
 
