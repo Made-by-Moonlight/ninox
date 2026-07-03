@@ -4,20 +4,29 @@ name: Publish to crates.io
 # to crates.io in dependency order using crates.io Trusted Publishing (OIDC)
 # — no long-lived CARGO_REGISTRY_TOKEN secret required.
 #
-# Trigger: push a tag matching `v*` (e.g. v0.1.0), or run manually via
-# workflow_dispatch.
+# Trigger: every push to main (i.e. on merge), a `v*` tag push, or manual
+# workflow_dispatch. Each crate is only actually published if its current
+# Cargo.toml version isn't already live on crates.io, so merges that don't
+# bump a version are a no-op — bump a crate's version in the PR you want
+# released.
 #
 # One-time setup per crate (crates.io Trusted Publishing):
-#   1. From https://crates.io/crates/new, add a "pending" trusted publisher
-#      for each crate name (ninox-core, ninox-server, ninox) — this works
-#      even before the crate has ever been published.
-#   2. For each, configure a GitHub publisher:
+# Unlike PyPI, crates.io has no "pending publisher" for crates that have
+# never been published — Trusted Publishing can only be configured by an
+# existing owner from a crate's own settings page, so the very first
+# publish of each crate must happen manually.
+#   1. Publish each crate manually once, in dependency order, using a
+#      personal API token (`cargo login`, then `cargo publish -p ninox-core`,
+#      wait for it to appear on crates.io, then `-p ninox-server`, then
+#      `-p ninox`). This makes you the crate's owner.
+#   2. For each crate, go to https://crates.io/crates/<crate-name>/settings,
+#      find "Trusted Publishing", and add a GitHub publisher:
 #        Repository owner:  Made-by-Moonlight
 #        Repository name:   ninox
 #        Workflow filename: publish.yml
 #        Environment:       (leave blank)
-#   3. The account that configures this becomes the crate owner on first
-#      successful publish from this workflow.
+#   3. After that, this workflow publishes all subsequent version bumps via
+#      OIDC — no token needed.
 #
 # Publish order matters: ninox-server depends on ninox-core, and ninox
 # depends on both. Each step waits for its crate to become visible in the
@@ -26,12 +35,17 @@ name: Publish to crates.io
 on:
   workflow_dispatch:
   push:
+    branches: [main]
     tags:
       - 'v*'
 
 permissions:
   contents: read
   id-token: write # crates.io trusted publishing via OIDC
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -57,7 +71,7 @@ jobs:
           crate="$1"
           version="$2"
           for i in $(seq 1 30); do
-            if curl -sf "https://crates.io/api/v1/crates/${crate}/${version}" > /dev/null; then
+            if curl -sf -A "ninox-ci-publish-workflow" "https://crates.io/api/v1/crates/${crate}/${version}" > /dev/null; then
               echo "${crate} ${version} is live."
               exit 0
             fi
@@ -69,41 +83,64 @@ jobs:
           SCRIPT
           chmod +x /tmp/wait-for-crate.sh
 
+      - name: Determine publish plan
+        id: plan
+        run: |
+          set -euo pipefail
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          for entry in core:ninox-core server:ninox-server app:ninox; do
+            key="${entry%%:*}"
+            crate="${entry##*:}"
+            version=$(echo "$metadata" | jq -r --arg n "$crate" '.packages[] | select(.name==$n) | .version')
+            echo "${key}_version=${version}" >> "$GITHUB_OUTPUT"
+            if curl -sf -A "ninox-ci-publish-workflow" "https://crates.io/api/v1/crates/${crate}/${version}" > /dev/null; then
+              echo "${crate} ${version} is already published — skipping."
+              echo "${key}_publish=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "${crate} ${version} is not yet published — will publish."
+              echo "${key}_publish=true" >> "$GITHUB_OUTPUT"
+            fi
+          done
+
       - name: Authenticate to crates.io (ninox-core)
         id: auth-core
+        if: steps.plan.outputs.core_publish == 'true'
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         with:
           crate: ninox-core
 
       - name: Publish ninox-core
+        if: steps.plan.outputs.core_publish == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth-core.outputs.token }}
         run: |
           cargo publish -p ninox-core
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="ninox-core") | .version')
-          /tmp/wait-for-crate.sh ninox-core "$version"
+          /tmp/wait-for-crate.sh ninox-core "${{ steps.plan.outputs.core_version }}"
 
       - name: Authenticate to crates.io (ninox-server)
         id: auth-server
+        if: steps.plan.outputs.server_publish == 'true'
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         with:
           crate: ninox-server
 
       - name: Publish ninox-server
+        if: steps.plan.outputs.server_publish == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth-server.outputs.token }}
         run: |
           cargo publish -p ninox-server
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="ninox-server") | .version')
-          /tmp/wait-for-crate.sh ninox-server "$version"
+          /tmp/wait-for-crate.sh ninox-server "${{ steps.plan.outputs.server_version }}"
 
       - name: Authenticate to crates.io (ninox)
         id: auth-app
+        if: steps.plan.outputs.app_publish == 'true'
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         with:
           crate: ninox
 
       - name: Publish ninox
+        if: steps.plan.outputs.app_publish == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth-app.outputs.token }}
         run: cargo publish -p ninox
