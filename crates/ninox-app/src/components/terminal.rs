@@ -13,16 +13,41 @@ const NERD_FONT: iced::Font = iced::Font {
     style: iced::font::Style::Normal,
 };
 
+pub const TERM_FONT_BYTES: &[u8] =
+    include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
+
+pub const TERM_FONT: iced::Font = iced::Font {
+    family:  iced::font::Family::Name("JetBrains Mono"),
+    weight:  iced::font::Weight::Normal,
+    stretch: iced::font::Stretch::Normal,
+    style:   iced::font::Style::Normal,
+};
+
 /// The single source of truth for the terminal's font size — every layout
 /// computation (canvas rendering, mouse hit-testing, and the tmux grid
 /// sizing in `app::App::resize_terminals`) must derive cell dimensions from
 /// this constant via `cell_size()` so they can never drift apart.
 pub const FONT_SIZE: f32 = 13.0;
 
-/// Monospace cell size (width, height) in pixels for a given font size —
-/// the same approximation used everywhere a terminal cell is measured.
+/// Monospace cell size (width, height) in pixels, measured once from the
+/// bundled font's tables — canvas drawing, hit-testing, and PTY sizing all
+/// derive from this so they can never drift apart.
 pub fn cell_size(font_size: f32) -> (f32, f32) {
-    (font_size * 0.6, font_size * 1.4)
+    use std::sync::OnceLock;
+    static RATIOS: OnceLock<(f32, f32)> = OnceLock::new();
+    let (w, h) = *RATIOS.get_or_init(|| {
+        let face = ttf_parser::Face::parse(TERM_FONT_BYTES, 0)
+            .expect("bundled terminal font parses");
+        let upem = face.units_per_em() as f32;
+        let advance = face
+            .glyph_index('M')
+            .and_then(|g| face.glyph_hor_advance(g))
+            .expect("monospace advance") as f32;
+        let height = (face.ascender() as f32 - face.descender() as f32
+            + face.line_gap() as f32).max(upem);
+        (advance / upem, height / upem)
+    });
+    (font_size * w, font_size * h)
 }
 
 // ---------------------------------------------------------------------------
@@ -499,7 +524,7 @@ fn draw_cell(
         let font = if (0xE000..=0xF8FF).contains(&cp) {
             NERD_FONT
         } else {
-            iced::Font::MONOSPACE
+            TERM_FONT
         };
         frame.fill_text(iced::widget::canvas::Text {
             content: c.to_string(),
@@ -616,5 +641,16 @@ mod tests {
         s.process(b"\x1b[?u");
         let reply = rx.try_recv().expect("kitty query must produce a reply");
         assert!(reply.starts_with(b"\x1b[?"), "unexpected kitty reply: {reply:?}");
+    }
+
+    #[test]
+    fn cell_size_comes_from_font_metrics() {
+        let (w, h) = cell_size(13.0);
+        // JetBrains Mono: advance 600/1000 upem → width exactly 0.6em.
+        assert!((w - 13.0 * 0.6).abs() < 0.01, "width {w}");
+        // Height = (ascender - descender + line_gap)/upem — sane range, and
+        // NOT the old hardcoded 1.4 approximation.
+        assert!(h > 13.0 * 1.1 && h < 13.0 * 1.5, "height {h}");
+        assert!((h - 13.0 * 1.4).abs() > 0.01, "height must be measured, not the 1.4 guess");
     }
 }

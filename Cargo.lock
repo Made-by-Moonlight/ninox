@@ -2682,6 +2682,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "ttf-parser 0.25.1",
 ]
 
 [[package]]
