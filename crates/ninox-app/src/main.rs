@@ -1,5 +1,6 @@
 mod app;
 mod components;
+mod style;
 mod theme;
 
 use ninox_core::{
