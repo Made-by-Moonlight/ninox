@@ -82,23 +82,25 @@ impl TerminalState {
 // ---------------------------------------------------------------------------
 
 /// Default terminal color palette (xterm-256 approximations for named colors).
+/// Field Notes terminal palette — warm paper-lamplight ANSI
+/// (spec §1 "Terminal": same in both themes; it is "the dark object").
 const DEFAULT_PALETTE: &[(u8, u8, u8)] = &[
-    (0x28, 0x28, 0x28),   // 0  Black
-    (0xcc, 0x24, 0x1d),   // 1  Red
-    (0x98, 0x97, 0x1a),   // 2  Green
-    (0xd7, 0x99, 0x21),   // 3  Yellow
-    (0x45, 0x85, 0x88),   // 4  Blue
-    (0xb1, 0x62, 0x86),   // 5  Magenta
-    (0x68, 0x9d, 0x6a),   // 6  Cyan
-    (0xa8, 0x99, 0x84),   // 7  White
-    (0x92, 0x83, 0x74),   // 8  BrightBlack
-    (0xfb, 0x49, 0x34),   // 9  BrightRed
-    (0xb8, 0xbb, 0x26),   // 10 BrightGreen
-    (0xfa, 0xbd, 0x2f),   // 11 BrightYellow
-    (0x83, 0xa5, 0x98),   // 12 BrightBlue
-    (0xd3, 0x86, 0x9b),   // 13 BrightMagenta
-    (0x8e, 0xc0, 0x7c),   // 14 BrightCyan
-    (0xeb, 0xdb, 0xb2),   // 15 BrightWhite
+    (0x2c, 0x28, 0x22),   // 0  Black
+    (0xf0, 0x8a, 0x72),   // 1  Red
+    (0x8f, 0xd3, 0x7f),   // 2  Green
+    (0xf0, 0xc0, 0x69),   // 3  Yellow
+    (0x7e, 0xa9, 0xd4),   // 4  Blue
+    (0xc8, 0x76, 0xb4),   // 5  Magenta
+    (0x4a, 0xb0, 0xa4),   // 6  Cyan
+    (0xec, 0xe4, 0xd0),   // 7  White
+    (0x7a, 0x72, 0x60),   // 8  BrightBlack
+    (0xf4, 0xa5, 0x8f),   // 9  BrightRed
+    (0xa8, 0xe2, 0x9a),   // 10 BrightGreen
+    (0xf5, 0xd0, 0x8a),   // 11 BrightYellow
+    (0x9d, 0xc1, 0xe4),   // 12 BrightBlue
+    (0xd9, 0x96, 0xc8),   // 13 BrightMagenta
+    (0x6f, 0xc4, 0xba),   // 14 BrightCyan
+    (0xf5, 0xef, 0xdd),   // 15 BrightWhite
 ];
 
 fn rgb_to_iced(rgb: Rgb) -> IcedColor {
@@ -370,7 +372,7 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                             iced::Point::new(x, y),
                             Size::new(cell_w, cell_h),
                         );
-                        frame.fill(&sel_rect, IcedColor { r: 0.27, g: 0.52, b: 0.80, a: 0.5 });
+                        frame.fill(&sel_rect, IcedColor { r: 0.941, g: 0.753, b: 0.412, a: 0.35 });
                     } else if is_cursor {
                         let cursor_rect = Path::rectangle(
                             iced::Point::new(x, y),
