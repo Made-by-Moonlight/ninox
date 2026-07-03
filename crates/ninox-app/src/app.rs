@@ -76,6 +76,7 @@ pub struct App {
     pub notifications:   VecDeque<Notification>,
     pub sidebar:         SidebarState,
     pub view:            View,
+    pub last_session:    Option<SessionId>,
     pub terminals:       HashMap<SessionId, TerminalState>,
     pub spawn_modal:     Option<SpawnForm>,
     /// Current terminal canvas dimensions, kept in sync by WindowResized.
@@ -103,6 +104,7 @@ pub enum Message {
     EngineEvent(Event),
     NavigateFleet { scope: Option<OrchestratorId> },
     NavigateSession(SessionId),
+    NavigateLastSession,
     SelectOrchestrator(Option<OrchestratorId>),
     SpawnSession,
     SpawnFormName(String),
@@ -286,6 +288,7 @@ impl App {
             notifications:  VecDeque::new(),
             sidebar:        SidebarState::default(),
             view:           View::default(),
+            last_session:   None,
             terminals:      HashMap::new(),
             spawn_modal:    None,
             // Placeholders — corrected below by resize_terminals() using the
@@ -424,6 +427,7 @@ impl App {
             }
 
             Message::NavigateSession(id) => {
+                state.last_session = Some(id.clone());
                 state.view = View::SessionDetail {
                     session_id: id.clone(),
                     panel: DetailPanel::default(),
@@ -475,6 +479,15 @@ impl App {
                     }
                     Message::Noop
                 })
+            }
+
+            Message::NavigateLastSession => {
+                if let Some(id) = state.last_session.clone() {
+                    if state.sessions.contains_key(&id) {
+                        return App::apply(state, Message::NavigateSession(id));
+                    }
+                }
+                Task::none()
             }
 
             Message::SelectOrchestrator(id) => {
@@ -550,6 +563,7 @@ impl App {
                         session_id: orch.id.clone(),
                         panel:      DetailPanel::Terminal,
                     };
+                    state.last_session = Some(orch.id.clone());
 
                     let engine     = state.engine.clone();
                     let tmux_id    = orch.id.clone();
@@ -1346,6 +1360,7 @@ mod tests {
             notifications:  VecDeque::new(),
             sidebar:        SidebarState::default(),
             view:           View::FleetBoard { scope: None },
+            last_session:   None,
             terminals:      HashMap::new(),
             spawn_modal:    None,
             terminal_cols:  140,
@@ -1422,6 +1437,38 @@ mod tests {
 
         // View should be the session detail for that orchestrator
         assert!(matches!(&m.view, View::SessionDetail { session_id, .. } if session_id == orch_id));
+    }
+
+    #[test]
+    fn navigate_session_records_last_session() {
+        let e = test_engine();
+        let mut m = base(e);
+        let s = Session {
+            id: "sess-a".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+        };
+        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        m = next;
+
+        let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
+        m = next;
+        assert_eq!(m.last_session.as_deref(), Some("sess-a"));
+
+        let (next, _) = m.update(Message::NavigateFleet { scope: None });
+        m = next;
+        let (next, _) = m.update(Message::NavigateLastSession);
+        m = next;
+        assert!(matches!(&m.view, View::SessionDetail { session_id, .. } if session_id == "sess-a"));
+    }
+
+    #[test]
+    fn navigate_last_session_without_history_is_noop() {
+        let e = test_engine();
+        let m = base(e);
+        let (m, _) = m.update(Message::NavigateLastSession);
+        assert!(matches!(m.view, View::FleetBoard { .. }));
     }
 
     #[test]
