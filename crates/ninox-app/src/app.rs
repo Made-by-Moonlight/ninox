@@ -345,6 +345,8 @@ impl App {
             Message::NavigateFleet { scope } => {
                 state.last_fleet_scope = scope.clone();
                 state.view = View::FleetBoard { scope };
+                // Off-screen sessions keep running detached; drop their view clients.
+                state.clients.clear();
                 Task::none()
             }
 
@@ -604,6 +606,9 @@ impl App {
                     k != &id && s.orchestrator_id.as_deref() != Some(id.as_str())
                 });
                 state.terminals.remove(&id);
+                // Drop clients for the orchestrator itself and any worker
+                // sessions removed above — only surviving sessions keep theirs.
+                state.clients.retain(|sid, _| state.sessions.contains_key(sid));
                 if state.sidebar.selected_orchestrator.as_deref() == Some(id.as_str()) {
                     state.sidebar.selected_orchestrator = None;
                 }
@@ -622,6 +627,7 @@ impl App {
                 }
                 state.sessions.remove(&id);
                 state.terminals.remove(&id);
+                state.clients.remove(&id);
                 let engine = state.engine.clone();
                 Task::future(async move {
                     if let Err(e) = engine.remove_session(&id).await {
@@ -801,6 +807,8 @@ impl App {
 
             Message::NavigatePrList => {
                 state.view = View::PrList;
+                // No session is on screen in the PR list; drop all view clients.
+                state.clients.clear();
                 Task::none()
             }
 
@@ -897,6 +905,8 @@ impl App {
                     s.status = SessionStatus::Done;
                 }
                 state.terminals.remove(&id);
+                // A done session is definitionally not viewable.
+                state.clients.remove(&id);
                 Task::none()
             }
 
