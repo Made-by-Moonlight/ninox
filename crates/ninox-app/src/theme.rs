@@ -20,6 +20,11 @@ pub struct ColorScheme {
     pub status_yellow:  Color,
     pub status_purple:  Color,
     pub status_grey:    Color,
+    /// 16-entry ANSI palette (0-7 normal, 8-15 bright) used to render
+    /// terminal text when a cell requests a named color that isn't
+    /// otherwise overridden by the emulator's dynamic color table — see
+    /// `terminal::ansi_to_iced`.
+    pub ansi: [Color; 16],
 }
 
 impl ColorScheme {
@@ -76,6 +81,14 @@ pub fn light() -> ColorScheme {
         status_yellow:  color!(0xf59e0b),
         status_purple:  color!(0xa855f7),
         status_grey:    color!(0x94a3b8),
+        // terminal_bg is a dark navy (0x1e2b4a), so this palette stays
+        // dark-bg tuned even though the surrounding UI is light.
+        ansi: [
+            color!(0x2a3655), color!(0xef6b6b), color!(0x5fd68a), color!(0xf0c24a),
+            color!(0x6f9df7), color!(0xc490f0), color!(0x55d3e0), color!(0xd5dcef),
+            color!(0x5a6a92), color!(0xf79a9a), color!(0x8fe8b0), color!(0xf7d97e),
+            color!(0x9dbcfa), color!(0xd9b6f5), color!(0x8ce4ee), color!(0xf2f5fd),
+        ],
     }
 }
 
@@ -98,6 +111,13 @@ pub fn dark() -> ColorScheme {
         status_yellow:  color!(0xfbbf24),
         status_purple:  color!(0xa78bfa),
         status_grey:    color!(0x64748b),
+        // Cool navy terminal_bg (0x0a1020).
+        ansi: [
+            color!(0x1a2233), color!(0xf87171), color!(0x4ade80), color!(0xfbbf24),
+            color!(0x60a5fa), color!(0xc084fc), color!(0x22d3ee), color!(0xcbd5e1),
+            color!(0x475569), color!(0xfca5a5), color!(0x86efac), color!(0xfde047),
+            color!(0x93c5fd), color!(0xd8b4fe), color!(0x67e8f9), color!(0xf1f5f9),
+        ],
     }
 }
 
@@ -120,5 +140,12 @@ pub fn warm_dark() -> ColorScheme {
         status_yellow:  color!(0xfbbf24),
         status_purple:  color!(0xa78bfa),
         status_grey:    color!(0x6b6358),
+        // Gruvbox — the palette this app has always used for warm_dark.
+        ansi: [
+            color!(0x282828), color!(0xcc241d), color!(0x98971a), color!(0xd79921),
+            color!(0x458588), color!(0xb16286), color!(0x689d6a), color!(0xa89984),
+            color!(0x928374), color!(0xfb4934), color!(0xb8bb26), color!(0xfabd2f),
+            color!(0x83a598), color!(0xd3869b), color!(0x8ec07c), color!(0xebdbb2),
+        ],
     }
 }

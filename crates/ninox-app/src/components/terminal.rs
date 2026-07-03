@@ -1,6 +1,7 @@
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::Term;
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, Rgb};
 use iced::widget::canvas::{Cache, Frame, Geometry, Path};
 use iced::{Color as IcedColor, Rectangle, Size, Theme};
 
@@ -146,50 +147,17 @@ impl TerminalState {
 // Color conversion
 // ---------------------------------------------------------------------------
 
-/// Default terminal color palette (xterm-256 approximations for named colors).
-const DEFAULT_PALETTE: &[(u8, u8, u8)] = &[
-    (0x28, 0x28, 0x28),   // 0  Black
-    (0xcc, 0x24, 0x1d),   // 1  Red
-    (0x98, 0x97, 0x1a),   // 2  Green
-    (0xd7, 0x99, 0x21),   // 3  Yellow
-    (0x45, 0x85, 0x88),   // 4  Blue
-    (0xb1, 0x62, 0x86),   // 5  Magenta
-    (0x68, 0x9d, 0x6a),   // 6  Cyan
-    (0xa8, 0x99, 0x84),   // 7  White
-    (0x92, 0x83, 0x74),   // 8  BrightBlack
-    (0xfb, 0x49, 0x34),   // 9  BrightRed
-    (0xb8, 0xbb, 0x26),   // 10 BrightGreen
-    (0xfa, 0xbd, 0x2f),   // 11 BrightYellow
-    (0x83, 0xa5, 0x98),   // 12 BrightBlue
-    (0xd3, 0x86, 0x9b),   // 13 BrightMagenta
-    (0x8e, 0xc0, 0x7c),   // 14 BrightCyan
-    (0xeb, 0xdb, 0xb2),   // 15 BrightWhite
-];
-
 fn rgb_to_iced(rgb: Rgb) -> IcedColor {
     IcedColor::from_rgb8(rgb.r, rgb.g, rgb.b)
 }
 
-fn named_to_iced(named: NamedColor, bg: IcedColor, fg: IcedColor) -> IcedColor {
-    // Use our default palette for the first 16 named colors.
-    let idx = named as usize;
-    if idx < DEFAULT_PALETTE.len() {
-        let (r, g, b) = DEFAULT_PALETTE[idx];
-        return IcedColor::from_rgb8(r, g, b);
-    }
-    // Foreground / Background fallbacks use the active theme colors.
-    match named {
-        NamedColor::Foreground | NamedColor::BrightForeground => fg,
-        NamedColor::Background => bg,
-        _ => fg,
-    }
-}
-
 /// Convert an alacritty `Color` to an iced `Color`, consulting the dynamic
-/// color table for indexed colors where possible.
+/// color table for indexed colors where possible, and otherwise the active
+/// theme's 16-entry ANSI palette (`ColorScheme::ansi`).
 pub fn ansi_to_iced(
     color: Color,
     colors: &alacritty_terminal::term::color::Colors,
+    ansi: &[IcedColor; 16],
     bg: IcedColor,
     fg: IcedColor,
 ) -> IcedColor {
@@ -199,7 +167,16 @@ pub fn ansi_to_iced(
             if let Some(rgb) = colors[named] {
                 return rgb_to_iced(rgb);
             }
-            named_to_iced(named, bg, fg)
+            let idx = named as usize;
+            if idx < 16 {
+                return ansi[idx];
+            }
+            // Foreground / Background fallbacks use the active theme colors.
+            match named {
+                NamedColor::Foreground | NamedColor::BrightForeground => fg,
+                NamedColor::Background => bg,
+                _ => fg,
+            }
         }
         Color::Spec(rgb) => rgb_to_iced(rgb),
         Color::Indexed(idx) => {
@@ -208,8 +185,7 @@ pub fn ansi_to_iced(
             }
             // 256-color cube / grayscale fallback.
             if idx < 16 {
-                let (r, g, b) = DEFAULT_PALETTE[idx as usize];
-                IcedColor::from_rgb8(r, g, b)
+                ansi[idx as usize]
             } else if idx < 232 {
                 let n = idx - 16;
                 let b = (n % 6) * 51;
@@ -270,6 +246,8 @@ pub struct TerminalWidget<'a> {
     pub terminal_bg: IcedColor,
     pub terminal_fg: IcedColor,
     pub cursor_color: IcedColor,
+    /// The active theme's 16-entry ANSI palette — see `ColorScheme::ansi`.
+    pub ansi: [IcedColor; 16],
     /// Known session IDs — a single click on a matching word navigates to that session.
     pub session_ids: Vec<String>,
 }
@@ -402,6 +380,9 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
         let term_bg = self.terminal_bg;
         let term_fg = self.terminal_fg;
         let cursor_color = self.cursor_color;
+        // Shape + blink from DECSCUSR. Blink is deliberately not animated —
+        // see the module-level note on steady cursor rendering.
+        let cursor_shape = term.cursor_style().shape;
 
         let geometry = self.state.cache.draw(renderer, bounds.size(), |frame: &mut Frame| {
             // Background fill.
@@ -431,10 +412,10 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                         let is_selected = cell_is_selected(sel, row, col);
                         draw_cell(
                             frame, x, y, cell_w, cell_h, self.font_size,
-                            cell.c, cell.fg, cell.bg,
+                            cell.c, cell.fg, cell.bg, cell.flags,
                             false, // cursor never draws in history
-                            is_selected,
-                            colors, term_bg, term_fg, cursor_color,
+                            cursor_shape, is_selected,
+                            colors, &self.ansi, term_bg, term_fg, cursor_color,
                         );
                     }
                     continue;
@@ -454,9 +435,9 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
 
                     draw_cell(
                         frame, x, y, cell_w, cell_h, self.font_size,
-                        cell.c, cell.fg, cell.bg,
-                        is_cursor, is_selected,
-                        colors, term_bg, term_fg, cursor_color,
+                        cell.c, cell.fg, cell.bg, cell.flags,
+                        is_cursor, cursor_shape, is_selected,
+                        colors, &self.ansi, term_bg, term_fg, cursor_color,
                     );
                 }
             }
@@ -478,8 +459,16 @@ fn cell_is_selected(sel: &SelectionState, row: usize, col: usize) -> bool {
     }).unwrap_or(false)
 }
 
-/// Draw one terminal cell (background/cursor/selection rect + glyph). Shared
-/// by live grid rows and tmux-history rows so both render identically.
+/// Draw a 1px decoration stroke (underline/strikeout/undercurl segments).
+fn stroke_line(frame: &mut Frame, x1: f32, y1: f32, x2: f32, y2: f32, color: IcedColor) {
+    let path = Path::line(iced::Point::new(x1, y1), iced::Point::new(x2, y2));
+    frame.stroke(&path, iced::widget::canvas::Stroke::default().with_width(1.0).with_color(color));
+}
+
+/// Draw one terminal cell (background/cursor/selection rect + glyph +
+/// decorations). Shared by live grid rows and tmux-history rows so both
+/// render identically — style resolution (fg/bg/flags → colors+font) lives
+/// here, next to the draw calls, so the two paths can't drift apart.
 #[allow(clippy::too_many_arguments)]
 fn draw_cell(
     frame: &mut Frame,
@@ -491,20 +480,32 @@ fn draw_cell(
     c: char,
     fg_color: Color,
     bg_color: Color,
+    flags: Flags,
     is_cursor: bool,
+    cursor_shape: CursorShape,
     is_selected: bool,
     colors: &alacritty_terminal::term::color::Colors,
+    ansi: &[IcedColor; 16],
     term_bg: IcedColor,
     term_fg: IcedColor,
     cursor_color: IcedColor,
 ) {
-    // Background.
-    let bg = ansi_to_iced(bg_color, colors, term_bg, term_fg);
+    // Resolve colors, then apply attribute transforms.
+    let mut fg = ansi_to_iced(fg_color, colors, ansi, term_bg, term_fg);
+    let mut bg = ansi_to_iced(bg_color, colors, ansi, term_bg, term_fg);
+    if flags.contains(Flags::INVERSE) { std::mem::swap(&mut fg, &mut bg); }
+    if flags.contains(Flags::DIM)     { fg.a *= 0.6; }
+    if flags.contains(Flags::HIDDEN)  { fg = bg; }
+
+    // Block cursor is a filled rect with an inverted glyph — the historical
+    // behavior. Beam/Underline/HollowBlock draw the cell normally and
+    // overlay a thin cursor mark instead of taking over the whole cell.
+    let block_cursor = is_cursor && cursor_shape == CursorShape::Block;
 
     if is_selected {
         let sel_rect = Path::rectangle(iced::Point::new(x, y), Size::new(cell_w, cell_h));
         frame.fill(&sel_rect, IcedColor { r: 0.27, g: 0.52, b: 0.80, a: 0.5 });
-    } else if is_cursor {
+    } else if block_cursor {
         let cursor_rect = Path::rectangle(iced::Point::new(x, y), Size::new(cell_w, cell_h));
         frame.fill(&cursor_rect, cursor_color);
     } else if bg != term_bg {
@@ -512,24 +513,48 @@ fn draw_cell(
         frame.fill(&bg_rect, bg);
     }
 
+    if is_cursor && !is_selected {
+        match cursor_shape {
+            CursorShape::Block => {} // handled above
+            CursorShape::Beam => {
+                frame.fill(&Path::rectangle(iced::Point::new(x, y), Size::new(2.0, cell_h)), cursor_color);
+            }
+            CursorShape::Underline => {
+                frame.fill(
+                    &Path::rectangle(iced::Point::new(x, y + cell_h - 2.0), Size::new(cell_w, 2.0)),
+                    cursor_color,
+                );
+            }
+            CursorShape::HollowBlock => {
+                stroke_line(frame, x, y, x + cell_w, y, cursor_color);
+                stroke_line(frame, x, y + cell_h, x + cell_w, y + cell_h, cursor_color);
+                stroke_line(frame, x, y, x, y + cell_h, cursor_color);
+                stroke_line(frame, x + cell_w, y, x + cell_w, y + cell_h, cursor_color);
+            }
+            CursorShape::Hidden => {}
+        }
+    }
+
     // Foreground text.
     if c != ' ' && c != '\0' {
-        let fg = if is_cursor {
-            term_bg
-        } else {
-            ansi_to_iced(fg_color, colors, term_bg, term_fg)
-        };
+        let glyph_fg = if block_cursor { term_bg } else { fg };
 
         let cp = c as u32;
         let font = if (0xE000..=0xF8FF).contains(&cp) {
             NERD_FONT
         } else {
-            TERM_FONT
+            iced::Font {
+                weight: if flags.intersects(Flags::BOLD) { iced::font::Weight::Bold }
+                        else { iced::font::Weight::Normal },
+                style:  if flags.contains(Flags::ITALIC) { iced::font::Style::Italic }
+                        else { iced::font::Style::Normal },
+                ..TERM_FONT
+            }
         };
         frame.fill_text(iced::widget::canvas::Text {
             content: c.to_string(),
             position: iced::Point::new(x, y),
-            color: fg,
+            color: glyph_fg,
             size: iced::Pixels(font_size),
             font,
             horizontal_alignment: iced::alignment::Horizontal::Left,
@@ -537,6 +562,25 @@ fn draw_cell(
             line_height: iced::widget::text::LineHeight::Relative(cell_h / font_size),
             shaping: iced::widget::text::Shaping::Advanced,
         });
+    }
+
+    // Decoration strokes — drawn in the resolved (post-transform) fg color.
+    let baseline = y + cell_h - 2.0;
+    if flags.contains(Flags::UNDERLINE) {
+        stroke_line(frame, x, baseline, x + cell_w, baseline, fg);
+    }
+    if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        stroke_line(frame, x, baseline - 2.0, x + cell_w, baseline - 2.0, fg);
+        stroke_line(frame, x, baseline,       x + cell_w, baseline,       fg);
+    }
+    if flags.contains(Flags::UNDERCURL) {
+        // Two-segment zigzag per cell — reads as a curl at terminal sizes.
+        stroke_line(frame, x, baseline, x + cell_w / 2.0, baseline - 2.0, fg);
+        stroke_line(frame, x + cell_w / 2.0, baseline - 2.0, x + cell_w, baseline, fg);
+    }
+    if flags.contains(Flags::STRIKEOUT) {
+        let mid = y + cell_h * 0.55;
+        stroke_line(frame, x, mid, x + cell_w, mid, fg);
     }
 }
 
@@ -641,6 +685,28 @@ mod tests {
         s.process(b"\x1b[?u");
         let reply = rx.try_recv().expect("kitty query must produce a reply");
         assert!(reply.starts_with(b"\x1b[?"), "unexpected kitty reply: {reply:?}");
+    }
+
+    #[test]
+    fn ansi_to_iced_uses_theme_palette_for_named_colors() {
+        use alacritty_terminal::vte::ansi::{Color, NamedColor};
+        let colors = alacritty_terminal::term::color::Colors::default();
+        let mut ansi = [IcedColor::BLACK; 16];
+        ansi[1] = IcedColor::from_rgb8(0x12, 0x34, 0x56); // themed "red"
+        let out = ansi_to_iced(
+            Color::Named(NamedColor::Red), &colors, &ansi,
+            IcedColor::BLACK, IcedColor::WHITE,
+        );
+        assert_eq!(out, IcedColor::from_rgb8(0x12, 0x34, 0x56));
+    }
+
+    #[test]
+    fn every_theme_defines_a_full_palette() {
+        for scheme in [crate::theme::light(), crate::theme::dark(), crate::theme::warm_dark()] {
+            // 16 distinct-ish entries; at minimum not all default black.
+            assert!(scheme.ansi.iter().any(|c| *c != iced::Color::BLACK));
+            assert_eq!(scheme.ansi.len(), 16);
+        }
     }
 
     #[test]

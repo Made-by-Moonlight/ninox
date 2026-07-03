@@ -167,6 +167,7 @@ pub fn session_detail<'a>(
             terminal_bg:  s.terminal_bg,
             terminal_fg:  s.terminal_fg,
             cursor_color: s.accent,
+            ansi:         s.ansi,
             session_ids,
         })
         .width(Length::Fill)
