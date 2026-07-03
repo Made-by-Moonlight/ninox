@@ -45,8 +45,11 @@ pub struct Pinboard<'a> {
 impl<'a> Pinboard<'a> {
     /// Lay out one [`Node`] per brain entry within `bounds`, sized by
     /// outgoing wikilink count and flagged `hit` when the entry matches the
-    /// active search filter.
-    fn nodes(&self, bounds: Rectangle) -> Vec<Node> {
+    /// active search filter. Also returns each entry's parsed outgoing
+    /// wikilinks (same order as `nodes`/`self.app.brain_view.entries`) so
+    /// callers that also need the edges don't re-parse the body a second
+    /// time per draw.
+    fn nodes_and_links(&self, bounds: Rectangle) -> (Vec<Node>, Vec<Vec<String>>) {
         let s = &self.app.scheme;
         let q = self.app.brain_view.filter.to_lowercase();
         self.app
@@ -54,18 +57,36 @@ impl<'a> Pinboard<'a> {
             .entries
             .iter()
             .map(|e| {
-                let links = extract_wikilinks(&e.body).len() as f32;
-                Node {
+                let links = extract_wikilinks(&e.body);
+                let node = Node {
                     x: bounds.width * (0.05 + 0.90 * hash01(&e.id, 7)),
                     y: bounds.height * (0.06 + 0.88 * hash01(&e.id, 13)),
-                    r: node_radius(links),
+                    r: node_radius(links.len() as f32),
                     color: category_color(s, &e.entry_type),
                     hit: !q.is_empty()
                         && (e.name.to_lowercase().contains(&q) || e.id.to_lowercase().contains(&q)),
                     id: e.id.clone(),
-                }
+                };
+                (node, links)
             })
-            .collect()
+            .unzip()
+    }
+
+    /// Lay out nodes only, discarding the parsed links (used where only
+    /// positions/radii are needed, e.g. click hit-testing).
+    fn nodes(&self, bounds: Rectangle) -> Vec<Node> {
+        self.nodes_and_links(bounds).0
+    }
+}
+
+/// Undirected dedup key for the edge between node indices `a` and `b`:
+/// order-independent, so a mutual pair of wikilinks (A -> B and B -> A)
+/// collapses to a single key instead of being stroked twice.
+fn edge_key(a: usize, b: usize) -> (usize, usize) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
     }
 }
 
@@ -91,18 +112,25 @@ impl<'a> canvas::Program<Message> for Pinboard<'a> {
         // Node coordinates are frame-local (origin at 0,0), matching the
         // Frame's own coordinate space — not the window-relative `bounds`.
         let local_bounds = Rectangle { x: 0.0, y: 0.0, ..bounds };
-        let nodes = self.nodes(local_bounds);
+        let (nodes, links) = self.nodes_and_links(local_bounds);
 
         // Dashed wikilink threads: faint ink by default, lit accent when
-        // either endpoint matches the active search.
+        // either endpoint matches the active search. Deduped by undirected
+        // node-pair so a mutual link (A -> B and B -> A) is stroked once,
+        // not twice — the "lit" state is direction-independent (either
+        // endpoint hitting is enough), so dedup can't drop it.
         let ink_edge = Color { a: 0.18, ..s.ink };
         let by_id: HashMap<&str, usize> =
             nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
-        for e in &self.app.brain_view.entries {
+        let mut drawn_edges: std::collections::HashSet<(usize, usize)> = Default::default();
+        for (e, entry_links) in self.app.brain_view.entries.iter().zip(&links) {
             let Some(&a) = by_id.get(e.id.as_str()) else { continue };
-            for link in extract_wikilinks(&e.body) {
-                let Some(target) = resolve_link(&self.app.brain_view.entries, &link) else { continue };
+            for link in entry_links {
+                let Some(target) = resolve_link(&self.app.brain_view.entries, link) else { continue };
                 let Some(&b) = by_id.get(target.id.as_str()) else { continue };
+                if !drawn_edges.insert(edge_key(a, b)) {
+                    continue;
+                }
                 let lit = nodes[a].hit || nodes[b].hit;
                 frame.stroke(
                     &Path::line(
@@ -209,5 +237,55 @@ mod tests {
         assert_eq!(node_radius(0.0), 3.0);
         assert_eq!(node_radius(100.0), 9.0);
         assert!(node_radius(2.0) > 3.0 && node_radius(2.0) < 9.0);
+    }
+
+    #[test]
+    fn edge_key_is_order_independent() {
+        assert_eq!(edge_key(2, 5), edge_key(5, 2));
+        assert_eq!(edge_key(2, 5), (2, 5));
+        assert_eq!(edge_key(0, 0), (0, 0));
+    }
+
+    /// Mirrors the dedup logic in `draw`: two entries that mutually wikilink
+    /// each other must collapse to exactly one edge, not two.
+    #[test]
+    fn mutual_wikilinks_dedup_to_one_edge() {
+        use ninox_core::BrainEntry;
+
+        let entries = vec![
+            BrainEntry {
+                id: "a.md".to_string(),
+                entry_type: "concepts".to_string(),
+                name: "a".to_string(),
+                tags: vec![],
+                repos: vec![],
+                updated: None,
+                body: "sees [[b]]".to_string(),
+            },
+            BrainEntry {
+                id: "b.md".to_string(),
+                entry_type: "concepts".to_string(),
+                name: "b".to_string(),
+                tags: vec![],
+                repos: vec![],
+                updated: None,
+                body: "sees [[a]]".to_string(),
+            },
+        ];
+
+        let by_id: HashMap<&str, usize> =
+            entries.iter().enumerate().map(|(i, e)| (e.id.as_str(), i)).collect();
+
+        let mut edges: std::collections::HashSet<(usize, usize)> = Default::default();
+        for e in &entries {
+            let Some(&a) = by_id.get(e.id.as_str()) else { continue };
+            for link in extract_wikilinks(&e.body) {
+                let Some(target) = resolve_link(&entries, &link) else { continue };
+                let Some(&b) = by_id.get(target.id.as_str()) else { continue };
+                edges.insert(edge_key(a, b));
+            }
+        }
+
+        assert_eq!(edges.len(), 1, "mutual A<->B links should dedup to a single edge, got {edges:?}");
     }
 }
