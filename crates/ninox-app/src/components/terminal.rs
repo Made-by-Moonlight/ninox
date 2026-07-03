@@ -331,7 +331,7 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                 }
                 // Drag — copy the selection.
                 let text = state.range().map(|((sc, sr), (ec, er))| {
-                    extract_selection(&self.state.term, sc, sr, ec, er)
+                    extract_selection(self.state, sc, sr, ec, er)
                 });
                 if let Some(t) = text.filter(|s| !s.trim().is_empty()) {
                     return (iced::widget::canvas::event::Status::Captured,
@@ -635,26 +635,44 @@ pub fn word_at(grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::c
     }).collect::<String>().trim().to_string()
 }
 
+/// Extract the text under a viewport selection, mirroring the draw path's
+/// row indexing exactly: when the view is scrolled back
+/// (`state.scrollback.offset > 0`), rows above the live screen must read
+/// from the cached tmux history rather than the live grid, or the
+/// highlighted text and the copied clipboard text diverge.
 pub fn extract_selection(
-    term: &Term<EventProxy>,
+    state: &TerminalState,
     start_col: usize, start_row: usize,
     end_col: usize,   end_row: usize,
 ) -> String {
     use alacritty_terminal::index::{Column, Line};
 
-    let grid = term.grid();
+    let grid = state.term.grid();
     let cols = grid.columns();
     let rows = grid.screen_lines();
+    let offset = state.scrollback.offset as i32;
     let mut out = String::new();
 
     for row in start_row..=end_row.min(rows.saturating_sub(1)) {
         let col_start = if row == start_row { start_col } else { 0 };
         let col_end   = if row == end_row   { end_col   } else { cols.saturating_sub(1) };
+        let col_end   = col_end.min(cols.saturating_sub(1));
 
+        let logical = row as i32 - offset;
         let mut line_text = String::new();
-        for col in col_start..=col_end.min(cols.saturating_sub(1)) {
-            let cell = &grid[Line(row as i32)][Column(col)];
-            line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
+        if logical < 0 {
+            // History row — same index math as the draw path.
+            if let Some(cells) = state.scrollback.line_above((-logical - 1) as usize) {
+                for cell in cells.iter().skip(col_start).take(col_end + 1 - col_start) {
+                    line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
+                }
+            }
+        } else {
+            let line = Line(logical);
+            for col in col_start..=col_end {
+                let cell = &grid[line][Column(col)];
+                line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
+            }
         }
         // Strip trailing spaces from each line.
         let trimmed = line_text.trim_end();
@@ -724,6 +742,32 @@ mod tests {
             assert!(scheme.ansi.iter().any(|c| *c != iced::Color::BLACK));
             assert_eq!(scheme.ansi.len(), 16);
         }
+    }
+
+    #[test]
+    fn extract_selection_reads_history_lines_when_scrolled_back() {
+        use crate::components::scrollback::StyledCell;
+        use alacritty_terminal::vte::ansi::NamedColor;
+
+        let mut s = TerminalState::new(20, 5, None);
+        s.process(b"live line one\r\nlive line two\r\n");
+
+        let mk_line = |text: &str| -> Vec<StyledCell> {
+            text.chars().map(|c| StyledCell {
+                c,
+                fg: Color::Named(NamedColor::Foreground),
+                bg: Color::Named(NamedColor::Background),
+                flags: Flags::empty(),
+            }).collect()
+        };
+        // Oldest first — "history two" sits directly above the live screen.
+        s.scrollback.absorb(vec![mk_line("history one"), mk_line("history two")], -2, true);
+        s.scrollback.offset = 2;
+
+        // Top two viewport rows (0, 1) are both scrolled into history at
+        // this offset — row 0 → history one, row 1 → history two.
+        let text = extract_selection(&s, 0, 0, 19, 1);
+        assert_eq!(text, "history one\nhistory two");
     }
 
     #[test]
