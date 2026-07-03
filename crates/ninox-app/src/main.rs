@@ -87,6 +87,10 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
+    if let Err(e) = tmux::write_server_config() {
+        eprintln!("failed to write tmux config: {e}");
+    }
+
     if let Err(e) = ninox_core::hooks::install_wrappers() {
         tracing::warn!("failed to install wrapper hooks: {e}");
     }
@@ -299,6 +303,11 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
         tokio::signal::ctrl_c().await?;
         token.cancel();
         return Ok(());
+    }
+
+    if let Err(e) = tmux::require_version().await {
+        eprintln!("{e}");
+        std::process::exit(1);
     }
 
     #[cfg(target_os = "macos")]

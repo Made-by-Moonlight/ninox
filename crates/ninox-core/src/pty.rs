@@ -143,20 +143,11 @@ pub async fn start_streaming(
     tokio::spawn(async move {
         let mut counter = 0u64;
         while let Some(bytes) = input_rx.recv().await {
-            let buf  = format!("ath-in-{}-{counter}", &tmux_id_input);
-            let tmp  = format!("/tmp/ath-in-{}-{counter}.tmp", &tmux_id_input);
+            let buf = format!("ath-in-{}-{counter}", &tmux_id_input);
+            let tmp = format!("/tmp/ath-in-{}-{counter}.tmp", &tmux_id_input);
             counter += 1;
 
-            if std::fs::write(&tmp, &bytes).is_err() { continue; }
-
-            let _ = tokio::process::Command::new("tmux")
-                .args(["load-buffer", "-b", &buf, &tmp, ";",
-                       "paste-buffer", "-b", &buf, "-t", &tmux_id_input, "-d"])
-                .kill_on_drop(true)
-                .output()
-                .await;
-
-            let _ = std::fs::remove_file(&tmp);
+            let _ = tmux::paste_buffer(&tmux_id_input, &buf, &tmp, &bytes).await;
         }
     });
 
