@@ -58,6 +58,13 @@ pub async fn require_version() -> Result<()> {
         (major, minor) >= (3, 2),
         "ninox requires tmux >= 3.2 for extended keyboard support; found {ver}"
     );
+    if (major, minor) < (3, 5) {
+        tracing::warn!(
+            "tmux {ver} detected — extended-keys-format csi-u requires tmux >= 3.5; \
+             Shift+Enter and other disambiguated keys may not reach apps correctly \
+             on this version"
+        );
+    }
     Ok(())
 }
 
@@ -264,6 +271,12 @@ pub async fn attach_args(session_id: &str) -> Vec<String> {
     let mut argv = vec!["tmux".to_string()];
     if run(&["has-session", "-t", session_id]).await.is_ok() {
         argv.extend(socket_args());
+    } else {
+        tracing::warn!(
+            "session {session_id} predates the ninox socket — attaching on the \
+             legacy default tmux server without the managed config (extended \
+             keys / resize guarantees are degraded until it terminates naturally)"
+        );
     }
     argv.extend(["attach-session", "-t", session_id].map(String::from));
     argv
