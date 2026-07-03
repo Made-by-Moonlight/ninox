@@ -718,6 +718,39 @@ impl App {
             }
 
             Message::RawKey { key, modifiers, text } => {
+                // Esc closes the spawn modal from anywhere.
+                if state.spawn_modal.is_some() {
+                    if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)) {
+                        state.spawn_modal = None;
+                    }
+                    return Task::none();
+                }
+
+                let terminal_capturing = matches!(
+                    &state.view,
+                    View::SessionDetail { panel, .. }
+                        if matches!(panel, DetailPanel::Terminal | DetailPanel::Split)
+                );
+                if !terminal_capturing && !modifiers.command() && !modifiers.control() && !modifiers.alt() {
+                    if let iced::keyboard::Key::Character(c) = &key {
+                        match c.as_str() {
+                            "1" => return App::apply(state, Message::NavigateFleet { scope: None }),
+                            "2" => return App::apply(state, Message::NavigateLastSession),
+                            "3" => return App::apply(state, Message::NavigatePrList),
+                            "4" => return App::apply(state, Message::NavigateBrain),
+                            "t" => {
+                                let next = match state.active_variant {
+                                    ThemeVariant::Dark | ThemeVariant::Ninox => ThemeVariant::Light,
+                                    ThemeVariant::Light => ThemeVariant::Dark,
+                                };
+                                return App::apply(state, Message::SwitchTheme(next));
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Task::none();
+                }
+
                 if let View::SessionDetail {
                     session_id,
                     panel: crate::components::session_detail::DetailPanel::Terminal
@@ -1922,5 +1955,65 @@ mod tests {
         let sessions = filtered_sessions(&m2);
         assert_eq!(sessions.len(), 2);
         assert!(sessions.iter().all(|s| s.name.contains("auth")));
+    }
+
+    fn press(app: App, ch: &str) -> App {
+        let (next, _) = app.update(Message::RawKey {
+            key:       iced::keyboard::Key::Character(ch.into()),
+            modifiers: iced::keyboard::Modifiers::default(),
+            text:      Some(ch.to_string()),
+        });
+        next
+    }
+
+    #[test]
+    fn number_keys_switch_views() {
+        let m = base(test_engine());
+        let m = press(m, "3");
+        assert!(matches!(m.view, View::PrList));
+        let m = press(m, "1");
+        assert!(matches!(m.view, View::FleetBoard { .. }));
+    }
+
+    #[test]
+    fn t_toggles_light_dark() {
+        let m = base(test_engine());
+        let before = m.active_variant;
+        let m = press(m, "t");
+        assert_ne!(m.active_variant, before);
+        let m = press(m, "t");
+        assert_eq!(m.active_variant, before);
+    }
+
+    #[test]
+    fn esc_closes_spawn_modal() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::SpawnSession);
+        assert!(m.spawn_modal.is_some());
+        let (m, _) = m.update(Message::RawKey {
+            key:       iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+            modifiers: iced::keyboard::Modifiers::default(),
+            text:      None,
+        });
+        assert!(m.spawn_modal.is_none());
+    }
+
+    #[test]
+    fn shortcuts_do_not_fire_in_terminal_view() {
+        let e = test_engine();
+        let mut m = base(e);
+        let s = Session {
+            id: "sess-a".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+        };
+        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        m = next;
+        let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
+        m = next;
+
+        let m = press(m, "1"); // must go to the terminal, not switch views
+        assert!(matches!(m.view, View::SessionDetail { .. }));
     }
 }
