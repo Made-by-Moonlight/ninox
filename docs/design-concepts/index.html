@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ninox — Design Concepts</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..700;1,9..144,300..700&family=Spline+Sans+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0f0d0a;--text:#f0e6d2;--muted:#786a52;--amber:#f2a33c;--line:#2e271d}
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  min-height:100vh;background:var(--bg);color:var(--text);
+  font-family:"Spline Sans Mono",monospace;
+  display:grid;place-items:center;padding:48px 24px;
+  background-image:radial-gradient(50rem 30rem at 50% -10%,rgba(242,163,60,.08),transparent 60%);
+}
+.wrap{max-width:860px;width:100%}
+h1{font-family:"Fraunces",serif;font-weight:480;font-size:34px;margin-bottom:6px}
+h1 i{font-style:italic;color:var(--amber);font-weight:380}
+.sub{color:var(--muted);font-size:12.5px;margin-bottom:36px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+a.card{
+  display:block;text-decoration:none;color:inherit;border:1px solid var(--line);border-radius:12px;
+  padding:20px 22px;transition:transform .15s,border-color .15s,box-shadow .2s;position:relative;overflow:hidden;
+}
+a.card:hover{transform:translateY(-3px);border-color:var(--amber);box-shadow:0 14px 34px rgba(0,0,0,.45)}
+a.card::before{content:"";position:absolute;inset:0;background:var(--tint);opacity:.9;z-index:-1}
+.no{font-size:10px;letter-spacing:.25em;color:var(--muted);margin-bottom:10px}
+h2{font-family:"Fraunces",serif;font-size:21px;font-weight:520;margin-bottom:8px}
+p{font-size:11.5px;line-height:1.65;color:#c9bda2;opacity:.85}
+.shows{margin-top:14px;font-size:10px;letter-spacing:.08em;color:var(--amber)}
+.c1{--tint:linear-gradient(160deg,#1a1611,#0f0d0a)}
+.c2{--tint:linear-gradient(160deg,#0d1218,#080b0e)}
+.c3{--tint:linear-gradient(160deg,#efe8d8,#f5f0e4)}
+.c3 h2,.c3 .no{color:#211d16}
+.c3 p{color:#5b5344}
+.c3 .shows{color:#c8451f}
+.c4{--tint:linear-gradient(160deg,#12152a,#0a0c18)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>⬡ Ninox — four <i>prospective directions</i></h1>
+  <div class="sub">Each concept is a navigable mockup: Fleet · Session · PRs · Brain (switch with the nav or keys 1–4). Same fleet, four personalities.</div>
+  <div class="grid">
+    <a class="card c1" href="01-night-watch.html">
+      <div class="no">CONCEPT 01</div>
+      <h2>Night Watch</h2>
+      <p>Ninox is an owl. Warm amber instrument-glow on near-black umber — the existing "Ninox" theme grown into a full identity. Fraunces + Spline Sans Mono.</p>
+      <div class="shows">sidebar nav · fleet · session split · PR ledger · brain</div>
+    </a>
+    <a class="card c2" href="02-mission-control.html">
+      <div class="no">CONCEPT 02</div>
+      <h2>Mission Control</h2>
+      <p>The fleet as a launch console: phosphor telemetry, corner-bracketed cards, alarm strip, spend meter, alerts panel. Density as aesthetic. Chakra Petch + IBM Plex Mono.</p>
+      <div class="shows">channel tabs · fleet · session · PR registry · brain radar</div>
+    </a>
+    <a class="card c3" href="03-field-notes.html">
+      <div class="no">CONCEPT 03</div>
+      <h2>Field Notes</h2>
+      <p>★ WINNER — an ornithologist's journal: warm paper, ruled ledgers, stamped statuses, light + dark ("lamplight") themes. Spec: field-notes-design.md. Newsreader + Archivo.</p>
+      <div class="shows">TOC nav · fleet · session · ledger · brain pinboard + catalogue · spawn · press t for dark</div>
+    </a>
+    <a class="card c4" href="04-nebula.html">
+      <div class="no">CONCEPT 04</div>
+      <h2>Nebula</h2>
+      <p>The whole app adrift in a violet nebula: glassmorphic panels over drifting cloud layers and a live starfield; the Brain constellation with temporal scrubber is the hero. Syne + JetBrains Mono.</p>
+      <div class="shows">pill nav · fleet · session · PRs · brain graph + timeline</div>
+    </a>
+  </div>
+</div>
+</body>
+</html>
