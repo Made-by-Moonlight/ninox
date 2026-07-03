@@ -1,10 +1,29 @@
 use iced::{
-    widget::{column, container, rich_text, scrollable, span, text, Space},
-    Background, Border, Element, Length,
+    widget::{column, container, rich_text, row, scrollable, span, text, Space},
+    Alignment, Background, Element, Length,
 };
 
 use crate::{app::Message, theme::ColorScheme};
 use ninox_core::types::{CIStatus, Comment, Session, PR};
+
+/// Serif-italic heading over a dotted rule — the "h3" treatment used
+/// throughout the info panels. `sub`, when present, is right-aligned mono.
+fn heading<'a>(label: &'a str, sub: Option<String>, s: &'a ColorScheme) -> Element<'a, Message> {
+    column![
+        row![
+            text(label).size(17).font(crate::style::SERIF_ITALIC).color(s.ink),
+            Space::new(Length::Fill, 0),
+            match sub {
+                Some(sub) => Element::from(text(sub).size(9.5).font(crate::style::MONO).color(s.faint)),
+                None => Space::new(0, 0).into(),
+            },
+        ]
+        .align_y(Alignment::Center),
+        Space::new(0, 4),
+        crate::style::dotted_rule(s.rule_dark),
+    ]
+    .into()
+}
 
 /// Info panel — shows PR metadata, CI status, and review comments.
 pub fn info_panel<'a>(
@@ -26,11 +45,15 @@ pub fn info_panel<'a>(
             );
         }
         Some(pr) => {
-            let pr_title = format!("PR #{} — {}", pr.number, pr.title);
             items.push(
                 container(
                     column![
-                        text(pr_title).size(14).color(s.ink),
+                        heading("Pull Request", None, s),
+                        Space::new(0, 8),
+                        text(format!("#{} — {}", pr.number, pr.title))
+                            .size(14)
+                            .font(crate::style::SERIF_MEDIUM)
+                            .color(s.ink),
                         Space::new(0, 4),
                         rich_text![
                             span(pr.url.as_str())
@@ -42,12 +65,8 @@ pub fn info_panel<'a>(
                     ],
                 )
                 .width(Length::Fill)
-                .padding([12, 16])
-                .style(move |_theme| container::Style {
-                    background: Some(Background::Color(s.card)),
-                    border: Border { color: s.rule_dark, width: 1.0, radius: 4.0.into() },
-                    ..Default::default()
-                })
+                .padding([14, 16])
+                .style(move |_theme| crate::style::card_style(s))
                 .into(),
             );
 
@@ -57,18 +76,18 @@ pub fn info_panel<'a>(
                 } else {
                     pr.body.clone()
                 };
-                items.push(Space::new(0, 8).into());
+                items.push(Space::new(0, 10).into());
                 items.push(
                     container(text(body_text).size(12).color(s.ink_2))
                         .width(Length::Fill)
-                        .padding([10, 16])
+                        .padding([14, 16])
+                        .style(move |_theme| crate::style::card_style(s))
                         .into(),
                 );
             }
 
             if let Some(ci) = ci {
                 items.push(Space::new(0, 12).into());
-                let ci_label = format!("CI: {}/{} passing", ci.passing, ci.total);
                 let ci_color = if ci.failing > 0 {
                     s.status_ci_failed
                 } else if ci.pending > 0 {
@@ -76,49 +95,81 @@ pub fn info_panel<'a>(
                 } else {
                     s.status_working
                 };
+                let glyph = if ci.failing > 0 {
+                    "✗"
+                } else if ci.pending > 0 {
+                    "◌"
+                } else {
+                    "✓"
+                };
                 items.push(
-                    container(text(ci_label).size(13).color(ci_color))
-                        .width(Length::Fill)
-                        .padding([10, 16])
-                        .style(move |_theme| container::Style {
-                            background: Some(Background::Color(s.card)),
-                            border: Border { color: s.rule_dark, width: 1.0, radius: 4.0.into() },
-                            ..Default::default()
-                        })
-                        .into(),
+                    container(
+                        column![
+                            heading("CI", None, s),
+                            Space::new(0, 8),
+                            row![
+                                text(glyph).size(14).color(ci_color).width(Length::Fixed(14.0)),
+                                text(format!("{}/{} passing", ci.passing, ci.total))
+                                    .size(12)
+                                    .font(crate::style::SANS)
+                                    .color(s.ink_2),
+                            ]
+                            .align_y(Alignment::Center),
+                        ],
+                    )
+                    .width(Length::Fill)
+                    .padding([14, 16])
+                    .style(move |_theme| crate::style::card_style(s))
+                    .into(),
                 );
             }
 
             if !comments.is_empty() {
                 items.push(Space::new(0, 12).into());
-                items.push(text("Review Comments").size(11).color(s.faint).into());
-                items.push(Space::new(0, 6).into());
+
+                let mut rows: Vec<Element<'a, Message>> = Vec::new();
+                rows.push(heading("Marginalia", Some(format!("{} comments", comments.len())), s));
 
                 for comment in comments {
                     let location = match (&comment.path, comment.line) {
-                        (Some(path), Some(line)) => format!("{} · {}:{}", comment.author, path, line),
-                        (Some(path), None) => format!("{} · {}", comment.author, path),
-                        _ => comment.author.clone(),
+                        (Some(path), Some(line)) => format!("{path}:{line}"),
+                        (Some(path), None) => path.clone(),
+                        _ => String::new(),
                     };
-                    items.push(
-                        container(
-                            column![
-                                text(location).size(11).color(s.accent),
-                                Space::new(0, 4),
-                                text(comment.body.as_str()).size(12).color(s.ink_2),
-                            ],
-                        )
-                        .width(Length::Fill)
-                        .padding([10, 12])
-                        .style(move |_theme| container::Style {
-                            background: Some(Background::Color(s.card)),
-                            border: Border { color: s.rule_dark, width: 1.0, radius: 4.0.into() },
-                            ..Default::default()
-                        })
+                    rows.push(Space::new(0, 10).into());
+                    rows.push(
+                        column![
+                            row![
+                                text(comment.author.clone())
+                                    .size(12)
+                                    .font(crate::style::SANS_BOLD)
+                                    .color(s.accent),
+                                if !location.is_empty() {
+                                    Element::from(row![
+                                        Space::new(8, 0),
+                                        text(location).size(9.5).font(crate::style::MONO).color(s.faint),
+                                    ])
+                                } else {
+                                    Space::new(0, 0).into()
+                                },
+                            ]
+                            .align_y(Alignment::Center),
+                            Space::new(0, 4),
+                            text(comment.body.as_str()).size(12).color(s.ink_2),
+                        ]
                         .into(),
                     );
-                    items.push(Space::new(0, 6).into());
+                    rows.push(Space::new(0, 8).into());
+                    rows.push(crate::style::dotted_rule(s.rule_dark));
                 }
+
+                items.push(
+                    container(column(rows))
+                        .width(Length::Fill)
+                        .padding([14, 16])
+                        .style(move |_theme| crate::style::card_style(s))
+                        .into(),
+                );
             }
         }
     }
