@@ -2204,6 +2204,125 @@ git commit -m "feat(native-app): field notes polish — notifications, empty sta
 
 ---
 
+### Task 15: Config-file themes — palettes loadable from TOML
+
+**User requirement (added mid-execution):** colors must be themable via config files so theming is really easy; one theme file stores BOTH the light and dark palettes.
+
+**Files:**
+- Modify: `crates/ninox-app/src/theme.rs` (theme-file loading, hex parsing, overlay)
+- Modify: `crates/ninox-core/src/config.rs` (`AppConfig.theme_file: Option<String>`, serde-defaulted)
+- Modify: `crates/ninox-app/src/app.rs` (App holds loaded `Themes`; `SwitchTheme`/startup read from it)
+- Test: `theme.rs` tests
+
+**Interfaces:**
+- Consumes: `AppConfig` TOML mechanics (`toml` crate already a workspace dep; config at `~/.config/ninox/config.toml`, `AppConfig::config_path()`).
+- Produces:
+
+```rust
+// theme.rs
+pub struct Themes { pub light: ColorScheme, pub dark: ColorScheme }
+impl Themes {
+    /// Built-in Field Notes palettes.
+    pub fn builtin() -> Self { Themes { light: light(), dark: dark() } }
+    /// builtin() overlaid with the user's theme file (missing keys keep defaults).
+    pub fn load(theme_file: Option<&str>) -> Self;
+    pub fn scheme(&self, v: ThemeVariant) -> ColorScheme; // Light→light, Dark|Ninox→dark
+}
+pub fn parse_hex(s: &str) -> Option<Color>;               // "#rrggbb" | "#rrggbbaa"
+pub(crate) fn apply_palette(base: &mut ColorScheme, table: &toml::Table); // by token name
+pub const TOKEN_NAMES: &[&str]; // all 28 field names — single source of truth
+pub fn write_default_theme_file(path: &std::path::Path) -> std::io::Result<()>; // full palettes
+```
+
+**Semantics:**
+- Theme files live in `~/.config/ninox/themes/<name>.toml` (same parent dir as `config.toml`). `AppConfig.theme_file = Some("field-notes")` resolves to `themes/field-notes.toml`; an absolute-path value is used as-is; `None` → use `themes/field-notes.toml` if it exists, else pure builtins.
+- File format — one file, both palettes, token = hex string:
+
+```toml
+# ~/.config/ninox/themes/field-notes.toml
+[light]
+paper = "#f5f0e4"
+accent = "#c8451f"
+# … any subset of tokens; omitted tokens keep the built-in Field Notes value
+
+[dark]
+paper = "#171410"
+accent = "#e06038"
+```
+
+- Token keys = `ColorScheme` field names exactly (paper, paper_2, card, ink, ink_2, faint, rule, rule_dark, accent, shadow, status_working, status_pr_open, status_ci_failed, status_review, status_mergeable, status_done, cat_pattern, cat_decision, cat_relationship, cat_error, term_bg, term_bar, term_bar_border, term_fg, term_ok, term_err, term_agent, term_dim). Unknown keys → `tracing::warn!`, not an error. Malformed hex → warn + keep default. Missing/unreadable file → warn + builtins (never crash the app over a theme file).
+- First run: if the themes dir doesn't exist, create it and write `themes/field-notes.toml` via `write_default_theme_file` containing the FULL default palettes (users edit a complete, working example).
+- Single source of truth: a `fn token_slot<'a>(s: &'a mut ColorScheme, name: &str) -> Option<&'a mut Color>` match serves both `apply_palette` (write into the scheme) and `write_default_theme_file` (read each token out of a fresh default via the same names) — no 28-way duplication in two places.
+- `App` gains `pub themes: Themes`, loaded once at startup from `config.theme_file`; the `SwitchTheme` handler and startup scheme selection use `state.themes.scheme(variant)` instead of `crate::theme::from_variant(variant)`. Keep `from_variant` as a thin wrapper over `Themes::builtin().scheme(v)` for tests/back-compat.
+
+- [ ] **Step 1: Write failing tests** (in `theme.rs`)
+
+```rust
+#[cfg(test)]
+mod theme_file_tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_variants() {
+        assert_eq!(parse_hex("#c8451f"), Some(iced::color!(0xc8451f)));
+        assert!(parse_hex("#c8451f80").is_some()); // alpha form parses
+        assert_eq!(parse_hex("c8451f"), parse_hex("#c8451f")); // leading # optional
+        assert_eq!(parse_hex("#xyz"), None);
+        assert_eq!(parse_hex(""), None);
+    }
+
+    #[test]
+    fn overlay_keeps_defaults_for_missing_keys() {
+        let table: toml::Table = toml::from_str(r##"paper = "#101010""##).unwrap();
+        let mut s = light();
+        apply_palette(&mut s, &table);
+        assert_eq!(s.paper, iced::color!(0x101010));   // overridden
+        assert_eq!(s.accent, light().accent);           // untouched
+    }
+
+    #[test]
+    fn default_theme_file_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("field-notes.toml");
+        write_default_theme_file(&p).unwrap();
+        let doc: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let light_tbl = doc["light"].as_table().unwrap();
+        assert_eq!(light_tbl.len(), TOKEN_NAMES.len()); // full palette written
+        let mut s = dark();
+        apply_palette(&mut s, light_tbl);
+        assert_eq!(s.paper, light().paper); // applying the written light palette reproduces light()
+        assert_eq!(s.term_dim, light().term_dim);
+    }
+
+    #[test]
+    fn themes_load_missing_file_falls_back_to_builtin() {
+        let t = Themes::load(Some("/nonexistent/path/nope.toml"));
+        assert_eq!(t.light.paper, light().paper);
+        assert_eq!(t.dark.accent, dark().accent);
+    }
+}
+```
+
+(`ColorScheme` needs `PartialEq` in its derive for these asserts. `tempfile` is already a dev-dependency of ninox-app. Add `toml = { workspace = true }` to ninox-app `[dependencies]`.)
+
+- [ ] **Step 2: Verify failure** — `cargo test -p ninox theme_file` → FAIL (functions missing).
+
+- [ ] **Step 3: Implement** per Interfaces/Semantics. `Themes::load` resolution: bare name → `AppConfig::config_path().parent().join("themes").join(format!("{name}.toml"))`; value containing `/` treated as a path (expand leading `~` via `dirs::home_dir()`).
+
+- [ ] **Step 4: Wire into the app** — `AppConfig.theme_file: Option<String>` with `#[serde(default)]`; App startup: create themes dir + write default file if absent, then `Themes::load(config.theme_file.as_deref())`; `SwitchTheme` uses `state.themes.scheme(variant)`. Keyboard `t` toggle and theme dots unchanged (they switch variants within the loaded theme, not files).
+
+- [ ] **Step 5: Run** — `cargo test -p ninox && cargo test -p ninox-core && cargo build -p ninox` → PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/ninox-app crates/ninox-core
+git commit -m "feat(native-app): load theme palettes from config-dir TOML theme files"
+```
+
+---
+
 ## Self-Review Notes (already applied)
 
 - Spec coverage: §1 tokens → Task 2; §2 fonts → Tasks 1/3; §3 texture rules → Task 3 helpers (grain + rotation consciously skipped per §8); §4 sidebar → Task 4; §5 fleet/session/PR/brain → Tasks 6/7/9/11–13; spawn modal → Task 10; §6 interactions → Tasks 5/6 (hover) — mockup deep-links are N/A for a native app; §7 empty states/notifications → Task 14; §7 items explicitly deferred by spec (ninox theme, temporal scrubber, drag-handle styling, ⬡ orchestrator badge) are deferred here too.
