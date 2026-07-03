@@ -40,63 +40,66 @@ impl alacritty_terminal::event::EventListener for EventProxy {
 // TerminalState — holds the terminal buffer + PTY sender
 // ---------------------------------------------------------------------------
 
+/// Cap on captured lines kept in `TerminalState::extra_history`, bounding
+/// memory for long-running sessions.
+const MAX_EXTRA_HISTORY: usize = 5000;
+
 pub struct TerminalState {
     pub term: Term<EventProxy>,
     pub cache: Cache,
     parser: Processor,
-    /// Viewport content as of the last time we let an ESC[2J actually scroll
-    /// it into scrollback history. Lets `process` tell a genuine content
-    /// change (push it before it's erased) apart from a TUI reissuing a
-    /// full-screen redraw identical to one already preserved (suppress the
-    /// duplicate). See `process` for why this exists.
-    last_pushed_frame: Option<String>,
+    /// Lines evicted from the live viewport by a full-screen redraw that
+    /// never goes through the terminal's native scrollback mechanism. Ink-
+    /// based TUIs (Claude Code, and most modern CLI agents) redraw their
+    /// whole screen using absolute/relative cursor addressing — `ESC[H`,
+    /// `ESC[nB`, `ESC[nG`, per-line `ESC[K` — rather than real linefeeds or
+    /// `ESC[2J`. Nothing about that sequence trips alacritty's own
+    /// scroll-into-history logic (which only fires on linefeed-driven
+    /// overflow or an explicit erase-display op), so content clipped off
+    /// the top during such a redraw would otherwise vanish with no trace.
+    /// `process` detects this and preserves the outgoing lines here, oldest
+    /// first, so scrolling can still reach them.
+    extra_history: std::collections::VecDeque<String>,
+    /// How many lines deep into `extra_history` the view is scrolled, on
+    /// top of whatever native grid history scrolling has already covered.
+    extra_offset: usize,
+    /// Full-viewport text as of the last time we captured a redraw, so a
+    /// TUI reissuing an identical frame (e.g. a spinner tick) doesn't get
+    /// re-captured into `extra_history` on every tick.
+    last_captured_frame: Option<String>,
 }
 
 impl TerminalState {
     /// Feed raw bytes from the PTY into the VTE parser → terminal state.
     pub fn process(&mut self, bytes: &[u8]) {
-        // ESC[2J (erase entire screen) calls clear_viewport(), which scrolls
-        // the current viewport into scrollback history. TUI apps like Claude
-        // Code redraw their whole screen via ESC[2J on every update — fine
-        // when the outgoing screen carries content we haven't preserved yet,
-        // but if the TUI reissues an *identical* frame (e.g. a spinner tick
-        // with no textual change), passing every ESC[2J through floods
-        // scrollback with repeated copies of the same screen. Suppressing
-        // every ESC[2J unconditionally (the previous fix) swings too far the
-        // other way: well-behaved TUIs clip their rendering to the terminal's
-        // row count and never overflow it naturally, so nothing ever scrolls
-        // into history and scrollback never grows at all.
-        //
-        // Instead, only push when the outgoing viewport differs from the
-        // last frame we chose to preserve — this collapses runs of identical
-        // redraws to a single scrollback copy while still capturing content
-        // the moment it's actually superseded by something new.
-        //
-        // Note: split sequences across chunk boundaries are not handled here;
-        // in practice tmux pipe-pane delivers complete sequences in single
-        // 4 KiB reads.
-        const NEEDLE: &[u8] = b"\x1b[2J";
-        const REPLACE: &[u8] = b"\x1b[H\x1b[0J";
+        let before = viewport_rows(&self.term);
+        self.parser.advance(&mut self.term, bytes);
+        let after = viewport_rows(&self.term);
 
-        if bytes.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
-            let mut i = 0;
-            while let Some(rel) = bytes[i..].windows(NEEDLE.len()).position(|w| w == NEEDLE) {
-                if rel > 0 {
-                    self.parser.advance(&mut self.term, &bytes[i..i + rel]);
+        // A full-screen redraw from an Ink-style TUI always rewrites row 0
+        // (it's redrawing everything from the top down); an in-place status
+        // or spinner tick elsewhere on screen does not touch row 0 at all.
+        // Use that as the signal that content is being replaced rather than
+        // merely ticking over.
+        if before[0] != after[0] {
+            let frame = before.join("\n");
+            if self.last_captured_frame.as_deref() != Some(frame.as_str()) {
+                for line in &before {
+                    let trimmed = line.trim_end();
+                    // Skip lines that are still visible somewhere in the new
+                    // frame (persistent chrome like the input box) — only
+                    // preserve what's actually being evicted.
+                    if !trimmed.is_empty() && !after.iter().any(|a| a.trim_end() == trimmed) {
+                        self.extra_history.push_back(trimmed.to_string());
+                    }
                 }
-                let outgoing = viewport_text(&self.term);
-                if self.last_pushed_frame.as_ref() == Some(&outgoing) {
-                    self.parser.advance(&mut self.term, REPLACE);
-                } else {
-                    self.parser.advance(&mut self.term, NEEDLE);
-                    self.last_pushed_frame = Some(outgoing);
+                while self.extra_history.len() > MAX_EXTRA_HISTORY {
+                    self.extra_history.pop_front();
                 }
-                i += rel + NEEDLE.len();
+                self.last_captured_frame = Some(frame);
             }
-            self.parser.advance(&mut self.term, &bytes[i..]);
-        } else {
-            self.parser.advance(&mut self.term, bytes);
         }
+
         self.cache.clear();
     }
 
@@ -361,6 +364,10 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
         let rows = grid.screen_lines();
         let cursor_point   = grid.cursor.point;
         let display_offset = grid.display_offset() as i32;
+        let history_size   = grid.history_size() as i32;
+        // Combined depth into history: native grid scrolling, then whatever
+        // extra_history scrolling covers beyond that (see `TerminalState::scroll`).
+        let total_offset = display_offset + self.state.extra_offset as i32;
 
         let term_bg = self.terminal_bg;
         let term_fg = self.terminal_fg;
@@ -372,17 +379,50 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
             frame.fill(&bg_all, term_bg);
 
             // Render each cell. When scrolled into history, shift line indices by
-            // display_offset so Line(0 - offset) accesses the history buffer.
+            // total_offset so Line(0 - offset) accesses the history buffer; once
+            // that runs out, fall back to `extra_history` (see its doc comment).
             for row in 0..rows {
-                for col in 0..cols {
-                    use alacritty_terminal::index::{Column, Line};
+                use alacritty_terminal::index::{Column, Line};
 
-                    let line   = Line(row as i32 - display_offset);
+                let logical_line = row as i32 - total_offset;
+                let y = row as f32 * cell_h;
+
+                if logical_line < -history_size {
+                    // Beyond native history — render a captured plain-text
+                    // line from `extra_history`, if one exists this far back.
+                    let lines_past = (-logical_line - history_size - 1) as usize;
+                    let Some(text) = self.state.extra_line(lines_past) else { continue };
+                    let chars: Vec<char> = text.chars().collect();
+
+                    for col in 0..cols {
+                        let ch = chars.get(col).copied().unwrap_or(' ');
+                        if ch == ' ' || ch == '\0' { continue; }
+                        let x = col as f32 * cell_w;
+                        let cp = ch as u32;
+                        let font = if (0xE000..=0xF8FF).contains(&cp) { NERD_FONT } else { iced::Font::MONOSPACE };
+                        frame.fill_text(iced::widget::canvas::Text {
+                            content: ch.to_string(),
+                            position: iced::Point::new(x, y),
+                            color: term_fg,
+                            size: iced::Pixels(self.font_size),
+                            font,
+                            horizontal_alignment: iced::alignment::Horizontal::Left,
+                            vertical_alignment: iced::alignment::Vertical::Top,
+                            line_height: iced::widget::text::LineHeight::Relative(
+                                cell_h / self.font_size,
+                            ),
+                            shaping: iced::widget::text::Shaping::Advanced,
+                        });
+                    }
+                    continue;
+                }
+
+                let line = Line(logical_line);
+                for col in 0..cols {
                     let column = Column(col);
                     let cell = &grid[line][column];
 
                     let x = col as f32 * cell_w;
-                    let y = row as f32 * cell_h;
 
                     // Background.
                     let bg = ansi_to_iced(cell.bg, colors, term_bg, term_fg);
@@ -521,25 +561,23 @@ pub fn extract_selection(
 // Viewport snapshotting
 // ---------------------------------------------------------------------------
 
-/// Render the current (unscrolled) viewport as plain text — used by
-/// `TerminalState::process` to detect when a TUI reissues a full-screen
-/// redraw identical to one it has already preserved in scrollback.
-fn viewport_text(term: &Term<EventProxy>) -> String {
+/// Render the current (unscrolled) viewport as one plain-text line per row —
+/// used by `TerminalState::process` to detect when a redraw is replacing
+/// content (row 0 changed) versus ticking a status line in place, and to
+/// capture outgoing lines before they're overwritten.
+fn viewport_rows(term: &Term<EventProxy>) -> Vec<String> {
     use alacritty_terminal::index::{Column, Line};
 
     let grid = term.grid();
     let cols = grid.columns();
     let rows = grid.screen_lines();
-    let mut out = String::with_capacity(rows * (cols + 1));
 
-    for row in 0..rows {
-        let line = Line(row as i32);
-        for col in 0..cols {
-            out.push(grid[line][Column(col)].c);
-        }
-        out.push('\n');
-    }
-    out
+    (0..rows)
+        .map(|row| {
+            let line = Line(row as i32);
+            (0..cols).map(|col| grid[line][Column(col)].c).collect::<String>()
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -555,27 +593,70 @@ impl TerminalState {
             term,
             cache: Cache::new(),
             parser: Processor::new(),
-            last_pushed_frame: None,
+            extra_history: std::collections::VecDeque::new(),
+            extra_offset: 0,
+            last_captured_frame: None,
         }
     }
 
-    /// Scroll the terminal display by `delta` lines (positive = up into history).
+    /// Scroll the terminal display by `delta` lines (positive = up into
+    /// history). Drains room in the native grid history first, then spills
+    /// into `extra_history`; scrolling back down drains `extra_history`
+    /// first, since it holds content further back than anything native
+    /// scrolling can reach.
     pub fn scroll(&mut self, delta: i32) {
         use alacritty_terminal::grid::Scroll;
-        self.term.grid_mut().scroll_display(Scroll::Delta(delta));
+
+        if delta > 0 {
+            let native_room =
+                self.term.grid().history_size() as i32 - self.term.grid().display_offset() as i32;
+            let into_native = delta.min(native_room.max(0));
+            if into_native > 0 {
+                self.term.grid_mut().scroll_display(Scroll::Delta(into_native));
+            }
+            let remaining = (delta - into_native) as usize;
+            if remaining > 0 {
+                self.extra_offset = (self.extra_offset + remaining).min(self.extra_history.len());
+            }
+        } else if delta < 0 {
+            let want_down = (-delta) as usize;
+            let from_extra = want_down.min(self.extra_offset);
+            self.extra_offset -= from_extra;
+            let remaining = (want_down - from_extra) as i32;
+            if remaining > 0 {
+                self.term.grid_mut().scroll_display(Scroll::Delta(-remaining));
+            }
+        }
         self.cache.clear();
     }
 
     /// Jump the display back down to the live viewport.
     pub fn scroll_to_bottom(&mut self) {
         use alacritty_terminal::grid::Scroll;
+        self.extra_offset = 0;
         self.term.grid_mut().scroll_display(Scroll::Bottom);
         self.cache.clear();
     }
 
     /// Whether the display is currently scrolled up into history.
     pub fn is_scrolled_back(&self) -> bool {
-        self.term.grid().display_offset() > 0
+        self.extra_offset > 0 || self.term.grid().display_offset() > 0
+    }
+
+    /// Combined scroll depth (native grid history + `extra_history`), and a
+    /// lookup from a logical line index (0 = oldest available) into the text
+    /// of that line, for rows that fall outside what the native grid can
+    /// represent. Used by rendering to blend `extra_history` in once native
+    /// history is exhausted.
+    fn extra_line(&self, lines_past_native_history: usize) -> Option<&str> {
+        let len = self.extra_history.len();
+        if lines_past_native_history >= len {
+            return None;
+        }
+        // `lines_past_native_history == 0` means "one line further back than
+        // the oldest native history line", which is the *newest* entry in
+        // `extra_history`.
+        self.extra_history.get(len - 1 - lines_past_native_history).map(String::as_str)
     }
 }
 
@@ -597,101 +678,111 @@ mod tests {
         s.process(b"\x1b[31mred\x1b[0m");
     }
 
-    /// Does any line currently in scrollback history contain `needle`?
-    fn history_contains(term: &Term<EventProxy>, needle: &str) -> bool {
-        use alacritty_terminal::index::{Column, Line};
-        let grid = term.grid();
-        let cols = grid.columns();
-        let history = grid.history_size() as i32;
-        (1..=history).any(|n| {
-            let mut line_text = String::with_capacity(cols);
-            for col in 0..cols {
-                line_text.push(grid[Line(-n)][Column(col)].c);
+    /// Build a redraw frame the way real Ink-based TUIs (Claude Code) send
+    /// them: `ESC[H` (cursor home) followed by each line's text, a per-line
+    /// erase, and cursor-relative moves to the next line — no `ESC[2J`, no
+    /// literal newlines. Captured directly from a live `claude` session.
+    fn ink_frame(lines: &[&str]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(b"\x1b[H");
+        for (i, l) in lines.iter().enumerate() {
+            f.extend_from_slice(l.as_bytes());
+            f.extend_from_slice(b"\x1b[K");
+            if i + 1 < lines.len() {
+                f.extend_from_slice(b"\r\x1b[1B");
             }
-            line_text.contains(needle)
-        })
-    }
-
-    #[test]
-    fn identical_redraws_are_deduped_but_content_survives_eventual_change() {
-        // Simulate an Ink-style TUI (like Claude Code) that redraws its whole
-        // screen via ESC[2J + cursor-home on every update.
-        let mut s = TerminalState::new(80, 10);
-        let make_frame = |text: &str| {
-            let mut f = Vec::new();
-            f.extend_from_slice(b"\x1b[2J\x1b[H");
-            f.extend_from_slice(text.as_bytes());
-            f
-        };
-
-        s.process(&make_frame("first response"));
-        s.process(&make_frame("first response")); // establishes the baseline push
-        let after_first = s.term.grid().history_size();
-
-        // Reissuing the identical frame (e.g. a spinner tick with no
-        // textual change) must not add further copies to scrollback.
-        for _ in 0..5 {
-            s.process(&make_frame("first response"));
         }
-        assert_eq!(
-            s.term.grid().history_size(),
-            after_first,
-            "identical redraws must not flood scrollback with duplicate frames"
-        );
+        f
+    }
 
-        // The conversation moves on — the old message must still be
-        // reachable in scrollback, not silently discarded.
-        s.process(&make_frame("second response"));
+    #[test]
+    fn cursor_addressed_redraw_preserves_evicted_content() {
+        // No ESC[2J and no real linefeeds anywhere — exactly how Claude
+        // Code's Ink renderer redraws. Content sliding out the top must
+        // still be captured since alacritty's native scrollback is never
+        // triggered by this style of redraw.
+        let mut s = TerminalState::new(80, 5);
+
+        s.process(&ink_frame(&["one", "two", "three", "four", "five"]));
+        assert!(s.extra_history.is_empty(), "nothing evicted by the first frame");
+
+        s.process(&ink_frame(&["two", "three", "four", "five", "six"]));
         assert!(
-            history_contains(&s.term, "first response"),
-            "content must survive being scrolled out by a genuine redraw"
+            s.extra_history.iter().any(|l| l == "one"),
+            "content evicted by a real redraw should be preserved, got {:?}",
+            s.extra_history
         );
     }
 
     #[test]
-    fn growing_tui_content_enters_scrollback() {
-        // A TUI that redraws the whole screen via ESC[2J on every update,
-        // appending one more line of "conversation" each time — genuinely
-        // new content every frame, not a duplicate.
-        let mut s = TerminalState::new(80, 10);
-        for i in 0..30 {
-            let mut frame = Vec::new();
-            frame.extend_from_slice(b"\x1b[2J\x1b[H");
-            for line in 0..=i {
-                frame.extend_from_slice(format!("message {line}\r\n").as_bytes());
-            }
-            s.process(&frame);
+    fn in_place_status_tick_does_not_flood_extra_history() {
+        // Only the last line (a spinner/elapsed-time counter) changes each
+        // redraw — row 0 and the rest of the content stay identical. This
+        // must not be mistaken for content being evicted.
+        let mut s = TerminalState::new(80, 5);
+        s.process(&ink_frame(&["one", "two", "three", "four", "Cogitated for 1s"]));
+        for n in 2..10 {
+            let last = format!("Cogitated for {n}s");
+            s.process(&ink_frame(&["one", "two", "three", "four", &last]));
         }
         assert!(
-            s.term.grid().history_size() > 0,
-            "growing TUI content should be scrollable, but history_size() is 0"
+            s.extra_history.is_empty(),
+            "status-line-only changes must not be captured, got {:?}",
+            s.extra_history
         );
     }
 
     #[test]
-    fn clipped_tui_content_enters_scrollback() {
-        // Well-behaved TUIs (Ink/ratatui/blessed) clip their own rendering to
-        // the terminal's row count and never emit more lines than fit on
-        // screen — they manage their own internal scroll/pager and rely on
-        // the terminal only for the *current* viewport. Each frame here is
-        // always <= 10 rows, but represents genuinely NEW conversation
-        // content sliding through a 10-row window (message 0..9, then
-        // message 1..10, etc.) — exactly like Claude Code showing only the
-        // last N lines of an ever-growing transcript.
-        let mut s = TerminalState::new(80, 10);
+    fn identical_redraws_are_deduped() {
+        let mut s = TerminalState::new(80, 5);
+        s.process(&ink_frame(&["a", "b", "c", "d", "e"]));
+        s.process(&ink_frame(&["b", "c", "d", "e", "f"])); // evicts "a"
+        let count_after_evict = s.extra_history.len();
+        assert!(count_after_evict > 0);
+
+        // Reissuing the identical frame must not duplicate the capture.
+        s.process(&ink_frame(&["b", "c", "d", "e", "f"]));
+        assert_eq!(s.extra_history.len(), count_after_evict);
+    }
+
+    #[test]
+    fn growing_cursor_addressed_content_is_all_reachable() {
+        // A transcript sliding through a fixed-height window one line at a
+        // time, exactly like Claude Code showing only the last N lines —
+        // every message that ever appeared must remain scrollable.
+        let mut s = TerminalState::new(80, 5);
         for i in 0u32..30 {
-            let mut frame = Vec::new();
-            frame.extend_from_slice(b"\x1b[2J\x1b[H");
-            let start = i.saturating_sub(9);
-            let lines: Vec<String> = (start..=i).map(|line| format!("message {line}")).collect();
-            // Join with \r\n *between* lines only — a real full-frame redraw
-            // leaves the cursor on the last row, it doesn't overflow past it.
-            frame.extend_from_slice(lines.join("\r\n").as_bytes());
-            s.process(&frame);
+            let start = i.saturating_sub(4);
+            let lines: Vec<String> = (start..=i).map(|n| format!("message {n}")).collect();
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            s.process(&ink_frame(&refs));
         }
-        assert!(
-            s.term.grid().history_size() > 0,
-            "clipped TUI content should still be scrollable, but history_size() is 0"
-        );
+        for n in 0..25 {
+            assert!(
+                s.extra_history.iter().any(|l| l == &format!("message {n}")),
+                "message {n} should still be reachable in history, got {:?}",
+                s.extra_history
+            );
+        }
+    }
+
+    #[test]
+    fn scrolling_reaches_extra_history_and_resets_to_bottom() {
+        let mut s = TerminalState::new(80, 5);
+        for i in 0u32..30 {
+            let start = i.saturating_sub(4);
+            let lines: Vec<String> = (start..=i).map(|n| format!("message {n}")).collect();
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            s.process(&ink_frame(&refs));
+        }
+        assert!(!s.is_scrolled_back());
+
+        s.scroll(100);
+        assert!(s.is_scrolled_back());
+        assert!(s.extra_offset > 0, "scrolling up should spill into extra_history");
+
+        s.scroll_to_bottom();
+        assert!(!s.is_scrolled_back());
+        assert_eq!(s.extra_offset, 0);
     }
 }
