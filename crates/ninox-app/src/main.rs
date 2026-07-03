@@ -321,7 +321,7 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
         .theme(app::App::theme)
         .window(window_settings)
         .font(SYMBOLS_NERD_FONT_MONO)
-        .run_with(move || app::App::new(engine, orchestrator_root, orchestrator_agent))?;
+        .run_with(move || app::App::new(engine, orchestrator_root, orchestrator_agent, brain))?;
 
     token.cancel();
     Ok(())

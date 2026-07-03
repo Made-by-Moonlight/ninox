@@ -46,13 +46,26 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     let s = &app.scheme;
 
     // On macOS with fullsize_content_view the traffic lights sit at the top-left
-    // (~y=28px). Extra top padding clears them so content doesn't clip under.
+    // (~y=20px, spanning to ~x=70px). The brand row is padded to sit beside them
+    // at the same height instead of being pushed below by a tall top clearance.
     #[cfg(target_os = "macos")]
-    let header_padding = Padding { top: 36.0, right: 12.0, bottom: 12.0, left: 12.0 };
+    let brand_padding = Padding { top: 10.0, right: 12.0, bottom: 4.0, left: 96.0 };
     #[cfg(not(target_os = "macos"))]
-    let header_padding = Padding { top: 12.0, right: 12.0, bottom: 12.0, left: 12.0 };
+    let brand_padding = Padding { top: 12.0, right: 12.0, bottom: 4.0, left: 12.0 };
 
-    // ── Header ────────────────────────────────────────────────────────────────
+    let actions_padding = Padding { top: 4.0, right: 12.0, bottom: 12.0, left: 12.0 };
+
+    // ── Header: brand row (beside the traffic lights) ───────────────────────────
+    let brand_row = container(text("Ninox").size(13).color(s.text_primary))
+        .padding(brand_padding)
+        .width(Length::Fill)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(s.bg_sidebar)),
+            border: Border { color: s.border, width: 0.0, radius: 0.0.into() },
+            ..Default::default()
+        });
+
+    // ── Header: actions row (notifications, PRs, Brain) ─────────────────────────
     let unread = app.notifications.len();
     let bell_label = if unread > 0 {
         format!("🔔 {}", unread.min(99))
@@ -69,42 +82,59 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
 
     let header = container(
         row![
-            text("⬡ Ninox").size(13).color(s.text_primary),
-            Space::new(Length::Fill, 0),
-            button(text(bell_label.clone()).size(11).color(
-                if unread > 0 { s.accent } else { s.text_muted }
-            ))
+            button(
+                text(bell_label.clone())
+                    .size(11)
+                    .color(if unread > 0 { s.accent } else { s.text_muted })
+                    .width(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Center)
+            )
             .on_press(Message::ToggleNotifications)
             .style(move |_theme, _status| button::Style {
                 background: None,
                 text_color: if unread > 0 { s.accent } else { s.text_muted },
-                border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 4.0.into() },
+                border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
                 ..Default::default()
             })
-            .padding([2, 4]),
-            button(text(prs_label.clone()).size(11).color(s.text_secondary))
-                .on_press(Message::NavigatePrList)
-                .style(move |_theme, _status| button::Style {
-                    background: None,
-                    text_color: s.text_secondary,
-                    border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
-                    ..Default::default()
-                })
-                .padding([2, 8]),
-            button(text("+ Spawn").size(11).color(s.accent))
-                .on_press(Message::SpawnSession)
-                .style(move |_theme, _status| button::Style {
-                    background: None,
-                    text_color: s.accent,
-                    border: Border { color: s.accent, width: 1.0, radius: 4.0.into() },
-                    ..Default::default()
-                })
-                .padding([2, 8]),
+            .padding([2, 4])
+            .width(Length::Fill),
+            button(
+                text(prs_label.clone())
+                    .size(11)
+                    .color(s.text_secondary)
+                    .width(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Center)
+            )
+            .on_press(Message::NavigatePrList)
+            .style(move |_theme, _status| button::Style {
+                background: None,
+                text_color: s.text_secondary,
+                border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
+                ..Default::default()
+            })
+            .padding([2, 8])
+            .width(Length::Fill),
+            button(
+                text("Brain")
+                    .size(11)
+                    .color(s.text_secondary)
+                    .width(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Center)
+            )
+            .on_press(Message::NavigateBrain)
+            .style(move |_theme, _status| button::Style {
+                background: None,
+                text_color: s.text_secondary,
+                border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
+                ..Default::default()
+            })
+            .padding([2, 8])
+            .width(Length::Fill),
         ]
         .spacing(8)
         .align_y(Alignment::Center),
     )
-    .padding(header_padding)
+    .padding(actions_padding)
     .width(Length::Fill)
     .style(move |_theme| container::Style {
         background: Some(Background::Color(s.bg_sidebar)),
@@ -194,15 +224,37 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     )
     .height(Length::Fill);
 
+    // ── Spawn button: full-width row underneath the orchestrator/session list ──
+    let spawn_row = container(
+        button(text("+ Spawn").size(12).color(s.accent))
+            .on_press(Message::SpawnSession)
+            .style(move |_theme, _status| button::Style {
+                background: None,
+                text_color: s.accent,
+                border: Border { color: s.accent, width: 1.0, radius: 4.0.into() },
+                ..Default::default()
+            })
+            .padding([6, 8])
+            .width(Length::Fill),
+    )
+    .padding([8, 12])
+    .width(Length::Fill)
+    .style(move |_theme| container::Style {
+        background: Some(Background::Color(s.bg_sidebar)),
+        border: Border { color: s.border, width: 1.0, radius: 0.0.into() },
+        ..Default::default()
+    });
+
     // ── Footer: theme popout ──────────────────────────────────────────────────
     let footer = theme_footer(app, s);
 
     // ── Notification panel (conditional overlay between header and list) ──────
-    let mut col_items: Vec<Element<Message>> = vec![header.into()];
+    let mut col_items: Vec<Element<Message>> = vec![brand_row.into(), header.into()];
     if app.sidebar.show_notifications {
         col_items.push(notification_panel(app));
     }
     col_items.push(list.into());
+    col_items.push(spawn_row.into());
     col_items.push(footer);
 
     container(column(col_items).spacing(0))

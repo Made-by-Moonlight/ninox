@@ -5,6 +5,7 @@ use ninox_core::{
     events::{Engine, Event},
     slugify,
     types::*,
+    BrainEntry, BrainIndex, QueryFilters,
 };
 use iced::{Element, Subscription, Task, Theme};
 use tokio::sync::broadcast;
@@ -32,11 +33,20 @@ pub struct FleetFilter {
     pub query: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct BrainViewState {
+    pub entries:  Vec<BrainEntry>,
+    pub loaded:   bool,
+    pub selected: Option<String>,
+    pub filter:   String,
+}
+
 #[derive(Debug, Clone)]
 pub enum View {
     FleetBoard { scope: Option<OrchestratorId> },
     SessionDetail { session_id: SessionId, panel: DetailPanel },
     PrList,
+    Brain,
 }
 
 impl Default for View {
@@ -58,6 +68,8 @@ pub struct App {
     pub orchestrator_agent: ninox_core::config::AgentConfig,
     pub orchestrators:      Vec<Orchestrator>,
     pub sessions:        HashMap<SessionId, Session>,
+    pub brain:           Arc<BrainIndex>,
+    pub brain_view:      BrainViewState,
     pub prs:             HashMap<PrId, PR>,
     pub ci_status:       HashMap<PrId, CIStatus>,
     pub review_threads:  HashMap<PrId, Vec<Comment>>,
@@ -115,6 +127,10 @@ pub enum Message {
     CopyToClipboard(String),
     PollSessions,
     NavigatePrList,
+    NavigateBrain,
+    BrainSelectEntry(String),
+    BrainFilterQuery(String),
+    BrainReindex,
     ToggleNotifications,
     DismissNotification(String),
     DismissAllNotifications,
@@ -232,7 +248,12 @@ fn key_to_terminal_bytes(
 // ---------------------------------------------------------------------------
 
 impl App {
-    pub fn new(engine: Arc<Engine>, orchestrator_root: std::path::PathBuf, orchestrator_agent: ninox_core::config::AgentConfig) -> (Self, Task<Message>) {
+    pub fn new(
+        engine: Arc<Engine>,
+        orchestrator_root: std::path::PathBuf,
+        orchestrator_agent: ninox_core::config::AgentConfig,
+        brain: Arc<BrainIndex>,
+    ) -> (Self, Task<Message>) {
         // Synchronously load persisted state from the DB so the UI isn't empty
         // on startup.
         let orchestrators = engine.store.list_orchestrators().unwrap_or_default();
@@ -257,6 +278,8 @@ impl App {
             orchestrator_agent,
             orchestrators,
             sessions,
+            brain,
+            brain_view:     BrainViewState::default(),
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
@@ -837,6 +860,45 @@ impl App {
                 Task::none()
             }
 
+            Message::NavigateBrain => {
+                if !state.brain_view.loaded {
+                    match state.brain.query("", QueryFilters::default()) {
+                        Ok(entries) => {
+                            state.brain_view.entries = entries;
+                            state.brain_view.loaded = true;
+                        }
+                        Err(e) => tracing::error!("brain query: {e}"),
+                    }
+                }
+                state.view = View::Brain;
+                Task::none()
+            }
+
+            Message::BrainSelectEntry(id) => {
+                state.brain_view.selected = Some(id);
+                Task::none()
+            }
+
+            Message::BrainFilterQuery(query) => {
+                state.brain_view.filter = query;
+                Task::none()
+            }
+
+            Message::BrainReindex => {
+                match state.brain.rebuild() {
+                    Ok(count) => {
+                        tracing::info!("brain reindexed: {count} entries");
+                        match state.brain.query("", QueryFilters::default()) {
+                            Ok(entries) => state.brain_view.entries = entries,
+                            Err(e) => tracing::error!("brain query after reindex: {e}"),
+                        }
+                        state.brain_view.loaded = true;
+                    }
+                    Err(e) => tracing::error!("brain rebuild: {e}"),
+                }
+                Task::none()
+            }
+
             Message::ToggleNotifications => {
                 state.sidebar.show_notifications = !state.sidebar.show_notifications;
                 Task::none()
@@ -980,6 +1042,7 @@ impl App {
     pub fn iced_view(state: &Self) -> Element<'_, Message> {
         use iced::widget::{container, row};
         use crate::components::{
+            brain_panel::brain_panel,
             fleet_board::fleet_board,
             pr_list::pr_list,
             session_detail::session_detail,
@@ -993,6 +1056,7 @@ impl App {
             View::FleetBoard { scope } => fleet_board(state, scope.as_ref()),
             View::SessionDetail { session_id, panel } => session_detail(state, session_id, panel),
             View::PrList => pr_list(state),
+            View::Brain => brain_panel(state),
         };
 
         let base: Element<Message> = container(
@@ -1260,6 +1324,11 @@ mod tests {
     }
 
     fn base(engine: Arc<Engine>) -> App {
+        let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
+        base_with_brain(engine, brain)
+    }
+
+    fn base_with_brain(engine: Arc<Engine>, brain: Arc<BrainIndex>) -> App {
         App {
             engine,
             config:             AppConfig::default(),
@@ -1269,6 +1338,8 @@ mod tests {
             orchestrator_agent: ninox_core::config::AgentConfig::default(),
             orchestrators:      vec![],
             sessions:       HashMap::new(),
+            brain,
+            brain_view:     BrainViewState::default(),
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
@@ -1380,7 +1451,8 @@ mod tests {
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
         }).unwrap();
         let engine = Engine::new(store);
-        let (app, _task) = App::new(engine, std::path::PathBuf::from("/tmp"), ninox_core::config::AgentConfig::default());
+        let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
+        let (app, _task) = App::new(engine, std::path::PathBuf::from("/tmp"), ninox_core::config::AgentConfig::default(), brain);
         assert_eq!(app.orchestrators.len(), 1);
         assert_eq!(app.sessions.len(), 1);
         assert!(app.sessions.contains_key("s1"));
@@ -1442,6 +1514,64 @@ mod tests {
         let m = base(e);
         let (m2, _) = m.update(Message::NavigatePrList);
         assert!(matches!(m2.view, View::PrList));
+    }
+
+    #[test]
+    fn navigate_brain_sets_view_and_loads_entries() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("concepts")).unwrap();
+        std::fs::write(
+            brain_dir.join("concepts").join("note.md"),
+            "---\nname: Note\n---\nSome body text.",
+        )
+        .unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        assert!(!m.brain_view.loaded);
+
+        let (m2, _) = m.update(Message::NavigateBrain);
+        assert!(matches!(m2.view, View::Brain));
+        assert!(m2.brain_view.loaded);
+        assert_eq!(m2.brain_view.entries.len(), 1);
+        assert_eq!(m2.brain_view.entries[0].name, "Note");
+    }
+
+    #[test]
+    fn brain_select_entry_sets_selected() {
+        let e = test_engine();
+        let m = base(e);
+        let (m2, _) = m.update(Message::BrainSelectEntry("concepts/note.md".into()));
+        assert_eq!(m2.brain_view.selected.as_deref(), Some("concepts/note.md"));
+    }
+
+    #[test]
+    fn brain_filter_query_sets_filter() {
+        let e = test_engine();
+        let m = base(e);
+        let (m2, _) = m.update(Message::BrainFilterQuery("rust".into()));
+        assert_eq!(m2.brain_view.filter, "rust");
+    }
+
+    #[test]
+    fn brain_reindex_reloads_entries_from_disk() {
+        let brain_dir = tempdir().unwrap().keep();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m2, _) = m.update(Message::NavigateBrain);
+        assert!(m2.brain_view.entries.is_empty());
+
+        // A file appears on disk after the initial load (e.g. hand-edited outside the app).
+        std::fs::create_dir_all(brain_dir.join("repos")).unwrap();
+        std::fs::write(brain_dir.join("repos").join("ninox.md"), "Ninox repo notes.").unwrap();
+
+        let (m3, _) = m2.update(Message::BrainReindex);
+        assert_eq!(m3.brain_view.entries.len(), 1);
+        assert_eq!(m3.brain_view.entries[0].id, "repos/ninox.md");
     }
 
     #[test]
