@@ -10,6 +10,10 @@ pub enum Event {
     SessionSpawned(Session),
     SessionDone(SessionId),
     TerminalOutput { session_id: SessionId, bytes: Vec<u8> },
+    /// Rendering stream from an attached tmux client (AttachedClient).
+    ClientOutput   { session_id: SessionId, bytes: Vec<u8> },
+    /// The attached tmux client process exited (detach, kill, server gone).
+    ClientClosed   { session_id: SessionId },
     CiUpdated      { pr_id: PrId, status: CIStatus },
     PrOpened       { session_id: SessionId, pr: PR },
     ReviewComment  { pr_id: PrId, comment: Comment },

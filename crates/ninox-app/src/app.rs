@@ -950,6 +950,10 @@ impl App {
                     .push(comment);
             }
 
+            // AttachedClient rendering stream: wired into the UI by a later task.
+            Event::ClientOutput { .. } => {}
+            Event::ClientClosed { .. } => {}
+
             Event::Notification(n) => {
                 let title = n.title.clone();
                 let body = n.body.clone();
