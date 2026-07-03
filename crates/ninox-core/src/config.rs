@@ -142,6 +142,11 @@ pub struct AppConfig {
     /// Knowledge base (brain) configuration.
     #[serde(default)]
     pub brain: BrainConfig,
+    /// Theme file name (resolves to `~/.config/ninox/themes/<name>.toml`) or
+    /// an absolute/`~`-relative path. `None` uses `themes/field-notes.toml`
+    /// if present, else the built-in Field Notes palettes.
+    #[serde(default)]
+    pub theme_file: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -155,6 +160,7 @@ impl Default for AppConfig {
             worker:           AgentConfig::default(),
             github_token:     None,
             brain:            BrainConfig::default(),
+            theme_file:       None,
         }
     }
 }

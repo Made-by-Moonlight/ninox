@@ -12,7 +12,7 @@ use tokio::sync::broadcast;
 
 use crate::{
     components::{session_detail::DetailPanel, spawn_modal::SpawnForm, terminal::TerminalState},
-    theme::{from_variant, ColorScheme},
+    theme::{ColorScheme, Themes},
 };
 
 const MAX_NOTIFICATIONS: usize = 50;
@@ -62,6 +62,7 @@ impl Default for View {
 pub struct App {
     pub engine:             Arc<Engine>,
     pub config:             AppConfig,
+    pub themes:             Themes,
     pub scheme:             ColorScheme,
     pub active_variant:     ThemeVariant,
     pub orchestrator_root:  std::path::PathBuf,
@@ -266,12 +267,25 @@ impl App {
             .collect();
 
         let config = AppConfig::load().unwrap_or_default();
-        let scheme = from_variant(config.theme);
+
+        // First run: seed a complete, editable default theme file so users
+        // have a working example to customize rather than a blank slate.
+        if let Some(themes_dir) = AppConfig::config_path().parent().map(|p| p.join("themes")) {
+            if !themes_dir.exists() {
+                let default_path = themes_dir.join("field-notes.toml");
+                if let Err(e) = crate::theme::write_default_theme_file(&default_path) {
+                    tracing::warn!("failed to write default theme file: {e}");
+                }
+            }
+        }
+        let themes = Themes::load(config.theme_file.as_deref());
+        let scheme = themes.scheme(config.theme);
         let active_variant = config.theme;
 
         let mut app = Self {
             engine:             engine.clone(),
             config,
+            themes,
             scheme,
             active_variant,
             orchestrator_root,
@@ -745,7 +759,7 @@ impl App {
 
             Message::SwitchTheme(variant) => {
                 state.active_variant = variant;
-                state.scheme = from_variant(variant);
+                state.scheme = state.themes.scheme(variant);
                 state.config.theme = variant;
                 state.sidebar.show_theme_popout = false;
                 for term in state.terminals.values_mut() {
@@ -1332,7 +1346,8 @@ mod tests {
         App {
             engine,
             config:             AppConfig::default(),
-            scheme:             from_variant(ThemeVariant::Dark),
+            themes:             Themes::builtin(),
+            scheme:             crate::theme::from_variant(ThemeVariant::Dark),
             active_variant:     ThemeVariant::Dark,
             orchestrator_root:  std::path::PathBuf::from("/tmp"),
             orchestrator_agent: ninox_core::config::AgentConfig::default(),

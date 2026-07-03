@@ -1,9 +1,10 @@
-use ninox_core::{types::SessionStatus, ThemeVariant};
+use ninox_core::{config::AppConfig, types::SessionStatus, ThemeVariant};
 use iced::{color, Color, Theme};
+use std::path::{Path, PathBuf};
 
 /// Field Notes design tokens — spec: docs/design-concepts/field-notes-design.md §1.
 /// The dark theme is the same journal read by lamplight, not a separate design.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColorScheme {
     // surfaces & ink
     pub paper:     Color, // app background
@@ -66,12 +67,226 @@ impl ColorScheme {
     }
 }
 
+/// Thin wrapper over `Themes::builtin().scheme(v)`, kept for tests/back-compat.
+#[allow(dead_code)]
 pub fn from_variant(v: ThemeVariant) -> ColorScheme {
-    match v {
-        ThemeVariant::Light => light(),
-        ThemeVariant::Dark  => dark(),
-        // "ninox" third theme is not yet designed (spec §7) — lamplight for now.
-        ThemeVariant::Ninox => dark(),
+    Themes::builtin().scheme(v)
+}
+
+// ---------------------------------------------------------------------------
+// Config-file themes — palettes loadable from TOML.
+//
+// Users edit ONE theme file (`~/.config/ninox/themes/<name>.toml`) containing
+// both a `[light]` and a `[dark]` table. Missing keys keep the built-in Field
+// Notes values; a bad theme file never crashes the app — it's logged and we
+// fall back to builtins.
+// ---------------------------------------------------------------------------
+
+/// All 28 `ColorScheme` field names — single source of truth for theme-file
+/// token keys, shared by `apply_palette` and `write_default_theme_file`.
+pub const TOKEN_NAMES: &[&str] = &[
+    "paper", "paper_2", "card", "ink", "ink_2", "faint", "rule", "rule_dark",
+    "accent", "shadow",
+    "status_working", "status_pr_open", "status_ci_failed", "status_review",
+    "status_mergeable", "status_done",
+    "cat_pattern", "cat_decision", "cat_relationship", "cat_error",
+    "term_bg", "term_bar", "term_bar_border", "term_fg", "term_ok", "term_err",
+    "term_agent", "term_dim",
+];
+
+/// Maps a token name to the corresponding mutable `Color` slot in `s`.
+/// Serves both `apply_palette` (write into a scheme) and
+/// `write_default_theme_file` (read tokens out of a fresh default), so the
+/// 28-way field list lives in exactly one place.
+fn token_slot<'a>(s: &'a mut ColorScheme, name: &str) -> Option<&'a mut Color> {
+    Some(match name {
+        "paper" => &mut s.paper,
+        "paper_2" => &mut s.paper_2,
+        "card" => &mut s.card,
+        "ink" => &mut s.ink,
+        "ink_2" => &mut s.ink_2,
+        "faint" => &mut s.faint,
+        "rule" => &mut s.rule,
+        "rule_dark" => &mut s.rule_dark,
+        "accent" => &mut s.accent,
+        "shadow" => &mut s.shadow,
+        "status_working" => &mut s.status_working,
+        "status_pr_open" => &mut s.status_pr_open,
+        "status_ci_failed" => &mut s.status_ci_failed,
+        "status_review" => &mut s.status_review,
+        "status_mergeable" => &mut s.status_mergeable,
+        "status_done" => &mut s.status_done,
+        "cat_pattern" => &mut s.cat_pattern,
+        "cat_decision" => &mut s.cat_decision,
+        "cat_relationship" => &mut s.cat_relationship,
+        "cat_error" => &mut s.cat_error,
+        "term_bg" => &mut s.term_bg,
+        "term_bar" => &mut s.term_bar,
+        "term_bar_border" => &mut s.term_bar_border,
+        "term_fg" => &mut s.term_fg,
+        "term_ok" => &mut s.term_ok,
+        "term_err" => &mut s.term_err,
+        "term_agent" => &mut s.term_agent,
+        "term_dim" => &mut s.term_dim,
+        _ => return None,
+    })
+}
+
+/// Parses a `"#rrggbb"` or `"#rrggbbaa"` hex color string. The leading `#`
+/// is optional.
+pub fn parse_hex(s: &str) -> Option<Color> {
+    let s = s.strip_prefix('#').unwrap_or(s);
+    if s.len() != 6 && s.len() != 8 {
+        return None;
+    }
+    if !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    let a = if s.len() == 8 {
+        u8::from_str_radix(&s[6..8], 16).ok()?
+    } else {
+        255
+    };
+    Some(Color::from_rgba8(r, g, b, a as f32 / 255.0))
+}
+
+fn to_hex(c: Color) -> String {
+    let r = (c.r * 255.0).round() as u8;
+    let g = (c.g * 255.0).round() as u8;
+    let b = (c.b * 255.0).round() as u8;
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// Overlays `table` onto `base` by token name. Unknown keys and malformed
+/// hex values are logged and skipped — never fatal.
+pub(crate) fn apply_palette(base: &mut ColorScheme, table: &toml::Table) {
+    for (key, value) in table {
+        let Some(slot) = token_slot(base, key) else {
+            tracing::warn!("unknown theme token '{key}'; ignoring");
+            continue;
+        };
+        let Some(hex_str) = value.as_str() else {
+            tracing::warn!("theme token '{key}' is not a string; keeping default");
+            continue;
+        };
+        match parse_hex(hex_str) {
+            Some(color) => *slot = color,
+            None => tracing::warn!(
+                "invalid hex color '{hex_str}' for theme token '{key}'; keeping default"
+            ),
+        }
+    }
+}
+
+fn palette_table(scheme: ColorScheme) -> toml::Table {
+    let mut scheme = scheme;
+    let mut table = toml::Table::new();
+    for name in TOKEN_NAMES {
+        if let Some(slot) = token_slot(&mut scheme, name) {
+            table.insert((*name).to_string(), toml::Value::String(to_hex(*slot)));
+        }
+    }
+    table
+}
+
+/// Writes a complete default theme file (both palettes, all tokens) to
+/// `path`, creating parent directories as needed. Users get a full, working
+/// example to edit rather than a blank/partial file.
+pub fn write_default_theme_file(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut doc = toml::Table::new();
+    doc.insert("light".to_string(), toml::Value::Table(palette_table(light())));
+    doc.insert("dark".to_string(), toml::Value::Table(palette_table(dark())));
+    let contents = toml::to_string_pretty(&doc)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(path, contents)
+}
+
+/// Both loaded palettes — the builtin Field Notes defaults, optionally
+/// overlaid with a user's config-dir theme file.
+#[derive(Debug, Clone)]
+pub struct Themes {
+    pub light: ColorScheme,
+    pub dark:  ColorScheme,
+}
+
+impl Themes {
+    /// Built-in Field Notes palettes.
+    pub fn builtin() -> Self {
+        Themes { light: light(), dark: dark() }
+    }
+
+    /// `builtin()` overlaid with the user's theme file (missing keys keep
+    /// defaults). Never fails — a missing/unreadable/malformed file just
+    /// falls back to builtins, with a warning.
+    pub fn load(theme_file: Option<&str>) -> Self {
+        let mut themes = Self::builtin();
+
+        let Some(path) = resolve_theme_path(theme_file) else {
+            return themes;
+        };
+
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("theme file {} unreadable: {e}", path.display());
+                return themes;
+            }
+        };
+
+        let doc: toml::Table = match toml::from_str(&contents) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("theme file {} has invalid TOML: {e}", path.display());
+                return themes;
+            }
+        };
+
+        if let Some(light_tbl) = doc.get("light").and_then(|v| v.as_table()) {
+            apply_palette(&mut themes.light, light_tbl);
+        }
+        if let Some(dark_tbl) = doc.get("dark").and_then(|v| v.as_table()) {
+            apply_palette(&mut themes.dark, dark_tbl);
+        }
+
+        themes
+    }
+
+    /// Light → light, Dark|Ninox → dark.
+    pub fn scheme(&self, v: ThemeVariant) -> ColorScheme {
+        match v {
+            ThemeVariant::Light => self.light,
+            ThemeVariant::Dark | ThemeVariant::Ninox => self.dark,
+        }
+    }
+}
+
+/// Resolves a `theme_file` config value to a concrete path:
+/// - `None` → `themes/field-notes.toml` next to `config.toml`, if it exists.
+/// - A bare name (no `/`) → `themes/<name>.toml` next to `config.toml`.
+/// - A value containing `/` is used as a path as-is, expanding a leading
+///   `~/` via `dirs::home_dir()`.
+fn resolve_theme_path(theme_file: Option<&str>) -> Option<PathBuf> {
+    let themes_dir = || AppConfig::config_path().parent().map(|p| p.join("themes"));
+
+    match theme_file {
+        Some(s) if s.contains('/') => {
+            if let Some(rest) = s.strip_prefix("~/") {
+                dirs::home_dir().map(|h| h.join(rest))
+            } else {
+                Some(PathBuf::from(s))
+            }
+        }
+        Some(name) => themes_dir().map(|d| d.join(format!("{name}.toml"))),
+        None => {
+            let p = themes_dir()?.join("field-notes.toml");
+            p.exists().then_some(p)
+        }
     }
 }
 
@@ -138,5 +353,50 @@ pub fn dark() -> ColorScheme {
         term_err:        color!(0xf08a72),
         term_agent:      color!(0xf0c069),
         term_dim:        color!(0x7a7260),
+    }
+}
+
+#[cfg(test)]
+mod theme_file_tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_variants() {
+        assert_eq!(parse_hex("#c8451f"), Some(iced::color!(0xc8451f)));
+        assert!(parse_hex("#c8451f80").is_some()); // alpha form parses
+        assert_eq!(parse_hex("c8451f"), parse_hex("#c8451f")); // leading # optional
+        assert_eq!(parse_hex("#xyz"), None);
+        assert_eq!(parse_hex(""), None);
+    }
+
+    #[test]
+    fn overlay_keeps_defaults_for_missing_keys() {
+        let table: toml::Table = toml::from_str(r##"paper = "#101010""##).unwrap();
+        let mut s = light();
+        apply_palette(&mut s, &table);
+        assert_eq!(s.paper, iced::color!(0x101010));   // overridden
+        assert_eq!(s.accent, light().accent);           // untouched
+    }
+
+    #[test]
+    fn default_theme_file_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("field-notes.toml");
+        write_default_theme_file(&p).unwrap();
+        let doc: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let light_tbl = doc["light"].as_table().unwrap();
+        assert_eq!(light_tbl.len(), TOKEN_NAMES.len()); // full palette written
+        let mut s = dark();
+        apply_palette(&mut s, light_tbl);
+        assert_eq!(s.paper, light().paper); // applying the written light palette reproduces light()
+        assert_eq!(s.term_dim, light().term_dim);
+    }
+
+    #[test]
+    fn themes_load_missing_file_falls_back_to_builtin() {
+        let t = Themes::load(Some("/nonexistent/path/nope.toml"));
+        assert_eq!(t.light.paper, light().paper);
+        assert_eq!(t.dark.accent, dark().accent);
     }
 }
