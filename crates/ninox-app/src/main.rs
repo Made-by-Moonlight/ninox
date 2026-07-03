@@ -335,7 +335,7 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
         .font(include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf").as_slice())
         .font(include_bytes!("../assets/fonts/JetBrainsMono-Italic.ttf").as_slice())
         .font(include_bytes!("../assets/fonts/JetBrainsMono-BoldItalic.ttf").as_slice())
-        .run_with(move || app::App::new(engine, orchestrator_root, orchestrator_agent))?;
+        .run_with(move || app::App::new(engine, orchestrator_root, orchestrator_agent, brain))?;
 
     token.cancel();
     Ok(())

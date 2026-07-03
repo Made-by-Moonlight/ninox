@@ -1,3 +1,4 @@
+pub mod brain_panel;
 pub mod filter_bar;
 pub mod fleet_board;
 pub mod info_panel;
