@@ -14,18 +14,25 @@ pub struct AttachedClient {
     input:  mpsc::UnboundedSender<Vec<u8>>,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Identity stamped on every event this client's threads emit — lets
+    /// consumers tell this client's events apart from a superseding one
+    /// attached to the same session_id after a stale-close race.
+    pub generation: u64,
 }
 
 impl AttachedClient {
     /// Spawn `argv` (from `tmux::attach_args`) on a fresh PTY sized
     /// cols x rows. Output is emitted as `Event::ClientOutput`; exactly one
-    /// `Event::ClientClosed` follows when the process exits.
+    /// `Event::ClientClosed` follows when the process exits. `generation`
+    /// is echoed on both events so a caller can distinguish this client's
+    /// events from a different generation's after a replace/reattach race.
     pub fn spawn(
         engine:     Arc<Engine>,
         session_id: SessionId,
         argv:       Vec<String>,
         cols:       u16,
         rows:       u16,
+        generation: u64,
     ) -> Result<Self> {
         anyhow::ensure!(!argv.is_empty(), "attach argv must not be empty");
         let pair = native_pty_system()
@@ -69,15 +76,22 @@ impl AttachedClient {
             let mut buf = [0u8; 8192];
             loop {
                 match std::io::Read::read(&mut reader, &mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    // A signal interrupted the blocking read (e.g. SIGWINCH
+                    // from a concurrent resize) — not a real error, retry
+                    // rather than tearing down the client and emitting a
+                    // spurious ClientClosed.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                     Ok(n) => engine_out.emit(Event::ClientOutput {
                         session_id: sid.clone(),
+                        generation,
                         bytes:      buf[..n].to_vec(),
                     }),
                 }
             }
             let _ = child.wait();
-            engine_out.emit(Event::ClientClosed { session_id: sid });
+            engine_out.emit(Event::ClientClosed { session_id: sid, generation });
         });
 
         // Writer thread: mpsc → PTY master (real keyboard input path).
@@ -90,7 +104,7 @@ impl AttachedClient {
             }
         });
 
-        Ok(Self { input: input_tx, master: pair.master, killer })
+        Ok(Self { input: input_tx, master: pair.master, killer, generation })
     }
 
     pub fn write(&self, bytes: Vec<u8>) {
@@ -150,7 +164,7 @@ mod tests {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() { break; }
             match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(Event::ClientOutput { session_id: sid, bytes })) if sid == session_id => {
+                Ok(Ok(Event::ClientOutput { session_id: sid, bytes, .. })) if sid == session_id => {
                     all.extend_from_slice(&bytes);
                 }
                 Ok(_) => {}
@@ -171,7 +185,7 @@ mod tests {
         sleep(Duration::from_millis(300)).await;
 
         let argv = tmux::attach_args(&id).await;
-        let client = AttachedClient::spawn(engine.clone(), id.clone(), argv, 100, 30).unwrap();
+        let client = AttachedClient::spawn(engine.clone(), id.clone(), argv, 100, 30, 1).unwrap();
 
         // Attach must repaint the current screen (shell prompt) unprompted.
         let repaint = collect_client_output(&mut rx, &id, 2000).await;
@@ -196,7 +210,7 @@ mod tests {
         sleep(Duration::from_millis(300)).await;
 
         let argv = tmux::attach_args(&id).await;
-        let client = AttachedClient::spawn(engine.clone(), id.clone(), argv, 97, 41).unwrap();
+        let client = AttachedClient::spawn(engine.clone(), id.clone(), argv, 97, 41, 1).unwrap();
         sleep(Duration::from_millis(500)).await;
 
         // window-size latest: the window follows the (only) client's PTY size.
@@ -232,7 +246,7 @@ mod tests {
         sleep(Duration::from_millis(400)).await;
 
         let argv = tmux::attach_args(&id).await;
-        let client = AttachedClient::spawn(engine.clone(), id.clone(), argv, 100, 30).unwrap();
+        let client = AttachedClient::spawn(engine.clone(), id.clone(), argv, 100, 30, 1).unwrap();
         sleep(Duration::from_millis(400)).await;
 
         client.write(b"\x1b[13;2u".to_vec()); // Shift+Enter, CSI-u encoded
@@ -256,7 +270,10 @@ mod tests {
         sleep(Duration::from_millis(300)).await;
 
         let argv = tmux::attach_args(&id).await;
-        let _client = AttachedClient::spawn(engine.clone(), id.clone(), argv, 80, 24).unwrap();
+        let expected_generation = 99;
+        let _client = AttachedClient::spawn(
+            engine.clone(), id.clone(), argv, 80, 24, expected_generation,
+        ).unwrap();
         sleep(Duration::from_millis(300)).await;
         tmux::kill_session(&id).await.unwrap();
 
@@ -264,10 +281,13 @@ mod tests {
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(!remaining.is_zero(), "ClientClosed never arrived");
-            if let Ok(Ok(Event::ClientClosed { session_id })) =
+            if let Ok(Ok(Event::ClientClosed { session_id, generation })) =
                 tokio::time::timeout(remaining, rx.recv()).await
             {
-                if session_id == id { break; }
+                if session_id == id {
+                    assert_eq!(generation, expected_generation, "generation must round-trip on ClientClosed");
+                    break;
+                }
             }
         }
     }

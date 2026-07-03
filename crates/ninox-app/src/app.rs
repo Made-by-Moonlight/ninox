@@ -72,6 +72,12 @@ pub struct App {
     /// Sessions that already burned their one automatic reattach after an
     /// unexpected ClientClosed. Cleared on navigation.
     reattach_attempted: std::collections::HashSet<SessionId>,
+    /// Monotonically increasing identity handed to every spawned
+    /// `AttachedClient`. Lets `Event::ClientOutput`/`ClientClosed` handlers
+    /// tell a stale client's events (from one that lost a concurrent-attach
+    /// race, or was superseded by a fresh NavigateSession) apart from the
+    /// currently-live client for the same session_id.
+    next_client_generation: u64,
     pub spawn_modal:     Option<SpawnForm>,
     /// Current terminal canvas dimensions, kept in sync by WindowResized.
     /// Used as the source of truth for all start_streaming + TerminalState::new calls.
@@ -220,6 +226,7 @@ impl App {
             terminals:      HashMap::new(),
             clients:        HashMap::new(),
             reattach_attempted: std::collections::HashSet::new(),
+            next_client_generation: 0,
             spawn_modal:    None,
             // Placeholders — corrected below by resize_terminals() using the
             // real default window size, so this never drifts out of sync with
@@ -397,10 +404,18 @@ impl App {
                 let viewing = matches!(&state.view,
                     View::SessionDetail { session_id: sid, .. } if sid == &session_id);
                 if !viewing { return Task::none(); }
+                // A live client already exists for this session — a
+                // concurrent attach (e.g. a re-navigate that fired its own
+                // ClientAttach) already won the race. Spawning another
+                // would orphan two AttachedClients pointed at the same
+                // session_id, one of which is stray.
+                if state.clients.contains_key(&session_id) { return Task::none(); }
 
                 let (cols, rows) = (state.terminal_cols, state.terminal_rows);
+                let generation = state.next_client_generation;
+                state.next_client_generation += 1;
                 match ninox_core::client::AttachedClient::spawn(
-                    state.engine.clone(), session_id.clone(), argv, cols, rows,
+                    state.engine.clone(), session_id.clone(), argv, cols, rows, generation,
                 ) {
                     Ok(client) => {
                         // Fresh emulator wired to the client so query replies
@@ -956,14 +971,32 @@ impl App {
                 Task::none()
             }
 
-            Event::ClientOutput { session_id, bytes } => {
+            Event::ClientOutput { session_id, generation, bytes } => {
+                // A stale client (superseded by a fresh attach) may still
+                // have a reader thread draining its last buffered output —
+                // only apply it if it's still the client on record.
+                let current = state.clients.get(&session_id).map(|c| c.generation);
+                if current != Some(generation) {
+                    return Task::none();
+                }
                 if let Some(term) = state.terminals.get_mut(&session_id) {
                     term.process(&bytes);
                 }
                 Task::none()
             }
 
-            Event::ClientClosed { session_id } => {
+            Event::ClientClosed { session_id, generation } => {
+                // Ignore a close from a client generation that is no longer
+                // the one on record — e.g. a deliberately dropped old
+                // client (NavigateSession re-click) whose ClientClosed
+                // arrives after a fresh client has already been attached.
+                // Acting on it would strand the new client by removing it
+                // and its terminal out from under the view.
+                let current = state.clients.get(&session_id).map(|c| c.generation);
+                if current != Some(generation) {
+                    return Task::none();
+                }
+
                 let viewing = matches!(&state.view,
                     View::SessionDetail { session_id: sid, .. } if sid == &session_id);
                 state.clients.remove(&session_id);
@@ -1341,6 +1374,7 @@ mod tests {
             terminals:      HashMap::new(),
             clients:        HashMap::new(),
             reattach_attempted: std::collections::HashSet::new(),
+            next_client_generation: 0,
             spawn_modal:    None,
             terminal_cols:  140,
             terminal_rows:  50,
@@ -1742,6 +1776,74 @@ mod tests {
             m = next;
         }
         assert_eq!(attention_count(&m), 2); // ci_failed + review_pending
+    }
+
+    #[tokio::test]
+    async fn stale_client_closed_does_not_strand_a_freshly_reattached_session() {
+        // Reproduces the critical bug: NavigateSession re-clicked on the
+        // currently-viewed session drops the OLD AttachedClient (killing
+        // its process) and attaches a fresh one. The OLD client's reader
+        // thread still surfaces exactly one ClientClosed once the killed
+        // process actually exits — carrying the OLD generation. Without
+        // generation tagging, that stale event would remove the NEW
+        // client + terminal out from under the view, and after the
+        // one-shot reattach budget burns, strand it at "Terminal
+        // connecting…" permanently.
+        fn tmux_available() -> bool {
+            std::process::Command::new("tmux").args(["-V"]).output()
+                .map(|o| o.status.success()).unwrap_or(false)
+        }
+        if !tmux_available() { return; }
+
+        let e = test_engine();
+        let m = base(e);
+        let sid = format!(
+            "app-gen-test-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+        );
+        ninox_core::tmux::create_session(&sid, "/tmp", "sleep 30", &[]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Navigate to the session and attach the first (OLD) client.
+        let (mut m, _) = m.update(Message::NavigateSession(sid.clone()));
+        let argv = ninox_core::tmux::attach_args(&sid).await;
+        let (m2, _) = m.update(Message::ClientAttach { session_id: sid.clone(), argv });
+        m = m2;
+        assert!(m.clients.contains_key(&sid), "first attach must succeed");
+        let old_generation = m.clients.get(&sid).unwrap().generation;
+
+        // Re-click the same session: NavigateSession drops the OLD client
+        // synchronously (dropping AttachedClient kills its process) and
+        // clears the terminal, mirroring the real re-click flow.
+        let (m3, _) = m.update(Message::NavigateSession(sid.clone()));
+        m = m3;
+        assert!(!m.clients.contains_key(&sid), "NavigateSession must drop the old client");
+
+        // The fresh (NEW) client attaches — different generation.
+        let argv2 = ninox_core::tmux::attach_args(&sid).await;
+        let (m4, _) = m.update(Message::ClientAttach { session_id: sid.clone(), argv: argv2 });
+        m = m4;
+        assert!(m.clients.contains_key(&sid), "second attach must succeed");
+        let new_generation = m.clients.get(&sid).unwrap().generation;
+        assert_ne!(old_generation, new_generation, "the two attaches must not share a generation");
+
+        // The OLD client's reader thread now surfaces its terminal
+        // ClientClosed, tagged with the OLD generation. This must be
+        // ignored — the currently-live client must survive intact.
+        let (m5, _) = m.update(Message::EngineEvent(Event::ClientClosed {
+            session_id: sid.clone(),
+            generation: old_generation,
+        }));
+        m = m5;
+
+        assert!(m.clients.contains_key(&sid), "a stale ClientClosed must not remove the current client");
+        assert!(m.terminals.contains_key(&sid), "the terminal entry must remain intact");
+        assert_eq!(
+            m.clients.get(&sid).unwrap().generation, new_generation,
+            "the surviving client must still be the new generation"
+        );
+
+        ninox_core::tmux::kill_session(&sid).await.unwrap();
     }
 
     #[test]

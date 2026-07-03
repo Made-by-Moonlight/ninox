@@ -11,9 +11,14 @@ pub enum Event {
     SessionDone(SessionId),
     TerminalOutput { session_id: SessionId, bytes: Vec<u8> },
     /// Rendering stream from an attached tmux client (AttachedClient).
-    ClientOutput   { session_id: SessionId, bytes: Vec<u8> },
+    /// `generation` identifies which `AttachedClient::spawn` call produced
+    /// this event — consumers must ignore events whose generation doesn't
+    /// match the currently-live client for `session_id` so a stale client
+    /// (superseded by a fresh attach) cannot clobber the new one.
+    ClientOutput   { session_id: SessionId, generation: u64, bytes: Vec<u8> },
     /// The attached tmux client process exited (detach, kill, server gone).
-    ClientClosed   { session_id: SessionId },
+    /// See `ClientOutput` for why `generation` matters.
+    ClientClosed   { session_id: SessionId, generation: u64 },
     CiUpdated      { pr_id: PrId, status: CIStatus },
     PrOpened       { session_id: SessionId, pr: PR },
     ReviewComment  { pr_id: PrId, comment: Comment },
