@@ -132,6 +132,14 @@ pub enum Message {
     ClearFleetFilter,
     ScrollTerminal { session_id: SessionId, delta: i32 },
     JumpToLatest { session_id: SessionId },
+    /// A chunk of tmux pane history came back from `capture-pane` for a
+    /// scrolled-back terminal.
+    HistoryFetched {
+        session_id: SessionId,
+        bytes: Vec<u8>,
+        fetched_to: i64,
+        top_reached: bool,
+    },
     OpenUrl(String),
     Noop,
 }
@@ -852,8 +860,30 @@ impl App {
                         if let Some(client) = state.clients.get(&session_id) {
                             for _ in 0..delta.unsigned_abs() { client.write(bytes.clone()); }
                         }
-                    } else {
-                        term.scroll(delta);
+                    } else if term.scroll(delta) {
+                        // Cache edge hit while more history may exist —
+                        // fetch the next chunk from tmux (the source of
+                        // truth for scrollback; the live grid holds none).
+                        term.scrollback.fetch_pending = true;
+                        let from = term.scrollback.fetched_to; // 0 on first fetch
+                        let sid = session_id.clone();
+                        return Task::future(async move {
+                            use crate::components::scrollback::FETCH_CHUNK;
+                            let total = ninox_core::tmux::history_size(&sid).await;
+                            let end = from - 1; // next line above cache
+                            let start = (from - FETCH_CHUNK).max(-total);
+                            if end < -total || total == 0 {
+                                return Message::HistoryFetched {
+                                    session_id: sid, bytes: Vec::new(),
+                                    fetched_to: from, top_reached: true,
+                                };
+                            }
+                            let bytes = ninox_core::tmux::capture_history(&sid, start, end).await;
+                            Message::HistoryFetched {
+                                session_id: sid, bytes,
+                                fetched_to: start, top_reached: start <= -total,
+                            }
+                        });
                     }
                 }
                 Task::none()
@@ -862,6 +892,17 @@ impl App {
             Message::JumpToLatest { session_id } => {
                 if let Some(term) = state.terminals.get_mut(&session_id) {
                     term.scroll_to_bottom();
+                }
+                Task::none()
+            }
+
+            Message::HistoryFetched { session_id, bytes, fetched_to, top_reached } => {
+                if let Some(term) = state.terminals.get_mut(&session_id) {
+                    use alacritty_terminal::grid::Dimensions;
+                    let cols = term.term.grid().columns() as u16;
+                    let lines = crate::components::scrollback::parse_capture(&bytes, cols);
+                    term.scrollback.absorb(lines, fetched_to, top_reached);
+                    term.cache.clear();
                 }
                 Task::none()
             }

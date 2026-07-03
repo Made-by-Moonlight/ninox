@@ -52,6 +52,11 @@ impl alacritty_terminal::event::EventListener for EventProxy {
 pub struct TerminalState {
     pub term: Term<EventProxy>,
     pub cache: Cache,
+    /// On-demand tmux history cache + scroll position for this view. The
+    /// live alacritty grid never accumulates scrollback of its own (the
+    /// client stream is a full-screen tmux UI), so all history rendering
+    /// comes from here.
+    pub scrollback: crate::components::scrollback::Scrollback,
     parser: Processor,
 }
 
@@ -65,7 +70,12 @@ impl TerminalState {
         let size = TermSize::new(cols as usize, rows as usize);
         let config = Config { kitty_keyboard: true, ..Config::default() };
         let term = Term::new(config, &size, EventProxy(reply));
-        Self { term, cache: Cache::new(), parser: Processor::new() }
+        Self {
+            term,
+            cache: Cache::new(),
+            scrollback: Default::default(),
+            parser: Processor::new(),
+        }
     }
 
     /// Feed raw bytes from the attached tmux client into the emulator.
@@ -74,24 +84,28 @@ impl TerminalState {
         self.cache.clear();
     }
 
-    /// Scroll the terminal display by `delta` lines (positive = up into
-    /// history).
-    pub fn scroll(&mut self, delta: i32) {
-        use alacritty_terminal::grid::Scroll;
-        self.term.grid_mut().scroll_display(Scroll::Delta(delta));
+    /// Scroll by `delta` lines (positive = up). Returns true when older
+    /// history must be fetched from tmux.
+    pub fn scroll(&mut self, delta: i32) -> bool {
+        let needs_fetch = if delta > 0 {
+            self.scrollback.scroll_up(delta as usize)
+        } else {
+            self.scrollback.scroll_down((-delta) as usize);
+            false
+        };
         self.cache.clear();
+        needs_fetch
     }
 
     /// Jump the display back down to the live viewport.
     pub fn scroll_to_bottom(&mut self) {
-        use alacritty_terminal::grid::Scroll;
-        self.term.grid_mut().scroll_display(Scroll::Bottom);
+        self.scrollback.offset = 0;
         self.cache.clear();
     }
 
     /// Whether the display is currently scrolled up into history.
     pub fn is_scrolled_back(&self) -> bool {
-        self.term.grid().display_offset() > 0
+        self.scrollback.offset > 0
     }
 
     /// Resize the terminal grid to match a new canvas size.
@@ -353,8 +367,12 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
         let colors = term.colors();
         let cols = grid.columns();
         let rows = grid.screen_lines();
-        let cursor_point   = grid.cursor.point;
-        let display_offset = grid.display_offset() as i32;
+        let cursor_point = grid.cursor.point;
+        // How many rows the view is scrolled up into tmux history. The
+        // native alacritty grid holds no scrollback of its own (the client
+        // stream is a full-screen tmux UI), so this offset is entirely
+        // driven by `Scrollback`, not `grid.display_offset()`.
+        let offset = self.state.scrollback.offset as i32;
 
         let term_bg = self.terminal_bg;
         let term_fg = self.terminal_fg;
@@ -365,89 +383,135 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
             let bg_all = Path::rectangle(iced::Point::ORIGIN, bounds.size());
             frame.fill(&bg_all, term_bg);
 
-            // Render each cell. When scrolled into history, shift line
-            // indices by display_offset so Line(0 - offset) accesses the
-            // history buffer.
+            // Compose the viewport as history-above + live-below: rows whose
+            // logical index is negative are served from the tmux scrollback
+            // cache, the rest from the live grid.
             for row in 0..rows {
                 use alacritty_terminal::index::{Column, Line};
 
-                let logical_line = row as i32 - display_offset;
+                let logical = row as i32 - offset;
                 let y = row as f32 * cell_h;
 
-                let line = Line(logical_line);
+                if logical < 0 {
+                    // History line fetched from tmux capture-pane. Content
+                    // between the cached snapshot and the live screen may be
+                    // stale/missing until jump-to-latest — accepted
+                    // trade-off, not a bug (see Scrollback docs).
+                    let Some(cells) = self.state.scrollback.line_above((-logical - 1) as usize)
+                    else {
+                        continue;
+                    };
+                    for (col, cell) in cells.iter().enumerate().take(cols) {
+                        let x = col as f32 * cell_w;
+                        let is_selected = cell_is_selected(sel, row, col);
+                        draw_cell(
+                            frame, x, y, cell_w, cell_h, self.font_size,
+                            cell.c, cell.fg, cell.bg,
+                            false, // cursor never draws in history
+                            is_selected,
+                            colors, term_bg, term_fg, cursor_color,
+                        );
+                    }
+                    continue;
+                }
+
+                let line = Line(logical);
                 for col in 0..cols {
                     let column = Column(col);
                     let cell = &grid[line][column];
-
                     let x = col as f32 * cell_w;
 
-                    // Background.
-                    let bg = ansi_to_iced(cell.bg, colors, term_bg, term_fg);
-                    let is_cursor = cursor_point.line == line && cursor_point.column == column;
+                    // The cursor is suppressed whenever the view is scrolled
+                    // back — it lives on the live screen, not in history.
+                    let is_cursor =
+                        offset == 0 && cursor_point.line == line && cursor_point.column == column;
+                    let is_selected = cell_is_selected(sel, row, col);
 
-                    let is_selected = sel.range().map(|((sc, sr), (ec, er))| {
-                        let in_row = row >= sr && row <= er;
-                        if !in_row { return false; }
-                        if sr == er { col >= sc && col <= ec }
-                        else if row == sr { col >= sc }
-                        else if row == er { col <= ec }
-                        else { true }
-                    }).unwrap_or(false);
-
-                    if is_selected {
-                        let sel_rect = Path::rectangle(
-                            iced::Point::new(x, y),
-                            Size::new(cell_w, cell_h),
-                        );
-                        frame.fill(&sel_rect, IcedColor { r: 0.27, g: 0.52, b: 0.80, a: 0.5 });
-                    } else if is_cursor {
-                        let cursor_rect = Path::rectangle(
-                            iced::Point::new(x, y),
-                            Size::new(cell_w, cell_h),
-                        );
-                        frame.fill(&cursor_rect, cursor_color);
-                    } else if bg != term_bg {
-                        let bg_rect = Path::rectangle(
-                            iced::Point::new(x, y),
-                            Size::new(cell_w, cell_h),
-                        );
-                        frame.fill(&bg_rect, bg);
-                    }
-
-                    // Foreground text.
-                    let ch = cell.c;
-                    if ch != ' ' && ch != '\0' {
-                        let fg = if is_cursor {
-                            term_bg
-                        } else {
-                            ansi_to_iced(cell.fg, colors, term_bg, term_fg)
-                        };
-
-                        let cp = ch as u32;
-                        let font = if (0xE000..=0xF8FF).contains(&cp) {
-                            NERD_FONT
-                        } else {
-                            iced::Font::MONOSPACE
-                        };
-                        frame.fill_text(iced::widget::canvas::Text {
-                            content: ch.to_string(),
-                            position: iced::Point::new(x, y),
-                            color: fg,
-                            size: iced::Pixels(self.font_size),
-                            font,
-                            horizontal_alignment: iced::alignment::Horizontal::Left,
-                            vertical_alignment: iced::alignment::Vertical::Top,
-                            line_height: iced::widget::text::LineHeight::Relative(
-                                cell_h / self.font_size,
-                            ),
-                            shaping: iced::widget::text::Shaping::Advanced,
-                        });
-                    }
+                    draw_cell(
+                        frame, x, y, cell_w, cell_h, self.font_size,
+                        cell.c, cell.fg, cell.bg,
+                        is_cursor, is_selected,
+                        colors, term_bg, term_fg, cursor_color,
+                    );
                 }
             }
         });
 
         vec![geometry]
+    }
+}
+
+/// Whether canvas cell (col, row) falls inside the current drag selection.
+fn cell_is_selected(sel: &SelectionState, row: usize, col: usize) -> bool {
+    sel.range().map(|((sc, sr), (ec, er))| {
+        let in_row = row >= sr && row <= er;
+        if !in_row { return false; }
+        if sr == er { col >= sc && col <= ec }
+        else if row == sr { col >= sc }
+        else if row == er { col <= ec }
+        else { true }
+    }).unwrap_or(false)
+}
+
+/// Draw one terminal cell (background/cursor/selection rect + glyph). Shared
+/// by live grid rows and tmux-history rows so both render identically.
+#[allow(clippy::too_many_arguments)]
+fn draw_cell(
+    frame: &mut Frame,
+    x: f32,
+    y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    font_size: f32,
+    c: char,
+    fg_color: Color,
+    bg_color: Color,
+    is_cursor: bool,
+    is_selected: bool,
+    colors: &alacritty_terminal::term::color::Colors,
+    term_bg: IcedColor,
+    term_fg: IcedColor,
+    cursor_color: IcedColor,
+) {
+    // Background.
+    let bg = ansi_to_iced(bg_color, colors, term_bg, term_fg);
+
+    if is_selected {
+        let sel_rect = Path::rectangle(iced::Point::new(x, y), Size::new(cell_w, cell_h));
+        frame.fill(&sel_rect, IcedColor { r: 0.27, g: 0.52, b: 0.80, a: 0.5 });
+    } else if is_cursor {
+        let cursor_rect = Path::rectangle(iced::Point::new(x, y), Size::new(cell_w, cell_h));
+        frame.fill(&cursor_rect, cursor_color);
+    } else if bg != term_bg {
+        let bg_rect = Path::rectangle(iced::Point::new(x, y), Size::new(cell_w, cell_h));
+        frame.fill(&bg_rect, bg);
+    }
+
+    // Foreground text.
+    if c != ' ' && c != '\0' {
+        let fg = if is_cursor {
+            term_bg
+        } else {
+            ansi_to_iced(fg_color, colors, term_bg, term_fg)
+        };
+
+        let cp = c as u32;
+        let font = if (0xE000..=0xF8FF).contains(&cp) {
+            NERD_FONT
+        } else {
+            iced::Font::MONOSPACE
+        };
+        frame.fill_text(iced::widget::canvas::Text {
+            content: c.to_string(),
+            position: iced::Point::new(x, y),
+            color: fg,
+            size: iced::Pixels(font_size),
+            font,
+            horizontal_alignment: iced::alignment::Horizontal::Left,
+            vertical_alignment: iced::alignment::Vertical::Top,
+            line_height: iced::widget::text::LineHeight::Relative(cell_h / font_size),
+            shaping: iced::widget::text::Shaping::Advanced,
+        });
     }
 }
 
