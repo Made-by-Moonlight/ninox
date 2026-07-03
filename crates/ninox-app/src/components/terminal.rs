@@ -44,24 +44,56 @@ pub struct TerminalState {
     pub term: Term<EventProxy>,
     pub cache: Cache,
     parser: Processor,
+    /// Viewport content as of the last time we let an ESC[2J actually scroll
+    /// it into scrollback history. Lets `process` tell a genuine content
+    /// change (push it before it's erased) apart from a TUI reissuing a
+    /// full-screen redraw identical to one already preserved (suppress the
+    /// duplicate). See `process` for why this exists.
+    last_pushed_frame: Option<String>,
 }
 
 impl TerminalState {
     /// Feed raw bytes from the PTY into the VTE parser → terminal state.
     pub fn process(&mut self, bytes: &[u8]) {
-        // ESC[2J (erase entire screen) on the primary screen calls clear_viewport()
-        // which scrolls the current viewport into scrollback history. TUI apps like
-        // Claude Code send ESC[2J on every full-screen redraw, flooding scrollback
-        // with repeated copies of the TUI chrome.
+        // ESC[2J (erase entire screen) calls clear_viewport(), which scrolls
+        // the current viewport into scrollback history. TUI apps like Claude
+        // Code redraw their whole screen via ESC[2J on every update — fine
+        // when the outgoing screen carries content we haven't preserved yet,
+        // but if the TUI reissues an *identical* frame (e.g. a spinner tick
+        // with no textual change), passing every ESC[2J through floods
+        // scrollback with repeated copies of the same screen. Suppressing
+        // every ESC[2J unconditionally (the previous fix) swings too far the
+        // other way: well-behaved TUIs clip their rendering to the terminal's
+        // row count and never overflow it naturally, so nothing ever scrolls
+        // into history and scrollback never grows at all.
         //
-        // Replace ESC[2J with ESC[H (cursor home) + ESC[0J (erase below cursor).
-        // ESC[0J uses reset_region() internally — same visual result, no scrollback push.
+        // Instead, only push when the outgoing viewport differs from the
+        // last frame we chose to preserve — this collapses runs of identical
+        // redraws to a single scrollback copy while still capturing content
+        // the moment it's actually superseded by something new.
         //
-        // Note: split sequences across chunk boundaries are not handled here; in
-        // practice tmux pipe-pane delivers complete sequences in single 4 KiB reads.
-        if bytes.windows(4).any(|w| w == b"\x1b[2J") {
-            let filtered = replace_clear_screen(bytes);
-            self.parser.advance(&mut self.term, &filtered);
+        // Note: split sequences across chunk boundaries are not handled here;
+        // in practice tmux pipe-pane delivers complete sequences in single
+        // 4 KiB reads.
+        const NEEDLE: &[u8] = b"\x1b[2J";
+        const REPLACE: &[u8] = b"\x1b[H\x1b[0J";
+
+        if bytes.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+            let mut i = 0;
+            while let Some(rel) = bytes[i..].windows(NEEDLE.len()).position(|w| w == NEEDLE) {
+                if rel > 0 {
+                    self.parser.advance(&mut self.term, &bytes[i..i + rel]);
+                }
+                let outgoing = viewport_text(&self.term);
+                if self.last_pushed_frame.as_ref() == Some(&outgoing) {
+                    self.parser.advance(&mut self.term, REPLACE);
+                } else {
+                    self.parser.advance(&mut self.term, NEEDLE);
+                    self.last_pushed_frame = Some(outgoing);
+                }
+                i += rel + NEEDLE.len();
+            }
+            self.parser.advance(&mut self.term, &bytes[i..]);
         } else {
             self.parser.advance(&mut self.term, bytes);
         }
@@ -486,28 +518,26 @@ pub fn extract_selection(
 }
 
 // ---------------------------------------------------------------------------
-// Byte-stream filters
+// Viewport snapshotting
 // ---------------------------------------------------------------------------
 
-/// Replace every ESC[2J with ESC[H ESC[0J.
-///
-/// ESC[H moves the cursor to the home position; ESC[0J erases from cursor to
-/// end of screen using reset_region() (no scrollback push), unlike ESC[2J
-/// which uses clear_viewport() → scroll_up() and pollutes scrollback.
-fn replace_clear_screen(bytes: &[u8]) -> Vec<u8> {
-    const NEEDLE: &[u8] = b"\x1b[2J";
-    const REPLACE: &[u8] = b"\x1b[H\x1b[0J";
+/// Render the current (unscrolled) viewport as plain text — used by
+/// `TerminalState::process` to detect when a TUI reissues a full-screen
+/// redraw identical to one it has already preserved in scrollback.
+fn viewport_text(term: &Term<EventProxy>) -> String {
+    use alacritty_terminal::index::{Column, Line};
 
-    let mut out = Vec::with_capacity(bytes.len() + 4);
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(NEEDLE) {
-            out.extend_from_slice(REPLACE);
-            i += NEEDLE.len();
-        } else {
-            out.push(bytes[i]);
-            i += 1;
+    let grid = term.grid();
+    let cols = grid.columns();
+    let rows = grid.screen_lines();
+    let mut out = String::with_capacity(rows * (cols + 1));
+
+    for row in 0..rows {
+        let line = Line(row as i32);
+        for col in 0..cols {
+            out.push(grid[line][Column(col)].c);
         }
+        out.push('\n');
     }
     out
 }
@@ -525,6 +555,7 @@ impl TerminalState {
             term,
             cache: Cache::new(),
             parser: Processor::new(),
+            last_pushed_frame: None,
         }
     }
 
@@ -533,6 +564,18 @@ impl TerminalState {
         use alacritty_terminal::grid::Scroll;
         self.term.grid_mut().scroll_display(Scroll::Delta(delta));
         self.cache.clear();
+    }
+
+    /// Jump the display back down to the live viewport.
+    pub fn scroll_to_bottom(&mut self) {
+        use alacritty_terminal::grid::Scroll;
+        self.term.grid_mut().scroll_display(Scroll::Bottom);
+        self.cache.clear();
+    }
+
+    /// Whether the display is currently scrolled up into history.
+    pub fn is_scrolled_back(&self) -> bool {
+        self.term.grid().display_offset() > 0
     }
 }
 
@@ -554,44 +597,101 @@ mod tests {
         s.process(b"\x1b[31mred\x1b[0m");
     }
 
-    #[test]
-    fn replace_clear_screen_substitutes_esc2j() {
-        let input = b"before\x1b[2Jafter";
-        let out = replace_clear_screen(input);
-        assert_eq!(out, b"before\x1b[H\x1b[0Jafter");
+    /// Does any line currently in scrollback history contain `needle`?
+    fn history_contains(term: &Term<EventProxy>, needle: &str) -> bool {
+        use alacritty_terminal::index::{Column, Line};
+        let grid = term.grid();
+        let cols = grid.columns();
+        let history = grid.history_size() as i32;
+        (1..=history).any(|n| {
+            let mut line_text = String::with_capacity(cols);
+            for col in 0..cols {
+                line_text.push(grid[Line(-n)][Column(col)].c);
+            }
+            line_text.contains(needle)
+        })
     }
 
     #[test]
-    fn replace_clear_screen_multiple_occurrences() {
-        let input = b"\x1b[2J\x1b[2J";
-        let out = replace_clear_screen(input);
-        assert_eq!(out, b"\x1b[H\x1b[0J\x1b[H\x1b[0J");
-    }
+    fn identical_redraws_are_deduped_but_content_survives_eventual_change() {
+        // Simulate an Ink-style TUI (like Claude Code) that redraws its whole
+        // screen via ESC[2J + cursor-home on every update.
+        let mut s = TerminalState::new(80, 10);
+        let make_frame = |text: &str| {
+            let mut f = Vec::new();
+            f.extend_from_slice(b"\x1b[2J\x1b[H");
+            f.extend_from_slice(text.as_bytes());
+            f
+        };
 
-    #[test]
-    fn replace_clear_screen_no_match_is_identity() {
-        let input = b"\x1b[H\x1b[0J plain text";
-        let out = replace_clear_screen(input);
-        assert_eq!(out, input);
-    }
+        s.process(&make_frame("first response"));
+        s.process(&make_frame("first response")); // establishes the baseline push
+        let after_first = s.term.grid().history_size();
 
-    #[test]
-    fn clear_screen_does_not_add_scrollback() {
-        // Fill the first 24 lines with content so clear_viewport would have
-        // something to push into scrollback if ESC[2J were passed through.
-        let mut s = TerminalState::new(80, 24);
-        for _ in 0..24 {
-            s.process(b"hello world\r\n");
+        // Reissuing the identical frame (e.g. a spinner tick with no
+        // textual change) must not add further copies to scrollback.
+        for _ in 0..5 {
+            s.process(&make_frame("first response"));
         }
-        let history_before = s.term.grid().history_size();
-
-        // ESC[2J should NOT add scrollback lines thanks to the filter.
-        s.process(b"\x1b[2J");
-
         assert_eq!(
             s.term.grid().history_size(),
-            history_before,
-            "ESC[2J must not push viewport content into scrollback"
+            after_first,
+            "identical redraws must not flood scrollback with duplicate frames"
+        );
+
+        // The conversation moves on — the old message must still be
+        // reachable in scrollback, not silently discarded.
+        s.process(&make_frame("second response"));
+        assert!(
+            history_contains(&s.term, "first response"),
+            "content must survive being scrolled out by a genuine redraw"
+        );
+    }
+
+    #[test]
+    fn growing_tui_content_enters_scrollback() {
+        // A TUI that redraws the whole screen via ESC[2J on every update,
+        // appending one more line of "conversation" each time — genuinely
+        // new content every frame, not a duplicate.
+        let mut s = TerminalState::new(80, 10);
+        for i in 0..30 {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(b"\x1b[2J\x1b[H");
+            for line in 0..=i {
+                frame.extend_from_slice(format!("message {line}\r\n").as_bytes());
+            }
+            s.process(&frame);
+        }
+        assert!(
+            s.term.grid().history_size() > 0,
+            "growing TUI content should be scrollable, but history_size() is 0"
+        );
+    }
+
+    #[test]
+    fn clipped_tui_content_enters_scrollback() {
+        // Well-behaved TUIs (Ink/ratatui/blessed) clip their own rendering to
+        // the terminal's row count and never emit more lines than fit on
+        // screen — they manage their own internal scroll/pager and rely on
+        // the terminal only for the *current* viewport. Each frame here is
+        // always <= 10 rows, but represents genuinely NEW conversation
+        // content sliding through a 10-row window (message 0..9, then
+        // message 1..10, etc.) — exactly like Claude Code showing only the
+        // last N lines of an ever-growing transcript.
+        let mut s = TerminalState::new(80, 10);
+        for i in 0u32..30 {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(b"\x1b[2J\x1b[H");
+            let start = i.saturating_sub(9);
+            let lines: Vec<String> = (start..=i).map(|line| format!("message {line}")).collect();
+            // Join with \r\n *between* lines only — a real full-frame redraw
+            // leaves the cursor on the last row, it doesn't overflow past it.
+            frame.extend_from_slice(lines.join("\r\n").as_bytes());
+            s.process(&frame);
+        }
+        assert!(
+            s.term.grid().history_size() > 0,
+            "clipped TUI content should still be scrollable, but history_size() is 0"
         );
     }
 }

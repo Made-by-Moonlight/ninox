@@ -122,6 +122,7 @@ pub enum Message {
     FleetFilterQuery(String),
     ClearFleetFilter,
     ScrollTerminal { session_id: SessionId, delta: i32 },
+    JumpToLatest { session_id: SessionId },
     OpenUrl(String),
     Noop,
 }
@@ -873,6 +874,13 @@ impl App {
             Message::ScrollTerminal { session_id, delta } => {
                 if let Some(term) = state.terminals.get_mut(&session_id) {
                     term.scroll(delta);
+                }
+                Task::none()
+            }
+
+            Message::JumpToLatest { session_id } => {
+                if let Some(term) = state.terminals.get_mut(&session_id) {
+                    term.scroll_to_bottom();
                 }
                 Task::none()
             }
