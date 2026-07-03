@@ -77,6 +77,8 @@ impl TerminalState {
     /// TUIs begin a full-screen redraw) and diff at each one individually.
     pub fn process(&mut self, bytes: &[u8]) {
         const HOME: &[u8] = b"\x1b[H";
+        const ERASE_DISPLAY: &[u8] = b"\x1b[2J";
+        const ERASE_SAVED: &[u8] = b"\x1b[3J";
 
         let splits: Vec<usize> = if bytes.len() >= HOME.len() {
             bytes.windows(HOME.len())
@@ -99,29 +101,34 @@ impl TerminalState {
 
         for (i, &start) in splits.iter().enumerate() {
             let end = splits.get(i + 1).copied().unwrap_or(bytes.len());
+            let segment = &bytes[start..end];
             let before = viewport_rows(&self.term);
-            self.parser.advance(&mut self.term, &bytes[start..end]);
+            self.parser.advance(&mut self.term, segment);
             let after = viewport_rows(&self.term);
-            self.capture_evicted_content(&before, &after);
+
+            // ESC[2J / ESC[3J (erase-display, erase-saved-lines) are what
+            // real `clear` implementations send — Ink itself never emits
+            // either (its redraws are pure cursor addressing, see
+            // `detect_shift`). Seeing one means the user explicitly asked
+            // for a clean slate: wipe whatever we've captured outside
+            // alacritty's own scrollback, and don't run shift-detection on
+            // this transition — it's a deliberate erase, not an eviction.
+            if segment.windows(4).any(|w| w == ERASE_DISPLAY || w == ERASE_SAVED) {
+                self.extra_history.clear();
+                self.extra_offset = 0;
+            } else {
+                self.capture_evicted_content(&before, &after);
+            }
         }
 
         self.cache.clear();
     }
 
-    /// Content isn't reliably evicted at a fixed row — Ink bottom/top-anchors
-    /// its rendering wherever it likes, which drifts as content grows, so
-    /// "did row 0 change" (the original heuristic) misses evictions that
-    /// happen anywhere else. Instead: an in-place status/spinner tick (an
-    /// elapsed-time counter, a spinner glyph) changes exactly one row and
-    /// leaves everything else identical; a genuine redraw that evicts
-    /// content shifts or rewrites many rows at once. Use that distinction,
-    /// then preserve whichever lines actually vanished.
+    /// Detect a genuine eviction via `detect_shift` and preserve whichever
+    /// lines it identifies as having scrolled off, in order.
     fn capture_evicted_content(&mut self, before: &[String], after: &[String]) {
-        let changed_rows = before.iter().zip(after.iter()).filter(|(b, a)| b != a).count();
-        if changed_rows <= 1 {
-            return;
-        }
-        for line in before {
+        let Some(k) = detect_shift(before, after) else { return };
+        for line in &before[..k] {
             let trimmed = line.trim_end();
             // Skip lines that are still visible somewhere in the new frame
             // (persistent chrome like the input box) — only preserve what's
@@ -593,10 +600,60 @@ pub fn extract_selection(
 // Viewport snapshotting
 // ---------------------------------------------------------------------------
 
+/// Detect whether `after` looks like `before` shifted up by some number of
+/// lines — i.e. `before`'s tail reappears as `after`'s head — and if so,
+/// return how many lines were evicted off the top.
+///
+/// Ink's redraws produce many overlapping, partially-settled frames for the
+/// same logical scroll event (a line being typed out character by character
+/// still touches rows above it via cursor addressing). Capturing "any line
+/// that doesn't appear anywhere in the new frame" — the previous approach —
+/// scoops up whichever transient snapshot a diff happened to land on, in
+/// whatever order events fired, producing scrollback that reads as a
+/// shuffled mess. Requiring a tail/head alignment instead only commits to
+/// an eviction once the shift is unambiguous, and yields the evicted lines
+/// in their original, correct order.
+///
+/// The alignment doesn't need to be byte-perfect: a status/spinner line
+/// (elapsed time, token count) can tick over in the very same redraw that
+/// evicts content, landing inside the "tail" region and mismatching on its
+/// own. Allow a handful of such mismatches rather than requiring an exact
+/// match, or almost every real eviction would fail to be recognized at all.
+///
+/// Prefers the *largest* shift with the fewest mismatches, so one call
+/// captures as much genuinely-evicted content as possible; requires at
+/// least one non-blank line in the shifted-off region for confidence.
+///
+/// Also requires a minimum amount of non-blank content in the *matched*
+/// region. Without this, a still-growing response (content filling
+/// previously-blank rows, nothing evicted yet) trivially "matches" at
+/// almost any shift — mostly-blank rows match mostly-blank rows by
+/// coincidence — which fires a false eviction and later re-captures the
+/// same lines for real once they're genuinely evicted, producing
+/// duplicates.
+fn detect_shift(before: &[String], after: &[String]) -> Option<usize> {
+    const MAX_MISMATCHES: usize = 8;
+    const MIN_NON_BLANK_MATCH_EVIDENCE: usize = 3;
+
+    let rows = before.len();
+    (1..rows)
+        .rev()
+        .filter(|&k| before[..k].iter().any(|l| !l.trim().is_empty()))
+        .filter_map(|k| {
+            let tail = &before[k..];
+            let head = &after[..rows - k];
+            let mismatches = tail.iter().zip(head.iter()).filter(|(b, a)| b != a).count();
+            let non_blank_evidence = tail.iter().filter(|l| !l.trim().is_empty()).count();
+            (mismatches <= MAX_MISMATCHES && non_blank_evidence >= MIN_NON_BLANK_MATCH_EVIDENCE)
+                .then_some((k, mismatches))
+        })
+        .min_by_key(|&(k, mismatches)| (mismatches, std::cmp::Reverse(k)))
+        .map(|(k, _)| k)
+}
+
 /// Render the current (unscrolled) viewport as one plain-text line per row —
-/// used by `TerminalState::process` to detect when a redraw is replacing
-/// content (row 0 changed) versus ticking a status line in place, and to
-/// capture outgoing lines before they're overwritten.
+/// used by `TerminalState::process` to detect evicted content and capture
+/// outgoing lines before they're overwritten.
 fn viewport_rows(term: &Term<EventProxy>) -> Vec<String> {
     use alacritty_terminal::index::{Column, Line};
 
@@ -695,6 +752,47 @@ impl TerminalState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn real_clear_wipes_extra_history() {
+        // `clear` (or `tput clear`) sends ESC[2J/ESC[3J — real sequences
+        // Ink never emits — so seeing one means the user explicitly asked
+        // for a clean slate, not just another TUI redraw.
+        let mut s = TerminalState::new(80, 5);
+        let frame = |lines: &[&str]| {
+            let mut f = Vec::new();
+            f.extend_from_slice(b"\x1b[H");
+            f.extend_from_slice(lines.join("\r\n").as_bytes());
+            f
+        };
+        s.process(&frame(&["a", "b", "c", "d", "e"]));
+        s.process(&frame(&["b", "c", "d", "e", "f"])); // evicts "a"
+        assert!(!s.extra_history.is_empty());
+
+        s.process(b"\x1b[H\x1b[2J");
+        assert!(s.extra_history.is_empty(), "clear should wipe captured scrollback too");
+    }
+
+    #[test]
+    fn real_capture_produces_no_duplicate_numbers() {
+        // A response that's still growing into unused blank rows (nothing
+        // evicted yet) can trivially "match" a shift by coincidence, since
+        // mostly-blank tails match mostly-blank tails almost anywhere —
+        // firing a false eviction that gets re-captured for real once the
+        // content is genuinely evicted later. Assert every number appears
+        // in extra_history at most once.
+        let mut s = TerminalState::new(140, 50);
+        for chunk in CLAUDE_OVERFLOW_CAPTURE.chunks(4096) {
+            s.process(chunk);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for line in &s.extra_history {
+            let trimmed = line.trim();
+            if trimmed.parse::<u32>().is_ok() || trimmed.strip_prefix("⏺ ").is_some_and(|n| n.parse::<u32>().is_ok()) {
+                assert!(seen.insert(trimmed.to_string()), "{trimmed:?} captured more than once");
+            }
+        }
+    }
+
     /// Raw PTY bytes captured from a real `claude` session (140x50) asked to
     /// print two number sequences back to back (1-40, then 100-180) — long
     /// enough that Ink's redraw evicts earlier content from the 50-row pane.
@@ -721,13 +819,23 @@ mod tests {
 
         // The capture asked for 1-40, then 100-180 — no 41-99 was ever
         // printed, so don't assert on it.
+        let mut last_pos = 0;
         for n in (1..=40).chain(100..=180) {
             let n = n.to_string();
             let bullet = format!("⏺ {n}"); // the first line of a response is bullet-prefixed
+            let pos = trimmed.iter().position(|l| *l == n || *l == bullet).unwrap_or_else(|| {
+                panic!("number {n} should be reachable somewhere in scrollback + live view")
+            });
+            // Not just reachable — in the right chronological order. A
+            // naive "capture anything that vanished" heuristic can find
+            // every number while still scattering them out of sequence,
+            // which reads as a shuffled mess rather than a scrollable
+            // transcript.
             assert!(
-                trimmed.iter().any(|l| *l == n || *l == bullet),
-                "number {n} should be reachable somewhere in scrollback + live view"
+                pos >= last_pos,
+                "number {n} appeared out of order (at {pos}, expected >= {last_pos})"
             );
+            last_pos = pos;
         }
     }
 
