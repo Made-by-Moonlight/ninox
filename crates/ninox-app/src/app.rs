@@ -926,7 +926,7 @@ impl App {
                 let term = state.terminals
                     .entry(session_id)
                     .or_insert_with(|| crate::components::terminal::TerminalState::new(
-                        state.terminal_cols, state.terminal_rows,
+                        state.terminal_cols, state.terminal_rows, None,
                     ));
                 term.process(&bytes);
             }
@@ -1532,7 +1532,7 @@ mod tests {
         let (mut m, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
         m.terminals.insert(
             "s1".into(),
-            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows),
+            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows, None),
         );
         let (m, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
         let wide_cols = m.terminals.get("s1").unwrap().term.grid().columns();
@@ -1578,7 +1578,7 @@ mod tests {
         let (mut m, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
         m.terminals.insert(
             "s1".into(),
-            crate::components::terminal::TerminalState::new(m.terminal_cols, m.terminal_rows),
+            crate::components::terminal::TerminalState::new(m.terminal_cols, m.terminal_rows, None),
         );
         // Re-apply Terminal now that a terminal exists, so it's sized as the
         // active (full-width) session rather than left at its initial size.
@@ -1625,13 +1625,13 @@ mod tests {
         let background_cols = m.terminal_cols;
         m.terminals.insert(
             "s1".into(),
-            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows),
+            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows, None),
         );
         // s2 is backgrounded at the same Split-assumed width every session
         // not currently in view is expected to sit at.
         m.terminals.insert(
             "s2".into(),
-            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows),
+            crate::components::terminal::TerminalState::new(background_cols, m.terminal_rows, None),
         );
 
         // s1 switches away from Split to a full-width panel while it's the
