@@ -144,8 +144,14 @@ mod tests {
     }
 
     fn unique_id() -> String {
-        format!("ac-{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+        // Millis alone collide when parallel test threads start within the
+        // same tick, producing duplicate tmux session names; a per-process
+        // counter guarantees uniqueness regardless of clock resolution.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        format!("ac-{millis}-{n}")
     }
 
     fn test_engine() -> Arc<crate::events::Engine> {
