@@ -33,12 +33,25 @@ pub struct FleetFilter {
     pub query: String,
 }
 
+/// Which of the two brain sub-views is showing (spec §5.IV "two modes").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BrainMode {
+    #[default]
+    Pinboard,
+    Catalogue,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BrainViewState {
     pub entries:  Vec<BrainEntry>,
     pub loaded:   bool,
     pub selected: Option<String>,
     pub filter:   String,
+    pub mode:         BrainMode,
+    pub open_drawers: std::collections::HashSet<String>,
+    /// Parsed markdown body of `selected`, preprocessed so `[[wikilinks]]`
+    /// render as clickable `ninox-brain:` links.
+    pub markdown: Vec<iced::widget::markdown::Item>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +84,11 @@ pub struct App {
     pub sessions:        HashMap<SessionId, Session>,
     pub brain:           Arc<BrainIndex>,
     pub brain_view:      BrainViewState,
+    /// All selectable knowledge-base catalogues (`AppConfig::catalogue_options()`,
+    /// snapshotted at startup — see `BrainSwitchCatalogue`).
+    pub catalogues:      Vec<ninox_core::config::CatalogueRef>,
+    /// Index into `catalogues` for the catalogue `brain` is currently open on.
+    pub active_catalogue: usize,
     pub prs:             HashMap<PrId, PR>,
     pub ci_status:       HashMap<PrId, CIStatus>,
     pub review_threads:  HashMap<PrId, Vec<Comment>>,
@@ -138,6 +156,13 @@ pub enum Message {
     BrainSelectEntry(String),
     BrainFilterQuery(String),
     BrainReindex,
+    BrainSetMode(BrainMode),
+    // TODO(field-notes): constructed by the Task 12 drawers/reading-pane UI.
+    #[allow(dead_code)]
+    BrainToggleDrawer(String),
+    #[allow(dead_code)]
+    BrainLinkClicked(iced::widget::markdown::Url),
+    BrainSwitchCatalogue(usize),
     ToggleNotifications,
     DismissNotification(String),
     DismissAllNotifications,
@@ -284,6 +309,7 @@ impl App {
         let themes = Themes::load(config.theme_file.as_deref());
         let scheme = themes.scheme(config.theme);
         let active_variant = config.theme;
+        let catalogues = config.catalogue_options();
 
         let mut app = Self {
             engine:             engine.clone(),
@@ -297,6 +323,8 @@ impl App {
             sessions,
             brain,
             brain_view:     BrainViewState::default(),
+            catalogues,
+            active_catalogue: 0,
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
@@ -1055,6 +1083,13 @@ impl App {
             }
 
             Message::BrainSelectEntry(id) => {
+                if let Some(e) = state.brain_view.entries.iter().find(|e| e.id == id) {
+                    state.brain_view.markdown = iced::widget::markdown::parse(
+                        &crate::components::brain_panel::preprocess_wikilinks(&e.body),
+                    ).collect();
+                    state.brain_view.open_drawers.insert(e.entry_type.clone());
+                    state.brain_view.mode = BrainMode::Catalogue;
+                }
                 state.brain_view.selected = Some(id);
                 Task::none()
             }
@@ -1075,6 +1110,62 @@ impl App {
                         state.brain_view.loaded = true;
                     }
                     Err(e) => tracing::error!("brain rebuild: {e}"),
+                }
+                Task::none()
+            }
+
+            Message::BrainSetMode(m) => {
+                state.brain_view.mode = m;
+                Task::none()
+            }
+
+            Message::BrainToggleDrawer(cat) => {
+                if !state.brain_view.open_drawers.remove(&cat) {
+                    state.brain_view.open_drawers.insert(cat);
+                }
+                Task::none()
+            }
+
+            Message::BrainLinkClicked(url) => {
+                if url.scheme() == "ninox-brain" {
+                    let link = url.path().to_string();
+                    if let Some(e) =
+                        crate::components::brain_panel::resolve_link(&state.brain_view.entries, &link)
+                    {
+                        let id = e.id.clone();
+                        return App::apply(state, Message::BrainSelectEntry(id));
+                    }
+                } else {
+                    return App::apply(state, Message::OpenUrl(url.to_string()));
+                }
+                Task::none()
+            }
+
+            // `App.brain` is an `Arc<BrainIndex>` shared with the server at startup —
+            // this replaces the app's own Arc with a fresh index over the chosen
+            // catalogue's path. It does NOT affect the server's copy (acceptable:
+            // catalogue viewing is app-side; the server's brain stays on the
+            // catalogue it was started with).
+            Message::BrainSwitchCatalogue(idx) => {
+                if let Some(cat) = state.catalogues.get(idx).cloned() {
+                    match BrainIndex::open(&cat.path) {
+                        Ok(new_brain) => {
+                            state.brain = Arc::new(new_brain);
+                            state.active_catalogue = idx;
+                            state.brain_view.selected = None;
+                            state.brain_view.markdown.clear();
+                            state.brain_view.open_drawers.clear();
+                            state.brain_view.loaded = false;
+                            match state.brain.query("", QueryFilters::default()) {
+                                Ok(entries) => {
+                                    state.brain_view.entries = entries;
+                                    state.brain_view.loaded = true;
+                                }
+                                Err(e) => tracing::error!("brain query after catalogue switch: {e}"),
+                            }
+                        }
+                        Err(e) => tracing::warn!("open catalogue '{}': {e}", cat.name),
+                    }
                 }
                 Task::none()
             }
@@ -1521,6 +1612,11 @@ mod tests {
             sessions:       HashMap::new(),
             brain,
             brain_view:     BrainViewState::default(),
+            catalogues:      vec![ninox_core::config::CatalogueRef {
+                name: "default".to_string(),
+                path: std::path::PathBuf::new(),
+            }],
+            active_catalogue: 0,
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
@@ -1820,6 +1916,60 @@ mod tests {
         let (m3, _) = m2.update(Message::BrainReindex);
         assert_eq!(m3.brain_view.entries.len(), 1);
         assert_eq!(m3.brain_view.entries[0].id, "repos/ninox.md");
+    }
+
+    #[test]
+    fn selecting_entry_opens_catalogue_and_drawer() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("symbols")).unwrap();
+        std::fs::write(brain_dir.join("symbols").join("x.md"), "---\nname: X\n---\nbody").unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let app = base_with_brain(e, brain);
+        let (app, _) = app.update(Message::NavigateBrain);
+        let (app, _) = app.update(Message::BrainSetMode(BrainMode::Pinboard));
+        let (app, _) = app.update(Message::BrainSelectEntry("symbols/x.md".into()));
+        assert_eq!(app.brain_view.mode, BrainMode::Catalogue);
+        assert!(app.brain_view.open_drawers.contains("symbols"));
+        assert_eq!(app.brain_view.selected.as_deref(), Some("symbols/x.md"));
+    }
+
+    #[test]
+    fn switching_catalogue_resets_selection_and_active_index() {
+        let dir_a = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_a.join("symbols")).unwrap();
+        std::fs::write(dir_a.join("symbols").join("a.md"), "a body").unwrap();
+        let dir_b = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_b.join("concepts")).unwrap();
+        std::fs::write(dir_b.join("concepts").join("b.md"), "b body").unwrap();
+
+        let brain_a = Arc::new(BrainIndex::open(&dir_a).unwrap());
+        brain_a.rebuild().unwrap();
+        // Seed dir_b's index too — `BrainSwitchCatalogue` opens a fresh
+        // `BrainIndex` over the target path but does not rebuild it (matching
+        // `NavigateBrain`'s lazy-load semantics), so the catalogue being
+        // switched to must already be indexed on disk.
+        BrainIndex::open(&dir_b).unwrap().rebuild().unwrap();
+
+        let e = test_engine();
+        let mut app = base_with_brain(e, brain_a);
+        app.catalogues = vec![
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone() },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone() },
+        ];
+        let (app, _) = app.update(Message::NavigateBrain);
+        let (app, _) = app.update(Message::BrainSelectEntry("symbols/a.md".into()));
+        assert_eq!(app.brain_view.selected.as_deref(), Some("symbols/a.md"));
+
+        let (app, _) = app.update(Message::BrainSwitchCatalogue(1));
+        assert_eq!(app.active_catalogue, 1);
+        assert_eq!(app.brain_view.selected, None);
+        assert!(app.brain_view.markdown.is_empty());
+        assert!(app.brain_view.open_drawers.is_empty());
+        assert_eq!(app.brain_view.entries.len(), 1);
+        assert_eq!(app.brain_view.entries[0].id, "concepts/b.md");
     }
 
     #[test]
