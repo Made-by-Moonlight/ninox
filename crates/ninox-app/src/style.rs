@@ -113,6 +113,18 @@ pub fn hline<'a, M: 'a>(color: Color, height: f32) -> Element<'a, M> {
         .into()
 }
 
+/// Vertical rule of the given color/thickness.
+pub fn vline<'a, M: 'a>(color: Color, width: f32) -> Element<'a, M> {
+    container(Space::new(0, 0))
+        .width(Length::Fixed(width))
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(color)),
+            ..Default::default()
+        })
+        .into()
+}
+
 /// Dotted rule for soft separations (card footers, comment threads).
 pub fn dotted_rule<'a, M: 'a>(color: Color) -> Element<'a, M> {
     container(
