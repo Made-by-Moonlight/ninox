@@ -383,12 +383,10 @@ fn pinboard_body(app: &App) -> Element<'_, Message> {
         ..Default::default()
     });
 
-    let board = container(
-        text("Nothing pinned tonight.").size(15).font(SERIF_ITALIC).color(s.faint),
-    )
-    .center_x(Length::Fill)
-    .center_y(Length::Fill)
-    .style(move |_theme| crate::style::heavy_frame(s));
+    let board = container(super::brain_pinboard::pinboard_canvas(app))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_theme| crate::style::heavy_frame(s));
 
     row![rail, board]
         .spacing(16)
