@@ -258,15 +258,6 @@ pub async fn pipe_pane(id: &str, dest_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Capture the current visible content of a pane with escape sequences.
-/// Used to replay initial output that was emitted before the FIFO pipe connected.
-pub async fn capture_pane(id: &str) -> Vec<u8> {
-    run_session_scoped(&["capture-pane", "-t", id, "-p", "-e"])
-        .await
-        .map(|s| s.into_bytes())
-        .unwrap_or_default()
-}
-
 /// Full argv for `tmux attach` for this session (element 0 is "tmux"),
 /// resolving whether it lives on the ninox or the legacy default server.
 pub async fn attach_args(session_id: &str) -> Vec<String> {
