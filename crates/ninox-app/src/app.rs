@@ -164,70 +164,6 @@ fn global_event_handler(
     })
 }
 
-/// Convert a key event to terminal bytes.
-/// `app_cursor`: true when the terminal has APP_CURSOR mode set — arrow keys
-/// use `\x1bO[ABCD]` instead of `\x1b[[ABCD]` in that mode.
-fn key_to_terminal_bytes(
-    key: &iced::keyboard::Key,
-    modifiers: iced::keyboard::Modifiers,
-    text: Option<&str>,
-    app_cursor: bool,
-) -> Option<Vec<u8>> {
-    use iced::keyboard::key::Named;
-    use iced::keyboard::Key;
-
-    // Ctrl+letter → caret notation (Ctrl+A=0x01 … Ctrl+Z=0x1A, Ctrl+[=ESC)
-    if modifiers.control() {
-        match key {
-            Key::Character(c) => {
-                if let Some(ch) = c.chars().next() {
-                    let b = match ch {
-                        'a'..='z' => Some(vec![(ch as u8) - b'a' + 1]),
-                        'A'..='Z' => Some(vec![(ch as u8) - b'A' + 1]),
-                        '[' => Some(b"\x1b".to_vec()),
-                        '\\' => Some(b"\x1c".to_vec()),
-                        ']' => Some(b"\x1d".to_vec()),
-                        '^' | '6' => Some(b"\x1e".to_vec()),
-                        '_' => Some(b"\x1f".to_vec()),
-                        _ => None,
-                    };
-                    if b.is_some() { return b; }
-                }
-            }
-            Key::Named(Named::Enter) => return Some(b"\r".to_vec()),
-            _ => {}
-        }
-    }
-
-    // Arrow keys: mode-sensitive
-    let arr = if app_cursor { ("OA","OB","OC","OD") } else { ("[A","[B","[C","[D") };
-    let esc = |s: &str| -> Vec<u8> { let mut v = b"\x1b".to_vec(); v.extend(s.as_bytes()); v };
-
-    let bytes: Vec<u8> = match key {
-        Key::Named(Named::Enter)      => b"\r".to_vec(),
-        Key::Named(Named::Escape)     => b"\x1b".to_vec(),
-        Key::Named(Named::Backspace)  => b"\x7f".to_vec(),
-        Key::Named(Named::Delete)     => b"\x1b[3~".to_vec(),
-        Key::Named(Named::Tab) if modifiers.shift() => b"\x1b[Z".to_vec(),
-        Key::Named(Named::Tab)        => b"\t".to_vec(),
-        Key::Named(Named::ArrowUp)    => esc(arr.0),
-        Key::Named(Named::ArrowDown)  => esc(arr.1),
-        Key::Named(Named::ArrowRight) => esc(arr.2),
-        Key::Named(Named::ArrowLeft)  => esc(arr.3),
-        Key::Named(Named::Home)       => b"\x1b[H".to_vec(),
-        Key::Named(Named::End)        => b"\x1b[F".to_vec(),
-        Key::Named(Named::PageUp)     => b"\x1b[5~".to_vec(),
-        Key::Named(Named::PageDown)   => b"\x1b[6~".to_vec(),
-        // Prefer `text` (the actual typed character, shift-resolved) over `c`
-        // (the base logical key). On some platforms Key::Character holds the
-        // unshifted key, so Shift+backtick would give c="`" instead of "~".
-        Key::Character(c)             => text.map(|t| t.as_bytes().to_vec())
-                                             .unwrap_or_else(|| c.as_str().as_bytes().to_vec()),
-        _ => text.map(|t| t.as_bytes().to_vec()).unwrap_or_default(),
-    };
-    if bytes.is_empty() { None } else { Some(bytes) }
-}
-
 // ---------------------------------------------------------------------------
 // Impl
 // ---------------------------------------------------------------------------
@@ -676,12 +612,10 @@ impl App {
                     panel: crate::components::session_detail::DetailPanel::Terminal
                         | crate::components::session_detail::DetailPanel::Split,
                 } = &state.view {
-                    let app_cursor = state.terminals.get(session_id)
-                        .map(|t| t.term.mode().contains(
-                            alacritty_terminal::term::TermMode::APP_CURSOR
-                        ))
-                        .unwrap_or(false);
-                    let Some(bytes) = key_to_terminal_bytes(&key, modifiers, text.as_deref(), app_cursor)
+                    let mode = state.terminals.get(session_id)
+                        .map(|t| *t.term.mode())
+                        .unwrap_or_else(alacritty_terminal::term::TermMode::empty);
+                    let Some(bytes) = crate::input::encode_key(&key, modifiers, text.as_deref(), &mode)
                         else { return Task::none(); };
                     let session_id = session_id.clone();
                     let engine = state.engine.clone();
