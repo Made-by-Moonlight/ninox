@@ -124,8 +124,20 @@ impl TerminalState {
     }
 
     /// Jump the display back down to the live viewport.
+    ///
+    /// Drops the whole cache rather than just zeroing `offset`. tmux
+    /// `capture-pane` line indices are relative to the *current* pane top,
+    /// which drifts as live output scrolls into history; a cached anchor
+    /// fetched at one live-output position can point at different lines
+    /// once more output has streamed. Discarding the cache here (the
+    /// natural point where the user leaves the stale scrollback view)
+    /// keeps re-entering history from replaying duplicated/misordered
+    /// chunks. Known residual trade-off: indices can still drift *within*
+    /// one continuous scrolled-back session while output keeps streaming in
+    /// the background — accepted for now; see the module doc on
+    /// `Scrollback`.
     pub fn scroll_to_bottom(&mut self) {
-        self.scrollback.offset = 0;
+        self.scrollback = Default::default();
         self.cache.clear();
     }
 
@@ -139,6 +151,11 @@ impl TerminalState {
         use alacritty_terminal::term::test::TermSize;
         let size = TermSize::new(cols as usize, rows as usize);
         self.term.resize(size);
+        // Cached history lines were parsed and wrapped at the old column
+        // width; keeping them around after a resize would render
+        // stale-width lines (see scroll_to_bottom for the same
+        // capture-pane-index-drift trade-off this also avoids).
+        self.scrollback = Default::default();
         self.cache.clear();
     }
 }
@@ -707,6 +724,39 @@ mod tests {
             assert!(scheme.ansi.iter().any(|c| *c != iced::Color::BLACK));
             assert_eq!(scheme.ansi.len(), 16);
         }
+    }
+
+    #[test]
+    fn scroll_to_bottom_resets_the_whole_scrollback_cache() {
+        let mut s = TerminalState::new(80, 24, None);
+        s.scrollback.absorb(vec![vec![]; 10], -10, true);
+        s.scrollback.offset = 5;
+        s.scrollback.fetch_pending = true;
+        assert!(!s.scrollback.lines.is_empty());
+
+        s.scroll_to_bottom();
+
+        assert!(s.scrollback.lines.is_empty(), "cached history must be dropped");
+        assert_eq!(s.scrollback.offset, 0);
+        assert_eq!(s.scrollback.fetched_to, 0);
+        assert!(!s.scrollback.top_reached);
+        assert!(!s.scrollback.fetch_pending);
+    }
+
+    #[test]
+    fn resize_resets_the_whole_scrollback_cache() {
+        let mut s = TerminalState::new(80, 24, None);
+        s.scrollback.absorb(vec![vec![]; 10], -10, true);
+        s.scrollback.offset = 5;
+        s.scrollback.fetch_pending = true;
+
+        s.resize(100, 30);
+
+        assert!(s.scrollback.lines.is_empty(), "cached history parsed at the old width must be dropped");
+        assert_eq!(s.scrollback.offset, 0);
+        assert_eq!(s.scrollback.fetched_to, 0);
+        assert!(!s.scrollback.top_reached);
+        assert!(!s.scrollback.fetch_pending);
     }
 
     #[test]
