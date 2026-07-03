@@ -109,6 +109,10 @@ pub enum Message {
     SelectOrchestrator(Option<OrchestratorId>),
     SpawnSession,
     SpawnFormName(String),
+    SpawnFormKind(crate::components::spawn_modal::SpawnKind),
+    SpawnFormWorkspace(String),
+    SpawnFormAgent(usize),
+    SpawnFormCatalogue(usize),
     SpawnFormConfirm,
     SpawnFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
@@ -507,12 +511,42 @@ impl App {
             }
 
             Message::SpawnSession => {
-                state.spawn_modal = Some(SpawnForm::default());
+                // Default the agent chip to whatever's configured as the
+                // orchestrator agent in config.toml, if it matches one of
+                // the presets; otherwise fall back to the first preset.
+                let agent_idx = crate::components::spawn_modal::AGENT_PRESETS
+                    .iter()
+                    .position(|p| {
+                        p.harness == state.orchestrator_agent.harness
+                            && p.model.map(str::to_string) == state.orchestrator_agent.model
+                    })
+                    .unwrap_or(0);
+                state.spawn_modal = Some(SpawnForm { agent_idx, ..SpawnForm::default() });
                 Task::none()
             }
 
             Message::SpawnFormName(v) => {
                 if let Some(f) = &mut state.spawn_modal { f.name = v; }
+                Task::none()
+            }
+
+            Message::SpawnFormKind(kind) => {
+                if let Some(f) = &mut state.spawn_modal { f.kind = kind; }
+                Task::none()
+            }
+
+            Message::SpawnFormWorkspace(v) => {
+                if let Some(f) = &mut state.spawn_modal { f.workspace = v; }
+                Task::none()
+            }
+
+            Message::SpawnFormAgent(idx) => {
+                if let Some(f) = &mut state.spawn_modal { f.agent_idx = idx; }
+                Task::none()
+            }
+
+            Message::SpawnFormCatalogue(idx) => {
+                if let Some(f) = &mut state.spawn_modal { f.catalogue_idx = idx; }
                 Task::none()
             }
 
@@ -522,141 +556,303 @@ impl App {
             }
 
             Message::SpawnFormConfirm => {
-                if let Some(form) = state.spawn_modal.take() {
-                    let name = form.name.trim().to_string();
-                    if name.is_empty() {
-                        return Task::none();
+                use crate::components::spawn_modal::{SpawnKind, AGENT_PRESETS};
+
+                let Some(form) = state.spawn_modal.clone() else { return Task::none(); };
+                let name = form.name.trim().to_string();
+                if name.is_empty() {
+                    return Task::none();
+                }
+
+                // Both kinds share the agent preset and brain catalogue.
+                let preset = AGENT_PRESETS.get(form.agent_idx).unwrap_or(&AGENT_PRESETS[0]);
+                let agent = ninox_core::config::AgentConfig {
+                    harness: preset.harness.to_string(),
+                    model:   preset.model.map(|m| m.to_string()),
+                };
+                let catalogue = state.config.catalogue_options()
+                    .into_iter()
+                    .nth(form.catalogue_idx)
+                    .unwrap_or_else(|| ninox_core::config::CatalogueRef {
+                        name: "default".to_string(),
+                        path: state.config.resolved_brain_path(),
+                    });
+                let catalogue_path = catalogue.path.to_string_lossy().to_string();
+
+                match form.kind {
+                    // ── Standalone path: an interactive, unattached session in
+                    // a user-supplied workspace. Mirrors the orchestrator flow
+                    // (interactive agent in tmux + PTY streaming) but with no
+                    // Orchestrator record, and with the same worktree isolation
+                    // + repo detection the CLI worker path uses (shared via
+                    // crate::spawn_util).
+                    SpawnKind::Standalone => {
+                        let workspace_input = form.workspace.trim().to_string();
+                        if workspace_input.is_empty() {
+                            // No workspace — keep the modal open (the UI also
+                            // disables confirm, but SpawnFormConfirm must not
+                            // silently proceed).
+                            return Task::none();
+                        }
+                        state.spawn_modal = None;
+
+                        let workspace = crate::spawn_util::expand_tilde(&workspace_input);
+
+                        let ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        let slug = slugify(&name);
+                        let sid = if slug.is_empty() { format!("session-{ts}") } else { slug };
+
+                        let session = Session {
+                            id:              sid.clone(),
+                            orchestrator_id: None,
+                            name:            name.clone(),
+                            repo:            String::new(),
+                            status:          SessionStatus::Working,
+                            agent_type:      agent.harness.clone(),
+                            cost_usd:        0.0,
+                            started_at:      ts as i64,
+                            pr_number:       None,
+                            pr_id:           None,
+                            workspace_path:  Some(workspace.clone()),
+                            pid:             None,
+                        };
+                        let _ = state.engine.store.upsert_session(&session);
+                        state.sessions.insert(session.id.clone(), session.clone());
+                        state.engine.emit(Event::SessionSpawned(session));
+
+                        state.view = View::SessionDetail {
+                            session_id: sid.clone(),
+                            panel:      DetailPanel::Terminal,
+                        };
+                        state.last_session = Some(sid.clone());
+
+                        let engine = state.engine.clone();
+                        let nm     = name;
+                        let ts_i64 = ts as i64;
+                        let t_cols = state.terminal_cols;
+                        let t_rows = state.terminal_rows;
+
+                        Task::future(async move {
+                            use ninox_core::{pty, tmux, Event as CoreEvent, Session, SessionStatus};
+
+                            // Isolate the session on its own branch/worktree when
+                            // the workspace is a git repo; otherwise work in the
+                            // directory itself (same fallback as run_spawn).
+                            let effective_ws =
+                                match crate::spawn_util::create_worker_worktree(&workspace, &sid).await {
+                                    Ok(path) => path,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "worktree creation failed for {sid}, using shared workspace: {e}"
+                                        );
+                                        workspace.clone()
+                                    }
+                                };
+
+                            // Repo slug from the base workspace's git remote so
+                            // poll_github can talk to the right owner/repo.
+                            let repo = crate::spawn_util::repo_from_workspace(&workspace)
+                                .unwrap_or_default();
+
+                            let ninox_bin = std::env::current_exe()
+                                .ok()
+                                .and_then(|p| p.to_str().map(str::to_string))
+                                .unwrap_or_else(|| "ninox".to_string());
+                            let ninox_config = ninox_core::config::AppConfig::config_path()
+                                .to_string_lossy()
+                                .to_string();
+
+                            // No NINOX_ORCHESTRATOR_ID and no caller-type vars:
+                            // this session is unattached and reports to no one.
+                            let env = [
+                                ("NINOX_BIN",    ninox_bin.as_str()),
+                                ("NINOX_CONFIG", ninox_config.as_str()),
+                                ("NINOX_BRAIN",  catalogue_path.as_str()),
+                            ];
+
+                            let ninox_bin_dir = ninox_core::config::AppConfig::ninox_bin_dir();
+                            let ninox_bin_dir_str = ninox_bin_dir.display().to_string()
+                                .replace('\'', "'\\''");
+                            let base_cmd = agent.interactive_cmd();
+                            let launch_cmd = format!(
+                                "export PATH='{ninox_bin_dir_str}':\"$PATH\"; {base_cmd}"
+                            );
+                            if let Err(e) = tmux::create_session(&sid, &effective_ws, &launch_cmd, &env).await {
+                                tracing::error!("tmux create failed for {sid}: {e}");
+                                return Message::Noop;
+                            }
+
+                            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+                            let pid = tmux::list_sessions()
+                                .await
+                                .ok()
+                                .and_then(|ss| ss.into_iter().find(|s| s.id == sid))
+                                .and_then(|s| s.pid);
+
+                            let updated = Session {
+                                id:              sid.clone(),
+                                orchestrator_id: None,
+                                name:            nm,
+                                repo,
+                                status:          SessionStatus::Working,
+                                agent_type:      agent.harness.clone(),
+                                cost_usd:        0.0,
+                                started_at:      ts_i64,
+                                pr_number:       None,
+                                pr_id:           None,
+                                workspace_path:  Some(effective_ws),
+                                pid,
+                            };
+                            let _ = engine.store.upsert_session(&updated);
+
+                            if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &sid, t_cols, t_rows).await {
+                                tracing::error!("pty setup failed for {sid}: {e}");
+                            }
+
+                            engine.emit(CoreEvent::SessionUpdated(updated));
+                            Message::Noop
+                        })
                     }
 
-                    let ts = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis();
+                    // ── Orchestrator path: existing flow, stamped with the
+                    // selected agent preset + brain catalogue.
+                    SpawnKind::Orchestrator => {
+                        state.spawn_modal = None;
 
-                    let slug = slugify(&name);
-                    let orch_id = if slug.is_empty() { format!("orch-{ts}") } else { slug };
-                    let orch = Orchestrator {
-                        id:         orch_id,
-                        name:       name.clone(),
-                        created_at: ts as i64,
-                    };
+                        let ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
 
-                    // Each orchestrator gets its own subdirectory under the root.
-                    // AGENTS.md/CLAUDE.md and hooks live in the root and are inherited.
-                    let ws = state.orchestrator_root
-                        .join(&orch.id)
-                        .to_string_lossy()
-                        .to_string();
+                        let slug = slugify(&name);
+                        let orch_id = if slug.is_empty() { format!("orch-{ts}") } else { slug };
+                        let orch = Orchestrator {
+                            id:         orch_id,
+                            name:       name.clone(),
+                            created_at: ts as i64,
+                        };
 
-                    let _ = state.engine.store.upsert_orchestrator(&orch);
-                    state.orchestrators.push(orch.clone());
-                    state.engine.emit(Event::OrchestratorSpawned(orch.clone()));
-
-                    let session = Session {
-                        id:              orch.id.clone(),
-                        orchestrator_id: None,
-                        name:            name.clone(),
-                        repo:            String::new(),
-                        status:          SessionStatus::Working,
-                        agent_type:      state.orchestrator_agent.harness.clone(),
-                        cost_usd:        0.0,
-                        started_at:      ts as i64,
-                        pr_number:       None,
-                        pr_id:           None,
-                        workspace_path:  Some(ws.clone()),
-                        pid:             None,
-                    };
-                    let _ = state.engine.store.upsert_session(&session);
-                    state.sessions.insert(session.id.clone(), session.clone());
-                    state.engine.emit(Event::SessionSpawned(session));
-
-                    state.view = View::SessionDetail {
-                        session_id: orch.id.clone(),
-                        panel:      DetailPanel::Terminal,
-                    };
-                    state.last_session = Some(orch.id.clone());
-
-                    let engine     = state.engine.clone();
-                    let tmux_id    = orch.id.clone();
-                    let sid        = orch.id.clone();
-                    let nm         = name;
-                    let ts_i64     = ts as i64;
-                    let orch_agent = state.orchestrator_agent.clone();
-                    let t_cols     = state.terminal_cols;
-                    let t_rows     = state.terminal_rows;
-
-                    return Task::future(async move {
-                        use ninox_core::{pty, tmux, Event as CoreEvent, Session, SessionStatus};
-
-                        if let Err(e) = tokio::fs::create_dir_all(&ws).await {
-                            tracing::error!("mkdir orchestrator workspace {ws}: {e}");
-                        }
-
-                        let ninox_bin = std::env::current_exe()
-                            .ok()
-                            .and_then(|p| p.to_str().map(str::to_string))
-                            .unwrap_or_else(|| "ninox".to_string());
-
-                        let ninox_config = ninox_core::config::AppConfig::config_path()
+                        // Each orchestrator gets its own subdirectory under the root.
+                        // AGENTS.md/CLAUDE.md and hooks live in the root and are inherited.
+                        let ws = state.orchestrator_root
+                            .join(&orch.id)
                             .to_string_lossy()
                             .to_string();
 
-                        let env = [
-                            ("NINOX_BIN",             ninox_bin.as_str()),
-                            ("NINOX_CONFIG",          ninox_config.as_str()),
-                            ("NINOX_ORCHESTRATOR_ID", sid.as_str()),
-                            ("AO_CALLER_TYPE",         "orchestrator"),
-                            ("ATHENE_CALLER_TYPE",     "orchestrator"),
-                        ];
+                        let _ = state.engine.store.upsert_orchestrator(&orch);
+                        state.orchestrators.push(orch.clone());
+                        state.engine.emit(Event::OrchestratorSpawned(orch.clone()));
 
-                        // Prepend ninox bin dir inside the shell command so the
-                        // `ninox` shim (which points to the current binary) is found
-                        // first — even after login-shell rc files reorder PATH.
-                        let ninox_bin_dir = ninox_core::config::AppConfig::ninox_bin_dir();
-                        let ninox_bin_dir_str = ninox_bin_dir.display().to_string()
-                            .replace('\'', "'\\''");
-                        let base_cmd = orch_agent.interactive_cmd();
-                        let launch_cmd = format!(
-                            "export PATH='{ninox_bin_dir_str}':\"$PATH\"; {base_cmd}"
-                        );
-                        if let Err(e) = tmux::create_session(&tmux_id, &ws, &launch_cmd, &env).await {
-                            tracing::error!("tmux create failed for {sid}: {e}");
-                            return Message::Noop;
-                        }
-
-                        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
-                        let pid = tmux::list_sessions()
-                            .await
-                            .ok()
-                            .and_then(|ss| ss.into_iter().find(|s| s.id == tmux_id))
-                            .and_then(|s| s.pid);
-
-                        let updated = Session {
-                            id:              sid.clone(),
+                        let session = Session {
+                            id:              orch.id.clone(),
                             orchestrator_id: None,
-                            name:            nm,
+                            name:            name.clone(),
                             repo:            String::new(),
                             status:          SessionStatus::Working,
-                            agent_type:      orch_agent.harness.clone(),
+                            agent_type:      agent.harness.clone(),
                             cost_usd:        0.0,
-                            started_at:      ts_i64,
+                            started_at:      ts as i64,
                             pr_number:       None,
                             pr_id:           None,
-                            workspace_path:  Some(ws),
-                            pid,
+                            workspace_path:  Some(ws.clone()),
+                            pid:             None,
                         };
-                        let _ = engine.store.upsert_session(&updated);
+                        let _ = state.engine.store.upsert_session(&session);
+                        state.sessions.insert(session.id.clone(), session.clone());
+                        state.engine.emit(Event::SessionSpawned(session));
 
-                        if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &tmux_id, t_cols, t_rows).await {
-                            tracing::error!("pty setup failed for {sid}: {e}");
-                        }
+                        state.view = View::SessionDetail {
+                            session_id: orch.id.clone(),
+                            panel:      DetailPanel::Terminal,
+                        };
+                        state.last_session = Some(orch.id.clone());
 
-                        engine.emit(CoreEvent::SessionUpdated(updated));
-                        Message::Noop
-                    });
+                        let engine     = state.engine.clone();
+                        let tmux_id    = orch.id.clone();
+                        let sid        = orch.id.clone();
+                        let nm         = name;
+                        let ts_i64     = ts as i64;
+                        let orch_agent = agent;
+                        let t_cols     = state.terminal_cols;
+                        let t_rows     = state.terminal_rows;
+
+                        Task::future(async move {
+                            use ninox_core::{pty, tmux, Event as CoreEvent, Session, SessionStatus};
+
+                            if let Err(e) = tokio::fs::create_dir_all(&ws).await {
+                                tracing::error!("mkdir orchestrator workspace {ws}: {e}");
+                            }
+
+                            let ninox_bin = std::env::current_exe()
+                                .ok()
+                                .and_then(|p| p.to_str().map(str::to_string))
+                                .unwrap_or_else(|| "ninox".to_string());
+
+                            let ninox_config = ninox_core::config::AppConfig::config_path()
+                                .to_string_lossy()
+                                .to_string();
+
+                            let env = [
+                                ("NINOX_BIN",             ninox_bin.as_str()),
+                                ("NINOX_CONFIG",          ninox_config.as_str()),
+                                ("NINOX_ORCHESTRATOR_ID", sid.as_str()),
+                                ("NINOX_BRAIN",           catalogue_path.as_str()),
+                                ("AO_CALLER_TYPE",         "orchestrator"),
+                                ("ATHENE_CALLER_TYPE",     "orchestrator"),
+                            ];
+
+                            // Prepend ninox bin dir inside the shell command so the
+                            // `ninox` shim (which points to the current binary) is found
+                            // first — even after login-shell rc files reorder PATH.
+                            let ninox_bin_dir = ninox_core::config::AppConfig::ninox_bin_dir();
+                            let ninox_bin_dir_str = ninox_bin_dir.display().to_string()
+                                .replace('\'', "'\\''");
+                            let base_cmd = orch_agent.interactive_cmd();
+                            let launch_cmd = format!(
+                                "export PATH='{ninox_bin_dir_str}':\"$PATH\"; {base_cmd}"
+                            );
+                            if let Err(e) = tmux::create_session(&tmux_id, &ws, &launch_cmd, &env).await {
+                                tracing::error!("tmux create failed for {sid}: {e}");
+                                return Message::Noop;
+                            }
+
+                            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+                            let pid = tmux::list_sessions()
+                                .await
+                                .ok()
+                                .and_then(|ss| ss.into_iter().find(|s| s.id == tmux_id))
+                                .and_then(|s| s.pid);
+
+                            let updated = Session {
+                                id:              sid.clone(),
+                                orchestrator_id: None,
+                                name:            nm,
+                                repo:            String::new(),
+                                status:          SessionStatus::Working,
+                                agent_type:      orch_agent.harness.clone(),
+                                cost_usd:        0.0,
+                                started_at:      ts_i64,
+                                pr_number:       None,
+                                pr_id:           None,
+                                workspace_path:  Some(ws),
+                                pid,
+                            };
+                            let _ = engine.store.upsert_session(&updated);
+
+                            if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &tmux_id, t_cols, t_rows).await {
+                                tracing::error!("pty setup failed for {sid}: {e}");
+                            }
+
+                            engine.emit(CoreEvent::SessionUpdated(updated));
+                            Message::Noop
+                        })
+                    }
                 }
-                Task::none()
             }
 
             Message::SwitchDetailPanel(new_panel) => {
@@ -1133,7 +1329,7 @@ impl App {
         .into();
 
         if let Some(form) = &state.spawn_modal {
-            iced::widget::stack![base, spawn_modal(form, &state.scheme)].into()
+            iced::widget::stack![base, spawn_modal(state, form)].into()
         } else {
             base
         }
@@ -2018,6 +2214,109 @@ mod tests {
             text:      None,
         });
         assert!(m.spawn_modal.is_none());
+    }
+
+    #[test]
+    fn spawn_form_field_messages_update_state() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("theme-tokens".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace("~/proj/ninox".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormAgent(1));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormCatalogue(0));
+        m = next;
+
+        let f = m.spawn_modal.as_ref().unwrap();
+        assert_eq!(f.name, "theme-tokens");
+        assert_eq!(f.kind, SpawnKind::Standalone);
+        assert_eq!(f.workspace, "~/proj/ninox");
+        assert_eq!(f.agent_idx, 1);
+        assert_eq!(f.catalogue_idx, 0);
+    }
+
+    #[test]
+    fn orchestrator_confirm_unaffected_by_workspace_field() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("theme-tokens".into()));
+        m = next;
+        // Type a workspace while on Standalone, then flip back to
+        // Orchestrator — the stale workspace text must not block or alter
+        // the orchestrator spawn (its workspace always derives from the
+        // orchestrator root).
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace("/does/not/matter".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Orchestrator));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        assert!(m.spawn_modal.is_none());
+        assert_eq!(m.orchestrators.len(), 1);
+        let sess = m.sessions.get("theme-tokens").expect("orchestrator session created");
+        assert_eq!(
+            sess.workspace_path.as_deref(),
+            Some(std::path::Path::new("/tmp/theme-tokens").to_str().unwrap()),
+            "workspace comes from the orchestrator root, not the form field",
+        );
+    }
+
+    #[test]
+    fn standalone_without_workspace_cannot_confirm() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-a".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        // No workspace supplied — confirm must no-op and leave the modal
+        // open so the user can fill it in.
+        assert!(m.sessions.is_empty());
+        assert!(m.spawn_modal.is_some());
+    }
+
+    #[test]
+    fn standalone_confirm_creates_unattached_session_without_orchestrator() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-a".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace("/tmp/solo-ws".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        assert!(m.spawn_modal.is_none());
+        assert!(m.orchestrators.is_empty(), "standalone spawn must not create an orchestrator");
+        let sess = m.sessions.get("solo-a").expect("standalone session created");
+        assert!(sess.orchestrator_id.is_none());
+        assert_eq!(sess.workspace_path.as_deref(), Some("/tmp/solo-ws"));
+        assert!(matches!(&m.view, View::SessionDetail { session_id, .. } if session_id == "solo-a"));
+        assert_eq!(m.last_session.as_deref(), Some("solo-a"));
     }
 
     #[test]

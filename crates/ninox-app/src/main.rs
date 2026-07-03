@@ -1,8 +1,10 @@
 mod app;
 mod components;
+mod spawn_util;
 mod style;
 mod theme;
 
+use spawn_util::{create_worker_worktree, repo_from_workspace};
 use ninox_core::{
     config::{AgentConfig, AppConfig},
     events::Engine,
@@ -341,21 +343,6 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
     Ok(())
 }
 
-/// Read `git remote get-url origin` from the workspace and parse it as a
-/// GitHub slug (`owner/repo`). Returns `None` if git fails or the URL is not
-/// a recognisable GitHub remote.
-fn repo_from_workspace(workspace: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["-C", workspace, "remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    ninox_core::github::split_repo(&url).map(|(o, r)| format!("{o}/{r}"))
-}
-
 fn default_db_path() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -374,46 +361,3 @@ fn has_display() -> bool {
     { std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok() }
 }
 
-/// Create an isolated git worktree for a worker session at
-/// `{repo}/.claude/worktrees/{session_id}` on a new branch `{session_id}`.
-///
-/// Returns the worktree path on success. If the branch name already exists
-/// (e.g. a previous run with the same name), the existing branch is checked
-/// out rather than creating a new one.
-async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Result<String> {
-    use tokio::process::Command;
-    use anyhow::Context as _;
-
-    let worktree_path = std::path::Path::new(repo)
-        .join(".claude")
-        .join("worktrees")
-        .join(session_id);
-    let worktree_str = worktree_path.to_string_lossy().to_string();
-
-    // Attempt 1: create a fresh branch named after the session.
-    let out = Command::new("git")
-        .args(["-C", repo, "worktree", "add", &worktree_str, "-b", session_id])
-        .output()
-        .await
-        .context("git worktree add")?;
-
-    if out.status.success() {
-        return Ok(worktree_str);
-    }
-
-    // Attempt 2: branch already exists — check it out without -b.
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if stderr.contains("already exists") {
-        let out2 = Command::new("git")
-            .args(["-C", repo, "worktree", "add", &worktree_str, session_id])
-            .output()
-            .await
-            .context("git worktree add (existing branch)")?;
-        if out2.status.success() {
-            return Ok(worktree_str);
-        }
-        anyhow::bail!("{}", String::from_utf8_lossy(&out2.stderr).trim());
-    }
-
-    anyhow::bail!("{}", stderr.trim());
-}

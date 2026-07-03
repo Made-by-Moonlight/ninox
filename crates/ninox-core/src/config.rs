@@ -113,6 +113,20 @@ fn shell_quote(s: &str) -> String {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BrainConfig {
     pub path: Option<PathBuf>,
+    /// Additional named knowledge bases selectable when spawning an
+    /// orchestrator. The implicit "default" catalogue (this config's
+    /// `resolved_brain_path()`) is always offered first by
+    /// `AppConfig::catalogue_options()` and is not duplicated even if an
+    /// entry here is also named "default".
+    #[serde(default)]
+    pub catalogues: Vec<CatalogueRef>,
+}
+
+/// A named, selectable knowledge-base catalogue.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CatalogueRef {
+    pub name: String,
+    pub path: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +180,23 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Path to the knowledge-base (brain) directory.
+    ///
+    /// Honors the `NINOX_BRAIN` environment variable as an override: if
+    /// set, it is treated as an absolute path to the brain directory and
+    /// returned as-is, mirroring how `config_path()` honors `NINOX_CONFIG`.
+    /// This lets a selected catalogue (see `catalogue_options()`) be handed
+    /// to a spawned orchestrator session via its environment without
+    /// mutating `config.toml`, and lets tests redirect brain reads/writes
+    /// without touching the real user brain directory.
+    ///
+    /// Falls back to `self.brain.path` when set, else `<config_dir>/ninox/brain`.
     pub fn resolved_brain_path(&self) -> PathBuf {
+        if let Ok(p) = std::env::var("NINOX_BRAIN") {
+            if !p.is_empty() {
+                return PathBuf::from(p);
+            }
+        }
         if let Some(ref p) = self.brain.path {
             return p.clone();
         }
@@ -174,6 +204,25 @@ impl AppConfig {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("ninox")
             .join("brain")
+    }
+
+    /// All selectable knowledge-base catalogues: the implicit "default"
+    /// (this config's `resolved_brain_path()`) followed by any additional
+    /// catalogues configured under `[[brain.catalogues]]` — skipping any
+    /// entry literally named "default" to avoid a confusing duplicate.
+    pub fn catalogue_options(&self) -> Vec<CatalogueRef> {
+        let mut options = vec![CatalogueRef {
+            name: "default".to_string(),
+            path: self.resolved_brain_path(),
+        }];
+        options.extend(
+            self.brain
+                .catalogues
+                .iter()
+                .filter(|c| c.name != "default")
+                .cloned(),
+        );
+        options
     }
 
     pub fn resolved_orchestrator_root(&self) -> PathBuf {
@@ -339,5 +388,57 @@ mod tests {
         }
 
         result.unwrap();
+    }
+
+    /// See `NINOX_CONFIG_ENV_GUARD` above — same rationale, different var.
+    static NINOX_BRAIN_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn resolved_brain_path_honors_ninox_brain_env() {
+        let _guard = NINOX_BRAIN_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("NINOX_BRAIN").ok();
+
+        let dir = tempdir().unwrap();
+        let override_path = dir.path().join("brain-override");
+        std::env::set_var("NINOX_BRAIN", &override_path);
+
+        let result = std::panic::catch_unwind(|| {
+            let cfg = AppConfig::default();
+            assert_eq!(cfg.resolved_brain_path(), override_path);
+        });
+
+        match prior {
+            Some(v) => std::env::set_var("NINOX_BRAIN", v),
+            None    => std::env::remove_var("NINOX_BRAIN"),
+        }
+
+        result.unwrap();
+    }
+
+    #[test]
+    fn catalogue_options_defaults_to_single_entry() {
+        // Serialize against resolved_brain_path_honors_ninox_brain_env: this
+        // test reads resolved_brain_path() twice (via catalogue_options and
+        // directly) and must not straddle that test's NINOX_BRAIN window.
+        let _guard = NINOX_BRAIN_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = AppConfig::default();
+        let options = cfg.catalogue_options();
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].name, "default");
+        assert_eq!(options[0].path, cfg.resolved_brain_path());
+    }
+
+    #[test]
+    fn catalogue_options_appends_configured_catalogues_and_skips_duplicate_default() {
+        let mut cfg = AppConfig::default();
+        cfg.brain.catalogues = vec![
+            CatalogueRef { name: "docs".to_string(), path: PathBuf::from("/tmp/docs-brain") },
+            CatalogueRef { name: "default".to_string(), path: PathBuf::from("/tmp/should-be-skipped") },
+        ];
+        let options = cfg.catalogue_options();
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].name, "default");
+        assert_eq!(options[1].name, "docs");
+        assert_eq!(options[1].path, PathBuf::from("/tmp/docs-brain"));
     }
 }
