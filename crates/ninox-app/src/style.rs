@@ -32,8 +32,9 @@ pub const MONO_MEDIUM: Font = Font { weight: Weight::Medium, ..MONO };
 // ── Hard offset shadows: no blur, ever ─────────────────────────────────────
 /// (card, hero, modal) shadow alphas for the active theme.
 pub fn shadow_alpha(s: &ColorScheme) -> (f32, f32, f32) {
-    // dark() uses pure-black shadows; light() uses ink-tinted ones.
-    if s.shadow == Color::BLACK { (0.50, 0.55, 0.65) } else { (0.12, 0.18, 0.30) }
+    // Explicit `dark` flag, not shadow-color sniffing — a theme file can tint
+    // `shadow` without breaking mode detection.
+    if s.dark { (0.50, 0.55, 0.65) } else { (0.12, 0.18, 0.30) }
 }
 
 pub fn hard_shadow(s: &ColorScheme, dx: f32, dy: f32, alpha: f32) -> Shadow {
@@ -147,5 +148,20 @@ mod tests {
     fn hard_shadows_never_blur() {
         let s = crate::theme::light();
         assert_eq!(hard_shadow(&s, 2.0, 3.0, 0.12).blur_radius, 0.0);
+    }
+
+    #[test]
+    fn shadow_alpha_uses_explicit_dark_flag() {
+        assert_eq!(shadow_alpha(&crate::theme::dark()), (0.50, 0.55, 0.65));
+        assert_eq!(shadow_alpha(&crate::theme::light()), (0.12, 0.18, 0.30));
+
+        // A theme file tinting dark's shadow color must not flip the
+        // detected mode — `dark` is an explicit flag, not inferred from
+        // shadow color.
+        let mut tinted_dark = crate::theme::dark();
+        let table: toml::Table = toml::from_str(r##"shadow = "#1a1208""##).unwrap();
+        crate::theme::apply_palette(&mut tinted_dark, &table);
+        assert_ne!(tinted_dark.shadow, Color::BLACK);
+        assert_eq!(shadow_alpha(&tinted_dark), (0.50, 0.55, 0.65));
     }
 }

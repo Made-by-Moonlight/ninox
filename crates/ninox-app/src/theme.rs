@@ -38,6 +38,9 @@ pub struct ColorScheme {
     pub term_err:        Color,
     pub term_agent:      Color,
     pub term_dim:        Color,
+    // mode flag — NOT a theme-file token (see TOKEN_NAMES); user palettes
+    // can't override it, it's never written to a theme file.
+    pub dark: bool,
 }
 
 impl ColorScheme {
@@ -157,7 +160,12 @@ fn to_hex(c: Color) -> String {
     let r = (c.r * 255.0).round() as u8;
     let g = (c.g * 255.0).round() as u8;
     let b = (c.b * 255.0).round() as u8;
-    format!("#{r:02x}{g:02x}{b:02x}")
+    if c.a != 1.0 {
+        let a = (c.a * 255.0).round() as u8;
+        format!("#{r:02x}{g:02x}{b:02x}{a:02x}")
+    } else {
+        format!("#{r:02x}{g:02x}{b:02x}")
+    }
 }
 
 /// Overlays `table` onto `base` by token name. Unknown keys and malformed
@@ -205,6 +213,19 @@ pub fn write_default_theme_file(path: &Path) -> std::io::Result<()> {
     let contents = toml::to_string_pretty(&doc)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     std::fs::write(path, contents)
+}
+
+/// First-run seeding: ensures `themes_dir/field-notes.toml` exists, writing a
+/// complete default theme file if absent. Creates `themes_dir` if needed.
+/// Never overwrites an existing file — a user's customized theme is never
+/// clobbered by a later run. Returns the path to the (possibly pre-existing)
+/// file.
+pub fn ensure_default_theme_file(themes_dir: &Path) -> std::io::Result<PathBuf> {
+    let default_path = themes_dir.join("field-notes.toml");
+    if !default_path.exists() {
+        write_default_theme_file(&default_path)?;
+    }
+    Ok(default_path)
 }
 
 /// Both loaded palettes — the builtin Field Notes defaults, optionally
@@ -320,6 +341,7 @@ pub fn light() -> ColorScheme {
         term_err:        color!(0xf08a72),
         term_agent:      color!(0xf0c069),
         term_dim:        color!(0x7a7260),
+        dark: false,
     }
 }
 
@@ -353,6 +375,7 @@ pub fn dark() -> ColorScheme {
         term_err:        color!(0xf08a72),
         term_agent:      color!(0xf0c069),
         term_dim:        color!(0x7a7260),
+        dark: true,
     }
 }
 
@@ -398,5 +421,48 @@ mod theme_file_tests {
         let t = Themes::load(Some("/nonexistent/path/nope.toml"));
         assert_eq!(t.light.paper, light().paper);
         assert_eq!(t.dark.accent, dark().accent);
+    }
+
+    #[test]
+    fn to_hex_round_trips_alpha() {
+        // parse_hex quantizes alpha to u8 via `a as f32 / 255.0`, so encoding
+        // the resulting color back should reproduce the exact same u8 octets
+        // — hence exact equality, not epsilon comparison.
+        let c = parse_hex("#c8451f80").unwrap();
+        assert_eq!(to_hex(c), "#c8451f80");
+        assert_eq!(parse_hex(&to_hex(c)), Some(c));
+    }
+
+    #[test]
+    fn to_hex_omits_alpha_when_opaque() {
+        let c = parse_hex("#c8451f").unwrap();
+        assert_eq!(to_hex(c), "#c8451f");
+    }
+
+    #[test]
+    fn ensure_default_theme_file_seeds_fresh_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let themes_dir = dir.path().join("themes");
+        let path = ensure_default_theme_file(&themes_dir).unwrap();
+        assert_eq!(path, themes_dir.join("field-notes.toml"));
+        assert!(path.exists());
+        let doc: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let light_tbl = doc["light"].as_table().unwrap();
+        let dark_tbl = doc["dark"].as_table().unwrap();
+        assert_eq!(light_tbl.len(), TOKEN_NAMES.len());
+        assert_eq!(dark_tbl.len(), TOKEN_NAMES.len());
+    }
+
+    #[test]
+    fn ensure_default_theme_file_never_overwrites_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let themes_dir = dir.path().join("themes");
+        std::fs::create_dir_all(&themes_dir).unwrap();
+        let path = themes_dir.join("field-notes.toml");
+        std::fs::write(&path, "custom = true\n").unwrap();
+
+        let returned = ensure_default_theme_file(&themes_dir).unwrap();
+        assert_eq!(returned, path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "custom = true\n");
     }
 }

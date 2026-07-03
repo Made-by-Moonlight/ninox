@@ -273,11 +273,8 @@ impl App {
         // First run: seed a complete, editable default theme file so users
         // have a working example to customize rather than a blank slate.
         if let Some(themes_dir) = AppConfig::config_path().parent().map(|p| p.join("themes")) {
-            if !themes_dir.exists() {
-                let default_path = themes_dir.join("field-notes.toml");
-                if let Err(e) = crate::theme::write_default_theme_file(&default_path) {
-                    tracing::warn!("failed to write default theme file: {e}");
-                }
+            if let Err(e) = crate::theme::ensure_default_theme_file(&themes_dir) {
+                tracing::warn!("failed to write default theme file: {e}");
             }
         }
         let themes = Themes::load(config.theme_file.as_deref());
