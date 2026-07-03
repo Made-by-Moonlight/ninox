@@ -24,6 +24,11 @@ pub fn parse_capture(bytes: &[u8], cols: u16) -> Vec<StyledLine> {
     use alacritty_terminal::grid::Dimensions;
     use alacritty_terminal::index::{Column, Line};
 
+    // Empty capture (zero history or failed capture) must add nothing to the cache.
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+
     let n_lines = bytes.iter().filter(|&&b| b == b'\n').count().max(1);
     // +1: every captured line (including the last) ends in \n, so the final
     // \r\n we feed below asks the cursor to move one line past the last
@@ -130,6 +135,12 @@ mod tests {
         // must not become phantom history lines.
         let lines = parse_capture(b"only\n", 40);
         assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn parse_capture_empty_input_returns_no_lines() {
+        // Zero history or a failed capture-pane must not cache phantom lines.
+        assert!(parse_capture(b"", 40).is_empty());
     }
 
     #[test]
