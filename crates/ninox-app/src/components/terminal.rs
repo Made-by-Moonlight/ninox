@@ -63,44 +63,76 @@ pub struct TerminalState {
     /// How many lines deep into `extra_history` the view is scrolled, on
     /// top of whatever native grid history scrolling has already covered.
     extra_offset: usize,
-    /// Full-viewport text as of the last time we captured a redraw, so a
-    /// TUI reissuing an identical frame (e.g. a spinner tick) doesn't get
-    /// re-captured into `extra_history` on every tick.
-    last_captured_frame: Option<String>,
 }
 
 impl TerminalState {
     /// Feed raw bytes from the PTY into the VTE parser → terminal state.
+    ///
+    /// A single PTY read can contain *many* full-screen redraws back to
+    /// back — dozens in one ~4 KiB chunk during active streaming — so we
+    /// can't just diff the viewport once around the whole call; that would
+    /// only ever see the net effect of the first redraw's "before" against
+    /// the last redraw's "after", silently losing everything in between.
+    /// Instead, split on every `ESC[H` (cursor home, which is how Ink-style
+    /// TUIs begin a full-screen redraw) and diff at each one individually.
     pub fn process(&mut self, bytes: &[u8]) {
-        let before = viewport_rows(&self.term);
-        self.parser.advance(&mut self.term, bytes);
-        let after = viewport_rows(&self.term);
+        const HOME: &[u8] = b"\x1b[H";
 
-        // A full-screen redraw from an Ink-style TUI always rewrites row 0
-        // (it's redrawing everything from the top down); an in-place status
-        // or spinner tick elsewhere on screen does not touch row 0 at all.
-        // Use that as the signal that content is being replaced rather than
-        // merely ticking over.
-        if before[0] != after[0] {
-            let frame = before.join("\n");
-            if self.last_captured_frame.as_deref() != Some(frame.as_str()) {
-                for line in &before {
-                    let trimmed = line.trim_end();
-                    // Skip lines that are still visible somewhere in the new
-                    // frame (persistent chrome like the input box) — only
-                    // preserve what's actually being evicted.
-                    if !trimmed.is_empty() && !after.iter().any(|a| a.trim_end() == trimmed) {
-                        self.extra_history.push_back(trimmed.to_string());
-                    }
-                }
-                while self.extra_history.len() > MAX_EXTRA_HISTORY {
-                    self.extra_history.pop_front();
-                }
-                self.last_captured_frame = Some(frame);
-            }
+        let splits: Vec<usize> = if bytes.len() >= HOME.len() {
+            bytes.windows(HOME.len())
+                .enumerate()
+                .filter_map(|(i, w)| (w == HOME).then_some(i))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if splits.is_empty() {
+            self.parser.advance(&mut self.term, bytes);
+            self.cache.clear();
+            return;
+        }
+
+        if splits[0] > 0 {
+            self.parser.advance(&mut self.term, &bytes[..splits[0]]);
+        }
+
+        for (i, &start) in splits.iter().enumerate() {
+            let end = splits.get(i + 1).copied().unwrap_or(bytes.len());
+            let before = viewport_rows(&self.term);
+            self.parser.advance(&mut self.term, &bytes[start..end]);
+            let after = viewport_rows(&self.term);
+            self.capture_evicted_content(&before, &after);
         }
 
         self.cache.clear();
+    }
+
+    /// Content isn't reliably evicted at a fixed row — Ink bottom/top-anchors
+    /// its rendering wherever it likes, which drifts as content grows, so
+    /// "did row 0 change" (the original heuristic) misses evictions that
+    /// happen anywhere else. Instead: an in-place status/spinner tick (an
+    /// elapsed-time counter, a spinner glyph) changes exactly one row and
+    /// leaves everything else identical; a genuine redraw that evicts
+    /// content shifts or rewrites many rows at once. Use that distinction,
+    /// then preserve whichever lines actually vanished.
+    fn capture_evicted_content(&mut self, before: &[String], after: &[String]) {
+        let changed_rows = before.iter().zip(after.iter()).filter(|(b, a)| b != a).count();
+        if changed_rows <= 1 {
+            return;
+        }
+        for line in before {
+            let trimmed = line.trim_end();
+            // Skip lines that are still visible somewhere in the new frame
+            // (persistent chrome like the input box) — only preserve what's
+            // actually being evicted.
+            if !trimmed.is_empty() && !after.iter().any(|a| a.trim_end() == trimmed) {
+                self.extra_history.push_back(trimmed.to_string());
+            }
+        }
+        while self.extra_history.len() > MAX_EXTRA_HISTORY {
+            self.extra_history.pop_front();
+        }
     }
 
     /// Resize the terminal grid to match a new canvas size.
@@ -595,7 +627,6 @@ impl TerminalState {
             parser: Processor::new(),
             extra_history: std::collections::VecDeque::new(),
             extra_offset: 0,
-            last_captured_frame: None,
         }
     }
 
@@ -663,6 +694,42 @@ impl TerminalState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Raw PTY bytes captured from a real `claude` session (140x50) asked to
+    /// print two number sequences back to back (1-40, then 100-180) — long
+    /// enough that Ink's redraw evicts earlier content from the 50-row pane.
+    /// No `ESC[2J`, no real linefeeds anywhere in it; redraws are pure
+    /// cursor-addressed rewrites, and the eviction boundary isn't at a fixed
+    /// row (it drifts). This is the exact shape of stream that broke the
+    /// naive "diff once per process() call" and "row 0 changed" heuristics.
+    const CLAUDE_OVERFLOW_CAPTURE: &[u8] = include_bytes!("testdata/claude_overflow_capture.bin");
+
+    #[test]
+    fn real_capture_all_content_reachable_across_pty_chunk_boundaries() {
+        let mut s = TerminalState::new(140, 50);
+        // Feed it the way tmux pipe-pane actually delivers it: ~4 KiB reads,
+        // not one giant call — a single chunk can contain dozens of Ink
+        // redraws, and `process` must catch evictions within a chunk, not
+        // just at its edges.
+        for chunk in CLAUDE_OVERFLOW_CAPTURE.chunks(4096) {
+            s.process(chunk);
+        }
+
+        let mut lines: Vec<String> = s.extra_history.iter().cloned().collect();
+        lines.extend(viewport_rows(&s.term));
+        let trimmed: Vec<&str> = lines.iter().map(|l| l.trim()).collect();
+
+        // The capture asked for 1-40, then 100-180 — no 41-99 was ever
+        // printed, so don't assert on it.
+        for n in (1..=40).chain(100..=180) {
+            let n = n.to_string();
+            let bullet = format!("⏺ {n}"); // the first line of a response is bullet-prefixed
+            assert!(
+                trimmed.iter().any(|l| *l == n || *l == bullet),
+                "number {n} should be reachable somewhere in scrollback + live view"
+            );
+        }
+    }
 
     #[test]
     fn process_advances_cursor() {
