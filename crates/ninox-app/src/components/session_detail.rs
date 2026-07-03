@@ -16,7 +16,7 @@ fn panel_btn<'a>(app: &'a App, label: &'static str, target: DetailPanel, active:
     let s = &app.scheme;
     let is_active = target == active;
     button(
-        text(label).size(11).color(if is_active { Color::WHITE } else { s.text_secondary }),
+        text(label).size(11).color(if is_active { Color::WHITE } else { s.ink_2 }),
     )
     .on_press(Message::SwitchDetailPanel(target))
     .padding([3, 8])
@@ -24,10 +24,10 @@ fn panel_btn<'a>(app: &'a App, label: &'static str, target: DetailPanel, active:
         background: if is_active {
             Some(Background::Color(s.accent))
         } else {
-            Some(Background::Color(s.bg_elevated))
+            Some(Background::Color(s.card))
         },
-        border: Border { color: s.border, width: 1.0, radius: 3.0.into() },
-        text_color: if is_active { Color::WHITE } else { s.text_secondary },
+        border: Border { color: s.rule_dark, width: 1.0, radius: 3.0.into() },
+        text_color: if is_active { Color::WHITE } else { s.ink_2 },
         ..Default::default()
     })
     .into()
@@ -53,7 +53,7 @@ pub fn session_detail<'a>(
 
     let Some(session) = app.sessions.get(session_id) else {
         return container(
-            text("Session not found").size(14).color(s.text_muted),
+            text("Session not found").size(14).color(s.faint),
         )
         .width(Length::Fill)
         .height(Length::Fill)
@@ -76,11 +76,11 @@ pub fn session_detail<'a>(
         });
 
     let back_scope = app.last_fleet_scope.clone();
-    let back_btn = button(text("← Fleet").size(12).color(s.text_secondary))
+    let back_btn = button(text("← Fleet").size(12).color(s.ink_2))
         .on_press(Message::NavigateFleet { scope: back_scope })
         .style(|_theme, _status| button::Style {
             background: None,
-            text_color: s.text_secondary,
+            text_color: s.ink_2,
             ..Default::default()
         });
 
@@ -121,9 +121,9 @@ pub fn session_detail<'a>(
         row![
             back_btn,
             Space::new(16, 0),
-            text(&session.name).size(14).color(s.text_primary),
+            text(&session.name).size(14).color(s.ink),
             Space::new(8, 0),
-            text("·").size(14).color(s.text_muted),
+            text("·").size(14).color(s.faint),
             Space::new(8, 0),
             text(repo_short(&session.repo)).size(13).color(s.accent),
             Space::new(Length::Fill, 0),
@@ -133,12 +133,12 @@ pub fn session_detail<'a>(
             Space::new(12, 0),
             status_dot,
             Space::new(6, 0),
-            text(cost).size(12).color(s.text_muted),
+            text(cost).size(12).color(s.faint),
             if !pr_label.is_empty() {
                 Element::from(
                     row![
                         Space::new(12, 0),
-                        text(pr_label.clone()).size(12).color(s.text_secondary),
+                        text(pr_label.clone()).size(12).color(s.ink_2),
                     ]
                     .align_y(Alignment::Center),
                 )
@@ -151,21 +151,21 @@ pub fn session_detail<'a>(
     .padding([10, 16])
     .width(Length::Fill)
     .style(move |_theme| container::Style {
-        background: Some(Background::Color(s.bg_surface)),
-        border: Border { color: s.border, width: 1.0, radius: 0.0.into() },
+        background: Some(Background::Color(s.card)),
+        border: Border { color: s.rule_dark, width: 1.0, radius: 0.0.into() },
         ..Default::default()
     });
 
     // ── Terminal pane ─────────────────────────────────────────────────────────
-    let terminal_bg = s.terminal_bg;
+    let terminal_bg = s.term_bg;
     let session_ids: Vec<String> = app.sessions.keys().cloned().collect();
     let terminal_pane: Element<Message> = if let Some(term_state) = app.terminals.get(session_id) {
         iced::widget::Canvas::new(TerminalWidget {
             state:        term_state,
             session_id:   session_id.to_string(),
             font_size:    FONT_SIZE,
-            terminal_bg:  s.terminal_bg,
-            terminal_fg:  s.terminal_fg,
+            terminal_bg:  s.term_bg,
+            terminal_fg:  s.term_fg,
             cursor_color: s.accent,
             session_ids,
         })
@@ -179,7 +179,7 @@ pub fn session_detail<'a>(
             _ => "Terminal connecting…",
         };
         container(
-            text(placeholder).size(13).color(s.text_muted),
+            text(placeholder).size(13).color(s.faint),
         )
         .width(Length::Fill)
         .height(Length::Fill)
@@ -207,8 +207,8 @@ pub fn session_detail<'a>(
     .width(Length::Fixed(info_width))
     .height(Length::Fill)
     .style(move |_theme| container::Style {
-        background: Some(Background::Color(s.bg_surface)),
-        border: Border { color: s.border, width: 1.0, radius: 0.0.into() },
+        background: Some(Background::Color(s.card)),
+        border: Border { color: s.rule_dark, width: 1.0, radius: 0.0.into() },
         ..Default::default()
     })
     .into();
@@ -232,7 +232,7 @@ pub fn session_detail<'a>(
                     background: Some(Background::Color(terminal_bg)),
                     ..Default::default()
                 }),
-            App::drag_handle(DragTarget::InfoPanel, s.border),
+            App::drag_handle(DragTarget::InfoPanel, s.rule_dark),
             info_pane,
         ]
         .height(Length::Fill)

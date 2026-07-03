@@ -71,9 +71,9 @@ pub fn board_sessions<'a>(
 fn tab_chip<'a>(app: &'a App, label: &'a str, msg: Message, is_active: bool) -> Element<'a, Message> {
     let s = &app.scheme;
     let accent       = s.accent;
-    let bg_elevated  = s.bg_elevated;
-    let border       = s.border;
-    let text_secondary = s.text_secondary;
+    let bg_elevated  = s.card;
+    let border       = s.rule_dark;
+    let text_secondary = s.ink_2;
     button(
         text(label).size(12).color(if is_active { Color::WHITE } else { text_secondary })
     )
@@ -99,20 +99,20 @@ fn session_card<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> 
             row![
                 status_dot(color),
                 Space::new(6, 0),
-                text(&session.name).size(12).color(s.text_primary),
+                text(&session.name).size(12).color(s.ink),
             ]
             .align_y(Alignment::Center),
-            text(repo_short(&session.repo)).size(11).color(s.text_secondary),
-            text(cost).size(11).color(s.text_muted),
+            text(repo_short(&session.repo)).size(11).color(s.ink_2),
+            text(cost).size(11).color(s.faint),
         ]
         .spacing(3)
         .padding(8),
     )
     .on_press(Message::NavigateSession(session_id))
     .style(move |_theme, _status| button::Style {
-        background: Some(Background::Color(s.bg_elevated)),
-        text_color: s.text_primary,
-        border: Border { color: s.border, width: 1.0, radius: 6.0.into() },
+        background: Some(Background::Color(s.card)),
+        text_color: s.ink,
+        border: Border { color: s.rule_dark, width: 1.0, radius: 6.0.into() },
         ..Default::default()
     })
     .width(Length::Fixed(180.0))
@@ -124,9 +124,9 @@ fn kanban_column<'a>(app: &'a App, label: &'static str, cards: Vec<Element<'a, M
     let count = cards.len();
     let header = container(
         row![
-            text(label).size(12).color(s.text_muted),
+            text(label).size(12).color(s.faint),
             Space::new(Length::Fill, 0),
-            text(count.to_string()).size(11).color(s.text_muted),
+            text(count.to_string()).size(11).color(s.faint),
         ]
         .align_y(Alignment::Center),
     )
@@ -142,8 +142,8 @@ fn kanban_column<'a>(app: &'a App, label: &'static str, cards: Vec<Element<'a, M
         .width(Length::Fixed(200.0))
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(Background::Color(s.bg_surface)),
-            border: Border { color: s.border, width: 1.0, radius: 8.0.into() },
+            background: Some(Background::Color(s.card)),
+            border: Border { color: s.rule_dark, width: 1.0, radius: 8.0.into() },
             ..Default::default()
         })
         .into()
@@ -183,12 +183,12 @@ fn attention_banner<'a>(app: &'a App) -> Option<Element<'a, Message>> {
                     .width(Length::Fixed(8.0))
                     .height(Length::Fixed(8.0))
                     .style(move |_| container::Style {
-                        background: Some(Background::Color(s.status_red)),
+                        background: Some(Background::Color(s.status_ci_failed)),
                         border: Border { radius: 4.0.into(), ..Default::default() },
                         ..Default::default()
                     }),
                 Space::new(8, 0),
-                text(message).size(12).color(s.status_red),
+                text(message).size(12).color(s.status_ci_failed),
             ]
             .align_y(Alignment::Center)
         )
@@ -196,13 +196,13 @@ fn attention_banner<'a>(app: &'a App) -> Option<Element<'a, Message>> {
         .width(Length::Fill)
         .style(move |_| container::Style {
             background: Some(Background::Color(Color {
-                r: s.status_red.r,
-                g: s.status_red.g,
-                b: s.status_red.b,
+                r: s.status_ci_failed.r,
+                g: s.status_ci_failed.g,
+                b: s.status_ci_failed.b,
                 a: 0.08,
             })),
             border: Border {
-                color: Color { a: 0.2, ..s.status_red },
+                color: Color { a: 0.2, ..s.status_ci_failed },
                 width: 0.0,
                 radius: 0.0.into(),
             },
@@ -227,9 +227,9 @@ pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Eleme
 
     let header = container(
         row![
-            text("Fleet").size(16).color(s.text_primary),
+            text("Fleet").size(16).color(s.ink),
             Space::new(8, 0),
-            text(format!("({} workers)", worker_count)).size(13).color(s.text_muted),
+            text(format!("({} workers)", worker_count)).size(13).color(s.faint),
         ]
         .align_y(Alignment::Center),
     )

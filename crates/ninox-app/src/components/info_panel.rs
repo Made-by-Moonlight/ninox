@@ -19,7 +19,7 @@ pub fn info_panel<'a>(
     match pr {
         None => {
             items.push(
-                container(text("No PR yet").size(13).color(s.text_muted))
+                container(text("No PR yet").size(13).color(s.faint))
                     .width(Length::Fill)
                     .padding([20, 16])
                     .into(),
@@ -30,7 +30,7 @@ pub fn info_panel<'a>(
             items.push(
                 container(
                     column![
-                        text(pr_title).size(14).color(s.text_primary),
+                        text(pr_title).size(14).color(s.ink),
                         Space::new(0, 4),
                         rich_text![
                             span(pr.url.as_str())
@@ -44,8 +44,8 @@ pub fn info_panel<'a>(
                 .width(Length::Fill)
                 .padding([12, 16])
                 .style(move |_theme| container::Style {
-                    background: Some(Background::Color(s.bg_elevated)),
-                    border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
+                    background: Some(Background::Color(s.card)),
+                    border: Border { color: s.rule_dark, width: 1.0, radius: 4.0.into() },
                     ..Default::default()
                 })
                 .into(),
@@ -59,7 +59,7 @@ pub fn info_panel<'a>(
                 };
                 items.push(Space::new(0, 8).into());
                 items.push(
-                    container(text(body_text).size(12).color(s.text_secondary))
+                    container(text(body_text).size(12).color(s.ink_2))
                         .width(Length::Fill)
                         .padding([10, 16])
                         .into(),
@@ -70,19 +70,19 @@ pub fn info_panel<'a>(
                 items.push(Space::new(0, 12).into());
                 let ci_label = format!("CI: {}/{} passing", ci.passing, ci.total);
                 let ci_color = if ci.failing > 0 {
-                    s.status_red
+                    s.status_ci_failed
                 } else if ci.pending > 0 {
-                    s.status_yellow
+                    s.status_review
                 } else {
-                    s.status_green
+                    s.status_working
                 };
                 items.push(
                     container(text(ci_label).size(13).color(ci_color))
                         .width(Length::Fill)
                         .padding([10, 16])
                         .style(move |_theme| container::Style {
-                            background: Some(Background::Color(s.bg_elevated)),
-                            border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
+                            background: Some(Background::Color(s.card)),
+                            border: Border { color: s.rule_dark, width: 1.0, radius: 4.0.into() },
                             ..Default::default()
                         })
                         .into(),
@@ -91,7 +91,7 @@ pub fn info_panel<'a>(
 
             if !comments.is_empty() {
                 items.push(Space::new(0, 12).into());
-                items.push(text("Review Comments").size(11).color(s.text_muted).into());
+                items.push(text("Review Comments").size(11).color(s.faint).into());
                 items.push(Space::new(0, 6).into());
 
                 for comment in comments {
@@ -105,14 +105,14 @@ pub fn info_panel<'a>(
                             column![
                                 text(location).size(11).color(s.accent),
                                 Space::new(0, 4),
-                                text(comment.body.as_str()).size(12).color(s.text_secondary),
+                                text(comment.body.as_str()).size(12).color(s.ink_2),
                             ],
                         )
                         .width(Length::Fill)
                         .padding([10, 12])
                         .style(move |_theme| container::Style {
-                            background: Some(Background::Color(s.bg_elevated)),
-                            border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
+                            background: Some(Background::Color(s.card)),
+                            border: Border { color: s.rule_dark, width: 1.0, radius: 4.0.into() },
                             ..Default::default()
                         })
                         .into(),
@@ -135,7 +135,7 @@ pub fn info_panel<'a>(
     .width(Length::Fill)
     .height(Length::Fill)
     .style(move |_theme| container::Style {
-        background: Some(Background::Color(s.bg_surface)),
+        background: Some(Background::Color(s.card)),
         ..Default::default()
     })
     .into()

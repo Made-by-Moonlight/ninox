@@ -8,8 +8,8 @@ use ninox_core::types::Session;
 
 fn field<'a>(label: &'static str, value: String, s: &'a ColorScheme) -> Element<'a, Message> {
     column![
-        text(label).size(10).color(s.text_muted),
-        text(value).size(12).color(s.text_primary),
+        text(label).size(10).color(s.faint),
+        text(value).size(12).color(s.ink),
     ]
     .spacing(2)
     .into()
@@ -54,7 +54,7 @@ pub fn inspector_panel<'a>(app: &'a App, session: &'a Session) -> Element<'a, Me
         let divider = container(Space::new(Length::Fill, 1.0))
             .width(Length::Fill)
             .style(move |_| container::Style {
-                background: Some(Background::Color(s.border)),
+                background: Some(Background::Color(s.rule_dark)),
                 ..Default::default()
             });
         vec![

@@ -1,37 +1,54 @@
 use ninox_core::{types::SessionStatus, ThemeVariant};
 use iced::{color, Color, Theme};
 
+/// Field Notes design tokens — spec: docs/design-concepts/field-notes-design.md §1.
+/// The dark theme is the same journal read by lamplight, not a separate design.
 #[derive(Debug, Clone, Copy)]
 pub struct ColorScheme {
-    pub bg_base:        Color,
-    pub bg_surface:     Color,
-    pub bg_elevated:    Color,
-    pub bg_sidebar:     Color,
-    pub border:         Color,
-    pub text_primary:   Color,
-    pub text_secondary: Color,
-    pub text_muted:     Color,
-    pub accent:         Color,
-    pub terminal_bg:    Color,
-    pub terminal_fg:    Color,
-    pub status_green:   Color,
-    pub status_blue:    Color,
-    pub status_red:     Color,
-    pub status_yellow:  Color,
-    pub status_purple:  Color,
-    pub status_grey:    Color,
+    // surfaces & ink
+    pub paper:     Color, // app background
+    pub paper_2:   Color, // sidebar, modal header, table header
+    pub card:      Color, // cards, panels, modals, reading pane
+    pub ink:       Color, // primary text, heavy borders
+    pub ink_2:     Color, // secondary text
+    pub faint:     Color, // tertiary/metadata text
+    pub rule:      Color, // light rules/separators
+    pub rule_dark: Color, // stronger rules, input underlines, card borders
+    pub accent:    Color, // vermilion
+    pub shadow:    Color, // hard-offset shadow base (alpha applied per-use)
+    // status
+    pub status_working:   Color,
+    pub status_pr_open:   Color,
+    pub status_ci_failed: Color,
+    pub status_review:    Color,
+    pub status_mergeable: Color,
+    pub status_done:      Color,
+    // brain categories beyond the status palette
+    pub cat_pattern:      Color,
+    pub cat_decision:     Color,
+    pub cat_relationship: Color,
+    pub cat_error:        Color,
+    // terminal — "the dark object" on the page
+    pub term_bg:         Color,
+    pub term_bar:        Color,
+    pub term_bar_border: Color,
+    pub term_fg:         Color,
+    pub term_ok:         Color,
+    pub term_err:        Color,
+    pub term_agent:      Color,
+    pub term_dim:        Color,
 }
 
 impl ColorScheme {
     pub fn status_color(&self, status: &SessionStatus) -> Color {
         use SessionStatus::*;
         match status {
-            Spawning | Working => self.status_green,
-            PrOpen             => self.status_blue,
-            CiFailed           => self.status_red,
-            ReviewPending      => self.status_yellow,
-            Mergeable          => self.status_purple,
-            Done | Terminated  => self.status_grey,
+            Spawning | Working => self.status_working,
+            PrOpen             => self.status_pr_open,
+            CiFailed           => self.status_ci_failed,
+            ReviewPending      => self.status_review,
+            Mergeable          => self.status_mergeable,
+            Done | Terminated  => self.status_done,
         }
     }
 
@@ -39,11 +56,11 @@ impl ColorScheme {
         Theme::custom(
             "Ninox".into(),
             iced::theme::Palette {
-                background: self.bg_base,
-                text:       self.text_primary,
+                background: self.paper,
+                text:       self.ink,
                 primary:    self.accent,
-                success:    self.status_green,
-                danger:     self.status_red,
+                success:    self.status_working,
+                danger:     self.status_ci_failed,
             },
         )
     }
@@ -51,74 +68,75 @@ impl ColorScheme {
 
 pub fn from_variant(v: ThemeVariant) -> ColorScheme {
     match v {
-        ThemeVariant::Light  => light(),
-        ThemeVariant::Dark   => dark(),
-        ThemeVariant::Ninox => warm_dark(),
+        ThemeVariant::Light => light(),
+        ThemeVariant::Dark  => dark(),
+        // "ninox" third theme is not yet designed (spec §7) — lamplight for now.
+        ThemeVariant::Ninox => dark(),
     }
 }
 
 pub fn light() -> ColorScheme {
     ColorScheme {
-        bg_base:        color!(0xeef2fb),
-        bg_surface:     color!(0xffffff),
-        bg_elevated:    color!(0xf3f6ff),
-        bg_sidebar:     color!(0xf5f7ff),
-        border:         color!(0x93a7d7, 0.4),
-        text_primary:   color!(0x1e2b4a),
-        text_secondary: color!(0x4a5c80),
-        text_muted:     color!(0x8a9bb8),
-        accent:         color!(0x4a6cf7),
-        terminal_bg:    color!(0x1e2b4a),
-        terminal_fg:    color!(0xe8dcc8),
-        status_green:   color!(0x22c55e),
-        status_blue:    color!(0x4a6cf7),
-        status_red:     color!(0xef4444),
-        status_yellow:  color!(0xf59e0b),
-        status_purple:  color!(0xa855f7),
-        status_grey:    color!(0x94a3b8),
+        paper:     color!(0xf5f0e4),
+        paper_2:   color!(0xefe8d8),
+        card:      color!(0xfbf7ee),
+        ink:       color!(0x211d16),
+        ink_2:     color!(0x5b5344),
+        faint:     color!(0x968a72),
+        rule:      color!(0xd9cfba),
+        rule_dark: color!(0xb7ab90),
+        accent:    color!(0xc8451f),
+        shadow:    color!(0x211d16),
+        status_working:   color!(0x3e7d34),
+        status_pr_open:   color!(0x20629e),
+        status_ci_failed: color!(0xc8451f),
+        status_review:    color!(0xa97913),
+        status_mergeable: color!(0x6d4fa3),
+        status_done:      color!(0x8b8272),
+        cat_pattern:      color!(0xa23f8c),
+        cat_decision:     color!(0xc86a1f),
+        cat_relationship: color!(0x2a8a80),
+        cat_error:        color!(0xb3261e),
+        term_bg:         color!(0x23201a),
+        term_bar:        color!(0x2c2822),
+        term_bar_border: color!(0x3a352c),
+        term_fg:         color!(0xece4d0),
+        term_ok:         color!(0x8fd37f),
+        term_err:        color!(0xf08a72),
+        term_agent:      color!(0xf0c069),
+        term_dim:        color!(0x7a7260),
     }
 }
 
 pub fn dark() -> ColorScheme {
     ColorScheme {
-        bg_base:        color!(0x0d1525),
-        bg_surface:     color!(0x131e35),
-        bg_elevated:    color!(0x1a2640),
-        bg_sidebar:     color!(0x0f1a2e),
-        border:         color!(0x3b599b, 0.45),
-        text_primary:   color!(0xe2e8f8),
-        text_secondary: color!(0x8a9bc5),
-        text_muted:     color!(0x4a5a80),
-        accent:         color!(0x6b8ef7),
-        terminal_bg:    color!(0x0a1020),
-        terminal_fg:    color!(0xe2e8f8),
-        status_green:   color!(0x4ade80),
-        status_blue:    color!(0x60a5fa),
-        status_red:     color!(0xf87171),
-        status_yellow:  color!(0xfbbf24),
-        status_purple:  color!(0xa78bfa),
-        status_grey:    color!(0x64748b),
-    }
-}
-
-pub fn warm_dark() -> ColorScheme {
-    ColorScheme {
-        bg_base:        color!(0x1a1714),
-        bg_surface:     color!(0x252118),
-        bg_elevated:    color!(0x2e2a24),
-        bg_sidebar:     color!(0x211e1a),
-        border:         color!(0x3d3830, 0.6),
-        text_primary:   color!(0xe8e4de),
-        text_secondary: color!(0xa09880),
-        text_muted:     color!(0x6b6358),
-        accent:         color!(0xd4a843),
-        terminal_bg:    color!(0x282828),
-        terminal_fg:    color!(0xebdbb2),
-        status_green:   color!(0x4ade80),
-        status_blue:    color!(0x60a5fa),
-        status_red:     color!(0xf87171),
-        status_yellow:  color!(0xfbbf24),
-        status_purple:  color!(0xa78bfa),
-        status_grey:    color!(0x6b6358),
+        paper:     color!(0x171410),
+        paper_2:   color!(0x1f1b15),
+        card:      color!(0x262119),
+        ink:       color!(0xece3cd),
+        ink_2:     color!(0xb5a98d),
+        faint:     color!(0x83775c),
+        rule:      color!(0x393227),
+        rule_dark: color!(0x4e4534),
+        accent:    color!(0xe06038),
+        shadow:    color!(0x000000),
+        status_working:   color!(0x7cc46a),
+        status_pr_open:   color!(0x5ca8e8),
+        status_ci_failed: color!(0xe86a4c),
+        status_review:    color!(0xd8a83c),
+        status_mergeable: color!(0xa184d6),
+        status_done:      color!(0x7d7461),
+        cat_pattern:      color!(0xc876b4),
+        cat_decision:     color!(0xe08a4a),
+        cat_relationship: color!(0x4ab0a4),
+        cat_error:        color!(0xe0604a),
+        term_bg:         color!(0x100d09),
+        term_bar:        color!(0x191510),
+        term_bar_border: color!(0x2c261d),
+        term_fg:         color!(0xece4d0),
+        term_ok:         color!(0x8fd37f),
+        term_err:        color!(0xf08a72),
+        term_agent:      color!(0xf0c069),
+        term_dim:        color!(0x7a7260),
     }
 }

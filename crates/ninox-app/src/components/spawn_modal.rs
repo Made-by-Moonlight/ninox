@@ -15,10 +15,10 @@ pub fn spawn_modal<'a>(form: &'a SpawnForm, s: &'a ColorScheme) -> Element<'a, M
 
     let dialog = container(
         column![
-            text("Spawn Orchestrator").size(16).color(s.text_primary),
+            text("Spawn Orchestrator").size(16).color(s.ink),
             Space::new(0, 4),
             column![
-                text("Name").size(11).color(s.text_muted),
+                text("Name").size(11).color(s.faint),
                 Space::new(0, 4),
                 text_input("e.g. my-feature", &form.name)
                     .on_input(Message::SpawnFormName)
@@ -29,12 +29,12 @@ pub fn spawn_modal<'a>(form: &'a SpawnForm, s: &'a ColorScheme) -> Element<'a, M
             .spacing(0),
             Space::new(0, 4),
             row![
-                button(text("Cancel").size(12).color(s.text_secondary))
+                button(text("Cancel").size(12).color(s.ink_2))
                     .on_press(Message::SpawnFormCancel)
                     .style(move |_theme, _status| button::Style {
                         background: None,
-                        text_color: s.text_secondary,
-                        border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
+                        text_color: s.ink_2,
+                        border: Border { color: s.rule_dark, width: 1.0, radius: 4.0.into() },
                         ..Default::default()
                     })
                     .padding([5, 12]),
@@ -42,15 +42,15 @@ pub fn spawn_modal<'a>(form: &'a SpawnForm, s: &'a ColorScheme) -> Element<'a, M
                 button(
                     text("Spawn")
                         .size(12)
-                        .color(if can_submit { Color::WHITE } else { s.text_muted }),
+                        .color(if can_submit { Color::WHITE } else { s.faint }),
                 )
                 .on_press_maybe(can_submit.then_some(Message::SpawnFormConfirm))
                 .style(move |_theme, _status| button::Style {
                     background: Some(Background::Color(
-                        if can_submit { s.accent } else { s.bg_elevated },
+                        if can_submit { s.accent } else { s.card },
                     )),
-                    border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
-                    text_color: if can_submit { Color::WHITE } else { s.text_muted },
+                    border: Border { color: s.rule_dark, width: 1.0, radius: 4.0.into() },
+                    text_color: if can_submit { Color::WHITE } else { s.faint },
                     ..Default::default()
                 })
                 .padding([5, 16]),
@@ -62,8 +62,8 @@ pub fn spawn_modal<'a>(form: &'a SpawnForm, s: &'a ColorScheme) -> Element<'a, M
     )
     .width(Length::Fixed(340.0))
     .style(move |_| container::Style {
-        background: Some(Background::Color(s.bg_surface)),
-        border: Border { color: s.border, width: 1.0, radius: 8.0.into() },
+        background: Some(Background::Color(s.card)),
+        border: Border { color: s.rule_dark, width: 1.0, radius: 8.0.into() },
         ..Default::default()
     });
 

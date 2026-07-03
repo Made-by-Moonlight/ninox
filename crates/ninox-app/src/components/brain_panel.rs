@@ -24,8 +24,8 @@ fn entry_row<'a>(app: &'a App, entry: &'a BrainEntry) -> Element<'a, Message> {
 
     button(
         column![
-            text(&entry.name).size(12).color(s.text_primary),
-            text(&entry.id).size(10).color(s.text_muted),
+            text(&entry.name).size(12).color(s.ink),
+            text(&entry.id).size(10).color(s.faint),
         ]
         .spacing(2),
     )
@@ -33,14 +33,14 @@ fn entry_row<'a>(app: &'a App, entry: &'a BrainEntry) -> Element<'a, Message> {
     .width(Length::Fill)
     .style(move |_theme, status| button::Style {
         background: Some(Background::Color(if is_selected {
-            s.bg_elevated
+            s.card
         } else {
             match status {
-                button::Status::Hovered => s.bg_elevated,
-                _ => s.bg_surface,
+                button::Status::Hovered => s.card,
+                _ => s.card,
             }
         })),
-        text_color: s.text_primary,
+        text_color: s.ink,
         border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 0.0.into() },
         ..Default::default()
     })
@@ -52,12 +52,12 @@ fn section<'a>(app: &'a App, entry_type: &str, entries: Vec<&'a BrainEntry>) -> 
     let s = &app.scheme;
 
     let heading = container(
-        text(format!("{entry_type} ({})", entries.len())).size(10).color(s.text_muted),
+        text(format!("{entry_type} ({})", entries.len())).size(10).color(s.faint),
     )
     .padding([6, 12])
     .width(Length::Fill)
     .style(move |_theme| container::Style {
-        background: Some(Background::Color(s.bg_elevated)),
+        background: Some(Background::Color(s.card)),
         ..Default::default()
     });
 
@@ -70,7 +70,7 @@ fn section<'a>(app: &'a App, entry_type: &str, entries: Vec<&'a BrainEntry>) -> 
 pub fn brain_panel(app: &App) -> Element<'_, Message> {
     let s = &app.scheme;
 
-    let back_btn = button(text("← Fleet").size(12).color(s.text_secondary))
+    let back_btn = button(text("← Fleet").size(12).color(s.ink_2))
         .on_press(Message::NavigateFleet { scope: None })
         .style(|_t, _s| button::Style {
             background: None,
@@ -93,9 +93,9 @@ pub fn brain_panel(app: &App) -> Element<'_, Message> {
         row![
             back_btn,
             Space::new(16, 0),
-            text("Brain").size(16).color(s.text_primary),
+            text("Brain").size(16).color(s.ink),
             Space::new(Length::Fill, 0),
-            text(format!("{} entries", app.brain_view.entries.len())).size(12).color(s.text_muted),
+            text(format!("{} entries", app.brain_view.entries.len())).size(12).color(s.faint),
             Space::new(12, 0),
             reindex_btn,
         ]
@@ -104,8 +104,8 @@ pub fn brain_panel(app: &App) -> Element<'_, Message> {
     .padding([12, 20])
     .width(Length::Fill)
     .style(move |_theme| container::Style {
-        background: Some(Background::Color(s.bg_base)),
-        border: Border { color: s.border, width: 0.0, radius: 0.0.into() },
+        background: Some(Background::Color(s.paper)),
+        border: Border { color: s.rule_dark, width: 0.0, radius: 0.0.into() },
         ..Default::default()
     });
 
@@ -119,8 +119,8 @@ pub fn brain_panel(app: &App) -> Element<'_, Message> {
     .padding([8, 20])
     .width(Length::Fill)
     .style(move |_theme| container::Style {
-        background: Some(Background::Color(s.bg_base)),
-        border: Border { color: s.border, width: 0.0, radius: 0.0.into() },
+        background: Some(Background::Color(s.paper)),
+        border: Border { color: s.rule_dark, width: 0.0, radius: 0.0.into() },
         ..Default::default()
     });
 
@@ -139,7 +139,7 @@ pub fn brain_panel(app: &App) -> Element<'_, Message> {
                 "No entries match this filter."
             })
             .size(13)
-            .color(s.text_muted),
+            .color(s.faint),
         )
         .padding([40, 20])
         .width(Length::Fill)
@@ -164,8 +164,8 @@ pub fn brain_panel(app: &App) -> Element<'_, Message> {
         .width(Length::Fixed(280.0))
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(Background::Color(s.bg_surface)),
-            border: Border { color: s.border, width: 1.0, radius: 0.0.into() },
+            background: Some(Background::Color(s.card)),
+            border: Border { color: s.rule_dark, width: 1.0, radius: 0.0.into() },
             ..Default::default()
         });
 
@@ -192,28 +192,28 @@ fn detail_pane(app: &App) -> Element<'_, Message> {
 
     let content: Element<Message> = match selected {
         None => container(
-            text("Select an entry to view its contents.").size(13).color(s.text_muted),
+            text("Select an entry to view its contents.").size(13).color(s.faint),
         )
         .padding(20)
         .into(),
         Some(entry) => {
             let mut meta_rows: Vec<Element<Message>> = vec![
                 row![
-                    text("Type").size(10).color(s.text_muted).width(Length::Fixed(80.0)),
-                    text(&entry.entry_type).size(12).color(s.text_primary),
+                    text("Type").size(10).color(s.faint).width(Length::Fixed(80.0)),
+                    text(&entry.entry_type).size(12).color(s.ink),
                 ]
                 .into(),
                 row![
-                    text("Path").size(10).color(s.text_muted).width(Length::Fixed(80.0)),
-                    text(&entry.id).size(12).color(s.text_secondary),
+                    text("Path").size(10).color(s.faint).width(Length::Fixed(80.0)),
+                    text(&entry.id).size(12).color(s.ink_2),
                 ]
                 .into(),
             ];
             if let Some(updated) = &entry.updated {
                 meta_rows.push(
                     row![
-                        text("Updated").size(10).color(s.text_muted).width(Length::Fixed(80.0)),
-                        text(updated).size(12).color(s.text_secondary),
+                        text("Updated").size(10).color(s.faint).width(Length::Fixed(80.0)),
+                        text(updated).size(12).color(s.ink_2),
                     ]
                     .into(),
                 );
@@ -221,8 +221,8 @@ fn detail_pane(app: &App) -> Element<'_, Message> {
             if !entry.tags.is_empty() {
                 meta_rows.push(
                     row![
-                        text("Tags").size(10).color(s.text_muted).width(Length::Fixed(80.0)),
-                        text(entry.tags.join(", ")).size(12).color(s.text_secondary),
+                        text("Tags").size(10).color(s.faint).width(Length::Fixed(80.0)),
+                        text(entry.tags.join(", ")).size(12).color(s.ink_2),
                     ]
                     .into(),
                 );
@@ -230,23 +230,23 @@ fn detail_pane(app: &App) -> Element<'_, Message> {
             if !entry.repos.is_empty() {
                 meta_rows.push(
                     row![
-                        text("Repos").size(10).color(s.text_muted).width(Length::Fixed(80.0)),
-                        text(entry.repos.join(", ")).size(12).color(s.text_secondary),
+                        text("Repos").size(10).color(s.faint).width(Length::Fixed(80.0)),
+                        text(entry.repos.join(", ")).size(12).color(s.ink_2),
                     ]
                     .into(),
                 );
             }
 
             column![
-                text(&entry.name).size(18).color(s.text_primary),
+                text(&entry.name).size(18).color(s.ink),
                 Space::new(0, 8),
                 column(meta_rows).spacing(4),
                 Space::new(0, 16),
                 container(Space::new(Length::Fill, 1)).width(Length::Fill).style(move |_theme| {
-                    container::Style { background: Some(Background::Color(s.border)), ..Default::default() }
+                    container::Style { background: Some(Background::Color(s.rule_dark)), ..Default::default() }
                 }),
                 Space::new(0, 16),
-                text(&entry.body).size(12).color(s.text_primary).font(iced::Font::MONOSPACE),
+                text(&entry.body).size(12).color(s.ink).font(iced::Font::MONOSPACE),
             ]
             .padding(20)
             .into()
@@ -257,7 +257,7 @@ fn detail_pane(app: &App) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(Background::Color(s.bg_base)),
+            background: Some(Background::Color(s.paper)),
             ..Default::default()
         })
         .into()

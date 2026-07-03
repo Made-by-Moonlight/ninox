@@ -8,13 +8,13 @@ use ninox_core::types::{CIStatus, PR};
 
 fn ci_badge<'a>(ci: Option<&CIStatus>, s: &'a ColorScheme) -> Element<'a, Message> {
     match ci {
-        None => text("—").size(11).color(s.text_muted).into(),
+        None => text("—").size(11).color(s.faint).into(),
         Some(c) if c.failing > 0 => {
             let label = format!("{}/{} CI", c.passing, c.total);
             container(text(label).size(10).color(Color::WHITE))
                 .padding([2, 6])
                 .style(move |_| container::Style {
-                    background: Some(Background::Color(s.status_red)),
+                    background: Some(Background::Color(s.status_ci_failed)),
                     border: Border { radius: 3.0.into(), ..Default::default() },
                     ..Default::default()
                 })
@@ -25,7 +25,7 @@ fn ci_badge<'a>(ci: Option<&CIStatus>, s: &'a ColorScheme) -> Element<'a, Messag
             container(text(label).size(10).color(Color::WHITE))
                 .padding([2, 6])
                 .style(move |_| container::Style {
-                    background: Some(Background::Color(s.status_green)),
+                    background: Some(Background::Color(s.status_working)),
                     border: Border { radius: 3.0.into(), ..Default::default() },
                     ..Default::default()
                 })
@@ -51,12 +51,12 @@ fn pr_row<'a>(app: &'a App, pr: &'a PR) -> Element<'a, Message> {
             .width(Length::Fixed(56.0)),
             // PR title
             container(
-                text(&pr.title).size(12).color(s.text_primary)
+                text(&pr.title).size(12).color(s.ink)
             )
             .width(Length::Fill),
             // Session name
             container(
-                text(session_name).size(11).color(s.text_secondary)
+                text(session_name).size(11).color(s.ink_2)
             )
             .width(Length::Fixed(120.0)),
             // CI badge
@@ -72,10 +72,10 @@ fn pr_row<'a>(app: &'a App, pr: &'a PR) -> Element<'a, Message> {
     .width(Length::Fill)
     .style(move |_t, status| button::Style {
         background: Some(Background::Color(match status {
-            button::Status::Hovered => s.bg_elevated,
-            _ => s.bg_surface,
+            button::Status::Hovered => s.card,
+            _ => s.card,
         })),
-        border: Border { color: s.border, width: 0.0, radius: 0.0.into() },
+        border: Border { color: s.rule_dark, width: 0.0, radius: 0.0.into() },
         ..Default::default()
     })
     .into()
@@ -89,7 +89,7 @@ pub fn pr_list(app: &App) -> Element<'_, Message> {
     prs.sort_by_key(|b| std::cmp::Reverse(b.number));
 
     let back_btn = button(
-        text("← Fleet").size(12).color(s.text_secondary)
+        text("← Fleet").size(12).color(s.ink_2)
     )
     .on_press(Message::NavigateFleet { scope: None })
     .style(|_t, _s| button::Style {
@@ -103,29 +103,29 @@ pub fn pr_list(app: &App) -> Element<'_, Message> {
         row![
             back_btn,
             Space::new(16, 0),
-            text("Pull Requests").size(16).color(s.text_primary),
+            text("Pull Requests").size(16).color(s.ink),
             Space::new(Length::Fill, 0),
-            text(format!("{} open", prs.len())).size(12).color(s.text_muted),
+            text(format!("{} open", prs.len())).size(12).color(s.faint),
         ]
         .align_y(Alignment::Center)
     )
     .padding([12, 20])
     .width(Length::Fill)
     .style(move |_| container::Style {
-        background: Some(Background::Color(s.bg_base)),
-        border: Border { color: s.border, width: 0.0, radius: 0.0.into() },
+        background: Some(Background::Color(s.paper)),
+        border: Border { color: s.rule_dark, width: 0.0, radius: 0.0.into() },
         ..Default::default()
     });
 
     let col_header = container(
         row![
-            container(text("#").size(10).color(s.text_muted))
+            container(text("#").size(10).color(s.faint))
                 .width(Length::Fixed(56.0)),
-            container(text("Title").size(10).color(s.text_muted))
+            container(text("Title").size(10).color(s.faint))
                 .width(Length::Fill),
-            container(text("Session").size(10).color(s.text_muted))
+            container(text("Session").size(10).color(s.faint))
                 .width(Length::Fixed(120.0)),
-            container(text("CI").size(10).color(s.text_muted))
+            container(text("CI").size(10).color(s.faint))
                 .width(Length::Fixed(80.0))
                 .align_x(iced::alignment::Horizontal::Right),
         ]
@@ -134,15 +134,15 @@ pub fn pr_list(app: &App) -> Element<'_, Message> {
     )
     .width(Length::Fill)
     .style(move |_| container::Style {
-        background: Some(Background::Color(s.bg_elevated)),
-        border: Border { color: s.border, width: 0.0, radius: 0.0.into() },
+        background: Some(Background::Color(s.card)),
+        border: Border { color: s.rule_dark, width: 0.0, radius: 0.0.into() },
         ..Default::default()
     });
 
     let rows: Vec<Element<Message>> = if prs.is_empty() {
         vec![
             container(
-                text("No pull requests yet.").size(13).color(s.text_muted),
+                text("No pull requests yet.").size(13).color(s.faint),
             )
             .padding([40, 20])
             .width(Length::Fill)
@@ -155,7 +155,7 @@ pub fn pr_list(app: &App) -> Element<'_, Message> {
                 let divider = container(Space::new(Length::Fill, 1.0))
                     .width(Length::Fill)
                     .style(move |_| container::Style {
-                        background: Some(Background::Color(s.border)),
+                        background: Some(Background::Color(s.rule_dark)),
                         ..Default::default()
                     })
                     .into();

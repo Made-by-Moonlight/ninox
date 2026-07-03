@@ -17,7 +17,7 @@ pub fn filter_bar<'a>(app: &'a App) -> Element<'a, Message> {
 
     let clear_btn = if has_filter {
         Some(
-            button(text("✕").size(11).color(s.text_muted))
+            button(text("✕").size(11).color(s.faint))
                 .on_press(Message::ClearFleetFilter)
                 .style(|_t, _s| button::Style {
                     background: None,
@@ -53,7 +53,7 @@ pub fn filter_bar<'a>(app: &'a App) -> Element<'a, Message> {
         row_items.push(btn.into());
     }
     row_items.push(Space::new(Length::Fill, 0).into());
-    row_items.push(text(count_label).size(11).color(s.text_muted).into());
+    row_items.push(text(count_label).size(11).color(s.faint).into());
 
     container(
         iced::widget::row(row_items).align_y(Alignment::Center).spacing(4)
@@ -61,8 +61,8 @@ pub fn filter_bar<'a>(app: &'a App) -> Element<'a, Message> {
     .padding([8, 16])
     .width(Length::Fill)
     .style(move |_| container::Style {
-        background: Some(Background::Color(s.bg_base)),
-        border: Border { color: s.border, width: 0.0, radius: 0.0.into() },
+        background: Some(Background::Color(s.paper)),
+        border: Border { color: s.rule_dark, width: 0.0, radius: 0.0.into() },
         ..Default::default()
     })
     .into()

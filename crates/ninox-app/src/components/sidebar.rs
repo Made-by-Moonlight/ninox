@@ -56,12 +56,12 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     let actions_padding = Padding { top: 4.0, right: 12.0, bottom: 12.0, left: 12.0 };
 
     // ── Header: brand row (beside the traffic lights) ───────────────────────────
-    let brand_row = container(text("Ninox").size(13).color(s.text_primary))
+    let brand_row = container(text("Ninox").size(13).color(s.ink))
         .padding(brand_padding)
         .width(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(Background::Color(s.bg_sidebar)),
-            border: Border { color: s.border, width: 0.0, radius: 0.0.into() },
+            background: Some(Background::Color(s.paper_2)),
+            border: Border { color: s.rule_dark, width: 0.0, radius: 0.0.into() },
             ..Default::default()
         });
 
@@ -85,15 +85,15 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
             button(
                 text(bell_label.clone())
                     .size(11)
-                    .color(if unread > 0 { s.accent } else { s.text_muted })
+                    .color(if unread > 0 { s.accent } else { s.faint })
                     .width(Length::Fill)
                     .align_x(iced::alignment::Horizontal::Center)
             )
             .on_press(Message::ToggleNotifications)
             .style(move |_theme, _status| button::Style {
                 background: None,
-                text_color: if unread > 0 { s.accent } else { s.text_muted },
-                border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
+                text_color: if unread > 0 { s.accent } else { s.faint },
+                border: Border { color: s.rule_dark, width: 1.0, radius: 4.0.into() },
                 ..Default::default()
             })
             .padding([2, 4])
@@ -101,15 +101,15 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
             button(
                 text(prs_label.clone())
                     .size(11)
-                    .color(s.text_secondary)
+                    .color(s.ink_2)
                     .width(Length::Fill)
                     .align_x(iced::alignment::Horizontal::Center)
             )
             .on_press(Message::NavigatePrList)
             .style(move |_theme, _status| button::Style {
                 background: None,
-                text_color: s.text_secondary,
-                border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
+                text_color: s.ink_2,
+                border: Border { color: s.rule_dark, width: 1.0, radius: 4.0.into() },
                 ..Default::default()
             })
             .padding([2, 8])
@@ -117,15 +117,15 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
             button(
                 text("Brain")
                     .size(11)
-                    .color(s.text_secondary)
+                    .color(s.ink_2)
                     .width(Length::Fill)
                     .align_x(iced::alignment::Horizontal::Center)
             )
             .on_press(Message::NavigateBrain)
             .style(move |_theme, _status| button::Style {
                 background: None,
-                text_color: s.text_secondary,
-                border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
+                text_color: s.ink_2,
+                border: Border { color: s.rule_dark, width: 1.0, radius: 4.0.into() },
                 ..Default::default()
             })
             .padding([2, 8])
@@ -137,8 +137,8 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     .padding(actions_padding)
     .width(Length::Fill)
     .style(move |_theme| container::Style {
-        background: Some(Background::Color(s.bg_sidebar)),
-        border: Border { color: s.border, width: 0.0, radius: 0.0.into() },
+        background: Some(Background::Color(s.paper_2)),
+        border: Border { color: s.rule_dark, width: 0.0, radius: 0.0.into() },
         ..Default::default()
     });
 
@@ -151,7 +151,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
         let orch_id = orch.id.clone();
         let is_viewing = matches!(&app.view, View::SessionDetail { session_id, .. } if session_id == &orch.id);
 
-        let chevron = button(text(toggle_icon).size(10).color(s.text_muted))
+        let chevron = button(text(toggle_icon).size(10).color(s.faint))
             .on_press(Message::SelectOrchestrator(if is_expanded {
                 None
             } else {
@@ -164,11 +164,11 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
             })
             .padding([6, 8]);
 
-        let name_btn = button(text(&orch.name).size(13).color(s.text_primary))
+        let name_btn = button(text(&orch.name).size(13).color(s.ink))
             .on_press(Message::NavigateSession(orch_id.clone()))
             .style(move |_theme, _status| button::Style {
-                background: if is_viewing { Some(Background::Color(s.bg_surface)) } else { None },
-                text_color: s.text_primary,
+                background: if is_viewing { Some(Background::Color(s.card)) } else { None },
+                text_color: s.ink,
                 border: Border::default(),
                 ..Default::default()
             })
@@ -176,7 +176,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
             .width(Length::Fill);
 
         let remove_id = orch.id.clone();
-        let remove_btn = button(text("×").size(12).color(s.text_muted))
+        let remove_btn = button(text("×").size(12).color(s.faint))
             .on_press(Message::RemoveOrchestrator(remove_id))
             .style(|_theme, _status| button::Style {
                 background: None,
@@ -240,8 +240,8 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     .padding([8, 12])
     .width(Length::Fill)
     .style(move |_theme| container::Style {
-        background: Some(Background::Color(s.bg_sidebar)),
-        border: Border { color: s.border, width: 1.0, radius: 0.0.into() },
+        background: Some(Background::Color(s.paper_2)),
+        border: Border { color: s.rule_dark, width: 1.0, radius: 0.0.into() },
         ..Default::default()
     });
 
@@ -261,8 +261,8 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
         .width(Length::Fixed(app.sidebar_width))
         .height(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(Background::Color(s.bg_sidebar)),
-            border: Border { color: s.border, width: 1.0, radius: 0.0.into() },
+            background: Some(Background::Color(s.paper_2)),
+            border: Border { color: s.rule_dark, width: 1.0, radius: 0.0.into() },
             ..Default::default()
         })
         .into()
@@ -276,7 +276,7 @@ fn worker_row<'a>(app: &'a App, session: &'a ninox_core::types::Session) -> Elem
     );
 
     let color = s.status_color(&session.status);
-    let bg = if is_selected { Some(Background::Color(s.bg_surface)) } else { None };
+    let bg = if is_selected { Some(Background::Color(s.card)) } else { None };
     let session_id = session.id.clone();
 
     button(
@@ -284,8 +284,8 @@ fn worker_row<'a>(app: &'a App, session: &'a ninox_core::types::Session) -> Elem
             status_dot(color),
             Space::new(6, 0),
             column![
-                text(&session.name).size(12).color(s.text_primary),
-                text(repo_short(&session.repo)).size(10).color(s.text_secondary),
+                text(&session.name).size(12).color(s.ink),
+                text(repo_short(&session.repo)).size(10).color(s.ink_2),
             ]
             .spacing(1),
         ]
@@ -295,7 +295,7 @@ fn worker_row<'a>(app: &'a App, session: &'a ninox_core::types::Session) -> Elem
     .on_press(Message::NavigateSession(session_id))
     .style(move |_theme, _status| button::Style {
         background: bg,
-        text_color: s.text_primary,
+        text_color: s.ink,
         border: Border::default(),
         ..Default::default()
     })
@@ -312,7 +312,7 @@ fn standalone_row<'a>(app: &'a App, session: &'a ninox_core::types::Session) -> 
     );
 
     let color = s.status_color(&session.status);
-    let bg = if is_selected { Some(Background::Color(s.bg_surface)) } else { None };
+    let bg = if is_selected { Some(Background::Color(s.card)) } else { None };
     let nav_id = session.id.clone();
     let remove_id = session.id.clone();
 
@@ -321,8 +321,8 @@ fn standalone_row<'a>(app: &'a App, session: &'a ninox_core::types::Session) -> 
             status_dot(color),
             Space::new(6, 0),
             column![
-                text(&session.name).size(12).color(s.text_primary),
-                text(repo_short(&session.repo)).size(10).color(s.text_secondary),
+                text(&session.name).size(12).color(s.ink),
+                text(repo_short(&session.repo)).size(10).color(s.ink_2),
             ]
             .spacing(1),
         ]
@@ -332,14 +332,14 @@ fn standalone_row<'a>(app: &'a App, session: &'a ninox_core::types::Session) -> 
     .on_press(Message::NavigateSession(nav_id))
     .style(move |_theme, _status| button::Style {
         background: bg,
-        text_color: s.text_primary,
+        text_color: s.ink,
         border: Border::default(),
         ..Default::default()
     })
     .padding(iced::Padding { top: 5.0, right: 4.0, bottom: 5.0, left: 26.0 })
     .width(Length::Fill);
 
-    let remove_btn = button(text("×").size(12).color(s.text_muted))
+    let remove_btn = button(text("×").size(12).color(s.faint))
         .on_press(Message::RemoveSession(remove_id))
         .style(|_theme, _status| button::Style {
             background: None,
@@ -366,9 +366,9 @@ fn theme_footer<'a>(app: &'a App, s: &'a ColorScheme) -> Element<'a, Message> {
                 ThemeVariant::Ninox => "Ninox",
             };
             let swatch_color = match variant {
-                ThemeVariant::Light  => crate::theme::light().bg_base,
-                ThemeVariant::Dark   => crate::theme::dark().bg_base,
-                ThemeVariant::Ninox => crate::theme::warm_dark().bg_base,
+                ThemeVariant::Light  => crate::theme::light().paper,
+                ThemeVariant::Dark   => crate::theme::dark().paper,
+                ThemeVariant::Ninox => crate::theme::dark().paper,
             };
 
             let check: Element<Message> = if is_active {
@@ -381,7 +381,7 @@ fn theme_footer<'a>(app: &'a App, s: &'a ColorScheme) -> Element<'a, Message> {
                 row![
                     theme_swatch(swatch_color),
                     Space::new(6, 0),
-                    text(label).size(12).color(if is_active { s.text_primary } else { s.text_secondary }),
+                    text(label).size(12).color(if is_active { s.ink } else { s.ink_2 }),
                     Space::new(Length::Fill, 0),
                     check,
                 ]
@@ -395,7 +395,7 @@ fn theme_footer<'a>(app: &'a App, s: &'a ColorScheme) -> Element<'a, Message> {
                     None
                 },
                 border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 6.0.into() },
-                text_color: s.text_primary,
+                text_color: s.ink,
                 ..Default::default()
             })
             .padding([6, 10])
@@ -408,7 +408,7 @@ fn theme_footer<'a>(app: &'a App, s: &'a ColorScheme) -> Element<'a, Message> {
             container(Space::new(Length::Fill, 1))
                 .width(Length::Fill)
                 .style(move |_theme| container::Style {
-                    background: Some(Background::Color(s.border)),
+                    background: Some(Background::Color(s.rule_dark)),
                     ..Default::default()
                 })
                 .into(),
@@ -424,9 +424,9 @@ fn theme_footer<'a>(app: &'a App, s: &'a ColorScheme) -> Element<'a, Message> {
 
     let trigger = button(
         row![
-            text("Theme").size(11).color(s.text_muted),
+            text("Theme").size(11).color(s.faint),
             Space::new(Length::Fill, 0),
-            text(format!("{variant_label} {arrow}")).size(11).color(s.text_primary),
+            text(format!("{variant_label} {arrow}")).size(11).color(s.ink),
         ]
         .align_y(Alignment::Center),
     )
@@ -434,7 +434,7 @@ fn theme_footer<'a>(app: &'a App, s: &'a ColorScheme) -> Element<'a, Message> {
     .style(|_theme, _status| button::Style {
         background: None,
         border: Border::default(),
-        text_color: s.text_primary,
+        text_color: s.ink,
         ..Default::default()
     })
     .padding([4, 0])
@@ -446,8 +446,8 @@ fn theme_footer<'a>(app: &'a App, s: &'a ColorScheme) -> Element<'a, Message> {
         .padding([8, 12])
         .width(Length::Fill)
         .style(move |_theme| container::Style {
-            background: Some(Background::Color(s.bg_sidebar)),
-            border: Border { color: s.border, width: 1.0, radius: 0.0.into() },
+            background: Some(Background::Color(s.paper_2)),
+            border: Border { color: s.rule_dark, width: 1.0, radius: 0.0.into() },
             ..Default::default()
         })
         .into()

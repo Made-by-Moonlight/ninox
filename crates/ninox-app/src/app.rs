@@ -1051,7 +1051,7 @@ impl App {
         };
         use iced::{Background, Length};
 
-        let bg = state.scheme.bg_base;
+        let bg = state.scheme.paper;
         let main: Element<Message> = match &state.view {
             View::FleetBoard { scope } => fleet_board(state, scope.as_ref()),
             View::SessionDetail { session_id, panel } => session_detail(state, session_id, panel),
@@ -1062,7 +1062,7 @@ impl App {
         let base: Element<Message> = container(
             row![
                 sidebar(state),
-                App::drag_handle(DragTarget::Sidebar, state.scheme.border),
+                App::drag_handle(DragTarget::Sidebar, state.scheme.rule_dark),
                 main,
             ].height(Length::Fill),
         )

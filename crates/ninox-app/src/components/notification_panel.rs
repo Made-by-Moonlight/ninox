@@ -21,11 +21,11 @@ fn kind_label(kind: &NotificationKind) -> &'static str {
 
 fn kind_color(kind: &NotificationKind, s: &ColorScheme) -> Color {
     match kind {
-        NotificationKind::CiFailure        => s.status_red,
-        NotificationKind::AgentStuck       => s.status_yellow,
-        NotificationKind::PrNeedsAttention => s.status_blue,
-        NotificationKind::MergeConflict    => s.status_red,
-        NotificationKind::WorkerDone       => s.status_grey,
+        NotificationKind::CiFailure        => s.status_ci_failed,
+        NotificationKind::AgentStuck       => s.status_review,
+        NotificationKind::PrNeedsAttention => s.status_pr_open,
+        NotificationKind::MergeConflict    => s.status_ci_failed,
+        NotificationKind::WorkerDone       => s.status_done,
     }
 }
 
@@ -33,9 +33,9 @@ pub fn notification_panel<'a>(app: &'a App) -> Element<'a, Message> {
     let s = &app.scheme;
 
     let header = row![
-        text("Notifications").size(12).color(s.text_primary),
+        text("Notifications").size(12).color(s.ink),
         Space::new(Length::Fill, 0),
-        button(text("Clear all").size(10).color(s.text_muted))
+        button(text("Clear all").size(10).color(s.faint))
             .on_press(Message::DismissAllNotifications)
             .style(|_t, _s| button::Style {
                 background: None,
@@ -50,7 +50,7 @@ pub fn notification_panel<'a>(app: &'a App) -> Element<'a, Message> {
     let items: Vec<Element<Message>> = if app.notifications.is_empty() {
         vec![
             container(
-                text("No notifications").size(12).color(s.text_muted),
+                text("No notifications").size(12).color(s.faint),
             )
             .padding([12, 16])
             .into()
@@ -73,7 +73,7 @@ pub fn notification_panel<'a>(app: &'a App) -> Element<'a, Message> {
                     Space::new(6, 0),
                     text(kind_label(&n.kind)).size(10).color(label_color),
                     Space::new(Length::Fill, 0),
-                    button(text("×").size(12).color(s.text_muted))
+                    button(text("×").size(12).color(s.faint))
                         .on_press(Message::DismissNotification(n_id))
                         .style(|_t, _s| button::Style {
                             background: None,
@@ -83,15 +83,15 @@ pub fn notification_panel<'a>(app: &'a App) -> Element<'a, Message> {
                         .padding([0, 4]),
                 ]
                 .align_y(Alignment::Center),
-                text(&n.title).size(12).color(s.text_primary),
-                text(&n.body).size(11).color(s.text_secondary),
+                text(&n.title).size(12).color(s.ink),
+                text(&n.body).size(11).color(s.ink_2),
             ]
             .spacing(2);
 
             let mut btn = button(row_content)
                 .style(move |_t, _s| button::Style {
-                    background: Some(Background::Color(s.bg_elevated)),
-                    border: Border { color: s.border, width: 1.0, radius: 4.0.into() },
+                    background: Some(Background::Color(s.card)),
+                    border: Border { color: s.rule_dark, width: 1.0, radius: 4.0.into() },
                     ..Default::default()
                 })
                 .padding([8, 12]);
@@ -115,8 +115,8 @@ pub fn notification_panel<'a>(app: &'a App) -> Element<'a, Message> {
     )
     .width(Length::Fill)
     .style(move |_| container::Style {
-        background: Some(Background::Color(s.bg_surface)),
-        border: Border { color: s.border, width: 1.0, radius: 6.0.into() },
+        background: Some(Background::Color(s.card)),
+        border: Border { color: s.rule_dark, width: 1.0, radius: 6.0.into() },
         ..Default::default()
     })
     .into()
