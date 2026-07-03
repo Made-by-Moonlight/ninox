@@ -185,7 +185,24 @@ impl AppConfig {
         })
     }
 
+    /// Path to the `config.toml` file.
+    ///
+    /// Honors the `NINOX_CONFIG` environment variable as an override: if
+    /// set, it is treated as an absolute path to the config file itself
+    /// (not a directory) and returned as-is. This is the same override
+    /// consumed by spawned agent sessions (see the `NINOX_CONFIG` env var
+    /// set alongside `NINOX_BIN` when launching orchestrator sessions), and
+    /// it also lets tests redirect config reads/writes away from the real
+    /// user config file (e.g. `~/Library/Application Support/ninox/config.toml`
+    /// on macOS) without mutating developer machine state.
+    ///
+    /// Falls back to `<config_dir>/ninox/config.toml` when unset.
     pub fn config_path() -> PathBuf {
+        if let Ok(p) = std::env::var("NINOX_CONFIG") {
+            if !p.is_empty() {
+                return PathBuf::from(p);
+            }
+        }
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("ninox")
@@ -292,5 +309,35 @@ mod tests {
     fn resolved_orchestrator_root_default() {
         let cfg = AppConfig::default();
         assert!(cfg.resolved_orchestrator_root().ends_with("ninox/orchestrator"));
+    }
+
+    /// `NINOX_CONFIG` is a process-global environment variable and `cargo
+    /// test` runs test functions on parallel threads, so mutating it is
+    /// inherently racy against any other test that reads `config_path()`
+    /// concurrently. This is the ONLY test in the crate that touches the
+    /// var, and the guard below serializes it against itself (in case this
+    /// test is ever duplicated/retried) while keeping the mutation/restore
+    /// window as small as possible.
+    static NINOX_CONFIG_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn config_path_honors_ninox_config_env() {
+        let _guard = NINOX_CONFIG_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("NINOX_CONFIG").ok();
+
+        let dir = tempdir().unwrap();
+        let override_path = dir.path().join("config_path_honors_ninox_config_env.toml");
+        std::env::set_var("NINOX_CONFIG", &override_path);
+
+        let result = std::panic::catch_unwind(|| {
+            assert_eq!(AppConfig::config_path(), override_path);
+        });
+
+        match prior {
+            Some(v) => std::env::set_var("NINOX_CONFIG", v),
+            None    => std::env::remove_var("NINOX_CONFIG"),
+        }
+
+        result.unwrap();
     }
 }

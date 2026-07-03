@@ -1977,12 +1977,34 @@ mod tests {
 
     #[test]
     fn t_toggles_light_dark() {
-        let m = base(test_engine());
-        let before = m.active_variant;
-        let m = press(m, "t");
-        assert_ne!(m.active_variant, before);
-        let m = press(m, "t");
-        assert_eq!(m.active_variant, before);
+        // `Message::SwitchTheme` calls `state.config.save()`, which writes to
+        // `AppConfig::config_path()`. Redirect that to a tempfile so this
+        // test never touches the real user config
+        // (e.g. `~/Library/Application Support/ninox/config.toml`).
+        // `NINOX_CONFIG` is process-global and `cargo test` runs tests in
+        // parallel threads; this is the only test in this file that
+        // exercises `SwitchTheme`/`config.save()`, which keeps the race
+        // window to "this test's own env mutation vs. itself".
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("t_toggles_light_dark_config.toml");
+        let prior = std::env::var("NINOX_CONFIG").ok();
+        std::env::set_var("NINOX_CONFIG", &config_path);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let m = base(test_engine());
+            let before = m.active_variant;
+            let m = press(m, "t");
+            assert_ne!(m.active_variant, before);
+            let m = press(m, "t");
+            assert_eq!(m.active_variant, before);
+        }));
+
+        match prior {
+            Some(v) => std::env::set_var("NINOX_CONFIG", v),
+            None    => std::env::remove_var("NINOX_CONFIG"),
+        }
+
+        result.unwrap();
     }
 
     #[test]
