@@ -52,7 +52,7 @@ versions). The user's `~/.tmux.conf` no longer applies. Config contents:
 
 ```
 set -g default-terminal "tmux-256color"
-set -as terminal-features "xterm-256color:RGB:usstyle:extkeys:hyperlinks"
+set -as terminal-features "xterm*:RGB:usstyle:extkeys:hyperlinks"
 set -s extended-keys always
 set -s extended-keys-format csi-u
 set -g history-limit 100000
@@ -66,7 +66,10 @@ set -g focus-events on
 `extended-keys always` + `extended-keys-format csi-u` + the `extkeys` feature flag is
 the Shift+Enter fix: the inner app's kitty-protocol negotiation flows through tmux to
 the app's emulator and back. Minimum tmux version: **3.2** (checked at startup with a
-clear error; 3.6a is current locally).
+clear error; 3.6a is current locally). tmux >= 3.5 is required for
+`extended-keys-format csi-u` to actually take effect; older versions (still >= 3.2, so
+they pass the startup check) log a warning and Shift+Enter may not reach apps
+correctly.
 
 **Migration:** sessions created by older builds live on the default tmux socket and
 will not appear on the ninox socket. tmux cannot move a session between servers, so:
@@ -122,8 +125,10 @@ is read from the live alacritty `Term`:
 tmux pane history is the source of truth (`history-limit 100000`).
 
 - On scroll above the live screen, fetch the needed range with
-  `capture-pane -e -J -S <start> -E <end>`, parse the styled text into render-ready
-  lines with a throwaway vte parser, and cache them.
+  `capture-pane -e -S <start> -E <end>`, parse the styled text into render-ready
+  lines with a throwaway vte parser, and cache them. Deliberately omits `-J` so
+  tmux's own line wrapping is preserved instead of being joined back into logical
+  lines.
 - Live rendering is unaffected; "jump to latest" drops the history view.
 - History survives reattach for free (tmux keeps it).
 - Selection/copy works across cached history lines.

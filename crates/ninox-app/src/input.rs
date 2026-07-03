@@ -3,10 +3,10 @@
 //!
 //! Modified functional keys are always emitted in kitty CSI-u form: ninox
 //! only ever talks to its own tmux server (extended-keys always), which
-//! forwards them to applications that requested them and downgrades them
-//! for applications that didn't — identical to a native extended-keys
-//! terminal. Legacy default-socket sessions may not understand CSI-u; they
-//! degrade exactly as they did before this feature existed.
+//! forwards them as CSI-u to every application, whether or not it
+//! negotiated extended keys — `extended-keys always` never downgrades,
+//! it always forwards. Legacy default-socket sessions may not understand
+//! CSI-u; they degrade exactly as they did before this feature existed.
 
 use alacritty_terminal::term::TermMode;
 use iced::keyboard::{key::Named, Key, Modifiers};
