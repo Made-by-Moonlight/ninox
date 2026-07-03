@@ -258,16 +258,6 @@ pub async fn pipe_pane(id: &str, dest_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Resize a tmux window to the given dimensions.
-pub async fn resize_window(id: &str, cols: u16, rows: u16) -> Result<()> {
-    run_session_scoped(&[
-        "resize-window", "-t", id,
-        "-x", &cols.to_string(),
-        "-y", &rows.to_string(),
-    ]).await?;
-    Ok(())
-}
-
 /// Capture the current visible content of a pane with escape sequences.
 /// Used to replay initial output that was emitted before the FIFO pipe connected.
 pub async fn capture_pane(id: &str) -> Vec<u8> {

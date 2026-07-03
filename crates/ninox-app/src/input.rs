@@ -109,8 +109,6 @@ pub fn encode_key(
 }
 
 /// Wrap pasted text in bracketed-paste markers when the app asked for them.
-// Wired up by the attached-client integration (app.rs); tests exercise it until then.
-#[allow(dead_code)]
 pub fn encode_paste(text: &str, mode: &TermMode) -> Vec<u8> {
     if mode.contains(TermMode::BRACKETED_PASTE) {
         let mut v = b"\x1b[200~".to_vec();
@@ -124,8 +122,6 @@ pub fn encode_paste(text: &str, mode: &TermMode) -> Vec<u8> {
 
 /// SGR-encode a wheel event for the inner app, or None if ninox's own
 /// scrollback should consume the wheel. col/row are 0-based cells.
-// Wired up by the attached-client integration (app.rs); tests exercise it until then.
-#[allow(dead_code)]
 pub fn encode_wheel(lines_up: i32, col: usize, row: usize, mode: &TermMode) -> Option<Vec<u8>> {
     if !mode.intersects(TermMode::MOUSE_MODE) {
         return None;
