@@ -5,7 +5,7 @@
 use iced::font::{Family, Stretch, Style as FontStyle, Weight};
 use iced::widget::{container, text, Space};
 use iced::{Background, Border, Color, Element, Font, Length, Shadow, Vector};
-use ninox_core::types::SessionStatus;
+use ninox_core::types::{CIStatus, SessionStatus};
 
 use crate::theme::ColorScheme;
 
@@ -80,6 +80,18 @@ pub fn stamp_word(status: &SessionStatus) -> &'static str {
         Mergeable          => "Ready",
         Done               => "Filed",
         Terminated         => "Closed",
+    }
+}
+
+/// Status color for a CI run: any failure → ci_failed, otherwise pending
+/// checks → review, otherwise all green → working.
+pub fn ci_color(s: &ColorScheme, ci: &CIStatus) -> Color {
+    if ci.failing > 0 {
+        s.status_ci_failed
+    } else if ci.pending > 0 {
+        s.status_review
+    } else {
+        s.status_working
     }
 }
 

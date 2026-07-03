@@ -88,13 +88,7 @@ pub fn info_panel<'a>(
 
             if let Some(ci) = ci {
                 items.push(Space::new(0, 12).into());
-                let ci_color = if ci.failing > 0 {
-                    s.status_ci_failed
-                } else if ci.pending > 0 {
-                    s.status_review
-                } else {
-                    s.status_working
-                };
+                let ci_color = crate::style::ci_color(s, ci);
                 let glyph = if ci.failing > 0 {
                     "✗"
                 } else if ci.pending > 0 {

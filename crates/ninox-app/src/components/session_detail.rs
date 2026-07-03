@@ -139,15 +139,7 @@ pub fn session_detail<'a>(
         .and_then(|p| app.review_threads.get(&p.id))
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
-    let ci_color = ci.map(|c| {
-        if c.failing > 0 {
-            s.status_ci_failed
-        } else if c.pending > 0 {
-            s.status_review
-        } else {
-            s.status_working
-        }
-    });
+    let ci_color = ci.map(|c| crate::style::ci_color(s, c));
 
     // ── Header ────────────────────────────────────────────────────────────────
     let status_dot = container(Space::new(0, 0))
