@@ -157,10 +157,7 @@ pub enum Message {
     BrainFilterQuery(String),
     BrainReindex,
     BrainSetMode(BrainMode),
-    // TODO(field-notes): constructed by the Task 12 drawers/reading-pane UI.
-    #[allow(dead_code)]
     BrainToggleDrawer(String),
-    #[allow(dead_code)]
     BrainLinkClicked(iced::widget::markdown::Url),
     BrainSwitchCatalogue(usize),
     ToggleNotifications,

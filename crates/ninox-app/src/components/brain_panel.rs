@@ -4,7 +4,10 @@ use iced::{
 };
 
 use crate::app::{App, BrainMode, Message};
-use crate::style::{hard_shadow, hline, micro_label, shadow_alpha, MONO, SERIF, SERIF_ITALIC};
+use crate::style::{
+    dotted_rule, hard_shadow, heavy_frame, hline, micro_label, shadow_alpha, stamp, vline, MONO,
+    MONO_MEDIUM, SERIF, SERIF_ITALIC, SERIF_MEDIUM,
+};
 use crate::theme::ColorScheme;
 use ninox_core::BrainEntry;
 
@@ -33,7 +36,6 @@ pub fn category_color(s: &ColorScheme, ty: &str) -> Color {
 }
 
 /// `[[target]]` occurrences, in order.
-#[allow(dead_code)] // TODO(field-notes): consumed by the Task 12 reading pane (backlinks)
 pub fn extract_wikilinks(body: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = body;
@@ -84,7 +86,6 @@ pub fn resolve_link<'a>(entries: &'a [BrainEntry], link: &str) -> Option<&'a Bra
 }
 
 /// Entries whose bodies wikilink to `target` ("Cited by").
-#[allow(dead_code)] // TODO(field-notes): consumed by the Task 12 reading pane (backlinks)
 pub fn backlinks_for<'a>(entries: &'a [BrainEntry], target: &BrainEntry) -> Vec<&'a BrainEntry> {
     entries.iter()
         .filter(|e| e.id != target.id)
@@ -167,55 +168,6 @@ fn matches_filter(entry: &BrainEntry, filter: &str) -> bool {
         || entry.id.to_lowercase().contains(&filter)
         || entry.entry_type.to_lowercase().contains(&filter)
         || entry.tags.iter().any(|t| t.to_lowercase().contains(&filter))
-}
-
-fn entry_row<'a>(app: &'a App, entry: &'a BrainEntry) -> Element<'a, Message> {
-    let s = &app.scheme;
-    let is_selected = app.brain_view.selected.as_deref() == Some(entry.id.as_str());
-    let id = entry.id.clone();
-
-    button(
-        column![
-            text(&entry.name).size(12).color(s.ink),
-            text(&entry.id).size(10).color(s.faint),
-        ]
-        .spacing(2),
-    )
-    .on_press(Message::BrainSelectEntry(id))
-    .width(Length::Fill)
-    .style(move |_theme, status| button::Style {
-        background: Some(Background::Color(if is_selected {
-            s.card
-        } else {
-            match status {
-                button::Status::Hovered => s.card,
-                _ => s.card,
-            }
-        })),
-        text_color: s.ink,
-        border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 0.0.into() },
-        ..Default::default()
-    })
-    .padding([8, 12])
-    .into()
-}
-
-fn section<'a>(app: &'a App, entry_type: &str, entries: Vec<&'a BrainEntry>) -> Element<'a, Message> {
-    let s = &app.scheme;
-
-    let heading = container(
-        text(format!("{entry_type} ({})", entries.len())).size(10).color(s.faint),
-    )
-    .padding([6, 12])
-    .width(Length::Fill)
-    .style(move |_theme| container::Style {
-        background: Some(Background::Color(s.card)),
-        ..Default::default()
-    });
-
-    let rows: Vec<Element<Message>> = entries.iter().map(|e| entry_row(app, e)).collect();
-
-    column(std::iter::once(heading.into()).chain(rows)).into()
 }
 
 /// One segment of the ✦/☰ mode toggle: micro-label typography, ink fill when active.
@@ -446,66 +398,10 @@ fn pinboard_body(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// Catalogue mode: volume plate + the existing grouped list on the left,
-/// reading pane on the right (drawer/reading-pane restyle lands in Task 12).
+/// Catalogue mode: 272px card-catalogue drawers on the left, markdown
+/// reading pane on the right (mockup `.cat-body`/`.drawers`/`.reading`).
 fn catalogue_body(app: &App) -> Element<'_, Message> {
-    let s = &app.scheme;
-    let (_, hero_a, _) = shadow_alpha(s);
-
-    let filtered: Vec<&BrainEntry> = app
-        .brain_view
-        .entries
-        .iter()
-        .filter(|e| matches_filter(e, &app.brain_view.filter))
-        .collect();
-
-    let list: Element<Message> = if filtered.is_empty() {
-        container(
-            text(if app.brain_view.entries.is_empty() {
-                "No entries yet. Write a Markdown file into the brain directory, then Reindex."
-            } else {
-                "No entries match this filter."
-            })
-            .size(13)
-            .color(s.faint),
-        )
-        .padding([40, 20])
-        .width(Length::Fill)
-        .into()
-    } else {
-        let mut by_type: Vec<(&str, Vec<&BrainEntry>)> = Vec::new();
-        for entry in &filtered {
-            match by_type.iter_mut().find(|(t, _)| *t == entry.entry_type.as_str()) {
-                Some((_, v)) => v.push(entry),
-                None => by_type.push((entry.entry_type.as_str(), vec![*entry])),
-            }
-        }
-        // Taxonomy order first, unknown types alphabetically after (mirrors
-        // `categories()`).
-        by_type.sort_by_key(|(t, _)| match TAXONOMY.iter().position(|x| x == t) {
-            Some(i) => (0, format!("{i:03}")),
-            None    => (1, t.to_string()),
-        });
-
-        let sections: Vec<Element<Message>> =
-            by_type.into_iter().map(|(t, entries)| section(app, t, entries)).collect();
-
-        scrollable(column(sections)).height(Length::Fill).into()
-    };
-
-    let left = container(column![volume_plate(app), list])
-        .width(Length::Fixed(272.0))
-        .height(Length::Fill)
-        .style(move |_theme| container::Style {
-            background: Some(Background::Color(s.card)),
-            border: Border { color: s.ink, width: 2.0, radius: 3.0.into() },
-            shadow: hard_shadow(s, 4.0, 5.0, hero_a),
-            ..Default::default()
-        });
-
-    let detail = detail_pane(app);
-
-    row![left, detail]
+    row![drawers_rail(app), reading_pane(app)]
         .spacing(16)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -513,7 +409,190 @@ fn catalogue_body(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-fn detail_pane(app: &App) -> Element<'_, Message> {
+/// The drawers rail: volume plate atop one drawer per category (taxonomy
+/// order), each expandable to a sorted list of matching entries.
+fn drawers_rail(app: &App) -> Element<'_, Message> {
+    let s = &app.scheme;
+
+    let filtered_entries: Vec<BrainEntry> = app
+        .brain_view
+        .entries
+        .iter()
+        .filter(|e| matches_filter(e, &app.brain_view.filter))
+        .cloned()
+        .collect();
+
+    let body: Element<Message> = if filtered_entries.is_empty() {
+        container(
+            text(if app.brain_view.entries.is_empty() {
+                "No entries yet. Write a Markdown file into the brain directory, then Reindex."
+            } else {
+                "No entries match this filter."
+            })
+            .size(12)
+            .font(SERIF_ITALIC)
+            .color(s.faint),
+        )
+        .padding([24, 16])
+        .into()
+    } else {
+        let drawers: Vec<Element<Message>> = categories(&filtered_entries)
+            .into_iter()
+            .map(|(cat, count)| drawer(app, &cat, count, &filtered_entries))
+            .collect();
+        column(drawers).into()
+    };
+
+    container(column![volume_plate(app), scrollable(body).height(Length::Fill)])
+        .width(Length::Fixed(272.0))
+        .height(Length::Fill)
+        .style(move |_theme| heavy_frame(s))
+        .into()
+}
+
+/// One drawer: header (caret, category dot, name, count, pull) plus, when
+/// open, its sorted entries (mockup `.drawer`/`.drawer-h`/`.dentry`).
+fn drawer<'a>(
+    app: &'a App,
+    cat: &str,
+    count: usize,
+    filtered_entries: &[BrainEntry],
+) -> Element<'a, Message> {
+    let s = &app.scheme;
+    let color = category_color(s, cat);
+    let is_open = app.brain_view.open_drawers.contains(cat);
+    let caret = if is_open { "▾" } else { "▸" };
+
+    let pull = container(Space::new(22, 7)).style(move |_theme| container::Style {
+        border: Border { color: s.rule_dark, width: 1.5, radius: 4.0.into() },
+        ..Default::default()
+    });
+
+    let header = button(
+        row![
+            text(caret).size(9).color(s.faint).width(Length::Fixed(10.0)),
+            text("●").size(9).color(color),
+            text(cat.to_string()).size(15).font(SERIF),
+            Space::new(Length::Fill, 0),
+            text(count.to_string()).size(9.5).font(MONO).color(s.faint),
+            pull,
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .on_press(Message::BrainToggleDrawer(cat.to_string()))
+    .width(Length::Fill)
+    .padding([10, 15])
+    .style(move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered);
+        button::Style {
+            background: Some(Background::Color(if hovered { s.paper } else { Color::TRANSPARENT })),
+            text_color: if hovered { s.ink } else { color },
+            border: Border::default(),
+            ..Default::default()
+        }
+    });
+
+    let mut children: Vec<Element<Message>> = vec![header.into()];
+
+    if is_open {
+        let mut entries: Vec<&BrainEntry> =
+            filtered_entries.iter().filter(|e| e.entry_type == cat).collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        children.extend(entries.into_iter().map(|e| dentry_row(app, e)));
+    }
+
+    children.push(hline(s.rule, 1.0));
+
+    column(children).into()
+}
+
+/// One entry in an open drawer. Selected = accent 3px left bar + `card` bg
+/// + `MONO_MEDIUM`; hovered = `paper_2` bg (visibly distinct from the
+/// transparent resting state) — an old regression collapsed hover to a
+/// no-op, so this must render differently in all three states.
+fn dentry_row<'a>(app: &'a App, entry: &BrainEntry) -> Element<'a, Message> {
+    let s = &app.scheme;
+    let is_selected = app.brain_view.selected.as_deref() == Some(entry.id.as_str());
+    let id = entry.id.clone();
+    let name = entry.name.clone();
+    let updated: String = entry.updated.as_deref().unwrap_or("").chars().take(10).collect();
+    let bar_color = if is_selected { s.accent } else { Color::TRANSPARENT };
+
+    button(
+        row![
+            vline(bar_color, 3.0),
+            container(
+                row![
+                    text(name).size(10.5).font(if is_selected { MONO_MEDIUM } else { MONO }),
+                    Space::new(Length::Fill, 0),
+                    text(updated).size(8.5).font(MONO).color(s.faint),
+                ]
+                .align_y(Alignment::Center),
+            )
+            .padding(iced::Padding { top: 4.0, right: 16.0, bottom: 4.0, left: 44.0 })
+            .width(Length::Fill),
+        ]
+        .height(Length::Fixed(22.0)),
+    )
+    .on_press(Message::BrainSelectEntry(id))
+    .width(Length::Fill)
+    .padding(0)
+    .style(move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered);
+        button::Style {
+            background: Some(Background::Color(if is_selected {
+                s.card
+            } else if hovered {
+                s.paper_2
+            } else {
+                Color::TRANSPARENT
+            })),
+            text_color: if is_selected || hovered { s.ink } else { s.ink_2 },
+            border: Border::default(),
+            ..Default::default()
+        }
+    })
+    .into()
+}
+
+/// One `dt`/`dd` row of the reading pane's frontmatter description list.
+fn fm_row<'a>(s: &ColorScheme, key: &str, value: String) -> Element<'a, Message> {
+    row![
+        container(micro_label(key, s.faint)).width(Length::Fixed(88.0)),
+        text(value).size(11).font(MONO).color(s.ink_2),
+    ]
+    .align_y(Alignment::Start)
+    .into()
+}
+
+/// A "cited by" backlink chip: mono id in a rule-bordered pill; press
+/// navigates to that entry.
+fn backlink_chip<'a>(s: &'a ColorScheme, entry: &'a BrainEntry) -> Element<'a, Message> {
+    let id = entry.id.clone();
+    button(text(entry.id.clone()).size(10.5).font(MONO))
+        .on_press(Message::BrainSelectEntry(id))
+        .padding([3, 9])
+        .style(move |_theme, status| {
+            let hovered = matches!(status, button::Status::Hovered);
+            button::Style {
+                background: None,
+                text_color: if hovered { s.ink } else { s.ink_2 },
+                border: Border {
+                    color: if hovered { s.ink } else { s.rule_dark },
+                    width: 1.0,
+                    radius: 2.0.into(),
+                },
+                ..Default::default()
+            }
+        })
+        .into()
+}
+
+/// The reading pane: crumb, title + type stamp, frontmatter dl, rendered
+/// markdown body (wikilinks clickable), and a "cited by" backlinks section.
+/// Empty state when nothing is selected (mockup `.reading`).
+fn reading_pane(app: &App) -> Element<'_, Message> {
     let s = &app.scheme;
 
     let selected = app
@@ -523,64 +602,80 @@ fn detail_pane(app: &App) -> Element<'_, Message> {
         .and_then(|id| app.brain_view.entries.iter().find(|e| &e.id == id));
 
     let content: Element<Message> = match selected {
-        None => container(
-            text("Select an entry to view its contents.").size(13).color(s.faint),
-        )
-        .padding(20)
-        .into(),
-        Some(entry) => {
-            let mut meta_rows: Vec<Element<Message>> = vec![
-                row![
-                    text("Type").size(10).color(s.faint).width(Length::Fixed(80.0)),
-                    text(&entry.entry_type).size(12).color(s.ink),
-                ]
-                .into(),
-                row![
-                    text("Path").size(10).color(s.faint).width(Length::Fixed(80.0)),
-                    text(&entry.id).size(12).color(s.ink_2),
-                ]
-                .into(),
+        None => container(text("Nothing pinned tonight.").size(15).font(SERIF_ITALIC).color(s.faint))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into(),
+        Some(e) => {
+            let crumb = text(format!(
+                "brain / {} / {}",
+                e.entry_type,
+                e.id.rsplit('/').next().unwrap_or(&e.id)
+            ))
+            .size(9.5)
+            .font(MONO)
+            .color(s.faint);
+
+            let title = row![
+                text(&e.name).size(32).font(SERIF_MEDIUM).color(s.ink),
+                Space::new(14, 0),
+                stamp(&e.entry_type, category_color(s, &e.entry_type)),
+            ]
+            .align_y(Alignment::Center);
+
+            let mut fm_rows: Vec<Element<Message>> = vec![fm_row(s, "type", e.entry_type.clone())];
+            if !e.tags.is_empty() {
+                fm_rows.push(fm_row(s, "tags", e.tags.join(", ")));
+            }
+            if !e.repos.is_empty() {
+                fm_rows.push(fm_row(s, "repos", e.repos.join(", ")));
+            }
+            if let Some(updated) = &e.updated {
+                fm_rows.push(fm_row(s, "updated", updated.clone()));
+            }
+            let frontmatter = column![
+                hline(s.ink, 2.0),
+                column(fm_rows).spacing(6).padding([10, 2]),
+                hline(s.rule_dark, 1.0),
             ];
-            if let Some(updated) = &entry.updated {
-                meta_rows.push(
-                    row![
-                        text("Updated").size(10).color(s.faint).width(Length::Fixed(80.0)),
-                        text(updated).size(12).color(s.ink_2),
-                    ]
-                    .into(),
-                );
-            }
-            if !entry.tags.is_empty() {
-                meta_rows.push(
-                    row![
-                        text("Tags").size(10).color(s.faint).width(Length::Fixed(80.0)),
-                        text(entry.tags.join(", ")).size(12).color(s.ink_2),
-                    ]
-                    .into(),
-                );
-            }
-            if !entry.repos.is_empty() {
-                meta_rows.push(
-                    row![
-                        text("Repos").size(10).color(s.faint).width(Length::Fixed(80.0)),
-                        text(entry.repos.join(", ")).size(12).color(s.ink_2),
-                    ]
-                    .into(),
-                );
-            }
+
+            let body = container(
+                iced::widget::markdown::view(
+                    &app.brain_view.markdown,
+                    iced::widget::markdown::Settings::default(),
+                    iced::widget::markdown::Style::from_palette(app.scheme.iced_theme().palette()),
+                )
+                .map(Message::BrainLinkClicked),
+            )
+            .max_width(640.0);
+
+            let backs = backlinks_for(&app.brain_view.entries, e);
+            let backlinks: Element<Message> = if backs.is_empty() {
+                Space::new(0, 0).into()
+            } else {
+                let chips: Vec<Element<Message>> =
+                    backs.iter().map(|b| backlink_chip(s, b)).collect();
+                column![
+                    Space::new(0, 22),
+                    dotted_rule(s.rule_dark),
+                    Space::new(0, 12),
+                    micro_label(&format!("Cited by — {} specimens", backs.len()), s.faint).size(9.0),
+                    Space::new(0, 8),
+                    row(chips).spacing(6).wrap(),
+                ]
+                .into()
+            };
 
             column![
-                text(&entry.name).size(18).color(s.ink),
-                Space::new(0, 8),
-                column(meta_rows).spacing(4),
+                crumb,
+                Space::new(0, 14),
+                title,
                 Space::new(0, 16),
-                container(Space::new(Length::Fill, 1)).width(Length::Fill).style(move |_theme| {
-                    container::Style { background: Some(Background::Color(s.rule_dark)), ..Default::default() }
-                }),
-                Space::new(0, 16),
-                text(&entry.body).size(12).color(s.ink).font(iced::Font::MONOSPACE),
+                frontmatter,
+                Space::new(0, 18),
+                body,
+                backlinks,
             ]
-            .padding(20)
             .into()
         }
     };
@@ -588,9 +683,7 @@ fn detail_pane(app: &App) -> Element<'_, Message> {
     container(scrollable(content).height(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(move |_theme| container::Style {
-            background: Some(Background::Color(s.paper)),
-            ..Default::default()
-        })
+        .padding([28, 36])
+        .style(move |_theme| heavy_frame(s))
         .into()
 }
