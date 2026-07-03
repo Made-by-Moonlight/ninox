@@ -1,17 +1,18 @@
 use iced::{
-    widget::{column, container, scrollable, text, Space},
-    Background, Element, Length,
+    widget::{column, container, row, scrollable, text},
+    Alignment, Element, Length,
 };
 
 use crate::{app::{App, Message}, theme::ColorScheme};
 use ninox_core::types::Session;
 
+/// A key/value row: fixed-width micro-label key, mono value.
 fn field<'a>(label: &'static str, value: String, s: &'a ColorScheme) -> Element<'a, Message> {
-    column![
-        text(label).size(10).color(s.faint),
-        text(value).size(12).color(s.ink),
+    row![
+        container(crate::style::micro_label(label, s.faint)).width(Length::Fixed(180.0)),
+        text(value).size(11.5).font(crate::style::MONO).color(s.ink_2),
     ]
-    .spacing(2)
+    .align_y(Alignment::Center)
     .into()
 }
 
@@ -50,22 +51,22 @@ pub fn inspector_panel<'a>(app: &'a App, session: &'a Session) -> Element<'a, Me
         field("Started (unix)", session.started_at.to_string(), s),
     ];
 
-    let content = fields.into_iter().flat_map(|f| {
-        let divider = container(Space::new(Length::Fill, 1.0))
-            .width(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(Background::Color(s.rule_dark)),
-                ..Default::default()
-            });
+    let content: Vec<Element<Message>> = fields.into_iter().flat_map(|f| {
         vec![
-            container(f).padding([8, 16]).width(Length::Fill).into(),
-            divider.into(),
+            container(f).padding([8, 0]).width(Length::Fill).into(),
+            crate::style::dotted_rule(s.rule_dark),
         ]
-    });
+    }).collect();
 
-    scrollable(
-        column(content.collect::<Vec<_>>())
+    container(
+        scrollable(
+            column(content),
+        )
+        .height(Length::Fill),
     )
+    .padding([18, 22])
+    .width(Length::Fill)
     .height(Length::Fill)
+    .style(move |_theme| crate::style::card_style(s))
     .into()
 }
