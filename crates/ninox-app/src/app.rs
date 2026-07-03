@@ -1437,6 +1437,10 @@ mod tests {
 
         // View should be the session detail for that orchestrator
         assert!(matches!(&m.view, View::SessionDetail { session_id, .. } if session_id == orch_id));
+
+        // The newly spawned orchestrator's session must be remembered as the
+        // last-visited session so NavigateLastSession can return to it.
+        assert_eq!(m.last_session.as_deref(), Some(orch_id.as_str()));
     }
 
     #[test]
@@ -1461,6 +1465,36 @@ mod tests {
         let (next, _) = m.update(Message::NavigateLastSession);
         m = next;
         assert!(matches!(&m.view, View::SessionDetail { session_id, .. } if session_id == "sess-a"));
+    }
+
+    #[test]
+    fn navigate_last_session_to_deleted_session_is_noop() {
+        let e = test_engine();
+        let mut m = base(e);
+        let s = Session {
+            id: "sess-a".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+        };
+        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        m = next;
+
+        let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
+        m = next;
+        assert_eq!(m.last_session.as_deref(), Some("sess-a"));
+
+        // Session is removed (e.g. worker finished/removed), but last_session
+        // still points at it.
+        m.sessions.remove("sess-a");
+
+        let (next, _) = m.update(Message::NavigateFleet { scope: None });
+        m = next;
+        assert!(matches!(m.view, View::FleetBoard { .. }));
+
+        let (next, _) = m.update(Message::NavigateLastSession);
+        m = next;
+        assert!(matches!(m.view, View::FleetBoard { .. }));
     }
 
     #[test]
