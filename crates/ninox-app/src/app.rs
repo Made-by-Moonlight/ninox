@@ -594,9 +594,15 @@ impl App {
                             // silently proceed).
                             return Task::none();
                         }
-                        state.spawn_modal = None;
 
                         let workspace = crate::spawn_util::expand_tilde(&workspace_input);
+                        if !std::path::Path::new(&workspace).exists() {
+                            // Bad path typed — keep the modal open rather than
+                            // optimistically spawning a session that can never
+                            // launch.
+                            return Task::none();
+                        }
+                        state.spawn_modal = None;
 
                         let ts = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -636,8 +642,6 @@ impl App {
                         let t_rows = state.terminal_rows;
 
                         Task::future(async move {
-                            use ninox_core::{pty, tmux, Event as CoreEvent, Session, SessionStatus};
-
                             // Isolate the session on its own branch/worktree when
                             // the workspace is a git repo; otherwise work in the
                             // directory itself (same fallback as run_spawn).
@@ -657,63 +661,25 @@ impl App {
                             let repo = crate::spawn_util::repo_from_workspace(&workspace)
                                 .unwrap_or_default();
 
-                            let ninox_bin = std::env::current_exe()
-                                .ok()
-                                .and_then(|p| p.to_str().map(str::to_string))
-                                .unwrap_or_else(|| "ninox".to_string());
-                            let ninox_config = ninox_core::config::AppConfig::config_path()
-                                .to_string_lossy()
-                                .to_string();
-
                             // No NINOX_ORCHESTRATOR_ID and no caller-type vars:
                             // this session is unattached and reports to no one.
-                            let env = [
-                                ("NINOX_BIN",    ninox_bin.as_str()),
-                                ("NINOX_CONFIG", ninox_config.as_str()),
-                                ("NINOX_BRAIN",  catalogue_path.as_str()),
-                            ];
-
-                            let ninox_bin_dir = ninox_core::config::AppConfig::ninox_bin_dir();
-                            let ninox_bin_dir_str = ninox_bin_dir.display().to_string()
-                                .replace('\'', "'\\''");
-                            let base_cmd = agent.interactive_cmd();
-                            let launch_cmd = format!(
-                                "export PATH='{ninox_bin_dir_str}':\"$PATH\"; {base_cmd}"
-                            );
-                            if let Err(e) = tmux::create_session(&sid, &effective_ws, &launch_cmd, &env).await {
-                                tracing::error!("tmux create failed for {sid}: {e}");
-                                return Message::Noop;
-                            }
-
-                            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
-                            let pid = tmux::list_sessions()
-                                .await
-                                .ok()
-                                .and_then(|ss| ss.into_iter().find(|s| s.id == sid))
-                                .and_then(|s| s.pid);
-
-                            let updated = Session {
-                                id:              sid.clone(),
-                                orchestrator_id: None,
-                                name:            nm,
-                                repo,
-                                status:          SessionStatus::Working,
-                                agent_type:      agent.harness.clone(),
-                                cost_usd:        0.0,
-                                started_at:      ts_i64,
-                                pr_number:       None,
-                                pr_id:           None,
-                                workspace_path:  Some(effective_ws),
-                                pid,
-                            };
-                            let _ = engine.store.upsert_session(&updated);
-
-                            if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &sid, t_cols, t_rows).await {
-                                tracing::error!("pty setup failed for {sid}: {e}");
-                            }
-
-                            engine.emit(CoreEvent::SessionUpdated(updated));
+                            crate::spawn_util::spawn_interactive_session(
+                                engine,
+                                crate::spawn_util::InteractiveSpawnParams {
+                                    session_id:      sid,
+                                    name:            nm,
+                                    workspace:       effective_ws,
+                                    repo,
+                                    orchestrator_id: None,
+                                    agent,
+                                    catalogue_path,
+                                    extra_env:       Vec::new(),
+                                    started_at:      ts_i64,
+                                    cols:            t_cols,
+                                    rows:            t_rows,
+                                },
+                            )
+                            .await;
                             Message::Noop
                         })
                     }
@@ -772,7 +738,6 @@ impl App {
                         state.last_session = Some(orch.id.clone());
 
                         let engine     = state.engine.clone();
-                        let tmux_id    = orch.id.clone();
                         let sid        = orch.id.clone();
                         let nm         = name;
                         let ts_i64     = ts as i64;
@@ -781,74 +746,35 @@ impl App {
                         let t_rows     = state.terminal_rows;
 
                         Task::future(async move {
-                            use ninox_core::{pty, tmux, Event as CoreEvent, Session, SessionStatus};
-
                             if let Err(e) = tokio::fs::create_dir_all(&ws).await {
                                 tracing::error!("mkdir orchestrator workspace {ws}: {e}");
                             }
 
-                            let ninox_bin = std::env::current_exe()
-                                .ok()
-                                .and_then(|p| p.to_str().map(str::to_string))
-                                .unwrap_or_else(|| "ninox".to_string());
-
-                            let ninox_config = ninox_core::config::AppConfig::config_path()
-                                .to_string_lossy()
-                                .to_string();
-
-                            let env = [
-                                ("NINOX_BIN",             ninox_bin.as_str()),
-                                ("NINOX_CONFIG",          ninox_config.as_str()),
-                                ("NINOX_ORCHESTRATOR_ID", sid.as_str()),
-                                ("NINOX_BRAIN",           catalogue_path.as_str()),
-                                ("AO_CALLER_TYPE",         "orchestrator"),
-                                ("ATHENE_CALLER_TYPE",     "orchestrator"),
+                            // Orchestrator sessions get the caller-type vars and
+                            // their own id so spawned workers can report back.
+                            let extra_env = vec![
+                                ("NINOX_ORCHESTRATOR_ID".to_string(), sid.clone()),
+                                ("AO_CALLER_TYPE".to_string(),        "orchestrator".to_string()),
+                                ("ATHENE_CALLER_TYPE".to_string(),    "orchestrator".to_string()),
                             ];
 
-                            // Prepend ninox bin dir inside the shell command so the
-                            // `ninox` shim (which points to the current binary) is found
-                            // first — even after login-shell rc files reorder PATH.
-                            let ninox_bin_dir = ninox_core::config::AppConfig::ninox_bin_dir();
-                            let ninox_bin_dir_str = ninox_bin_dir.display().to_string()
-                                .replace('\'', "'\\''");
-                            let base_cmd = orch_agent.interactive_cmd();
-                            let launch_cmd = format!(
-                                "export PATH='{ninox_bin_dir_str}':\"$PATH\"; {base_cmd}"
-                            );
-                            if let Err(e) = tmux::create_session(&tmux_id, &ws, &launch_cmd, &env).await {
-                                tracing::error!("tmux create failed for {sid}: {e}");
-                                return Message::Noop;
-                            }
-
-                            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
-                            let pid = tmux::list_sessions()
-                                .await
-                                .ok()
-                                .and_then(|ss| ss.into_iter().find(|s| s.id == tmux_id))
-                                .and_then(|s| s.pid);
-
-                            let updated = Session {
-                                id:              sid.clone(),
-                                orchestrator_id: None,
-                                name:            nm,
-                                repo:            String::new(),
-                                status:          SessionStatus::Working,
-                                agent_type:      orch_agent.harness.clone(),
-                                cost_usd:        0.0,
-                                started_at:      ts_i64,
-                                pr_number:       None,
-                                pr_id:           None,
-                                workspace_path:  Some(ws),
-                                pid,
-                            };
-                            let _ = engine.store.upsert_session(&updated);
-
-                            if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &tmux_id, t_cols, t_rows).await {
-                                tracing::error!("pty setup failed for {sid}: {e}");
-                            }
-
-                            engine.emit(CoreEvent::SessionUpdated(updated));
+                            crate::spawn_util::spawn_interactive_session(
+                                engine,
+                                crate::spawn_util::InteractiveSpawnParams {
+                                    session_id:      sid,
+                                    name:            nm,
+                                    workspace:       ws,
+                                    repo:            String::new(),
+                                    orchestrator_id: None,
+                                    agent:           orch_agent,
+                                    catalogue_path,
+                                    extra_env,
+                                    started_at:      ts_i64,
+                                    cols:            t_cols,
+                                    rows:            t_rows,
+                                },
+                            )
+                            .await;
                             Message::Noop
                         })
                     }
@@ -2298,6 +2224,10 @@ mod tests {
     fn standalone_confirm_creates_unattached_session_without_orchestrator() {
         use crate::components::spawn_modal::SpawnKind;
 
+        // Confirm-time validation requires the workspace path to exist.
+        let ws = tempdir().unwrap().keep();
+        let ws_str = ws.to_string_lossy().to_string();
+
         let mut m = base(test_engine());
         let (next, _) = m.update(Message::SpawnSession);
         m = next;
@@ -2305,7 +2235,7 @@ mod tests {
         m = next;
         let (next, _) = m.update(Message::SpawnFormName("solo-a".into()));
         m = next;
-        let (next, _) = m.update(Message::SpawnFormWorkspace("/tmp/solo-ws".into()));
+        let (next, _) = m.update(Message::SpawnFormWorkspace(ws_str.clone()));
         m = next;
         let (next, _) = m.update(Message::SpawnFormConfirm);
         m = next;
@@ -2314,9 +2244,35 @@ mod tests {
         assert!(m.orchestrators.is_empty(), "standalone spawn must not create an orchestrator");
         let sess = m.sessions.get("solo-a").expect("standalone session created");
         assert!(sess.orchestrator_id.is_none());
-        assert_eq!(sess.workspace_path.as_deref(), Some("/tmp/solo-ws"));
+        assert_eq!(sess.workspace_path.as_deref(), Some(ws_str.as_str()));
         assert!(matches!(&m.view, View::SessionDetail { session_id, .. } if session_id == "solo-a"));
         assert_eq!(m.last_session.as_deref(), Some("solo-a"));
+    }
+
+    #[test]
+    fn standalone_confirm_with_nonexistent_workspace_keeps_modal_open() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-bad".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace(
+            "/definitely/not/a/real/workspace/path".into(),
+        ));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        // Bad path — confirm must no-op, keep the modal open for correction,
+        // and never optimistically create a session.
+        assert!(m.spawn_modal.is_some());
+        assert!(m.sessions.is_empty());
+        assert!(m.orchestrators.is_empty());
+        assert!(matches!(m.view, View::FleetBoard { .. }));
     }
 
     #[test]

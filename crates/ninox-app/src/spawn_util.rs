@@ -1,6 +1,114 @@
 //! Shared spawn plumbing used by both the CLI worker path (`main.rs
 //! run_spawn`) and the in-app standalone spawn (`app.rs SpawnFormConfirm`):
-//! isolated worktree creation, repo-slug detection, and tilde expansion.
+//! isolated worktree creation, repo-slug detection, tilde expansion, and the
+//! interactive tmux+PTY launch sequence shared by both spawn-modal kinds.
+
+use std::sync::Arc;
+
+use ninox_core::{events::Engine, pty, tmux, Event, Session, SessionStatus};
+
+/// The per-kind differences between the spawn-modal launch paths
+/// (standalone vs orchestrator). Everything else — env resolution,
+/// PATH-prepend launch command, tmux session creation, pid lookup,
+/// session persistence, and PTY streaming — is identical and lives in
+/// [`spawn_interactive_session`].
+pub struct InteractiveSpawnParams {
+    /// Session id; also used as the tmux session name.
+    pub session_id:      String,
+    pub name:            String,
+    /// Directory the agent starts in (isolated worktree for standalone,
+    /// per-orchestrator subdirectory for orchestrators). Recorded as the
+    /// session's `workspace_path`.
+    pub workspace:       String,
+    /// GitHub `owner/repo` slug ("" when unknown / not applicable).
+    pub repo:            String,
+    pub orchestrator_id: Option<String>,
+    pub agent:           ninox_core::config::AgentConfig,
+    /// Brain catalogue path, exported as `NINOX_BRAIN` for both kinds.
+    pub catalogue_path:  String,
+    /// Extra env pairs beyond the shared NINOX_BIN/NINOX_CONFIG/NINOX_BRAIN
+    /// (e.g. NINOX_ORCHESTRATOR_ID + caller-type vars for orchestrators).
+    pub extra_env:       Vec<(String, String)>,
+    pub started_at:      i64,
+    pub cols:            u16,
+    pub rows:            u16,
+}
+
+/// Launch an interactive agent session inside tmux and start PTY streaming.
+///
+/// On tmux failure (e.g. the workspace path is bad) the session is marked
+/// `Terminated` in the store and a `SessionUpdated` event is emitted so the
+/// UI shows "Session exited" instead of a session stuck in Working forever.
+pub async fn spawn_interactive_session(engine: Arc<Engine>, p: InteractiveSpawnParams) {
+    let sid = p.session_id;
+
+    let ninox_bin = std::env::current_exe()
+        .ok()
+        .and_then(|x| x.to_str().map(str::to_string))
+        .unwrap_or_else(|| "ninox".to_string());
+    let ninox_config = ninox_core::config::AppConfig::config_path()
+        .to_string_lossy()
+        .to_string();
+
+    let mut env: Vec<(&str, &str)> = vec![
+        ("NINOX_BIN",    ninox_bin.as_str()),
+        ("NINOX_CONFIG", ninox_config.as_str()),
+        ("NINOX_BRAIN",  p.catalogue_path.as_str()),
+    ];
+    for (k, v) in &p.extra_env {
+        env.push((k.as_str(), v.as_str()));
+    }
+
+    // Prepend ninox bin dir inside the shell command so the `ninox` shim
+    // (which points to the current binary) is found first — even after
+    // login-shell rc files reorder PATH.
+    let ninox_bin_dir = ninox_core::config::AppConfig::ninox_bin_dir();
+    let ninox_bin_dir_str = ninox_bin_dir.display().to_string().replace('\'', "'\\''");
+    let base_cmd = p.agent.interactive_cmd();
+    let launch_cmd = format!("export PATH='{ninox_bin_dir_str}':\"$PATH\"; {base_cmd}");
+
+    if let Err(e) = tmux::create_session(&sid, &p.workspace, &launch_cmd, &env).await {
+        tracing::error!("tmux create failed for {sid}: {e}");
+        // Surface the failure: without this the optimistically inserted
+        // session would sit in Working forever.
+        if let Ok(Some(mut s)) = engine.store.get_session(&sid) {
+            s.status = SessionStatus::Terminated;
+            let _ = engine.store.upsert_session(&s);
+            engine.emit(Event::SessionUpdated(s));
+        }
+        return;
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let pid = tmux::list_sessions()
+        .await
+        .ok()
+        .and_then(|ss| ss.into_iter().find(|s| s.id == sid))
+        .and_then(|s| s.pid);
+
+    let updated = Session {
+        id:              sid.clone(),
+        orchestrator_id: p.orchestrator_id,
+        name:            p.name,
+        repo:            p.repo,
+        status:          SessionStatus::Working,
+        agent_type:      p.agent.harness.clone(),
+        cost_usd:        0.0,
+        started_at:      p.started_at,
+        pr_number:       None,
+        pr_id:           None,
+        workspace_path:  Some(p.workspace),
+        pid,
+    };
+    let _ = engine.store.upsert_session(&updated);
+
+    if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &sid, p.cols, p.rows).await {
+        tracing::error!("pty setup failed for {sid}: {e}");
+    }
+
+    engine.emit(Event::SessionUpdated(updated));
+}
 
 /// Expand a leading `~` or `~/` in a user-supplied path to the home directory.
 /// Returns the input unchanged when it doesn't start with `~` (or when the
