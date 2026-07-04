@@ -360,59 +360,53 @@ mod tests {
         assert!(cfg.resolved_orchestrator_root().ends_with("ninox/orchestrator"));
     }
 
-    /// `NINOX_CONFIG` is a process-global environment variable and `cargo
-    /// test` runs test functions on parallel threads, so mutating it is
-    /// inherently racy against any other test that reads `config_path()`
-    /// concurrently. This is the ONLY test in the crate that touches the
-    /// var, and the guard below serializes it against itself (in case this
-    /// test is ever duplicated/retried) while keeping the mutation/restore
-    /// window as small as possible.
-    static NINOX_CONFIG_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serializes tests that mutate process-global env vars (`NINOX_CONFIG`,
+    /// `NINOX_BRAIN`) against each other — `cargo test` runs test fns on
+    /// parallel threads, so without this guard one test's env mutation could
+    /// leak into another's read.
+    static ENV_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set `key=value` for the duration of `f`, restoring the prior value
+    /// (or unsetting it) afterward. Serialized via `ENV_TEST_GUARD` since env
+    /// vars are process-global state shared across parallel test threads.
+    /// Mirrors `ninox_app::app::tests::with_env_override`.
+    fn with_env_override<T>(
+        key: &str,
+        value: impl AsRef<std::ffi::OsStr>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(key).ok();
+        std::env::set_var(key, value);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        match prior {
+            Some(v) => std::env::set_var(key, v),
+            None    => std::env::remove_var(key),
+        }
+        result.unwrap()
+    }
 
     #[test]
     fn config_path_honors_ninox_config_env() {
-        let _guard = NINOX_CONFIG_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var("NINOX_CONFIG").ok();
-
         let dir = tempdir().unwrap();
         let override_path = dir.path().join("config_path_honors_ninox_config_env.toml");
-        std::env::set_var("NINOX_CONFIG", &override_path);
 
-        let result = std::panic::catch_unwind(|| {
+        with_env_override("NINOX_CONFIG", &override_path, || {
             assert_eq!(AppConfig::config_path(), override_path);
         });
-
-        match prior {
-            Some(v) => std::env::set_var("NINOX_CONFIG", v),
-            None    => std::env::remove_var("NINOX_CONFIG"),
-        }
-
-        result.unwrap();
     }
-
-    /// See `NINOX_CONFIG_ENV_GUARD` above — same rationale, different var.
-    static NINOX_BRAIN_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn resolved_brain_path_honors_ninox_brain_env() {
-        let _guard = NINOX_BRAIN_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var("NINOX_BRAIN").ok();
-
         let dir = tempdir().unwrap();
         let override_path = dir.path().join("brain-override");
-        std::env::set_var("NINOX_BRAIN", &override_path);
 
-        let result = std::panic::catch_unwind(|| {
+        with_env_override("NINOX_BRAIN", &override_path, || {
             let cfg = AppConfig::default();
             assert_eq!(cfg.resolved_brain_path(), override_path);
         });
-
-        match prior {
-            Some(v) => std::env::set_var("NINOX_BRAIN", v),
-            None    => std::env::remove_var("NINOX_BRAIN"),
-        }
-
-        result.unwrap();
     }
 
     #[test]
@@ -420,7 +414,7 @@ mod tests {
         // Serialize against resolved_brain_path_honors_ninox_brain_env: this
         // test reads resolved_brain_path() twice (via catalogue_options and
         // directly) and must not straddle that test's NINOX_BRAIN window.
-        let _guard = NINOX_BRAIN_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let cfg = AppConfig::default();
         let options = cfg.catalogue_options();
         assert_eq!(options.len(), 1);

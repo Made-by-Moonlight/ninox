@@ -24,7 +24,6 @@ const MAX_NOTIFICATIONS: usize = 50;
 #[derive(Debug, Clone, Default)]
 pub struct SidebarState {
     pub selected_orchestrator: Option<OrchestratorId>,
-    pub show_theme_popout:     bool,
     pub show_notifications:    bool,
 }
 
@@ -137,7 +136,6 @@ pub enum Message {
     RemoveOrchestrator(OrchestratorId),
     RemoveSession(SessionId),
     SwitchTheme(ThemeVariant),
-    ToggleThemePopout,
     // Raw key event from the global subscription — bytes are computed in the handler
     // where we have access to the terminal mode (APP_CURSOR changes arrow sequences).
     RawKey {
@@ -943,16 +941,10 @@ impl App {
             }
 
 
-            Message::ToggleThemePopout => {
-                state.sidebar.show_theme_popout = !state.sidebar.show_theme_popout;
-                Task::none()
-            }
-
             Message::SwitchTheme(variant) => {
                 state.active_variant = variant;
                 state.scheme = state.themes.scheme(variant);
                 state.config.theme = variant;
-                state.sidebar.show_theme_popout = false;
                 for term in state.terminals.values_mut() {
                     term.cache.clear();
                 }
@@ -1668,6 +1660,7 @@ mod tests {
                 title:      "t".into(),
                 body:       "b".into(),
                 session_id: None,
+                created_at: 0,
             })));
             m = next;
         }
@@ -1988,6 +1981,7 @@ mod tests {
             let (next, _) = m.update(Message::EngineEvent(Event::Notification(Notification {
                 id: id.into(), kind: NotificationKind::WorkerDone,
                 title: "t".into(), body: "b".into(), session_id: None,
+                created_at: 0,
             })));
             m = next;
         }
@@ -2174,6 +2168,7 @@ mod tests {
             let (next, _) = m.update(Message::EngineEvent(Event::Notification(Notification {
                 id: id.into(), kind: NotificationKind::WorkerDone,
                 title: "t".into(), body: "b".into(), session_id: None,
+                created_at: 0,
             })));
             m = next;
         }
@@ -2244,36 +2239,51 @@ mod tests {
         assert!(matches!(m.view, View::FleetBoard { .. }));
     }
 
+    /// Serializes tests that mutate process-global env vars (`NINOX_CONFIG`)
+    /// against each other — `cargo test` runs test fns on parallel threads,
+    /// so without this guard one test's env mutation could leak into
+    /// another's read.
+    static ENV_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set `key=value` for the duration of `f`, restoring the prior value
+    /// (or unsetting it) afterward. Serialized via `ENV_TEST_GUARD` since
+    /// env vars are process-global state shared across parallel test
+    /// threads. Mirrors `ninox_core::config::tests::with_env_override`.
+    fn with_env_override<T>(
+        key: &str,
+        value: impl AsRef<std::ffi::OsStr>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(key).ok();
+        std::env::set_var(key, value);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        match prior {
+            Some(v) => std::env::set_var(key, v),
+            None    => std::env::remove_var(key),
+        }
+        result.unwrap()
+    }
+
     #[test]
     fn t_toggles_light_dark() {
         // `Message::SwitchTheme` calls `state.config.save()`, which writes to
         // `AppConfig::config_path()`. Redirect that to a tempfile so this
         // test never touches the real user config
         // (e.g. `~/Library/Application Support/ninox/config.toml`).
-        // `NINOX_CONFIG` is process-global and `cargo test` runs tests in
-        // parallel threads; this is the only test in this file that
-        // exercises `SwitchTheme`/`config.save()`, which keeps the race
-        // window to "this test's own env mutation vs. itself".
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("t_toggles_light_dark_config.toml");
-        let prior = std::env::var("NINOX_CONFIG").ok();
-        std::env::set_var("NINOX_CONFIG", &config_path);
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_env_override("NINOX_CONFIG", &config_path, || {
             let m = base(test_engine());
             let before = m.active_variant;
             let m = press(m, "t");
             assert_ne!(m.active_variant, before);
             let m = press(m, "t");
             assert_eq!(m.active_variant, before);
-        }));
-
-        match prior {
-            Some(v) => std::env::set_var("NINOX_CONFIG", v),
-            None    => std::env::remove_var("NINOX_CONFIG"),
-        }
-
-        result.unwrap();
+        });
     }
 
     #[test]
@@ -2439,5 +2449,25 @@ mod tests {
 
         let m = press(m, "1"); // must go to the terminal, not switch views
         assert!(matches!(m.view, View::SessionDetail { .. }));
+    }
+
+    #[test]
+    fn spawn_modal_swallows_number_keys_without_navigating() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::NavigatePrList);
+        assert!(matches!(m.view, View::PrList));
+
+        let (m, _) = m.update(Message::SpawnSession);
+        assert!(m.spawn_modal.is_some());
+
+        // While the modal is open, "1" must not fall through to the
+        // fleet-board navigation shortcut — the modal swallows every key
+        // except Escape.
+        let m = press(m, "1");
+        assert!(m.spawn_modal.is_some(), "modal must remain open");
+        assert!(
+            matches!(m.view, View::PrList),
+            "\"1\" must not navigate while the spawn modal is open"
+        );
     }
 }
