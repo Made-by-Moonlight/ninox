@@ -1,9 +1,5 @@
 //! Field Notes PR ledger — spec: docs/design-concepts/field-notes-design.md §5-III,
 //! mockup `.ledger`/`.prt-row` in docs/design-concepts/03-field-notes.html.
-//!
-//! NOTE(follow-up): the folio date label is rendered as a bare "LEDGER" micro-label
-//! instead of "LEDGER — {D MONTH YYYY}" — `chrono` isn't available on this branch.
-//! Wire the date back in once the polish task adds a date dependency.
 
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
@@ -110,18 +106,23 @@ fn pr_row<'a>(app: &'a App, pr: &'a PR) -> Element<'a, Message> {
 }
 
 pub fn pr_list(app: &App) -> Element<'_, Message> {
+    use chrono::{Datelike, Local};
     let s = &app.scheme;
 
     // Sort PRs by number descending
     let mut prs: Vec<&PR> = app.prs.values().collect();
     prs.sort_by_key(|b| std::cmp::Reverse(b.number));
 
+    let now = Local::now();
+    let month = crate::style::MONTHS[now.month0() as usize];
+    let ledger_label = format!("LEDGER — {} {} {}", now.day(), month, now.year());
+
     let folio = container(
         row![
             text("Pull ").size(30).font(SERIF).color(s.ink),
             text("requests").size(30).font(SERIF_ITALIC).color(s.ink),
             Space::new(18, 0),
-            text("LEDGER").size(10.5).font(MONO).color(s.faint),
+            text(ledger_label).size(10.5).font(MONO).color(s.faint),
             Space::new(Length::Fill, 0),
             text(format!("{} open", prs.len())).size(10.5).font(MONO).color(s.ink_2),
         ]
@@ -152,10 +153,15 @@ pub fn pr_list(app: &App) -> Element<'_, Message> {
 
     let rows: Vec<Element<Message>> = if prs.is_empty() {
         vec![
-            container(text("No pull requests yet.").size(13).color(s.faint))
-                .padding([40, 20])
-                .width(Length::Fill)
-                .into(),
+            container(
+                text("No pull requests on file.")
+                    .size(15)
+                    .font(SERIF_ITALIC)
+                    .color(s.faint),
+            )
+            .padding([40, 20])
+            .width(Length::Fill)
+            .into(),
         ]
     } else {
         let mut items: Vec<Element<Message>> = Vec::new();

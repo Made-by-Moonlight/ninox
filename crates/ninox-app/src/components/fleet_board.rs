@@ -7,11 +7,6 @@ use crate::app::{App, Message};
 use crate::components::filter_bar::filter_bar;
 use ninox_core::types::{OrchestratorId, Session, SessionStatus};
 
-#[allow(dead_code)]
-fn repo_short(repo: &str) -> &str {
-    repo.rsplit('/').next().unwrap_or(repo)
-}
-
 struct Column {
     label: &'static str,
     status: SessionStatus,
@@ -75,18 +70,20 @@ pub fn folio_title(hour: u32) -> String {
 
 fn tab_chip<'a>(app: &'a App, label: &'a str, msg: Message, is_active: bool) -> Element<'a, Message> {
     let s = &app.scheme;
-    let ink = s.ink;
-    let card = s.card;
-    button(crate::style::micro_label(label, if is_active { card } else { ink }))
+    let border = Border { color: s.ink, width: 1.5, radius: 2.0.into() };
+    button(crate::style::micro_label(label, if is_active { s.card } else { s.ink }))
         .on_press(msg)
         .padding([4, 10])
-        .style(move |_theme, _status| button::Style {
-            background: Some(Background::Color(if is_active { ink } else { iced::Color::TRANSPARENT })),
-            text_color: if is_active { card } else { ink },
-            border: Border { color: ink, width: 1.5, radius: 2.0.into() },
-            ..Default::default()
-        })
+        .style(crate::style::segment_style(s, is_active, s.ink, None, border, border))
         .into()
+}
+
+/// Sessions counted toward the "total" figure — every session that isn't
+/// itself an orchestrator's own bookkeeping session.
+fn total_session_count(app: &App) -> usize {
+    let orch_ids: std::collections::HashSet<&str> =
+        app.orchestrators.iter().map(|o| o.id.as_str()).collect();
+    app.sessions.values().filter(|w| !orch_ids.contains(w.id.as_str())).count()
 }
 
 /// Folio header row: split-weight serif title, "VOL." mono date stamp, the
@@ -96,13 +93,10 @@ fn folio<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Element<'a, Mes
     let s = &app.scheme;
     let now = Local::now();
     let title = folio_title(now.hour());
-    let month = ["JANUARY","FEBRUARY","MARCH","APRIL","MAY","JUNE","JULY",
-                 "AUGUST","SEPTEMBER","OCTOBER","NOVEMBER","DECEMBER"][now.month0() as usize];
+    let month = crate::style::MONTHS[now.month0() as usize];
     let date_label = format!("VOL. I — {} {} {}", now.day(), month, now.year());
 
-    let orch_ids: std::collections::HashSet<&str> =
-        app.orchestrators.iter().map(|o| o.id.as_str()).collect();
-    let total = app.sessions.values().filter(|w| !orch_ids.contains(w.id.as_str())).count();
+    let total = total_session_count(app);
     let shown = COLUMNS.iter()
         .map(|c| board_sessions(app, &c.status, scope.map(|x| x.as_str())).len())
         .sum::<usize>()
@@ -270,36 +264,53 @@ pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Eleme
         );
     }
 
-    let ledger_cols: Vec<Element<Message>> = COLUMNS
-        .iter()
-        .enumerate()
-        .map(|(i, col)| {
-            let mut col_sessions = board_sessions(app, &col.status, scope.map(|s| s.as_str()));
-            if col.status == SessionStatus::Done {
-                col_sessions.extend(board_sessions(app, &SessionStatus::Terminated, scope.map(|s| s.as_str())));
-            }
-            let cards: Vec<Element<Message>> = col_sessions
-                .iter()
-                .map(|s| session_card(app, s))
-                .collect();
-            ledger_column(app, col.label, cards, i == 0)
-        })
-        .collect();
-
-    let board = scrollable::Scrollable::with_direction(
-        row(ledger_cols),
-        scrollable::Direction::Horizontal(scrollable::Scrollbar::default()),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill);
-
-    sections.push(
-        container(board)
-            .padding(iced::Padding { top: 16.0, right: 28.0, bottom: 16.0, left: 28.0 })
+    if total_session_count(app) == 0 {
+        let s = &app.scheme;
+        sections.push(
+            container(
+                text("No sessions in the field.")
+                    .size(15)
+                    .font(crate::style::SERIF_ITALIC)
+                    .color(s.faint),
+            )
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
             .width(Length::Fill)
             .height(Length::Fill)
             .into(),
-    );
+        );
+    } else {
+        let ledger_cols: Vec<Element<Message>> = COLUMNS
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                let mut col_sessions = board_sessions(app, &col.status, scope.map(|s| s.as_str()));
+                if col.status == SessionStatus::Done {
+                    col_sessions.extend(board_sessions(app, &SessionStatus::Terminated, scope.map(|s| s.as_str())));
+                }
+                let cards: Vec<Element<Message>> = col_sessions
+                    .iter()
+                    .map(|s| session_card(app, s))
+                    .collect();
+                ledger_column(app, col.label, cards, i == 0)
+            })
+            .collect();
+
+        let board = scrollable::Scrollable::with_direction(
+            row(ledger_cols),
+            scrollable::Direction::Horizontal(scrollable::Scrollbar::default()),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        sections.push(
+            container(board)
+                .padding(iced::Padding { top: 16.0, right: 28.0, bottom: 16.0, left: 28.0 })
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+        );
+    }
 
     column(sections)
         .width(Length::Fill)

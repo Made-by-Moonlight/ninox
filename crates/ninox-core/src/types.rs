@@ -77,4 +77,7 @@ pub struct Notification {
     pub title:      String,
     pub body:       String,
     pub session_id: Option<SessionId>,
+    /// Unix epoch milliseconds — rendered as the mono timestamp on the
+    /// notification slip (spec §7).
+    pub created_at: i64,
 }

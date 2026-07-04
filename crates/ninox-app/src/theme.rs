@@ -210,8 +210,7 @@ pub fn write_default_theme_file(path: &Path) -> std::io::Result<()> {
     let mut doc = toml::Table::new();
     doc.insert("light".to_string(), toml::Value::Table(palette_table(light())));
     doc.insert("dark".to_string(), toml::Value::Table(palette_table(dark())));
-    let contents = toml::to_string_pretty(&doc)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let contents = toml::to_string_pretty(&doc).map_err(std::io::Error::other)?;
     std::fs::write(path, contents)
 }
 
