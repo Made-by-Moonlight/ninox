@@ -630,7 +630,6 @@ impl App {
                             // launch.
                             return Task::none();
                         }
-                        state.spawn_modal = None;
 
                         let ts = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -638,6 +637,17 @@ impl App {
                             .as_millis();
                         let slug = slugify(&name);
                         let sid = if slug.is_empty() { format!("session-{ts}") } else { slug };
+
+                        if state.sessions.contains_key(&sid) {
+                            // Slugified name collides with an existing session
+                            // id — upserting would silently overwrite that
+                            // session's stored record, and the subsequent
+                            // tmux-create (same session name) would then fail
+                            // and mark the *hijacked* record Terminated. Keep
+                            // the modal open so the user can rename instead.
+                            return Task::none();
+                        }
+                        state.spawn_modal = None;
 
                         let session = Session {
                             id:              sid.clone(),
@@ -715,8 +725,6 @@ impl App {
                     // ── Orchestrator path: existing flow, stamped with the
                     // selected agent preset + brain catalogue.
                     SpawnKind::Orchestrator => {
-                        state.spawn_modal = None;
-
                         let ts = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
@@ -724,6 +732,19 @@ impl App {
 
                         let slug = slugify(&name);
                         let orch_id = if slug.is_empty() { format!("orch-{ts}") } else { slug };
+
+                        if state.sessions.contains_key(&orch_id)
+                            || state.orchestrators.iter().any(|o| o.id == orch_id)
+                        {
+                            // Same hazard as the standalone path: a duplicate
+                            // name would upsert over an existing session/
+                            // orchestrator record, then fail tmux-create and
+                            // mark the hijacked record Terminated. Keep the
+                            // modal open so the user can rename instead.
+                            return Task::none();
+                        }
+                        state.spawn_modal = None;
+
                         let orch = Orchestrator {
                             id:         orch_id,
                             name:       name.clone(),
@@ -1122,7 +1143,11 @@ impl App {
 
             Message::BrainLinkClicked(url) => {
                 if url.scheme() == "ninox-brain" {
-                    let link = url.path().to_string();
+                    // `url.path()` returns the raw, still percent-encoded
+                    // opaque part (this is a cannot-be-a-base URL, so `url`
+                    // never decodes it for us) — reverse the encoding
+                    // `preprocess_wikilinks` applied before matching.
+                    let link = crate::components::brain_panel::percent_decode_wikilink_target(url.path());
                     if let Some(e) =
                         crate::components::brain_panel::resolve_link(&state.brain_view.entries, &link)
                     {
@@ -2490,6 +2515,92 @@ mod tests {
         assert!(m.sessions.is_empty());
         assert!(m.orchestrators.is_empty());
         assert!(matches!(m.view, View::FleetBoard { .. }));
+    }
+
+    #[test]
+    fn standalone_confirm_with_duplicate_name_keeps_modal_open_and_original_untouched() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        // Two separate workspaces so any difference between the original and
+        // a would-be overwrite is easy to see.
+        let ws1 = tempdir().unwrap().keep();
+        let ws1_str = ws1.to_string_lossy().to_string();
+        let ws2 = tempdir().unwrap().keep();
+        let ws2_str = ws2.to_string_lossy().to_string();
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-a".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace(ws1_str.clone()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+        assert!(m.spawn_modal.is_none(), "first spawn with a unique name must succeed");
+        let original = m.sessions.get("solo-a").cloned().expect("original session created");
+        assert_eq!(original.workspace_path.as_deref(), Some(ws1_str.as_str()));
+
+        // Spawn again with the exact same name — slugify("solo-a") collides
+        // with the existing session id.
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-a".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace(ws2_str.clone()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        assert!(
+            m.spawn_modal.is_some(),
+            "a name colliding with an existing session id must keep the modal open, not overwrite it"
+        );
+        assert_eq!(m.sessions.len(), 1, "the colliding spawn must not create/overwrite any session");
+        let unchanged = m.sessions.get("solo-a").expect("original session must still exist");
+        assert_eq!(
+            unchanged.workspace_path.as_deref(),
+            Some(ws1_str.as_str()),
+            "the original session's record must be untouched by the rejected duplicate spawn"
+        );
+    }
+
+    #[test]
+    fn orchestrator_confirm_with_duplicate_name_keeps_modal_open_and_original_untouched() {
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("orch-a".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+        assert!(m.spawn_modal.is_none(), "first orchestrator spawn with a unique name must succeed");
+        assert_eq!(m.orchestrators.len(), 1);
+        let original = m.sessions.get("orch-a").cloned().expect("original orchestrator session created");
+
+        // Spawn a second orchestrator with the exact same name.
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("orch-a".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        assert!(
+            m.spawn_modal.is_some(),
+            "a name colliding with an existing orchestrator id must keep the modal open"
+        );
+        assert_eq!(m.orchestrators.len(), 1, "no second orchestrator record should be created");
+        assert_eq!(m.sessions.len(), 1, "the colliding spawn must not create/overwrite any session");
+        let unchanged = m.sessions.get("orch-a").expect("original orchestrator session must still exist");
+        assert_eq!(
+            unchanged.started_at, original.started_at,
+            "the original orchestrator session's record must be untouched by the rejected duplicate spawn"
+        );
     }
 
     #[test]

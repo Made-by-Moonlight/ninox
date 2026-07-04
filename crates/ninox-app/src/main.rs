@@ -213,16 +213,79 @@ async fn run_spawn(
         cmd_base,
     );
 
-    let mut env_vec: Vec<(&str, &str)> = vec![
-        ("ATHENE_SESSION",  &id),
-        ("ATHENE_DATA_DIR", &sessions_dir_str),
-    ];
-    if !orch_id_env.is_empty() {
-        env_vec.push(("NINOX_ORCHESTRATOR_ID", &orch_id_env));
-    }
+    // A fresh tmux session does *not* inherit the caller's ambient
+    // environment — only vars explicitly passed via `-e` (see
+    // `tmux::create_session`) or already tracked in the server's global
+    // environment (seeded once, from whichever process first started the
+    // server). Since `run_spawn` is normally invoked (as `ninox spawn`) from
+    // *inside* an orchestrator's own tmux session — one that itself was
+    // launched with NINOX_BRAIN/NINOX_CONFIG via `-e` by
+    // `spawn_util::spawn_interactive_session` — those vars are present in
+    // this process's own env and must be forwarded explicitly, or the
+    // spawned worker loses brain/config access entirely.
+    let ninox_brain_env = std::env::var("NINOX_BRAIN").ok();
+    let ninox_config_env = std::env::var("NINOX_CONFIG").ok();
+
+    let env_vec = worker_env_vars(
+        &id,
+        &sessions_dir_str,
+        &orch_id_env,
+        ninox_brain_env.as_deref(),
+        ninox_config_env.as_deref(),
+    );
     tmux::create_session(&id, &effective_workspace, &cmd, &env_vec).await?;
 
     Ok(())
+}
+
+/// The tmux env for a spawned worker: always the session id + data dir, plus
+/// whichever of orchestrator id / brain path / config path are actually
+/// present (an empty `orch_id` or `None` env value is omitted rather than
+/// forwarded as an empty string).
+fn worker_env_vars<'a>(
+    id: &'a str,
+    sessions_dir: &'a str,
+    orch_id: &'a str,
+    ninox_brain: Option<&'a str>,
+    ninox_config: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut env_vec: Vec<(&str, &str)> = vec![
+        ("ATHENE_SESSION",  id),
+        ("ATHENE_DATA_DIR", sessions_dir),
+    ];
+    if !orch_id.is_empty() {
+        env_vec.push(("NINOX_ORCHESTRATOR_ID", orch_id));
+    }
+    if let Some(v) = ninox_brain {
+        env_vec.push(("NINOX_BRAIN", v));
+    }
+    if let Some(v) = ninox_config {
+        env_vec.push(("NINOX_CONFIG", v));
+    }
+    env_vec
+}
+
+#[cfg(test)]
+mod worker_env_tests {
+    use super::worker_env_vars;
+
+    #[test]
+    fn forwards_brain_and_config_when_present() {
+        let env = worker_env_vars("w1", "/data", "orch1", Some("/brain.db"), Some("/cfg.toml"));
+        assert!(env.contains(&("NINOX_ORCHESTRATOR_ID", "orch1")));
+        assert!(env.contains(&("NINOX_BRAIN", "/brain.db")));
+        assert!(env.contains(&("NINOX_CONFIG", "/cfg.toml")));
+        assert!(env.contains(&("ATHENE_SESSION", "w1")));
+        assert!(env.contains(&("ATHENE_DATA_DIR", "/data")));
+    }
+
+    #[test]
+    fn omits_brain_config_and_orchestrator_id_when_absent() {
+        let env = worker_env_vars("w1", "/data", "", None, None);
+        assert!(!env.iter().any(|(k, _)| *k == "NINOX_ORCHESTRATOR_ID"));
+        assert!(!env.iter().any(|(k, _)| *k == "NINOX_BRAIN"));
+        assert!(!env.iter().any(|(k, _)| *k == "NINOX_CONFIG"));
+    }
 }
 
 async fn run_brain(action: BrainAction) -> anyhow::Result<()> {

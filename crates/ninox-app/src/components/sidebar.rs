@@ -14,6 +14,11 @@ fn repo_short(repo: &str) -> &str {
     repo.rsplit('/').next().unwrap_or(repo)
 }
 
+/// "N workers" / "1 worker" — the orchestrator tree row's worker-count label.
+fn worker_count_label(count: usize) -> String {
+    if count == 1 { "1 worker".to_string() } else { format!("{count} workers") }
+}
+
 /// Status dot: filled circle, 1.5px border in the status color.
 /// Done/terminated renders hollow (transparent fill).
 fn status_dot(color: Color, hollow: bool) -> Element<'static, Message> {
@@ -178,7 +183,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
             app,
             &orch.id,
             &orch.name,
-            &format!("{worker_count} workers"),
+            &worker_count_label(worker_count),
             app.sessions.get(&orch.id).map(|se| &se.status),
             true,  // bold
             false, // not indented
@@ -375,4 +380,17 @@ fn theme_dots_footer(app: &App) -> Element<'_, Message> {
     .padding([12, 18])
     .width(Length::Fill)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_count_label_pluralizes_correctly() {
+        assert_eq!(worker_count_label(0), "0 workers");
+        assert_eq!(worker_count_label(1), "1 worker");
+        assert_eq!(worker_count_label(2), "2 workers");
+        assert_eq!(worker_count_label(11), "11 workers");
+    }
 }

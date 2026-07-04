@@ -54,7 +54,50 @@ pub fn extract_wikilinks(body: &str) -> Vec<String> {
     out
 }
 
-/// `[[x]]` → `[x](ninox-brain:x)` so the markdown widget renders clickable links.
+/// Percent-encode the characters that would otherwise break the
+/// `[text](dest)` CommonMark link syntax when used as a link *destination*
+/// (a bare space ends the destination early; unbalanced `(`/`)` end it too)
+/// or collide with our own `%`-escaping. Deliberately not a general URL
+/// encoder — this only needs to round-trip wikilink targets between
+/// `preprocess_wikilinks` and the `BrainLinkClicked` handler, which reverses
+/// it with `percent_decode_wikilink_target` before calling `resolve_link`.
+fn percent_encode_wikilink_target(target: &str) -> String {
+    let mut out = String::with_capacity(target.len());
+    for ch in target.chars() {
+        match ch {
+            ' ' => out.push_str("%20"),
+            '(' => out.push_str("%28"),
+            ')' => out.push_str("%29"),
+            '%' => out.push_str("%25"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Reverses `percent_encode_wikilink_target`. Unknown/malformed `%xx`
+/// sequences are passed through literally rather than dropped.
+pub fn percent_decode_wikilink_target(target: &str) -> String {
+    let mut out = String::with_capacity(target.len());
+    let mut chars = target.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        let hex: String = chars.by_ref().take(2).collect();
+        match u8::from_str_radix(&hex, 16) {
+            Ok(byte) => out.push(byte as char),
+            Err(_) => { out.push('%'); out.push_str(&hex); }
+        }
+    }
+    out
+}
+
+/// `[[x]]` → `[x](ninox-brain:x)` so the markdown widget renders clickable
+/// links. The destination is percent-encoded (see
+/// `percent_encode_wikilink_target`) since a raw target containing spaces or
+/// parens is invalid CommonMark and truncates the link at the first space.
 pub fn preprocess_wikilinks(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut rest = body;
@@ -64,7 +107,8 @@ pub fn preprocess_wikilinks(body: &str) -> String {
         match after.find("]]") {
             Some(end) => {
                 let target = after[..end].trim();
-                out.push_str(&format!("[{target}](ninox-brain:{target})"));
+                let encoded = percent_encode_wikilink_target(target);
+                out.push_str(&format!("[{target}](ninox-brain:{encoded})"));
                 rest = &after[end + 2..];
             }
             None => { out.push_str("[["); rest = after; }
@@ -644,6 +688,26 @@ mod tests {
             preprocess_wikilinks("see [[frame-alignment]]."),
             "see [frame-alignment](ninox-brain:frame-alignment)."
         );
+    }
+
+    #[test]
+    fn preprocesses_wikilinks_with_spaces_to_valid_commonmark() {
+        // A raw space in the destination would end the CommonMark link at
+        // the first word ("[my target](ninox-brain:my target)." parses as a
+        // link to "my" followed by literal text) — the destination must be
+        // percent-encoded while the visible link text stays readable.
+        assert_eq!(
+            preprocess_wikilinks("see [[my target]]."),
+            "see [my target](ninox-brain:my%20target)."
+        );
+    }
+
+    #[test]
+    fn percent_encode_and_decode_wikilink_targets_round_trip() {
+        for target in ["my target", "a (parenthetical) target", "100% done", "plain"] {
+            let encoded = percent_encode_wikilink_target(target);
+            assert_eq!(percent_decode_wikilink_target(&encoded), target);
+        }
     }
 
     #[test]
