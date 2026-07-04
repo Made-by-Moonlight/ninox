@@ -12,7 +12,8 @@ use crate::theme::ColorScheme;
 use ninox_core::BrainEntry;
 
 // ---------------------------------------------------------------------------
-// Pure helpers (wikilinks, backlinks, categories) — TDD'd in `mod tests` below.
+// Pure helpers (wikilinks, backlinks, categories) — TDD'd in `mod tests` at
+// the bottom of this file.
 // ---------------------------------------------------------------------------
 
 /// Order per spec §1 "brain category colors".
@@ -107,58 +108,6 @@ pub fn categories(entries: &[BrainEntry]) -> Vec<(String, usize)> {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn entry(id: &str, ty: &str, name: &str, body: &str) -> ninox_core::brain::BrainEntry {
-        ninox_core::brain::BrainEntry {
-            id: id.into(), entry_type: ty.into(), name: name.into(),
-            tags: vec![], repos: vec![], updated: None, body: body.into(),
-        }
-    }
-
-    #[test]
-    fn extracts_wikilinks() {
-        assert_eq!(
-            extract_wikilinks("passes [[frame-alignment]] before [[errors/scrollback-dup]] runs"),
-            vec!["frame-alignment".to_string(), "errors/scrollback-dup".to_string()]
-        );
-        assert!(extract_wikilinks("no links [here] or [[unclosed").is_empty());
-    }
-
-    #[test]
-    fn preprocesses_wikilinks_to_brain_urls() {
-        assert_eq!(
-            preprocess_wikilinks("see [[frame-alignment]]."),
-            "see [frame-alignment](ninox-brain:frame-alignment)."
-        );
-    }
-
-    #[test]
-    fn backlinks_match_by_name_or_id_stem() {
-        let a = entry("symbols/scrollback-buffer.md", "symbols", "ScrollbackBuffer", "…");
-        let b = entry("concepts/frame-alignment.md", "concepts", "frame-alignment",
-                      "owned by [[ScrollbackBuffer]]");
-        let c = entry("errors/scrollback-dup.md", "errors", "scrollback-dup", "unrelated");
-        let all = vec![a.clone(), b.clone(), c];
-        let backs = backlinks_for(&all, &a);
-        assert_eq!(backs.len(), 1);
-        assert_eq!(backs[0].id, b.id);
-    }
-
-    #[test]
-    fn categories_are_counted_and_ordered_by_taxonomy() {
-        let all = vec![
-            entry("symbols/a.md", "symbols", "a", ""),
-            entry("symbols/b.md", "symbols", "b", ""),
-            entry("errors/x.md", "errors", "x", ""),
-        ];
-        let cats = categories(&all);
-        assert_eq!(cats, vec![("symbols".to_string(), 2), ("errors".to_string(), 1)]);
-    }
-}
-
 fn matches_filter(entry: &BrainEntry, filter: &str) -> bool {
     if filter.is_empty() {
         return true;
@@ -170,68 +119,51 @@ fn matches_filter(entry: &BrainEntry, filter: &str) -> bool {
         || entry.tags.iter().any(|t| t.to_lowercase().contains(&filter))
 }
 
-/// One segment of the ✦/☰ mode toggle: micro-label typography, ink fill when active.
-fn mode_segment<'a>(s: &'a ColorScheme, label: &str, mode: BrainMode, active: bool) -> Element<'a, Message> {
-    button(micro_label(label, if active { s.card } else { s.ink_2 }))
-        .on_press(Message::BrainSetMode(mode))
-        .padding([5, 14])
-        .style(move |_theme, status| button::Style {
-            background: Some(Background::Color(if active { s.ink } else { Color::TRANSPARENT })),
-            text_color: if active {
-                s.card
-            } else if status == button::Status::Hovered {
-                s.ink
-            } else {
-                s.ink_2
-            },
-            border: Border::default(),
-            ..Default::default()
-        })
-        .into()
-}
-
 /// Joined ✦ PINBOARD / ☰ CATALOGUE segments in a 1.5px ink frame with a hard
-/// 2×2 shadow (mockup `.brain-mode`).
+/// 2×2 shadow (mockup `.brain-mode`) — same bordered-frame pattern
+/// spawn_modal's Entry-type toggle uses (`crate::style::segmented_frame`).
 fn mode_toggle(app: &App) -> Element<'_, Message> {
     let s = &app.scheme;
-    let (card_a, _, _) = shadow_alpha(s);
-    container(
-        row![
-            mode_segment(s, "✦ Pinboard", BrainMode::Pinboard, app.brain_view.mode == BrainMode::Pinboard),
-            crate::style::vline(s.ink, 1.5),
-            mode_segment(s, "☰ Catalogue", BrainMode::Catalogue, app.brain_view.mode == BrainMode::Catalogue),
-        ]
-        .height(Length::Shrink),
-    )
-    .style(move |_theme| container::Style {
-        border: Border { color: s.ink, width: 1.5, radius: 2.0.into() },
-        shadow: hard_shadow(s, 2.0, 2.0, card_a),
-        ..Default::default()
-    })
-    .into()
+    crate::style::segmented_frame(s, vec![
+        crate::style::toggle_segment(
+            s, "✦ Pinboard", app.brain_view.mode == BrainMode::Pinboard,
+            Message::BrainSetMode(BrainMode::Pinboard),
+        ),
+        crate::style::toggle_segment(
+            s, "☰ Catalogue", app.brain_view.mode == BrainMode::Catalogue,
+            Message::BrainSetMode(BrainMode::Catalogue),
+        ),
+    ])
 }
 
-/// Underlined "⌕ search specimens…" field wired to the existing filter query.
+/// Underlined "⌕ search specimens…" field wired to the existing filter
+/// query, with a ✕ clear affordance once a query is typed (matches
+/// `filter_bar::filter_bar`).
 fn search_field(app: &App) -> Element<'_, Message> {
     let s = &app.scheme;
+    let has_filter = !app.brain_view.filter.is_empty();
     let input = text_input("search specimens…", &app.brain_view.filter)
         .on_input(Message::BrainFilterQuery)
         .size(12)
         .padding([4, 2])
-        .style(move |_t, _st| text_input::Style {
-            background: Background::Color(Color::TRANSPARENT),
-            border: Border::default(),
-            icon: s.faint,
-            placeholder: s.faint,
-            value: s.ink,
-            selection: Color { a: 0.35, ..s.accent },
-        });
-    column![
-        row![text("⌕").size(13).color(s.faint), Space::new(6, 0), input].align_y(Alignment::Center),
-        hline(s.ink, 1.5),
-    ]
-    .width(Length::Fixed(230.0))
-    .into()
+        .style(crate::style::underlined_input_style(s));
+
+    let mut field_row = row![text("⌕").size(13).color(s.faint), Space::new(6, 0), input]
+        .align_y(Alignment::Center);
+    if has_filter {
+        field_row = field_row.push(
+            button(text("✕").size(10).color(s.faint))
+                .on_press(Message::BrainFilterQuery(String::new()))
+                .padding(0)
+                .style(|_t, _st| button::Style {
+                    background: None,
+                    border: Border::default(),
+                    ..Default::default()
+                }),
+        );
+    }
+
+    column![field_row, hline(s.ink, 1.5)].width(Length::Fixed(230.0)).into()
 }
 
 /// Folio header: "The *brain*", SPECIMENS count, ✦/☰ mode toggle, underlined
@@ -423,11 +355,11 @@ fn drawers_rail(app: &App) -> Element<'_, Message> {
     let body: Element<Message> = if filtered_entries.is_empty() {
         container(
             text(if app.brain_view.entries.is_empty() {
-                "No entries yet. Write a Markdown file into the brain directory, then Reindex."
+                "The specimen drawers are empty — run ninox brain index."
             } else {
                 "No entries match this filter."
             })
-            .size(12)
+            .size(15)
             .font(SERIF_ITALIC)
             .color(s.faint),
         )
@@ -507,8 +439,8 @@ fn drawer<'a>(
 
 /// One entry in an open drawer. Selected = accent 3px left bar + `card` bg
 /// + `MONO_MEDIUM`; hovered = `paper_2` bg (visibly distinct from the
-/// transparent resting state) — an old regression collapsed hover to a
-/// no-op, so this must render differently in all three states.
+///   transparent resting state) — an old regression collapsed hover to a
+///   no-op, so this must render differently in all three states.
 fn dentry_row<'a>(app: &'a App, entry: &BrainEntry) -> Element<'a, Message> {
     let s = &app.scheme;
     let is_selected = app.brain_view.selected.as_deref() == Some(entry.id.as_str());
@@ -684,4 +616,56 @@ fn reading_pane(app: &App) -> Element<'_, Message> {
         .padding([28, 36])
         .style(move |_theme| heavy_frame(s))
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, ty: &str, name: &str, body: &str) -> ninox_core::brain::BrainEntry {
+        ninox_core::brain::BrainEntry {
+            id: id.into(), entry_type: ty.into(), name: name.into(),
+            tags: vec![], repos: vec![], updated: None, body: body.into(),
+        }
+    }
+
+    #[test]
+    fn extracts_wikilinks() {
+        assert_eq!(
+            extract_wikilinks("passes [[frame-alignment]] before [[errors/scrollback-dup]] runs"),
+            vec!["frame-alignment".to_string(), "errors/scrollback-dup".to_string()]
+        );
+        assert!(extract_wikilinks("no links [here] or [[unclosed").is_empty());
+    }
+
+    #[test]
+    fn preprocesses_wikilinks_to_brain_urls() {
+        assert_eq!(
+            preprocess_wikilinks("see [[frame-alignment]]."),
+            "see [frame-alignment](ninox-brain:frame-alignment)."
+        );
+    }
+
+    #[test]
+    fn backlinks_match_by_name_or_id_stem() {
+        let a = entry("symbols/scrollback-buffer.md", "symbols", "ScrollbackBuffer", "…");
+        let b = entry("concepts/frame-alignment.md", "concepts", "frame-alignment",
+                      "owned by [[ScrollbackBuffer]]");
+        let c = entry("errors/scrollback-dup.md", "errors", "scrollback-dup", "unrelated");
+        let all = vec![a.clone(), b.clone(), c];
+        let backs = backlinks_for(&all, &a);
+        assert_eq!(backs.len(), 1);
+        assert_eq!(backs[0].id, b.id);
+    }
+
+    #[test]
+    fn categories_are_counted_and_ordered_by_taxonomy() {
+        let all = vec![
+            entry("symbols/a.md", "symbols", "a", ""),
+            entry("symbols/b.md", "symbols", "b", ""),
+            entry("errors/x.md", "errors", "x", ""),
+        ];
+        let cats = categories(&all);
+        assert_eq!(cats, vec![("symbols".to_string(), 2), ("errors".to_string(), 1)]);
+    }
 }

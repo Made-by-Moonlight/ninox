@@ -68,14 +68,7 @@ fn styled_input<'a>(s: &'a ColorScheme, placeholder: &'a str, value: &'a str) ->
         .font(SERIF)
         .size(16)
         .padding([4, 2])
-        .style(move |_theme, _status| text_input::Style {
-            background: Background::Color(Color::TRANSPARENT),
-            border: Border::default(),
-            icon: s.faint,
-            placeholder: s.faint,
-            value: s.ink,
-            selection: Color { a: 0.35, ..s.accent },
-        })
+        .style(style::underlined_input_style(s))
 }
 
 fn pick_style<'a>(s: &'a ColorScheme) -> impl Fn(&iced::Theme, pick_list::Status) -> pick_list::Style + 'a {
@@ -88,23 +81,18 @@ fn pick_style<'a>(s: &'a ColorScheme) -> impl Fn(&iced::Theme, pick_list::Status
     }
 }
 
-/// A chip-style toggle button shared by the kind toggle, agent chips, and
-/// catalogue chips (the one pill exception in the design language).
+/// A pill-style toggle button shared by the agent and catalogue chip rows
+/// (the one pill exception in the design language; the Entry-type toggle
+/// uses the bordered `style::segmented_frame`/`toggle_segment` pair instead —
+/// see `kind_toggle` below).
 fn chip<'a>(s: &'a ColorScheme, label: String, selected: bool, on_press: Message) -> Element<'a, Message> {
     let text_color = if selected { s.card } else { s.ink_2 };
+    let border_active = Border { color: s.ink, width: 1.5, radius: 14.0.into() };
+    let border_inactive = Border { color: s.rule_dark, width: 1.5, radius: 14.0.into() };
     button(text(label).size(11).font(if selected { SANS_BOLD } else { SANS }).color(text_color))
         .on_press(on_press)
         .padding([7, 16])
-        .style(move |_theme, _status| button::Style {
-            background: Some(Background::Color(if selected { s.ink } else { Color::TRANSPARENT })),
-            text_color,
-            border: Border {
-                color: if selected { s.ink } else { s.rule_dark },
-                width: 1.5,
-                radius: 14.0.into(),
-            },
-            ..Default::default()
-        })
+        .style(style::segment_style(s, selected, s.ink_2, None, border_active, border_inactive))
         .into()
 }
 
@@ -131,25 +119,27 @@ pub fn spawn_modal<'a>(state: &'a App, form: &'a SpawnForm) -> Element<'a, Messa
         ..Default::default()
     });
 
-    // ── Entry type: two segments, ink-filled when active ────────────────────
+    // ── Entry type: two borderless segments in a shared bordered frame
+    // (mockup `.bm`/`.brain-mode` — matches brain_panel's mode toggle rather
+    // than the pill `chip()` style, which would double its 1.5px border
+    // where two touching segments meet) ─────────────────────────────────────
     let kind_toggle = column![
         micro_label("Entry type", s.ink_2),
         Space::new(0, 8),
-        row![
-            chip(
+        style::segmented_frame(s, vec![
+            style::toggle_segment(
                 s,
-                "⬡ ORCHESTRATOR".to_string(),
+                "⬡ Orchestrator",
                 form.kind == SpawnKind::Orchestrator,
                 Message::SpawnFormKind(SpawnKind::Orchestrator),
             ),
-            chip(
+            style::toggle_segment(
                 s,
-                "STANDALONE".to_string(),
+                "Standalone",
                 form.kind == SpawnKind::Standalone,
                 Message::SpawnFormKind(SpawnKind::Standalone),
             ),
-        ]
-        .spacing(0),
+        ]),
     ]
     .spacing(0);
 
@@ -177,14 +167,7 @@ pub fn spawn_modal<'a>(state: &'a App, form: &'a SpawnForm) -> Element<'a, Messa
                 .font(MONO)
                 .size(13)
                 .padding([6, 2])
-                .style(move |_theme, _status| text_input::Style {
-                    background: Background::Color(Color::TRANSPARENT),
-                    border: Border::default(),
-                    icon: s.faint,
-                    placeholder: s.faint,
-                    value: s.ink,
-                    selection: Color { a: 0.35, ..s.accent },
-                }),
+                .style(style::underlined_input_style(s)),
             hline(s.rule_dark, 1.5),
         ]
         .spacing(4)

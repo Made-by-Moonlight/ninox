@@ -1,13 +1,19 @@
 //! Field Notes shared styling: fonts, hard offset shadows, cards, stamps.
 //! Spec: docs/design-concepts/field-notes-design.md §2–3.
-#![allow(dead_code)] // TODO(field-notes): remove once all views consume these helpers
 
 use iced::font::{Family, Stretch, Style as FontStyle, Weight};
-use iced::widget::{container, text, Space};
+use iced::widget::{button, container, row, text, text_input, Space};
 use iced::{Background, Border, Color, Element, Font, Length, Shadow, Vector};
 use ninox_core::types::{CIStatus, SessionStatus};
 
 use crate::theme::ColorScheme;
+
+/// Full month names, indexed by `chrono`'s `month0()` (0 = January) —
+/// shared by fleet_board's and pr_list's folio date labels.
+pub const MONTHS: [&str; 12] = [
+    "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
+    "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
+];
 
 // ── Typography: three families, three jobs ─────────────────────────────────
 pub const SERIF: Font = Font {
@@ -149,6 +155,92 @@ pub fn dotted_rule<'a, M: 'a>(color: Color) -> Element<'a, M> {
     .height(Length::Fixed(8.0))
     .clip(true)
     .into()
+}
+
+// ── Segmented toggles ───────────────────────────────────────────────────────
+/// `button::Style` for one item of a segmented toggle: `ink`-filled
+/// background + `card` text when `active`, transparent otherwise.
+/// `inactive_text`/`hover_text` cover per-site hover feedback (brain_panel's
+/// mode toggle turns `ink`-colored on hover; others stay fixed), and
+/// `border_active`/`border_inactive` cover every border treatment used
+/// across the app: an always-on rectangle (fleet_board's scope tabs), a
+/// state-colored pill (spawn_modal's agent/catalogue chips), or no border at
+/// all (`Border::default()`, for segments living inside a `segmented_frame`).
+/// Shared by fleet_board's `tab_chip`, spawn_modal's `chip`, and
+/// `toggle_segment` below.
+pub fn segment_style<'a>(
+    s: &'a ColorScheme,
+    active: bool,
+    inactive_text: Color,
+    hover_text: Option<Color>,
+    border_active: Border,
+    border_inactive: Border,
+) -> impl Fn(&iced::Theme, button::Status) -> button::Style + 'a {
+    move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered);
+        button::Style {
+            background: Some(Background::Color(if active { s.ink } else { Color::TRANSPARENT })),
+            text_color: if active {
+                s.card
+            } else if hovered {
+                hover_text.unwrap_or(inactive_text)
+            } else {
+                inactive_text
+            },
+            border: if active { border_active } else { border_inactive },
+            ..Default::default()
+        }
+    }
+}
+
+/// One item of a borderless segmented toggle meant to sit inside
+/// `segmented_frame` (mockup `.bm`): micro-label typography, `ink`-filled +
+/// `card` text when active, `ink`-colored text on hover otherwise. Shared by
+/// brain_panel's Pinboard/Catalogue mode toggle and spawn_modal's Entry-type
+/// toggle.
+pub fn toggle_segment<'a, M: Clone + 'a>(s: &'a ColorScheme, label: &str, active: bool, on_press: M) -> Element<'a, M> {
+    button(micro_label(label, if active { s.card } else { s.ink_2 }))
+        .on_press(on_press)
+        .padding([5, 14])
+        .style(segment_style(s, active, s.ink_2, Some(s.ink), Border::default(), Border::default()))
+        .into()
+}
+
+/// The bordered, hard-shadowed frame around a `toggle_segment` row, with an
+/// `ink` `vline` between each segment (mockup `.brain-mode`). Shared by
+/// brain_panel's mode toggle and spawn_modal's Entry-type toggle.
+pub fn segmented_frame<'a, M: 'a>(s: &'a ColorScheme, segments: Vec<Element<'a, M>>) -> Element<'a, M> {
+    let (card_a, _, _) = shadow_alpha(s);
+    let mut children: Vec<Element<M>> = Vec::with_capacity(segments.len() * 2);
+    for (i, seg) in segments.into_iter().enumerate() {
+        if i > 0 {
+            children.push(vline(s.ink, 1.5));
+        }
+        children.push(seg);
+    }
+    container(row(children).height(Length::Shrink))
+        .style(move |_theme| container::Style {
+            border: Border { color: s.ink, width: 1.5, radius: 2.0.into() },
+            shadow: hard_shadow(s, 2.0, 2.0, card_a),
+            ..Default::default()
+        })
+        .into()
+}
+
+// ── Underlined text inputs ──────────────────────────────────────────────────
+/// Style for the app's underlined text inputs: transparent background, no
+/// border (the underline is a separate `hline`), `faint` icon/placeholder,
+/// `ink` value, and a 35%-alpha `accent` selection. Shared by the fleet/brain
+/// filter fields and the spawn modal's name/workspace fields.
+pub fn underlined_input_style(s: &ColorScheme) -> impl Fn(&iced::Theme, text_input::Status) -> text_input::Style + '_ {
+    move |_theme, _status| text_input::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border::default(),
+        icon: s.faint,
+        placeholder: s.faint,
+        value: s.ink,
+        selection: Color { a: 0.35, ..s.accent },
+    }
 }
 
 #[cfg(test)]

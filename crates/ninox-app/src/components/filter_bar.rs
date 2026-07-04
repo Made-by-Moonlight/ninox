@@ -1,10 +1,10 @@
 use iced::{
     widget::{button, column, row, text, text_input, Space},
-    Alignment, Background, Border, Element, Length,
+    Alignment, Border, Element, Length,
 };
 
 use crate::app::{App, Message};
-use crate::style::hline;
+use crate::style::{hline, underlined_input_style};
 
 /// Underlined "⌕ filter the fleet…" field for the folio row.
 pub fn filter_bar(app: &App) -> Element<'_, Message> {
@@ -14,14 +14,7 @@ pub fn filter_bar(app: &App) -> Element<'_, Message> {
         .on_input(Message::FleetFilterQuery)
         .size(12)
         .padding([4, 2])
-        .style(move |_t, _st| text_input::Style {
-            background: Background::Color(iced::Color::TRANSPARENT),
-            border: Border::default(),
-            icon: s.faint,
-            placeholder: s.faint,
-            value: s.ink,
-            selection: iced::Color { a: 0.35, ..s.accent },
-        });
+        .style(underlined_input_style(s));
 
     let mut field_row = row![text("⌕").size(13).color(s.faint), Space::new(6, 0), input]
         .align_y(Alignment::Center);
