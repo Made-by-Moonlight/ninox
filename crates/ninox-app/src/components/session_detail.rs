@@ -13,6 +13,56 @@ fn repo_short(repo: &str) -> &str {
     repo.rsplit('/').next().unwrap_or(repo)
 }
 
+// ── Terminal chrome budget ───────────────────────────────────────────────────
+//
+// `App::resize_terminals` picks a PTY grid size (cols/rows) from the window
+// size *before* iced has laid anything out, so it has to predict how much of
+// the window the terminal `Canvas` will actually get. If the prediction is
+// too generous, the PTY (and alacritty's grid) end up bigger than the canvas
+// that renders it, and — because `TerminalWidget::draw` anchors to the
+// top-left — the bottom rows (including the live prompt line) clip off the
+// bottom of the frame instead of being cut evenly.
+//
+// These two constants are that prediction, derived from the actual widget
+// tree built below (`session_detail`), not eyeballed. iced's default text
+// `LineHeight` is `Relative(1.3)` (see `iced_core::text::LineHeight`), so a
+// `text(..).size(N)` line is `N * 1.3` px tall; that's the basis for every
+// text-derived number here. Border `width` is intentionally excluded —
+// iced draws container borders as a stroke over the box's existing bounds,
+// it does not add to layout size (see `iced_widget::container::layout`).
+//
+// Height, top to bottom, above the terminal `Canvas` for *both* the
+// `Terminal` and `Split` panels (they share the same `term_stage`/
+// `term_frame` chrome — see `content` below):
+//   - `header` container:             padding [14, 20] -> 28.0 vertical
+//       + content row (max child):    `identity` column is tallest:
+//         name text size 28 (28*1.3 = 36.4) + 4.0 spacing
+//         + subline text size 10 (10*1.3 = 13.0)          = 53.4
+//     header total:                                          81.4
+//   - `tabs_block` container:         padding top 10 / bottom 0 -> 10.0
+//       + content column:  panel_btn row (label 15*1.3=19.5 + 4.0 Space
+//         + 2.0 underline hline) = 25.5, plus the full-width 2.0 hline
+//         drawn below the row                                27.5
+//     tabs_block total:                                       37.5
+//   - `term_stage` container:         padding 16 all sides -> 32.0 vertical
+//   - `term_frame`'s `title_bar`:     padding [7, 12] -> 14.0 vertical
+//       + content row (max child):    dot 8.0 vs text 9.5*1.3=12.35 -> 12.35
+//     title_bar total:                                        26.35
+//   - hline between title_bar and the pane:                    1.0
+//   ---------------------------------------------------------------------
+//   sum:  81.4 + 37.5 + 32.0 + 26.35 + 1.0 = 178.25, rounded up for a small
+//   safety margin (font metrics / hinting can round a hair differently than
+//   this arithmetic) to:
+pub(crate) const TERM_CHROME_H: f32 = 180.0;
+
+// Width chrome affecting the terminal canvas: only `term_stage`'s own
+// padding narrows it (16 left + 16 right = 32.0) — everything else in the
+// tree (header, tabs, title_bar) is either full-width or lays out
+// vertically above the canvas, so it doesn't reduce the canvas's width.
+// Sidebar/info-panel widths are already subtracted separately by the
+// caller (`App::resize_terminals`), since those aren't part of this chrome.
+pub(crate) const TERM_CHROME_W: f32 = 32.0;
+
 /// Panel tab — italic serif label, accent underline when active, sitting
 /// flush above the full-width ink rule drawn by the caller.
 fn panel_btn<'a>(app: &'a App, label: &'static str, target: DetailPanel, active: DetailPanel) -> Element<'a, Message> {

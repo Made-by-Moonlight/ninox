@@ -409,18 +409,23 @@ impl App {
     /// do that (e.g. immediately for a window resize, or once at
     /// drag-release rather than every frame).
     fn resize_terminals(state: &mut Self) -> Vec<(SessionId, u16, u16)> {
+        use crate::components::session_detail::{TERM_CHROME_H, TERM_CHROME_W};
+
         let (cell_w, cell_h) = crate::components::terminal::cell_size(
             crate::components::terminal::FONT_SIZE,
         );
         let sidebar_w = state.sidebar_width + 5.0; // +5 for drag handle
-        let header_h  = 80.0f32;
         let info_w    = state.info_width + 5.0; // +5 for drag handle
 
         // Background sizing: what any session shows once Split (the default
         // panel) is active — this is also the authoritative size recorded on
         // `state` for sessions that don't have a `TerminalState` yet.
-        let bg_cols = ((state.window_width - sidebar_w - info_w).max(200.0) / cell_w) as u16;
-        let bg_rows = ((state.window_height - header_h).max(100.0) / cell_h) as u16;
+        // `TERM_CHROME_W`/`TERM_CHROME_H` are the header/tabs/term-frame
+        // chrome that sits around the terminal `Canvas` in both the
+        // `Terminal` and `Split` panels — see their doc comment in
+        // `session_detail.rs` for the pixel-by-pixel derivation.
+        let bg_cols = ((state.window_width - sidebar_w - info_w - TERM_CHROME_W).max(200.0) / cell_w) as u16;
+        let bg_rows = ((state.window_height - TERM_CHROME_H).max(100.0) / cell_h) as u16;
         state.terminal_cols = bg_cols;
         state.terminal_rows = bg_rows;
 
@@ -432,7 +437,7 @@ impl App {
                 Some((session_id.clone(), bg_cols, bg_rows))
             }
             View::SessionDetail { session_id, .. } => {
-                let cols = ((state.window_width - sidebar_w).max(200.0) / cell_w) as u16;
+                let cols = ((state.window_width - sidebar_w - TERM_CHROME_W).max(200.0) / cell_w) as u16;
                 Some((session_id.clone(), cols, bg_rows))
             }
             _ => None,
@@ -2157,6 +2162,61 @@ mod tests {
             background_cols as usize,
             "a backgrounded session must stay at the Split-assumed width — it isn't shown by \
              the panel change and will default back to Split next time it's navigated to"
+        );
+    }
+
+    #[test]
+    fn resize_terminals_budgets_the_real_session_detail_chrome() {
+        // Guards against the PTY grid being sized larger than the terminal
+        // `Canvas` actually rendered by `session_detail` — if this drifts
+        // from the widget tree again, the bottom rows (including the live
+        // prompt line) clip off-screen instead of the grid staying in sync.
+        // Expected dims are derived from the same `TERM_CHROME_*` constants
+        // `resize_terminals` uses, not re-typed magic numbers, so this test
+        // fails the moment the two go out of sync with each other.
+        use crate::components::session_detail::{TERM_CHROME_H, TERM_CHROME_W};
+
+        let e = test_engine();
+        let mut m = base(e);
+        m.window_width  = 1200.0;
+        m.window_height = 800.0;
+        m.sidebar_width = 220.0;
+        m.info_width    = 300.0;
+
+        let (cell_w, cell_h) = crate::components::terminal::cell_size(
+            crate::components::terminal::FONT_SIZE,
+        );
+        let sidebar_w = m.sidebar_width + 5.0;
+        let info_w    = m.info_width + 5.0;
+
+        let expected_bg_cols = ((m.window_width - sidebar_w - info_w - TERM_CHROME_W) / cell_w) as u16;
+        let expected_bg_rows = ((m.window_height - TERM_CHROME_H) / cell_h) as u16;
+        let expected_full_cols = ((m.window_width - sidebar_w - TERM_CHROME_W) / cell_w) as u16;
+
+        App::resize_terminals(&mut m);
+        assert_eq!(m.terminal_cols, expected_bg_cols);
+        assert_eq!(m.terminal_rows, expected_bg_rows);
+
+        let s = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0,
+            started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None,
+        };
+        let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (m, _) = m.update(Message::NavigateSession("s1".into()));
+        let mut m = m;
+        m.terminals.insert(
+            "s1".into(),
+            crate::components::terminal::TerminalState::new(m.terminal_cols, m.terminal_rows),
+        );
+        let (m, _) = m.update(Message::SwitchDetailPanel(crate::components::session_detail::DetailPanel::Terminal));
+        use alacritty_terminal::grid::Dimensions;
+        assert_eq!(
+            m.terminals.get("s1").unwrap().term.grid().columns(),
+            expected_full_cols as usize,
+            "full-width Terminal panel must subtract TERM_CHROME_W, not just the sidebar"
         );
     }
 
