@@ -40,20 +40,23 @@ fn repo_short(repo: &str) -> &str {
 //         + subline text size 10 (10*1.3 = 13.0)          = 53.4
 //     header total:                                          81.4
 //   - `tabs_block` container:         padding top 10 / bottom 0 -> 10.0
-//       + content column:  panel_btn row (label 15*1.3=19.5 + 4.0 Space
-//         + 2.0 underline hline) = 25.5, plus the full-width 2.0 hline
-//         drawn below the row                                27.5
-//     tabs_block total:                                       37.5
+//       + content column:  panel_btn is a button(...) whose own
+//         .padding([2, 2]) wraps its inner column (label 15*1.3=19.5
+//         + 4.0 Space + 2.0 underline hline = 25.5), so the button lays
+//         out at 25.5 + 4.0 = 29.5; plus the full-width 2.0 hline drawn
+//         below the row                                       31.5
+//     tabs_block total:                                       41.5
 //   - `term_stage` container:         padding 16 all sides -> 32.0 vertical
 //   - `term_frame`'s `title_bar`:     padding [7, 12] -> 14.0 vertical
 //       + content row (max child):    dot 8.0 vs text 9.5*1.3=12.35 -> 12.35
 //     title_bar total:                                        26.35
 //   - hline between title_bar and the pane:                    1.0
 //   ---------------------------------------------------------------------
-//   sum:  81.4 + 37.5 + 32.0 + 26.35 + 1.0 = 178.25, rounded up for a small
+//   sum:  81.4 + 41.5 + 32.0 + 26.35 + 1.0 = 182.25, rounded up for a small
 //   safety margin (font metrics / hinting can round a hair differently than
-//   this arithmetic) to:
-pub(crate) const TERM_CHROME_H: f32 = 180.0;
+//   this arithmetic; the canvas is top-anchored, so over-estimating is safe
+//   while under-estimating clips the prompt row) to:
+pub(crate) const TERM_CHROME_H: f32 = 185.0;
 
 // Width chrome affecting the terminal canvas: only `term_stage`'s own
 // padding narrows it (16 left + 16 right = 32.0) — everything else in the
