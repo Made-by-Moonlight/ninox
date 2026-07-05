@@ -93,7 +93,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
             row![
                 text("Nin").size(27).font(SERIF_MEDIUM).color(s.ink),
                 text("ox").size(27).font(SERIF_ITALIC).color(s.ink),
-                text(" ⬡").size(20).color(s.ink),
+                text(" ⬡").size(20).font(crate::style::GLYPH).color(s.ink),
             ]
             .align_y(Alignment::End),
             Space::new(0, 6),
@@ -292,50 +292,75 @@ fn tree_row<'a>(
     let name_font = if bold { SANS_BOLD } else { crate::style::SANS };
     let left_pad = if indented { 38.0 } else { 18.0 };
 
-    let mut content = row![
-        container(Space::new(0, 0)).width(3).height(Length::Fixed(20.0)).style(move |_| {
-            container::Style {
-                background: Some(Background::Color(if is_active { s.accent } else { Color::TRANSPARENT })),
-                ..Default::default()
-            }
-        }),
-        Space::new(left_pad - 3.0, 0),
-        dot,
-        Space::new(9, 0),
-        text(name.to_owned()).size(12.5).font(name_font).color(if is_active || bold { s.ink } else { s.ink_2 }),
-        Space::new(Length::Fill, 0),
-        text(right.to_owned()).size(10).font(MONO).color(s.faint),
-    ]
-    .align_y(Alignment::Center);
+    // Row-level hover/active background: shared by the navigate button and
+    // (so the whole row still reads as one control) the chevron/× buttons,
+    // which otherwise sit transparent. All three are SIBLING buttons — an
+    // iced `button` swallows presses on any button nested inside it, which
+    // is why the chevron/× used to be dead when they lived inside the
+    // navigate button's content.
+    let row_bg = move |hovered: bool| {
+        (is_active || hovered).then_some(Background::Color(s.card))
+    };
+
+    let navigate = button(
+        row![
+            container(Space::new(0, 0)).width(3).height(Length::Fixed(20.0)).style(move |_| {
+                container::Style {
+                    background: Some(Background::Color(if is_active { s.accent } else { Color::TRANSPARENT })),
+                    ..Default::default()
+                }
+            }),
+            Space::new(left_pad - 3.0, 0),
+            dot,
+            Space::new(9, 0),
+            text(name.to_owned()).size(12.5).font(name_font).color(if is_active || bold { s.ink } else { s.ink_2 }),
+            Space::new(Length::Fill, 0),
+            text(right.to_owned()).size(10).font(MONO).color(s.faint),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .on_press(Message::NavigateSession(id.to_owned()))
+    .style(move |_t, status| button::Style {
+        background: row_bg(matches!(status, button::Status::Hovered)),
+        text_color: s.ink_2,
+        border: Border::default(),
+        ..Default::default()
+    })
+    .padding(Padding { top: 3.0, right: 0.0, bottom: 3.0, left: 0.0 })
+    .width(Length::Fill);
+
+    let mut row_items: Vec<Element<Message>> = vec![navigate.into()];
 
     if let Some(toggle_target) = chevron_toggle {
-        content = content.push(Space::new(4, 0));
-        content = content.push(
+        row_items.push(Space::new(4, 0).into());
+        row_items.push(
             button(text(if toggle_target.is_none() { "▾" } else { "▸" }).size(9).color(s.faint))
                 .on_press(Message::SelectOrchestrator(toggle_target))
-                .style(|_t, _st| button::Style { background: None, border: Border::default(), ..Default::default() })
-                .padding([2, 4]),
+                .style(move |_t, status| button::Style {
+                    background: row_bg(matches!(status, button::Status::Hovered)),
+                    border: Border::default(),
+                    ..Default::default()
+                })
+                .padding([2, 4])
+                .into(),
         );
     }
     if let Some(remove_msg) = remove {
-        content = content.push(
+        row_items.push(
             button(text("×").size(12).color(s.faint))
                 .on_press(remove_msg)
-                .style(|_t, _st| button::Style { background: None, border: Border::default(), ..Default::default() })
-                .padding([2, 6]),
+                .style(move |_t, status| button::Style {
+                    background: row_bg(matches!(status, button::Status::Hovered)),
+                    border: Border::default(),
+                    ..Default::default()
+                })
+                .padding([2, 6])
+                .into(),
         );
     }
 
-    button(content)
-        .on_press(Message::NavigateSession(id.to_owned()))
-        .style(move |_t, status| button::Style {
-            background: (is_active || matches!(status, button::Status::Hovered))
-                .then_some(Background::Color(s.card)),
-            text_color: s.ink_2,
-            border: Border::default(),
-            ..Default::default()
-        })
-        .padding(Padding { top: 3.0, right: 10.0, bottom: 3.0, left: 0.0 })
+    container(row(row_items).align_y(Alignment::Center))
+        .padding(Padding { top: 0.0, right: 10.0, bottom: 0.0, left: 0.0 })
         .width(Length::Fill)
         .into()
 }
