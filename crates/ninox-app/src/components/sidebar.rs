@@ -105,14 +105,14 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
 
     // ── 2. Table-of-contents nav ─────────────────────────────────────────────
     let on_fleet = matches!(app.view, View::FleetBoard { .. });
-    let on_session = matches!(app.view, View::SessionDetail { .. });
     let on_prs = matches!(app.view, View::PrList);
     let on_brain = matches!(app.view, View::Brain);
     let toc = column![
         toc_item(app, "I.", "Fleet board", "1", Message::NavigateFleet { scope: None }, on_fleet),
-        toc_item(app, "II.", "Session", "2", Message::NavigateLastSession, on_session),
-        toc_item(app, "III.", "Pull requests", "3", Message::NavigatePrList, on_prs),
-        toc_item(app, "IV.", "Brain", "4", Message::NavigateBrain, on_brain),
+        // No "Session" entry: the session tree below IS the session
+        // navigation — a TOC alias for "last session" was redundant.
+        toc_item(app, "II.", "Pull requests", "2", Message::NavigatePrList, on_prs),
+        toc_item(app, "III.", "Brain", "3", Message::NavigateBrain, on_brain),
     ]
     .padding(Padding { top: 10.0, right: 0.0, bottom: 10.0, left: 0.0 });
 

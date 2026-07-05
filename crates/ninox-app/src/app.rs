@@ -63,6 +63,20 @@ pub struct BrainViewState {
     /// Parsed markdown body of `selected`, preprocessed so `[[wikilinks]]`
     /// render as clickable `ninox-brain:` links.
     pub markdown: Vec<iced::widget::markdown::Item>,
+    /// Entries that link to `selected` ("cited by"), fetched from the index
+    /// in the `BrainSelectEntry` handler rather than re-derived from
+    /// `entries` on every render. Empty when nothing is selected.
+    pub backlinks: Vec<BrainEntry>,
+    /// Entries related to `selected` — direct links, then co-citation, then
+    /// shared tags (see `BrainIndex::related`) — same fetch-on-select
+    /// pattern as `backlinks`.
+    pub related: Vec<BrainEntry>,
+    /// Pinboard edges as undirected, deduplicated node-index pairs into
+    /// `entries`, resolved from `BrainIndex::links_all()` once per data
+    /// change (`NavigateBrain` / `BrainReindex` / `BrainSwitchCatalogue`) —
+    /// see `App::refresh_brain_edges` and `brain_pinboard::resolve_edges`.
+    /// Never re-derived per canvas draw.
+    pub edges: Vec<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,7 +120,6 @@ pub struct App {
     pub notifications:   VecDeque<Notification>,
     pub sidebar:         SidebarState,
     pub view:            View,
-    pub last_session:    Option<SessionId>,
     /// The user's preferred worker panel — global, not per-session: the
     /// last tab chosen in any session detail, applied when opening a
     /// worker (resetting to Split on every navigation was jarring).
@@ -156,7 +169,6 @@ pub enum Message {
     EngineEvent(Event),
     NavigateFleet { scope: Option<OrchestratorId> },
     NavigateSession(SessionId),
-    NavigateLastSession,
     /// Attach argv resolved — spawn the hidden tmux client for this session.
     ClientAttach { session_id: SessionId, argv: Vec<String> },
     /// Toggle an orchestrator's worker list open/closed in the tree.
@@ -318,7 +330,6 @@ impl App {
             notifications:  VecDeque::new(),
             sidebar:        SidebarState::default(),
             view:           View::default(),
-            last_session:   None,
             worker_panel:   Default::default(),
             terminals:      HashMap::new(),
             clients:        HashMap::new(),
@@ -460,6 +471,51 @@ impl App {
         resized
     }
 
+    /// Re-derive pinboard edges (node-index pairs into `brain_view.entries`)
+    /// from the index's resolved link graph. Called once per data change —
+    /// `NavigateBrain`'s initial load, `BrainReindex`, and
+    /// `BrainSwitchCatalogue` — never per canvas draw. A DB error is
+    /// tolerated: warn and leave the pinboard edge-less rather than panic.
+    fn refresh_brain_edges(state: &mut Self) {
+        match state.brain.links_all() {
+            Ok(links) => {
+                state.brain_view.edges = crate::components::brain_pinboard::resolve_edges(
+                    &state.brain_view.entries,
+                    &links,
+                );
+            }
+            Err(e) => {
+                tracing::warn!("brain links_all: {e}");
+                state.brain_view.edges.clear();
+            }
+        }
+    }
+
+    /// Refetches `backlinks`/`related` for `brain_view.selected` from the
+    /// index. No-ops when nothing is selected. Shared by `BrainSelectEntry`
+    /// (fresh selection) and `BrainReindex` (index may have changed under a
+    /// still-selected entry) — markdown handling stays with the select path
+    /// since reindex never changes which entry is selected, only its graph.
+    fn refresh_selection_graph(state: &mut Self) {
+        let Some(id) = state.brain_view.selected.clone() else {
+            return;
+        };
+        match state.brain.backlinks(&id) {
+            Ok(backs) => state.brain_view.backlinks = backs,
+            Err(e) => {
+                tracing::warn!("brain backlinks({id}): {e}");
+                state.brain_view.backlinks = Vec::new();
+            }
+        }
+        match state.brain.related(&id, 6) {
+            Ok(rel) => state.brain_view.related = rel,
+            Err(e) => {
+                tracing::warn!("brain related({id}): {e}");
+                state.brain_view.related = Vec::new();
+            }
+        }
+    }
+
     /// Shared mutation logic.
     fn apply(state: &mut Self, message: Message) -> Task<Message> {
         match message {
@@ -474,7 +530,6 @@ impl App {
             }
 
             Message::NavigateSession(id) => {
-                state.last_session = Some(id.clone());
                 // Selecting an orchestrator auto-expands its workers in the
                 // sidebar tree; selecting one of its workers keeps it open.
                 if state.orchestrators.iter().any(|o| o.id == id) {
@@ -517,15 +572,6 @@ impl App {
                     let argv = ninox_core::tmux::attach_args(&id).await;
                     Message::ClientAttach { session_id: id, argv }
                 })
-            }
-
-            Message::NavigateLastSession => {
-                if let Some(id) = state.last_session.clone() {
-                    if state.sessions.contains_key(&id) {
-                        return App::apply(state, Message::NavigateSession(id));
-                    }
-                }
-                Task::none()
             }
 
             Message::ClientAttach { session_id, argv } => {
@@ -824,7 +870,6 @@ impl App {
                             session_id: sid.clone(),
                             panel:      DetailPanel::Terminal,
                         };
-                        state.last_session = Some(sid.clone());
 
                         let engine = state.engine.clone();
                         let nm     = name;
@@ -944,7 +989,6 @@ impl App {
                             session_id: orch.id.clone(),
                             panel:      DetailPanel::Terminal,
                         };
-                        state.last_session = Some(orch.id.clone());
 
                         let engine     = state.engine.clone();
                         let sid        = orch.id.clone();
@@ -1078,9 +1122,8 @@ impl App {
                     if let iced::keyboard::Key::Character(c) = &key {
                         match c.as_str() {
                             "1" => return App::apply(state, Message::NavigateFleet { scope: None }),
-                            "2" => return App::apply(state, Message::NavigateLastSession),
-                            "3" => return App::apply(state, Message::NavigatePrList),
-                            "4" => return App::apply(state, Message::NavigateBrain),
+                            "2" => return App::apply(state, Message::NavigatePrList),
+                            "3" => return App::apply(state, Message::NavigateBrain),
                             "t" => {
                                 let next = match state.active_variant {
                                     ThemeVariant::Dark | ThemeVariant::Ninox => ThemeVariant::Light,
@@ -1268,6 +1311,7 @@ impl App {
                         Ok(entries) => {
                             state.brain_view.entries = entries;
                             state.brain_view.loaded = true;
+                            Self::refresh_brain_edges(state);
                         }
                         Err(e) => tracing::error!("brain query: {e}"),
                     }
@@ -1285,6 +1329,7 @@ impl App {
                     state.brain_view.mode = BrainMode::Catalogue;
                 }
                 state.brain_view.selected = Some(id);
+                Self::refresh_selection_graph(state);
                 Task::none()
             }
 
@@ -1303,7 +1348,26 @@ impl App {
                     Ok(count) => {
                         tracing::info!("brain reindexed: {count} entries");
                         match state.brain.query("", QueryFilters::default()) {
-                            Ok(entries) => state.brain_view.entries = entries,
+                            Ok(entries) => {
+                                state.brain_view.entries = entries;
+                                Self::refresh_brain_edges(state);
+                                // The selected entry may have been renamed or
+                                // deleted by whatever triggered the reindex —
+                                // if it no longer resolves, clear the pane
+                                // instead of showing a ghost selection.
+                                let ghost = state
+                                    .brain_view
+                                    .selected
+                                    .as_ref()
+                                    .is_some_and(|id| !state.brain_view.entries.iter().any(|e| &e.id == id));
+                                if ghost {
+                                    state.brain_view.selected = None;
+                                    state.brain_view.markdown = Vec::new();
+                                    state.brain_view.backlinks = Vec::new();
+                                    state.brain_view.related = Vec::new();
+                                }
+                                Self::refresh_selection_graph(state);
+                            }
                             Err(e) => tracing::error!("brain query after reindex: {e}"),
                         }
                         state.brain_view.loaded = true;
@@ -1360,11 +1424,15 @@ impl App {
                             state.brain_view.hovered = None;
                             state.brain_view.markdown.clear();
                             state.brain_view.open_drawers.clear();
+                            state.brain_view.backlinks.clear();
+                            state.brain_view.related.clear();
+                            state.brain_view.edges.clear();
                             state.brain_view.loaded = false;
                             match state.brain.query("", QueryFilters::default()) {
                                 Ok(entries) => {
                                     state.brain_view.entries = entries;
                                     state.brain_view.loaded = true;
+                                    Self::refresh_brain_edges(state);
                                 }
                                 Err(e) => tracing::error!("brain query after catalogue switch: {e}"),
                             }
@@ -1935,7 +2003,6 @@ mod tests {
             notifications:  VecDeque::new(),
             sidebar:        SidebarState::default(),
             view:           View::FleetBoard { scope: None },
-            last_session:   None,
             worker_panel:   Default::default(),
             terminals:      HashMap::new(),
             clients:        HashMap::new(),
@@ -2022,32 +2089,6 @@ mod tests {
 
         // The newly spawned orchestrator's session must be remembered as the
         // last-visited session so NavigateLastSession can return to it.
-        assert_eq!(m.last_session.as_deref(), Some(orch_id.as_str()));
-    }
-
-    #[test]
-    fn navigate_session_records_last_session() {
-        let e = test_engine();
-        let mut m = base(e);
-        let s = Session {
-            id: "sess-a".into(), orchestrator_id: None, name: "w".into(),
-            repo: "r".into(), status: SessionStatus::Working,
-            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
-            pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None,
-        };
-        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
-        m = next;
-
-        let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
-        m = next;
-        assert_eq!(m.last_session.as_deref(), Some("sess-a"));
-
-        let (next, _) = m.update(Message::NavigateFleet { scope: None });
-        m = next;
-        let (next, _) = m.update(Message::NavigateLastSession);
-        m = next;
-        assert!(matches!(&m.view, View::SessionDetail { session_id, .. } if session_id == "sess-a"));
     }
 
     #[test]
@@ -2079,45 +2120,6 @@ mod tests {
             matches!(&m.view, View::SessionDetail { panel: DetailPanel::Terminal, .. }),
             "opening a worker must use the global preferred panel, not reset to Split"
         );
-    }
-
-    #[test]
-    fn navigate_last_session_to_deleted_session_is_noop() {
-        let e = test_engine();
-        let mut m = base(e);
-        let s = Session {
-            id: "sess-a".into(), orchestrator_id: None, name: "w".into(),
-            repo: "r".into(), status: SessionStatus::Working,
-            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
-            pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None,
-        };
-        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
-        m = next;
-
-        let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
-        m = next;
-        assert_eq!(m.last_session.as_deref(), Some("sess-a"));
-
-        // Session is removed (e.g. worker finished/removed), but last_session
-        // still points at it.
-        m.sessions.remove("sess-a");
-
-        let (next, _) = m.update(Message::NavigateFleet { scope: None });
-        m = next;
-        assert!(matches!(m.view, View::FleetBoard { .. }));
-
-        let (next, _) = m.update(Message::NavigateLastSession);
-        m = next;
-        assert!(matches!(m.view, View::FleetBoard { .. }));
-    }
-
-    #[test]
-    fn navigate_last_session_without_history_is_noop() {
-        let e = test_engine();
-        let m = base(e);
-        let (m, _) = m.update(Message::NavigateLastSession);
-        assert!(matches!(m.view, View::FleetBoard { .. }));
     }
 
     #[test]
@@ -2378,6 +2380,196 @@ mod tests {
         assert!(app.brain_view.open_drawers.is_empty());
         assert_eq!(app.brain_view.entries.len(), 1);
         assert_eq!(app.brain_view.entries[0].id, "concepts/b.md");
+    }
+
+    #[test]
+    fn navigate_brain_populates_pinboard_edges_from_the_index() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("people")).unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("alice.md"),
+            "---\nname: Alice\n---\nManages [[bob]].",
+        )
+        .unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("bob.md"),
+            "---\nname: Bob\n---\nReports to [[alice]].",
+        )
+        .unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        assert!(m.brain_view.edges.is_empty());
+
+        let (m2, _) = m.update(Message::NavigateBrain);
+        // Alice <-> Bob's mutual link resolves to a single undirected
+        // node-index edge, computed once from `links_all()` rather than
+        // re-parsed per pinboard draw.
+        assert_eq!(m2.brain_view.edges.len(), 1);
+        let (a, b) = m2.brain_view.edges[0];
+        let ids: Vec<&str> =
+            [a, b].iter().map(|&i| m2.brain_view.entries[i].id.as_str()).collect();
+        assert!(ids.contains(&"people/alice.md"));
+        assert!(ids.contains(&"people/bob.md"));
+    }
+
+    #[test]
+    fn selecting_entry_populates_backlinks_and_related_from_the_index() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("people")).unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("alice.md"),
+            "---\nname: Alice\n---\nManages [[bob]].",
+        )
+        .unwrap();
+        std::fs::write(brain_dir.join("people").join("bob.md"), "---\nname: Bob\n---\nbody").unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m2, _) = m.update(Message::NavigateBrain);
+        assert!(m2.brain_view.backlinks.is_empty());
+        assert!(m2.brain_view.related.is_empty());
+
+        let (m3, _) = m2.update(Message::BrainSelectEntry("people/bob.md".into()));
+        assert_eq!(m3.brain_view.backlinks.len(), 1);
+        assert_eq!(m3.brain_view.backlinks[0].id, "people/alice.md");
+        assert!(
+            m3.brain_view.related.iter().any(|e| e.id == "people/alice.md"),
+            "alice directly links to bob, so alice should rank in bob's related list: {:?}",
+            m3.brain_view.related.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reindex_refreshes_backlinks_and_related_for_the_selected_entry() {
+        // BrainReindex used to refetch entries + edges but leave the reading
+        // pane's backlinks/related as stale snapshots from selection time --
+        // if the on-disk citation graph changed underneath the selection,
+        // the chips kept pointing at a graph that no longer existed.
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("people")).unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("alice.md"),
+            "---\nname: Alice\n---\nManages [[bob]].",
+        )
+        .unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("bob.md"),
+            "---\nname: Bob\n---\nReports to [[alice]].",
+        )
+        .unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m2, _) = m.update(Message::NavigateBrain);
+        let (m3, _) = m2.update(Message::BrainSelectEntry("people/alice.md".into()));
+        assert_eq!(
+            m3.brain_view.backlinks.len(),
+            1,
+            "bob cites alice, so alice's backlinks should start populated"
+        );
+        assert!(m3.brain_view.related.iter().any(|e| e.id == "people/bob.md"));
+
+        // Bob (the only entry citing/cited-by alice) is deleted on disk
+        // (e.g. removed outside the app) -- alice stays selected, but her
+        // backlinks/related must reflect the new, bob-less graph after
+        // reindex rather than the stale selection-time snapshot.
+        std::fs::remove_file(brain_dir.join("people").join("bob.md")).unwrap();
+
+        let (m4, _) = m3.update(Message::BrainReindex);
+        assert_eq!(m4.brain_view.selected.as_deref(), Some("people/alice.md"));
+        assert!(
+            m4.brain_view.backlinks.is_empty(),
+            "backlinks must be refreshed after reindex, not left stale: {:?}",
+            m4.brain_view.backlinks.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+        assert!(
+            m4.brain_view.related.is_empty(),
+            "bob is gone, so alice's related list must be refreshed to drop it, not left stale: {:?}",
+            m4.brain_view.related.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reindex_clears_selection_if_the_selected_entry_disappears() {
+        // If the selected entry's file is deleted (or renamed) before a
+        // reindex, `selected` must be cleared so the reading pane falls back
+        // to its empty state instead of showing a ghost entry with stale
+        // markdown/backlinks/related from before the deletion.
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("people")).unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("alice.md"),
+            "---\nname: Alice\n---\nManages [[bob]].",
+        )
+        .unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("bob.md"),
+            "---\nname: Bob\n---\nReports to [[alice]].",
+        )
+        .unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m2, _) = m.update(Message::NavigateBrain);
+        let (m3, _) = m2.update(Message::BrainSelectEntry("people/alice.md".into()));
+        assert_eq!(m3.brain_view.selected.as_deref(), Some("people/alice.md"));
+        assert!(!m3.brain_view.markdown.is_empty());
+        assert!(!m3.brain_view.backlinks.is_empty());
+
+        std::fs::remove_file(brain_dir.join("people").join("alice.md")).unwrap();
+
+        let (m4, _) = m3.update(Message::BrainReindex);
+        assert_eq!(
+            m4.brain_view.selected, None,
+            "selection must be cleared once the selected entry no longer resolves"
+        );
+        assert!(m4.brain_view.markdown.is_empty());
+        assert!(m4.brain_view.backlinks.is_empty());
+        assert!(m4.brain_view.related.is_empty());
+    }
+
+    #[test]
+    fn switching_catalogue_clears_and_repopulates_pinboard_edges() {
+        let dir_a = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_a.join("people")).unwrap();
+        std::fs::write(dir_a.join("people").join("alice.md"), "Sees [[bob]].").unwrap();
+        std::fs::write(dir_a.join("people").join("bob.md"), "Sees [[alice]].").unwrap();
+
+        let dir_b = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_b.join("people")).unwrap();
+        std::fs::write(dir_b.join("people").join("carol.md"), "No links here.").unwrap();
+
+        let brain_a = Arc::new(BrainIndex::open(&dir_a).unwrap());
+        brain_a.rebuild().unwrap();
+        BrainIndex::open(&dir_b).unwrap().rebuild().unwrap();
+
+        let e = test_engine();
+        let mut app = base_with_brain(e, brain_a);
+        app.catalogues = vec![
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone() },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone() },
+        ];
+        let (app, _) = app.update(Message::NavigateBrain);
+        assert_eq!(
+            app.brain_view.edges.len(),
+            1,
+            "alice<->bob's mutual link should resolve to one edge in catalogue A"
+        );
+
+        let (app, _) = app.update(Message::BrainSwitchCatalogue(1));
+        assert!(
+            app.brain_view.edges.is_empty(),
+            "catalogue B has no links -- edges must be cleared, not left over from A"
+        );
     }
 
     #[test]
@@ -2781,8 +2973,10 @@ mod tests {
     #[test]
     fn number_keys_switch_views() {
         let m = base(test_engine());
-        let m = press(m, "3");
+        let m = press(m, "2");
         assert!(matches!(m.view, View::PrList));
+        let m = press(m, "3");
+        assert!(matches!(m.view, View::Brain));
         let m = press(m, "1");
         assert!(matches!(m.view, View::FleetBoard { .. }));
     }
@@ -3102,7 +3296,6 @@ mod tests {
         assert!(sess.orchestrator_id.is_none());
         assert_eq!(sess.workspace_path.as_deref(), Some(ws_str.as_str()));
         assert!(matches!(&m.view, View::SessionDetail { session_id, .. } if session_id == "solo-a"));
-        assert_eq!(m.last_session.as_deref(), Some("solo-a"));
     }
 
     #[test]
