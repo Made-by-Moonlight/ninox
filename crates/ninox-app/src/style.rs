@@ -45,6 +45,25 @@ pub const GLYPH: Font = Font::with_name("Apple Symbols");
 #[cfg(not(target_os = "macos"))]
 pub const GLYPH: Font = Font::DEFAULT;
 
+/// Alternate glyph font for the FEW code points Apple Symbols lacks:
+/// verified via CoreText, ✦ (U+2726) exists in Menlo but not Apple
+/// Symbols, while ⬡/☰ exist only in Apple Symbols — so glyph sites pick
+/// per character. Non-macOS: same unverified-default fallback as GLYPH
+/// (tracked in issue #11).
+#[cfg(target_os = "macos")]
+pub const GLYPH_ALT: Font = Font::with_name("Menlo");
+#[cfg(not(target_os = "macos"))]
+pub const GLYPH_ALT: Font = Font::DEFAULT;
+
+/// The right glyph font for one of the app's permitted glyphs — per-character,
+/// because no single macOS font covers all of them (see GLYPH_ALT).
+pub fn glyph_font_for(glyph: &str) -> Font {
+    match glyph.chars().next() {
+        Some('✦') => GLYPH_ALT,
+        _ => GLYPH,
+    }
+}
+
 // ── Hard offset shadows: no blur, ever ─────────────────────────────────────
 /// (card, hero, modal) shadow alphas for the active theme.
 pub fn shadow_alpha(s: &ColorScheme) -> (f32, f32, f32) {
@@ -230,7 +249,7 @@ pub fn toggle_segment_glyph<'a, M: Clone + 'a>(
     let color = if active { s.card } else { s.ink_2 };
     button(
         row![
-            text(glyph.to_string()).size(9.5).font(GLYPH).color(color),
+            text(glyph.to_string()).size(9.5).font(glyph_font_for(glyph)).color(color),
             Space::new(5, 0),
             micro_label(label, color),
         ]

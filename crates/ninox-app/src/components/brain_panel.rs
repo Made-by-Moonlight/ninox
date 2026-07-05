@@ -299,11 +299,14 @@ fn volume_plate(app: &App) -> Element<'_, Message> {
         .map(|c| c.name.as_str())
         .unwrap_or("default");
 
+    // ⌂ renders separately in the glyph font — inside pick_list option
+    // strings it would tofu in Spline Sans Mono (missing U+2302).
+    let house = || text("⌂").size(11).font(crate::style::GLYPH).color(s.ink);
     let switcher: Element<Message> = if app.catalogues.len() > 1 {
-        let names: Vec<String> = app.catalogues.iter().map(|c| format!("⌂ {}", c.name)).collect();
+        let names: Vec<String> = app.catalogues.iter().map(|c| c.name.clone()).collect();
         let selected = names.get(app.active_catalogue).cloned();
         let lookup = names.clone();
-        pick_list(names, selected, move |chosen| {
+        let list = pick_list(names, selected, move |chosen| {
             let idx = lookup.iter().position(|n| n == &chosen).unwrap_or(0);
             Message::BrainSwitchCatalogue(idx)
         })
@@ -316,12 +319,16 @@ fn volume_plate(app: &App) -> Element<'_, Message> {
             handle_color: s.faint,
             background: Background::Color(Color::TRANSPARENT),
             border: Border::default(),
-        })
-        .into()
+        });
+        row![house(), Space::new(5, 0), list]
+            .align_y(Alignment::Center)
+            .into()
     } else {
         // Single catalogue: the plate renders inert.
         row![
-            text(format!("⌂ {name}")).size(11).font(MONO).color(s.ink),
+            house(),
+            Space::new(5, 0),
+            text(name.to_string()).size(11).font(MONO).color(s.ink),
             Space::new(8, 0),
             text("▾").size(10).color(s.faint),
         ]
