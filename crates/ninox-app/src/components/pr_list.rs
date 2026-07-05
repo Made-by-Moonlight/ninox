@@ -1,175 +1,212 @@
+//! Field Notes PR ledger — spec: docs/design-concepts/field-notes-design.md §5-III,
+//! mockup `.ledger`/`.prt-row` in docs/design-concepts/03-field-notes.html.
+
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
     Alignment, Background, Border, Color, Element, Length,
 };
 
-use crate::{app::{App, Message}, theme::ColorScheme};
+use crate::{
+    app::{App, Message},
+    style::{hline, heavy_frame, micro_label, stamp, MONO, MONO_MEDIUM, SANS, SERIF, SERIF_ITALIC},
+    theme::ColorScheme,
+};
 use ninox_core::types::{CIStatus, PR};
 
-fn ci_badge<'a>(ci: Option<&CIStatus>, s: &'a ColorScheme) -> Element<'a, Message> {
+fn repo_short(repo: &str) -> &str {
+    repo.rsplit('/').next().unwrap_or(repo)
+}
+
+/// CI stamp, wording adapted from the CI counts: fail → `Failed`,
+/// partial → `Running x/y`, complete → `Passed x/y`. No run yet renders as
+/// a plain faint em-dash rather than a stamp.
+fn ci_badge<'a, M: 'a>(ci: Option<&CIStatus>, s: &ColorScheme) -> Element<'a, M> {
     match ci {
-        None => text("—").size(11).color(s.text_muted).into(),
-        Some(c) if c.failing > 0 => {
-            let label = format!("{}/{} CI", c.passing, c.total);
-            container(text(label).size(10).color(Color::WHITE))
-                .padding([2, 6])
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(s.status_red)),
-                    border: Border { radius: 3.0.into(), ..Default::default() },
-                    ..Default::default()
-                })
-                .into()
+        None => text("—").size(11).color(s.faint).into(),
+        Some(c) if c.failing > 0 => stamp("Failed", s.status_ci_failed),
+        Some(c) if c.passing < c.total => {
+            stamp(&format!("Running {}/{}", c.passing, c.total), s.status_review)
         }
-        Some(c) => {
-            let label = format!("{}/{} CI", c.passing, c.total);
-            container(text(label).size(10).color(Color::WHITE))
-                .padding([2, 6])
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(s.status_green)),
-                    border: Border { radius: 3.0.into(), ..Default::default() },
-                    ..Default::default()
-                })
-                .into()
-        }
+        Some(c) => stamp(&format!("Passed {}/{}", c.passing, c.total), s.status_working),
     }
+}
+
+/// Small filled circle — session status indicator in the Session column.
+fn status_dot(color: Color) -> Element<'static, Message> {
+    container(Space::new(0, 0))
+        .width(Length::Fixed(7.0))
+        .height(Length::Fixed(7.0))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(color)),
+            border: Border { radius: 3.5.into(), ..Default::default() },
+            ..Default::default()
+        })
+        .into()
 }
 
 fn pr_row<'a>(app: &'a App, pr: &'a PR) -> Element<'a, Message> {
     let s = &app.scheme;
     let ci = app.ci_status.get(&pr.id);
-    let session_name = app.sessions.get(&pr.session_id)
-        .map(|s| s.name.as_str())
-        .unwrap_or("—");
+    let session = app.sessions.get(&pr.session_id);
+    let session_name = session.map(|se| se.name.as_str()).unwrap_or("—");
+    let session_color = session.map(|se| s.status_color(&se.status)).unwrap_or(s.faint);
+    let session_repo = session.map(|se| repo_short(&se.repo)).unwrap_or("—");
+    let cost = session
+        .map(|se| format!("${:.2}", se.cost_usd))
+        .unwrap_or_else(|| "—".to_string());
     let session_id = pr.session_id.clone();
 
     button(
         row![
-            // PR number
             container(
-                text(format!("#{}", pr.number)).size(12).color(s.accent)
+                text(format!("#{}", pr.number)).size(12).font(MONO_MEDIUM).color(s.accent)
             )
-            .width(Length::Fixed(56.0)),
-            // PR title
+            .width(Length::Fixed(70.0)),
             container(
-                text(&pr.title).size(12).color(s.text_primary)
+                text(&pr.title)
+                    .size(15)
+                    .font(SERIF)
+                    .color(s.ink)
+                    .wrapping(iced::widget::text::Wrapping::None),
             )
-            .width(Length::Fill),
-            // Session name
+            .width(Length::Fill)
+            .clip(true),
             container(
-                text(session_name).size(11).color(s.text_secondary)
+                row![
+                    status_dot(session_color),
+                    Space::new(7, 0),
+                    text(session_name).size(11.5).font(SANS).color(s.ink_2),
+                ]
+                .align_y(Alignment::Center),
             )
-            .width(Length::Fixed(120.0)),
-            // CI badge
-            container(ci_badge(ci, s))
-                .width(Length::Fixed(80.0))
+            .width(Length::Fixed(150.0)),
+            container(text(session_repo).size(10).font(MONO).color(s.faint))
+                .width(Length::Fixed(120.0)),
+            container(ci_badge(ci, s)).width(Length::Fixed(130.0)),
+            container(text(cost).size(11.5).font(MONO).color(s.ink))
+                .width(Length::Fixed(70.0))
                 .align_x(iced::alignment::Horizontal::Right),
         ]
         .align_y(Alignment::Center)
         .spacing(12)
-        .padding([8, 12]),
+        .padding([12, 18]),
     )
     .on_press(Message::NavigateSession(session_id))
     .width(Length::Fill)
     .style(move |_t, status| button::Style {
-        background: Some(Background::Color(match status {
-            button::Status::Hovered => s.bg_elevated,
-            _ => s.bg_surface,
-        })),
-        border: Border { color: s.border, width: 0.0, radius: 0.0.into() },
+        // Normal state stays transparent so the ledger's card background
+        // shows through; hover swaps to `paper` so it visibly differs.
+        background: matches!(status, button::Status::Hovered)
+            .then_some(Background::Color(s.paper)),
+        text_color: s.ink,
+        border: Border::default(),
         ..Default::default()
     })
     .into()
 }
 
 pub fn pr_list(app: &App) -> Element<'_, Message> {
+    use chrono::{Datelike, Local};
     let s = &app.scheme;
 
     // Sort PRs by number descending
     let mut prs: Vec<&PR> = app.prs.values().collect();
     prs.sort_by_key(|b| std::cmp::Reverse(b.number));
 
-    let back_btn = button(
-        text("← Fleet").size(12).color(s.text_secondary)
-    )
-    .on_press(Message::NavigateFleet { scope: None })
-    .style(|_t, _s| button::Style {
-        background: None,
-        border: Border::default(),
-        ..Default::default()
-    })
-    .padding([4, 0]);
+    let now = Local::now();
+    let month = crate::style::MONTHS[now.month0() as usize];
+    let ledger_label = format!("LEDGER — {} {} {}", now.day(), month, now.year());
+    let open_count = prs.len();
 
-    let header = container(
-        row![
-            back_btn,
-            Space::new(16, 0),
-            text("Pull Requests").size(16).color(s.text_primary),
-            Space::new(Length::Fill, 0),
-            text(format!("{} open", prs.len())).size(12).color(s.text_muted),
-        ]
-        .align_y(Alignment::Center)
-    )
-    .padding([12, 20])
-    .width(Length::Fill)
-    .style(move |_| container::Style {
-        background: Some(Background::Color(s.bg_base)),
-        border: Border { color: s.border, width: 0.0, radius: 0.0.into() },
-        ..Default::default()
-    });
+    let folio = crate::components::folio::folio_scaffold(
+        app,
+        move || {
+            let s = &app.scheme;
+            row![
+                text("Pull ").size(30).font(SERIF).color(s.ink),
+                text("requests").size(30).font(SERIF_ITALIC).color(s.ink),
+                Space::new(18, 0),
+                text(ledger_label.clone())
+                    .size(10.5)
+                    .font(MONO)
+                    .color(s.faint)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .align_y(Alignment::End)
+            .into()
+        },
+        move || {
+            let s = &app.scheme;
+            vec![
+                text(format!("{open_count} open"))
+                    .size(10.5)
+                    .font(MONO)
+                    .color(s.ink_2)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into(),
+            ]
+        },
+    );
 
     let col_header = container(
         row![
-            container(text("#").size(10).color(s.text_muted))
-                .width(Length::Fixed(56.0)),
-            container(text("Title").size(10).color(s.text_muted))
-                .width(Length::Fill),
-            container(text("Session").size(10).color(s.text_muted))
-                .width(Length::Fixed(120.0)),
-            container(text("CI").size(10).color(s.text_muted))
-                .width(Length::Fixed(80.0))
+            container(micro_label("№", s.ink_2)).width(Length::Fixed(70.0)),
+            container(micro_label("Title", s.ink_2)).width(Length::Fill),
+            container(micro_label("Session", s.ink_2)).width(Length::Fixed(150.0)),
+            container(micro_label("Repo", s.ink_2)).width(Length::Fixed(120.0)),
+            container(micro_label("CI", s.ink_2)).width(Length::Fixed(130.0)),
+            container(micro_label("Cost", s.ink_2))
+                .width(Length::Fixed(70.0))
                 .align_x(iced::alignment::Horizontal::Right),
         ]
         .spacing(12)
-        .padding([6, 12])
+        .padding([12, 18]),
     )
     .width(Length::Fill)
     .style(move |_| container::Style {
-        background: Some(Background::Color(s.bg_elevated)),
-        border: Border { color: s.border, width: 0.0, radius: 0.0.into() },
+        background: Some(Background::Color(s.paper_2)),
         ..Default::default()
     });
 
     let rows: Vec<Element<Message>> = if prs.is_empty() {
         vec![
             container(
-                text("No pull requests yet.").size(13).color(s.text_muted),
+                text("No pull requests on file.")
+                    .size(15)
+                    .font(SERIF_ITALIC)
+                    .color(s.faint),
             )
             .padding([40, 20])
             .width(Length::Fill)
-            .into()
+            .into(),
         ]
     } else {
-        prs.iter()
-            .flat_map(|pr| {
-                let row_elem = pr_row(app, pr);
-                let divider = container(Space::new(Length::Fill, 1.0))
-                    .width(Length::Fill)
-                    .style(move |_| container::Style {
-                        background: Some(Background::Color(s.border)),
-                        ..Default::default()
-                    })
-                    .into();
-                vec![row_elem, divider]
-            })
-            .collect()
+        let mut items: Vec<Element<Message>> = Vec::new();
+        for (i, pr) in prs.iter().enumerate() {
+            if i > 0 {
+                items.push(hline(s.rule, 1.0));
+            }
+            items.push(pr_row(app, pr));
+        }
+        items
     };
 
-    column![
-        header,
+    let table = container(column![
         col_header,
+        hline(s.ink, 2.0),
         scrollable(column(rows)).height(Length::Fill),
-    ]
+    ])
     .width(Length::Fill)
     .height(Length::Fill)
-    .into()
+    .style(move |_| heavy_frame(s));
+
+    let table_wrapper = container(table)
+        .padding([14, 28])
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+    column![folio, table_wrapper]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }

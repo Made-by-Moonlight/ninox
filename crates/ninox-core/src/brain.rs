@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rayon::prelude::*;
+use rusqlite::{params, functions::FunctionFlags, Connection};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -59,109 +60,86 @@ impl BrainIndex {
                  body    TEXT NOT NULL DEFAULT ''
              );
              CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts
-                 USING fts5(name, tags, body, content=entries, content_rowid=rowid);",
+                 USING fts5(name, tags, body, content=entries, content_rowid=rowid);
+             CREATE TABLE IF NOT EXISTS links (from_id TEXT NOT NULL, target TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS links_from ON links(from_id);
+             CREATE INDEX IF NOT EXISTS links_target ON links(target);",
+        )?;
+        // Expose `stem(x)` to SQL so link-resolution queries can share the
+        // same "stem(target) == stem(id)" rule used in Rust, without
+        // round-tripping candidate sets through the application layer.
+        conn.create_scalar_function(
+            "stem",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let s: String = ctx.get(0)?;
+                Ok(stem_of(&s))
+            },
         )?;
         ensure_gitignore(&brain_path)?;
         Ok(Self { conn: Mutex::new(conn), brain_path })
     }
 
     /// Walk the brain directory, parse markdown files, and repopulate the index.
+    ///
+    /// Reading and parsing every file is embarrassingly parallel and is the
+    /// dominant cost for large vaults, so it runs across a rayon thread pool.
+    /// The results are then funneled through a single writer that performs
+    /// all inserts inside one transaction (rather than one implicit
+    /// transaction/fsync per file), which is what actually matters for
+    /// indexing thousands of files quickly on real disks.
+    ///
     /// Returns the number of files indexed.
     pub fn rebuild(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch("DELETE FROM entries; DELETE FROM entries_fts;")?;
-
-        let mut count = 0usize;
-        for entry in WalkDir::new(&self.brain_path)
+        // Cheap sequential walk to enumerate candidate files.
+        let paths: Vec<PathBuf> = WalkDir::new(&self.brain_path)
             .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
+            .map(|e| e.into_path())
+            .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("md"))
+            .collect();
+
+        // Read + parse across a thread pool. Pure function, no shared state.
+        let records: Vec<FileRecord> = paths
+            .par_iter()
+            .filter_map(|p| process_file(&self.brain_path, p))
+            .collect();
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute_batch("DELETE FROM entries; DELETE FROM entries_fts; DELETE FROM links;")?;
+
+        let count = records.len();
         {
-            let path = entry.path();
-            // Skip non-files, non-.md files, and the index db itself
-            if !path.is_file() {
-                continue;
-            }
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext != "md" {
-                continue;
-            }
-
-            let rel = path
-                .strip_prefix(&self.brain_path)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
-
-            let content = match fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let parsed = parse_markdown(&content);
-
-            // Derive entry_type from parent dir name (or frontmatter "type" field)
-            let parent_type = path
-                .parent()
-                .and_then(|p| {
-                    // If the parent IS brain_path itself, there's no meaningful type dir
-                    if p == self.brain_path { None } else { p.file_name() }
-                })
-                .and_then(|n| n.to_str())
-                .map(str::to_string);
-
-            let entry_type = parsed
-                .frontmatter
-                .get("type")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .or(parent_type)
-                .unwrap_or_else(|| "note".to_string());
-
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown");
-            let name = parsed
-                .frontmatter
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| stem.to_string());
-
-            let tags: Vec<String> = parsed
-                .frontmatter
-                .get("tags")
-                .and_then(|v| v.as_sequence())
-                .cloned()
-                .unwrap_or_default();
-
-            let repos: Vec<String> = parsed
-                .frontmatter
-                .get("repos")
-                .and_then(|v| v.as_sequence())
-                .cloned()
-                .unwrap_or_default();
-
-            let updated = parsed
-                .frontmatter
-                .get("updated")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-
-            let tags_json = serde_json::to_string(&tags)?;
-            let repos_json = serde_json::to_string(&repos)?;
-
-            conn.execute(
+            let mut insert_entry = tx.prepare(
                 "INSERT INTO entries (id, type, name, tags, repos, updated, body)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![rel, entry_type, name, tags_json, repos_json, updated, parsed.body],
             )?;
+            let mut insert_link =
+                tx.prepare("INSERT INTO links (from_id, target) VALUES (?1, ?2)")?;
 
-            count += 1;
+            for rec in &records {
+                let tags_json = serde_json::to_string(&rec.tags)?;
+                let repos_json = serde_json::to_string(&rec.repos)?;
+                insert_entry.execute(params![
+                    rec.id,
+                    rec.entry_type,
+                    rec.name,
+                    tags_json,
+                    repos_json,
+                    rec.updated,
+                    rec.body
+                ])?;
+                for target in &rec.links {
+                    insert_link.execute(params![rec.id, target])?;
+                }
+            }
         }
+        tx.commit()?;
 
-        // Rebuild the FTS index from the content table
+        // Rebuild the FTS index from the content table.
         conn.execute_batch("INSERT INTO entries_fts(entries_fts) VALUES('rebuild');")?;
 
         Ok(count)
@@ -223,13 +201,131 @@ impl BrainIndex {
     /// Fetch a single entry by its relative path id.
     pub fn get(&self, id: &str) -> Result<Option<BrainEntry>> {
         let conn = self.conn.lock().unwrap();
+        get_by_id(&conn, id)
+    }
+
+    /// Entries whose links resolve to `id` (i.e. entries that link *to* `id`).
+    ///
+    /// Resolution rule (matches the app's render-time wikilink resolution):
+    /// a raw link target `t` resolves to entry `e` when
+    /// `t == e.name OR t == e.id OR stem(t) == stem(e.id) OR stem(t) == e.name`.
+    pub fn backlinks(&self, id: &str) -> Result<Vec<BrainEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let Some(entry) = get_by_id(&conn, id)? else {
+            return Ok(Vec::new());
+        };
         let mut stmt = conn.prepare(
-            "SELECT id, type, name, tags, repos, updated, body FROM entries WHERE id = ?1",
+            "SELECT DISTINCT src.id, src.type, src.name, src.tags, src.repos, src.updated, src.body
+             FROM links l
+             JOIN entries src ON src.id = l.from_id
+             WHERE src.id != ?2
+               AND (l.target = ?1 OR l.target = ?2 OR stem(l.target) = stem(?2) OR stem(l.target) = ?1)
+             ORDER BY src.name",
         )?;
-        let mut rows = stmt.query_map([id], row_to_entry)?;
-        match rows.next() {
-            None => Ok(None),
-            Some(r) => Ok(Some(r?)),
+        let rows = stmt.query_map(params![entry.name, entry.id], row_to_entry)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Resolved targets of `id`'s own links (i.e. entries that `id` links to).
+    pub fn outlinks(&self, id: &str) -> Result<Vec<BrainEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT e.id, e.type, e.name, e.tags, e.repos, e.updated, e.body
+             FROM links l
+             JOIN entries e ON (
+                 l.target = e.name OR
+                 l.target = e.id OR
+                 stem(l.target) = stem(e.id) OR
+                 stem(l.target) = e.name
+             )
+             WHERE l.from_id = ?1 AND e.id != ?1
+             ORDER BY e.name",
+        )?;
+        let rows = stmt.query_map(params![id], row_to_entry)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The full resolved (from_id, to_id) edge list, for pinboard rendering.
+    pub fn links_all(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT l.from_id, e.id
+             FROM links l
+             JOIN entries e ON (
+                 l.target = e.name OR
+                 l.target = e.id OR
+                 stem(l.target) = stem(e.id) OR
+                 stem(l.target) = e.name
+             )
+             WHERE l.from_id != e.id
+             ORDER BY l.from_id, e.id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Entries related to `id`, ranked: direct links (either direction) first,
+    /// then co-citation (entries reachable via a shared linked target or a
+    /// shared linking source), then entries sharing at least one tag.
+    /// Deduplicated, excludes `id` itself, capped at `limit`.
+    pub fn related(&self, id: &str, limit: usize) -> Result<Vec<BrainEntry>> {
+        let entry = match self.get(id)? {
+            Some(e) => e,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut ranked: Vec<BrainEntry> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(entry.id.clone());
+
+        // Tier 1: direct links, either direction.
+        let outs = self.outlinks(id)?;
+        let backs = self.backlinks(id)?;
+        merge_unique(outs.clone(), &mut ranked, &mut seen);
+        merge_unique(backs.clone(), &mut ranked, &mut seen);
+
+        // Tier 2: co-citation -- entries that share an outbound target with
+        // `id` (found via the backlinks of each of `id`'s targets), plus
+        // entries reachable from the same sources that link to `id` (found
+        // via the outlinks of each of `id`'s linking sources).
+        let mut co_citation: Vec<BrainEntry> = Vec::new();
+        for target in &outs {
+            co_citation.extend(self.backlinks(&target.id)?);
+        }
+        for source in &backs {
+            co_citation.extend(self.outlinks(&source.id)?);
+        }
+        merge_unique(co_citation, &mut ranked, &mut seen);
+
+        // Tier 3: shared-tag overlap.
+        if !entry.tags.is_empty() {
+            let conn = self.conn.lock().unwrap();
+            let clauses: Vec<&str> = entry.tags.iter().map(|_| "tags LIKE ?").collect();
+            let sql = format!(
+                "SELECT id, type, name, tags, repos, updated, body FROM entries
+                 WHERE id != ? AND ({}) ORDER BY name",
+                clauses.join(" OR ")
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut bind_params: Vec<String> = vec![entry.id.clone()];
+            bind_params.extend(entry.tags.iter().map(|t| format!("%\"{t}\"%")));
+            let param_refs: Vec<&dyn rusqlite::ToSql> =
+                bind_params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), row_to_entry)?;
+            let tag_matches: Vec<BrainEntry> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            merge_unique(tag_matches, &mut ranked, &mut seen);
+        }
+
+        ranked.truncate(limit);
+        Ok(ranked)
+    }
+}
+
+/// Merge `items` into `ranked`, skipping anything already present in `seen`.
+fn merge_unique(items: Vec<BrainEntry>, ranked: &mut Vec<BrainEntry>, seen: &mut HashSet<String>) {
+    for item in items {
+        if seen.insert(item.id.clone()) {
+            ranked.push(item);
         }
     }
 }
@@ -237,6 +333,141 @@ impl BrainIndex {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Fetch a single entry by id against an already-locked connection.
+fn get_by_id(conn: &Connection, id: &str) -> Result<Option<BrainEntry>> {
+    let mut stmt = conn
+        .prepare("SELECT id, type, name, tags, repos, updated, body FROM entries WHERE id = ?1")?;
+    let mut rows = stmt.query_map([id], row_to_entry)?;
+    match rows.next() {
+        None => Ok(None),
+        Some(r) => Ok(Some(r?)),
+    }
+}
+
+/// The file-stem of a path-like string: the last `/`-separated segment with
+/// its trailing extension stripped. Used both from Rust and registered as a
+/// SQL scalar function (`stem(x)`) so link-resolution queries can apply the
+/// same rule the app uses when it needs to compare raw wikilink targets.
+fn stem_of(s: &str) -> String {
+    let base = s.rsplit('/').next().unwrap_or(s);
+    match base.rsplit_once('.') {
+        Some((stem, _ext)) if !stem.is_empty() => stem.to_string(),
+        _ => base.to_string(),
+    }
+}
+
+/// Extract raw wikilink targets from a markdown body, Obsidian-style.
+///
+/// Handles `[[target]]`, `[[target|alias]]` (target `target`),
+/// `[[target#heading]]` / `[[target#^block]]` (target `target`), and
+/// `[[target#heading|alias]]` (target `target`). Embeds (`![[x]]`) are
+/// skipped. Targets are returned raw, exactly as written -- resolving them
+/// to entry ids happens at query time via [`BrainIndex::backlinks`] /
+/// [`BrainIndex::outlinks`] / [`BrainIndex::links_all`].
+fn extract_wikilinks(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel_start) = text[search_from..].find("[[") {
+        let start = search_from + rel_start;
+        let is_embed = start > 0 && text.as_bytes()[start - 1] == b'!';
+        let inner_start = start + 2;
+        let Some(rel_end) = text[inner_start..].find("]]") else {
+            break;
+        };
+        let end = inner_start + rel_end;
+        let inner = &text[inner_start..end];
+        search_from = end + 2;
+
+        if is_embed || inner.is_empty() {
+            continue;
+        }
+        let before_alias = inner.split('|').next().unwrap_or(inner);
+        let target = before_alias.split('#').next().unwrap_or(before_alias).trim();
+        if !target.is_empty() {
+            out.push(target.to_string());
+        }
+    }
+    out
+}
+
+/// Everything derived from a single markdown file, computed off the main
+/// thread during [`BrainIndex::rebuild`]. Pure data -- no connection, no I/O
+/// side effects beyond the initial read -- so it's safely `Send`.
+struct FileRecord {
+    id: String,
+    entry_type: String,
+    name: String,
+    tags: Vec<String>,
+    repos: Vec<String>,
+    updated: Option<String>,
+    body: String,
+    links: Vec<String>,
+}
+
+/// Read and parse a single candidate file into a [`FileRecord`]. Pure
+/// function of its inputs (aside from the filesystem read), safe to call
+/// from any thread in the rebuild worker pool.
+fn process_file(brain_path: &Path, path: &Path) -> Option<FileRecord> {
+    let rel = path
+        .strip_prefix(brain_path)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string();
+
+    let content = fs::read_to_string(path).ok()?;
+    let parsed = parse_markdown(&content);
+
+    // Derive entry_type from parent dir name (or frontmatter "type" field)
+    let parent_type = path
+        .parent()
+        .and_then(|p| {
+            // If the parent IS brain_path itself, there's no meaningful type dir
+            if p == brain_path { None } else { p.file_name() }
+        })
+        .and_then(|n| n.to_str())
+        .map(str::to_string);
+
+    let entry_type = parsed
+        .frontmatter
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or(parent_type)
+        .unwrap_or_else(|| "note".to_string());
+
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
+    let name = parsed
+        .frontmatter
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| stem.to_string());
+
+    let tags: Vec<String> = parsed
+        .frontmatter
+        .get("tags")
+        .and_then(|v| v.as_sequence())
+        .cloned()
+        .unwrap_or_default();
+
+    let repos: Vec<String> = parsed
+        .frontmatter
+        .get("repos")
+        .and_then(|v| v.as_sequence())
+        .cloned()
+        .unwrap_or_default();
+
+    let updated = parsed
+        .frontmatter
+        .get("updated")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let links = extract_wikilinks(&parsed.body);
+
+    Some(FileRecord { id: rel, entry_type, name, tags, repos, updated, body: parsed.body, links })
+}
 
 fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<BrainEntry> {
     let tags_json: String = r.get(3)?;
@@ -464,5 +695,252 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry_type, "people");
+    }
+
+    // -----------------------------------------------------------------
+    // Wikilink extraction
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn wikilink_plain() {
+        assert_eq!(extract_wikilinks("see [[Target]] please"), vec!["Target"]);
+    }
+
+    #[test]
+    fn wikilink_with_alias() {
+        assert_eq!(extract_wikilinks("see [[Target|shown text]]"), vec!["Target"]);
+    }
+
+    #[test]
+    fn wikilink_with_heading() {
+        assert_eq!(extract_wikilinks("see [[Target#Heading]]"), vec!["Target"]);
+    }
+
+    #[test]
+    fn wikilink_with_block_ref() {
+        assert_eq!(extract_wikilinks("see [[Target#^abc123]]"), vec!["Target"]);
+    }
+
+    #[test]
+    fn wikilink_with_heading_and_alias() {
+        assert_eq!(extract_wikilinks("see [[a#b|c]]"), vec!["a"]);
+    }
+
+    #[test]
+    fn wikilink_skips_embeds() {
+        assert_eq!(extract_wikilinks("![[embedded-image]]"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn wikilink_multiple_and_mixed() {
+        let text = "Links: [[one]], ![[skip-me]], [[two|Two]], and [[three#Sec|Three]].";
+        assert_eq!(extract_wikilinks(text), vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn stem_of_strips_path_and_extension() {
+        assert_eq!(stem_of("people/alice.md"), "alice");
+        assert_eq!(stem_of("alice"), "alice");
+        assert_eq!(stem_of("alice.md"), "alice");
+        assert_eq!(stem_of("a/b/c.md"), "c");
+    }
+
+    // -----------------------------------------------------------------
+    // Link-graph fixture for backlinks / outlinks / links_all / related
+    // -----------------------------------------------------------------
+
+    /// Builds a small vault with a known link graph:
+    ///   alice --[[bob]]--> bob            (stem match: "bob" == stem("people/bob.md"))
+    ///   alice --[[projects/athene.md|Athene]]--> athene   (exact id match)
+    ///   bob   --[[alice]]--> alice        (stem match)
+    ///   carol --[[bob]]--> bob            (stem match; co-cites bob with alice)
+    ///   dave: no links, shares the "infra" tag with alice only.
+    fn make_linked_brain() -> (BrainIndex, tempfile::TempDir) {
+        let (brain, dir) = make_brain();
+        let people = dir.path().join("people");
+        let projects = dir.path().join("projects");
+        fs::create_dir_all(&people).unwrap();
+        fs::create_dir_all(&projects).unwrap();
+
+        fs::write(
+            people.join("alice.md"),
+            "---\nname: Alice\ntags:\n- infra\n- leads\n---\n\
+             Manager of [[bob]] and works with [[projects/athene.md|Athene]]. \
+             See [[bob#Contact]] too. Also embed ![[ignored]].",
+        )
+        .unwrap();
+        fs::write(
+            people.join("bob.md"),
+            "---\nname: Bob\ntags:\n- infra\n---\nReports to [[alice]].",
+        )
+        .unwrap();
+        fs::write(
+            projects.join("athene.md"),
+            "---\nname: Athene\ntags:\n- platform\n---\nFlagship project.",
+        )
+        .unwrap();
+        fs::write(
+            people.join("carol.md"),
+            "---\nname: Carol\ntags:\n- ops\n---\nAlso reports to [[bob]].",
+        )
+        .unwrap();
+        fs::write(
+            people.join("dave.md"),
+            "---\nname: Dave\ntags:\n- infra\n---\nNo links, just tag overlap.",
+        )
+        .unwrap();
+
+        brain.rebuild().unwrap();
+        (brain, dir)
+    }
+
+    #[test]
+    fn outlinks_resolves_stem_and_id_matches() {
+        let (brain, _dir) = make_linked_brain();
+        let outs = brain.outlinks("people/alice.md").unwrap();
+        let ids: Vec<&str> = outs.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"people/bob.md"), "expected stem-matched bob in {ids:?}");
+        assert!(ids.contains(&"projects/athene.md"), "expected id-matched athene in {ids:?}");
+        assert_eq!(outs.len(), 2, "duplicate [[bob]] mentions should be deduped: {ids:?}");
+    }
+
+    #[test]
+    fn backlinks_resolves_incoming_links() {
+        let (brain, _dir) = make_linked_brain();
+        let backs = brain.backlinks("people/bob.md").unwrap();
+        let ids: Vec<&str> = backs.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"people/alice.md"));
+        assert!(ids.contains(&"people/carol.md"));
+        assert_eq!(ids.len(), 2);
+
+        let alice_backs = brain.backlinks("people/alice.md").unwrap();
+        assert_eq!(alice_backs.len(), 1);
+        assert_eq!(alice_backs[0].id, "people/bob.md");
+    }
+
+    #[test]
+    fn backlinks_and_outlinks_empty_for_unknown_or_unlinked() {
+        let (brain, _dir) = make_linked_brain();
+        assert!(brain.backlinks("nowhere.md").unwrap().is_empty());
+        assert!(brain.outlinks("people/dave.md").unwrap().is_empty());
+    }
+
+    #[test]
+    fn links_all_returns_resolved_edges() {
+        let (brain, _dir) = make_linked_brain();
+        let edges = brain.links_all().unwrap();
+        assert!(edges.contains(&("people/alice.md".to_string(), "people/bob.md".to_string())));
+        assert!(edges.contains(&(
+            "people/alice.md".to_string(),
+            "projects/athene.md".to_string()
+        )));
+        assert!(edges.contains(&("people/bob.md".to_string(), "people/alice.md".to_string())));
+        assert!(edges.contains(&("people/carol.md".to_string(), "people/bob.md".to_string())));
+        assert_eq!(edges.len(), 4, "edges should be deduped: {edges:?}");
+    }
+
+    #[test]
+    fn related_ranks_direct_links_then_co_citation_then_tags() {
+        let (brain, _dir) = make_linked_brain();
+        let related = brain.related("people/alice.md", 10).unwrap();
+        let ids: Vec<&str> = related.iter().map(|e| e.id.as_str()).collect();
+
+        // Never includes self.
+        assert!(!ids.contains(&"people/alice.md"));
+
+        let pos = |id: &str| ids.iter().position(|x| *x == id);
+        let bob = pos("people/bob.md").expect("bob is a direct link");
+        let athene = pos("projects/athene.md").expect("athene is a direct link");
+        let carol = pos("people/carol.md").expect("carol co-cites bob with alice");
+        let dave = pos("people/dave.md").expect("dave shares the infra tag");
+
+        // Tier 1 (direct links) ranks above tier 2 (co-citation) which ranks
+        // above tier 3 (shared tag only).
+        assert!(bob < carol && athene < carol, "direct links should outrank co-citation");
+        assert!(carol < dave, "co-citation should outrank shared-tag-only");
+    }
+
+    #[test]
+    fn related_respects_limit() {
+        let (brain, _dir) = make_linked_brain();
+        let related = brain.related("people/alice.md", 1).unwrap();
+        assert_eq!(related.len(), 1);
+    }
+
+    #[test]
+    fn related_unknown_id_is_empty() {
+        let (brain, _dir) = make_linked_brain();
+        assert!(brain.related("nowhere.md", 10).unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Scale proof
+    // -----------------------------------------------------------------
+
+    /// Synthesizes a vault with `n` markdown files spread across nested
+    /// folders, each with realistic-ish frontmatter, body size, and a
+    /// handful of wikilinks to other generated files.
+    fn generate_synthetic_vault(root: &Path, n: usize) {
+        let folders = ["people", "projects", "notes", "meetings", "areas"];
+        // Pad body text out to roughly 2-4KB per file.
+        let filler = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. \
+                       Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\n";
+
+        for i in 0..n {
+            let folder = folders[i % folders.len()];
+            let sub = i % 20; // nest further to exercise deeper directory walks
+            let dir = root.join(folder).join(format!("sub{sub}"));
+            fs::create_dir_all(&dir).unwrap();
+
+            let mut body = String::new();
+            for _ in 0..30 {
+                body.push_str(filler);
+            }
+            // ~8 wikilinks to other files in the vault.
+            for k in 0..8 {
+                let target_i = (i + k * 37 + 1) % n;
+                let target_folder = folders[target_i % folders.len()];
+                body.push_str(&format!("See [[{target_folder}/note{target_i}]].\n"));
+            }
+
+            let content = format!(
+                "---\nname: Note {i}\ntags:\n- tag{}\n- shared\nupdated: 2026-01-01\n---\n{body}",
+                i % 50
+            );
+            fs::write(dir.join(format!("note{i}.md")), content).unwrap();
+        }
+    }
+
+    #[test]
+    fn rebuild_scales_to_500_files_within_ceiling() {
+        let dir = tempdir().unwrap();
+        generate_synthetic_vault(dir.path(), 500);
+        let brain = BrainIndex::open(dir.path()).unwrap();
+
+        let start = std::time::Instant::now();
+        let count = brain.rebuild().unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(count, 500);
+        println!("rebuild of 500 files took {elapsed:?}");
+        // Generous ceiling: this is here to catch a catastrophic regression
+        // (e.g. an accidental fsync-per-file reintroduction), not to pin
+        // down exact performance.
+        assert!(elapsed.as_secs() < 10, "rebuild of 500 files took too long: {elapsed:?}");
+    }
+
+    #[test]
+    #[ignore = "benchmark: run explicitly with `cargo test -p ninox-core --release -- --ignored rebuild_scales_to_5000_files -- --nocapture`"]
+    fn rebuild_scales_to_5000_files() {
+        let dir = tempdir().unwrap();
+        generate_synthetic_vault(dir.path(), 5_000);
+        let brain = BrainIndex::open(dir.path()).unwrap();
+
+        let start = std::time::Instant::now();
+        let count = brain.rebuild().unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(count, 5_000);
+        println!("rebuild of 5,000 files took {elapsed:?}");
     }
 }

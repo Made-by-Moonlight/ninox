@@ -10,7 +10,7 @@ repository  = "https://github.com/Made-by-Moonlight/ninox"
 tokio      = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
-rusqlite   = { workspace = true }
+rusqlite   = { workspace = true, features = ["functions"] }
 anyhow     = { workspace = true }
 toml       = { workspace = true }
 dirs       = { workspace = true }
@@ -19,6 +19,7 @@ tokio-util = { workspace = true }
 libc       = { workspace = true }
 reqwest    = { workspace = true }
 walkdir    = { workspace = true }
+rayon      = { workspace = true }
 portable-pty = "0.8"
 
 [dev-dependencies]

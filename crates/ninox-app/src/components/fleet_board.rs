@@ -1,27 +1,11 @@
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
-    Alignment, Background, Border, Color, Element, Length,
+    Alignment, Background, Border, Element, Length,
 };
 
 use crate::app::{App, Message};
 use crate::components::filter_bar::filter_bar;
 use ninox_core::types::{OrchestratorId, Session, SessionStatus};
-
-fn repo_short(repo: &str) -> &str {
-    repo.rsplit('/').next().unwrap_or(repo)
-}
-
-fn status_dot(color: Color) -> Element<'static, Message> {
-    container(Space::new(0, 0))
-        .width(Length::Fixed(8.0))
-        .height(Length::Fixed(8.0))
-        .style(move |_theme| container::Style {
-            background: Some(Background::Color(color)),
-            border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 4.0.into() },
-            ..Default::default()
-        })
-        .into()
-}
 
 struct Column {
     label: &'static str,
@@ -35,7 +19,6 @@ const COLUMNS: &[Column] = &[
     Column { label: "Review",    status: SessionStatus::ReviewPending },
     Column { label: "Mergeable", status: SessionStatus::Mergeable },
     Column { label: "Done",      status: SessionStatus::Done },
-    Column { label: "Terminated", status: SessionStatus::Terminated },
 ];
 
 #[cfg(test)]
@@ -68,176 +51,217 @@ pub fn board_sessions<'a>(
     sessions
 }
 
-fn tab_chip<'a>(app: &'a App, label: &'a str, msg: Message, is_active: bool) -> Element<'a, Message> {
-    let s = &app.scheme;
-    let accent       = s.accent;
-    let bg_elevated  = s.bg_elevated;
-    let border       = s.border;
-    let text_secondary = s.text_secondary;
-    button(
-        text(label).size(12).color(if is_active { Color::WHITE } else { text_secondary })
-    )
-    .on_press(msg)
-    .padding([4, 10])
-    .style(move |_theme, _status| button::Style {
-        background: Some(Background::Color(if is_active { accent } else { bg_elevated })),
-        text_color: if is_active { Color::WHITE } else { text_secondary },
-        border: Border { color: border, width: 1.0, radius: 4.0.into() },
-        ..Default::default()
-    })
-    .into()
-}
-
-fn session_card<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
-    let s = &app.scheme;
-    let color = s.status_color(&session.status);
-    let session_id = session.id.clone();
-    let cost = format!("${:.2}", session.cost_usd);
-
-    button(
-        column![
-            row![
-                status_dot(color),
-                Space::new(6, 0),
-                text(&session.name).size(12).color(s.text_primary),
-            ]
-            .align_y(Alignment::Center),
-            text(repo_short(&session.repo)).size(11).color(s.text_secondary),
-            text(cost).size(11).color(s.text_muted),
-        ]
-        .spacing(3)
-        .padding(8),
-    )
-    .on_press(Message::NavigateSession(session_id))
-    .style(move |_theme, _status| button::Style {
-        background: Some(Background::Color(s.bg_elevated)),
-        text_color: s.text_primary,
-        border: Border { color: s.border, width: 1.0, radius: 6.0.into() },
-        ..Default::default()
-    })
-    .width(Length::Fixed(180.0))
-    .into()
-}
-
-fn kanban_column<'a>(app: &'a App, label: &'static str, cards: Vec<Element<'a, Message>>) -> Element<'a, Message> {
-    let s = &app.scheme;
-    let count = cards.len();
-    let header = container(
-        row![
-            text(label).size(12).color(s.text_muted),
-            Space::new(Length::Fill, 0),
-            text(count.to_string()).size(11).color(s.text_muted),
-        ]
-        .align_y(Alignment::Center),
-    )
-    .padding([8, 10])
-    .width(Length::Fixed(200.0));
-
-    let body = scrollable(
-        column(cards).spacing(6).padding(10u16),
-    )
-    .height(Length::Fill);
-
-    container(column![header, body])
-        .width(Length::Fixed(200.0))
-        .height(Length::Fill)
-        .style(move |_theme| container::Style {
-            background: Some(Background::Color(s.bg_surface)),
-            border: Border { color: s.border, width: 1.0, radius: 8.0.into() },
-            ..Default::default()
-        })
-        .into()
-}
-
 pub fn attention_count(app: &App) -> usize {
     app.sessions.values().filter(|s| {
         matches!(s.status, SessionStatus::CiFailed | SessionStatus::ReviewPending)
     }).count()
 }
 
-fn attention_banner<'a>(app: &'a App) -> Option<Element<'a, Message>> {
-    if attention_count(app) == 0 {
-        return None;
-    }
+/// "Morning observations" / … by local hour (spec §5 folio header).
+pub fn folio_title(hour: u32) -> String {
+    let period = match hour {
+        5..=11  => "Morning",
+        12..=16 => "Afternoon",
+        17..=21 => "Evening",
+        _       => "Night",
+    };
+    format!("{period} observations")
+}
+
+fn tab_chip<'a>(app: &'a App, label: &'a str, msg: Message, is_active: bool) -> Element<'a, Message> {
     let s = &app.scheme;
-    let ci_count = app.sessions.values()
-        .filter(|s| matches!(s.status, SessionStatus::CiFailed))
-        .count();
-    let review_count = app.sessions.values()
-        .filter(|s| matches!(s.status, SessionStatus::ReviewPending))
-        .count();
-
-    let mut parts: Vec<String> = Vec::new();
-    if ci_count > 0 {
-        parts.push(format!("{ci_count} CI failure{}", if ci_count == 1 { "" } else { "s" }));
-    }
-    if review_count > 0 {
-        parts.push(format!("{review_count} awaiting review"));
-    }
-    let message = parts.join("  ·  ");
-
-    Some(
-        container(
-            row![
-                container(Space::new(0, 0))
-                    .width(Length::Fixed(8.0))
-                    .height(Length::Fixed(8.0))
-                    .style(move |_| container::Style {
-                        background: Some(Background::Color(s.status_red)),
-                        border: Border { radius: 4.0.into(), ..Default::default() },
-                        ..Default::default()
-                    }),
-                Space::new(8, 0),
-                text(message).size(12).color(s.status_red),
-            ]
-            .align_y(Alignment::Center)
-        )
-        .padding([8, 16])
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(Color {
-                r: s.status_red.r,
-                g: s.status_red.g,
-                b: s.status_red.b,
-                a: 0.08,
-            })),
-            border: Border {
-                color: Color { a: 0.2, ..s.status_red },
-                width: 0.0,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        })
+    let border = Border { color: s.ink, width: 1.5, radius: 2.0.into() };
+    button(crate::style::micro_label(label, if is_active { s.card } else { s.ink }))
+        .on_press(msg)
+        .padding([4, 10])
+        .style(crate::style::segment_style(s, is_active, s.ink, None, border, border))
         .into()
+}
+
+/// Sessions counted toward the "total" figure — every session that isn't
+/// itself an orchestrator's own bookkeeping session.
+fn total_session_count(app: &App) -> usize {
+    let orch_ids: std::collections::HashSet<&str> =
+        app.orchestrators.iter().map(|o| o.id.as_str()).collect();
+    app.sessions.values().filter(|w| !orch_ids.contains(w.id.as_str())).count()
+}
+
+/// Folio header row: split-weight serif title, "VOL." mono date stamp, the
+/// filter field, and a "shown/total" session count. Wraps onto two rows at
+/// narrow widths via `folio::folio_scaffold` — see that module for why.
+fn folio<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Element<'a, Message> {
+    use chrono::{Datelike, Local, Timelike};
+    let now = Local::now();
+    let title = folio_title(now.hour());
+    let month = crate::style::MONTHS[now.month0() as usize];
+    let date_label = format!("VOL. I — {} {} {}", now.day(), month, now.year());
+
+    let total = total_session_count(app);
+    let shown = COLUMNS.iter()
+        .map(|c| board_sessions(app, &c.status, scope.map(|x| x.as_str())).len())
+        .sum::<usize>()
+        + board_sessions(app, &SessionStatus::Terminated, scope.map(|x| x.as_str())).len();
+
+    crate::components::folio::folio_scaffold(
+        app,
+        move || {
+            let s = &app.scheme;
+            // Split the title so the last word is italic ("Morning *observations*").
+            let (head, tail) = title.rsplit_once(' ').unwrap_or(("", title.as_str()));
+            row![
+                text(format!("{head} ")).size(34).font(crate::style::SERIF).color(s.ink),
+                text(tail.to_owned()).size(34).font(crate::style::SERIF_ITALIC).color(s.ink),
+                Space::new(18, 0),
+                text(date_label.clone())
+                    .size(10.5)
+                    .font(crate::style::MONO)
+                    .color(s.faint)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .align_y(Alignment::End)
+            .into()
+        },
+        move || {
+            let s = &app.scheme;
+            vec![
+                filter_bar(app),
+                text(format!("{shown}/{total} sessions"))
+                    .size(10.5)
+                    .font(crate::style::MONO)
+                    .color(s.ink_2)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into(),
+            ]
+        },
     )
 }
 
-pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Element<'a, Message> {
+/// 1.5px vermilion-bordered banner shown while any session needs attention.
+fn attention_banner(app: &App) -> Option<Element<'_, Message>> {
+    if attention_count(app) == 0 { return None; }
     let s = &app.scheme;
-
-    let orch_ids: std::collections::HashSet<&str> =
-        app.orchestrators.iter().map(|o| o.id.as_str()).collect();
-    let worker_count = app.sessions.values().filter(|sess| {
-        !orch_ids.contains(sess.id.as_str())
-            && match scope {
-                Some(oid) => sess.orchestrator_id.as_ref() == Some(oid),
-                None => true,
-            }
-    }).count();
-
-    let header = container(
-        row![
-            text("Fleet").size(16).color(s.text_primary),
-            Space::new(8, 0),
-            text(format!("({} workers)", worker_count)).size(13).color(s.text_muted),
-        ]
-        .align_y(Alignment::Center),
+    let ci = app.sessions.values().filter(|w| matches!(w.status, SessionStatus::CiFailed)).count();
+    let review = app.sessions.values().filter(|w| matches!(w.status, SessionStatus::ReviewPending)).count();
+    let mut parts = Vec::new();
+    if ci > 0 { parts.push(format!("{ci} CI failure{}", if ci == 1 { "" } else { "s" })); }
+    if review > 0 { parts.push(format!("{review} review{}", if review == 1 { "" } else { "s" })); }
+    Some(
+        container(
+            row![
+                text("⚑").size(13).font(crate::style::GLYPH).color(s.accent),
+                Space::new(10, 0),
+                text(format!("{} require attention.", parts.join(" and ")))
+                    .size(12).font(crate::style::SANS_BOLD).color(s.accent),
+            ]
+            .align_y(Alignment::Center),
+        )
+        .padding([8, 14])
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(iced::Color { a: 0.06, ..s.accent })),
+            border: Border { color: s.accent, width: 1.5, radius: 2.0.into() },
+            ..Default::default()
+        })
+        .into(),
     )
-    .padding([14, 20])
-    .width(Length::Fill);
+}
 
-    // Orchestrator filter tabs — only render when there are orchestrators
-    let tabs: Option<Element<Message>> = if !app.orchestrators.is_empty() {
+fn session_card<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
+    let s = &app.scheme;
+    let st_color = s.status_color(&session.status);
+    let word = crate::style::stamp_word(&session.status);
+    let (card_a, _, _) = crate::style::shadow_alpha(s);
+    let repo_line = if session.repo.is_empty() {
+        session.id.clone()
+    } else {
+        session.repo.clone()
+    };
+    button(
+        column![
+            text(&session.name).size(16).font(crate::style::SERIF_MEDIUM).color(s.ink),
+            Space::new(0, 2),
+            text(repo_line).size(9.5).font(crate::style::MONO).color(s.faint),
+            Space::new(0, 9),
+            crate::style::dotted_rule(s.rule_dark),
+            row![
+                crate::style::stamp(word, st_color),
+                Space::new(Length::Fill, 0),
+                text(format!("${:.2}", session.cost_usd))
+                    .size(11.5).font(crate::style::MONO_MEDIUM).color(s.ink),
+            ]
+            .align_y(Alignment::Center),
+        ]
+        .padding(iced::Padding { top: 12.0, right: 13.0, bottom: 10.0, left: 13.0 }),
+    )
+    .on_press(Message::NavigateSession(session.id.clone()))
+    .width(Length::Fill)
+    .style(move |_t, status| {
+        let hovered = matches!(status, button::Status::Hovered);
+        button::Style {
+            background: Some(Background::Color(s.card)),
+            text_color: s.ink,
+            border: Border { color: s.rule_dark, width: 1.0, radius: 2.0.into() },
+            shadow: crate::style::hard_shadow(
+                s,
+                if hovered { 4.0 } else { 2.0 },
+                if hovered { 6.0 } else { 3.0 },
+                card_a + if hovered { 0.02 } else { 0.0 },
+            ),
+        }
+    })
+    .into()
+}
+
+fn ledger_column<'a>(
+    app: &'a App,
+    label: &'static str,
+    cards: Vec<Element<'a, Message>>,
+    first: bool,
+) -> Element<'a, Message> {
+    let s = &app.scheme;
+    let count = cards.len();
+    let head = column![
+        row![
+            text(label).size(16.5).font(crate::style::SERIF_MEDIUM_ITALIC).color(s.ink),
+            Space::new(Length::Fill, 0),
+            text(format!("№ {count}")).size(10).font(crate::style::MONO).color(s.faint),
+        ]
+        .align_y(Alignment::End),
+        Space::new(0, 8),
+        crate::style::hline(s.ink, 2.0),
+    ];
+    let body = scrollable(column(cards).spacing(12).padding(iced::Padding {
+        top: 12.0, right: 2.0, bottom: 4.0, left: 0.0,
+    }))
+    .height(Length::Fill);
+
+    let inner = column![head, body].width(Length::Fixed(220.0));
+    if first {
+        container(inner).padding(iced::Padding { top: 0.0, right: 12.0, bottom: 0.0, left: 0.0 }).into()
+    } else {
+        row![
+            crate::style::vline(s.rule, 1.0),
+            container(inner).padding([0, 12]),
+        ]
+        .into()
+    }
+}
+
+pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Element<'a, Message> {
+    let mut sections: Vec<Element<Message>> = Vec::new();
+    sections.push(folio(app, scope));
+
+    if let Some(banner) = attention_banner(app) {
+        sections.push(
+            container(banner)
+                .padding(iced::Padding { top: 0.0, right: 28.0, bottom: 0.0, left: 28.0 })
+                .width(Length::Fill)
+                .into(),
+        );
+    }
+
+    // Orchestrator scope chips — only render when there are orchestrators.
+    if !app.orchestrators.is_empty() {
         let mut chips: Vec<Element<Message>> = Vec::new();
         chips.push(tab_chip(app, "All", Message::NavigateFleet { scope: None }, scope.is_none()));
         for orch in &app.orchestrators {
@@ -249,49 +273,77 @@ pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Eleme
                 is_active,
             ));
         }
-        Some(
-            container(row(chips).spacing(6))
-                .padding([4, 20])
+        sections.push(
+            container(row(chips).spacing(8))
+                .padding(iced::Padding { top: 0.0, right: 28.0, bottom: 10.0, left: 28.0 })
                 .width(Length::Fill)
                 .into(),
-        )
+        );
+    }
+
+    if total_session_count(app) == 0 {
+        let s = &app.scheme;
+        sections.push(
+            container(
+                text("No sessions in the field.")
+                    .size(15)
+                    .font(crate::style::SERIF_ITALIC)
+                    .color(s.faint),
+            )
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        );
     } else {
-        None
-    };
+        let ledger_cols: Vec<Element<Message>> = COLUMNS
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                let mut col_sessions = board_sessions(app, &col.status, scope.map(|s| s.as_str()));
+                if col.status == SessionStatus::Done {
+                    col_sessions.extend(board_sessions(app, &SessionStatus::Terminated, scope.map(|s| s.as_str())));
+                }
+                let cards: Vec<Element<Message>> = col_sessions
+                    .iter()
+                    .map(|s| session_card(app, s))
+                    .collect();
+                ledger_column(app, col.label, cards, i == 0)
+            })
+            .collect();
 
-    let kanban_cols: Vec<Element<Message>> = COLUMNS
-        .iter()
-        .map(|col| {
-            let col_sessions = board_sessions(app, &col.status, scope.map(|s| s.as_str()));
-            let cards: Vec<Element<Message>> = col_sessions
-                .iter()
-                .map(|s| session_card(app, s))
-                .collect();
-            kanban_column(app, col.label, cards)
-        })
-        .collect();
+        let board = scrollable::Scrollable::with_direction(
+            row(ledger_cols),
+            scrollable::Direction::Horizontal(scrollable::Scrollbar::default()),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill);
 
-    let board = scrollable::Scrollable::with_direction(
-        row(kanban_cols).spacing(12).padding(20u16),
-        scrollable::Direction::Horizontal(scrollable::Scrollbar::default()),
-    )
-    .width(Length::Fill);
-
-    let banner = attention_banner(app);
-    let bar = filter_bar(app);
-    let mut col_children: Vec<Element<Message>> = Vec::new();
-    col_children.push(header.into());
-    if let Some(t) = tabs {
-        col_children.push(t);
+        sections.push(
+            container(board)
+                .padding(iced::Padding { top: 16.0, right: 28.0, bottom: 16.0, left: 28.0 })
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+        );
     }
-    if let Some(b) = banner {
-        col_children.push(b);
-    }
-    col_children.push(bar);
-    col_children.push(board.into());
 
-    column(col_children)
+    column(sections)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folio_title_follows_time_of_day() {
+        assert_eq!(folio_title(6),  "Morning observations");
+        assert_eq!(folio_title(13), "Afternoon observations");
+        assert_eq!(folio_title(19), "Evening observations");
+        assert_eq!(folio_title(2),  "Night observations");
+    }
 }

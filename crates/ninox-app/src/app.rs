@@ -11,8 +11,11 @@ use iced::{Element, Subscription, Task, Theme};
 use tokio::sync::broadcast;
 
 use crate::{
-    components::{session_detail::DetailPanel, spawn_modal::SpawnForm, terminal::TerminalState},
-    theme::{from_variant, ColorScheme},
+    components::{
+        catalogue_modal::CatalogueForm, session_detail::DetailPanel, spawn_modal::SpawnForm,
+        terminal::TerminalState,
+    },
+    theme::{ColorScheme, Themes},
 };
 
 const MAX_NOTIFICATIONS: usize = 50;
@@ -23,8 +26,10 @@ const MAX_NOTIFICATIONS: usize = 50;
 
 #[derive(Debug, Clone, Default)]
 pub struct SidebarState {
-    pub selected_orchestrator: Option<OrchestratorId>,
-    pub show_theme_popout:     bool,
+    /// Orchestrators whose worker lists are expanded in the tree. A set,
+    /// not a single id — expanding one orchestrator must not collapse the
+    /// others (user directive).
+    pub expanded_orchestrators: std::collections::HashSet<OrchestratorId>,
     pub show_notifications:    bool,
 }
 
@@ -33,12 +38,45 @@ pub struct FleetFilter {
     pub query: String,
 }
 
+/// Which of the two brain sub-views is showing (spec §5.IV "two modes").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BrainMode {
+    #[default]
+    Pinboard,
+    Catalogue,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BrainViewState {
     pub entries:  Vec<BrainEntry>,
     pub loaded:   bool,
     pub selected: Option<String>,
+    /// Entry id under the cursor on the pinboard canvas, if any — drives the
+    /// bottom-right hover preview slip. Reset on catalogue/mode switch since
+    /// a stale hover from a since-gone view makes no sense; resolution
+    /// against `entries` is defensive elsewhere (reindex can also drop the
+    /// hovered id without going through either reset path).
+    pub hovered:  Option<String>,
     pub filter:   String,
+    pub mode:         BrainMode,
+    pub open_drawers: std::collections::HashSet<String>,
+    /// Parsed markdown body of `selected`, preprocessed so `[[wikilinks]]`
+    /// render as clickable `ninox-brain:` links.
+    pub markdown: Vec<iced::widget::markdown::Item>,
+    /// Entries that link to `selected` ("cited by"), fetched from the index
+    /// in the `BrainSelectEntry` handler rather than re-derived from
+    /// `entries` on every render. Empty when nothing is selected.
+    pub backlinks: Vec<BrainEntry>,
+    /// Entries related to `selected` — direct links, then co-citation, then
+    /// shared tags (see `BrainIndex::related`) — same fetch-on-select
+    /// pattern as `backlinks`.
+    pub related: Vec<BrainEntry>,
+    /// Pinboard edges as undirected, deduplicated node-index pairs into
+    /// `entries`, resolved from `BrainIndex::links_all()` once per data
+    /// change (`NavigateBrain` / `BrainReindex` / `BrainSwitchCatalogue`) —
+    /// see `App::refresh_brain_edges` and `brain_pinboard::resolve_edges`.
+    /// Never re-derived per canvas draw.
+    pub edges: Vec<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +100,7 @@ impl Default for View {
 pub struct App {
     pub engine:             Arc<Engine>,
     pub config:             AppConfig,
+    pub themes:             Themes,
     pub scheme:             ColorScheme,
     pub active_variant:     ThemeVariant,
     pub orchestrator_root:  std::path::PathBuf,
@@ -70,12 +109,21 @@ pub struct App {
     pub sessions:        HashMap<SessionId, Session>,
     pub brain:           Arc<BrainIndex>,
     pub brain_view:      BrainViewState,
+    /// All selectable knowledge-base catalogues (`AppConfig::catalogue_options()`,
+    /// snapshotted at startup — see `BrainSwitchCatalogue`).
+    pub catalogues:      Vec<ninox_core::config::CatalogueRef>,
+    /// Index into `catalogues` for the catalogue `brain` is currently open on.
+    pub active_catalogue: usize,
     pub prs:             HashMap<PrId, PR>,
     pub ci_status:       HashMap<PrId, CIStatus>,
     pub review_threads:  HashMap<PrId, Vec<Comment>>,
     pub notifications:   VecDeque<Notification>,
     pub sidebar:         SidebarState,
     pub view:            View,
+    /// The user's preferred worker panel — global, not per-session: the
+    /// last tab chosen in any session detail, applied when opening a
+    /// worker (resetting to Split on every navigation was jarring).
+    pub worker_panel:    crate::components::session_detail::DetailPanel,
     pub terminals:       HashMap<SessionId, TerminalState>,
     /// One hidden tmux client per on-screen session (the "view"). Dropping
     /// an entry kills the client process; the session itself stays detached
@@ -91,6 +139,11 @@ pub struct App {
     /// currently-live client for the same session_id.
     next_client_generation: u64,
     pub spawn_modal:     Option<SpawnForm>,
+    /// Add-a-catalogue journal-entry modal, opened from the `+` at the
+    /// right edge of the brain view's volume plate. Exclusive with
+    /// `spawn_modal` in practice (spawn lives in other views); when both are
+    /// somehow set, rendering and Esc both give `spawn_modal` precedence.
+    pub catalogue_modal: Option<CatalogueForm>,
     /// Current terminal canvas dimensions, kept in sync by WindowResized.
     /// Used as the source of truth for all start_streaming + TerminalState::new calls.
     pub terminal_cols:   u16,
@@ -118,16 +171,27 @@ pub enum Message {
     NavigateSession(SessionId),
     /// Attach argv resolved — spawn the hidden tmux client for this session.
     ClientAttach { session_id: SessionId, argv: Vec<String> },
-    SelectOrchestrator(Option<OrchestratorId>),
+    /// Toggle an orchestrator's worker list open/closed in the tree.
+    SelectOrchestrator(OrchestratorId),
     SpawnSession,
     SpawnFormName(String),
+    SpawnFormKind(crate::components::spawn_modal::SpawnKind),
+    SpawnFormWorkspace(String),
+    SpawnFormAgent(usize),
+    SpawnFormCatalogue(usize),
     SpawnFormConfirm,
     SpawnFormCancel,
+    /// Opened from the `+` at the right edge of the brain view's volume
+    /// plate (`components::brain_panel::volume_plate`).
+    CatalogueModalOpen,
+    CatalogueFormName(String),
+    CatalogueFormPath(String),
+    CatalogueFormConfirm,
+    CatalogueFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
     RemoveOrchestrator(OrchestratorId),
     RemoveSession(SessionId),
     SwitchTheme(ThemeVariant),
-    ToggleThemePopout,
     // Raw key event from the global subscription — bytes are computed in the handler
     // where we have access to the terminal mode (APP_CURSOR changes arrow sequences).
     RawKey {
@@ -144,8 +208,15 @@ pub enum Message {
     NavigatePrList,
     NavigateBrain,
     BrainSelectEntry(String),
+    /// The pinboard canvas's hovered node changed (including to/from `None`)
+    /// — emitted only on change, never on every mouse move.
+    BrainHoverEntry(Option<String>),
     BrainFilterQuery(String),
     BrainReindex,
+    BrainSetMode(BrainMode),
+    BrainToggleDrawer(String),
+    BrainLinkClicked(iced::widget::markdown::Url),
+    BrainSwitchCatalogue(usize),
     ToggleNotifications,
     DismissNotification(String),
     DismissAllNotifications,
@@ -226,12 +297,23 @@ impl App {
             .collect();
 
         let config = AppConfig::load().unwrap_or_default();
-        let scheme = from_variant(config.theme);
+
+        // First run: seed a complete, editable default theme file so users
+        // have a working example to customize rather than a blank slate.
+        if let Some(themes_dir) = AppConfig::config_path().parent().map(|p| p.join("themes")) {
+            if let Err(e) = crate::theme::ensure_default_theme_file(&themes_dir) {
+                tracing::warn!("failed to write default theme file: {e}");
+            }
+        }
+        let themes = Themes::load(config.theme_file.as_deref());
+        let scheme = themes.scheme(config.theme);
         let active_variant = config.theme;
+        let catalogues = config.catalogue_options();
 
         let mut app = Self {
             engine:             engine.clone(),
             config,
+            themes,
             scheme,
             active_variant,
             orchestrator_root,
@@ -240,17 +322,21 @@ impl App {
             sessions,
             brain,
             brain_view:     BrainViewState::default(),
+            catalogues,
+            active_catalogue: 0,
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
             notifications:  VecDeque::new(),
             sidebar:        SidebarState::default(),
             view:           View::default(),
+            worker_panel:   Default::default(),
             terminals:      HashMap::new(),
             clients:        HashMap::new(),
             reattach_attempted: std::collections::HashSet::new(),
             next_client_generation: 0,
             spawn_modal:    None,
+            catalogue_modal: None,
             // Placeholders — corrected below by resize_terminals() using the
             // real default window size, so this never drifts out of sync with
             // main.rs's iced::window::Settings::default() (1024x768).
@@ -331,30 +417,40 @@ impl App {
     /// do that (e.g. immediately for a window resize, or once at
     /// drag-release rather than every frame).
     fn resize_terminals(state: &mut Self) -> Vec<(SessionId, u16, u16)> {
+        use crate::components::session_detail::{TERM_CHROME_H, TERM_CHROME_W};
+
         let (cell_w, cell_h) = crate::components::terminal::cell_size(
             crate::components::terminal::FONT_SIZE,
         );
         let sidebar_w = state.sidebar_width + 5.0; // +5 for drag handle
-        let header_h  = 80.0f32;
         let info_w    = state.info_width + 5.0; // +5 for drag handle
 
         // Background sizing: what any session shows once Split (the default
         // panel) is active — this is also the authoritative size recorded on
         // `state` for sessions that don't have a `TerminalState` yet.
-        let bg_cols = ((state.window_width - sidebar_w - info_w).max(200.0) / cell_w) as u16;
-        let bg_rows = ((state.window_height - header_h).max(100.0) / cell_h) as u16;
+        // `TERM_CHROME_W`/`TERM_CHROME_H` are the header/tabs/term-frame
+        // chrome that sits around the terminal `Canvas` in both the
+        // `Terminal` and `Split` panels — see their doc comment in
+        // `session_detail.rs` for the pixel-by-pixel derivation.
+        let bg_cols = ((state.window_width - sidebar_w - info_w - TERM_CHROME_W).max(200.0) / cell_w) as u16;
+        let bg_rows = ((state.window_height - TERM_CHROME_H).max(100.0) / cell_h) as u16;
         state.terminal_cols = bg_cols;
         state.terminal_rows = bg_rows;
 
         // The actively-viewed session uses whatever panel it's actually
         // showing — only Split narrows the width; every other panel uses
-        // the full (non-info-panel) width.
+        // the full (non-info-panel) width. Orchestrator sessions render
+        // terminal-only at full width REGARDLESS of the stored panel (see
+        // `session_detail`'s `effective_panel`), so their sizing must match
+        // or tmux draws the session at Split width and dot-fills the rest.
         let active = match &state.view {
-            View::SessionDetail { session_id, panel: crate::components::session_detail::DetailPanel::Split } => {
+            View::SessionDetail { session_id, panel: crate::components::session_detail::DetailPanel::Split }
+                if !state.orchestrators.iter().any(|o| &o.id == session_id) =>
+            {
                 Some((session_id.clone(), bg_cols, bg_rows))
             }
             View::SessionDetail { session_id, .. } => {
-                let cols = ((state.window_width - sidebar_w).max(200.0) / cell_w) as u16;
+                let cols = ((state.window_width - sidebar_w - TERM_CHROME_W).max(200.0) / cell_w) as u16;
                 Some((session_id.clone(), cols, bg_rows))
             }
             _ => None,
@@ -375,6 +471,51 @@ impl App {
         resized
     }
 
+    /// Re-derive pinboard edges (node-index pairs into `brain_view.entries`)
+    /// from the index's resolved link graph. Called once per data change —
+    /// `NavigateBrain`'s initial load, `BrainReindex`, and
+    /// `BrainSwitchCatalogue` — never per canvas draw. A DB error is
+    /// tolerated: warn and leave the pinboard edge-less rather than panic.
+    fn refresh_brain_edges(state: &mut Self) {
+        match state.brain.links_all() {
+            Ok(links) => {
+                state.brain_view.edges = crate::components::brain_pinboard::resolve_edges(
+                    &state.brain_view.entries,
+                    &links,
+                );
+            }
+            Err(e) => {
+                tracing::warn!("brain links_all: {e}");
+                state.brain_view.edges.clear();
+            }
+        }
+    }
+
+    /// Refetches `backlinks`/`related` for `brain_view.selected` from the
+    /// index. No-ops when nothing is selected. Shared by `BrainSelectEntry`
+    /// (fresh selection) and `BrainReindex` (index may have changed under a
+    /// still-selected entry) — markdown handling stays with the select path
+    /// since reindex never changes which entry is selected, only its graph.
+    fn refresh_selection_graph(state: &mut Self) {
+        let Some(id) = state.brain_view.selected.clone() else {
+            return;
+        };
+        match state.brain.backlinks(&id) {
+            Ok(backs) => state.brain_view.backlinks = backs,
+            Err(e) => {
+                tracing::warn!("brain backlinks({id}): {e}");
+                state.brain_view.backlinks = Vec::new();
+            }
+        }
+        match state.brain.related(&id, 6) {
+            Ok(rel) => state.brain_view.related = rel,
+            Err(e) => {
+                tracing::warn!("brain related({id}): {e}");
+                state.brain_view.related = Vec::new();
+            }
+        }
+    }
+
     /// Shared mutation logic.
     fn apply(state: &mut Self, message: Message) -> Task<Message> {
         match message {
@@ -389,9 +530,20 @@ impl App {
             }
 
             Message::NavigateSession(id) => {
+                // Selecting an orchestrator auto-expands its workers in the
+                // sidebar tree; selecting one of its workers keeps it open.
+                if state.orchestrators.iter().any(|o| o.id == id) {
+                    state.sidebar.expanded_orchestrators.insert(id.clone());
+                } else if let Some(orch_id) = state
+                    .sessions
+                    .get(&id)
+                    .and_then(|w| w.orchestrator_id.clone())
+                {
+                    state.sidebar.expanded_orchestrators.insert(orch_id);
+                }
                 state.view = View::SessionDetail {
                     session_id: id.clone(),
-                    panel: DetailPanel::default(),
+                    panel: state.worker_panel,
                 };
                 // Drop every client that is no longer on screen — the tmux
                 // sessions stay detached and running.
@@ -466,17 +618,49 @@ impl App {
             }
 
             Message::SelectOrchestrator(id) => {
-                state.sidebar.selected_orchestrator = id;
+                if !state.sidebar.expanded_orchestrators.remove(&id) {
+                    state.sidebar.expanded_orchestrators.insert(id);
+                }
                 Task::none()
             }
 
             Message::SpawnSession => {
-                state.spawn_modal = Some(SpawnForm::default());
+                // Default the agent chip to whatever's configured as the
+                // orchestrator agent in config.toml, if it matches one of
+                // the presets; otherwise fall back to the first preset.
+                let agent_idx = crate::components::spawn_modal::AGENT_PRESETS
+                    .iter()
+                    .position(|p| {
+                        p.harness == state.orchestrator_agent.harness
+                            && p.model.map(str::to_string) == state.orchestrator_agent.model
+                    })
+                    .unwrap_or(0);
+                state.spawn_modal = Some(SpawnForm { agent_idx, ..SpawnForm::default() });
                 Task::none()
             }
 
             Message::SpawnFormName(v) => {
-                if let Some(f) = &mut state.spawn_modal { f.name = v; }
+                if let Some(f) = &mut state.spawn_modal { f.name = v; f.error = None; }
+                Task::none()
+            }
+
+            Message::SpawnFormKind(kind) => {
+                if let Some(f) = &mut state.spawn_modal { f.kind = kind; f.error = None; }
+                Task::none()
+            }
+
+            Message::SpawnFormWorkspace(v) => {
+                if let Some(f) = &mut state.spawn_modal { f.workspace = v; f.error = None; }
+                Task::none()
+            }
+
+            Message::SpawnFormAgent(idx) => {
+                if let Some(f) = &mut state.spawn_modal { f.agent_idx = idx; f.error = None; }
+                Task::none()
+            }
+
+            Message::SpawnFormCatalogue(idx) => {
+                if let Some(f) = &mut state.spawn_modal { f.catalogue_idx = idx; f.error = None; }
                 Task::none()
             }
 
@@ -485,148 +669,375 @@ impl App {
                 Task::none()
             }
 
-            Message::SpawnFormConfirm => {
-                if let Some(form) = state.spawn_modal.take() {
-                    let name = form.name.trim().to_string();
-                    if name.is_empty() {
-                        return Task::none();
+            Message::CatalogueModalOpen => {
+                state.catalogue_modal = Some(CatalogueForm::default());
+                Task::none()
+            }
+
+            Message::CatalogueFormName(v) => {
+                if let Some(f) = &mut state.catalogue_modal { f.name = v; f.error = None; }
+                Task::none()
+            }
+
+            Message::CatalogueFormPath(v) => {
+                if let Some(f) = &mut state.catalogue_modal { f.path = v; f.error = None; }
+                Task::none()
+            }
+
+            Message::CatalogueFormCancel => {
+                state.catalogue_modal = None;
+                Task::none()
+            }
+
+            // Guard order mirrors the design spec: empty name, duplicate
+            // name (vs `catalogue_options()`), empty path, path exists but
+            // isn't a directory, then create/open failure. Each guard sets
+            // `form.error` and returns with the modal still open and
+            // `config.brain.catalogues` untouched.
+            Message::CatalogueFormConfirm => {
+                let Some(form) = state.catalogue_modal.clone() else { return Task::none(); };
+
+                let name = form.name.trim().to_string();
+                if name.is_empty() {
+                    if let Some(f) = &mut state.catalogue_modal {
+                        f.error = Some("give this catalogue a name".to_string());
                     }
+                    return Task::none();
+                }
 
-                    let ts = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis();
+                if state.config.catalogue_options().iter().any(|c| c.name == name) {
+                    if let Some(f) = &mut state.catalogue_modal {
+                        f.error = Some(format!("a catalogue named {name} already exists"));
+                    }
+                    return Task::none();
+                }
 
-                    let slug = slugify(&name);
-                    let orch_id = if slug.is_empty() { format!("orch-{ts}") } else { slug };
-                    let orch = Orchestrator {
-                        id:         orch_id,
-                        name:       name.clone(),
-                        created_at: ts as i64,
-                    };
+                let path_input = form.path.trim().to_string();
+                if path_input.is_empty() {
+                    if let Some(f) = &mut state.catalogue_modal {
+                        f.error = Some("path is required".to_string());
+                    }
+                    return Task::none();
+                }
 
-                    // Each orchestrator gets its own subdirectory under the root.
-                    // AGENTS.md/CLAUDE.md and hooks live in the root and are inherited.
-                    let ws = state.orchestrator_root
-                        .join(&orch.id)
-                        .to_string_lossy()
-                        .to_string();
+                let expanded = crate::spawn_util::expand_tilde(&path_input);
+                let path = std::path::PathBuf::from(&expanded);
+                if path.exists() && !path.is_dir() {
+                    if let Some(f) = &mut state.catalogue_modal {
+                        f.error = Some(format!("{expanded} exists but isn't a directory"));
+                    }
+                    return Task::none();
+                }
 
-                    let _ = state.engine.store.upsert_orchestrator(&orch);
-                    state.orchestrators.push(orch.clone());
-                    state.engine.emit(Event::OrchestratorSpawned(orch.clone()));
+                if let Err(e) = std::fs::create_dir_all(&path) {
+                    if let Some(f) = &mut state.catalogue_modal {
+                        f.error = Some(format!("couldn't create {expanded}: {e}"));
+                    }
+                    return Task::none();
+                }
 
-                    let session = Session {
-                        id:              orch.id.clone(),
-                        orchestrator_id: None,
-                        name:            name.clone(),
-                        repo:            String::new(),
-                        status:          SessionStatus::Working,
-                        agent_type:      state.orchestrator_agent.harness.clone(),
-                        cost_usd:        0.0,
-                        started_at:      ts as i64,
-                        pr_number:       None,
-                        pr_id:           None,
-                        workspace_path:  Some(ws.clone()),
-                        pid:             None,
-                    };
-                    let _ = state.engine.store.upsert_session(&session);
-                    state.sessions.insert(session.id.clone(), session.clone());
-                    state.engine.emit(Event::SessionSpawned(session));
+                // Initialize the index — creates .index.db + .gitignore.
+                if let Err(e) = BrainIndex::open(&path) {
+                    if let Some(f) = &mut state.catalogue_modal {
+                        f.error = Some(format!("couldn't initialize brain index: {e}"));
+                    }
+                    return Task::none();
+                }
 
-                    state.view = View::SessionDetail {
-                        session_id: orch.id.clone(),
-                        panel:      DetailPanel::Terminal,
-                    };
+                state.config.brain.catalogues.push(ninox_core::config::CatalogueRef {
+                    name: name.clone(),
+                    path: path.clone(),
+                });
+                if let Err(e) = state.config.save() {
+                    tracing::warn!("failed to save config after adding catalogue '{name}': {e}");
+                }
+                state.catalogues = state.config.catalogue_options();
+                let idx = state
+                    .catalogues
+                    .iter()
+                    .position(|c| c.path == path)
+                    .unwrap_or_else(|| state.catalogues.len().saturating_sub(1));
 
-                    let engine     = state.engine.clone();
-                    let tmux_id    = orch.id.clone();
-                    let sid        = orch.id.clone();
-                    let nm         = name;
-                    let ts_i64     = ts as i64;
-                    let orch_agent = state.orchestrator_agent.clone();
+                state.catalogue_modal = None;
+                // Reuse BrainSwitchCatalogue's handler logic to open the
+                // index for real and refresh the view.
+                App::apply(state, Message::BrainSwitchCatalogue(idx))
+            }
 
-                    return Task::future(async move {
-                        use ninox_core::{pty, tmux, Event as CoreEvent, Session, SessionStatus};
+            Message::SpawnFormConfirm => {
+                use crate::components::spawn_modal::{SpawnKind, AGENT_PRESETS};
 
-                        if let Err(e) = tokio::fs::create_dir_all(&ws).await {
-                            tracing::error!("mkdir orchestrator workspace {ws}: {e}");
+                let Some(form) = state.spawn_modal.clone() else { return Task::none(); };
+                let name = form.name.trim().to_string();
+                if name.is_empty() {
+                    // Only reachable via keyboard submit — the SPAWN button is
+                    // disabled while the name is empty.
+                    if let Some(f) = &mut state.spawn_modal {
+                        f.error = Some("give this entry a name".to_string());
+                    }
+                    return Task::none();
+                }
+
+                // Both kinds share the agent preset and brain catalogue.
+                let preset = AGENT_PRESETS.get(form.agent_idx).unwrap_or(&AGENT_PRESETS[0]);
+                let agent = ninox_core::config::AgentConfig {
+                    harness: preset.harness.to_string(),
+                    model:   preset.model.map(|m| m.to_string()),
+                };
+                let catalogue = state.config.catalogue_options()
+                    .into_iter()
+                    .nth(form.catalogue_idx)
+                    .unwrap_or_else(|| ninox_core::config::CatalogueRef {
+                        name: "default".to_string(),
+                        path: state.config.resolved_brain_path(),
+                    });
+                let catalogue_path = catalogue.path.to_string_lossy().to_string();
+
+                match form.kind {
+                    // ── Standalone path: an interactive, unattached session in
+                    // a user-supplied workspace. Mirrors the orchestrator flow
+                    // (interactive agent in tmux + PTY streaming) but with no
+                    // Orchestrator record, and with the same worktree isolation
+                    // + repo detection the CLI worker path uses (shared via
+                    // crate::spawn_util).
+                    SpawnKind::Standalone => {
+                        let workspace_input = form.workspace.trim().to_string();
+                        if workspace_input.is_empty() {
+                            // No workspace — keep the modal open (the UI also
+                            // disables confirm, but SpawnFormConfirm must not
+                            // silently proceed).
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some("workspace is required for a standalone session".to_string());
+                            }
+                            return Task::none();
                         }
 
-                        let ninox_bin = std::env::current_exe()
-                            .ok()
-                            .and_then(|p| p.to_str().map(str::to_string))
-                            .unwrap_or_else(|| "ninox".to_string());
+                        let workspace = crate::spawn_util::expand_tilde(&workspace_input);
+                        if !std::path::Path::new(&workspace).exists() {
+                            // Bad path typed — keep the modal open rather than
+                            // optimistically spawning a session that can never
+                            // launch.
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!("workspace {workspace} does not exist"));
+                            }
+                            return Task::none();
+                        }
 
-                        let ninox_config = ninox_core::config::AppConfig::config_path()
+                        let ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        let slug = slugify(&name);
+                        let sid = if slug.is_empty() { format!("session-{ts}") } else { slug };
+
+                        if state.sessions.contains_key(&sid) {
+                            // Slugified name collides with an existing session
+                            // id — upserting would silently overwrite that
+                            // session's stored record, and the subsequent
+                            // tmux-create (same session name) would then fail
+                            // and mark the *hijacked* record Terminated. Keep
+                            // the modal open so the user can rename instead.
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!(
+                                    "a session named {sid} already exists — pick another name"
+                                ));
+                            }
+                            return Task::none();
+                        }
+                        state.spawn_modal = None;
+
+                        let session = Session {
+                            id:              sid.clone(),
+                            orchestrator_id: None,
+                            name:            name.clone(),
+                            repo:            String::new(),
+                            status:          SessionStatus::Working,
+                            agent_type:      agent.harness.clone(),
+                            cost_usd:        0.0,
+                            started_at:      ts as i64,
+                            pr_number:       None,
+                            pr_id:           None,
+                            workspace_path:  Some(workspace.clone()),
+                            pid:             None,
+                            model:           agent.model.clone(),
+                            context_tokens:  None,
+                        };
+                        let _ = state.engine.store.upsert_session(&session);
+                        state.sessions.insert(session.id.clone(), session.clone());
+                        state.engine.emit(Event::SessionSpawned(session));
+
+                        state.view = View::SessionDetail {
+                            session_id: sid.clone(),
+                            panel:      DetailPanel::Terminal,
+                        };
+
+                        let engine = state.engine.clone();
+                        let nm     = name;
+                        let ts_i64 = ts as i64;
+
+                        Task::future(async move {
+                            // Isolate the session on its own branch/worktree when
+                            // the workspace is a git repo; otherwise work in the
+                            // directory itself (same fallback as run_spawn).
+                            let effective_ws =
+                                match crate::spawn_util::create_worker_worktree(&workspace, &sid).await {
+                                    Ok(path) => path,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "worktree creation failed for {sid}, using shared workspace: {e}"
+                                        );
+                                        workspace.clone()
+                                    }
+                                };
+
+                            // Repo slug from the base workspace's git remote so
+                            // poll_github can talk to the right owner/repo.
+                            let repo = crate::spawn_util::repo_from_workspace(&workspace)
+                                .unwrap_or_default();
+
+                            // No NINOX_ORCHESTRATOR_ID and no caller-type vars:
+                            // this session is unattached and reports to no one.
+                            let attach_sid = sid.clone();
+                            let attach = crate::spawn_util::spawn_interactive_session(
+                                engine,
+                                crate::spawn_util::InteractiveSpawnParams {
+                                    session_id:      sid,
+                                    name:            nm,
+                                    workspace:       effective_ws,
+                                    repo,
+                                    orchestrator_id: None,
+                                    agent,
+                                    catalogue_path,
+                                    extra_env:       Vec::new(),
+                                    started_at:      ts_i64,
+                                },
+                            )
+                            .await;
+                            match attach {
+                                Some(argv) => Message::ClientAttach { session_id: attach_sid, argv },
+                                None => Message::Noop,
+                            }
+                        })
+                    }
+
+                    // ── Orchestrator path: existing flow, stamped with the
+                    // selected agent preset + brain catalogue.
+                    SpawnKind::Orchestrator => {
+                        let ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+
+                        let slug = slugify(&name);
+                        let orch_id = if slug.is_empty() { format!("orch-{ts}") } else { slug };
+
+                        if state.sessions.contains_key(&orch_id)
+                            || state.orchestrators.iter().any(|o| o.id == orch_id)
+                        {
+                            // Same hazard as the standalone path: a duplicate
+                            // name would upsert over an existing session/
+                            // orchestrator record, then fail tmux-create and
+                            // mark the hijacked record Terminated. Keep the
+                            // modal open so the user can rename instead.
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!(
+                                    "a session named {orch_id} already exists — pick another name"
+                                ));
+                            }
+                            return Task::none();
+                        }
+                        state.spawn_modal = None;
+
+                        let orch = Orchestrator {
+                            id:         orch_id,
+                            name:       name.clone(),
+                            created_at: ts as i64,
+                        };
+
+                        // Each orchestrator gets its own subdirectory under the root.
+                        // AGENTS.md/CLAUDE.md and hooks live in the root and are inherited.
+                        let ws = state.orchestrator_root
+                            .join(&orch.id)
                             .to_string_lossy()
                             .to_string();
 
-                        let env = [
-                            ("NINOX_BIN",             ninox_bin.as_str()),
-                            ("NINOX_CONFIG",          ninox_config.as_str()),
-                            ("NINOX_ORCHESTRATOR_ID", sid.as_str()),
-                            ("AO_CALLER_TYPE",         "orchestrator"),
-                            ("ATHENE_CALLER_TYPE",     "orchestrator"),
-                        ];
+                        let _ = state.engine.store.upsert_orchestrator(&orch);
+                        state.orchestrators.push(orch.clone());
+                        state.engine.emit(Event::OrchestratorSpawned(orch.clone()));
 
-                        // Prepend ninox bin dir inside the shell command so the
-                        // `ninox` shim (which points to the current binary) is found
-                        // first — even after login-shell rc files reorder PATH.
-                        let ninox_bin_dir = ninox_core::config::AppConfig::ninox_bin_dir();
-                        let ninox_bin_dir_str = ninox_bin_dir.display().to_string()
-                            .replace('\'', "'\\''");
-                        let base_cmd = orch_agent.interactive_cmd();
-                        let launch_cmd = format!(
-                            "export PATH='{ninox_bin_dir_str}':\"$PATH\"; {base_cmd}"
-                        );
-                        if let Err(e) = tmux::create_session(&tmux_id, &ws, &launch_cmd, &env).await {
-                            tracing::error!("tmux create failed for {sid}: {e}");
-                            return Message::Noop;
-                        }
-
-                        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
-                        let pid = tmux::list_sessions()
-                            .await
-                            .ok()
-                            .and_then(|ss| ss.into_iter().find(|s| s.id == tmux_id))
-                            .and_then(|s| s.pid);
-
-                        let updated = Session {
-                            id:              sid.clone(),
+                        let session = Session {
+                            id:              orch.id.clone(),
                             orchestrator_id: None,
-                            name:            nm,
+                            name:            name.clone(),
                             repo:            String::new(),
                             status:          SessionStatus::Working,
-                            agent_type:      orch_agent.harness.clone(),
+                            agent_type:      agent.harness.clone(),
                             cost_usd:        0.0,
-                            started_at:      ts_i64,
+                            started_at:      ts as i64,
                             pr_number:       None,
                             pr_id:           None,
-                            workspace_path:  Some(ws),
-                            pid,
+                            workspace_path:  Some(ws.clone()),
+                            pid:             None,
+                            model:           agent.model.clone(),
+                            context_tokens:  None,
                         };
-                        let _ = engine.store.upsert_session(&updated);
+                        let _ = state.engine.store.upsert_session(&session);
+                        state.sessions.insert(session.id.clone(), session.clone());
+                        state.engine.emit(Event::SessionSpawned(session));
 
-                        if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &tmux_id).await {
-                            tracing::error!("pty setup failed for {sid}: {e}");
-                        }
+                        state.view = View::SessionDetail {
+                            session_id: orch.id.clone(),
+                            panel:      DetailPanel::Terminal,
+                        };
 
-                        engine.emit(CoreEvent::SessionUpdated(updated));
-                        // Attach a hidden tmux client so the freshly-spawned
-                        // session's view renders immediately (mirrors
-                        // NavigateSession's attach flow).
-                        let argv = tmux::attach_args(&tmux_id).await;
-                        Message::ClientAttach { session_id: sid, argv }
-                    });
+                        let engine     = state.engine.clone();
+                        let sid        = orch.id.clone();
+                        let nm         = name;
+                        let ts_i64     = ts as i64;
+                        let orch_agent = agent;
+
+                        Task::future(async move {
+                            if let Err(e) = tokio::fs::create_dir_all(&ws).await {
+                                tracing::error!("mkdir orchestrator workspace {ws}: {e}");
+                            }
+
+                            // Orchestrator sessions get the caller-type vars and
+                            // their own id so spawned workers can report back.
+                            let extra_env = vec![
+                                ("NINOX_ORCHESTRATOR_ID".to_string(), sid.clone()),
+                                ("AO_CALLER_TYPE".to_string(),        "orchestrator".to_string()),
+                                ("ATHENE_CALLER_TYPE".to_string(),    "orchestrator".to_string()),
+                            ];
+
+                            let attach_sid = sid.clone();
+                            let attach = crate::spawn_util::spawn_interactive_session(
+                                engine,
+                                crate::spawn_util::InteractiveSpawnParams {
+                                    session_id:      sid,
+                                    name:            nm,
+                                    workspace:       ws,
+                                    repo:            String::new(),
+                                    orchestrator_id: None,
+                                    agent:           orch_agent,
+                                    catalogue_path,
+                                    extra_env,
+                                    started_at:      ts_i64,
+                                },
+                            )
+                            .await;
+                            match attach {
+                                Some(argv) => Message::ClientAttach { session_id: attach_sid, argv },
+                                None => Message::Noop,
+                            }
+                        })
+                    }
                 }
-                Task::none()
             }
 
             Message::SwitchDetailPanel(new_panel) => {
                 if let View::SessionDetail { panel, .. } = &mut state.view {
                     *panel = new_panel;
+                    state.worker_panel = new_panel;
                 }
                 // Entering/leaving Split changes how much width the terminal
                 // canvas actually has, so the grid must be reflowed to match.
@@ -655,9 +1066,7 @@ impl App {
                 // Drop clients for the orchestrator itself and any worker
                 // sessions removed above — only surviving sessions keep theirs.
                 state.clients.retain(|sid, _| state.sessions.contains_key(sid));
-                if state.sidebar.selected_orchestrator.as_deref() == Some(id.as_str()) {
-                    state.sidebar.selected_orchestrator = None;
-                }
+                state.sidebar.expanded_orchestrators.remove(&id);
                 let engine = state.engine.clone();
                 Task::future(async move {
                     if let Err(e) = engine.remove_orchestrator(&id).await {
@@ -684,6 +1093,50 @@ impl App {
             }
 
             Message::RawKey { key, modifiers, text } => {
+                // Esc closes the spawn modal from anywhere. Checked first —
+                // both can't be open in practice (spawn lives in other
+                // views), but if they somehow were, spawn takes precedence
+                // here just like it does in `iced_view`'s stacking order.
+                if state.spawn_modal.is_some() {
+                    if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)) {
+                        state.spawn_modal = None;
+                    }
+                    return Task::none();
+                }
+
+                // Esc closes the add-catalogue modal (Brain view's volume
+                // plate `+`) at the same precedence level.
+                if state.catalogue_modal.is_some() {
+                    if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)) {
+                        state.catalogue_modal = None;
+                    }
+                    return Task::none();
+                }
+
+                let terminal_capturing = matches!(
+                    &state.view,
+                    View::SessionDetail { panel, .. }
+                        if matches!(panel, DetailPanel::Terminal | DetailPanel::Split)
+                );
+                if !terminal_capturing && !modifiers.command() && !modifiers.control() && !modifiers.alt() {
+                    if let iced::keyboard::Key::Character(c) = &key {
+                        match c.as_str() {
+                            "1" => return App::apply(state, Message::NavigateFleet { scope: None }),
+                            "2" => return App::apply(state, Message::NavigatePrList),
+                            "3" => return App::apply(state, Message::NavigateBrain),
+                            "t" => {
+                                let next = match state.active_variant {
+                                    ThemeVariant::Dark | ThemeVariant::Ninox => ThemeVariant::Light,
+                                    ThemeVariant::Light => ThemeVariant::Dark,
+                                };
+                                return App::apply(state, Message::SwitchTheme(next));
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Task::none();
+                }
+
                 if let View::SessionDetail {
                     session_id,
                     panel: crate::components::session_detail::DetailPanel::Terminal
@@ -737,16 +1190,10 @@ impl App {
             }
 
 
-            Message::ToggleThemePopout => {
-                state.sidebar.show_theme_popout = !state.sidebar.show_theme_popout;
-                Task::none()
-            }
-
             Message::SwitchTheme(variant) => {
                 state.active_variant = variant;
-                state.scheme = from_variant(variant);
+                state.scheme = state.themes.scheme(variant);
                 state.config.theme = variant;
-                state.sidebar.show_theme_popout = false;
                 for term in state.terminals.values_mut() {
                     term.cache.clear();
                 }
@@ -864,6 +1311,7 @@ impl App {
                         Ok(entries) => {
                             state.brain_view.entries = entries;
                             state.brain_view.loaded = true;
+                            Self::refresh_brain_edges(state);
                         }
                         Err(e) => tracing::error!("brain query: {e}"),
                     }
@@ -873,7 +1321,20 @@ impl App {
             }
 
             Message::BrainSelectEntry(id) => {
+                if let Some(e) = state.brain_view.entries.iter().find(|e| e.id == id) {
+                    state.brain_view.markdown = iced::widget::markdown::parse(
+                        &crate::components::brain_panel::preprocess_wikilinks(&e.body),
+                    ).collect();
+                    state.brain_view.open_drawers.insert(e.entry_type.clone());
+                    state.brain_view.mode = BrainMode::Catalogue;
+                }
                 state.brain_view.selected = Some(id);
+                Self::refresh_selection_graph(state);
+                Task::none()
+            }
+
+            Message::BrainHoverEntry(id) => {
+                state.brain_view.hovered = id;
                 Task::none()
             }
 
@@ -887,12 +1348,97 @@ impl App {
                     Ok(count) => {
                         tracing::info!("brain reindexed: {count} entries");
                         match state.brain.query("", QueryFilters::default()) {
-                            Ok(entries) => state.brain_view.entries = entries,
+                            Ok(entries) => {
+                                state.brain_view.entries = entries;
+                                Self::refresh_brain_edges(state);
+                                // The selected entry may have been renamed or
+                                // deleted by whatever triggered the reindex —
+                                // if it no longer resolves, clear the pane
+                                // instead of showing a ghost selection.
+                                let ghost = state
+                                    .brain_view
+                                    .selected
+                                    .as_ref()
+                                    .is_some_and(|id| !state.brain_view.entries.iter().any(|e| &e.id == id));
+                                if ghost {
+                                    state.brain_view.selected = None;
+                                    state.brain_view.markdown = Vec::new();
+                                    state.brain_view.backlinks = Vec::new();
+                                    state.brain_view.related = Vec::new();
+                                }
+                                Self::refresh_selection_graph(state);
+                            }
                             Err(e) => tracing::error!("brain query after reindex: {e}"),
                         }
                         state.brain_view.loaded = true;
                     }
                     Err(e) => tracing::error!("brain rebuild: {e}"),
+                }
+                Task::none()
+            }
+
+            Message::BrainSetMode(m) => {
+                state.brain_view.mode = m;
+                state.brain_view.hovered = None;
+                Task::none()
+            }
+
+            Message::BrainToggleDrawer(cat) => {
+                if !state.brain_view.open_drawers.remove(&cat) {
+                    state.brain_view.open_drawers.insert(cat);
+                }
+                Task::none()
+            }
+
+            Message::BrainLinkClicked(url) => {
+                if url.scheme() == "ninox-brain" {
+                    // `url.path()` returns the raw, still percent-encoded
+                    // opaque part (this is a cannot-be-a-base URL, so `url`
+                    // never decodes it for us) — reverse the encoding
+                    // `preprocess_wikilinks` applied before matching.
+                    let link = crate::components::brain_panel::percent_decode_wikilink_target(url.path());
+                    if let Some(e) =
+                        crate::components::brain_panel::resolve_link(&state.brain_view.entries, &link)
+                    {
+                        let id = e.id.clone();
+                        return App::apply(state, Message::BrainSelectEntry(id));
+                    }
+                } else {
+                    return App::apply(state, Message::OpenUrl(url.to_string()));
+                }
+                Task::none()
+            }
+
+            // `App.brain` is an `Arc<BrainIndex>` shared with the server at startup —
+            // this replaces the app's own Arc with a fresh index over the chosen
+            // catalogue's path. It does NOT affect the server's copy (acceptable:
+            // catalogue viewing is app-side; the server's brain stays on the
+            // catalogue it was started with).
+            Message::BrainSwitchCatalogue(idx) => {
+                if let Some(cat) = state.catalogues.get(idx).cloned() {
+                    match BrainIndex::open(&cat.path) {
+                        Ok(new_brain) => {
+                            state.brain = Arc::new(new_brain);
+                            state.active_catalogue = idx;
+                            state.brain_view.selected = None;
+                            state.brain_view.hovered = None;
+                            state.brain_view.markdown.clear();
+                            state.brain_view.open_drawers.clear();
+                            state.brain_view.backlinks.clear();
+                            state.brain_view.related.clear();
+                            state.brain_view.edges.clear();
+                            state.brain_view.loaded = false;
+                            match state.brain.query("", QueryFilters::default()) {
+                                Ok(entries) => {
+                                    state.brain_view.entries = entries;
+                                    state.brain_view.loaded = true;
+                                    Self::refresh_brain_edges(state);
+                                }
+                                Err(e) => tracing::error!("brain query after catalogue switch: {e}"),
+                            }
+                        }
+                        Err(e) => tracing::warn!("open catalogue '{}': {e}", cat.name),
+                    }
                 }
                 Task::none()
             }
@@ -1143,6 +1689,7 @@ impl App {
         use iced::widget::{container, row};
         use crate::components::{
             brain_panel::brain_panel,
+            catalogue_modal::catalogue_modal,
             fleet_board::fleet_board,
             pr_list::pr_list,
             session_detail::session_detail,
@@ -1151,7 +1698,7 @@ impl App {
         };
         use iced::{Background, Length};
 
-        let bg = state.scheme.bg_base;
+        let bg = state.scheme.paper;
         let main: Element<Message> = match &state.view {
             View::FleetBoard { scope } => fleet_board(state, scope.as_ref()),
             View::SessionDetail { session_id, panel } => session_detail(state, session_id, panel),
@@ -1162,7 +1709,7 @@ impl App {
         let base: Element<Message> = container(
             row![
                 sidebar(state),
-                App::drag_handle(DragTarget::Sidebar, state.scheme.border),
+                App::drag_handle(DragTarget::Sidebar, state.scheme.rule_dark),
                 main,
             ].height(Length::Fill),
         )
@@ -1174,8 +1721,12 @@ impl App {
         })
         .into();
 
+        // Spawn wins on top if both were somehow set — exclusive in
+        // practice (spawn lives in other views).
         if let Some(form) = &state.spawn_modal {
-            iced::widget::stack![base, spawn_modal(form, &state.scheme)].into()
+            iced::widget::stack![base, spawn_modal(state, form)].into()
+        } else if let Some(form) = &state.catalogue_modal {
+            iced::widget::stack![base, catalogue_modal(state, form)].into()
         } else {
             base
         }
@@ -1432,7 +1983,8 @@ mod tests {
         App {
             engine,
             config:             AppConfig::default(),
-            scheme:             from_variant(ThemeVariant::Dark),
+            themes:             Themes::builtin(),
+            scheme:             crate::theme::from_variant(ThemeVariant::Dark),
             active_variant:     ThemeVariant::Dark,
             orchestrator_root:  std::path::PathBuf::from("/tmp"),
             orchestrator_agent: ninox_core::config::AgentConfig::default(),
@@ -1440,17 +1992,24 @@ mod tests {
             sessions:       HashMap::new(),
             brain,
             brain_view:     BrainViewState::default(),
+            catalogues:      vec![ninox_core::config::CatalogueRef {
+                name: "default".to_string(),
+                path: std::path::PathBuf::new(),
+            }],
+            active_catalogue: 0,
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
             notifications:  VecDeque::new(),
             sidebar:        SidebarState::default(),
             view:           View::FleetBoard { scope: None },
+            worker_panel:   Default::default(),
             terminals:      HashMap::new(),
             clients:        HashMap::new(),
             reattach_attempted: std::collections::HashSet::new(),
             next_client_generation: 0,
             spawn_modal:    None,
+            catalogue_modal: None,
             terminal_cols:  140,
             terminal_rows:  50,
             window_width:   0.0,
@@ -1480,6 +2039,7 @@ mod tests {
             pr_id:           None,
             workspace_path:  None,
             pid:             None,
+            model: None, context_tokens: None,
         };
         let (updated, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         assert!(updated.sessions.contains_key("s1"));
@@ -1496,6 +2056,7 @@ mod tests {
                 title:      "t".into(),
                 body:       "b".into(),
                 session_id: None,
+                created_at: 0,
             })));
             m = next;
         }
@@ -1525,6 +2086,40 @@ mod tests {
 
         // View should be the session detail for that orchestrator
         assert!(matches!(&m.view, View::SessionDetail { session_id, .. } if session_id == orch_id));
+
+        // The newly spawned orchestrator's session must be remembered as the
+        // last-visited session so NavigateLastSession can return to it.
+    }
+
+    #[test]
+    fn opening_worker_uses_global_preferred_panel() {
+        use crate::components::session_detail::DetailPanel;
+        let e = test_engine();
+        let mut m = base(e);
+        let s = Session {
+            id: "sess-a".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None,
+        };
+        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        m = next;
+
+        let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
+        m = next;
+        assert!(matches!(&m.view, View::SessionDetail { panel: DetailPanel::Split, .. }));
+
+        let (next, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
+        m = next;
+        let (next, _) = m.update(Message::NavigateFleet { scope: None });
+        m = next;
+        let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
+        m = next;
+        assert!(
+            matches!(&m.view, View::SessionDetail { panel: DetailPanel::Terminal, .. }),
+            "opening a worker must use the global preferred panel, not reset to Split"
+        );
     }
 
     #[test]
@@ -1552,6 +2147,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         }).unwrap();
         let engine = Engine::new(store);
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
@@ -1572,6 +2168,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.42,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         m = m2;
@@ -1599,6 +2196,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         };
         let _ = m.engine.store.upsert_session(&worker);
         let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(worker)));
@@ -1707,6 +2305,274 @@ mod tests {
     }
 
     #[test]
+    fn selecting_entry_opens_catalogue_and_drawer() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("symbols")).unwrap();
+        std::fs::write(brain_dir.join("symbols").join("x.md"), "---\nname: X\n---\nbody").unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let app = base_with_brain(e, brain);
+        let (app, _) = app.update(Message::NavigateBrain);
+        let (app, _) = app.update(Message::BrainSetMode(BrainMode::Pinboard));
+        let (app, _) = app.update(Message::BrainSelectEntry("symbols/x.md".into()));
+        assert_eq!(app.brain_view.mode, BrainMode::Catalogue);
+        assert!(app.brain_view.open_drawers.contains("symbols"));
+        assert_eq!(app.brain_view.selected.as_deref(), Some("symbols/x.md"));
+    }
+
+    #[test]
+    fn hover_entry_sets_and_clears_hovered() {
+        let e = test_engine();
+        let m = base(e);
+        assert_eq!(m.brain_view.hovered, None);
+        let (m2, _) = m.update(Message::BrainHoverEntry(Some("symbols/x.md".into())));
+        assert_eq!(m2.brain_view.hovered.as_deref(), Some("symbols/x.md"));
+        let (m3, _) = m2.update(Message::BrainHoverEntry(None));
+        assert_eq!(m3.brain_view.hovered, None);
+    }
+
+    #[test]
+    fn switching_mode_clears_hovered() {
+        let e = test_engine();
+        let m = base(e);
+        let (m2, _) = m.update(Message::BrainHoverEntry(Some("symbols/x.md".into())));
+        assert_eq!(m2.brain_view.hovered.as_deref(), Some("symbols/x.md"));
+        let (m3, _) = m2.update(Message::BrainSetMode(BrainMode::Catalogue));
+        assert_eq!(m3.brain_view.hovered, None);
+    }
+
+    #[test]
+    fn switching_catalogue_resets_selection_and_active_index() {
+        let dir_a = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_a.join("symbols")).unwrap();
+        std::fs::write(dir_a.join("symbols").join("a.md"), "a body").unwrap();
+        let dir_b = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_b.join("concepts")).unwrap();
+        std::fs::write(dir_b.join("concepts").join("b.md"), "b body").unwrap();
+
+        let brain_a = Arc::new(BrainIndex::open(&dir_a).unwrap());
+        brain_a.rebuild().unwrap();
+        // Seed dir_b's index too — `BrainSwitchCatalogue` opens a fresh
+        // `BrainIndex` over the target path but does not rebuild it (matching
+        // `NavigateBrain`'s lazy-load semantics), so the catalogue being
+        // switched to must already be indexed on disk.
+        BrainIndex::open(&dir_b).unwrap().rebuild().unwrap();
+
+        let e = test_engine();
+        let mut app = base_with_brain(e, brain_a);
+        app.catalogues = vec![
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone() },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone() },
+        ];
+        let (app, _) = app.update(Message::NavigateBrain);
+        let (app, _) = app.update(Message::BrainSelectEntry("symbols/a.md".into()));
+        assert_eq!(app.brain_view.selected.as_deref(), Some("symbols/a.md"));
+        let (app, _) = app.update(Message::BrainHoverEntry(Some("symbols/a.md".into())));
+        assert_eq!(app.brain_view.hovered.as_deref(), Some("symbols/a.md"));
+
+        let (app, _) = app.update(Message::BrainSwitchCatalogue(1));
+        assert_eq!(app.active_catalogue, 1);
+        assert_eq!(app.brain_view.selected, None);
+        assert_eq!(app.brain_view.hovered, None);
+        assert!(app.brain_view.markdown.is_empty());
+        assert!(app.brain_view.open_drawers.is_empty());
+        assert_eq!(app.brain_view.entries.len(), 1);
+        assert_eq!(app.brain_view.entries[0].id, "concepts/b.md");
+    }
+
+    #[test]
+    fn navigate_brain_populates_pinboard_edges_from_the_index() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("people")).unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("alice.md"),
+            "---\nname: Alice\n---\nManages [[bob]].",
+        )
+        .unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("bob.md"),
+            "---\nname: Bob\n---\nReports to [[alice]].",
+        )
+        .unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        assert!(m.brain_view.edges.is_empty());
+
+        let (m2, _) = m.update(Message::NavigateBrain);
+        // Alice <-> Bob's mutual link resolves to a single undirected
+        // node-index edge, computed once from `links_all()` rather than
+        // re-parsed per pinboard draw.
+        assert_eq!(m2.brain_view.edges.len(), 1);
+        let (a, b) = m2.brain_view.edges[0];
+        let ids: Vec<&str> =
+            [a, b].iter().map(|&i| m2.brain_view.entries[i].id.as_str()).collect();
+        assert!(ids.contains(&"people/alice.md"));
+        assert!(ids.contains(&"people/bob.md"));
+    }
+
+    #[test]
+    fn selecting_entry_populates_backlinks_and_related_from_the_index() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("people")).unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("alice.md"),
+            "---\nname: Alice\n---\nManages [[bob]].",
+        )
+        .unwrap();
+        std::fs::write(brain_dir.join("people").join("bob.md"), "---\nname: Bob\n---\nbody").unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m2, _) = m.update(Message::NavigateBrain);
+        assert!(m2.brain_view.backlinks.is_empty());
+        assert!(m2.brain_view.related.is_empty());
+
+        let (m3, _) = m2.update(Message::BrainSelectEntry("people/bob.md".into()));
+        assert_eq!(m3.brain_view.backlinks.len(), 1);
+        assert_eq!(m3.brain_view.backlinks[0].id, "people/alice.md");
+        assert!(
+            m3.brain_view.related.iter().any(|e| e.id == "people/alice.md"),
+            "alice directly links to bob, so alice should rank in bob's related list: {:?}",
+            m3.brain_view.related.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reindex_refreshes_backlinks_and_related_for_the_selected_entry() {
+        // BrainReindex used to refetch entries + edges but leave the reading
+        // pane's backlinks/related as stale snapshots from selection time --
+        // if the on-disk citation graph changed underneath the selection,
+        // the chips kept pointing at a graph that no longer existed.
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("people")).unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("alice.md"),
+            "---\nname: Alice\n---\nManages [[bob]].",
+        )
+        .unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("bob.md"),
+            "---\nname: Bob\n---\nReports to [[alice]].",
+        )
+        .unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m2, _) = m.update(Message::NavigateBrain);
+        let (m3, _) = m2.update(Message::BrainSelectEntry("people/alice.md".into()));
+        assert_eq!(
+            m3.brain_view.backlinks.len(),
+            1,
+            "bob cites alice, so alice's backlinks should start populated"
+        );
+        assert!(m3.brain_view.related.iter().any(|e| e.id == "people/bob.md"));
+
+        // Bob (the only entry citing/cited-by alice) is deleted on disk
+        // (e.g. removed outside the app) -- alice stays selected, but her
+        // backlinks/related must reflect the new, bob-less graph after
+        // reindex rather than the stale selection-time snapshot.
+        std::fs::remove_file(brain_dir.join("people").join("bob.md")).unwrap();
+
+        let (m4, _) = m3.update(Message::BrainReindex);
+        assert_eq!(m4.brain_view.selected.as_deref(), Some("people/alice.md"));
+        assert!(
+            m4.brain_view.backlinks.is_empty(),
+            "backlinks must be refreshed after reindex, not left stale: {:?}",
+            m4.brain_view.backlinks.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+        assert!(
+            m4.brain_view.related.is_empty(),
+            "bob is gone, so alice's related list must be refreshed to drop it, not left stale: {:?}",
+            m4.brain_view.related.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reindex_clears_selection_if_the_selected_entry_disappears() {
+        // If the selected entry's file is deleted (or renamed) before a
+        // reindex, `selected` must be cleared so the reading pane falls back
+        // to its empty state instead of showing a ghost entry with stale
+        // markdown/backlinks/related from before the deletion.
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("people")).unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("alice.md"),
+            "---\nname: Alice\n---\nManages [[bob]].",
+        )
+        .unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("bob.md"),
+            "---\nname: Bob\n---\nReports to [[alice]].",
+        )
+        .unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m2, _) = m.update(Message::NavigateBrain);
+        let (m3, _) = m2.update(Message::BrainSelectEntry("people/alice.md".into()));
+        assert_eq!(m3.brain_view.selected.as_deref(), Some("people/alice.md"));
+        assert!(!m3.brain_view.markdown.is_empty());
+        assert!(!m3.brain_view.backlinks.is_empty());
+
+        std::fs::remove_file(brain_dir.join("people").join("alice.md")).unwrap();
+
+        let (m4, _) = m3.update(Message::BrainReindex);
+        assert_eq!(
+            m4.brain_view.selected, None,
+            "selection must be cleared once the selected entry no longer resolves"
+        );
+        assert!(m4.brain_view.markdown.is_empty());
+        assert!(m4.brain_view.backlinks.is_empty());
+        assert!(m4.brain_view.related.is_empty());
+    }
+
+    #[test]
+    fn switching_catalogue_clears_and_repopulates_pinboard_edges() {
+        let dir_a = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_a.join("people")).unwrap();
+        std::fs::write(dir_a.join("people").join("alice.md"), "Sees [[bob]].").unwrap();
+        std::fs::write(dir_a.join("people").join("bob.md"), "Sees [[alice]].").unwrap();
+
+        let dir_b = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_b.join("people")).unwrap();
+        std::fs::write(dir_b.join("people").join("carol.md"), "No links here.").unwrap();
+
+        let brain_a = Arc::new(BrainIndex::open(&dir_a).unwrap());
+        brain_a.rebuild().unwrap();
+        BrainIndex::open(&dir_b).unwrap().rebuild().unwrap();
+
+        let e = test_engine();
+        let mut app = base_with_brain(e, brain_a);
+        app.catalogues = vec![
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone() },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone() },
+        ];
+        let (app, _) = app.update(Message::NavigateBrain);
+        assert_eq!(
+            app.brain_view.edges.len(),
+            1,
+            "alice<->bob's mutual link should resolve to one edge in catalogue A"
+        );
+
+        let (app, _) = app.update(Message::BrainSwitchCatalogue(1));
+        assert!(
+            app.brain_view.edges.is_empty(),
+            "catalogue B has no links -- edges must be cleared, not left over from A"
+        );
+    }
+
+    #[test]
     fn toggle_notifications_flips_show_flag() {
         let e = test_engine();
         let m = base(e);
@@ -1725,6 +2591,7 @@ mod tests {
             let (next, _) = m.update(Message::EngineEvent(Event::Notification(Notification {
                 id: id.into(), kind: NotificationKind::WorkerDone,
                 title: "t".into(), body: "b".into(), session_id: None,
+                created_at: 0,
             })));
             m = next;
         }
@@ -1745,6 +2612,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 1.23,
             started_at: 0, pr_number: Some(42), pr_id: None,
             workspace_path: Some("/tmp/w".into()), pid: Some(1234),
+            model: None, context_tokens: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -1770,6 +2638,7 @@ mod tests {
                 agent_type: "claude-code".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
+            model: None, context_tokens: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -1819,6 +2688,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         // NavigateSession defaults to the Split panel, so switch to Terminal
@@ -1863,6 +2733,7 @@ mod tests {
                 agent_type: "claude-code".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
+            model: None, context_tokens: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -1904,6 +2775,62 @@ mod tests {
     }
 
     #[test]
+    fn resize_terminals_budgets_the_real_session_detail_chrome() {
+        // Guards against the PTY grid being sized larger than the terminal
+        // `Canvas` actually rendered by `session_detail` — if this drifts
+        // from the widget tree again, the bottom rows (including the live
+        // prompt line) clip off-screen instead of the grid staying in sync.
+        // Expected dims are derived from the same `TERM_CHROME_*` constants
+        // `resize_terminals` uses, not re-typed magic numbers, so this test
+        // fails the moment the two go out of sync with each other.
+        use crate::components::session_detail::{TERM_CHROME_H, TERM_CHROME_W};
+
+        let e = test_engine();
+        let mut m = base(e);
+        m.window_width  = 1200.0;
+        m.window_height = 800.0;
+        m.sidebar_width = 220.0;
+        m.info_width    = 300.0;
+
+        let (cell_w, cell_h) = crate::components::terminal::cell_size(
+            crate::components::terminal::FONT_SIZE,
+        );
+        let sidebar_w = m.sidebar_width + 5.0;
+        let info_w    = m.info_width + 5.0;
+
+        let expected_bg_cols = ((m.window_width - sidebar_w - info_w - TERM_CHROME_W) / cell_w) as u16;
+        let expected_bg_rows = ((m.window_height - TERM_CHROME_H) / cell_h) as u16;
+        let expected_full_cols = ((m.window_width - sidebar_w - TERM_CHROME_W) / cell_w) as u16;
+
+        App::resize_terminals(&mut m);
+        assert_eq!(m.terminal_cols, expected_bg_cols);
+        assert_eq!(m.terminal_rows, expected_bg_rows);
+
+        let s = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0,
+            started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None,
+            model: None, context_tokens: None,
+        };
+        let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (m, _) = m.update(Message::NavigateSession("s1".into()));
+        let mut m = m;
+        m.terminals.insert(
+            "s1".into(),
+            crate::components::terminal::TerminalState::new(m.terminal_cols, m.terminal_rows, None),
+        );
+        let (m, _) = m.update(Message::SwitchDetailPanel(crate::components::session_detail::DetailPanel::Terminal));
+        use alacritty_terminal::grid::Dimensions;
+        assert_eq!(
+            m.terminals.get("s1").unwrap().term.grid().columns(),
+            expected_full_cols as usize,
+            "full-width Terminal panel must subtract TERM_CHROME_W, not just the sidebar"
+        );
+    }
+
+    #[test]
     fn dismiss_all_clears_notifications() {
         let e = test_engine();
         let mut m = base(e);
@@ -1911,6 +2838,7 @@ mod tests {
             let (next, _) = m.update(Message::EngineEvent(Event::Notification(Notification {
                 id: id.into(), kind: NotificationKind::WorkerDone,
                 title: "t".into(), body: "b".into(), session_id: None,
+                created_at: 0,
             })));
             m = next;
         }
@@ -1934,6 +2862,7 @@ mod tests {
                 agent_type: "c".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
+            model: None, context_tokens: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -2021,6 +2950,7 @@ mod tests {
                 agent_type: "c".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
+            model: None, context_tokens: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -2029,5 +2959,525 @@ mod tests {
         let sessions = filtered_sessions(&m2);
         assert_eq!(sessions.len(), 2);
         assert!(sessions.iter().all(|s| s.name.contains("auth")));
+    }
+
+    fn press(app: App, ch: &str) -> App {
+        let (next, _) = app.update(Message::RawKey {
+            key:       iced::keyboard::Key::Character(ch.into()),
+            modifiers: iced::keyboard::Modifiers::default(),
+            text:      Some(ch.to_string()),
+        });
+        next
+    }
+
+    #[test]
+    fn number_keys_switch_views() {
+        let m = base(test_engine());
+        let m = press(m, "2");
+        assert!(matches!(m.view, View::PrList));
+        let m = press(m, "3");
+        assert!(matches!(m.view, View::Brain));
+        let m = press(m, "1");
+        assert!(matches!(m.view, View::FleetBoard { .. }));
+    }
+
+    /// Serializes tests that mutate process-global env vars (`NINOX_CONFIG`)
+    /// against each other — `cargo test` runs test fns on parallel threads,
+    /// so without this guard one test's env mutation could leak into
+    /// another's read.
+    static ENV_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set `key=value` for the duration of `f`, restoring the prior value
+    /// (or unsetting it) afterward. Serialized via `ENV_TEST_GUARD` since
+    /// env vars are process-global state shared across parallel test
+    /// threads. Mirrors `ninox_core::config::tests::with_env_override`.
+    fn with_env_override<T>(
+        key: &str,
+        value: impl AsRef<std::ffi::OsStr>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(key).ok();
+        std::env::set_var(key, value);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        match prior {
+            Some(v) => std::env::set_var(key, v),
+            None    => std::env::remove_var(key),
+        }
+        result.unwrap()
+    }
+
+    #[test]
+    fn t_toggles_light_dark() {
+        // `Message::SwitchTheme` calls `state.config.save()`, which writes to
+        // `AppConfig::config_path()`. Redirect that to a tempfile so this
+        // test never touches the real user config
+        // (e.g. `~/Library/Application Support/ninox/config.toml`).
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("t_toggles_light_dark_config.toml");
+
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            let before = m.active_variant;
+            let m = press(m, "t");
+            assert_ne!(m.active_variant, before);
+            let m = press(m, "t");
+            assert_eq!(m.active_variant, before);
+        });
+    }
+
+    #[test]
+    fn esc_closes_spawn_modal() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::SpawnSession);
+        assert!(m.spawn_modal.is_some());
+        let (m, _) = m.update(Message::RawKey {
+            key:       iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+            modifiers: iced::keyboard::Modifiers::default(),
+            text:      None,
+        });
+        assert!(m.spawn_modal.is_none());
+    }
+
+    // ── Add-a-catalogue modal ────────────────────────────────────────────
+
+    #[test]
+    fn catalogue_modal_open_sets_a_blank_form() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::CatalogueModalOpen);
+        let form = m.catalogue_modal.as_ref().expect("modal opens");
+        assert!(form.name.is_empty());
+        assert!(form.path.is_empty());
+        assert!(form.error.is_none());
+    }
+
+    #[test]
+    fn catalogue_form_field_edits_update_state_and_clear_error() {
+        let m = base(test_engine());
+        let (mut m, _) = m.update(Message::CatalogueModalOpen);
+        m.catalogue_modal.as_mut().unwrap().error = Some("stale".to_string());
+        let (m, _) = m.update(Message::CatalogueFormName("ninox-dev".into()));
+        assert_eq!(m.catalogue_modal.as_ref().unwrap().name, "ninox-dev");
+        assert!(m.catalogue_modal.as_ref().unwrap().error.is_none());
+
+        let mut m = m;
+        m.catalogue_modal.as_mut().unwrap().error = Some("stale again".to_string());
+        let (m, _) = m.update(Message::CatalogueFormPath("~/brains/dev".into()));
+        assert_eq!(m.catalogue_modal.as_ref().unwrap().path, "~/brains/dev");
+        assert!(m.catalogue_modal.as_ref().unwrap().error.is_none());
+    }
+
+    #[test]
+    fn catalogue_form_cancel_closes_modal() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::CatalogueModalOpen);
+        assert!(m.catalogue_modal.is_some());
+        let (m, _) = m.update(Message::CatalogueFormCancel);
+        assert!(m.catalogue_modal.is_none());
+    }
+
+    #[test]
+    fn esc_closes_catalogue_modal() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::CatalogueModalOpen);
+        assert!(m.catalogue_modal.is_some());
+        let (m, _) = m.update(Message::RawKey {
+            key:       iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+            modifiers: iced::keyboard::Modifiers::default(),
+            text:      None,
+        });
+        assert!(m.catalogue_modal.is_none());
+    }
+
+    #[test]
+    fn confirm_guard_empty_name_keeps_modal_open_and_config_untouched() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::CatalogueModalOpen);
+        let before = m.config.brain.catalogues.clone();
+        let (m, _) = m.update(Message::CatalogueFormConfirm);
+        let form = m.catalogue_modal.as_ref().expect("modal stays open");
+        assert!(form.error.as_deref().unwrap().contains("name"), "{:?}", form.error);
+        assert_eq!(m.config.brain.catalogues, before);
+    }
+
+    #[test]
+    fn confirm_guard_duplicate_name_keeps_modal_open_and_config_untouched() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::CatalogueModalOpen);
+        // "default" is always present via `catalogue_options()`.
+        let (m, _) = m.update(Message::CatalogueFormName("default".into()));
+        let (m, _) = m.update(Message::CatalogueFormPath("/tmp/whatever-not-touched".into()));
+        let before = m.config.brain.catalogues.clone();
+        let (m, _) = m.update(Message::CatalogueFormConfirm);
+        let form = m.catalogue_modal.as_ref().expect("modal stays open");
+        assert!(form.error.as_deref().unwrap().contains("already exists"), "{:?}", form.error);
+        assert_eq!(m.config.brain.catalogues, before);
+    }
+
+    #[test]
+    fn confirm_guard_empty_path_keeps_modal_open_and_config_untouched() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::CatalogueModalOpen);
+        let (m, _) = m.update(Message::CatalogueFormName("ninox-dev".into()));
+        let before = m.config.brain.catalogues.clone();
+        let (m, _) = m.update(Message::CatalogueFormConfirm);
+        let form = m.catalogue_modal.as_ref().expect("modal stays open");
+        assert!(form.error.as_deref().unwrap().contains("path"), "{:?}", form.error);
+        assert_eq!(m.config.brain.catalogues, before);
+    }
+
+    #[test]
+    fn confirm_guard_path_exists_but_isnt_a_directory_keeps_modal_open_and_config_untouched() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("not-a-dir");
+        std::fs::write(&file_path, b"nope").unwrap();
+
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::CatalogueModalOpen);
+        let (m, _) = m.update(Message::CatalogueFormName("ninox-dev".into()));
+        let (m, _) = m.update(Message::CatalogueFormPath(file_path.to_string_lossy().to_string()));
+        let before = m.config.brain.catalogues.clone();
+        let (m, _) = m.update(Message::CatalogueFormConfirm);
+        let form = m.catalogue_modal.as_ref().expect("modal stays open");
+        assert!(form.error.as_deref().unwrap().contains("directory"), "{:?}", form.error);
+        assert_eq!(m.config.brain.catalogues, before);
+    }
+
+    #[test]
+    fn confirm_happy_path_files_a_new_catalogue_and_switches_to_it() {
+        // `CatalogueFormConfirm` calls `state.config.save()`, which writes
+        // to `AppConfig::config_path()`. Redirect that to a tempfile so
+        // this test never touches the real user config (see
+        // `t_toggles_light_dark` for the same pattern).
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("catalogue_happy_path_config.toml");
+        let catalogue_dir = dir.path().join("ninox-dev-brain");
+
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            let (m, _) = m.update(Message::CatalogueModalOpen);
+            let (m, _) = m.update(Message::CatalogueFormName("ninox-dev".into()));
+            let (m, _) = m.update(Message::CatalogueFormPath(
+                catalogue_dir.to_string_lossy().to_string(),
+            ));
+            let (m, _) = m.update(Message::CatalogueFormConfirm);
+
+            assert!(m.catalogue_modal.is_none(), "modal closes on success");
+            assert!(
+                m.config
+                    .brain
+                    .catalogues
+                    .iter()
+                    .any(|c| c.name == "ninox-dev" && c.path == catalogue_dir),
+                "config gains the new catalogue entry: {:?}",
+                m.config.brain.catalogues
+            );
+            assert!(
+                m.catalogues.iter().any(|c| c.name == "ninox-dev"),
+                "state.catalogues refreshed from config.catalogue_options()"
+            );
+            let idx = m.catalogues.iter().position(|c| c.name == "ninox-dev").unwrap();
+            assert_eq!(m.active_catalogue, idx, "active catalogue switches to the new one");
+            assert!(
+                catalogue_dir.join(".index.db").exists(),
+                "brain index initialized on disk"
+            );
+
+            let saved = std::fs::read_to_string(&config_path).unwrap();
+            assert!(saved.contains("ninox-dev"), "catalogue persisted to config.toml");
+        });
+    }
+
+    #[test]
+    fn spawn_form_field_messages_update_state() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("theme-tokens".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace("~/proj/ninox".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormAgent(1));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormCatalogue(0));
+        m = next;
+
+        let f = m.spawn_modal.as_ref().unwrap();
+        assert_eq!(f.name, "theme-tokens");
+        assert_eq!(f.kind, SpawnKind::Standalone);
+        assert_eq!(f.workspace, "~/proj/ninox");
+        assert_eq!(f.agent_idx, 1);
+        assert_eq!(f.catalogue_idx, 0);
+    }
+
+    #[test]
+    fn orchestrator_confirm_unaffected_by_workspace_field() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("theme-tokens".into()));
+        m = next;
+        // Type a workspace while on Standalone, then flip back to
+        // Orchestrator — the stale workspace text must not block or alter
+        // the orchestrator spawn (its workspace always derives from the
+        // orchestrator root).
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace("/does/not/matter".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Orchestrator));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        assert!(m.spawn_modal.is_none());
+        assert_eq!(m.orchestrators.len(), 1);
+        let sess = m.sessions.get("theme-tokens").expect("orchestrator session created");
+        assert_eq!(
+            sess.workspace_path.as_deref(),
+            Some(std::path::Path::new("/tmp/theme-tokens").to_str().unwrap()),
+            "workspace comes from the orchestrator root, not the form field",
+        );
+    }
+
+    #[test]
+    fn standalone_without_workspace_cannot_confirm() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-a".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        // No workspace supplied — confirm must no-op and leave the modal
+        // open so the user can fill it in, with an inline error explaining why.
+        assert!(m.sessions.is_empty());
+        let form = m.spawn_modal.as_ref().expect("modal stays open");
+        let err = form.error.as_deref().expect("guard refusal must surface an error");
+        assert!(err.contains("workspace is required"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn standalone_confirm_creates_unattached_session_without_orchestrator() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        // Confirm-time validation requires the workspace path to exist.
+        let ws = tempdir().unwrap().keep();
+        let ws_str = ws.to_string_lossy().to_string();
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-a".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace(ws_str.clone()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        assert!(m.spawn_modal.is_none());
+        assert!(m.orchestrators.is_empty(), "standalone spawn must not create an orchestrator");
+        let sess = m.sessions.get("solo-a").expect("standalone session created");
+        assert!(sess.orchestrator_id.is_none());
+        assert_eq!(sess.workspace_path.as_deref(), Some(ws_str.as_str()));
+        assert!(matches!(&m.view, View::SessionDetail { session_id, .. } if session_id == "solo-a"));
+    }
+
+    #[test]
+    fn standalone_confirm_with_nonexistent_workspace_keeps_modal_open() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-bad".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace(
+            "/definitely/not/a/real/workspace/path".into(),
+        ));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        // Bad path — confirm must no-op, keep the modal open for correction,
+        // and never optimistically create a session.
+        assert!(m.sessions.is_empty());
+        assert!(m.orchestrators.is_empty());
+        assert!(matches!(m.view, View::FleetBoard { .. }));
+        let form = m.spawn_modal.as_ref().expect("modal stays open");
+        let err = form.error.as_deref().expect("guard refusal must surface an error");
+        assert!(err.contains("does not exist"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn standalone_confirm_with_duplicate_name_keeps_modal_open_and_original_untouched() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        // Two separate workspaces so any difference between the original and
+        // a would-be overwrite is easy to see.
+        let ws1 = tempdir().unwrap().keep();
+        let ws1_str = ws1.to_string_lossy().to_string();
+        let ws2 = tempdir().unwrap().keep();
+        let ws2_str = ws2.to_string_lossy().to_string();
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-a".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace(ws1_str.clone()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+        assert!(m.spawn_modal.is_none(), "first spawn with a unique name must succeed");
+        let original = m.sessions.get("solo-a").cloned().expect("original session created");
+        assert_eq!(original.workspace_path.as_deref(), Some(ws1_str.as_str()));
+
+        // Spawn again with the exact same name — slugify("solo-a") collides
+        // with the existing session id.
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-a".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace(ws2_str.clone()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        let form = m.spawn_modal.as_ref().expect(
+            "a name colliding with an existing session id must keep the modal open, not overwrite it"
+        );
+        let err = form.error.as_deref().expect("guard refusal must surface an error");
+        assert!(err.contains("solo-a"), "unexpected error message: {err}");
+        assert!(err.contains("already exists"), "unexpected error message: {err}");
+        assert_eq!(m.sessions.len(), 1, "the colliding spawn must not create/overwrite any session");
+        let unchanged = m.sessions.get("solo-a").expect("original session must still exist");
+        assert_eq!(
+            unchanged.workspace_path.as_deref(),
+            Some(ws1_str.as_str()),
+            "the original session's record must be untouched by the rejected duplicate spawn"
+        );
+    }
+
+    #[test]
+    fn orchestrator_confirm_with_duplicate_name_keeps_modal_open_and_original_untouched() {
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("orch-a".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+        assert!(m.spawn_modal.is_none(), "first orchestrator spawn with a unique name must succeed");
+        assert_eq!(m.orchestrators.len(), 1);
+        let original = m.sessions.get("orch-a").cloned().expect("original orchestrator session created");
+
+        // Spawn a second orchestrator with the exact same name.
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("orch-a".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        let form = m.spawn_modal.as_ref().expect(
+            "a name colliding with an existing orchestrator id must keep the modal open"
+        );
+        let err = form.error.as_deref().expect("guard refusal must surface an error");
+        assert!(err.contains("orch-a"), "unexpected error message: {err}");
+        assert!(err.contains("already exists"), "unexpected error message: {err}");
+        assert_eq!(m.orchestrators.len(), 1, "no second orchestrator record should be created");
+        assert_eq!(m.sessions.len(), 1, "the colliding spawn must not create/overwrite any session");
+        let unchanged = m.sessions.get("orch-a").expect("original orchestrator session must still exist");
+        assert_eq!(
+            unchanged.started_at, original.started_at,
+            "the original orchestrator session's record must be untouched by the rejected duplicate spawn"
+        );
+    }
+
+    #[test]
+    fn editing_spawn_form_name_clears_stale_guard_error() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-a".into()));
+        m = next;
+        // No workspace — confirm is blocked and sets an inline error.
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+        assert!(m.spawn_modal.as_ref().unwrap().error.is_some(), "guard refusal must set an error");
+
+        // Editing any field clears the stale error, even before it's fixed.
+        let (next, _) = m.update(Message::SpawnFormName("solo-b".into()));
+        m = next;
+        assert!(
+            m.spawn_modal.as_ref().unwrap().error.is_none(),
+            "editing a field must clear the stale guard error"
+        );
+    }
+
+    #[test]
+    fn shortcuts_do_not_fire_in_terminal_view() {
+        let e = test_engine();
+        let mut m = base(e);
+        let s = Session {
+            id: "sess-a".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None,
+        };
+        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        m = next;
+        let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
+        m = next;
+
+        let m = press(m, "1"); // must go to the terminal, not switch views
+        assert!(matches!(m.view, View::SessionDetail { .. }));
+    }
+
+    #[test]
+    fn spawn_modal_swallows_number_keys_without_navigating() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::NavigatePrList);
+        assert!(matches!(m.view, View::PrList));
+
+        let (m, _) = m.update(Message::SpawnSession);
+        assert!(m.spawn_modal.is_some());
+
+        // While the modal is open, "1" must not fall through to the
+        // fleet-board navigation shortcut — the modal swallows every key
+        // except Escape.
+        let m = press(m, "1");
+        assert!(m.spawn_modal.is_some(), "modal must remain open");
+        assert!(
+            matches!(m.view, View::PrList),
+            "\"1\" must not navigate while the spawn modal is open"
+        );
     }
 }

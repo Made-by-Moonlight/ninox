@@ -1,18 +1,36 @@
 use iced::{
-    widget::{column, container, scrollable, text, Space},
-    Background, Element, Length,
+    widget::{column, container, row, scrollable, text},
+    Alignment, Element, Length,
 };
 
 use crate::{app::{App, Message}, theme::ColorScheme};
 use ninox_core::types::Session;
 
+/// A key/value row: fixed-width micro-label key, mono value.
 fn field<'a>(label: &'static str, value: String, s: &'a ColorScheme) -> Element<'a, Message> {
-    column![
-        text(label).size(10).color(s.text_muted),
-        text(value).size(12).color(s.text_primary),
+    row![
+        container(crate::style::micro_label(label, s.faint)).width(Length::Fixed(180.0)),
+        text(value).size(11.5).font(crate::style::MONO).color(s.ink_2),
     ]
-    .spacing(2)
+    .align_y(Alignment::Center)
     .into()
+}
+
+/// Renders the `Burn` field per the Field Notes kv-sheet spec
+/// (`docs/design-concepts/03-field-notes.html`: `<dt>Burn</dt><dd><b>$3.60</b> · 214k tokens</dd>`) —
+/// dollar cost plus the current context-window occupancy, once the usage
+/// poller (`ninox_core::lifecycle::usage`/`poller::poll_usage`) has ingested
+/// at least one turn. Falls back to just the dollar figure until then.
+fn format_burn(cost_usd: f64, context_tokens: Option<u64>) -> String {
+    match context_tokens {
+        Some(t) => format!("${cost_usd:.2} · {} tokens", format_tokens_k(t)),
+        None    => format!("${cost_usd:.2}"),
+    }
+}
+
+/// `214389` → `"214k"`. Rounds to the nearest thousand.
+fn format_tokens_k(tokens: u64) -> String {
+    format!("{}k", (tokens as f64 / 1000.0).round() as u64)
 }
 
 fn status_str(status: &ninox_core::types::SessionStatus) -> &'static str {
@@ -43,29 +61,52 @@ pub fn inspector_panel<'a>(app: &'a App, session: &'a Session) -> Element<'a, Me
         field("Status",         status_str(&session.status).to_string(), s),
         field("Agent",          session.agent_type.clone(), s),
         field("Orchestrator",   orchestrator_name.to_string(), s),
-        field("Cost",           format!("${:.4}", session.cost_usd), s),
+        field("Burn",           format_burn(session.cost_usd, session.context_tokens), s),
         field("PR",             session.pr_number.map(|n| format!("#{n}")).unwrap_or("—".into()), s),
         field("PID",            session.pid.map(|p| p.to_string()).unwrap_or("—".into()), s),
         field("Workspace",      session.workspace_path.clone().unwrap_or("—".into()), s),
         field("Started (unix)", session.started_at.to_string(), s),
     ];
 
-    let content = fields.into_iter().flat_map(|f| {
-        let divider = container(Space::new(Length::Fill, 1.0))
-            .width(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(Background::Color(s.border)),
-                ..Default::default()
-            });
+    let content: Vec<Element<Message>> = fields.into_iter().flat_map(|f| {
         vec![
-            container(f).padding([8, 16]).width(Length::Fill).into(),
-            divider.into(),
+            container(f).padding([8, 0]).width(Length::Fill).into(),
+            crate::style::dotted_rule(s.rule_dark),
         ]
-    });
+    }).collect();
 
-    scrollable(
-        column(content.collect::<Vec<_>>())
+    container(
+        scrollable(
+            column(content),
+        )
+        .height(Length::Fill),
     )
+    .padding([18, 22])
+    .width(Length::Fill)
     .height(Length::Fill)
+    .style(move |_theme| crate::style::card_style(s))
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_burn_matches_design_spec_example() {
+        // docs/design-concepts/03-field-notes.html: `$3.60 · 214k tokens`.
+        assert_eq!(format_burn(3.60, Some(214_000)), "$3.60 · 214k tokens");
+    }
+
+    #[test]
+    fn format_burn_omits_tokens_when_unknown() {
+        assert_eq!(format_burn(0.0, None), "$0.00");
+    }
+
+    #[test]
+    fn format_tokens_k_rounds_to_nearest_thousand() {
+        assert_eq!(format_tokens_k(214_389), "214k");
+        assert_eq!(format_tokens_k(500), "1k");
+        assert_eq!(format_tokens_k(0), "0k");
+    }
 }
