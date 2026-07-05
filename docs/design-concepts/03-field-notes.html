@@ -748,18 +748,18 @@ $ <span class="cursor"></span></pre>
         </div>
         <div class="set-card">
           <h3>Harnesses</h3>
-          <div class="harness"><span class="tog on">&#10003;</span><span class="nm">claude-code</span><span class="bin">claude</span><div class="select" style="flex:1;border-bottom:1.5px solid var(--rule-dark);font-family:'Spline Sans Mono',monospace;font-size:11px;padding:3px 2px"><span>fable-5</span><span class="car">&#9662;</span></div><span class="lock">DEFAULT</span></div>
-          <div class="harness"><span class="tog"></span><span class="nm">codex</span><span class="bin">codex</span><input placeholder="model&hellip;" disabled /></div>
-          <div class="harness"><span class="tog"></span><span class="nm">opencode</span><span class="bin">opencode</span><input placeholder="model&hellip;" disabled /></div>
-          <div class="harness"><span class="tog"></span><span class="nm">aider</span><span class="bin">aider</span><input placeholder="model&hellip;" disabled /></div>
-          <div class="harness"><span class="tog"></span><span class="nm"><i style="font-family:Newsreader;font-style:italic;color:var(--faint)">custom&hellip;</i></span><span class="bin">freebuff</span><input placeholder="custom model id&hellip;" disabled /></div>
-          <div class="setfoot" style="margin-top:10px">model pickers list what the harness reports (models_cmd) or its curated known set; custom&hellip; frees the text field. off by default &mdash; enabled harnesses appear as agent chips when spawning</div>
+          <div class="harness"><span class="tog on">&#10003;</span><span class="nm">claude-code</span><span class="bin">claude</span><span class="bin" style="flex:1">workers &#10003;</span><span class="lock">DEFAULT</span></div><span class="lock">DEFAULT</span></div>
+          <div class="harness"><span class="tog"></span><span class="nm">codex</span><span class="bin">codex</span><span class="bin" style="flex:1">workers &#10003;</span></div>
+          <div class="harness"><span class="tog"></span><span class="nm">opencode</span><span class="bin">opencode</span><span class="bin" style="flex:1">workers &#10003;</span></div>
+          <div class="harness"><span class="tog"></span><span class="nm">aider</span><span class="bin">aider</span><span class="bin" style="flex:1">workers &#10003;</span></div>
+          <div class="harness"><span class="tog"></span><span class="nm"><i style="font-family:Newsreader;font-style:italic;color:var(--faint)">custom&hellip;</i></span><span class="bin">freebuff</span><span class="bin" style="flex:1">workers &ndash; unverified</span></div>
+          <div class="setfoot" style="margin-top:10px">off by default &mdash; enabled harnesses appear as agent chips when spawning; models are chosen at spawn time</div>
         </div>
         <div class="set-card">
-          <h3>Assignments</h3>
-          <div class="role"><span class="lbl">Orchestrators</span><div class="select"><span>claude-code &middot; fable-5</span><span class="car">&#9662;</span></div></div>
-          <div class="role"><span class="lbl">Workers</span><div class="select"><span>claude-code &middot; fable-5</span><span class="car">&#9662;</span></div></div>
-          <div class="setfoot">what new sessions use unless the spawn entry overrides it</div>
+          <h3>Workers</h3>
+                    <div class="role"><span class="lbl">Harness</span><div class="select"><span>claude-code</span><span class="car">&#9662;</span></div></div>
+          <div class="role"><span class="lbl">Model</span><div class="select"><span>haiku-4.5</span><span class="car">&#9662;</span></div></div>
+          <div class="setfoot">what orchestrator agents launch via ninox spawn &mdash; the one place a model is chosen without you</div>
         </div>
       </div>
     </section>
@@ -845,7 +845,6 @@ document.querySelectorAll('.harness .tog').forEach(tg=>tg.addEventListener('clic
   if(tg.parentElement.querySelector('.lock')) return;   // default harness stays on
   tg.classList.toggle('on');
   tg.innerHTML = tg.classList.contains('on') ? '&#10003;' : '';
-  tg.parentElement.querySelector('input').disabled = !tg.classList.contains('on');
 }));
 
 /* theme switching — light / dark ("t" toggles too) */
