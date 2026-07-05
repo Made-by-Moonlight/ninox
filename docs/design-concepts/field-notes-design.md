@@ -187,6 +187,16 @@ Fields as underlined serif inputs; cost estimate, Cancel ghost + vermilion "Spaw
 with offset shadow. Esc closes.
 
 ### V. Settings — the appendix
+
+> **Implemented 2026-07-05** (`feat/settings-harnesses`; plan:
+> `docs/superpowers/plans/2026-07-05-settings-appendix.md`). Deliberate
+> deltas from the text below: substituted launch args are shell-quoted
+> (semantically identical to the old commands); a `[harnesses.<name>]`
+> config entry replaces the builtin spec wholesale (the Settings toggle
+> therefore writes the full effective spec); re-filed workers respawn
+> interactively — their original spawn prompt is not stored; aider ships
+> without a `models_cmd` (its `--list-models` needs a search argument —
+> supply one in config if wanted).
 Opened from the sidebar footer (which becomes a `Settings ▸` row — the theme dots MOVE
 here). Folio: "The *appendix*" / SETTINGS. A single narrow column (~720px) of cards:
 
