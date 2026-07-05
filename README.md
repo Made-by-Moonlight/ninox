@@ -1,3 +1,5 @@
+<img src="docs/assets/ninox-logo.png" alt="Ninox" width="214" height="78">
+
 # Ninox
 
 Ninox is the native desktop app for [Athene](https://github.com/Made-by-Moonlight/Athene) — built in Rust with [Iced](https://github.com/iced-rs/iced). It embeds its own orchestrator engine directly and runs a GPU-accelerated UI: no Electron, no bundled browser.
