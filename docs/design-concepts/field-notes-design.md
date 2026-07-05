@@ -193,7 +193,14 @@ here). Folio: "The *appendix*" / SETTINGS. A single narrow column (~720px) of ca
 - **Theme**: the light/dark/ninox dots (relocated from the footer) + a mono pointer to
   the active theme file (`themes/field-notes.toml`).
 - **Harnesses**: one row per agent harness — ink-fill toggle, serif name, mono binary,
-  underlined mono default-model input (disabled until enabled). `claude-code` is the
+  and a **model picker** (underlined select, not free text — users don't know model id
+  strings). The picker is fed, in precedence order: (1) `models_cmd` output when the
+  spec defines one and it succeeds (e.g. `opencode models`, `aider --list-models` —
+  run on demand when the row is enabled, cached per app run, warn-and-fall-through on
+  failure); (2) the spec's curated `known_models` list (claude-code ships
+  fable-5 / opus-4.8 / sonnet-5 / haiku-4.5); (3) the currently-configured value. The
+  LAST picker entry is always `custom…`, which reveals the underlined mono free-text
+  input as the escape hatch. `claude-code` is the
   locked-on DEFAULT; `codex`, `opencode`, `aider` and custom names (e.g. `freebuff` —
   unknown harnesses run their name verbatim as the binary) are **off by default**.
   Enabled harnesses appear as agent chips in the Spawn modal.
@@ -210,6 +217,8 @@ binary  = "freebuff"
 model   = "fb-large"
 interactive_args = ["--model", "{model}"]
 worker_args      = ["--model", "{model}", "-p", "{prompt}"]
+known_models     = ["fb-large", "fb-mini"]   # curated fallback for the picker
+models_cmd       = ["freebuff", "models"]    # optional: live model discovery
 ```
 
 The four known harnesses ship as compiled-in default specs (claude-code enabled,
