@@ -86,6 +86,8 @@ mod tests {
                 pr_id: None,
                 workspace_path: None,
                 pid: None,
+                model: None,
+                context_tokens: None,
             })
             .unwrap();
         let app = sessions_router(engine);
@@ -120,6 +122,8 @@ mod tests {
                 pr_id: None,
                 workspace_path: None,
                 pid: None,
+                model: None,
+                context_tokens: None,
             })
             .unwrap();
         let response = sessions_router(engine)

@@ -25,6 +25,16 @@ pub struct Session {
     pub pr_id:          Option<PrId>,
     pub workspace_path: Option<String>,
     pub pid:            Option<u32>,
+    /// Model identifier the session was spawned with (e.g. `"claude-fable-5"`),
+    /// mirrors `AgentConfig::model`. `#[serde(default)]` for wire/DB
+    /// back-compat with sessions recorded before this field existed.
+    #[serde(default)]
+    pub model:          Option<String>,
+    /// Current context-window occupancy in tokens, as last observed from the
+    /// agent's own transcript (see `ninox_core::lifecycle::usage`).
+    /// `None` until the usage poller has ingested at least one turn.
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

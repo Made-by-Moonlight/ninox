@@ -201,6 +201,8 @@ async fn run_spawn(
         pr_id:           None,
         workspace_path:  Some(effective_workspace.clone()),
         pid:             None,
+        model:           agent.model.clone(),
+        context_tokens:  None,
     };
 
     store.upsert_session(&session)?;

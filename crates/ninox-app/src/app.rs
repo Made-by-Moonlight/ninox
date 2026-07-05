@@ -859,6 +859,8 @@ impl App {
                             pr_id:           None,
                             workspace_path:  Some(workspace.clone()),
                             pid:             None,
+                            model:           agent.model.clone(),
+                            context_tokens:  None,
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -976,6 +978,8 @@ impl App {
                             pr_id:           None,
                             workspace_path:  Some(ws.clone()),
                             pid:             None,
+                            model:           agent.model.clone(),
+                            context_tokens:  None,
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -2035,6 +2039,7 @@ mod tests {
             pr_id:           None,
             workspace_path:  None,
             pid:             None,
+            model: None, context_tokens: None,
         };
         let (updated, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         assert!(updated.sessions.contains_key("s1"));
@@ -2096,6 +2101,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         m = next;
@@ -2141,6 +2147,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         }).unwrap();
         let engine = Engine::new(store);
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
@@ -2161,6 +2168,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.42,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         m = m2;
@@ -2188,6 +2196,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         };
         let _ = m.engine.store.upsert_session(&worker);
         let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(worker)));
@@ -2603,6 +2612,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 1.23,
             started_at: 0, pr_number: Some(42), pr_id: None,
             workspace_path: Some("/tmp/w".into()), pid: Some(1234),
+            model: None, context_tokens: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -2628,6 +2638,7 @@ mod tests {
                 agent_type: "claude-code".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
+            model: None, context_tokens: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -2677,6 +2688,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         // NavigateSession defaults to the Split panel, so switch to Terminal
@@ -2721,6 +2733,7 @@ mod tests {
                 agent_type: "claude-code".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
+            model: None, context_tokens: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -2799,6 +2812,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         let (m, _) = m.update(Message::NavigateSession("s1".into()));
@@ -2848,6 +2862,7 @@ mod tests {
                 agent_type: "c".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
+            model: None, context_tokens: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -2935,6 +2950,7 @@ mod tests {
                 agent_type: "c".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
+            model: None, context_tokens: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -3434,6 +3450,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         m = next;
