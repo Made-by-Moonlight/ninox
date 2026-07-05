@@ -5,19 +5,60 @@ use tokio::process::Command;
 /// Isolates ninox from the user's own tmux server and ~/.tmux.conf.
 const SOCKET: &str = "ninox";
 
-/// The ninox-managed server config (spec §"Dedicated tmux server").
-const SERVER_CONFIG: &str = r#"# Managed by ninox — rewritten on every app start. Do not edit.
-set -g  default-terminal "tmux-256color"
-set -as terminal-features "xterm*:RGB:usstyle:extkeys:hyperlinks"
-set -s  extended-keys always
-set -s  extended-keys-format csi-u
-set -g  history-limit 100000
-set -g  status off
-set -s  escape-time 0
-set -g  window-size latest
-set -g  allow-passthrough on
-set -g  focus-events on
-"#;
+/// Parse a `tmux -V` version string (e.g. "tmux 3.4" or "tmux 3.5a") into
+/// (major, minor). Unparseable input degrades to (0, 0) so version checks
+/// fail closed rather than panicking.
+fn parse_tmux_version(raw: &str) -> (u32, u32) {
+    let ver = raw.trim().strip_prefix("tmux ").unwrap_or(raw.trim());
+    let mut parts = ver.split(|c: char| !c.is_ascii_digit());
+    let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (major, minor)
+}
+
+/// The installed tmux version, detected synchronously (a single fast `tmux
+/// -V` call). Used to build a config that only uses directives the running
+/// tmux actually supports, and by tests to gate assertions that only hold on
+/// newer tmux. Returns (0, 0) if tmux is missing or unparseable.
+pub fn detected_version_sync() -> (u32, u32) {
+    std::process::Command::new("tmux")
+        .arg("-V")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_tmux_version(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or((0, 0))
+}
+
+/// `extended-keys-format` (needed to disambiguate keys like Shift+Enter as
+/// CSI-u) was added in tmux 3.5; older tmux rejects the option outright.
+fn supports_extended_keys_format((major, minor): (u32, u32)) -> bool {
+    (major, minor) >= (3, 5)
+}
+
+/// Build the ninox-managed server config (spec §"Dedicated tmux server"),
+/// tailored to what `version` actually supports so we never ask an older
+/// tmux to parse a directive it doesn't understand.
+fn server_config_for_version(version: (u32, u32)) -> String {
+    let mut cfg = String::from("# Managed by ninox — rewritten on every app start. Do not edit.\n");
+    cfg.push_str("set -g  default-terminal \"tmux-256color\"\n");
+    cfg.push_str("set -as terminal-features \"xterm*:RGB:usstyle:extkeys:hyperlinks\"\n");
+    cfg.push_str("set -s  extended-keys always\n");
+    if supports_extended_keys_format(version) {
+        cfg.push_str("set -s  extended-keys-format csi-u\n");
+    }
+    cfg.push_str("set -g  history-limit 100000\n");
+    cfg.push_str("set -g  status off\n");
+    cfg.push_str("set -s  escape-time 0\n");
+    cfg.push_str("set -g  window-size latest\n");
+    cfg.push_str("set -g  allow-passthrough on\n");
+    cfg.push_str("set -g  focus-events on\n");
+    // Keep the server alive with zero sessions/clients so the one-time
+    // bootstrap in `ensure_server_ready` (a bare `start-server`, no session)
+    // doesn't get reaped before later commands reach it.
+    cfg.push_str("set -g  exit-empty off\n");
+    cfg
+}
 
 fn config_path() -> std::path::PathBuf {
     dirs::config_dir()
@@ -27,22 +68,23 @@ fn config_path() -> std::path::PathBuf {
 }
 
 /// Write the ninox tmux server config. Called once at startup so config
-/// drift between app versions cannot accumulate.
+/// drift between app versions cannot accumulate. The content is tailored to
+/// the installed tmux version (see `server_config_for_version`).
 pub fn write_server_config() -> Result<std::path::PathBuf> {
     let path = config_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, SERVER_CONFIG)?;
+    std::fs::write(&path, server_config_for_version(detected_version_sync()))?;
     Ok(path)
 }
 
 /// argv prefix routing a tmux invocation to the private ninox server.
+/// Does NOT include `-f`: config application is handled once, deterministically,
+/// by `ensure_server_ready` (see its doc comment for why `-f` on every
+/// invocation is not safe to rely on).
 fn socket_args() -> Vec<String> {
-    vec![
-        "-L".into(), SOCKET.into(),
-        "-f".into(), config_path().display().to_string(),
-    ]
+    vec!["-L".into(), SOCKET.into()]
 }
 
 /// Fail fast if tmux is missing or older than 3.2 (extended-keys support).
@@ -51,14 +93,12 @@ pub async fn require_version() -> Result<()> {
         .context("tmux not found — install tmux (brew install tmux / apt install tmux)")?;
     let v = String::from_utf8_lossy(&out.stdout);
     let ver = v.trim().strip_prefix("tmux ").unwrap_or(v.trim());
-    let mut parts = ver.split(|c: char| !c.is_ascii_digit());
-    let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let version = parse_tmux_version(&v);
     anyhow::ensure!(
-        (major, minor) >= (3, 2),
+        version >= (3, 2),
         "ninox requires tmux >= 3.2 for extended keyboard support; found {ver}"
     );
-    if (major, minor) < (3, 5) {
+    if !supports_extended_keys_format(version) {
         tracing::warn!(
             "tmux {ver} detected — extended-keys-format csi-u requires tmux >= 3.5; \
              Shift+Enter and other disambiguated keys may not reach apps correctly \
@@ -68,12 +108,57 @@ pub async fn require_version() -> Result<()> {
     Ok(())
 }
 
+/// Ensure the ninox config file exists, the private tmux server is running,
+/// and that server has our config applied — exactly once per process, no
+/// matter how many concurrent callers race to be first.
+///
+/// Why this exists: `tmux -f <path>` silently falls back to built-in
+/// defaults — no error, nothing on stderr — if `<path>` doesn't exist yet
+/// (verified directly: `tmux -f /does/not/exist new-session -d ...` exits 0
+/// with default options). `write_server_config` is normally called once by
+/// `main` before any session is created, but nothing else guarantees that
+/// ordering — a caller that creates a session before the config file has
+/// ever been written (e.g. this crate's test suite, or a future call site)
+/// gets a server silently running with tmux defaults (status bar visible,
+/// 2000-line history, no window-size follow) for that server's entire
+/// lifetime, since config is only read once, at server start. Reproduced
+/// deterministically on a from-scratch Linux `$HOME` (no prior ninox run to
+/// have left the file behind) — exactly the shape of a fresh CI runner or a
+/// fresh install, which is why this only ever showed up on Ubuntu CI.
+/// Funnelling every ninox-socket command through this guard first means the
+/// file is written, and the server started against it, exactly once, before
+/// anything else can race ahead and start the server unconfigured.
+async fn ensure_server_ready() {
+    static READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    READY.get_or_init(|| async {
+        if let Err(e) = write_server_config() {
+            tracing::warn!("failed to write tmux config: {e}");
+        }
+        let conf = config_path().display().to_string();
+        // `start-server` needs no session; `exit-empty off` (in our config)
+        // keeps the freshly-started server alive with none. If a server
+        // from an older ninox run is already up, `-f` here is a no-op, so
+        // `source-file` re-applies our (possibly newer) config explicitly —
+        // this is also what makes "rewritten on every app start" true for a
+        // long-lived server, not just for the file on disk.
+        let _ = run_raw(&["-L", SOCKET, "-f", &conf, "start-server"]).await;
+        let _ = run_raw(&["-L", SOCKET, "source-file", &conf]).await;
+    }).await;
+}
+
 fn is_missing_session(e: &anyhow::Error) -> bool {
     let msg = e.to_string();
     msg.contains("can't find session")
         || msg.contains("session not found")
         || msg.contains("no server running")
         || msg.contains("no sessions")
+        // tmux's message for a session-targeted command (has-session,
+        // kill-session, list-panes, ...) when the server is up but holds
+        // zero sessions total — a state that's now reachable because
+        // `ensure_server_ready` keeps the ninox server alive empty
+        // (`exit-empty off`) rather than only ever existing once a real
+        // session has been created on it.
+        || msg.contains("no current target")
 }
 
 /// Metadata about a running tmux session from `list-sessions`.
@@ -87,6 +172,7 @@ pub struct TmuxSession {
 
 /// Run a tmux subcommand against the ninox server and return trimmed stdout.
 async fn run(args: &[&str]) -> Result<String> {
+    ensure_server_ready().await;
     let prefix = socket_args();
     let mut full: Vec<&str> = prefix.iter().map(String::as_str).collect();
     full.extend_from_slice(args);
@@ -220,15 +306,22 @@ pub async fn has_session(id: &str) -> bool {
 /// first; legacy sessions on the default server are appended for any id not
 /// already seen (ninox socket wins on conflicts).
 pub async fn list_sessions() -> Result<Vec<TmuxSession>> {
-    let fmt = "#{session_name}\t#{session_created}\t#{pane_pid}\t#{pane_tty}";
-    let ninox_raw = run_best_effort(&["list-sessions", "-F", fmt]).await;
-    let default_raw = run_best_effort_default(&["list-sessions", "-F", fmt]).await;
+    // A literal tab column separator is mangled by tmux's -F formatter on
+    // older tmux (verified: tmux 3.4 rewrites an embedded tab byte in a -F
+    // template to `_` in the output, so every field collapses into one;
+    // tmux 3.6 passes it through untouched). `|` survives on both and can't
+    // appear in any of these fields (ninox controls session-name shape;
+    // the rest are numeric or a `/dev/...` path).
+    const SEP: &str = "|";
+    let fmt = format!("#{{session_name}}{SEP}#{{session_created}}{SEP}#{{pane_pid}}{SEP}#{{pane_tty}}");
+    let ninox_raw = run_best_effort(&["list-sessions", "-F", &fmt]).await;
+    let default_raw = run_best_effort_default(&["list-sessions", "-F", &fmt]).await;
 
     let mut seen = std::collections::HashSet::new();
     let mut sessions = Vec::new();
     for raw in [ninox_raw, default_raw] {
         for line in raw.lines().filter(|l| !l.is_empty()) {
-            let mut cols = line.splitn(4, '\t');
+            let mut cols = line.splitn(4, SEP);
             let Some(id) = cols.next().map(str::to_string) else { continue };
             if !seen.insert(id.clone()) {
                 continue;
@@ -339,8 +432,14 @@ mod tests {
     }
 
     fn unique_id() -> String {
+        // Millis alone collide when parallel test threads start within the
+        // same tick, producing duplicate tmux session names; a per-process
+        // counter guarantees uniqueness regardless of clock resolution (see
+        // the same fix in client.rs's unique_id).
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         format!(
-            "test-{}",
+            "test-{}-{n}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -395,13 +494,22 @@ mod tests {
         for required in [
             "default-terminal \"tmux-256color\"",
             "extended-keys always",
-            "extended-keys-format csi-u",
             "history-limit 100000",
             "status off",
             "window-size latest",
             "allow-passthrough on",
+            "exit-empty off",
         ] {
             assert!(body.contains(required), "config missing {required:?}\n{body}");
+        }
+        // extended-keys-format requires tmux >= 3.5 (older tmux rejects the
+        // option outright); the written config must match what's installed.
+        if supports_extended_keys_format(detected_version_sync()) {
+            assert!(body.contains("extended-keys-format csi-u"),
+                    "config missing extended-keys-format on tmux >= 3.5\n{body}");
+        } else {
+            assert!(!body.contains("extended-keys-format"),
+                    "config must omit extended-keys-format on tmux < 3.5 (rejected as invalid)\n{body}");
         }
     }
 
