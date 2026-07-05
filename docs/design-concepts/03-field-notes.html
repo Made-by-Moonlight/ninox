@@ -387,9 +387,8 @@ canvas{position:absolute;inset:0;width:100%;height:100%}
 
     <nav class="toc">
       <div class="toc-item on" data-nav="fleet"><span class="rn">I.</span><span class="lbl">Fleet board</span><span class="dots"></span><span class="k">1</span></div>
-      <div class="toc-item" data-nav="session"><span class="rn">II.</span><span class="lbl">Session</span><span class="dots"></span><span class="k">2</span></div>
-      <div class="toc-item" data-nav="prs"><span class="rn">III.</span><span class="lbl">Pull requests</span><span class="dots"></span><span class="k">3</span></div>
-      <div class="toc-item" data-nav="brain"><span class="rn">IV.</span><span class="lbl">Brain</span><span class="dots"></span><span class="k">4</span></div>
+      <div class="toc-item" data-nav="prs"><span class="rn">II.</span><span class="lbl">Pull requests</span><span class="dots"></span><span class="k">2</span></div>
+      <div class="toc-item" data-nav="brain"><span class="rn">III.</span><span class="lbl">Brain</span><span class="dots"></span><span class="k">3</span></div>
     </nav>
 
     <div class="side-actions">
@@ -764,7 +763,7 @@ document.querySelectorAll('[data-nav]').forEach(el=>{
 });
 addEventListener('keydown', e=>{
   if(e.key==='Escape') document.getElementById('spawn-modal').classList.remove('open');
-  const k = {'1':'fleet','2':'session','3':'prs','4':'brain'}[e.key];
+  const k = {'1':'fleet','2':'prs','3':'brain'}[e.key];
   if(k) go(k);
 });
 const sdBody = document.getElementById('sd-body');

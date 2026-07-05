@@ -106,7 +106,6 @@ pub struct App {
     pub notifications:   VecDeque<Notification>,
     pub sidebar:         SidebarState,
     pub view:            View,
-    pub last_session:    Option<SessionId>,
     /// The user's preferred worker panel — global, not per-session: the
     /// last tab chosen in any session detail, applied when opening a
     /// worker (resetting to Split on every navigation was jarring).
@@ -156,7 +155,6 @@ pub enum Message {
     EngineEvent(Event),
     NavigateFleet { scope: Option<OrchestratorId> },
     NavigateSession(SessionId),
-    NavigateLastSession,
     /// Attach argv resolved — spawn the hidden tmux client for this session.
     ClientAttach { session_id: SessionId, argv: Vec<String> },
     /// Toggle an orchestrator's worker list open/closed in the tree.
@@ -318,7 +316,6 @@ impl App {
             notifications:  VecDeque::new(),
             sidebar:        SidebarState::default(),
             view:           View::default(),
-            last_session:   None,
             worker_panel:   Default::default(),
             terminals:      HashMap::new(),
             clients:        HashMap::new(),
@@ -474,7 +471,6 @@ impl App {
             }
 
             Message::NavigateSession(id) => {
-                state.last_session = Some(id.clone());
                 // Selecting an orchestrator auto-expands its workers in the
                 // sidebar tree; selecting one of its workers keeps it open.
                 if state.orchestrators.iter().any(|o| o.id == id) {
@@ -517,15 +513,6 @@ impl App {
                     let argv = ninox_core::tmux::attach_args(&id).await;
                     Message::ClientAttach { session_id: id, argv }
                 })
-            }
-
-            Message::NavigateLastSession => {
-                if let Some(id) = state.last_session.clone() {
-                    if state.sessions.contains_key(&id) {
-                        return App::apply(state, Message::NavigateSession(id));
-                    }
-                }
-                Task::none()
             }
 
             Message::ClientAttach { session_id, argv } => {
@@ -822,7 +809,6 @@ impl App {
                             session_id: sid.clone(),
                             panel:      DetailPanel::Terminal,
                         };
-                        state.last_session = Some(sid.clone());
 
                         let engine = state.engine.clone();
                         let nm     = name;
@@ -940,7 +926,6 @@ impl App {
                             session_id: orch.id.clone(),
                             panel:      DetailPanel::Terminal,
                         };
-                        state.last_session = Some(orch.id.clone());
 
                         let engine     = state.engine.clone();
                         let sid        = orch.id.clone();
@@ -1074,9 +1059,8 @@ impl App {
                     if let iced::keyboard::Key::Character(c) = &key {
                         match c.as_str() {
                             "1" => return App::apply(state, Message::NavigateFleet { scope: None }),
-                            "2" => return App::apply(state, Message::NavigateLastSession),
-                            "3" => return App::apply(state, Message::NavigatePrList),
-                            "4" => return App::apply(state, Message::NavigateBrain),
+                            "2" => return App::apply(state, Message::NavigatePrList),
+                            "3" => return App::apply(state, Message::NavigateBrain),
                             "t" => {
                                 let next = match state.active_variant {
                                     ThemeVariant::Dark | ThemeVariant::Ninox => ThemeVariant::Light,
@@ -1931,7 +1915,6 @@ mod tests {
             notifications:  VecDeque::new(),
             sidebar:        SidebarState::default(),
             view:           View::FleetBoard { scope: None },
-            last_session:   None,
             worker_panel:   Default::default(),
             terminals:      HashMap::new(),
             clients:        HashMap::new(),
@@ -2017,31 +2000,6 @@ mod tests {
 
         // The newly spawned orchestrator's session must be remembered as the
         // last-visited session so NavigateLastSession can return to it.
-        assert_eq!(m.last_session.as_deref(), Some(orch_id.as_str()));
-    }
-
-    #[test]
-    fn navigate_session_records_last_session() {
-        let e = test_engine();
-        let mut m = base(e);
-        let s = Session {
-            id: "sess-a".into(), orchestrator_id: None, name: "w".into(),
-            repo: "r".into(), status: SessionStatus::Working,
-            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
-            pr_number: None, pr_id: None, workspace_path: None, pid: None,
-        };
-        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
-        m = next;
-
-        let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
-        m = next;
-        assert_eq!(m.last_session.as_deref(), Some("sess-a"));
-
-        let (next, _) = m.update(Message::NavigateFleet { scope: None });
-        m = next;
-        let (next, _) = m.update(Message::NavigateLastSession);
-        m = next;
-        assert!(matches!(&m.view, View::SessionDetail { session_id, .. } if session_id == "sess-a"));
     }
 
     #[test]
@@ -2072,44 +2030,6 @@ mod tests {
             matches!(&m.view, View::SessionDetail { panel: DetailPanel::Terminal, .. }),
             "opening a worker must use the global preferred panel, not reset to Split"
         );
-    }
-
-    #[test]
-    fn navigate_last_session_to_deleted_session_is_noop() {
-        let e = test_engine();
-        let mut m = base(e);
-        let s = Session {
-            id: "sess-a".into(), orchestrator_id: None, name: "w".into(),
-            repo: "r".into(), status: SessionStatus::Working,
-            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
-            pr_number: None, pr_id: None, workspace_path: None, pid: None,
-        };
-        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
-        m = next;
-
-        let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
-        m = next;
-        assert_eq!(m.last_session.as_deref(), Some("sess-a"));
-
-        // Session is removed (e.g. worker finished/removed), but last_session
-        // still points at it.
-        m.sessions.remove("sess-a");
-
-        let (next, _) = m.update(Message::NavigateFleet { scope: None });
-        m = next;
-        assert!(matches!(m.view, View::FleetBoard { .. }));
-
-        let (next, _) = m.update(Message::NavigateLastSession);
-        m = next;
-        assert!(matches!(m.view, View::FleetBoard { .. }));
-    }
-
-    #[test]
-    fn navigate_last_session_without_history_is_noop() {
-        let e = test_engine();
-        let m = base(e);
-        let (m, _) = m.update(Message::NavigateLastSession);
-        assert!(matches!(m.view, View::FleetBoard { .. }));
     }
 
     #[test]
@@ -2763,8 +2683,10 @@ mod tests {
     #[test]
     fn number_keys_switch_views() {
         let m = base(test_engine());
-        let m = press(m, "3");
+        let m = press(m, "2");
         assert!(matches!(m.view, View::PrList));
+        let m = press(m, "3");
+        assert!(matches!(m.view, View::Brain));
         let m = press(m, "1");
         assert!(matches!(m.view, View::FleetBoard { .. }));
     }
@@ -3084,7 +3006,6 @@ mod tests {
         assert!(sess.orchestrator_id.is_none());
         assert_eq!(sess.workspace_path.as_deref(), Some(ws_str.as_str()));
         assert!(matches!(&m.view, View::SessionDetail { session_id, .. } if session_id == "solo-a"));
-        assert_eq!(m.last_session.as_deref(), Some("solo-a"));
     }
 
     #[test]
