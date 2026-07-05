@@ -98,6 +98,9 @@ pub struct App {
     pub sidebar:         SidebarState,
     pub view:            View,
     pub last_session:    Option<SessionId>,
+    /// Last panel the user chose per session — re-entering a session
+    /// restores it instead of resetting to the Split default (jarring).
+    pub panel_memory:    HashMap<SessionId, crate::components::session_detail::DetailPanel>,
     pub terminals:       HashMap<SessionId, TerminalState>,
     /// One hidden tmux client per on-screen session (the "view"). Dropping
     /// an entry kills the client process; the session itself stays detached
@@ -291,6 +294,7 @@ impl App {
             sidebar:        SidebarState::default(),
             view:           View::default(),
             last_session:   None,
+            panel_memory:   HashMap::new(),
             terminals:      HashMap::new(),
             clients:        HashMap::new(),
             reattach_attempted: std::collections::HashSet::new(),
@@ -458,7 +462,7 @@ impl App {
                 }
                 state.view = View::SessionDetail {
                     session_id: id.clone(),
-                    panel: DetailPanel::default(),
+                    panel: state.panel_memory.get(&id).copied().unwrap_or_default(),
                 };
                 // Drop every client that is no longer on screen — the tmux
                 // sessions stay detached and running.
@@ -862,8 +866,9 @@ impl App {
             }
 
             Message::SwitchDetailPanel(new_panel) => {
-                if let View::SessionDetail { panel, .. } = &mut state.view {
+                if let View::SessionDetail { session_id, panel } = &mut state.view {
                     *panel = new_panel;
+                    state.panel_memory.insert(session_id.clone(), new_panel);
                 }
                 // Entering/leaving Split changes how much width the terminal
                 // canvas actually has, so the grid must be reflowed to match.
@@ -1782,6 +1787,7 @@ mod tests {
             sidebar:        SidebarState::default(),
             view:           View::FleetBoard { scope: None },
             last_session:   None,
+            panel_memory:   HashMap::new(),
             terminals:      HashMap::new(),
             clients:        HashMap::new(),
             reattach_attempted: std::collections::HashSet::new(),
@@ -1890,6 +1896,36 @@ mod tests {
         let (next, _) = m.update(Message::NavigateLastSession);
         m = next;
         assert!(matches!(&m.view, View::SessionDetail { session_id, .. } if session_id == "sess-a"));
+    }
+
+    #[test]
+    fn reentering_session_restores_last_panel() {
+        use crate::components::session_detail::DetailPanel;
+        let e = test_engine();
+        let mut m = base(e);
+        let s = Session {
+            id: "sess-a".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+        };
+        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        m = next;
+
+        let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
+        m = next;
+        assert!(matches!(&m.view, View::SessionDetail { panel: DetailPanel::Split, .. }));
+
+        let (next, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
+        m = next;
+        let (next, _) = m.update(Message::NavigateFleet { scope: None });
+        m = next;
+        let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
+        m = next;
+        assert!(
+            matches!(&m.view, View::SessionDetail { panel: DetailPanel::Terminal, .. }),
+            "re-entering must restore the last chosen panel, not reset to Split"
+        );
     }
 
     #[test]
