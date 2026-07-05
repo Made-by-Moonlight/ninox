@@ -239,6 +239,19 @@ mod tests {
     #[tokio::test]
     async fn shift_enter_csi_u_reaches_kitty_enabled_app() {
         if !tmux_available() { return; }
+        // extended-keys-format csi-u (how tmux disambiguates Shift+Enter for
+        // a forwarded CSI-u sequence) does not exist before tmux 3.5 — our
+        // managed config omits it there (see tmux::server_config_for_version),
+        // so there's nothing this test can exercise. Skip with a clear
+        // reason rather than failing on tmux that genuinely can't do this.
+        let version = tmux::detected_version_sync();
+        if version < (3, 5) {
+            eprintln!(
+                "skipping shift_enter_csi_u_reaches_kitty_enabled_app: tmux {version:?} \
+                 predates extended-keys-format (needs >= 3.5)"
+            );
+            return;
+        }
         let id = unique_id();
         let engine = test_engine();
         let mut rx = engine.subscribe();
