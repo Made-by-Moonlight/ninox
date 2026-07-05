@@ -38,6 +38,12 @@ pub struct ColorScheme {
     pub term_err:        Color,
     pub term_agent:      Color,
     pub term_dim:        Color,
+    /// 16-entry ANSI palette (0-7 normal, 8-15 bright) used to render
+    /// terminal text when a cell requests a named color that isn't
+    /// otherwise overridden by the emulator's dynamic color table — see
+    /// `terminal::ansi_to_iced`. Field Notes: identical in both themes,
+    /// the terminal is "the dark object" on the page (spec §1).
+    pub ansi: [Color; 16],
     // mode flag — NOT a theme-file token (see TOKEN_NAMES); user palettes
     // can't override it, it's never written to a theme file.
     pub dark: bool,
@@ -340,6 +346,12 @@ pub fn light() -> ColorScheme {
         term_err:        color!(0xf08a72),
         term_agent:      color!(0xf0c069),
         term_dim:        color!(0x7a7260),
+        ansi: [
+            color!(0x2c2822), color!(0xf08a72), color!(0x8fd37f), color!(0xf0c069),
+            color!(0x7ea9d4), color!(0xc876b4), color!(0x4ab0a4), color!(0xece4d0),
+            color!(0x7a7260), color!(0xf4a58f), color!(0xa8e29a), color!(0xf5d08a),
+            color!(0x9dc1e4), color!(0xd996c8), color!(0x6fc4ba), color!(0xf5efdd),
+        ],
         dark: false,
     }
 }
@@ -374,6 +386,12 @@ pub fn dark() -> ColorScheme {
         term_err:        color!(0xf08a72),
         term_agent:      color!(0xf0c069),
         term_dim:        color!(0x7a7260),
+        ansi: [
+            color!(0x2c2822), color!(0xf08a72), color!(0x8fd37f), color!(0xf0c069),
+            color!(0x7ea9d4), color!(0xc876b4), color!(0x4ab0a4), color!(0xece4d0),
+            color!(0x7a7260), color!(0xf4a58f), color!(0xa8e29a), color!(0xf5d08a),
+            color!(0x9dc1e4), color!(0xd996c8), color!(0x6fc4ba), color!(0xf5efdd),
+        ],
         dark: true,
     }
 }

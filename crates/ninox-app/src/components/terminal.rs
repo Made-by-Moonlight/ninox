@@ -1,6 +1,7 @@
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::Term;
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, Rgb};
 use iced::widget::canvas::{Cache, Frame, Geometry, Path};
 use iced::{Color as IcedColor, Rectangle, Size, Theme};
 
@@ -13,27 +14,61 @@ const NERD_FONT: iced::Font = iced::Font {
     style: iced::font::Style::Normal,
 };
 
+pub const TERM_FONT_BYTES: &[u8] =
+    include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
+
+pub const TERM_FONT: iced::Font = iced::Font {
+    family:  iced::font::Family::Name("JetBrains Mono"),
+    weight:  iced::font::Weight::Normal,
+    stretch: iced::font::Stretch::Normal,
+    style:   iced::font::Style::Normal,
+};
+
 /// The single source of truth for the terminal's font size — every layout
 /// computation (canvas rendering, mouse hit-testing, and the tmux grid
 /// sizing in `app::App::resize_terminals`) must derive cell dimensions from
 /// this constant via `cell_size()` so they can never drift apart.
 pub const FONT_SIZE: f32 = 13.0;
 
-/// Monospace cell size (width, height) in pixels for a given font size —
-/// the same approximation used everywhere a terminal cell is measured.
+/// Monospace cell size (width, height) in pixels, measured once from the
+/// bundled font's tables — canvas drawing, hit-testing, and PTY sizing all
+/// derive from this so they can never drift apart.
 pub fn cell_size(font_size: f32) -> (f32, f32) {
-    (font_size * 0.6, font_size * 1.4)
+    use std::sync::OnceLock;
+    static RATIOS: OnceLock<(f32, f32)> = OnceLock::new();
+    let (w, h) = *RATIOS.get_or_init(|| {
+        let face = ttf_parser::Face::parse(TERM_FONT_BYTES, 0)
+            .expect("bundled terminal font parses");
+        let upem = face.units_per_em() as f32;
+        let advance = face
+            .glyph_index('M')
+            .and_then(|g| face.glyph_hor_advance(g))
+            .expect("monospace advance") as f32;
+        let height = (face.ascender() as f32 - face.descender() as f32
+            + face.line_gap() as f32).max(upem);
+        (advance / upem, height / upem)
+    });
+    (font_size * w, font_size * h)
 }
 
 // ---------------------------------------------------------------------------
 // EventProxy
 // ---------------------------------------------------------------------------
 
+/// Forwards emulator-generated replies (cursor position reports, device
+/// attributes, kitty keyboard responses) back to the PTY. `None` (tests,
+/// sessions with no attached client) silently drops them.
 #[derive(Clone)]
-pub struct EventProxy;
+pub struct EventProxy(Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>);
 
 impl alacritty_terminal::event::EventListener for EventProxy {
-    fn send_event(&self, _: alacritty_terminal::event::Event) {}
+    fn send_event(&self, event: alacritty_terminal::event::Event) {
+        if let alacritty_terminal::event::Event::PtyWrite(text) = event {
+            if let Some(tx) = &self.0 {
+                let _ = tx.send(text.into_bytes());
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -43,29 +78,72 @@ impl alacritty_terminal::event::EventListener for EventProxy {
 pub struct TerminalState {
     pub term: Term<EventProxy>,
     pub cache: Cache,
+    /// On-demand tmux history cache + scroll position for this view. The
+    /// live alacritty grid never accumulates scrollback of its own (the
+    /// client stream is a full-screen tmux UI), so all history rendering
+    /// comes from here.
+    pub scrollback: crate::components::scrollback::Scrollback,
     parser: Processor,
 }
 
 impl TerminalState {
-    /// Feed raw bytes from the PTY into the VTE parser → terminal state.
-    pub fn process(&mut self, bytes: &[u8]) {
-        // ESC[2J (erase entire screen) on the primary screen calls clear_viewport()
-        // which scrolls the current viewport into scrollback history. TUI apps like
-        // Claude Code send ESC[2J on every full-screen redraw, flooding scrollback
-        // with repeated copies of the TUI chrome.
-        //
-        // Replace ESC[2J with ESC[H (cursor home) + ESC[0J (erase below cursor).
-        // ESC[0J uses reset_region() internally — same visual result, no scrollback push.
-        //
-        // Note: split sequences across chunk boundaries are not handled here; in
-        // practice tmux pipe-pane delivers complete sequences in single 4 KiB reads.
-        if bytes.windows(4).any(|w| w == b"\x1b[2J") {
-            let filtered = replace_clear_screen(bytes);
-            self.parser.advance(&mut self.term, &filtered);
-        } else {
-            self.parser.advance(&mut self.term, bytes);
+    pub fn new(
+        cols: u16,
+        rows: u16,
+        reply: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    ) -> Self {
+        use alacritty_terminal::term::{Config, test::TermSize};
+        let size = TermSize::new(cols as usize, rows as usize);
+        let config = Config { kitty_keyboard: true, ..Config::default() };
+        let term = Term::new(config, &size, EventProxy(reply));
+        Self {
+            term,
+            cache: Cache::new(),
+            scrollback: Default::default(),
+            parser: Processor::new(),
         }
+    }
+
+    /// Feed raw bytes from the attached tmux client into the emulator.
+    pub fn process(&mut self, bytes: &[u8]) {
+        self.parser.advance(&mut self.term, bytes);
         self.cache.clear();
+    }
+
+    /// Scroll by `delta` lines (positive = up). Returns true when older
+    /// history must be fetched from tmux.
+    pub fn scroll(&mut self, delta: i32) -> bool {
+        let needs_fetch = if delta > 0 {
+            self.scrollback.scroll_up(delta as usize)
+        } else {
+            self.scrollback.scroll_down((-delta) as usize);
+            false
+        };
+        self.cache.clear();
+        needs_fetch
+    }
+
+    /// Jump the display back down to the live viewport.
+    ///
+    /// Drops the whole cache rather than just zeroing `offset`. tmux
+    /// `capture-pane` line indices are relative to the *current* pane top,
+    /// which drifts as live output scrolls into history; a cached anchor
+    /// fetched at one live-output position can point at different lines
+    /// once more output has streamed. Discarding the cache here (the
+    /// natural point where the user leaves the stale scrollback view)
+    /// keeps re-entering history from replaying duplicated/misordered
+    /// chunks. Known residual trade-off: indices can still drift *within*
+    /// one continuous scrolled-back session while output keeps streaming in
+    /// the background — accepted for now; see the module doc on
+    /// `Scrollback`.
+    pub fn scroll_to_bottom(&mut self) {
+        self.scrollback = Default::default();
+        self.cache.clear();
+    }
+
+    /// Whether the display is currently scrolled up into history.
+    pub fn is_scrolled_back(&self) -> bool {
+        self.scrollback.offset > 0
     }
 
     /// Resize the terminal grid to match a new canvas size.
@@ -73,6 +151,11 @@ impl TerminalState {
         use alacritty_terminal::term::test::TermSize;
         let size = TermSize::new(cols as usize, rows as usize);
         self.term.resize(size);
+        // Cached history lines were parsed and wrapped at the old column
+        // width; keeping them around after a resize would render
+        // stale-width lines (see scroll_to_bottom for the same
+        // capture-pane-index-drift trade-off this also avoids).
+        self.scrollback = Default::default();
         self.cache.clear();
     }
 }
@@ -81,52 +164,17 @@ impl TerminalState {
 // Color conversion
 // ---------------------------------------------------------------------------
 
-/// Default terminal color palette (xterm-256 approximations for named colors).
-/// Field Notes terminal palette — warm paper-lamplight ANSI
-/// (spec §1 "Terminal": same in both themes; it is "the dark object").
-const DEFAULT_PALETTE: &[(u8, u8, u8)] = &[
-    (0x2c, 0x28, 0x22),   // 0  Black
-    (0xf0, 0x8a, 0x72),   // 1  Red
-    (0x8f, 0xd3, 0x7f),   // 2  Green
-    (0xf0, 0xc0, 0x69),   // 3  Yellow
-    (0x7e, 0xa9, 0xd4),   // 4  Blue
-    (0xc8, 0x76, 0xb4),   // 5  Magenta
-    (0x4a, 0xb0, 0xa4),   // 6  Cyan
-    (0xec, 0xe4, 0xd0),   // 7  White
-    (0x7a, 0x72, 0x60),   // 8  BrightBlack
-    (0xf4, 0xa5, 0x8f),   // 9  BrightRed
-    (0xa8, 0xe2, 0x9a),   // 10 BrightGreen
-    (0xf5, 0xd0, 0x8a),   // 11 BrightYellow
-    (0x9d, 0xc1, 0xe4),   // 12 BrightBlue
-    (0xd9, 0x96, 0xc8),   // 13 BrightMagenta
-    (0x6f, 0xc4, 0xba),   // 14 BrightCyan
-    (0xf5, 0xef, 0xdd),   // 15 BrightWhite
-];
-
 fn rgb_to_iced(rgb: Rgb) -> IcedColor {
     IcedColor::from_rgb8(rgb.r, rgb.g, rgb.b)
 }
 
-fn named_to_iced(named: NamedColor, bg: IcedColor, fg: IcedColor) -> IcedColor {
-    // Use our default palette for the first 16 named colors.
-    let idx = named as usize;
-    if idx < DEFAULT_PALETTE.len() {
-        let (r, g, b) = DEFAULT_PALETTE[idx];
-        return IcedColor::from_rgb8(r, g, b);
-    }
-    // Foreground / Background fallbacks use the active theme colors.
-    match named {
-        NamedColor::Foreground | NamedColor::BrightForeground => fg,
-        NamedColor::Background => bg,
-        _ => fg,
-    }
-}
-
 /// Convert an alacritty `Color` to an iced `Color`, consulting the dynamic
-/// color table for indexed colors where possible.
+/// color table for indexed colors where possible, and otherwise the active
+/// theme's 16-entry ANSI palette (`ColorScheme::ansi`).
 pub fn ansi_to_iced(
     color: Color,
     colors: &alacritty_terminal::term::color::Colors,
+    ansi: &[IcedColor; 16],
     bg: IcedColor,
     fg: IcedColor,
 ) -> IcedColor {
@@ -136,7 +184,16 @@ pub fn ansi_to_iced(
             if let Some(rgb) = colors[named] {
                 return rgb_to_iced(rgb);
             }
-            named_to_iced(named, bg, fg)
+            let idx = named as usize;
+            if idx < 16 {
+                return ansi[idx];
+            }
+            // Foreground / Background fallbacks use the active theme colors.
+            match named {
+                NamedColor::Foreground | NamedColor::BrightForeground => fg,
+                NamedColor::Background => bg,
+                _ => fg,
+            }
         }
         Color::Spec(rgb) => rgb_to_iced(rgb),
         Color::Indexed(idx) => {
@@ -145,8 +202,7 @@ pub fn ansi_to_iced(
             }
             // 256-color cube / grayscale fallback.
             if idx < 16 {
-                let (r, g, b) = DEFAULT_PALETTE[idx as usize];
-                IcedColor::from_rgb8(r, g, b)
+                ansi[idx as usize]
             } else if idx < 232 {
                 let n = idx - 16;
                 let b = (n % 6) * 51;
@@ -207,6 +263,8 @@ pub struct TerminalWidget<'a> {
     pub terminal_bg: IcedColor,
     pub terminal_fg: IcedColor,
     pub cursor_color: IcedColor,
+    /// The active theme's 16-entry ANSI palette — see `ColorScheme::ansi`.
+    pub ansi: [IcedColor; 16],
     /// Known session IDs — a single click on a matching word navigates to that session.
     pub session_ids: Vec<String>,
 }
@@ -273,7 +331,7 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                 }
                 // Drag — copy the selection.
                 let text = state.range().map(|((sc, sr), (ec, er))| {
-                    extract_selection(&self.state.term, sc, sr, ec, er)
+                    extract_selection(self.state, sc, sr, ec, er)
                 });
                 if let Some(t) = text.filter(|s| !s.trim().is_empty()) {
                     return (iced::widget::canvas::event::Status::Captured,
@@ -329,98 +387,217 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
         let colors = term.colors();
         let cols = grid.columns();
         let rows = grid.screen_lines();
-        let cursor_point   = grid.cursor.point;
-        let display_offset = grid.display_offset() as i32;
+        let cursor_point = grid.cursor.point;
+        // How many rows the view is scrolled up into tmux history. The
+        // native alacritty grid holds no scrollback of its own (the client
+        // stream is a full-screen tmux UI), so this offset is entirely
+        // driven by `Scrollback`, not `grid.display_offset()`.
+        let offset = self.state.scrollback.offset as i32;
 
         let term_bg = self.terminal_bg;
         let term_fg = self.terminal_fg;
         let cursor_color = self.cursor_color;
+        // Shape + blink from DECSCUSR. Blink is deliberately not animated —
+        // see the module-level note on steady cursor rendering.
+        let cursor_shape = term.cursor_style().shape;
 
         let geometry = self.state.cache.draw(renderer, bounds.size(), |frame: &mut Frame| {
             // Background fill.
             let bg_all = Path::rectangle(iced::Point::ORIGIN, bounds.size());
             frame.fill(&bg_all, term_bg);
 
-            // Render each cell. When scrolled into history, shift line indices by
-            // display_offset so Line(0 - offset) accesses the history buffer.
+            // Compose the viewport as history-above + live-below: rows whose
+            // logical index is negative are served from the tmux scrollback
+            // cache, the rest from the live grid.
             for row in 0..rows {
-                for col in 0..cols {
-                    use alacritty_terminal::index::{Column, Line};
+                use alacritty_terminal::index::{Column, Line};
 
-                    let line   = Line(row as i32 - display_offset);
+                let logical = row as i32 - offset;
+                let y = row as f32 * cell_h;
+
+                if logical < 0 {
+                    // History line fetched from tmux capture-pane. Content
+                    // between the cached snapshot and the live screen may be
+                    // stale/missing until jump-to-latest — accepted
+                    // trade-off, not a bug (see Scrollback docs).
+                    let Some(cells) = self.state.scrollback.line_above((-logical - 1) as usize)
+                    else {
+                        continue;
+                    };
+                    for (col, cell) in cells.iter().enumerate().take(cols) {
+                        let x = col as f32 * cell_w;
+                        let is_selected = cell_is_selected(sel, row, col);
+                        draw_cell(
+                            frame, x, y, cell_w, cell_h, self.font_size,
+                            cell.c, cell.fg, cell.bg, cell.flags,
+                            false, // cursor never draws in history
+                            cursor_shape, is_selected,
+                            colors, &self.ansi, term_bg, term_fg, cursor_color,
+                        );
+                    }
+                    continue;
+                }
+
+                let line = Line(logical);
+                for col in 0..cols {
                     let column = Column(col);
                     let cell = &grid[line][column];
-
                     let x = col as f32 * cell_w;
-                    let y = row as f32 * cell_h;
 
-                    // Background.
-                    let bg = ansi_to_iced(cell.bg, colors, term_bg, term_fg);
-                    let is_cursor = cursor_point.line == line && cursor_point.column == column;
+                    // The cursor is suppressed whenever the view is scrolled
+                    // back — it lives on the live screen, not in history.
+                    let is_cursor =
+                        offset == 0 && cursor_point.line == line && cursor_point.column == column;
+                    let is_selected = cell_is_selected(sel, row, col);
 
-                    let is_selected = sel.range().map(|((sc, sr), (ec, er))| {
-                        let in_row = row >= sr && row <= er;
-                        if !in_row { return false; }
-                        if sr == er { col >= sc && col <= ec }
-                        else if row == sr { col >= sc }
-                        else if row == er { col <= ec }
-                        else { true }
-                    }).unwrap_or(false);
-
-                    if is_selected {
-                        let sel_rect = Path::rectangle(
-                            iced::Point::new(x, y),
-                            Size::new(cell_w, cell_h),
-                        );
-                        frame.fill(&sel_rect, IcedColor { r: 0.941, g: 0.753, b: 0.412, a: 0.35 });
-                    } else if is_cursor {
-                        let cursor_rect = Path::rectangle(
-                            iced::Point::new(x, y),
-                            Size::new(cell_w, cell_h),
-                        );
-                        frame.fill(&cursor_rect, cursor_color);
-                    } else if bg != term_bg {
-                        let bg_rect = Path::rectangle(
-                            iced::Point::new(x, y),
-                            Size::new(cell_w, cell_h),
-                        );
-                        frame.fill(&bg_rect, bg);
-                    }
-
-                    // Foreground text.
-                    let ch = cell.c;
-                    if ch != ' ' && ch != '\0' {
-                        let fg = if is_cursor {
-                            term_bg
-                        } else {
-                            ansi_to_iced(cell.fg, colors, term_bg, term_fg)
-                        };
-
-                        let cp = ch as u32;
-                        let font = if (0xE000..=0xF8FF).contains(&cp) {
-                            NERD_FONT
-                        } else {
-                            iced::Font::MONOSPACE
-                        };
-                        frame.fill_text(iced::widget::canvas::Text {
-                            content: ch.to_string(),
-                            position: iced::Point::new(x, y),
-                            color: fg,
-                            size: iced::Pixels(self.font_size),
-                            font,
-                            horizontal_alignment: iced::alignment::Horizontal::Left,
-                            vertical_alignment: iced::alignment::Vertical::Top,
-                            line_height: iced::widget::text::LineHeight::Relative(
-                                cell_h / self.font_size,
-                            ),
-                            shaping: iced::widget::text::Shaping::Advanced,
-                        });
-                    }
+                    draw_cell(
+                        frame, x, y, cell_w, cell_h, self.font_size,
+                        cell.c, cell.fg, cell.bg, cell.flags,
+                        is_cursor, cursor_shape, is_selected,
+                        colors, &self.ansi, term_bg, term_fg, cursor_color,
+                    );
                 }
             }
         });
 
         vec![geometry]
+    }
+}
+
+/// Whether canvas cell (col, row) falls inside the current drag selection.
+fn cell_is_selected(sel: &SelectionState, row: usize, col: usize) -> bool {
+    sel.range().map(|((sc, sr), (ec, er))| {
+        let in_row = row >= sr && row <= er;
+        if !in_row { return false; }
+        if sr == er { col >= sc && col <= ec }
+        else if row == sr { col >= sc }
+        else if row == er { col <= ec }
+        else { true }
+    }).unwrap_or(false)
+}
+
+/// Draw a 1px decoration stroke (underline/strikeout/undercurl segments).
+fn stroke_line(frame: &mut Frame, x1: f32, y1: f32, x2: f32, y2: f32, color: IcedColor) {
+    let path = Path::line(iced::Point::new(x1, y1), iced::Point::new(x2, y2));
+    frame.stroke(&path, iced::widget::canvas::Stroke::default().with_width(1.0).with_color(color));
+}
+
+/// Draw one terminal cell (background/cursor/selection rect + glyph +
+/// decorations). Shared by live grid rows and tmux-history rows so both
+/// render identically — style resolution (fg/bg/flags → colors+font) lives
+/// here, next to the draw calls, so the two paths can't drift apart.
+#[allow(clippy::too_many_arguments)]
+fn draw_cell(
+    frame: &mut Frame,
+    x: f32,
+    y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    font_size: f32,
+    c: char,
+    fg_color: Color,
+    bg_color: Color,
+    flags: Flags,
+    is_cursor: bool,
+    cursor_shape: CursorShape,
+    is_selected: bool,
+    colors: &alacritty_terminal::term::color::Colors,
+    ansi: &[IcedColor; 16],
+    term_bg: IcedColor,
+    term_fg: IcedColor,
+    cursor_color: IcedColor,
+) {
+    // Resolve colors, then apply attribute transforms.
+    let mut fg = ansi_to_iced(fg_color, colors, ansi, term_bg, term_fg);
+    let mut bg = ansi_to_iced(bg_color, colors, ansi, term_bg, term_fg);
+    if flags.contains(Flags::INVERSE) { std::mem::swap(&mut fg, &mut bg); }
+    if flags.contains(Flags::DIM)     { fg.a *= 0.6; }
+    if flags.contains(Flags::HIDDEN)  { fg = bg; }
+
+    // Block cursor is a filled rect with an inverted glyph — the historical
+    // behavior. Beam/Underline/HollowBlock draw the cell normally and
+    // overlay a thin cursor mark instead of taking over the whole cell.
+    let block_cursor = is_cursor && cursor_shape == CursorShape::Block;
+
+    if is_selected {
+        let sel_rect = Path::rectangle(iced::Point::new(x, y), Size::new(cell_w, cell_h));
+        frame.fill(&sel_rect, IcedColor { r: 0.941, g: 0.753, b: 0.412, a: 0.35 }); // #f0c069 amber, field notes
+    } else if block_cursor {
+        let cursor_rect = Path::rectangle(iced::Point::new(x, y), Size::new(cell_w, cell_h));
+        frame.fill(&cursor_rect, cursor_color);
+    } else if bg != term_bg {
+        let bg_rect = Path::rectangle(iced::Point::new(x, y), Size::new(cell_w, cell_h));
+        frame.fill(&bg_rect, bg);
+    }
+
+    if is_cursor && !is_selected {
+        match cursor_shape {
+            CursorShape::Block => {} // handled above
+            CursorShape::Beam => {
+                frame.fill(&Path::rectangle(iced::Point::new(x, y), Size::new(2.0, cell_h)), cursor_color);
+            }
+            CursorShape::Underline => {
+                frame.fill(
+                    &Path::rectangle(iced::Point::new(x, y + cell_h - 2.0), Size::new(cell_w, 2.0)),
+                    cursor_color,
+                );
+            }
+            CursorShape::HollowBlock => {
+                stroke_line(frame, x, y, x + cell_w, y, cursor_color);
+                stroke_line(frame, x, y + cell_h, x + cell_w, y + cell_h, cursor_color);
+                stroke_line(frame, x, y, x, y + cell_h, cursor_color);
+                stroke_line(frame, x + cell_w, y, x + cell_w, y + cell_h, cursor_color);
+            }
+            CursorShape::Hidden => {}
+        }
+    }
+
+    // Foreground text.
+    if c != ' ' && c != '\0' {
+        let glyph_fg = if block_cursor { term_bg } else { fg };
+
+        let cp = c as u32;
+        let font = if (0xE000..=0xF8FF).contains(&cp) {
+            NERD_FONT
+        } else {
+            iced::Font {
+                weight: if flags.intersects(Flags::BOLD) { iced::font::Weight::Bold }
+                        else { iced::font::Weight::Normal },
+                style:  if flags.contains(Flags::ITALIC) { iced::font::Style::Italic }
+                        else { iced::font::Style::Normal },
+                ..TERM_FONT
+            }
+        };
+        frame.fill_text(iced::widget::canvas::Text {
+            content: c.to_string(),
+            position: iced::Point::new(x, y),
+            color: glyph_fg,
+            size: iced::Pixels(font_size),
+            font,
+            horizontal_alignment: iced::alignment::Horizontal::Left,
+            vertical_alignment: iced::alignment::Vertical::Top,
+            line_height: iced::widget::text::LineHeight::Relative(cell_h / font_size),
+            shaping: iced::widget::text::Shaping::Advanced,
+        });
+    }
+
+    // Decoration strokes — drawn in the resolved (post-transform) fg color.
+    let baseline = y + cell_h - 2.0;
+    if flags.contains(Flags::UNDERLINE) {
+        stroke_line(frame, x, baseline, x + cell_w, baseline, fg);
+    }
+    if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        stroke_line(frame, x, baseline - 2.0, x + cell_w, baseline - 2.0, fg);
+        stroke_line(frame, x, baseline,       x + cell_w, baseline,       fg);
+    }
+    if flags.contains(Flags::UNDERCURL) {
+        // Two-segment zigzag per cell — reads as a curl at terminal sizes.
+        stroke_line(frame, x, baseline, x + cell_w / 2.0, baseline - 2.0, fg);
+        stroke_line(frame, x + cell_w / 2.0, baseline - 2.0, x + cell_w, baseline, fg);
+    }
+    if flags.contains(Flags::STRIKEOUT) {
+        let mid = y + cell_h * 0.55;
+        stroke_line(frame, x, mid, x + cell_w, mid, fg);
     }
 }
 
@@ -458,26 +635,44 @@ pub fn word_at(grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::c
     }).collect::<String>().trim().to_string()
 }
 
+/// Extract the text under a viewport selection, mirroring the draw path's
+/// row indexing exactly: when the view is scrolled back
+/// (`state.scrollback.offset > 0`), rows above the live screen must read
+/// from the cached tmux history rather than the live grid, or the
+/// highlighted text and the copied clipboard text diverge.
 pub fn extract_selection(
-    term: &Term<EventProxy>,
+    state: &TerminalState,
     start_col: usize, start_row: usize,
     end_col: usize,   end_row: usize,
 ) -> String {
     use alacritty_terminal::index::{Column, Line};
 
-    let grid = term.grid();
+    let grid = state.term.grid();
     let cols = grid.columns();
     let rows = grid.screen_lines();
+    let offset = state.scrollback.offset as i32;
     let mut out = String::new();
 
     for row in start_row..=end_row.min(rows.saturating_sub(1)) {
         let col_start = if row == start_row { start_col } else { 0 };
         let col_end   = if row == end_row   { end_col   } else { cols.saturating_sub(1) };
+        let col_end   = col_end.min(cols.saturating_sub(1));
 
+        let logical = row as i32 - offset;
         let mut line_text = String::new();
-        for col in col_start..=col_end.min(cols.saturating_sub(1)) {
-            let cell = &grid[Line(row as i32)][Column(col)];
-            line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
+        if logical < 0 {
+            // History row — same index math as the draw path.
+            if let Some(cells) = state.scrollback.line_above((-logical - 1) as usize) {
+                for cell in cells.iter().skip(col_start).take(col_end + 1 - col_start) {
+                    line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
+                }
+            }
+        } else {
+            let line = Line(logical);
+            for col in col_start..=col_end {
+                let cell = &grid[line][Column(col)];
+                line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
+            }
         }
         // Strip trailing spaces from each line.
         let trimmed = line_text.trim_end();
@@ -487,113 +682,135 @@ pub fn extract_selection(
     out
 }
 
-// ---------------------------------------------------------------------------
-// Byte-stream filters
-// ---------------------------------------------------------------------------
-
-/// Replace every ESC[2J with ESC[H ESC[0J.
-///
-/// ESC[H moves the cursor to the home position; ESC[0J erases from cursor to
-/// end of screen using reset_region() (no scrollback push), unlike ESC[2J
-/// which uses clear_viewport() → scroll_up() and pollutes scrollback.
-fn replace_clear_screen(bytes: &[u8]) -> Vec<u8> {
-    const NEEDLE: &[u8] = b"\x1b[2J";
-    const REPLACE: &[u8] = b"\x1b[H\x1b[0J";
-
-    let mut out = Vec::with_capacity(bytes.len() + 4);
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(NEEDLE) {
-            out.extend_from_slice(REPLACE);
-            i += NEEDLE.len();
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-impl TerminalState {
-    pub fn new(cols: u16, rows: u16) -> Self {
-        use alacritty_terminal::term::{Config, test::TermSize};
-        let size = TermSize::new(cols as usize, rows as usize);
-        let term = Term::new(Config::default(), &size, EventProxy);
-        Self {
-            term,
-            cache: Cache::new(),
-            parser: Processor::new(),
-        }
-    }
-
-    /// Scroll the terminal display by `delta` lines (positive = up into history).
-    pub fn scroll(&mut self, delta: i32) {
-        use alacritty_terminal::grid::Scroll;
-        self.term.grid_mut().scroll_display(Scroll::Delta(delta));
-        self.cache.clear();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn process_advances_cursor() {
-        let mut s = TerminalState::new(80, 24);
+        let mut s = TerminalState::new(80, 24, None);
         s.process(b"hello");
-        // After printing 5 chars, cursor should be at column 5.
         assert_eq!(s.term.grid().cursor.point.column.0, 5);
     }
 
     #[test]
     fn process_ansi_no_panic() {
-        let mut s = TerminalState::new(80, 24);
+        let mut s = TerminalState::new(80, 24, None);
         s.process(b"\x1b[31mred\x1b[0m");
     }
 
     #[test]
-    fn replace_clear_screen_substitutes_esc2j() {
-        let input = b"before\x1b[2Jafter";
-        let out = replace_clear_screen(input);
-        assert_eq!(out, b"before\x1b[H\x1b[0Jafter");
+    fn emulator_query_responses_are_forwarded_to_reply_channel() {
+        // The inner app (via tmux) queries the terminal — e.g. DSR 6 (cursor
+        // position report). The emulator's answer must reach the reply
+        // channel; dropping it hangs TUIs that wait for the response.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut s = TerminalState::new(80, 24, Some(tx));
+        s.process(b"\x1b[6n"); // Device Status Report: cursor position
+        let reply = rx.try_recv().expect("DSR must produce a reply");
+        assert_eq!(reply, b"\x1b[1;1R".to_vec());
     }
 
     #[test]
-    fn replace_clear_screen_multiple_occurrences() {
-        let input = b"\x1b[2J\x1b[2J";
-        let out = replace_clear_screen(input);
-        assert_eq!(out, b"\x1b[H\x1b[0J\x1b[H\x1b[0J");
+    fn kitty_keyboard_query_is_answered() {
+        // Claude Code probes kitty keyboard support with CSI ? u. A reply
+        // is what makes Shift+Enter negotiation work end-to-end.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut s = TerminalState::new(80, 24, Some(tx));
+        s.process(b"\x1b[?u");
+        let reply = rx.try_recv().expect("kitty query must produce a reply");
+        assert!(reply.starts_with(b"\x1b[?"), "unexpected kitty reply: {reply:?}");
     }
 
     #[test]
-    fn replace_clear_screen_no_match_is_identity() {
-        let input = b"\x1b[H\x1b[0J plain text";
-        let out = replace_clear_screen(input);
-        assert_eq!(out, input);
-    }
-
-    #[test]
-    fn clear_screen_does_not_add_scrollback() {
-        // Fill the first 24 lines with content so clear_viewport would have
-        // something to push into scrollback if ESC[2J were passed through.
-        let mut s = TerminalState::new(80, 24);
-        for _ in 0..24 {
-            s.process(b"hello world\r\n");
-        }
-        let history_before = s.term.grid().history_size();
-
-        // ESC[2J should NOT add scrollback lines thanks to the filter.
-        s.process(b"\x1b[2J");
-
-        assert_eq!(
-            s.term.grid().history_size(),
-            history_before,
-            "ESC[2J must not push viewport content into scrollback"
+    fn ansi_to_iced_uses_theme_palette_for_named_colors() {
+        use alacritty_terminal::vte::ansi::{Color, NamedColor};
+        let colors = alacritty_terminal::term::color::Colors::default();
+        let mut ansi = [IcedColor::BLACK; 16];
+        ansi[1] = IcedColor::from_rgb8(0x12, 0x34, 0x56); // themed "red"
+        let out = ansi_to_iced(
+            Color::Named(NamedColor::Red), &colors, &ansi,
+            IcedColor::BLACK, IcedColor::WHITE,
         );
+        assert_eq!(out, IcedColor::from_rgb8(0x12, 0x34, 0x56));
+    }
+
+    #[test]
+    fn every_theme_defines_a_full_palette() {
+        for scheme in [crate::theme::light(), crate::theme::dark()] {
+            // 16 distinct-ish entries; at minimum not all default black.
+            assert!(scheme.ansi.iter().any(|c| *c != iced::Color::BLACK));
+            assert_eq!(scheme.ansi.len(), 16);
+        }
+    }
+
+    #[test]
+    fn extract_selection_reads_history_lines_when_scrolled_back() {
+        use crate::components::scrollback::StyledCell;
+        use alacritty_terminal::vte::ansi::NamedColor;
+
+        let mut s = TerminalState::new(20, 5, None);
+        s.process(b"live line one\r\nlive line two\r\n");
+
+        let mk_line = |text: &str| -> Vec<StyledCell> {
+            text.chars().map(|c| StyledCell {
+                c,
+                fg: Color::Named(NamedColor::Foreground),
+                bg: Color::Named(NamedColor::Background),
+                flags: Flags::empty(),
+            }).collect()
+        };
+        // Oldest first — "history two" sits directly above the live screen.
+        s.scrollback.absorb(vec![mk_line("history one"), mk_line("history two")], -2, true);
+        s.scrollback.offset = 2;
+
+        // Top two viewport rows (0, 1) are both scrolled into history at
+        // this offset — row 0 → history one, row 1 → history two.
+        let text = extract_selection(&s, 0, 0, 19, 1);
+        assert_eq!(text, "history one\nhistory two");
+    }
+
+    #[test]
+    fn scroll_to_bottom_resets_the_whole_scrollback_cache() {
+        let mut s = TerminalState::new(80, 24, None);
+        s.scrollback.absorb(vec![vec![]; 10], -10, true);
+        s.scrollback.offset = 5;
+        s.scrollback.fetch_pending = true;
+        assert!(!s.scrollback.lines.is_empty());
+
+        s.scroll_to_bottom();
+
+        assert!(s.scrollback.lines.is_empty(), "cached history must be dropped");
+        assert_eq!(s.scrollback.offset, 0);
+        assert_eq!(s.scrollback.fetched_to, 0);
+        assert!(!s.scrollback.top_reached);
+        assert!(!s.scrollback.fetch_pending);
+    }
+
+    #[test]
+    fn resize_resets_the_whole_scrollback_cache() {
+        let mut s = TerminalState::new(80, 24, None);
+        s.scrollback.absorb(vec![vec![]; 10], -10, true);
+        s.scrollback.offset = 5;
+        s.scrollback.fetch_pending = true;
+
+        s.resize(100, 30);
+
+        assert!(s.scrollback.lines.is_empty(), "cached history parsed at the old width must be dropped");
+        assert_eq!(s.scrollback.offset, 0);
+        assert_eq!(s.scrollback.fetched_to, 0);
+        assert!(!s.scrollback.top_reached);
+        assert!(!s.scrollback.fetch_pending);
+    }
+
+    #[test]
+    fn cell_size_comes_from_font_metrics() {
+        let (w, h) = cell_size(13.0);
+        // JetBrains Mono: advance 600/1000 upem → width exactly 0.6em.
+        assert!((w - 13.0 * 0.6).abs() < 0.01, "width {w}");
+        // Height = (ascender - descender + line_gap)/upem — sane range, and
+        // NOT the old hardcoded 1.4 approximation.
+        assert!(h > 13.0 * 1.1 && h < 13.0 * 1.5, "height {h}");
+        assert!((h - 13.0 * 1.4).abs() > 0.01, "height must be measured, not the 1.4 guess");
     }
 }

@@ -30,16 +30,21 @@ pub struct InteractiveSpawnParams {
     /// (e.g. NINOX_ORCHESTRATOR_ID + caller-type vars for orchestrators).
     pub extra_env:       Vec<(String, String)>,
     pub started_at:      i64,
-    pub cols:            u16,
-    pub rows:            u16,
 }
 
 /// Launch an interactive agent session inside tmux and start PTY streaming.
 ///
+/// On success, returns the tmux attach argv for the new session so the
+/// caller can emit `Message::ClientAttach` and render it immediately at the
+/// right size (the attached-client flow sizes the PTY to the real panel).
 /// On tmux failure (e.g. the workspace path is bad) the session is marked
-/// `Terminated` in the store and a `SessionUpdated` event is emitted so the
-/// UI shows "Session exited" instead of a session stuck in Working forever.
-pub async fn spawn_interactive_session(engine: Arc<Engine>, p: InteractiveSpawnParams) {
+/// `Terminated` in the store, a `SessionUpdated` event is emitted so the UI
+/// shows "Session exited" instead of a session stuck in Working forever, and
+/// `None` is returned.
+pub async fn spawn_interactive_session(
+    engine: Arc<Engine>,
+    p: InteractiveSpawnParams,
+) -> Option<Vec<String>> {
     let sid = p.session_id;
 
     let ninox_bin = std::env::current_exe()
@@ -76,7 +81,7 @@ pub async fn spawn_interactive_session(engine: Arc<Engine>, p: InteractiveSpawnP
             let _ = engine.store.upsert_session(&s);
             engine.emit(Event::SessionUpdated(s));
         }
-        return;
+        return None;
     }
 
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
@@ -103,11 +108,14 @@ pub async fn spawn_interactive_session(engine: Arc<Engine>, p: InteractiveSpawnP
     };
     let _ = engine.store.upsert_session(&updated);
 
-    if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &sid, p.cols, p.rows).await {
+    if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &sid).await {
         tracing::error!("pty setup failed for {sid}: {e}");
     }
 
     engine.emit(Event::SessionUpdated(updated));
+
+    // Hidden tmux client attach argv — mirrors NavigateSession's attach flow.
+    Some(tmux::attach_args(&sid).await)
 }
 
 /// Expand a leading `~` or `~/` in a user-supplied path to the home directory.

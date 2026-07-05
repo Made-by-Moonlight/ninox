@@ -314,18 +314,46 @@ pub fn session_detail<'a>(
     let terminal_bg = s.term_bg;
     let session_ids: Vec<String> = app.sessions.keys().cloned().collect();
     let terminal_pane: Element<Message> = if let Some(term_state) = app.terminals.get(session_id) {
-        iced::widget::Canvas::new(TerminalWidget {
+        let canvas = iced::widget::Canvas::new(TerminalWidget {
             state:        term_state,
             session_id:   session_id.to_string(),
             font_size:    FONT_SIZE,
             terminal_bg:  s.term_bg,
             terminal_fg:  s.term_fg,
             cursor_color: s.accent,
+            ansi:         s.ansi,
             session_ids,
         })
         .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        .height(Length::Fill);
+
+        // Scrolled up into history — surface a floating button to jump back
+        // down to the live output, since new output won't auto-scroll into
+        // view while the user is reading scrollback.
+        let jump_to_latest: Option<Element<Message>> = term_state.is_scrolled_back().then(|| {
+            container(
+                button(text("↓ Jump to latest").size(12).color(Color::WHITE))
+                    .on_press(Message::JumpToLatest { session_id: session_id.to_string() })
+                    .padding([6, 14])
+                    .style(move |_theme, _status| button::Style {
+                        background: Some(Background::Color(s.accent)),
+                        border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 999.0.into() },
+                        text_color: Color::WHITE,
+                        ..Default::default()
+                    }),
+            )
+            .center_x(Length::Fill)
+            .align_bottom(Length::Fill)
+            .padding(iced::Padding::default().bottom(16))
+            .into()
+        });
+
+        iced::widget::Stack::new()
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .push(canvas)
+            .push_maybe(jump_to_latest)
+            .into()
     } else {
         use ninox_core::types::SessionStatus;
         let placeholder = match session.status {

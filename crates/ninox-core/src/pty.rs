@@ -21,19 +21,15 @@ fn fifo_path(session_id: &str) -> String {
 /// 6. Spawns a task that forwards bytes from the mpsc input channel to the TTY.
 /// 7. Registers the input sender with the engine so the WebSocket terminal can use it.
 ///
-/// Wire up PTY streaming for an already-running tmux session.
-///
-/// `cols` and `rows` must match the caller's `TerminalState` dimensions.
-/// The tmux session is resized to these dimensions before `capture_pane` so
-/// the captured escape sequences reference the same column positions as the
-/// TerminalState grid — mismatches cause text to appear at wrong horizontal
-/// offsets.
+/// The native app no longer renders from this tap — `AttachedClient` (a
+/// hidden tmux client over a real PTY) is the source of truth for on-screen
+/// sessions and repaints the whole screen on attach. This FIFO/pipe-pane tap
+/// now exists solely for the browser WebSocket route and background-session
+/// monitoring.
 pub async fn start_streaming(
     engine:     Arc<Engine>,
     session_id: SessionId,
     tmux_id:    &str,
-    cols:       u16,
-    rows:       u16,
 ) -> Result<()> {
     // Cancel any previous FIFO reader for this session before setting up a new
     // one.  This prevents the old reader from emitting stale events after the
@@ -60,20 +56,6 @@ pub async fn start_streaming(
     };
 
     tmux::pipe_pane(tmux_id, &path).await?;
-
-    // ── Force SIGWINCH via bounce resize ──────────────────────────────────────
-    // Unlike Zed (which owns a direct PTY stream and never needs a snapshot),
-    // we reconnect to an already-running tmux session.  We must force a full
-    // repaint so the FIFO receives a clean screen — no capture_pane needed.
-    //
-    // A "bounce" resize (cols→cols-1→cols) guarantees SIGWINCH even when the
-    // terminal was already at `cols` rows.  The process redraws twice and
-    // settles at the correct size.  The FIFO stream is the single source of
-    // truth for the TerminalState — no snapshot races, no ordering conflicts.
-    let bounce = cols.saturating_sub(1).max(2);
-    let _ = tmux::resize_window(tmux_id, bounce, rows).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    let _ = tmux::resize_window(tmux_id, cols, rows).await;
 
     // --- Output task: FIFO → Event::TerminalOutput ---
     let engine_out = engine.clone();
@@ -143,20 +125,11 @@ pub async fn start_streaming(
     tokio::spawn(async move {
         let mut counter = 0u64;
         while let Some(bytes) = input_rx.recv().await {
-            let buf  = format!("ath-in-{}-{counter}", &tmux_id_input);
-            let tmp  = format!("/tmp/ath-in-{}-{counter}.tmp", &tmux_id_input);
+            let buf = format!("ath-in-{}-{counter}", &tmux_id_input);
+            let tmp = format!("/tmp/ath-in-{}-{counter}.tmp", &tmux_id_input);
             counter += 1;
 
-            if std::fs::write(&tmp, &bytes).is_err() { continue; }
-
-            let _ = tokio::process::Command::new("tmux")
-                .args(["load-buffer", "-b", &buf, &tmp, ";",
-                       "paste-buffer", "-b", &buf, "-t", &tmux_id_input, "-d"])
-                .kill_on_drop(true)
-                .output()
-                .await;
-
-            let _ = std::fs::remove_file(&tmp);
+            let _ = tmux::paste_buffer(&tmux_id_input, &buf, &tmp, &bytes).await;
         }
     });
 
@@ -229,7 +202,7 @@ mod tests {
 
         tmux::create_session(&id, "/tmp", "bash", &[]).await.unwrap();
         sleep(Duration::from_millis(300)).await;
-        start_streaming(engine.clone(), id.clone(), &id, 80, 24).await.unwrap();
+        start_streaming(engine.clone(), id.clone(), &id).await.unwrap();
         sleep(Duration::from_millis(200)).await;
 
         if let Some(w) = engine.get_pty_writer(&id).await {
@@ -257,7 +230,7 @@ mod tests {
         let cmd = "bash -c 'select x in yes no; do echo \"chose:$x\"; break; done'";
         tmux::create_session(&id, "/tmp", cmd, &[]).await.unwrap();
         sleep(Duration::from_millis(400)).await;
-        start_streaming(engine.clone(), id.clone(), &id, 80, 24).await.unwrap();
+        start_streaming(engine.clone(), id.clone(), &id).await.unwrap();
         sleep(Duration::from_millis(300)).await;
 
         // Send "1\r" to select option 1 ("yes")
