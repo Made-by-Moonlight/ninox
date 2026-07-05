@@ -216,6 +216,8 @@ pub enum Message {
     NavigateBrain,
     /// Opened from the sidebar footer's `Settings ▸` row.
     NavigateSettings,
+    /// Flip a harness's enabled flag (inert for the locked-on claude-code).
+    SettingsToggleHarness(String),
     BrainSelectEntry(String),
     /// The pinboard canvas's hovered node changed (including to/from `None`)
     /// — emitted only on change, never on every mouse move.
@@ -1410,6 +1412,23 @@ impl App {
                 // Kick model discovery for the worker default's harness so
                 // the Workers card's picker has live options when it opens.
                 Self::ensure_models(state, &state.config.worker.harness.clone())
+            }
+
+            Message::SettingsToggleHarness(name) => {
+                // claude-code is the locked-on default — inert by design.
+                if name == "claude-code" {
+                    return Task::none();
+                }
+                // Write the FULL effective spec with `enabled` flipped —
+                // config entries replace builtin specs wholesale, so a bare
+                // `{ enabled: true }` would wipe the builtin's args.
+                let mut spec = state.config.registry().spec(&name);
+                spec.enabled = !spec.enabled;
+                state.config.harnesses.insert(name.clone(), spec);
+                if let Err(e) = state.config.save() {
+                    tracing::warn!("failed to save config after toggling harness {name}: {e}");
+                }
+                Task::none()
             }
 
             Message::BrainSelectEntry(id) => {
@@ -3149,6 +3168,38 @@ mod tests {
             assert_ne!(m.active_variant, before);
             let m = press(m, "t");
             assert_eq!(m.active_variant, before);
+        });
+    }
+
+    #[test]
+    fn toggling_a_harness_enables_it_and_persists() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("toggle_harness_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            assert!(!m.config.registry().enabled_names().contains(&"codex".to_string()));
+            let (m, _) = m.update(Message::SettingsToggleHarness("codex".into()));
+            assert!(m.config.registry().enabled_names().contains(&"codex".to_string()));
+            // persisted: a fresh load sees it too, with the builtin's args
+            // intact (the toggle writes the full effective spec)
+            let loaded = ninox_core::config::AppConfig::load().unwrap();
+            assert!(loaded.registry().enabled_names().contains(&"codex".to_string()));
+            assert!(loaded.registry().spec("codex").worker_args.is_some());
+            // toggling back disables
+            let (m, _) = m.update(Message::SettingsToggleHarness("codex".into()));
+            assert!(!m.config.registry().enabled_names().contains(&"codex".to_string()));
+        });
+    }
+
+    #[test]
+    fn claude_code_toggle_is_inert() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("claude_toggle_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            let (m, _) = m.update(Message::SettingsToggleHarness("claude-code".into()));
+            assert!(m.config.registry().enabled_names().contains(&"claude-code".to_string()));
+            assert!(m.config.harnesses.is_empty(), "inert toggle must not write config");
         });
     }
 

@@ -35,6 +35,7 @@ pub fn settings_panel(app: &App) -> Element<'_, Message> {
 
     let cards = column![
         theme_card(app),
+        harnesses_card(app),
     ]
     .spacing(18)
     .width(Length::Fixed(COLUMN_W));
@@ -124,4 +125,62 @@ fn theme_card(app: &App) -> Element<'_, Message> {
     ]
     .spacing(0)
     .into())
+}
+
+/// Harnesses card: one row per registry harness — ink-fill toggle, serif
+/// name, mono binary, `workers ✓/–` marker. NO model field here by design:
+/// interactive spawns always choose their model in the Spawn modal.
+fn harnesses_card(app: &App) -> Element<'_, Message> {
+    let s = &app.scheme;
+    let registry = app.config.registry();
+    let mut rows = column![].spacing(10);
+    for name in registry.names() {
+        let spec = registry.spec(&name);
+        let locked = name == "claude-code";
+        let enabled = spec.enabled;
+        let binary = spec.binary.clone().unwrap_or_else(|| name.clone());
+        let worker_capable = spec.worker_args.is_some();
+        let workers = if worker_capable { "workers ✓" } else { "workers –" };
+
+        let toggle = button(Space::new(0, 0))
+            .on_press_maybe((!locked).then(|| Message::SettingsToggleHarness(name.clone())))
+            .width(Length::Fixed(30.0))
+            .height(Length::Fixed(16.0))
+            .padding(0)
+            .style(move |_t, status| button::Style {
+                background: enabled.then_some(Background::Color(s.ink)),
+                text_color: s.ink,
+                border: Border {
+                    color: if matches!(status, button::Status::Hovered) && !locked { s.accent } else { s.ink },
+                    width: 1.5,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            });
+
+        let name_label = text(name.clone()).size(14).font(SERIF)
+            .color(if enabled { s.ink } else { s.ink_2 });
+        let suffix: Element<Message> = if locked {
+            text("default").size(9).font(MONO).color(s.faint).into()
+        } else {
+            Space::new(0, 0).into()
+        };
+
+        rows = rows.push(
+            row![
+                toggle,
+                Space::new(12, 0),
+                name_label,
+                Space::new(8, 0),
+                suffix,
+                Space::new(Length::Fill, 0),
+                text(binary).size(10).font(MONO).color(s.faint),
+                Space::new(14, 0),
+                text(workers).size(10).font(MONO)
+                    .color(if worker_capable { s.ink_2 } else { s.faint }),
+            ]
+            .align_y(Alignment::Center),
+        );
+    }
+    card(app, "Harnesses", rows.into())
 }
