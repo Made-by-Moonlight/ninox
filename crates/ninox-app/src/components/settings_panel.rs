@@ -14,6 +14,13 @@ use crate::{
     style::{card_style, hline, micro_label, MONO, SERIF, SERIF_ITALIC},
 };
 
+/// Settings-view UI state (custom-model input text for the Workers card).
+#[derive(Debug, Clone, Default)]
+pub struct SettingsState {
+    /// `Some` while the Workers model picker is in `custom…` mode.
+    pub worker_custom: Option<String>,
+}
+
 /// Column width — "a single narrow column (~720px) of cards".
 const COLUMN_W: f32 = 720.0;
 
@@ -36,6 +43,7 @@ pub fn settings_panel(app: &App) -> Element<'_, Message> {
     let cards = column![
         theme_card(app),
         harnesses_card(app),
+        workers_card(app),
     ]
     .spacing(18)
     .width(Length::Fixed(COLUMN_W));
@@ -183,4 +191,64 @@ fn harnesses_card(app: &App) -> Element<'_, Message> {
         );
     }
     card(app, "Harnesses", rows.into())
+}
+
+/// Workers card — the one unmanned decision: what `ninox spawn` launches
+/// when orchestrator agents spawn workers. Harness picker (enabled,
+/// worker-capable harnesses only) + model picker (select with a `custom…`
+/// escape hatch). Maps to config `[worker]`.
+fn workers_card(app: &App) -> Element<'_, Message> {
+    use iced::widget::{pick_list, text_input};
+    let s = &app.scheme;
+    let registry = app.config.registry();
+
+    let harness_opts: Vec<String> = registry.enabled_names().into_iter()
+        .filter(|n| registry.spec(n).worker_args.is_some())
+        .collect();
+    let harness_sel = harness_opts.iter()
+        .find(|n| **n == app.config.worker.harness)
+        .cloned();
+    let harness_pick = pick_list(harness_opts, harness_sel, Message::SettingsWorkerHarness)
+        .font(MONO)
+        .text_size(12)
+        .padding([6, 10])
+        .style(crate::style::pick_style(s));
+
+    let spec = registry.spec(&app.config.worker.harness);
+    let discovered = app.model_lists.get(&app.config.worker.harness).and_then(|m| m.as_deref());
+    let configured = app.config.worker.model.clone().or_else(|| spec.model.clone());
+    let model_opts = crate::models::model_options(&spec, discovered, configured.as_deref());
+    let model_sel = if app.settings.worker_custom.is_some() {
+        Some(crate::models::CUSTOM_SENTINEL.to_string())
+    } else {
+        configured
+    };
+    let model_pick = pick_list(model_opts, model_sel, Message::SettingsWorkerModel)
+        .placeholder("harness default")
+        .font(MONO)
+        .text_size(12)
+        .padding([6, 10])
+        .style(crate::style::pick_style(s));
+
+    let mut body = column![
+        row![
+            column![micro_label("Harness", s.faint), Space::new(0, 6), harness_pick].spacing(0),
+            Space::new(20, 0),
+            column![micro_label("Model", s.faint), Space::new(0, 6), model_pick].spacing(0),
+        ]
+        .align_y(Alignment::Start),
+    ]
+    .spacing(0);
+    if let Some(v) = &app.settings.worker_custom {
+        body = body.push(Space::new(0, 10)).push(
+            text_input("model id", v)
+                .on_input(Message::SettingsWorkerCustomModel)
+                .on_submit(Message::SettingsWorkerCustomCommit)
+                .font(MONO)
+                .size(12)
+                .padding([4, 2])
+                .style(crate::style::underlined_input_style(s)),
+        );
+    }
+    card(app, "Workers", body.into())
 }

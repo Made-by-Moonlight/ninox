@@ -11,7 +11,7 @@ use iced::{
 
 use crate::{
     app::{App, Message},
-    style::{self, hard_shadow, hline, micro_label, shadow_alpha, MONO, SANS, SANS_BOLD, SERIF, SERIF_ITALIC},
+    style::{self, hard_shadow, hline, micro_label, pick_style, shadow_alpha, MONO, SANS, SANS_BOLD, SERIF, SERIF_ITALIC},
     theme::ColorScheme,
 };
 
@@ -127,15 +127,6 @@ fn styled_input<'a>(s: &'a ColorScheme, placeholder: &'a str, value: &'a str) ->
     style::serif_underlined_input(s, placeholder, value)
 }
 
-fn pick_style<'a>(s: &'a ColorScheme) -> impl Fn(&iced::Theme, pick_list::Status) -> pick_list::Style + 'a {
-    move |_theme, _status| pick_list::Style {
-        text_color: s.ink,
-        placeholder_color: s.faint,
-        handle_color: s.ink_2,
-        background: Background::Color(Color::TRANSPARENT),
-        border: Border { color: s.rule_dark, width: 1.0, radius: 2.0.into() },
-    }
-}
 
 /// A pill-style toggle button shared by the agent and catalogue chip rows
 /// (the one pill exception in the design language; the Entry-type toggle

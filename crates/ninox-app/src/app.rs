@@ -143,6 +143,8 @@ pub struct App {
     /// `Some(None)` = attempted and failed (pickers fall through to the
     /// spec's known_models); absent = not attempted yet.
     pub model_lists:     HashMap<String, Option<Vec<String>>>,
+    /// Settings-view UI state (custom-model input for the Workers card).
+    pub settings:        crate::components::settings_panel::SettingsState,
     pub spawn_modal:     Option<SpawnForm>,
     /// Add-a-catalogue journal-entry modal, opened from the `+` at the
     /// right edge of the brain view's volume plate. Exclusive with
@@ -218,6 +220,11 @@ pub enum Message {
     NavigateSettings,
     /// Flip a harness's enabled flag (inert for the locked-on claude-code).
     SettingsToggleHarness(String),
+    /// Workers card — the `[worker]` default `ninox spawn` launches.
+    SettingsWorkerHarness(String),
+    SettingsWorkerModel(String),
+    SettingsWorkerCustomModel(String),
+    SettingsWorkerCustomCommit,
     BrainSelectEntry(String),
     /// The pinboard canvas's hovered node changed (including to/from `None`)
     /// — emitted only on change, never on every mouse move.
@@ -350,6 +357,7 @@ impl App {
             reattach_attempted: std::collections::HashSet::new(),
             next_client_generation: 0,
             model_lists:    HashMap::new(),
+            settings:       Default::default(),
             spawn_modal:    None,
             catalogue_modal: None,
             // Placeholders — corrected below by resize_terminals() using the
@@ -1431,6 +1439,49 @@ impl App {
                 Task::none()
             }
 
+            Message::SettingsWorkerHarness(h) => {
+                let task = Self::ensure_models(state, &h);
+                state.config.worker.harness = h;
+                // Clear the model — ids from one harness must not leak into
+                // another's launch command.
+                state.config.worker.model = None;
+                state.settings.worker_custom = None;
+                if let Err(e) = state.config.save() {
+                    tracing::warn!("failed to save worker harness: {e}");
+                }
+                task
+            }
+
+            Message::SettingsWorkerModel(v) => {
+                if v == crate::models::CUSTOM_SENTINEL {
+                    state.settings.worker_custom =
+                        Some(state.config.worker.model.clone().unwrap_or_default());
+                    return Task::none();
+                }
+                state.settings.worker_custom = None;
+                state.config.worker.model = Some(v);
+                if let Err(e) = state.config.save() {
+                    tracing::warn!("failed to save worker model: {e}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsWorkerCustomModel(v) => {
+                state.settings.worker_custom = Some(v);
+                Task::none()
+            }
+
+            Message::SettingsWorkerCustomCommit => {
+                if let Some(v) = state.settings.worker_custom.take() {
+                    let t = v.trim();
+                    state.config.worker.model = (!t.is_empty()).then(|| t.to_string());
+                    if let Err(e) = state.config.save() {
+                        tracing::warn!("failed to save worker model: {e}");
+                    }
+                }
+                Task::none()
+            }
+
             Message::BrainSelectEntry(id) => {
                 if let Some(e) = state.brain_view.entries.iter().find(|e| e.id == id) {
                     state.brain_view.markdown = iced::widget::markdown::parse(
@@ -2127,6 +2178,7 @@ mod tests {
             reattach_attempted: std::collections::HashSet::new(),
             next_client_generation: 0,
             model_lists:    HashMap::new(),
+            settings:       Default::default(),
             spawn_modal:    None,
             catalogue_modal: None,
             terminal_cols:  140,
@@ -3200,6 +3252,54 @@ mod tests {
             let (m, _) = m.update(Message::SettingsToggleHarness("claude-code".into()));
             assert!(m.config.registry().enabled_names().contains(&"claude-code".to_string()));
             assert!(m.config.harnesses.is_empty(), "inert toggle must not write config");
+        });
+    }
+
+    #[test]
+    fn worker_harness_change_persists_and_clears_model() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("worker_harness_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            let (m, _) = m.update(Message::SettingsWorkerModel("claude-haiku-4-5".into()));
+            let (m, _) = m.update(Message::SettingsToggleHarness("codex".into()));
+            let (m, _) = m.update(Message::SettingsWorkerHarness("codex".into()));
+            assert_eq!(m.config.worker.harness, "codex");
+            assert!(m.config.worker.model.is_none(), "stale model must not leak across harnesses");
+            let loaded = ninox_core::config::AppConfig::load().unwrap();
+            assert_eq!(loaded.worker.harness, "codex");
+            assert!(loaded.worker.model.is_none());
+        });
+    }
+
+    #[test]
+    fn worker_model_pick_persists_and_custom_commits() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("worker_model_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            let (m, _) = m.update(Message::SettingsWorkerModel("claude-haiku-4-5".into()));
+            assert_eq!(m.config.worker.model.as_deref(), Some("claude-haiku-4-5"));
+
+            // custom… opens the input (seeded with the current model)
+            // without touching config
+            let (m, _) = m.update(Message::SettingsWorkerModel(crate::models::CUSTOM_SENTINEL.into()));
+            assert_eq!(m.settings.worker_custom.as_deref(), Some("claude-haiku-4-5"));
+            assert_eq!(m.config.worker.model.as_deref(), Some("claude-haiku-4-5"));
+
+            // typing + commit writes and closes custom mode
+            let (m, _) = m.update(Message::SettingsWorkerCustomModel("my-model".into()));
+            let (m, _) = m.update(Message::SettingsWorkerCustomCommit);
+            assert_eq!(m.config.worker.model.as_deref(), Some("my-model"));
+            assert!(m.settings.worker_custom.is_none());
+            let loaded = ninox_core::config::AppConfig::load().unwrap();
+            assert_eq!(loaded.worker.model.as_deref(), Some("my-model"));
+
+            // committing a blank custom clears the model (harness default)
+            let (m, _) = m.update(Message::SettingsWorkerModel(crate::models::CUSTOM_SENTINEL.into()));
+            let (m, _) = m.update(Message::SettingsWorkerCustomModel("   ".into()));
+            let (m, _) = m.update(Message::SettingsWorkerCustomCommit);
+            assert!(m.config.worker.model.is_none());
         });
     }
 
