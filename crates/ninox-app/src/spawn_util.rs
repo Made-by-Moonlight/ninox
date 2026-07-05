@@ -212,3 +212,51 @@ mod tests {
         assert_eq!(expand_tilde("~other/proj"), "~other/proj");
     }
 }
+
+#[cfg(test)]
+mod persistence_probe {
+    use super::*;
+    use ninox_core::{config::AgentConfig, store::Store};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    /// End-to-end persistence probe — NOT part of the suite (`--ignored`).
+    /// Spawns a REAL interactive agent session through the exact app code
+    /// path, attaches+drops a client like the app quitting, then this test
+    /// process exits. The controller verifies from outside that the tmux
+    /// session survives. Cleanup is the controller's job (kill-session).
+    #[tokio::test]
+    #[ignore]
+    async fn spawn_probe() {
+        let store = Arc::new(Store::open(tempdir().unwrap().keep().join("p.db")).unwrap());
+        let engine = ninox_core::events::Engine::new(store);
+        let ws = tempdir().unwrap().keep().to_string_lossy().to_string();
+
+        let attach = spawn_interactive_session(
+            engine.clone(),
+            InteractiveSpawnParams {
+                session_id:      "fnd-probe".into(),
+                name:            "fnd-probe".into(),
+                workspace:       ws,
+                repo:            String::new(),
+                orchestrator_id: None,
+                agent:           AgentConfig::default(),
+                catalogue_path:  String::new(),
+                extra_env:       Vec::new(),
+                started_at:      0,
+            },
+        )
+        .await;
+        let argv = attach.expect("tmux create must succeed");
+
+        // Mirror the app: attach a hidden client, then drop it (Cmd-Q path).
+        let client = ninox_core::client::AttachedClient::spawn(
+            engine, "fnd-probe".into(), argv, 140, 40, 0,
+        )
+        .expect("attach");
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        drop(client);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // test process exits here — the "app" is gone.
+    }
+}
