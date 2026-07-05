@@ -6,7 +6,7 @@ use iced::{
 use crate::app::{App, BrainMode, Message};
 use crate::style::{
     dotted_rule, hard_shadow, heavy_frame, hline, micro_label, shadow_alpha, stamp, vline, MONO,
-    MONO_MEDIUM, SANS_BOLD, SERIF, SERIF_ITALIC, SERIF_MEDIUM,
+    MONO_MEDIUM, SANS, SANS_BOLD, SERIF, SERIF_ITALIC, SERIF_MEDIUM,
 };
 use crate::theme::ColorScheme;
 use ninox_core::BrainEntry;
@@ -147,6 +147,53 @@ pub fn preprocess_wikilinks(body: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Plain-text preview snippet for the pinboard hover-preview slip: the first
+/// `max_chars` characters of `body` with markdown noise lightly stripped —
+/// leading `#`/`##`/… ATX header lines dropped entirely, wikilinks reduced
+/// to readable text (`[[target|alias]]` → `alias`, `[[target]]` → `target`,
+/// mirroring `parse_wikilink_content`'s pipe split, minus its heading
+/// handling — a snippet has no use for `#section` anchors), and runs of
+/// whitespace (including the newlines left by dropped header lines)
+/// collapsed to single spaces. Stripping/collapsing happens before
+/// truncation so the `max_chars` cut lands in clean text, never mid-syntax;
+/// an ellipsis is appended only when the result was actually truncated.
+pub fn preview_snippet(body: &str, max_chars: usize) -> String {
+    let no_headers = body
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut stripped = String::with_capacity(no_headers.len());
+    let mut rest = no_headers.as_str();
+    while let Some(start) = rest.find("[[") {
+        stripped.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find("]]") {
+            Some(end) => {
+                let content = &after[..end];
+                let (target, display) = parse_wikilink_content(content);
+                stripped.push_str(if content.contains('|') { &display } else { &target });
+                rest = &after[end + 2..];
+            }
+            None => {
+                stripped.push_str("[[");
+                rest = after;
+            }
+        }
+    }
+    stripped.push_str(rest);
+
+    let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if collapsed.chars().count() <= max_chars {
+        collapsed
+    } else {
+        let truncated: String = collapsed.chars().take(max_chars).collect();
+        format!("{}…", truncated.trim_end())
+    }
 }
 
 /// Does `link` refer to `entry`? Match on name, full id, or id stem.
@@ -385,6 +432,44 @@ pub fn brain_panel(app: &App) -> Element<'_, Message> {
         .into()
 }
 
+/// Fixed-position hover preview slip (mockup `.bpreview`): shown at the
+/// bottom-right of the pinboard whenever a node is hovered, regardless of
+/// where the cursor actually is (per the mockup, it does not follow the
+/// cursor). 240px wide, `paper_2` background, 1.5px ink border, radius 2,
+/// hard 3×3 card-tier shadow. Mockup applies `transform: rotate(1deg)` —
+/// iced can't rotate widgets (see `stamp()`'s note on the same limitation),
+/// so the slip renders unrotated; accepted deviation.
+fn hover_preview_slip<'a>(s: &'a ColorScheme, entry: &'a BrainEntry) -> Element<'a, Message> {
+    let (card_a, _, _) = shadow_alpha(s);
+
+    let micro = text(format!("● {} — {}", entry.entry_type, entry.id).to_uppercase())
+        .size(8.5)
+        .font(SANS_BOLD)
+        .color(category_color(s, &entry.entry_type));
+    let name = text(entry.name.clone()).size(16).font(SERIF_MEDIUM).color(s.ink);
+    let snippet = text(preview_snippet(&entry.body, 160)).size(11).font(SANS).color(s.ink_2);
+
+    let slip = container(
+        column![micro, Space::new(0, 5), name, Space::new(0, 4), snippet],
+    )
+    .width(Length::Fixed(240.0))
+    .padding([12, 14])
+    .style(move |_theme| container::Style {
+        background: Some(Background::Color(s.paper_2)),
+        border: Border { color: s.ink, width: 1.5, radius: 2.0.into() },
+        shadow: hard_shadow(s, 3.0, 3.0, card_a),
+        ..Default::default()
+    });
+
+    container(slip)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::End)
+        .align_y(Alignment::End)
+        .padding([14, 14])
+        .into()
+}
+
 /// Pinboard placeholder: taxonomy rail (volume plate + category counts)
 /// beside an empty heavy frame — the specimen-board canvas lands in Task 13.
 fn pinboard_body(app: &App) -> Element<'_, Message> {
@@ -426,10 +511,23 @@ fn pinboard_body(app: &App) -> Element<'_, Message> {
         ..Default::default()
     });
 
-    let board = container(super::brain_pinboard::pinboard_canvas(app))
+    let board_frame = container(super::brain_pinboard::pinboard_canvas(app))
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| crate::style::heavy_frame(s));
+
+    // Hovered id may no longer exist (a reindex/catalogue switch can drop or
+    // rename entries out from under a stale hover) — resolve defensively and
+    // simply skip the slip rather than panicking or showing stale content.
+    let hovered_entry = app
+        .brain_view
+        .hovered
+        .as_deref()
+        .and_then(|id| app.brain_view.entries.iter().find(|e| e.id == id));
+    let board: Element<Message> = match hovered_entry {
+        Some(e) => iced::widget::stack![board_frame, hover_preview_slip(s, e)].into(),
+        None => board_frame.into(),
+    };
 
     row![rail, board]
         .spacing(16)
@@ -881,5 +979,58 @@ mod tests {
         ];
         let cats = categories(&all);
         assert_eq!(cats, vec![("symbols".to_string(), 2), ("errors".to_string(), 1)]);
+    }
+
+    #[test]
+    fn preview_snippet_drops_leading_header_lines() {
+        assert_eq!(
+            preview_snippet("# Title\n\nRing buffer behind terminal pane.", 200),
+            "Ring buffer behind terminal pane."
+        );
+    }
+
+    #[test]
+    fn preview_snippet_drops_multiple_header_levels_anywhere_in_the_body() {
+        assert_eq!(
+            preview_snippet("## Overview\nFirst line.\n### Details\nSecond line.", 200),
+            "First line. Second line."
+        );
+    }
+
+    #[test]
+    fn preview_snippet_reduces_aliased_wikilinks_to_the_alias() {
+        assert_eq!(
+            preview_snippet("Ring buffer behind [[TerminalPane|the pane]]; frames align.", 200),
+            "Ring buffer behind the pane; frames align."
+        );
+    }
+
+    #[test]
+    fn preview_snippet_reduces_bare_wikilinks_to_the_target() {
+        assert_eq!(
+            preview_snippet("Owned by [[ScrollbackBuffer]] exclusively.", 200),
+            "Owned by ScrollbackBuffer exclusively."
+        );
+    }
+
+    #[test]
+    fn preview_snippet_collapses_whitespace() {
+        assert_eq!(preview_snippet("a\n\n  b\t\tc   d", 200), "a b c d");
+    }
+
+    #[test]
+    fn preview_snippet_truncates_with_ellipsis_when_over_max_chars() {
+        let body = "a".repeat(200);
+        let snippet = preview_snippet(&body, 160);
+        assert_eq!(snippet.chars().count(), 161); // 160 chars + the ellipsis char
+        assert!(snippet.ends_with('…'));
+        assert_eq!(&snippet[..160], "a".repeat(160).as_str());
+    }
+
+    #[test]
+    fn preview_snippet_leaves_short_text_untouched_without_ellipsis() {
+        let snippet = preview_snippet("short body", 160);
+        assert_eq!(snippet, "short body");
+        assert!(!snippet.ends_with('…'));
     }
 }

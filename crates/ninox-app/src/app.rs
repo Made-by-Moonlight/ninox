@@ -51,6 +51,12 @@ pub struct BrainViewState {
     pub entries:  Vec<BrainEntry>,
     pub loaded:   bool,
     pub selected: Option<String>,
+    /// Entry id under the cursor on the pinboard canvas, if any — drives the
+    /// bottom-right hover preview slip. Reset on catalogue/mode switch since
+    /// a stale hover from a since-gone view makes no sense; resolution
+    /// against `entries` is defensive elsewhere (reindex can also drop the
+    /// hovered id without going through either reset path).
+    pub hovered:  Option<String>,
     pub filter:   String,
     pub mode:         BrainMode,
     pub open_drawers: std::collections::HashSet<String>,
@@ -190,6 +196,9 @@ pub enum Message {
     NavigatePrList,
     NavigateBrain,
     BrainSelectEntry(String),
+    /// The pinboard canvas's hovered node changed (including to/from `None`)
+    /// — emitted only on change, never on every mouse move.
+    BrainHoverEntry(Option<String>),
     BrainFilterQuery(String),
     BrainReindex,
     BrainSetMode(BrainMode),
@@ -1275,6 +1284,11 @@ impl App {
                 Task::none()
             }
 
+            Message::BrainHoverEntry(id) => {
+                state.brain_view.hovered = id;
+                Task::none()
+            }
+
             Message::BrainFilterQuery(query) => {
                 state.brain_view.filter = query;
                 Task::none()
@@ -1297,6 +1311,7 @@ impl App {
 
             Message::BrainSetMode(m) => {
                 state.brain_view.mode = m;
+                state.brain_view.hovered = None;
                 Task::none()
             }
 
@@ -1338,6 +1353,7 @@ impl App {
                             state.brain = Arc::new(new_brain);
                             state.active_catalogue = idx;
                             state.brain_view.selected = None;
+                            state.brain_view.hovered = None;
                             state.brain_view.markdown.clear();
                             state.brain_view.open_drawers.clear();
                             state.brain_view.loaded = false;
@@ -2294,6 +2310,27 @@ mod tests {
     }
 
     #[test]
+    fn hover_entry_sets_and_clears_hovered() {
+        let e = test_engine();
+        let m = base(e);
+        assert_eq!(m.brain_view.hovered, None);
+        let (m2, _) = m.update(Message::BrainHoverEntry(Some("symbols/x.md".into())));
+        assert_eq!(m2.brain_view.hovered.as_deref(), Some("symbols/x.md"));
+        let (m3, _) = m2.update(Message::BrainHoverEntry(None));
+        assert_eq!(m3.brain_view.hovered, None);
+    }
+
+    #[test]
+    fn switching_mode_clears_hovered() {
+        let e = test_engine();
+        let m = base(e);
+        let (m2, _) = m.update(Message::BrainHoverEntry(Some("symbols/x.md".into())));
+        assert_eq!(m2.brain_view.hovered.as_deref(), Some("symbols/x.md"));
+        let (m3, _) = m2.update(Message::BrainSetMode(BrainMode::Catalogue));
+        assert_eq!(m3.brain_view.hovered, None);
+    }
+
+    #[test]
     fn switching_catalogue_resets_selection_and_active_index() {
         let dir_a = tempdir().unwrap().keep();
         std::fs::create_dir_all(dir_a.join("symbols")).unwrap();
@@ -2319,10 +2356,13 @@ mod tests {
         let (app, _) = app.update(Message::NavigateBrain);
         let (app, _) = app.update(Message::BrainSelectEntry("symbols/a.md".into()));
         assert_eq!(app.brain_view.selected.as_deref(), Some("symbols/a.md"));
+        let (app, _) = app.update(Message::BrainHoverEntry(Some("symbols/a.md".into())));
+        assert_eq!(app.brain_view.hovered.as_deref(), Some("symbols/a.md"));
 
         let (app, _) = app.update(Message::BrainSwitchCatalogue(1));
         assert_eq!(app.active_catalogue, 1);
         assert_eq!(app.brain_view.selected, None);
+        assert_eq!(app.brain_view.hovered, None);
         assert!(app.brain_view.markdown.is_empty());
         assert!(app.brain_view.open_drawers.is_empty());
         assert_eq!(app.brain_view.entries.len(), 1);

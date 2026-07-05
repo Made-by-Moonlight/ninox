@@ -37,7 +37,9 @@ fn hash01(s: &str, salt: u64) -> f32 {
 }
 
 /// The pinboard canvas program. Borrows `App` for the duration of a single
-/// `view()` call; holds no mutable state of its own (`State = ()`).
+/// `view()` call; its only mutable state is [`PinboardState`]'s hover
+/// selection (node positions are still re-derived from bounds every frame,
+/// never cached).
 pub struct Pinboard<'a> {
     pub app: &'a App,
 }
@@ -79,6 +81,32 @@ impl<'a> Pinboard<'a> {
     }
 }
 
+/// The pinboard canvas `Program`'s interaction state: which node (if any)
+/// the cursor is currently hovering. Mutated in `update()` and read back in
+/// `draw()` (to render the hover ring) and `mouse_interaction()` (to switch
+/// to a pointer cursor) — node positions themselves stay re-derived from
+/// bounds every frame (see module docs), only the hover *selection* persists.
+#[derive(Default)]
+pub struct PinboardState {
+    hovered: Option<String>,
+}
+
+/// Nearest node to `pos`, if within `r + 6` of it — the shared hit-test
+/// tolerance for both click-to-select (`update`'s `ButtonPressed`) and
+/// hover-preview detection (`update`'s `CursorMoved`), so hovering and
+/// clicking always agree on which node is "under" the cursor.
+fn hit_test(nodes: &[Node], pos: Point) -> Option<String> {
+    nodes
+        .iter()
+        .min_by(|a, b| {
+            let da = (a.x - pos.x).hypot(a.y - pos.y);
+            let db = (b.x - pos.x).hypot(b.y - pos.y);
+            da.partial_cmp(&db).unwrap()
+        })
+        .filter(|n| (n.x - pos.x).hypot(n.y - pos.y) < n.r + 6.0)
+        .map(|n| n.id.clone())
+}
+
 /// Undirected dedup key for the edge between node indices `a` and `b`:
 /// order-independent, so a mutual pair of wikilinks (A -> B and B -> A)
 /// collapses to a single key instead of being stroked twice.
@@ -97,11 +125,11 @@ fn node_radius(link_count: f32) -> f32 {
 }
 
 impl<'a> canvas::Program<Message> for Pinboard<'a> {
-    type State = ();
+    type State = PinboardState;
 
     fn draw(
         &self,
-        _state: &(),
+        state: &PinboardState,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
@@ -166,6 +194,15 @@ impl<'a> canvas::Program<Message> for Pinboard<'a> {
                     Stroke::default().with_color(s.accent).with_width(1.2),
                 );
             }
+            // Hover ring: full-alpha ink, +3px — deliberately narrower and a
+            // different color from the +4px vermilion search-hit ring above
+            // so the two states never read as the same thing.
+            if state.hovered.as_deref() == Some(n.id.as_str()) {
+                frame.stroke(
+                    &Path::circle(Point::new(n.x, n.y), n.r + 3.0),
+                    Stroke::default().with_color(Color { a: 1.0, ..s.ink }).with_width(1.4),
+                );
+            }
         }
 
         vec![frame.into_geometry()]
@@ -173,30 +210,51 @@ impl<'a> canvas::Program<Message> for Pinboard<'a> {
 
     fn update(
         &self,
-        _state: &mut (),
+        state: &mut PinboardState,
         event: canvas::Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> (canvas::event::Status, Option<Message>) {
-        if let canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
-            if let Some(pos) = cursor.position_in(bounds) {
-                let local_bounds = Rectangle { x: 0.0, y: 0.0, ..bounds };
-                let nodes = self.nodes(local_bounds);
-                if let Some(n) = nodes.iter().min_by(|a, b| {
-                    let da = (a.x - pos.x).hypot(a.y - pos.y);
-                    let db = (b.x - pos.x).hypot(b.y - pos.y);
-                    da.partial_cmp(&db).unwrap()
-                }) {
-                    if (n.x - pos.x).hypot(n.y - pos.y) < n.r + 6.0 {
-                        return (
-                            canvas::event::Status::Captured,
-                            Some(Message::BrainSelectEntry(n.id.clone())),
-                        );
+        match event {
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if let Some(pos) = cursor.position_in(bounds) {
+                    let local_bounds = Rectangle { x: 0.0, y: 0.0, ..bounds };
+                    let nodes = self.nodes(local_bounds);
+                    if let Some(id) = hit_test(&nodes, pos) {
+                        return (canvas::event::Status::Captured, Some(Message::BrainSelectEntry(id)));
                     }
                 }
             }
+            // `CursorLeft` fires when the cursor exits the *window*, which
+            // `position_in` alone wouldn't catch; folded into the same
+            // handling as `CursorMoved` (whose `position_in` already goes
+            // `None` once the cursor leaves just this canvas's bounds) so
+            // both paths converge on one hover-state update.
+            canvas::Event::Mouse(mouse::Event::CursorMoved { .. } | mouse::Event::CursorLeft) => {
+                let local_bounds = Rectangle { x: 0.0, y: 0.0, ..bounds };
+                let nodes = self.nodes(local_bounds);
+                let hovered = cursor.position_in(bounds).and_then(|pos| hit_test(&nodes, pos));
+                if hovered != state.hovered {
+                    state.hovered = hovered.clone();
+                    return (canvas::event::Status::Ignored, Some(Message::BrainHoverEntry(hovered)));
+                }
+            }
+            _ => {}
         }
         (canvas::event::Status::Ignored, None)
+    }
+
+    fn mouse_interaction(
+        &self,
+        state: &PinboardState,
+        _bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        if state.hovered.is_some() {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::default()
+        }
     }
 }
 
@@ -237,6 +295,24 @@ mod tests {
         assert_eq!(node_radius(0.0), 3.0);
         assert_eq!(node_radius(100.0), 9.0);
         assert!(node_radius(2.0) > 3.0 && node_radius(2.0) < 9.0);
+    }
+
+    #[test]
+    fn hit_test_picks_nearest_node_within_tolerance() {
+        let nodes = vec![
+            Node { x: 10.0, y: 10.0, r: 4.0, color: Color::BLACK, hit: false, id: "a".into() },
+            Node { x: 100.0, y: 100.0, r: 4.0, color: Color::BLACK, hit: false, id: "b".into() },
+        ];
+        assert_eq!(hit_test(&nodes, Point::new(11.0, 11.0)), Some("a".to_string()));
+        assert_eq!(hit_test(&nodes, Point::new(99.0, 101.0)), Some("b".to_string()));
+    }
+
+    #[test]
+    fn hit_test_returns_none_outside_tolerance() {
+        let nodes =
+            vec![Node { x: 10.0, y: 10.0, r: 4.0, color: Color::BLACK, hit: false, id: "a".into() }];
+        // r + 6 == 10, so a point 11px away misses.
+        assert_eq!(hit_test(&nodes, Point::new(21.0, 10.0)), None);
     }
 
     #[test]
