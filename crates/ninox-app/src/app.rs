@@ -138,6 +138,10 @@ pub struct App {
     /// race, or was superseded by a fresh NavigateSession) apart from the
     /// currently-live client for the same session_id.
     next_client_generation: u64,
+    /// Per-app-run `models_cmd` discovery cache, keyed by harness name.
+    /// `Some(None)` = attempted and failed (pickers fall through to the
+    /// spec's known_models); absent = not attempted yet.
+    pub model_lists:     HashMap<String, Option<Vec<String>>>,
     pub spawn_modal:     Option<SpawnForm>,
     /// Add-a-catalogue journal-entry modal, opened from the `+` at the
     /// right edge of the brain view's volume plate. Exclusive with
@@ -234,6 +238,9 @@ pub enum Message {
         top_reached: bool,
     },
     OpenUrl(String),
+    /// `models_cmd` discovery finished for a harness (`None` = failed —
+    /// cached so pickers fall through to known_models without retrying).
+    ModelListLoaded { harness: String, models: Option<Vec<String>> },
     Noop,
 }
 
@@ -335,6 +342,7 @@ impl App {
             clients:        HashMap::new(),
             reattach_attempted: std::collections::HashSet::new(),
             next_client_generation: 0,
+            model_lists:    HashMap::new(),
             spawn_modal:    None,
             catalogue_modal: None,
             // Placeholders — corrected below by resize_terminals() using the
@@ -416,6 +424,22 @@ impl App {
     /// tmux pane needs resizing to match — callers decide whether/when to
     /// do that (e.g. immediately for a window resize, or once at
     /// drag-release rather than every frame).
+    /// Kick off `models_cmd` discovery for a harness (cached per app run —
+    /// including failures, which fall through to known_models).
+    fn ensure_models(state: &App, harness: &str) -> Task<Message> {
+        if state.model_lists.contains_key(harness) {
+            return Task::none();
+        }
+        let Some(cmd) = state.config.registry().spec(harness).models_cmd else {
+            return Task::none();
+        };
+        let h = harness.to_string();
+        Task::future(async move {
+            let models = crate::models::run_models_cmd(cmd).await;
+            Message::ModelListLoaded { harness: h, models }
+        })
+    }
+
     fn resize_terminals(state: &mut Self) -> Vec<(SessionId, u16, u16)> {
         use crate::components::session_detail::{TERM_CHROME_H, TERM_CHROME_W};
 
@@ -635,8 +659,9 @@ impl App {
                             && p.model.map(str::to_string) == state.orchestrator_agent.model
                     })
                     .unwrap_or(0);
+                let harness = state.orchestrator_agent.harness.clone();
                 state.spawn_modal = Some(SpawnForm { agent_idx, ..SpawnForm::default() });
-                Task::none()
+                Self::ensure_models(state, &harness)
             }
 
             Message::SpawnFormName(v) => {
@@ -1542,6 +1567,11 @@ impl App {
                 Task::none()
             }
 
+            Message::ModelListLoaded { harness, models } => {
+                state.model_lists.insert(harness, models);
+                Task::none()
+            }
+
             Message::Noop => Task::none(),
         }
     }
@@ -2011,6 +2041,7 @@ mod tests {
             clients:        HashMap::new(),
             reattach_attempted: std::collections::HashSet::new(),
             next_client_generation: 0,
+            model_lists:    HashMap::new(),
             spawn_modal:    None,
             catalogue_modal: None,
             terminal_cols:  140,
@@ -2023,6 +2054,20 @@ mod tests {
             fleet_filter:    FleetFilter::default(),
             last_fleet_scope: None,
         }
+    }
+
+    #[test]
+    fn model_list_loaded_populates_cache() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::ModelListLoaded {
+            harness: "opencode".into(),
+            models:  Some(vec!["a".into()]),
+        });
+        assert_eq!(m.model_lists.get("opencode"), Some(&Some(vec!["a".to_string()])));
+        // A failed discovery is cached too — pickers fall through to
+        // known_models without retrying every render.
+        let (m, _) = m.update(Message::ModelListLoaded { harness: "aider".into(), models: None });
+        assert_eq!(m.model_lists.get("aider"), Some(&None));
     }
 
     #[test]

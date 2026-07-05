@@ -1,6 +1,7 @@
 mod app;
 mod components;
 mod input;
+mod models;
 mod spawn_util;
 mod style;
 mod theme;
