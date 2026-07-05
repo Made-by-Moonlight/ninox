@@ -1,8 +1,11 @@
 mod app;
 mod components;
 mod input;
+mod spawn_util;
+mod style;
 mod theme;
 
+use spawn_util::{create_worker_worktree, repo_from_workspace};
 use ninox_core::{
     config::{AgentConfig, AppConfig},
     events::Engine,
@@ -177,12 +180,11 @@ async fn run_spawn(
              **Goal:** complete the task and open a pull request.\n\n\
              To message the orchestrator (e.g. when stuck or when the PR is open):\n\
              ```bash\n\
-             {bin} send {orch_id} \"<your message>\"\n\
+             ninox send {orch_id} \"<your message>\"\n\
              ```\n\
              Report back when: (a) you are blocked and need a decision, \
              or (b) the PR is open and the task is done.",
             orch_id = orch_id_env,
-            bin = ninox_bin_str,
         ));
     }
 
@@ -215,17 +217,58 @@ async fn run_spawn(
         cmd_base,
     );
 
-    let mut env_vec: Vec<(&str, &str)> = vec![
-        ("ATHENE_SESSION",  &id),
-        ("ATHENE_DATA_DIR", &sessions_dir_str),
-    ];
-    if !orch_id_env.is_empty() {
-        env_vec.push(("NINOX_ORCHESTRATOR_ID", &orch_id_env));
-    }
+    // A fresh tmux session does *not* inherit the caller's ambient
+    // environment — only vars explicitly passed via `-e` (see
+    // `tmux::create_session`) or already tracked in the server's global
+    // environment (seeded once, from whichever process first started the
+    // server). Since `run_spawn` is normally invoked (as `ninox spawn`) from
+    // *inside* an orchestrator's own tmux session — one that itself was
+    // launched with NINOX_BRAIN/NINOX_CONFIG via `-e` by
+    // `spawn_util::spawn_interactive_session` — those vars are present in
+    // this process's own env and must be forwarded explicitly, or the
+    // spawned worker loses brain/config access entirely.
+    let ninox_brain_env = std::env::var("NINOX_BRAIN").ok();
+    let ninox_config_env = std::env::var("NINOX_CONFIG").ok();
+
+    let env_vec = worker_env_vars(
+        &id,
+        &sessions_dir_str,
+        &orch_id_env,
+        ninox_brain_env.as_deref(),
+        ninox_config_env.as_deref(),
+    );
     tmux::create_session(&id, &effective_workspace, &cmd, &env_vec).await?;
 
     Ok(())
 }
+
+/// The tmux env for a spawned worker: always the session id + data dir, plus
+/// whichever of orchestrator id / brain path / config path are actually
+/// present (an empty `orch_id` or `None` env value is omitted rather than
+/// forwarded as an empty string).
+fn worker_env_vars<'a>(
+    id: &'a str,
+    sessions_dir: &'a str,
+    orch_id: &'a str,
+    ninox_brain: Option<&'a str>,
+    ninox_config: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut env_vec: Vec<(&str, &str)> = vec![
+        ("ATHENE_SESSION",  id),
+        ("ATHENE_DATA_DIR", sessions_dir),
+    ];
+    if !orch_id.is_empty() {
+        env_vec.push(("NINOX_ORCHESTRATOR_ID", orch_id));
+    }
+    if let Some(v) = ninox_brain {
+        env_vec.push(("NINOX_BRAIN", v));
+    }
+    if let Some(v) = ninox_config {
+        env_vec.push(("NINOX_CONFIG", v));
+    }
+    env_vec
+}
+
 
 async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
     let config = AppConfig::load().unwrap_or_default();
@@ -325,35 +368,33 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
 
     const SYMBOLS_NERD_FONT_MONO: &[u8] =
         include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
+    const FONT_NEWSREADER: &[u8] =
+        include_bytes!("../assets/fonts/Newsreader[opsz,wght].ttf");
+    const FONT_NEWSREADER_ITALIC: &[u8] =
+        include_bytes!("../assets/fonts/Newsreader-Italic[opsz,wght].ttf");
+    const FONT_ARCHIVO: &[u8] =
+        include_bytes!("../assets/fonts/Archivo[wdth,wght].ttf");
+    const FONT_SPLINE_SANS_MONO: &[u8] =
+        include_bytes!("../assets/fonts/SplineSansMono[wght].ttf");
 
     iced::application("Ninox", app::App::iced_update, app::App::iced_view)
         .subscription(app::App::subscription)
         .theme(app::App::theme)
         .window(window_settings)
         .font(SYMBOLS_NERD_FONT_MONO)
+        .font(FONT_NEWSREADER)
+        .font(FONT_NEWSREADER_ITALIC)
+        .font(FONT_ARCHIVO)
+        .font(FONT_SPLINE_SANS_MONO)
         .font(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf").as_slice())
         .font(include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf").as_slice())
         .font(include_bytes!("../assets/fonts/JetBrainsMono-Italic.ttf").as_slice())
         .font(include_bytes!("../assets/fonts/JetBrainsMono-BoldItalic.ttf").as_slice())
+        .default_font(iced::Font::with_name("Archivo"))
         .run_with(move || app::App::new(engine, orchestrator_root, orchestrator_agent, brain))?;
 
     token.cancel();
     Ok(())
-}
-
-/// Read `git remote get-url origin` from the workspace and parse it as a
-/// GitHub slug (`owner/repo`). Returns `None` if git fails or the URL is not
-/// a recognisable GitHub remote.
-fn repo_from_workspace(workspace: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["-C", workspace, "remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    ninox_core::github::split_repo(&url).map(|(o, r)| format!("{o}/{r}"))
 }
 
 fn default_db_path() -> PathBuf {
@@ -374,46 +415,25 @@ fn has_display() -> bool {
     { std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok() }
 }
 
-/// Create an isolated git worktree for a worker session at
-/// `{repo}/.claude/worktrees/{session_id}` on a new branch `{session_id}`.
-///
-/// Returns the worktree path on success. If the branch name already exists
-/// (e.g. a previous run with the same name), the existing branch is checked
-/// out rather than creating a new one.
-async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Result<String> {
-    use tokio::process::Command;
-    use anyhow::Context as _;
+#[cfg(test)]
+mod worker_env_tests {
+    use super::worker_env_vars;
 
-    let worktree_path = std::path::Path::new(repo)
-        .join(".claude")
-        .join("worktrees")
-        .join(session_id);
-    let worktree_str = worktree_path.to_string_lossy().to_string();
-
-    // Attempt 1: create a fresh branch named after the session.
-    let out = Command::new("git")
-        .args(["-C", repo, "worktree", "add", &worktree_str, "-b", session_id])
-        .output()
-        .await
-        .context("git worktree add")?;
-
-    if out.status.success() {
-        return Ok(worktree_str);
+    #[test]
+    fn forwards_brain_and_config_when_present() {
+        let env = worker_env_vars("w1", "/data", "orch1", Some("/brain.db"), Some("/cfg.toml"));
+        assert!(env.contains(&("NINOX_ORCHESTRATOR_ID", "orch1")));
+        assert!(env.contains(&("NINOX_BRAIN", "/brain.db")));
+        assert!(env.contains(&("NINOX_CONFIG", "/cfg.toml")));
+        assert!(env.contains(&("ATHENE_SESSION", "w1")));
+        assert!(env.contains(&("ATHENE_DATA_DIR", "/data")));
     }
 
-    // Attempt 2: branch already exists — check it out without -b.
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if stderr.contains("already exists") {
-        let out2 = Command::new("git")
-            .args(["-C", repo, "worktree", "add", &worktree_str, session_id])
-            .output()
-            .await
-            .context("git worktree add (existing branch)")?;
-        if out2.status.success() {
-            return Ok(worktree_str);
-        }
-        anyhow::bail!("{}", String::from_utf8_lossy(&out2.stderr).trim());
+    #[test]
+    fn omits_brain_config_and_orchestrator_id_when_absent() {
+        let env = worker_env_vars("w1", "/data", "", None, None);
+        assert!(!env.iter().any(|(k, _)| *k == "NINOX_ORCHESTRATOR_ID"));
+        assert!(!env.iter().any(|(k, _)| *k == "NINOX_BRAIN"));
+        assert!(!env.iter().any(|(k, _)| *k == "NINOX_CONFIG"));
     }
-
-    anyhow::bail!("{}", stderr.trim());
 }

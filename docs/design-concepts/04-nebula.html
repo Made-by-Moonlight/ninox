@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ninox — Concept 04 · Nebula</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@500;600;700;800&family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   CONCEPT 04 — NEBULA
+   The whole app adrift in a violet nebula: glassmorphic panels
+   floating over drifting cloud layers and starfield. The Brain
+   is the hero view; Fleet, Session, and PRs share the sky.
+   Display: Syne · Data: JetBrains Mono
+   ============================================================ */
+:root{
+  --bg:#0b0918;
+  --panel:rgba(24,20,48,.62);
+  --panel-hi:rgba(34,28,66,.72);
+  --line:rgba(146,126,220,.22);
+  --line-hi:rgba(176,156,255,.45);
+  --text:#eae6ff;
+  --text-2:#a89fd6;
+  --muted:#6a6199;
+  --violet:#a78bfa;
+  --lilac:#c4b5fd;
+  --s-working:#6ee7a8;
+  --s-propen:#7cc4ff;
+  --s-cifail:#ff6b8a;
+  --s-review:#ffd479;
+  --s-merge:#c99aff;
+  --s-done:#6b6690;
+  --c-repo:#7cc4ff;
+  --c-symbol:#6ee7a8;
+  --c-concept:#ffd479;
+  --c-pattern:#ff9ee8;
+  --c-decision:#ffab7c;
+  --c-arch:#b39bff;
+  --c-error:#ff6b8a;
+  --c-rel:#8be8e0;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
+body{
+  background:var(--bg);color:var(--text);
+  font-family:"JetBrains Mono",monospace;font-size:12px;overflow:hidden;
+}
+/* ---- the nebula: layered drifting clouds + stars ---- */
+.nebula{position:fixed;inset:-20%;z-index:0;pointer-events:none}
+.cloud{position:absolute;border-radius:50%;filter:blur(70px);opacity:.55;mix-blend-mode:screen}
+.c1{width:60vw;height:44vh;left:2%;top:6%;
+  background:radial-gradient(closest-side,#4c3a8f,#2c2160 55%,transparent);
+  animation:drift1 46s ease-in-out infinite alternate}
+.c2{width:52vw;height:50vh;right:-4%;top:30%;
+  background:radial-gradient(closest-side,#6d55b8,#3a2a78 55%,transparent);
+  animation:drift2 58s ease-in-out infinite alternate;opacity:.42}
+.c3{width:46vw;height:40vh;left:26%;bottom:-6%;
+  background:radial-gradient(closest-side,#8a6fd0,#4a3690 50%,transparent);
+  animation:drift1 72s ease-in-out infinite alternate-reverse;opacity:.35}
+.c4{width:30vw;height:26vh;left:52%;top:2%;
+  background:radial-gradient(closest-side,#b18ae0,#5c3f9e 55%,transparent);
+  animation:drift2 39s ease-in-out infinite alternate-reverse;opacity:.28}
+@keyframes drift1{to{transform:translate(6vw,3vh) scale(1.12)}}
+@keyframes drift2{to{transform:translate(-5vw,-3vh) scale(1.08)}}
+#stars{position:fixed;inset:0;z-index:1;pointer-events:none}
+body::after{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:2;opacity:.045;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+.app{position:relative;z-index:3;display:flex;flex-direction:column;height:100vh}
+
+/* ---------- top bar ---------- */
+.top{
+  display:flex;align-items:center;gap:14px;padding:11px 20px;
+  border-bottom:1px solid var(--line);background:rgba(16,13,34,.55);backdrop-filter:blur(14px);
+}
+.brand{display:flex;align-items:center;gap:10px}
+.brand .hex{color:var(--lilac);font-size:17px;text-shadow:0 0 14px var(--violet)}
+.brand b{font-family:"Syne",sans-serif;font-weight:800;font-size:15px;letter-spacing:.06em}
+.brand b i{font-style:normal;color:var(--violet)}
+.nav{display:flex;gap:4px;margin-left:14px}
+.nav button{
+  padding:6px 16px;border-radius:20px;border:1px solid transparent;background:none;
+  color:var(--text-2);font-family:"Syne",sans-serif;font-size:11.5px;font-weight:600;cursor:pointer;
+  display:flex;align-items:center;gap:7px;
+}
+.nav button .k{font-family:"JetBrains Mono",monospace;font-size:8.5px;color:var(--muted);
+  border:1px solid var(--line);border-radius:4px;padding:0 4px}
+.nav button:hover{color:var(--text)}
+.nav button.on{
+  color:var(--text);border-color:var(--line-hi);background:rgba(167,139,250,.13);
+  box-shadow:0 0 18px rgba(167,139,250,.18);
+}
+.gsearch{
+  margin-left:auto;display:flex;align-items:center;gap:9px;min-width:260px;
+  border:1px solid var(--line);border-radius:20px;padding:6px 14px;
+  background:rgba(10,8,24,.5);color:var(--muted);
+}
+.gsearch b{color:var(--text)}
+.kbd{border:1px solid var(--line);border-radius:4px;padding:0 5px;font-size:9px;color:var(--muted)}
+.bell{position:relative;border:1px solid var(--line);background:rgba(10,8,24,.5);color:var(--text-2);
+  width:32px;height:32px;border-radius:50%;cursor:pointer;font-size:13px}
+.bell:hover{border-color:var(--line-hi);color:var(--lilac)}
+.bell .n{position:absolute;top:-4px;right:-4px;background:var(--s-cifail);color:#fff;font-size:8.5px;
+  min-width:15px;height:15px;border-radius:8px;display:grid;place-items:center;font-weight:700}
+
+/* ---------- attention ribbon ---------- */
+.ribbon{
+  display:flex;align-items:center;gap:12px;padding:7px 20px;font-size:11.5px;color:#ffc4d1;
+  background:linear-gradient(90deg,rgba(255,107,138,.16),rgba(255,107,138,.03));
+  border-bottom:1px solid rgba(255,107,138,.3);backdrop-filter:blur(10px);
+}
+.ribbon .sig{width:8px;height:8px;border-radius:50%;background:var(--s-cifail);
+  box-shadow:0 0 10px var(--s-cifail);animation:pulse 1.2s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.3}}
+.ribbon b{color:var(--s-cifail)}
+.ribbon .go{margin-left:auto;color:var(--s-cifail);cursor:pointer;font-size:10.5px;letter-spacing:.08em}
+
+/* ---------- views ---------- */
+.stage{flex:1;display:flex;min-height:0;position:relative}
+.view{display:none;flex:1;min-height:0;flex-direction:column}
+.view.on{display:flex}
+.pagebar{display:flex;align-items:center;gap:16px;padding:16px 22px 10px}
+.pagebar h1{font-family:"Syne",sans-serif;font-size:21px;font-weight:700;letter-spacing:.01em}
+.pagebar h1 span{color:var(--violet)}
+.count{margin-left:auto;font-size:10.5px;color:var(--muted);letter-spacing:.08em}
+.count b{color:var(--text-2)}
+
+/* fleet */
+.board{flex:1;display:flex;gap:14px;overflow-x:auto;padding:8px 22px 22px;align-items:flex-start}
+.col{min-width:238px;width:238px;flex:none}
+.col-head{display:flex;align-items:center;gap:9px;padding:9px 12px;margin-bottom:10px;
+  border:1px solid var(--line);border-radius:22px;background:var(--panel);backdrop-filter:blur(12px)}
+.col-head h2{font-family:"Syne",sans-serif;font-size:12.5px;font-weight:700}
+.col-head .n{margin-left:auto;font-size:9.5px;color:var(--muted)}
+.dot{width:8px;height:8px;border-radius:50%;flex:none;box-shadow:0 0 9px currentColor;background:currentColor}
+.dot.working{color:var(--s-working)}
+.dot.propen{color:var(--s-propen)}
+.dot.cifail{color:var(--s-cifail);animation:pulse 1.2s ease-in-out infinite}
+.dot.review{color:var(--s-review)}
+.dot.merge{color:var(--s-merge)}
+.dot.done{color:var(--s-done)}
+.cards{display:flex;flex-direction:column;gap:10px}
+.card{
+  border:1px solid var(--line);border-radius:14px;padding:13px 14px 11px;cursor:pointer;
+  background:var(--panel);backdrop-filter:blur(12px);
+  transition:transform .18s,border-color .18s,box-shadow .2s;
+}
+.card:hover{transform:translateY(-3px);border-color:var(--line-hi);
+  box-shadow:0 14px 34px rgba(0,0,0,.45),0 0 24px rgba(167,139,250,.12)}
+.card .top{display:flex;align-items:center;gap:9px;margin-bottom:5px}
+.card .nm{font-family:"Syne",sans-serif;font-size:13px;font-weight:700}
+.card .rp{font-size:10px;color:var(--muted);margin-bottom:10px}
+.card .meta{display:flex;align-items:center;gap:8px;font-size:10px;color:var(--text-2)}
+.cost{margin-left:auto;font-size:11.5px;color:var(--lilac);text-shadow:0 0 10px rgba(167,139,250,.5)}
+.tag{font-size:9px;padding:2px 8px;border-radius:9px;border:1px solid var(--line);color:var(--text-2);letter-spacing:.05em}
+.tag.fail{color:var(--s-cifail);border-color:rgba(255,107,138,.4)}
+.tag.rev{color:var(--s-review);border-color:rgba(255,212,121,.4)}
+.tag.pr{color:var(--s-propen);border-color:rgba(124,196,255,.4)}
+.tag.mrg{color:var(--s-merge);border-color:rgba(201,154,255,.45)}
+
+/* session */
+.sd-head{display:flex;align-items:center;gap:12px;margin:16px 22px 10px;padding:10px 14px;
+  border:1px solid var(--line);border-radius:14px;background:var(--panel);backdrop-filter:blur(12px)}
+.back{width:28px;height:28px;border:1px solid var(--line);border-radius:50%;background:none;
+  color:var(--text-2);cursor:pointer;font-size:13px}
+.back:hover{border-color:var(--line-hi);color:var(--lilac)}
+.sd-name{font-family:"Syne",sans-serif;font-size:16px;font-weight:700}
+.sd-repo{font-size:10px;color:var(--muted)}
+.pr-chip{font-size:9.5px;color:var(--s-cifail);border:1px solid rgba(255,107,138,.45);border-radius:10px;padding:2px 9px}
+.sd-cost{margin-left:auto;font-size:12.5px;color:var(--lilac);text-shadow:0 0 10px rgba(167,139,250,.5)}
+.kill{border:1px solid rgba(255,107,138,.5);background:none;color:var(--s-cifail);border-radius:16px;
+  padding:5px 16px;font-family:"Syne",sans-serif;font-size:10.5px;font-weight:700;cursor:pointer}
+.kill:hover{background:rgba(255,107,138,.14)}
+.sd-tabs{display:flex;gap:4px;margin:0 22px 10px;border:1px solid var(--line);border-radius:20px;
+  width:max-content;padding:3px;background:var(--panel);backdrop-filter:blur(12px)}
+.sd-tab{background:none;border:none;border-radius:16px;color:var(--muted);
+  font-family:"Syne",sans-serif;font-size:10.5px;font-weight:600;padding:5px 15px;cursor:pointer}
+.sd-tab:hover{color:var(--text-2)}
+.sd-tab.on{color:var(--text);background:rgba(167,139,250,.18);box-shadow:0 0 14px rgba(167,139,250,.15)}
+.sd-body{flex:1;display:flex;gap:12px;min-height:0;padding:0 22px 20px}
+.term{flex:1.7;min-width:0;border:1px solid var(--line);border-radius:14px;overflow:hidden;
+  background:rgba(7,5,18,.82);backdrop-filter:blur(10px);display:flex;flex-direction:column}
+.term-bar{display:flex;align-items:center;gap:10px;padding:7px 13px;border-bottom:1px solid var(--line);
+  font-size:9.5px;color:var(--muted);letter-spacing:.08em}
+.term-bar .dotc{width:8px;height:8px;border-radius:50%;background:var(--s-working);box-shadow:0 0 8px var(--s-working)}
+.term-bar .r{margin-left:auto}
+.tlines{flex:1;overflow-y:auto;padding:12px 15px;font-size:11.5px;line-height:1.75;color:#d9d2f5;white-space:pre-wrap}
+.tlines .dim{color:#585179}
+.tlines .ok{color:var(--s-working)}
+.tlines .bad{color:var(--s-cifail)}
+.tlines .agent{color:var(--lilac)}
+.tlines .cursor{display:inline-block;width:8px;height:14px;background:var(--lilac);
+  vertical-align:-2px;animation:blink 1.1s steps(1) infinite;box-shadow:0 0 10px var(--violet)}
+@keyframes blink{50%{opacity:0}}
+.info{flex:1;min-width:0;max-width:350px;display:flex;flex-direction:column;gap:11px;overflow-y:auto}
+.panel{border:1px solid var(--line);border-radius:14px;background:var(--panel);backdrop-filter:blur(12px);padding:13px 15px}
+.panel h3{font-family:"Syne",sans-serif;font-size:12.5px;font-weight:700;margin-bottom:9px;display:flex;align-items:baseline;gap:8px}
+.panel h3 .sub{margin-left:auto;font-family:"JetBrains Mono",monospace;font-weight:400;font-size:9px;color:var(--muted)}
+.ci-row{display:flex;align-items:center;gap:9px;font-size:11px;color:var(--text-2);padding:3px 0}
+.ci-row .st{width:13px;text-align:center}
+.ci-row .ok{color:var(--s-working)}
+.ci-row .bad{color:var(--s-cifail)}
+.ci-row .run{color:var(--s-review);animation:pulse 1.4s ease-in-out infinite}
+.ci-row .t{margin-left:auto;font-size:9px;color:var(--muted)}
+.cmt{border-top:1px dashed var(--line);padding:8px 0 3px;font-size:11px;color:var(--text-2);line-height:1.6}
+.cmt:first-of-type{border-top:none}
+.cmt .who{color:var(--lilac);font-weight:500}
+.cmt .ln{color:var(--muted);font-size:9px}
+.inspector{flex:1;display:none;border:1px solid var(--line);border-radius:14px;
+  background:var(--panel);backdrop-filter:blur(12px);padding:16px 18px;overflow-y:auto}
+.kv{display:grid;grid-template-columns:165px 1fr;gap:9px 16px;font-size:11.5px}
+.kv dt{color:var(--muted);letter-spacing:.1em;font-size:9.5px;text-transform:uppercase;padding-top:1px}
+.kv dd{color:var(--text-2)}
+.kv dd b{color:var(--text);font-weight:500}
+.sd-body.mode-terminal .info{display:none}
+.sd-body.mode-info .term{display:none}
+.sd-body.mode-info .info{max-width:none;flex-direction:row;flex-wrap:wrap;align-content:flex-start}
+.sd-body.mode-info .info .panel{flex:1;min-width:290px}
+.sd-body.mode-inspector .term,.sd-body.mode-inspector .info{display:none}
+.sd-body.mode-inspector .inspector{display:block}
+
+/* PRs */
+.prwrap{margin:6px 22px;display:flex;flex-direction:column;gap:9px}
+.prt-row{display:grid;grid-template-columns:66px 1fr 150px 120px 130px 66px;gap:12px;
+  padding:12px 17px;align-items:center;cursor:pointer;font-size:11.5px;
+  border:1px solid var(--line);border-radius:13px;background:var(--panel);backdrop-filter:blur(12px);
+  transition:transform .15s,border-color .15s}
+.prt-row:hover{transform:translateY(-2px);border-color:var(--line-hi)}
+.prt-row.h{background:none;border-color:transparent;backdrop-filter:none;color:var(--muted);
+  font-size:9px;letter-spacing:.2em;text-transform:uppercase;cursor:default;padding:2px 17px}
+.prt-row.h:hover{transform:none}
+.prt-row .num{color:var(--lilac)}
+.prt-row .ttl{font-family:"Syne",sans-serif;font-weight:600;font-size:12.5px;color:var(--text);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.prt-row .sess{color:var(--text-2);display:flex;align-items:center;gap:8px;font-size:10.5px}
+.prt-row .rp2{color:var(--muted);font-size:10px}
+.prt-row .cost2{color:var(--lilac);text-align:right;font-size:11px}
+.ci-badge{font-size:9px;padding:2px 9px;border-radius:9px;border:1px solid;letter-spacing:.08em;justify-self:start}
+.cib-run{color:var(--s-review);border-color:rgba(255,212,121,.4)}
+.cib-fail{color:var(--s-cifail);border-color:rgba(255,107,138,.45)}
+.cib-pass{color:var(--s-working);border-color:rgba(110,231,168,.4)}
+.cib-mrg{color:var(--s-merge);border-color:rgba(201,154,255,.45)}
+
+/* brain */
+.brain-body{flex:1;display:flex;min-height:0}
+.rail{width:228px;min-width:228px;border-right:1px solid var(--line);
+  background:rgba(16,13,34,.5);backdrop-filter:blur(10px);overflow-y:auto;padding:12px 0}
+.rail .h{font-family:"Syne",sans-serif;font-size:9.5px;font-weight:700;letter-spacing:.24em;
+  text-transform:uppercase;color:var(--muted);padding:4px 16px 10px}
+.cat{display:flex;align-items:center;gap:9px;padding:6px 16px;cursor:pointer;color:var(--text-2);font-size:11.5px}
+.cat:hover{background:rgba(167,139,250,.07);color:var(--text)}
+.cat .star{width:9px;height:9px;border-radius:50%;flex:none;box-shadow:0 0 8px currentColor;background:currentColor}
+.cat .n{margin-left:auto;font-size:9.5px;color:var(--muted);border:1px solid var(--line);border-radius:8px;padding:0 6px}
+.cat .chev{font-size:8px;color:var(--muted);width:8px}
+.entry{padding:4px 16px 4px 42px;font-size:10.5px;color:var(--muted);cursor:pointer;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.entry:hover{color:var(--text)}
+.entry.hot{color:var(--c-symbol)}
+.rail .tags{padding:14px 16px 4px;display:flex;flex-wrap:wrap;gap:6px}
+.tagpill{font-size:9.5px;border:1px solid var(--line);border-radius:10px;padding:2px 8px;color:var(--text-2);cursor:pointer}
+.tagpill.on{border-color:var(--lilac);color:var(--lilac);background:rgba(167,139,250,.1)}
+.skywrap{flex:1;position:relative;min-width:0}
+#sky{position:absolute;inset:0;width:100%;height:100%}
+.preview{position:absolute;left:44%;top:20%;width:252px;z-index:6;
+  background:rgba(20,16,44,.88);border:1px solid var(--line-hi);border-radius:13px;padding:13px 15px;
+  backdrop-filter:blur(10px);box-shadow:0 16px 44px rgba(0,0,0,.5),0 0 26px rgba(110,231,168,.1)}
+.preview .type{display:inline-flex;align-items:center;gap:6px;font-size:9px;letter-spacing:.2em;
+  text-transform:uppercase;color:var(--c-symbol);margin-bottom:7px}
+.preview .type i{width:7px;height:7px;border-radius:50%;background:var(--c-symbol);box-shadow:0 0 7px var(--c-symbol)}
+.preview h3{font-family:"Syne",sans-serif;font-size:14.5px;font-weight:700;margin-bottom:6px}
+.preview p{font-size:10.5px;line-height:1.65;color:var(--text-2)}
+.preview p code{color:var(--c-symbol)}
+.preview .links{margin-top:9px;padding-top:8px;border-top:1px dashed var(--line);font-size:9.5px;color:var(--muted)}
+.preview .links b{color:var(--lilac);font-weight:500}
+.legend{position:absolute;right:16px;top:14px;z-index:5;background:rgba(16,13,34,.72);
+  border:1px solid var(--line);border-radius:13px;padding:11px 13px;backdrop-filter:blur(10px)}
+.legend .h{font-family:"Syne",sans-serif;font-size:9px;font-weight:700;letter-spacing:.22em;
+  text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+.lg{display:flex;align-items:center;gap:8px;font-size:10px;color:var(--text-2);padding:2px 0;cursor:pointer}
+.lg i{width:8px;height:8px;border-radius:50%;box-shadow:0 0 7px currentColor;background:currentColor}
+.lg:hover{color:var(--text)}
+.legend .opt{margin-top:9px;padding-top:8px;border-top:1px dashed var(--line);
+  font-size:9.5px;color:var(--muted);display:flex;gap:8px}
+.legend .opt .on{color:var(--lilac)}
+.timebar{display:flex;align-items:center;gap:16px;padding:11px 20px;
+  border-top:1px solid var(--line);background:rgba(16,13,34,.6);backdrop-filter:blur(12px)}
+.play{width:30px;height:30px;border-radius:50%;border:1px solid var(--violet);background:rgba(167,139,250,.12);
+  color:var(--lilac);cursor:pointer;font-size:11px;display:grid;place-items:center;flex:none;
+  box-shadow:0 0 16px rgba(167,139,250,.25)}
+.track{flex:1;position:relative;height:30px}
+.track .base{position:absolute;left:0;right:0;top:14px;height:2px;background:var(--line)}
+.track .fill{position:absolute;left:0;width:72%;top:14px;height:2px;background:linear-gradient(90deg,var(--muted),var(--lilac))}
+.track .thumb{position:absolute;left:72%;top:7px;width:16px;height:16px;border-radius:50%;
+  background:var(--lilac);box-shadow:0 0 18px var(--violet);cursor:grab;transform:translateX(-50%)}
+.track .tick{position:absolute;top:20px;font-size:8.5px;color:var(--muted);transform:translateX(-50%)}
+.timelabel{font-size:10px;color:var(--text-2);white-space:nowrap}
+.timelabel b{color:var(--lilac);font-weight:500}
+.recent{font-size:9.5px;color:var(--c-symbol);border:1px solid rgba(110,231,168,.4);border-radius:10px;
+  padding:2px 9px;white-space:nowrap;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="nebula">
+  <div class="cloud c1"></div>
+  <div class="cloud c2"></div>
+  <div class="cloud c3"></div>
+  <div class="cloud c4"></div>
+</div>
+<canvas id="stars"></canvas>
+
+<div class="app">
+
+  <header class="top">
+    <div class="brand"><span class="hex">⬡</span><b>nin<i>ox</i></b></div>
+    <nav class="nav">
+      <button class="on" data-nav="fleet">Fleet<span class="k">1</span></button>
+      <button data-nav="session">Session<span class="k">2</span></button>
+      <button data-nav="prs">PRs<span class="k">3</span></button>
+      <button data-nav="brain">Brain<span class="k">4</span></button>
+    </nav>
+    <div class="gsearch">⌕ <span>search everything…</span> <span class="kbd" style="margin-left:auto">⌘K</span></div>
+    <button class="bell">🕭<span class="n">3</span></button>
+  </header>
+
+  <div class="ribbon">
+    <span class="sig"></span>
+    <span><b>1 CI failure</b> · <b>1 review</b> drifting toward you</span>
+    <span class="go">attend →</span>
+  </div>
+
+  <div class="stage">
+
+    <!-- FLEET -->
+    <section class="view on" id="view-fleet">
+      <div class="pagebar">
+        <h1>Fleet <span>adrift</span></h1>
+        <div class="count"><b>8/8</b> sessions · Σ $20.21</div>
+      </div>
+      <div class="board">
+        <section class="col">
+          <div class="col-head"><span class="dot working"></span><h2>Working</h2><span class="n">3</span></div>
+          <div class="cards">
+            <article class="card" data-nav="session">
+              <div class="top"><span class="dot working"></span><span class="nm">terminal-render</span></div>
+              <div class="rp">slievr/ninox · feat/native-terminal</div>
+              <div class="meta"><span class="tag">uptime 1h 22m</span><span class="cost">$4.87</span></div>
+            </article>
+            <article class="card" data-nav="session">
+              <div class="top"><span class="dot working"></span><span class="nm">brain-index</span></div>
+              <div class="rp">slievr/ninox · feat/brain-fts</div>
+              <div class="meta"><span class="tag">uptime 34m</span><span class="cost">$1.12</span></div>
+            </article>
+            <article class="card" data-nav="session">
+              <div class="top"><span class="dot working"></span><span class="nm">atlas</span></div>
+              <div class="rp">orchestrator · 3 workers</div>
+              <div class="meta"><span class="tag">coordinator</span><span class="cost">$0.44</span></div>
+            </article>
+          </div>
+        </section>
+        <section class="col">
+          <div class="col-head"><span class="dot propen"></span><h2>PR Open</h2><span class="n">1</span></div>
+          <div class="cards">
+            <article class="card" data-nav="session">
+              <div class="top"><span class="dot propen"></span><span class="nm">docs-gen</span></div>
+              <div class="rp">slievr/ninox-docs · docs/agent-guide</div>
+              <div class="meta"><span class="tag pr">#214 · CI 4/6</span><span class="cost">$2.31</span></div>
+            </article>
+          </div>
+        </section>
+        <section class="col">
+          <div class="col-head"><span class="dot cifail"></span><h2>CI Failed</h2><span class="n">1</span></div>
+          <div class="cards">
+            <article class="card" data-nav="session">
+              <div class="top"><span class="dot cifail"></span><span class="nm">scrollback-fix</span></div>
+              <div class="rp">slievr/ninox · fix/scrollback-order</div>
+              <div class="meta"><span class="tag fail">#209 · test ✗</span><span class="cost">$3.60</span></div>
+            </article>
+          </div>
+        </section>
+        <section class="col">
+          <div class="col-head"><span class="dot review"></span><h2>Review</h2><span class="n">1</span></div>
+          <div class="cards">
+            <article class="card" data-nav="session">
+              <div class="top"><span class="dot review"></span><span class="nm">pr-sync</span></div>
+              <div class="rp">slievr/ninox · feat/pr-webhooks</div>
+              <div class="meta"><span class="tag rev">#207 · 2 comments</span><span class="cost">$5.02</span></div>
+            </article>
+          </div>
+        </section>
+        <section class="col">
+          <div class="col-head"><span class="dot merge"></span><h2>Mergeable</h2><span class="n">1</span></div>
+          <div class="cards">
+            <article class="card" data-nav="session">
+              <div class="top"><span class="dot merge"></span><span class="nm">flaky-tests</span></div>
+              <div class="rp">slievr/ninox · fix/flaky-e2e</div>
+              <div class="meta"><span class="tag mrg">#201 · CI ✓</span><span class="cost">$1.88</span></div>
+            </article>
+          </div>
+        </section>
+        <section class="col">
+          <div class="col-head"><span class="dot done"></span><h2>Done</h2><span class="n">1</span></div>
+          <div class="cards">
+            <article class="card" data-nav="session">
+              <div class="top"><span class="dot done"></span><span class="nm">release-bot</span></div>
+              <div class="rp">slievr/ninox · release/v0.4</div>
+              <div class="meta"><span class="tag">merged</span><span class="cost">$0.97</span></div>
+            </article>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <!-- SESSION -->
+    <section class="view" id="view-session">
+      <div class="sd-head">
+        <button class="back" data-nav="fleet">←</button>
+        <span class="dot cifail"></span>
+        <div>
+          <div class="sd-name">scrollback-fix</div>
+          <div class="sd-repo">slievr/ninox · fix/scrollback-order · worker of atlas</div>
+        </div>
+        <span class="pr-chip">PR #209 · CI ✗</span>
+        <span class="sd-cost">$3.60</span>
+        <button class="kill">Kill</button>
+      </div>
+      <div class="sd-tabs">
+        <button class="sd-tab" data-mode="terminal">Terminal</button>
+        <button class="sd-tab on" data-mode="split">Split</button>
+        <button class="sd-tab" data-mode="info">Info</button>
+        <button class="sd-tab" data-mode="inspector">Inspector</button>
+      </div>
+      <div class="sd-body mode-split" id="sd-body">
+        <div class="term">
+          <div class="term-bar"><span class="dotc"></span>tmux · pane %12 · 80×36<span class="r">scrollback 412</span></div>
+          <pre class="tlines"><span class="dim">[atlas → scrollback-fix] task: fix scrollback ordering/duplicates</span>
+$ cargo test -p ninox-app terminal::
+<span class="dim">   Compiling ninox-app v0.4.1 (crates/ninox-app)
+    Finished test [unoptimized] target in 8.42s
+     Running unittests src/lib.rs</span>
+
+running 14 tests
+test terminal::cursor_modes ............. <span class="ok">ok</span>
+test terminal::wide_glyphs .............. <span class="ok">ok</span>
+test terminal::frame_alignment .......... <span class="bad">FAILED</span>
+test terminal::scrollback_order ......... <span class="bad">FAILED</span>
+
+failures:
+
+---- terminal::scrollback_order ----
+<span class="bad">assertion `left == right` failed: rows duplicated at redraw boundary
+  left: 412
+ right: 408</span>
+
+<span class="agent">✦ agent │ The grid diff runs before frames are aligned, so
+        │ cursor-addressed redraws re-emit the boundary rows.
+        │ Moving align_frames() ahead of diff_grid() in
+        │ renderer.rs and re-running the suite…</span>
+
+$ <span class="cursor"></span></pre>
+        </div>
+        <div class="info">
+          <div class="panel">
+            <h3>PR #209 <span class="sub">align frames before diff</span></h3>
+            <div class="ci-row"><span class="st ok">✓</span>build <span class="t">1m 42s</span></div>
+            <div class="ci-row"><span class="st ok">✓</span>clippy <span class="t">58s</span></div>
+            <div class="ci-row"><span class="st ok">✓</span>fmt <span class="t">12s</span></div>
+            <div class="ci-row"><span class="st bad">✗</span>test · 2 failed <span class="t">8m 03s</span></div>
+            <div class="ci-row"><span class="st run">◌</span>e2e · queued <span class="t">—</span></div>
+          </div>
+          <div class="panel">
+            <h3>Review <span class="sub">2 comments</span></h3>
+            <div class="cmt"><span class="who">@slievr</span> <span class="ln">renderer.rs:214</span><br>Why not align at PTY-read time instead of per redraw?</div>
+            <div class="cmt"><span class="who">@slievr</span> <span class="ln">terminal.rs:88</span><br>Add a regression test with a cursor-addressed TUI capture. ✨</div>
+          </div>
+        </div>
+        <div class="inspector">
+          <dl class="kv">
+            <dt>Session ID</dt><dd><b>sess_01J9QK3V8WXY</b></dd>
+            <dt>Agent</dt><dd>claude · <b>fable-5</b></dd>
+            <dt>Kind</dt><dd>worker</dd>
+            <dt>Orchestrator</dt><dd><b>atlas</b> (or-01)</dd>
+            <dt>PID</dt><dd>48213</dd>
+            <dt>tmux</dt><dd>ninox-fleet:5 · pane %12</dd>
+            <dt>Workspace</dt><dd>~/fleet/worktrees/scrollback-fix</dd>
+            <dt>Branch</dt><dd>fix/scrollback-order</dd>
+            <dt>Created</dt><dd>2026-07-03 01:12 UTC</dd>
+            <dt>Last output</dt><dd>2s ago</dd>
+            <dt>Burn</dt><dd><b style="color:var(--lilac)">$3.60</b> · 214k tokens</dd>
+          </dl>
+        </div>
+      </div>
+    </section>
+
+    <!-- PRS -->
+    <section class="view" id="view-prs">
+      <div class="pagebar">
+        <h1>Pull <span>requests</span></h1>
+        <div class="count"><b>4</b> open</div>
+      </div>
+      <div class="prwrap">
+        <div class="prt-row h"><span>№</span><span>Title</span><span>Session</span><span>Repo</span><span>CI</span><span style="text-align:right">Burn</span></div>
+        <div class="prt-row" data-nav="session"><span class="num">#214</span><span class="ttl">docs(agents): authoring guide for fleet workers</span><span class="sess"><span class="dot propen"></span>docs-gen</span><span class="rp2">ninox-docs</span><span class="ci-badge cib-run">running 4/6</span><span class="cost2">$2.31</span></div>
+        <div class="prt-row" data-nav="session"><span class="num">#209</span><span class="ttl">fix(native-app): align frames before scrollback diff</span><span class="sess"><span class="dot cifail"></span>scrollback-fix</span><span class="rp2">ninox</span><span class="ci-badge cib-fail">failed · test</span><span class="cost2">$3.60</span></div>
+        <div class="prt-row" data-nav="session"><span class="num">#207</span><span class="ttl">feat(fleet): PR webhook sync</span><span class="sess"><span class="dot review"></span>pr-sync</span><span class="rp2">ninox</span><span class="ci-badge cib-pass">passed 6/6</span><span class="cost2">$5.02</span></div>
+        <div class="prt-row" data-nav="session"><span class="num">#201</span><span class="ttl">fix(ci): deflake the e2e suite</span><span class="sess"><span class="dot merge"></span>flaky-tests</span><span class="rp2">ninox</span><span class="ci-badge cib-mrg">mergeable</span><span class="cost2">$1.88</span></div>
+      </div>
+    </section>
+
+    <!-- BRAIN -->
+    <section class="view" id="view-brain">
+      <div class="brain-body">
+        <aside class="rail">
+          <div class="h">brain/ — 128 entries</div>
+          <div class="cat"><span class="chev">▸</span><span class="star" style="color:var(--c-repo)"></span>repos<span class="n">6</span></div>
+          <div class="cat"><span class="chev">▾</span><span class="star" style="color:var(--c-symbol)"></span>symbols<span class="n">41</span></div>
+          <div class="entry hot">TerminalPane::draw_grid</div>
+          <div class="entry">ScrollbackBuffer</div>
+          <div class="entry">EventBus::subscribe</div>
+          <div class="entry">SessionStore::poll</div>
+          <div class="cat"><span class="chev">▸</span><span class="star" style="color:var(--c-concept)"></span>concepts<span class="n">22</span></div>
+          <div class="cat"><span class="chev">▸</span><span class="star" style="color:var(--c-pattern)"></span>patterns<span class="n">17</span></div>
+          <div class="cat"><span class="chev">▸</span><span class="star" style="color:var(--c-decision)"></span>decisions<span class="n">19</span></div>
+          <div class="cat"><span class="chev">▸</span><span class="star" style="color:var(--c-arch)"></span>architecture<span class="n">9</span></div>
+          <div class="cat"><span class="chev">▸</span><span class="star" style="color:var(--c-rel)"></span>relationships<span class="n">8</span></div>
+          <div class="cat"><span class="chev">▸</span><span class="star" style="color:var(--c-error)"></span>errors<span class="n">6</span></div>
+          <div class="h" style="padding-top:16px">filter by tag</div>
+          <div class="tags">
+            <span class="tagpill on">terminal</span>
+            <span class="tagpill">tmux</span>
+            <span class="tagpill">rendering</span>
+            <span class="tagpill">ci</span>
+            <span class="tagpill">iced</span>
+          </div>
+        </aside>
+        <div class="skywrap">
+          <canvas id="sky"></canvas>
+          <div class="preview">
+            <span class="type"><i></i>symbol</span>
+            <h3>ScrollbackBuffer</h3>
+            <p>Ring buffer behind <code>TerminalPane</code>; frames must be aligned before diffing or cursor-addressed redraws duplicate rows.</p>
+            <div class="links">↳ 6 wikilinks · <b>[[frame-alignment]]</b>, <b>[[err/scrollback-dup]]</b>…</div>
+          </div>
+          <div class="legend">
+            <div class="h">Node = entry</div>
+            <div class="lg"><i style="color:var(--c-repo)"></i>repo</div>
+            <div class="lg"><i style="color:var(--c-symbol)"></i>symbol</div>
+            <div class="lg"><i style="color:var(--c-concept)"></i>concept</div>
+            <div class="lg"><i style="color:var(--c-pattern)"></i>pattern</div>
+            <div class="lg"><i style="color:var(--c-decision)"></i>decision</div>
+            <div class="lg"><i style="color:var(--c-arch)"></i>architecture</div>
+            <div class="lg"><i style="color:var(--c-rel)"></i>relationship</div>
+            <div class="lg"><i style="color:var(--c-error)"></i>error</div>
+            <div class="opt">cluster: <span class="on">category</span> · <span>repo</span></div>
+          </div>
+        </div>
+      </div>
+      <footer class="timebar">
+        <button class="play">▶</button>
+        <div class="track">
+          <div class="base"></div><div class="fill"></div><div class="thumb"></div>
+          <span class="tick" style="left:2%">Mar</span>
+          <span class="tick" style="left:26%">Apr</span>
+          <span class="tick" style="left:50%">May</span>
+          <span class="tick" style="left:74%">Jun</span>
+          <span class="tick" style="left:97%">Jul</span>
+        </div>
+        <span class="timelabel">as of <b>14 Jun 2026</b> · 96/128 entries</span>
+        <span class="recent">✦ pulse last 24h</span>
+      </footer>
+    </section>
+
+  </div>
+</div>
+
+<script>
+/* ---- nav ---- */
+const navBtns = document.querySelectorAll('.nav button');
+function go(view){
+  navBtns.forEach(b=>b.classList.toggle('on', b.dataset.nav===view));
+  document.querySelectorAll('.view').forEach(v=>v.classList.toggle('on', v.id==='view-'+view));
+  window.dispatchEvent(new Event('resize'));
+}
+document.querySelectorAll('[data-nav]').forEach(el=>{
+  el.addEventListener('click', e=>{ go(el.dataset.nav); e.stopPropagation(); });
+});
+addEventListener('keydown', e=>{
+  const k = {'1':'fleet','2':'session','3':'prs','4':'brain'}[e.key];
+  if(k) go(k);
+});
+const sdBody = document.getElementById('sd-body');
+document.querySelectorAll('.sd-tab').forEach(t=>{
+  t.addEventListener('click', ()=>{
+    document.querySelectorAll('.sd-tab').forEach(x=>x.classList.toggle('on', x===t));
+    sdBody.className = 'sd-body mode-'+t.dataset.mode;
+  });
+});
+
+/* ---- global starfield (behind everything, all views) ---- */
+const sc = document.getElementById('stars');
+const sctx = sc.getContext('2d');
+let SW,SH;
+function sresize(){ SW=sc.width=innerWidth*devicePixelRatio; SH=sc.height=innerHeight*devicePixelRatio; }
+sresize(); addEventListener('resize', sresize);
+let sseed=7; function srnd(){sseed=(sseed*16807)%2147483647;return (sseed-1)/2147483646}
+const stars=[];
+for(let i=0;i<160;i++) stars.push({x:srnd(),y:srnd(),r:.4+srnd()*1.3,tw:srnd()*Math.PI*2,sp:.5+srnd()});
+function starFrame(ts){
+  sctx.clearRect(0,0,SW,SH);
+  for(const s of stars){
+    const a=.25+.5*Math.abs(Math.sin(ts*.0004*s.sp+s.tw));
+    sctx.fillStyle='rgba(234,230,255,'+a+')';
+    sctx.beginPath();sctx.arc(s.x*SW,s.y*SH,s.r*devicePixelRatio,0,7);sctx.fill();
+  }
+  requestAnimationFrame(starFrame);
+}
+requestAnimationFrame(starFrame);
+
+/* ---- brain constellation ---- */
+const canvas = document.getElementById('sky');
+const ctx = canvas.getContext('2d');
+const COLORS = {repo:'#7cc4ff',symbol:'#6ee7a8',concept:'#ffd479',pattern:'#ff9ee8',
+  decision:'#ffab7c',arch:'#b39bff',error:'#ff6b8a',rel:'#8be8e0'};
+const TYPES = Object.keys(COLORS);
+let W=0,H=0;
+function resize(){
+  const r = canvas.getBoundingClientRect();
+  if(r.width===0) return;
+  W = canvas.width = r.width*devicePixelRatio;
+  H = canvas.height = r.height*devicePixelRatio;
+}
+resize(); addEventListener('resize', resize);
+let seed=42; function rnd(){seed=(seed*16807)%2147483647;return (seed-1)/2147483646}
+const N=74, nodes=[];
+for(let i=0;i<N;i++){
+  const t=TYPES[Math.floor(rnd()*TYPES.length)];
+  nodes.push({x:rnd(),y:rnd(),vx:(rnd()-.5)*.0004,vy:(rnd()-.5)*.0004,
+    r:2+rnd()*rnd()*7,type:t,tw:rnd()*Math.PI*2,lit:rnd()<.09});
+}
+const edges=[];
+for(let i=0;i<N;i++)for(let j=i+1;j<N;j++){
+  if(Math.hypot(nodes[i].x-nodes[j].x,nodes[i].y-nodes[j].y)<.11 && rnd()<.55) edges.push([i,j]);
+}
+let t0=0;
+function frame(ts){
+  const dt=Math.min(ts-t0,50); t0=ts;
+  if(W===0){ resize(); requestAnimationFrame(frame); return; }
+  ctx.clearRect(0,0,W,H);
+  for(const n of nodes){
+    n.x+=n.vx*dt*.06;n.y+=n.vy*dt*.06;
+    if(n.x<.03||n.x>.97)n.vx*=-1; if(n.y<.05||n.y>.95)n.vy*=-1;
+    n.tw+=dt*.0012;
+  }
+  ctx.lineWidth=1;
+  for(const [a,b] of edges){
+    const A=nodes[a],B=nodes[b];
+    ctx.strokeStyle=(A.lit||B.lit)?'rgba(196,181,253,.4)':'rgba(168,159,214,.14)';
+    ctx.beginPath();ctx.moveTo(A.x*W,A.y*H);ctx.lineTo(B.x*W,B.y*H);ctx.stroke();
+  }
+  for(const n of nodes){
+    const x=n.x*W,y=n.y*H,R=n.r*devicePixelRatio*(.75+.25*Math.sin(n.tw));
+    const c=COLORS[n.type];
+    const g=ctx.createRadialGradient(x,y,0,x,y,R*4);
+    g.addColorStop(0,c);g.addColorStop(.35,c+'55');g.addColorStop(1,'transparent');
+    ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,R*4,0,7);ctx.fill();
+    ctx.fillStyle=n.lit?'#ffffff':c;
+    ctx.beginPath();ctx.arc(x,y,R,0,7);ctx.fill();
+    if(n.lit){
+      ctx.strokeStyle='rgba(255,255,255,'+(.5+.5*Math.sin(n.tw*2))+')';
+      ctx.lineWidth=1.5*devicePixelRatio;
+      ctx.beginPath();ctx.arc(x,y,R+5*devicePixelRatio,0,7);ctx.stroke();
+    }
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

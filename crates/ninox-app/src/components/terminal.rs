@@ -147,6 +147,15 @@ impl TerminalState {
     }
 
     /// Resize the terminal grid to match a new canvas size.
+    /// Current live-grid size (cols, rows) — the emulator's actual
+    /// dimensions, which the session-detail title bar reports (the
+    /// app-level `terminal_cols/rows` are only the background/Split
+    /// sizing, not necessarily what this session was resized to).
+    pub fn grid_size(&self) -> (u16, u16) {
+        let grid = self.term.grid();
+        (grid.columns() as u16, grid.screen_lines() as u16)
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16) {
         use alacritty_terminal::term::test::TermSize;
         let size = TermSize::new(cols as usize, rows as usize);
@@ -521,7 +530,7 @@ fn draw_cell(
 
     if is_selected {
         let sel_rect = Path::rectangle(iced::Point::new(x, y), Size::new(cell_w, cell_h));
-        frame.fill(&sel_rect, IcedColor { r: 0.27, g: 0.52, b: 0.80, a: 0.5 });
+        frame.fill(&sel_rect, IcedColor { r: 0.941, g: 0.753, b: 0.412, a: 0.35 }); // #f0c069 amber, field notes
     } else if block_cursor {
         let cursor_rect = Path::rectangle(iced::Point::new(x, y), Size::new(cell_w, cell_h));
         frame.fill(&cursor_rect, cursor_color);
@@ -737,7 +746,7 @@ mod tests {
 
     #[test]
     fn every_theme_defines_a_full_palette() {
-        for scheme in [crate::theme::light(), crate::theme::dark(), crate::theme::warm_dark()] {
+        for scheme in [crate::theme::light(), crate::theme::dark()] {
             // 16 distinct-ish entries; at minimum not all default black.
             assert!(scheme.ansi.iter().any(|c| *c != iced::Color::BLACK));
             assert_eq!(scheme.ansi.len(), 16);

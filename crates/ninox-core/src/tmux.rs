@@ -274,17 +274,11 @@ pub async fn create_session(
     base.extend_from_slice(&extra);
     base.push(&shell_cmd);
 
-    for attempt in 0..2u8 {
-        match run(&base).await {
-            Ok(_) => break,
-            Err(e) if attempt == 0 && e.to_string().contains("duplicate session") => {
-                run_best_effort(&["kill-session", "-t", id]).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    Ok(())
+    // A duplicate name means a LIVE tmux session already exists under this
+    // id. Killing it to make room (the old behavior) silently destroys a
+    // running agent whenever the store and tmux disagree about what exists —
+    // surface the conflict to the caller instead; the spawn UI shows it.
+    run(&base).await.map(|_| ())
 }
 
 /// Kill a tmux session.  Succeeds even if the session doesn't exist.

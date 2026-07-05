@@ -77,4 +77,45 @@ pub struct Notification {
     pub title:      String,
     pub body:       String,
     pub session_id: Option<SessionId>,
+    /// Unix epoch milliseconds — rendered as the mono timestamp on the
+    /// notification slip (spec §7).
+    ///
+    /// `#[serde(default)]` for wire back-compat: older senders/payloads that
+    /// predate this field must still deserialize (as `0`) instead of failing.
+    #[serde(default)]
+    pub created_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_deserializes_without_created_at_for_wire_back_compat() {
+        // Payload from a sender that predates the `created_at` field — must
+        // not fail to deserialize; missing field defaults to 0.
+        let json = r#"{
+            "id": "n1",
+            "kind": "worker_done",
+            "title": "Done",
+            "body": "…",
+            "session_id": null
+        }"#;
+        let n: Notification = serde_json::from_str(json).expect("missing created_at must not error");
+        assert_eq!(n.created_at, 0);
+    }
+
+    #[test]
+    fn notification_round_trips_created_at_when_present() {
+        let json = r#"{
+            "id": "n1",
+            "kind": "worker_done",
+            "title": "Done",
+            "body": "…",
+            "session_id": null,
+            "created_at": 12345
+        }"#;
+        let n: Notification = serde_json::from_str(json).expect("valid payload must deserialize");
+        assert_eq!(n.created_at, 12345);
+    }
 }

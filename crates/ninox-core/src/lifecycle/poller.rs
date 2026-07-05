@@ -14,6 +14,14 @@ use crate::{
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
+/// Unix epoch milliseconds "now" — used to stamp `Notification::created_at`.
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub struct Poller {
     engine:           Arc<Engine>,
     enrichment_cache: Arc<std::sync::Mutex<EnrichmentCache>>,
@@ -108,6 +116,7 @@ impl Poller {
                     title:      format!("PR merged — {}", session.name),
                     body:       format!("#{} merged successfully", pr_number),
                     session_id: Some(session.id.clone()),
+                    created_at: now_millis(),
                 }));
                 if let Err(e) = self.engine.cleanup_session(&session.id).await {
                     tracing::warn!("cleanup_session {}: {e}", session.id);
@@ -169,6 +178,7 @@ impl Poller {
                     title:      format!("CI failing — {}", session.name),
                     body:       format!("{}/{} checks failing", ci.failing, ci.total),
                     session_id: Some(session.id.clone()),
+                    created_at: now_millis(),
                 }));
                 // Send reaction to the agent in the tmux session
                 let failing_names: Vec<String> = checks.iter()
@@ -246,6 +256,7 @@ impl Poller {
                     title:      format!("Review comments — {}", session.name),
                     body:       "Changes requested on your PR".to_string(),
                     session_id: Some(session.id.clone()),
+                    created_at: now_millis(),
                 }));
                 if !new_comments.is_empty() {
                     let msg = crate::lifecycle::reactions::format_review_reaction(
