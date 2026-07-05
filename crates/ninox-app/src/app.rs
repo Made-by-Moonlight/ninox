@@ -23,7 +23,10 @@ const MAX_NOTIFICATIONS: usize = 50;
 
 #[derive(Debug, Clone, Default)]
 pub struct SidebarState {
-    pub selected_orchestrator: Option<OrchestratorId>,
+    /// Orchestrators whose worker lists are expanded in the tree. A set,
+    /// not a single id — expanding one orchestrator must not collapse the
+    /// others (user directive).
+    pub expanded_orchestrators: std::collections::HashSet<OrchestratorId>,
     pub show_notifications:    bool,
 }
 
@@ -138,7 +141,8 @@ pub enum Message {
     NavigateLastSession,
     /// Attach argv resolved — spawn the hidden tmux client for this session.
     ClientAttach { session_id: SessionId, argv: Vec<String> },
-    SelectOrchestrator(Option<OrchestratorId>),
+    /// Toggle an orchestrator's worker list open/closed in the tree.
+    SelectOrchestrator(OrchestratorId),
     SpawnSession,
     SpawnFormName(String),
     SpawnFormKind(crate::components::spawn_modal::SpawnKind),
@@ -444,13 +448,13 @@ impl App {
                 // Selecting an orchestrator auto-expands its workers in the
                 // sidebar tree; selecting one of its workers keeps it open.
                 if state.orchestrators.iter().any(|o| o.id == id) {
-                    state.sidebar.selected_orchestrator = Some(id.clone());
+                    state.sidebar.expanded_orchestrators.insert(id.clone());
                 } else if let Some(orch_id) = state
                     .sessions
                     .get(&id)
                     .and_then(|w| w.orchestrator_id.clone())
                 {
-                    state.sidebar.selected_orchestrator = Some(orch_id);
+                    state.sidebar.expanded_orchestrators.insert(orch_id);
                 }
                 state.view = View::SessionDetail {
                     session_id: id.clone(),
@@ -538,7 +542,9 @@ impl App {
             }
 
             Message::SelectOrchestrator(id) => {
-                state.sidebar.selected_orchestrator = id;
+                if !state.sidebar.expanded_orchestrators.remove(&id) {
+                    state.sidebar.expanded_orchestrators.insert(id);
+                }
                 Task::none()
             }
 
@@ -886,9 +892,7 @@ impl App {
                 // Drop clients for the orchestrator itself and any worker
                 // sessions removed above — only surviving sessions keep theirs.
                 state.clients.retain(|sid, _| state.sessions.contains_key(sid));
-                if state.sidebar.selected_orchestrator.as_deref() == Some(id.as_str()) {
-                    state.sidebar.selected_orchestrator = None;
-                }
+                state.sidebar.expanded_orchestrators.remove(&id);
                 let engine = state.engine.clone();
                 Task::future(async move {
                     if let Err(e) = engine.remove_orchestrator(&id).await {

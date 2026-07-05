@@ -173,7 +173,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
         );
     }
     for orch in &app.orchestrators {
-        let is_expanded = app.sidebar.selected_orchestrator.as_deref() == Some(orch.id.as_str());
+        let is_expanded = app.sidebar.expanded_orchestrators.contains(orch.id.as_str());
         let worker_count = app
             .sessions
             .values()
@@ -187,7 +187,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
             app.sessions.get(&orch.id).map(|se| &se.status),
             true,  // bold
             false, // not indented
-            Some(if is_expanded { None } else { Some(orch.id.clone()) }), // chevron toggle target
+            Some((orch.id.clone(), is_expanded)), // chevron: toggle this orchestrator
             Some(Message::RemoveOrchestrator(orch.id.clone())),
         ));
         if is_expanded {
@@ -276,7 +276,7 @@ fn tree_row<'a>(
     status: Option<&ninox_core::types::SessionStatus>,
     bold: bool,
     indented: bool,
-    chevron_toggle: Option<Option<ninox_core::types::OrchestratorId>>,
+    chevron_toggle: Option<(ninox_core::types::OrchestratorId, bool)>,
     remove: Option<Message>,
 ) -> Element<'a, Message> {
     let s = &app.scheme;
@@ -331,11 +331,11 @@ fn tree_row<'a>(
 
     let mut row_items: Vec<Element<Message>> = vec![navigate.into()];
 
-    if let Some(toggle_target) = chevron_toggle {
+    if let Some((toggle_id, is_open)) = chevron_toggle {
         row_items.push(Space::new(4, 0).into());
         row_items.push(
-            button(text(if toggle_target.is_none() { "▾" } else { "▸" }).size(9).color(s.faint))
-                .on_press(Message::SelectOrchestrator(toggle_target))
+            button(text(if is_open { "▾" } else { "▸" }).size(9).color(s.faint))
+                .on_press(Message::SelectOrchestrator(toggle_id))
                 .style(move |_t, status| button::Style {
                     background: row_bg(matches!(status, button::Status::Hovered)),
                     border: Border::default(),
