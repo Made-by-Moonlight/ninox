@@ -494,6 +494,31 @@ impl App {
         }
     }
 
+    /// Refetches `backlinks`/`related` for `brain_view.selected` from the
+    /// index. No-ops when nothing is selected. Shared by `BrainSelectEntry`
+    /// (fresh selection) and `BrainReindex` (index may have changed under a
+    /// still-selected entry) — markdown handling stays with the select path
+    /// since reindex never changes which entry is selected, only its graph.
+    fn refresh_selection_graph(state: &mut Self) {
+        let Some(id) = state.brain_view.selected.clone() else {
+            return;
+        };
+        match state.brain.backlinks(&id) {
+            Ok(backs) => state.brain_view.backlinks = backs,
+            Err(e) => {
+                tracing::warn!("brain backlinks({id}): {e}");
+                state.brain_view.backlinks = Vec::new();
+            }
+        }
+        match state.brain.related(&id, 6) {
+            Ok(rel) => state.brain_view.related = rel,
+            Err(e) => {
+                tracing::warn!("brain related({id}): {e}");
+                state.brain_view.related = Vec::new();
+            }
+        }
+    }
+
     /// Shared mutation logic.
     fn apply(state: &mut Self, message: Message) -> Task<Message> {
         match message {
@@ -1315,21 +1340,8 @@ impl App {
                     state.brain_view.open_drawers.insert(e.entry_type.clone());
                     state.brain_view.mode = BrainMode::Catalogue;
                 }
-                match state.brain.backlinks(&id) {
-                    Ok(backs) => state.brain_view.backlinks = backs,
-                    Err(e) => {
-                        tracing::warn!("brain backlinks({id}): {e}");
-                        state.brain_view.backlinks = Vec::new();
-                    }
-                }
-                match state.brain.related(&id, 6) {
-                    Ok(rel) => state.brain_view.related = rel,
-                    Err(e) => {
-                        tracing::warn!("brain related({id}): {e}");
-                        state.brain_view.related = Vec::new();
-                    }
-                }
                 state.brain_view.selected = Some(id);
+                Self::refresh_selection_graph(state);
                 Task::none()
             }
 
@@ -1351,6 +1363,22 @@ impl App {
                             Ok(entries) => {
                                 state.brain_view.entries = entries;
                                 Self::refresh_brain_edges(state);
+                                // The selected entry may have been renamed or
+                                // deleted by whatever triggered the reindex —
+                                // if it no longer resolves, clear the pane
+                                // instead of showing a ghost selection.
+                                let ghost = state
+                                    .brain_view
+                                    .selected
+                                    .as_ref()
+                                    .is_some_and(|id| !state.brain_view.entries.iter().any(|e| &e.id == id));
+                                if ghost {
+                                    state.brain_view.selected = None;
+                                    state.brain_view.markdown = Vec::new();
+                                    state.brain_view.backlinks = Vec::new();
+                                    state.brain_view.related = Vec::new();
+                                }
+                                Self::refresh_selection_graph(state);
                             }
                             Err(e) => tracing::error!("brain query after reindex: {e}"),
                         }
@@ -2485,6 +2513,99 @@ mod tests {
             "alice directly links to bob, so alice should rank in bob's related list: {:?}",
             m3.brain_view.related.iter().map(|e| &e.id).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn reindex_refreshes_backlinks_and_related_for_the_selected_entry() {
+        // BrainReindex used to refetch entries + edges but leave the reading
+        // pane's backlinks/related as stale snapshots from selection time --
+        // if the on-disk citation graph changed underneath the selection,
+        // the chips kept pointing at a graph that no longer existed.
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("people")).unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("alice.md"),
+            "---\nname: Alice\n---\nManages [[bob]].",
+        )
+        .unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("bob.md"),
+            "---\nname: Bob\n---\nReports to [[alice]].",
+        )
+        .unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m2, _) = m.update(Message::NavigateBrain);
+        let (m3, _) = m2.update(Message::BrainSelectEntry("people/alice.md".into()));
+        assert_eq!(
+            m3.brain_view.backlinks.len(),
+            1,
+            "bob cites alice, so alice's backlinks should start populated"
+        );
+        assert!(m3.brain_view.related.iter().any(|e| e.id == "people/bob.md"));
+
+        // Bob (the only entry citing/cited-by alice) is deleted on disk
+        // (e.g. removed outside the app) -- alice stays selected, but her
+        // backlinks/related must reflect the new, bob-less graph after
+        // reindex rather than the stale selection-time snapshot.
+        std::fs::remove_file(brain_dir.join("people").join("bob.md")).unwrap();
+
+        let (m4, _) = m3.update(Message::BrainReindex);
+        assert_eq!(m4.brain_view.selected.as_deref(), Some("people/alice.md"));
+        assert!(
+            m4.brain_view.backlinks.is_empty(),
+            "backlinks must be refreshed after reindex, not left stale: {:?}",
+            m4.brain_view.backlinks.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+        assert!(
+            m4.brain_view.related.is_empty(),
+            "bob is gone, so alice's related list must be refreshed to drop it, not left stale: {:?}",
+            m4.brain_view.related.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reindex_clears_selection_if_the_selected_entry_disappears() {
+        // If the selected entry's file is deleted (or renamed) before a
+        // reindex, `selected` must be cleared so the reading pane falls back
+        // to its empty state instead of showing a ghost entry with stale
+        // markdown/backlinks/related from before the deletion.
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("people")).unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("alice.md"),
+            "---\nname: Alice\n---\nManages [[bob]].",
+        )
+        .unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("bob.md"),
+            "---\nname: Bob\n---\nReports to [[alice]].",
+        )
+        .unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m2, _) = m.update(Message::NavigateBrain);
+        let (m3, _) = m2.update(Message::BrainSelectEntry("people/alice.md".into()));
+        assert_eq!(m3.brain_view.selected.as_deref(), Some("people/alice.md"));
+        assert!(!m3.brain_view.markdown.is_empty());
+        assert!(!m3.brain_view.backlinks.is_empty());
+
+        std::fs::remove_file(brain_dir.join("people").join("alice.md")).unwrap();
+
+        let (m4, _) = m3.update(Message::BrainReindex);
+        assert_eq!(
+            m4.brain_view.selected, None,
+            "selection must be cleared once the selected entry no longer resolves"
+        );
+        assert!(m4.brain_view.markdown.is_empty());
+        assert!(m4.brain_view.backlinks.is_empty());
+        assert!(m4.brain_view.related.is_empty());
     }
 
     #[test]
