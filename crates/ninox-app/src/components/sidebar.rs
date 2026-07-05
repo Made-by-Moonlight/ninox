@@ -313,9 +313,24 @@ fn tree_row<'a>(
             Space::new(left_pad - 3.0, 0),
             dot,
             Space::new(9, 0),
-            text(name.to_owned()).size(12.5).font(name_font).color(if is_active || bold { s.ink } else { s.ink_2 }),
-            Space::new(Length::Fill, 0),
-            text(right.to_owned()).size(10).font(MONO).color(s.faint),
+            // Single-line + clipped: at narrow sidebar widths iced would
+            // otherwise wrap the name onto two lines and letter-stack the
+            // mono slug into a vertical column over the row controls.
+            container(
+                text(name.to_owned())
+                    .size(12.5)
+                    .font(name_font)
+                    .color(if is_active || bold { s.ink } else { s.ink_2 })
+                    .wrapping(iced::widget::text::Wrapping::None),
+            )
+            .width(Length::Fill)
+            .clip(true),
+            Space::new(6, 0),
+            text(right.to_owned())
+                .size(10)
+                .font(MONO)
+                .color(s.faint)
+                .wrapping(iced::widget::text::Wrapping::None),
         ]
         .align_y(Alignment::Center),
     )
