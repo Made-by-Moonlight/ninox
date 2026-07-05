@@ -784,6 +784,7 @@ impl App {
                     harness: preset.harness.to_string(),
                     model:   preset.model.map(|m| m.to_string()),
                 };
+                let base_cmd = state.config.registry().interactive_cmd(&agent);
                 let catalogue = state.config.catalogue_options()
                     .into_iter()
                     .nth(form.catalogue_idx)
@@ -907,6 +908,7 @@ impl App {
                                     repo,
                                     orchestrator_id: None,
                                     agent,
+                                    base_cmd,
                                     catalogue_path,
                                     extra_env:       Vec::new(),
                                     started_at:      ts_i64,
@@ -1019,6 +1021,7 @@ impl App {
                                     repo:            String::new(),
                                     orchestrator_id: None,
                                     agent:           orch_agent,
+                                    base_cmd,
                                     catalogue_path,
                                     extra_env,
                                     started_at:      ts_i64,

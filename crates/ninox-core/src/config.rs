@@ -53,60 +53,9 @@ impl Default for AgentConfig {
     }
 }
 
-impl AgentConfig {
-    /// Interactive launch command for an orchestrator session.
-    pub fn interactive_cmd(&self) -> String {
-        let binary = harness_binary(&self.harness);
-        match &self.model {
-            Some(m) => format!("{binary} --model {m}"),
-            None    => binary.to_string(),
-        }
-    }
-
-    /// Launch command for a worker session.
-    pub fn worker_cmd(&self, prompt: &str) -> String {
-        let binary = harness_binary(&self.harness);
-        let quoted = shell_quote(prompt);
-        match self.harness.as_str() {
-            "claude-code" => {
-                // Interactive mode with positional prompt: the full agent TUI is
-                // visible in the terminal and the agent runs autonomously.
-                // --dangerously-skip-permissions allows tool calls without approval.
-                let model_part = self.model.as_deref()
-                    .map(|m| format!(" --model {}", shell_quote(m)))
-                    .unwrap_or_default();
-                format!("{binary} --dangerously-skip-permissions{model_part} -- {quoted}")
-            }
-            "aider" => {
-                let model_part = self.model.as_deref()
-                    .map(|m| format!(" --model {}", shell_quote(m)))
-                    .unwrap_or_default();
-                format!("{binary}{model_part} --message {quoted}")
-            }
-            _ => {
-                let model_part = self.model.as_deref()
-                    .map(|m| format!(" --model {}", shell_quote(m)))
-                    .unwrap_or_default();
-                format!("{binary}{model_part} -p {quoted}")
-            }
-        }
-    }
-}
-
-fn harness_binary(harness: &str) -> &str {
-    match harness {
-        "claude-code" => "claude",
-        "codex"       => "codex",
-        "aider"       => "aider",
-        "opencode"    => "opencode",
-        other         => other,
-    }
-}
-
-
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
+// Launch-command construction lives in `crate::harness` — `AgentConfig` is
+// only the per-role/per-spawn pointer (harness name + model) into the
+// registry; resolve via `AppConfig::registry().interactive_cmd/worker_cmd`.
 
 // ---------------------------------------------------------------------------
 // Brain configuration
@@ -345,29 +294,8 @@ mod tests {
         assert!(cfg.worker.model.is_none());
     }
 
-    #[test]
-    fn interactive_cmd_with_model() {
-        let cfg = AgentConfig { harness: "claude-code".into(), model: Some("claude-opus-4-5".into()) };
-        assert_eq!(cfg.interactive_cmd(), "claude --model claude-opus-4-5");
-    }
-
-    #[test]
-    fn worker_cmd_codex() {
-        let cfg = AgentConfig { harness: "codex".into(), model: Some("gpt-4o".into()) };
-        assert_eq!(cfg.worker_cmd("do the thing"), "codex --model 'gpt-4o' -p 'do the thing'");
-    }
-
-    #[test]
-    fn worker_cmd_claude_code() {
-        let cfg = AgentConfig { harness: "claude-code".into(), model: None };
-        assert_eq!(cfg.worker_cmd("Fix the bug"), "claude --dangerously-skip-permissions -- 'Fix the bug'");
-    }
-
-    #[test]
-    fn worker_cmd_claude_code_with_model() {
-        let cfg = AgentConfig { harness: "claude-code".into(), model: Some("claude-opus-4-5".into()) };
-        assert_eq!(cfg.worker_cmd("do task"), "claude --dangerously-skip-permissions --model 'claude-opus-4-5' -- 'do task'");
-    }
+    // Launch-shape tests for the four known harnesses moved to
+    // `crate::harness::tests` with the registry.
 
     #[test]
     fn resolved_orchestrator_root_default() {

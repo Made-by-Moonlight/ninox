@@ -7,7 +7,7 @@ mod theme;
 
 use spawn_util::{create_worker_worktree, repo_from_workspace};
 use ninox_core::{
-    config::{AgentConfig, AppConfig},
+    config::AppConfig,
     events::Engine,
     github::resolve_token,
     lifecycle::poller::Poller,
@@ -111,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
     match args.command {
         Some(Command::Spawn { prompt, workspace, name, orchestrator_id }) => {
             let config = AppConfig::load().unwrap_or_default();
-            run_spawn(store, config.worker, prompt, workspace, name, orchestrator_id).await
+            run_spawn(store, config, prompt, workspace, name, orchestrator_id).await
         }
         Some(Command::Send { session_id, message }) => {
             ninox_core::tmux::send_keys(&session_id, &message).await
@@ -125,12 +125,13 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_spawn(
     store: Arc<Store>,
-    agent: AgentConfig,
+    config: AppConfig,
     prompt: String,
     workspace: String,
     name: Option<String>,
     orchestrator_id: Option<String>,
 ) -> anyhow::Result<()> {
+    let agent = config.worker.clone();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -212,7 +213,15 @@ async fn run_spawn(
     // -e PATH=..., because the login shell (-l) sources rc files that may
     // re-prepend Homebrew or nvm directories, pushing our wrapper behind the
     // real `gh`. By exporting PATH here we win the race after rc files run.
-    let cmd_base = agent.worker_cmd(&effective_prompt);
+    let registry = config.registry();
+    let Some(cmd_base) = registry.worker_cmd(&agent, &effective_prompt) else {
+        anyhow::bail!(
+            "harness '{}' has no verified worker mode (no worker_args in its spec) — \
+             pick a worker-capable harness in Settings or add worker_args under \
+             [harnesses.{}] in config.toml",
+            agent.harness, agent.harness,
+        );
+    };
     let cmd = format!(
         "export PATH='{}':\"$PATH\"; {}",
         ninox_bin_str.replace('\'', "'\\''"),

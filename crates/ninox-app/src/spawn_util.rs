@@ -24,6 +24,11 @@ pub struct InteractiveSpawnParams {
     pub repo:            String,
     pub orchestrator_id: Option<String>,
     pub agent:           ninox_core::config::AgentConfig,
+    /// Resolved interactive launch command (registry-resolved by the
+    /// caller: `AppConfig::registry().interactive_cmd(&agent)`). Kept
+    /// separate from `agent` so this module needs no registry access;
+    /// `agent` remains for session-record stamping (agent_type/model).
+    pub base_cmd:        String,
     /// Brain catalogue path, exported as `NINOX_BRAIN` for both kinds.
     pub catalogue_path:  String,
     /// Extra env pairs beyond the shared NINOX_BIN/NINOX_CONFIG/NINOX_BRAIN
@@ -72,7 +77,7 @@ pub async fn spawn_interactive_session(
     // login-shell rc files reorder PATH.
     let ninox_bin_dir = ninox_core::config::AppConfig::ninox_bin_dir();
     let ninox_bin_dir_str = ninox_bin_dir.display().to_string().replace('\'', "'\\''");
-    let base_cmd = p.agent.interactive_cmd();
+    let base_cmd = p.base_cmd;
     let launch_cmd = format!("export PATH='{ninox_bin_dir_str}':\"$PATH\"; {base_cmd}");
 
     if let Err(e) = tmux::create_session(&sid, &p.workspace, &launch_cmd, &env).await {
@@ -295,6 +300,9 @@ mod persistence_probe {
                 repo:            String::new(),
                 orchestrator_id: None,
                 agent:           AgentConfig::default(),
+                base_cmd:        ninox_core::config::AppConfig::default()
+                                     .registry()
+                                     .interactive_cmd(&AgentConfig::default()),
                 catalogue_path:  String::new(),
                 extra_env:       Vec::new(),
                 started_at:      0,
@@ -340,6 +348,9 @@ mod persistence_probe {
                 repo:            String::new(),
                 orchestrator_id: None,
                 agent:           AgentConfig::default(),
+                base_cmd:        ninox_core::config::AppConfig::default()
+                                     .registry()
+                                     .interactive_cmd(&AgentConfig::default()),
                 catalogue_path:  String::new(),
                 extra_env:       Vec::new(),
                 started_at:      0,
