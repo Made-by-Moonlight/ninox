@@ -269,28 +269,6 @@ fn worker_env_vars<'a>(
     env_vec
 }
 
-#[cfg(test)]
-mod worker_env_tests {
-    use super::worker_env_vars;
-
-    #[test]
-    fn forwards_brain_and_config_when_present() {
-        let env = worker_env_vars("w1", "/data", "orch1", Some("/brain.db"), Some("/cfg.toml"));
-        assert!(env.contains(&("NINOX_ORCHESTRATOR_ID", "orch1")));
-        assert!(env.contains(&("NINOX_BRAIN", "/brain.db")));
-        assert!(env.contains(&("NINOX_CONFIG", "/cfg.toml")));
-        assert!(env.contains(&("ATHENE_SESSION", "w1")));
-        assert!(env.contains(&("ATHENE_DATA_DIR", "/data")));
-    }
-
-    #[test]
-    fn omits_brain_config_and_orchestrator_id_when_absent() {
-        let env = worker_env_vars("w1", "/data", "", None, None);
-        assert!(!env.iter().any(|(k, _)| *k == "NINOX_ORCHESTRATOR_ID"));
-        assert!(!env.iter().any(|(k, _)| *k == "NINOX_BRAIN"));
-        assert!(!env.iter().any(|(k, _)| *k == "NINOX_CONFIG"));
-    }
-}
 
 async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
     let config = AppConfig::load().unwrap_or_default();
@@ -437,3 +415,25 @@ fn has_display() -> bool {
     { std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok() }
 }
 
+#[cfg(test)]
+mod worker_env_tests {
+    use super::worker_env_vars;
+
+    #[test]
+    fn forwards_brain_and_config_when_present() {
+        let env = worker_env_vars("w1", "/data", "orch1", Some("/brain.db"), Some("/cfg.toml"));
+        assert!(env.contains(&("NINOX_ORCHESTRATOR_ID", "orch1")));
+        assert!(env.contains(&("NINOX_BRAIN", "/brain.db")));
+        assert!(env.contains(&("NINOX_CONFIG", "/cfg.toml")));
+        assert!(env.contains(&("ATHENE_SESSION", "w1")));
+        assert!(env.contains(&("ATHENE_DATA_DIR", "/data")));
+    }
+
+    #[test]
+    fn omits_brain_config_and_orchestrator_id_when_absent() {
+        let env = worker_env_vars("w1", "/data", "", None, None);
+        assert!(!env.iter().any(|(k, _)| *k == "NINOX_ORCHESTRATOR_ID"));
+        assert!(!env.iter().any(|(k, _)| *k == "NINOX_BRAIN"));
+        assert!(!env.iter().any(|(k, _)| *k == "NINOX_CONFIG"));
+    }
+}
