@@ -200,6 +200,10 @@ pub enum Message {
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
     RemoveOrchestrator(OrchestratorId),
     RemoveSession(SessionId),
+    /// Kill the tmux session and respawn the same name/workspace with the
+    /// CURRENT registry settings (session header, beside Kill). On a
+    /// Terminated husk this "just spawns".
+    RefileSession(SessionId),
     SwitchTheme(ThemeVariant),
     // Raw key event from the global subscription — bytes are computed in the handler
     // where we have access to the terminal mode (APP_CURSOR changes arrow sequences).
@@ -259,6 +263,49 @@ pub enum Message {
 }
 
 // ---------------------------------------------------------------------------
+// Re-file — respawn a session onto current settings
+// ---------------------------------------------------------------------------
+
+/// Everything a Re-file needs, resolved against the CURRENT registry —
+/// settings changes apply to new spawns immediately and to existing
+/// sessions on Re-file; no silent in-place swaps (spec §V "Updating
+/// running sessions"). Pure so it's unit-testable without tmux.
+pub struct RefilePlan {
+    pub agent:          ninox_core::config::AgentConfig,
+    pub base_cmd:       String,
+    pub workspace:      String,
+    pub catalogue_path: String,
+    pub extra_env:      Vec<(String, String)>,
+}
+
+/// `None` when the session has no recorded workspace (nothing to respawn
+/// into). A worker re-files interactively — its original spawn prompt is
+/// not stored — but keeps its orchestrator attachment for the tree.
+pub fn refile_plan(
+    session: &Session,
+    is_orchestrator: bool,
+    config: &AppConfig,
+) -> Option<RefilePlan> {
+    let workspace = session.workspace_path.clone()?;
+    let agent = ninox_core::config::AgentConfig {
+        harness: session.agent_type.clone(),
+        model:   session.model.clone(),
+    };
+    let base_cmd = config.registry().interactive_cmd(&agent);
+    let catalogue_path = session.catalogue_path.clone()
+        .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
+    let extra_env = if is_orchestrator {
+        vec![
+            ("NINOX_ORCHESTRATOR_ID".to_string(), session.id.clone()),
+            ("AO_CALLER_TYPE".to_string(),        "orchestrator".to_string()),
+            ("ATHENE_CALLER_TYPE".to_string(),    "orchestrator".to_string()),
+        ]
+    } else {
+        Vec::new()
+    };
+    Some(RefilePlan { agent, base_cmd, workspace, catalogue_path, extra_env })
+}
+
 // ---------------------------------------------------------------------------
 // Keyboard → terminal byte conversion (static fn — no captures allowed by listen_with)
 // ---------------------------------------------------------------------------
@@ -941,6 +988,7 @@ impl App {
                             pid:             None,
                             model:           agent.model.clone(),
                             context_tokens:  None,
+                            catalogue_path:  Some(catalogue_path.clone()),
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1074,6 +1122,7 @@ impl App {
                             pid:             None,
                             model:           agent.model.clone(),
                             context_tokens:  None,
+                            catalogue_path:  Some(catalogue_path.clone()),
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1184,6 +1233,56 @@ impl App {
                         tracing::error!("remove session {id}: {e}");
                     }
                     Message::Noop
+                })
+            }
+
+            Message::RefileSession(id) => {
+                let Some(session) = state.sessions.get(&id).cloned() else { return Task::none(); };
+                let is_orch = state.orchestrators.iter().any(|o| o.id == id);
+                let Some(plan) = refile_plan(&session, is_orch, &state.config) else {
+                    tracing::warn!("refile {id}: no workspace recorded, cannot respawn");
+                    return Task::none();
+                };
+                // Drop the live client/grid first so the old PTY doesn't
+                // fight the respawn for the same tmux session name.
+                state.clients.remove(&id);
+                state.terminals.remove(&id);
+
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let engine  = state.engine.clone();
+                let name    = session.name.clone();
+                let repo    = session.repo.clone();
+                let orch_id = session.orchestrator_id.clone();
+                Task::future(async move {
+                    // Ignore kill errors — a Terminated husk has no tmux
+                    // session, and Re-file on one "just spawns". The
+                    // respawn upserts the record back to Working with cost
+                    // 0; the usage poller re-ingests real spend from the
+                    // workspace transcript.
+                    let _ = ninox_core::tmux::kill_session(&id).await;
+                    let attach = crate::spawn_util::spawn_interactive_session(
+                        engine,
+                        crate::spawn_util::InteractiveSpawnParams {
+                            session_id:      id.clone(),
+                            name,
+                            workspace:       plan.workspace,
+                            repo,
+                            orchestrator_id: orch_id,
+                            agent:           plan.agent,
+                            base_cmd:        plan.base_cmd,
+                            catalogue_path:  plan.catalogue_path,
+                            extra_env:       plan.extra_env,
+                            started_at:      ts,
+                        },
+                    )
+                    .await;
+                    match attach {
+                        Some(argv) => Message::ClientAttach { session_id: id, argv },
+                        None       => Message::Noop,
+                    }
                 })
             }
 
@@ -2193,6 +2292,66 @@ mod tests {
         }
     }
 
+    fn refile_session(id: &str) -> Session {
+        Session {
+            id: id.into(), orchestrator_id: None, name: id.into(), repo: String::new(),
+            status: SessionStatus::Terminated, agent_type: "claude-code".into(),
+            cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: Some("/tmp/ws".into()), pid: None,
+            model: Some("claude-opus-4-8".into()), context_tokens: None,
+            catalogue_path: Some("/brains/b".into()),
+        }
+    }
+
+    #[test]
+    fn refile_plan_resolves_agent_through_current_registry() {
+        let mut cfg = ninox_core::config::AppConfig::default();
+        // simulate a spec change since the session was filed
+        cfg.harnesses.insert("claude-code".to_string(), ninox_core::harness::HarnessSpec {
+            enabled: true,
+            binary:  Some("claude-nightly".into()),
+            interactive_args: vec!["--model".into(), "{model}".into()],
+            ..Default::default()
+        });
+        let session = refile_session("s1");
+        let plan = refile_plan(&session, false, &cfg).expect("plan");
+        assert_eq!(plan.base_cmd, "claude-nightly --model 'claude-opus-4-8'");
+        assert_eq!(plan.workspace, "/tmp/ws");
+        assert_eq!(plan.catalogue_path, "/brains/b");
+        assert!(plan.extra_env.is_empty());
+        assert_eq!(plan.agent.harness, "claude-code");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn refile_plan_orchestrator_gets_caller_env_and_no_workspace_means_no_plan() {
+        let cfg = ninox_core::config::AppConfig::default();
+        let mut session = refile_session("o1");
+        session.catalogue_path = None;
+        let plan = refile_plan(&session, true, &cfg).expect("plan");
+        assert!(plan.extra_env.iter().any(|(k, v)| k == "NINOX_ORCHESTRATOR_ID" && v == "o1"));
+        assert!(plan.extra_env.iter().any(|(k, _)| k == "ATHENE_CALLER_TYPE"));
+        // no recorded catalogue → default brain path
+        assert!(!plan.catalogue_path.is_empty());
+
+        session.workspace_path = None;
+        assert!(refile_plan(&session, true, &cfg).is_none());
+    }
+
+    #[test]
+    fn refile_message_drops_client_state_and_keeps_session() {
+        let e = test_engine();
+        let mut m = base(e);
+        let s = refile_session("s1");
+        m.sessions.insert("s1".into(), s);
+        m.terminals.insert("s1".into(), TerminalState::new(80, 24, None));
+        let (m, _) = m.update(Message::RefileSession("s1".into()));
+        // The stale grid is dropped so the respawned PTY starts clean; the
+        // session record itself stays (the respawn upserts it to Working).
+        assert!(!m.terminals.contains_key("s1"));
+        assert!(m.sessions.contains_key("s1"));
+    }
+
     #[test]
     fn navigate_settings_switches_view() {
         let m = base(test_engine());
@@ -2234,7 +2393,7 @@ mod tests {
             pr_id:           None,
             workspace_path:  None,
             pid:             None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let (updated, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         assert!(updated.sessions.contains_key("s1"));
@@ -2296,7 +2455,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         m = next;
@@ -2342,7 +2501,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         }).unwrap();
         let engine = Engine::new(store);
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
@@ -2363,7 +2522,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.42,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         m = m2;
@@ -2391,7 +2550,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let _ = m.engine.store.upsert_session(&worker);
         let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(worker)));
@@ -2807,7 +2966,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 1.23,
             started_at: 0, pr_number: Some(42), pr_id: None,
             workspace_path: Some("/tmp/w".into()), pid: Some(1234),
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -2833,7 +2992,7 @@ mod tests {
                 agent_type: "claude-code".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -2883,7 +3042,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         // NavigateSession defaults to the Split panel, so switch to Terminal
@@ -2928,7 +3087,7 @@ mod tests {
                 agent_type: "claude-code".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -3007,7 +3166,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         let (m, _) = m.update(Message::NavigateSession("s1".into()));
@@ -3057,7 +3216,7 @@ mod tests {
                 agent_type: "c".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -3145,7 +3304,7 @@ mod tests {
                 agent_type: "c".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -3786,7 +3945,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         m = next;

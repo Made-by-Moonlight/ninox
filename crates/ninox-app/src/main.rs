@@ -205,6 +205,10 @@ async fn run_spawn(
         pid:             None,
         model:           agent.model.clone(),
         context_tokens:  None,
+        // The catalogue this worker thinks with — `NINOX_BRAIN` is
+        // forwarded from the orchestrator's own environment (see the env
+        // block below), so record the same value for Re-file.
+        catalogue_path:  std::env::var("NINOX_BRAIN").ok().filter(|s| !s.is_empty()),
     };
 
     store.upsert_session(&session)?;

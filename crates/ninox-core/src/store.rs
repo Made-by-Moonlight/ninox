@@ -46,6 +46,7 @@ impl Store {
         for (col, ddl) in [
             ("model",          "ALTER TABLE sessions ADD COLUMN model TEXT"),
             ("context_tokens", "ALTER TABLE sessions ADD COLUMN context_tokens INTEGER"),
+            ("catalogue_path", "ALTER TABLE sessions ADD COLUMN catalogue_path TEXT"),
         ] {
             if !Self::column_exists(&conn, "sessions", col)? {
                 conn.execute(ddl, [])?;
@@ -68,17 +69,20 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO sessions (id,orchestrator_id,name,repo,status,agent_type,
-             cost_usd,started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+             cost_usd,started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
+             catalogue_path)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
              ON CONFLICT(id) DO UPDATE SET
              status=excluded.status,cost_usd=excluded.cost_usd,
              pr_number=excluded.pr_number,pr_id=excluded.pr_id,
              workspace_path=excluded.workspace_path,pid=excluded.pid,
-             model=excluded.model,context_tokens=excluded.context_tokens",
+             model=excluded.model,context_tokens=excluded.context_tokens,
+             catalogue_path=excluded.catalogue_path",
             params![
                 s.id, s.orchestrator_id, s.name, s.repo, status, s.agent_type,
                 s.cost_usd, s.started_at, s.pr_number, s.pr_id,
-                s.workspace_path, s.pid, s.model, s.context_tokens
+                s.workspace_path, s.pid, s.model, s.context_tokens,
+                s.catalogue_path
             ],
         )?;
         Ok(())
@@ -88,7 +92,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
-             started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens
+             started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
+             catalogue_path
              FROM sessions ORDER BY started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -107,18 +112,20 @@ impl Store {
                 r.get::<_, Option<u32>>(11)?,
                 r.get::<_, Option<String>>(12)?,
                 r.get::<_, Option<i64>>(13)?,
+                r.get::<_, Option<String>>(14)?,
             ))
         })?;
         rows.map(|r| {
             let (id, orchestrator_id, name, repo, status_str, agent_type,
                  cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
-                 model, context_tokens) = r?;
+                 model, context_tokens, catalogue_path) = r?;
             let status = serde_json::from_str(&format!("\"{status_str}\""))
                 .unwrap_or(SessionStatus::Working);
             Ok(Session {
                 id, orchestrator_id, name, repo, status, agent_type,
                 cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                 model, context_tokens: context_tokens.map(|v| v.max(0) as u64),
+                catalogue_path,
             })
         })
         .collect()
@@ -128,7 +135,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
-             started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens
+             started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
+             catalogue_path
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], |r| {
@@ -147,6 +155,7 @@ impl Store {
                 r.get::<_, Option<u32>>(11)?,
                 r.get::<_, Option<String>>(12)?,
                 r.get::<_, Option<i64>>(13)?,
+                r.get::<_, Option<String>>(14)?,
             ))
         })?;
         match rows.next() {
@@ -154,13 +163,14 @@ impl Store {
             Some(r) => {
                 let (id, orchestrator_id, name, repo, status_str, agent_type,
                      cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
-                     model, context_tokens) = r?;
+                     model, context_tokens, catalogue_path) = r?;
                 let status = serde_json::from_str(&format!("\"{status_str}\""))
                     .unwrap_or(SessionStatus::Working);
                 Ok(Some(Session {
                     id, orchestrator_id, name, repo, status, agent_type,
                     cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                     model, context_tokens: context_tokens.map(|v| v.max(0) as u64),
+                    catalogue_path,
                 }))
             }
         }
@@ -283,7 +293,7 @@ mod tests {
             repo: "slievr/Athene".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         store.upsert_session(&session).unwrap();
         let list = store.list_sessions().unwrap();
@@ -299,7 +309,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         store.upsert_session(&s).unwrap();
         s.status = SessionStatus::Done;
@@ -317,7 +327,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap();
@@ -334,12 +344,30 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 1.5, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: Some("claude-fable-5".into()), context_tokens: Some(214_000),
+            model: Some("claude-fable-5".into()), context_tokens: Some(214_000), catalogue_path: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap().unwrap();
         assert_eq!(found.model.as_deref(), Some("claude-fable-5"));
         assert_eq!(found.context_tokens, Some(214_000));
+    }
+
+    #[test]
+    fn catalogue_path_round_trips() {
+        let store = test_store();
+        let s = Session {
+            id: "s2".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None,
+            catalogue_path: Some("/brains/x".into()),
+        };
+        store.upsert_session(&s).unwrap();
+        let found = store.get_session("s2").unwrap().unwrap();
+        assert_eq!(found.catalogue_path.as_deref(), Some("/brains/x"));
+        // list path decodes it too
+        assert_eq!(store.list_sessions().unwrap()[0].catalogue_path.as_deref(), Some("/brains/x"));
     }
 
     #[test]
@@ -357,7 +385,7 @@ mod tests {
                 repo: "r".into(), status: SessionStatus::Working,
                 agent_type: agent_type.into(), cost_usd: cost, started_at: 0,
                 pr_number: None, pr_id: None, workspace_path: None, pid: None,
-                model: model.map(String::from), context_tokens: None,
+                model: model.map(String::from), context_tokens: None, catalogue_path: None,
             }).unwrap();
         }
         let samples = store.cost_samples("claude-code", Some("claude-fable-5")).unwrap();

@@ -241,6 +241,27 @@ pub fn session_detail<'a>(
         None => Space::new(0, 0).into(),
     };
 
+    // Re-file: kill + respawn the same name/workspace with the CURRENT
+    // registry settings. Rendered for ALL sessions (orchestrators too —
+    // this also covers respawning over a Terminated husk, which "just
+    // spawns").
+    let refile_btn: Element<Message> = {
+        let sid = session_id.to_string();
+        button(crate::style::micro_label("Re-file", s.ink_2).size(10.0))
+            .on_press(Message::RefileSession(sid))
+            .padding([6, 16])
+            .style(move |_theme, status| {
+                let hovered = matches!(status, button::Status::Hovered);
+                button::Style {
+                    background: hovered.then_some(Background::Color(s.ink)),
+                    text_color: if hovered { s.card } else { s.ink_2 },
+                    border: Border { color: s.ink_2, width: 1.5, radius: 2.0.into() },
+                    shadow: crate::style::hard_shadow(s, 2.0, 2.0, crate::style::shadow_alpha(s).0),
+                }
+            })
+            .into()
+    };
+
     let kill_btn: Element<Message> = if !is_orchestrator {
         let sid = session_id.to_string();
         button(crate::style::micro_label("Kill", s.accent).size(10.0))
@@ -272,6 +293,8 @@ pub fn session_detail<'a>(
             Space::new(14, 0),
             text(cost).size(13).font(crate::style::MONO).color(s.ink_2),
             Space::new(14, 0),
+            refile_btn,
+            Space::new(10, 0),
             kill_btn,
         ]
         .align_y(Alignment::Center),
