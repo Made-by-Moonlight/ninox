@@ -46,6 +46,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 0, pr_number: Some(7), pr_id: Some(7),
             workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         }
     }
 

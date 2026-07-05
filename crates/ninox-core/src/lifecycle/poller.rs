@@ -6,6 +6,7 @@ use crate::{
     lifecycle::{
         enrichment::EnrichmentCache,
         probe::is_pid_alive,
+        usage,
     },
     types::{
         CIStatus, Comment, Notification, NotificationKind, PrId, SessionStatus, PR,
@@ -37,13 +38,16 @@ impl Poller {
 
     pub async fn start(self, token: CancellationToken) {
         let mut pid_interval    = tokio::time::interval(Duration::from_secs(5));
+        let mut usage_interval  = tokio::time::interval(Duration::from_secs(10));
         let mut github_interval = tokio::time::interval(Duration::from_secs(30));
         // Prevent a missed tick from causing back-to-back polls.
         github_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        usage_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = token.cancelled()      => break,
                 _ = pid_interval.tick()    => self.poll_pids().await,
+                _ = usage_interval.tick()  => self.poll_usage().await,
                 _ = github_interval.tick() => self.poll_github().await,
             }
         }
@@ -84,6 +88,39 @@ impl Poller {
                     }
                 }
             }
+        }
+    }
+
+    // ── Cost / context-window usage ─────────────────────────────────────────
+
+    /// Ingest cost/token usage for every active session by reading `claude`'s
+    /// own transcript for the session's workspace directory (see
+    /// `lifecycle::usage`). Sessions without a workspace, or whose transcript
+    /// has no usage yet (agent hasn't taken a turn), are left untouched.
+    /// Only writes + emits when something actually changed, so this doesn't
+    /// spam the store/UI every tick for idle sessions.
+    async fn poll_usage(&self) {
+        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+        for mut session in sessions {
+            if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
+                continue;
+            }
+            let Some(workspace) = session.workspace_path.clone() else { continue };
+            let Some(snapshot) = usage::ingest_usage_for_workspace(&workspace) else { continue };
+
+            let cost_changed = (session.cost_usd - snapshot.cost_usd).abs() > 1e-9;
+            let context_changed = session.context_tokens != Some(snapshot.context_tokens);
+            if !cost_changed && !context_changed {
+                continue;
+            }
+
+            session.cost_usd = snapshot.cost_usd;
+            session.context_tokens = Some(snapshot.context_tokens);
+            if session.model.is_none() {
+                session.model = snapshot.model;
+            }
+            let _ = self.engine.store.upsert_session(&session);
+            self.engine.emit(Event::SessionUpdated(session));
         }
     }
 
@@ -394,5 +431,92 @@ mod tests {
         let ci = CIStatus { pr_id: 1, total: 3, failing: 0, passing: 3, pending: 0 };
         let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, true);
         assert!(matches!(s, SessionStatus::ReviewPending));
+    }
+
+    fn test_session(id: &str, workspace: &str) -> crate::types::Session {
+        crate::types::Session {
+            id: id.into(), orchestrator_id: None, name: id.into(),
+            repo: String::new(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None,
+            workspace_path: Some(workspace.into()), pid: None,
+            model: None, context_tokens: None,
+        }
+    }
+
+    /// End-to-end (within-process) proof that the poller closes the gap
+    /// documented in `lifecycle::usage`: given a workspace whose `claude`
+    /// transcript directory has usage recorded, `poll_usage` writes the
+    /// derived cost/context/model back into the store and emits
+    /// `SessionUpdated` — the exact path the UI's $0.0000 / missing-tokens
+    /// symptom traces back to when this ingestion doesn't happen.
+    // The `ENV_TEST_GUARD` mutex is intentionally held across the `.await`
+    // points below — it serializes access to the process-global
+    // `NINOX_CLAUDE_PROJECTS_DIR` env var against other tests (in this file
+    // and in `lifecycle::usage`) for this single-threaded `#[tokio::test]`,
+    // and must stay held for the env var's entire lifetime, not just around
+    // the sync portions.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn poll_usage_ingests_transcript_into_store_and_emits_update() {
+        use crate::{lifecycle::usage::{claude_project_slug, ENV_TEST_GUARD}, store::Store};
+        use std::io::Write;
+
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let projects_dir = tempfile::tempdir().unwrap();
+        let workspace = "/tmp/poller-usage-probe-workspace";
+        let project_dir = projects_dir.path().join(claude_project_slug(workspace));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let mut f = std::fs::File::create(project_dir.join("s.jsonl")).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-07-05T13:00:00.000Z","message":{{"model":"claude-fable-5","usage":{{"input_tokens":2,"output_tokens":300,"cache_creation_input_tokens":500,"cache_read_input_tokens":45000}}}}}}"#
+        ).unwrap();
+        drop(f);
+
+        let prior = std::env::var("NINOX_CLAUDE_PROJECTS_DIR").ok();
+        std::env::set_var("NINOX_CLAUDE_PROJECTS_DIR", projects_dir.path());
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", workspace)).unwrap();
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_usage().await;
+
+        match prior {
+            Some(v) => std::env::set_var("NINOX_CLAUDE_PROJECTS_DIR", v),
+            None    => std::env::remove_var("NINOX_CLAUDE_PROJECTS_DIR"),
+        }
+
+        let updated = store.get_session("s1").unwrap().unwrap();
+        assert!(updated.cost_usd > 0.0, "cost_usd should be ingested, not 0.0000");
+        assert_eq!(updated.context_tokens, Some(2 + 500 + 45000));
+        assert_eq!(updated.model.as_deref(), Some("claude-fable-5"));
+
+        let evt = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("SessionUpdated should be emitted")
+            .unwrap();
+        assert!(matches!(evt, Event::SessionUpdated(s) if s.id == "s1" && s.cost_usd > 0.0));
+    }
+
+    #[tokio::test]
+    async fn poll_usage_leaves_sessions_without_workspace_or_usage_untouched() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut no_ws = test_session("no-ws", "/does/not/matter");
+        no_ws.workspace_path = None;
+        store.upsert_session(&no_ws).unwrap();
+        let engine = Engine::new(store.clone());
+        let poller = Poller::new(engine);
+
+        poller.poll_usage().await;
+
+        let unchanged = store.get_session("no-ws").unwrap().unwrap();
+        assert_eq!(unchanged.cost_usd, 0.0);
+        assert_eq!(unchanged.context_tokens, None);
     }
 }

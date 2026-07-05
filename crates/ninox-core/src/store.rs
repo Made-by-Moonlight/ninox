@@ -19,7 +19,8 @@ impl Store {
                 status TEXT NOT NULL, agent_type TEXT NOT NULL,
                 cost_usd REAL NOT NULL DEFAULT 0, started_at INTEGER NOT NULL,
                 pr_number INTEGER, pr_id INTEGER,
-                workspace_path TEXT, pid INTEGER
+                workspace_path TEXT, pid INTEGER,
+                model TEXT, context_tokens INTEGER
             );
             CREATE TABLE IF NOT EXISTS orchestrators (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL
@@ -40,7 +41,26 @@ impl Store {
                 path TEXT, line INTEGER, created_at INTEGER NOT NULL
             );
         ")?;
+        // Migrations for columns added after initial release — idempotent so
+        // both fresh and pre-existing databases end up with the same schema.
+        for (col, ddl) in [
+            ("model",          "ALTER TABLE sessions ADD COLUMN model TEXT"),
+            ("context_tokens", "ALTER TABLE sessions ADD COLUMN context_tokens INTEGER"),
+        ] {
+            if !Self::column_exists(&conn, "sessions", col)? {
+                conn.execute(ddl, [])?;
+            }
+        }
         Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let exists = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .any(|c| c == column);
+        Ok(exists)
     }
 
     pub fn upsert_session(&self, s: &Session) -> Result<()> {
@@ -48,16 +68,17 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO sessions (id,orchestrator_id,name,repo,status,agent_type,
-             cost_usd,started_at,pr_number,pr_id,workspace_path,pid)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+             cost_usd,started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
              ON CONFLICT(id) DO UPDATE SET
              status=excluded.status,cost_usd=excluded.cost_usd,
              pr_number=excluded.pr_number,pr_id=excluded.pr_id,
-             workspace_path=excluded.workspace_path,pid=excluded.pid",
+             workspace_path=excluded.workspace_path,pid=excluded.pid,
+             model=excluded.model,context_tokens=excluded.context_tokens",
             params![
                 s.id, s.orchestrator_id, s.name, s.repo, status, s.agent_type,
                 s.cost_usd, s.started_at, s.pr_number, s.pr_id,
-                s.workspace_path, s.pid
+                s.workspace_path, s.pid, s.model, s.context_tokens
             ],
         )?;
         Ok(())
@@ -67,7 +88,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
-             started_at,pr_number,pr_id,workspace_path,pid
+             started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens
              FROM sessions ORDER BY started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -84,16 +105,20 @@ impl Store {
                 r.get::<_, Option<i64>>(9)?,
                 r.get::<_, Option<String>>(10)?,
                 r.get::<_, Option<u32>>(11)?,
+                r.get::<_, Option<String>>(12)?,
+                r.get::<_, Option<i64>>(13)?,
             ))
         })?;
         rows.map(|r| {
             let (id, orchestrator_id, name, repo, status_str, agent_type,
-                 cost_usd, started_at, pr_number, pr_id, workspace_path, pid) = r?;
+                 cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
+                 model, context_tokens) = r?;
             let status = serde_json::from_str(&format!("\"{status_str}\""))
                 .unwrap_or(SessionStatus::Working);
             Ok(Session {
                 id, orchestrator_id, name, repo, status, agent_type,
                 cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
+                model, context_tokens: context_tokens.map(|v| v.max(0) as u64),
             })
         })
         .collect()
@@ -103,7 +128,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
-             started_at,pr_number,pr_id,workspace_path,pid
+             started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], |r| {
@@ -120,21 +145,43 @@ impl Store {
                 r.get::<_, Option<i64>>(9)?,
                 r.get::<_, Option<String>>(10)?,
                 r.get::<_, Option<u32>>(11)?,
+                r.get::<_, Option<String>>(12)?,
+                r.get::<_, Option<i64>>(13)?,
             ))
         })?;
         match rows.next() {
             None => Ok(None),
             Some(r) => {
                 let (id, orchestrator_id, name, repo, status_str, agent_type,
-                     cost_usd, started_at, pr_number, pr_id, workspace_path, pid) = r?;
+                     cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
+                     model, context_tokens) = r?;
                 let status = serde_json::from_str(&format!("\"{status_str}\""))
                     .unwrap_or(SessionStatus::Working);
                 Ok(Some(Session {
                     id, orchestrator_id, name, repo, status, agent_type,
                     cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
+                    model, context_tokens: context_tokens.map(|v| v.max(0) as u64),
                 }))
             }
         }
+    }
+
+    /// Non-zero `cost_usd` samples recorded for sessions matching the given
+    /// agent harness (`agent_type`) and model — used to compute a
+    /// data-driven spawn-modal cost estimate once enough history exists for
+    /// a given preset. Read-only; built on `list_sessions` like
+    /// `sessions_by_orchestrator`.
+    pub fn cost_samples(&self, agent_type: &str, model: Option<&str>) -> Result<Vec<f64>> {
+        let sessions = self.list_sessions()?;
+        Ok(sessions
+            .into_iter()
+            .filter(|s| {
+                s.agent_type == agent_type
+                    && s.model.as_deref() == model
+                    && s.cost_usd > 0.0
+            })
+            .map(|s| s.cost_usd)
+            .collect())
     }
 
     pub fn upsert_orchestrator(&self, o: &Orchestrator) -> Result<()> {
@@ -236,6 +283,7 @@ mod tests {
             repo: "slievr/Athene".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         };
         store.upsert_session(&session).unwrap();
         let list = store.list_sessions().unwrap();
@@ -251,6 +299,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         };
         store.upsert_session(&s).unwrap();
         s.status = SessionStatus::Done;
@@ -268,11 +317,51 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().name, "w");
         assert!(store.get_session("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn model_and_context_tokens_round_trip() {
+        let store = test_store();
+        let s = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 1.5, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: Some("claude-fable-5".into()), context_tokens: Some(214_000),
+        };
+        store.upsert_session(&s).unwrap();
+        let found = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(found.model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(found.context_tokens, Some(214_000));
+    }
+
+    #[test]
+    fn cost_samples_filters_by_agent_and_model_and_excludes_zero() {
+        let store = test_store();
+        for (id, agent_type, model, cost) in [
+            ("a", "claude-code", Some("claude-fable-5"), 3.0),
+            ("b", "claude-code", Some("claude-fable-5"), 5.0),
+            ("c", "claude-code", Some("claude-fable-5"), 0.0), // excluded: zero cost
+            ("d", "claude-code", Some("claude-opus-4-8"), 2.0), // excluded: different model
+            ("e", "codex",       Some("claude-fable-5"), 4.0),  // excluded: different harness
+        ] {
+            store.upsert_session(&Session {
+                id: id.into(), orchestrator_id: None, name: id.into(),
+                repo: "r".into(), status: SessionStatus::Working,
+                agent_type: agent_type.into(), cost_usd: cost, started_at: 0,
+                pr_number: None, pr_id: None, workspace_path: None, pid: None,
+                model: model.map(String::from), context_tokens: None,
+            }).unwrap();
+        }
+        let samples = store.cost_samples("claude-code", Some("claude-fable-5")).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert!((samples.iter().sum::<f64>() - 8.0).abs() < f64::EPSILON);
     }
 }
