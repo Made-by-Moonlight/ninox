@@ -91,9 +91,10 @@ Fixed left sidebar (258px, resizable) + main content, one view at a time.
 **Sidebar, top→bottom:**
 1. Masthead: "Nin*ox* ⬡" + "FLEET FIELD JOURNAL" microlabel.
 2. **Table-of-contents nav** — the app's top-level navigation, styled as a journal TOC
-   with roman numerals and dotted leaders: `I. Fleet board · II. Session ·
-   III. Pull requests · IV. Brain`. Active item: vermilion 3px left bar + red numeral.
-   Keyboard 1–4 switches views.
+   with roman numerals and dotted leaders: `I. Fleet board · II. Pull requests ·
+   III. Brain`. No "Session" entry — the session tree below IS the session
+   navigation. Active item: vermilion 3px left bar + red numeral.
+   Keyboard 1–3 switches views.
 3. Action row: `Alerts (badge) · + Spawn`.
 4. Session tree: orchestrators (bold) with indented workers, standalone sessions below;
    status dot + name + repo slug; active = card bg + vermilion left bar. Click → Session view.
@@ -187,7 +188,7 @@ with offset shadow. Esc closes.
 
 ## 6. Interaction inventory
 
-- Keys: `1–4` views · `t` theme · `Esc` closes modal. Mockup deep links:
+- Keys: `1–3` views · `t` theme · `Esc` closes modal. Mockup deep links:
   `#dark`, `#brain`, `#catalogue` (comma-separable).
 - Hovers: cards lift; tree/TOC rows tint to card bg; × remove buttons appear on row hover.
 - All live data (status dots, costs, CI stamps, counts) updates in place via the
