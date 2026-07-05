@@ -220,6 +220,23 @@ stays as the per-role/per-spawn pointer into the registry, and the existing
 `interactive_cmd`/`worker_cmd` call sites resolve through it. Serde-defaulted
 throughout — existing configs keep parsing unchanged.
 
+**Freebuff (researched 2026-07-05):** real harness — the free, ad-supported tier of
+Codebuff (CodebuffAI/codebuff monorepo, `freebuff/`), terminal agent with a Claude
+Code-like workflow. Binary `freebuff` (`npm install -g freebuff`); interactive =
+run bare in the workspace; model via `--model <name>`; `--yes` auto-approves. Ships
+as a compiled-in default spec (disabled): `interactive_args = ["--model", "{model}"]`.
+A one-shot/worker prompt mode is UNVERIFIED — the default spec omits `worker_args`
+(a harness without worker_args is selectable for orchestrators/standalone sessions
+but not offered for CLI worker spawns until someone supplies the args in config).
+
+**Updating running sessions:** sessions are processes — changing a harness spec,
+model, or binary version never mutates a live session. The mechanism: a per-session
+**Re-file** action (session header, beside Kill): kills the tmux session and
+respawns the same name/workspace with the CURRENT registry settings (this also
+subsumes the respawn-over-Terminated-husk gap — Re-file on a Terminated session
+just spawns). Settings changes therefore apply to new spawns immediately and to
+existing sessions on Re-file; no silent in-place swaps.
+
 ## 6. Interaction inventory
 
 - Keys: `1–3` views · `t` theme · `Esc` closes modal. Mockup deep links:
