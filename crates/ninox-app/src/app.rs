@@ -63,6 +63,20 @@ pub struct BrainViewState {
     /// Parsed markdown body of `selected`, preprocessed so `[[wikilinks]]`
     /// render as clickable `ninox-brain:` links.
     pub markdown: Vec<iced::widget::markdown::Item>,
+    /// Entries that link to `selected` ("cited by"), fetched from the index
+    /// in the `BrainSelectEntry` handler rather than re-derived from
+    /// `entries` on every render. Empty when nothing is selected.
+    pub backlinks: Vec<BrainEntry>,
+    /// Entries related to `selected` — direct links, then co-citation, then
+    /// shared tags (see `BrainIndex::related`) — same fetch-on-select
+    /// pattern as `backlinks`.
+    pub related: Vec<BrainEntry>,
+    /// Pinboard edges as undirected, deduplicated node-index pairs into
+    /// `entries`, resolved from `BrainIndex::links_all()` once per data
+    /// change (`NavigateBrain` / `BrainReindex` / `BrainSwitchCatalogue`) —
+    /// see `App::refresh_brain_edges` and `brain_pinboard::resolve_edges`.
+    /// Never re-derived per canvas draw.
+    pub edges: Vec<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -458,6 +472,26 @@ impl App {
             resized.push((sid, cols, rows));
         }
         resized
+    }
+
+    /// Re-derive pinboard edges (node-index pairs into `brain_view.entries`)
+    /// from the index's resolved link graph. Called once per data change —
+    /// `NavigateBrain`'s initial load, `BrainReindex`, and
+    /// `BrainSwitchCatalogue` — never per canvas draw. A DB error is
+    /// tolerated: warn and leave the pinboard edge-less rather than panic.
+    fn refresh_brain_edges(state: &mut Self) {
+        match state.brain.links_all() {
+            Ok(links) => {
+                state.brain_view.edges = crate::components::brain_pinboard::resolve_edges(
+                    &state.brain_view.entries,
+                    &links,
+                );
+            }
+            Err(e) => {
+                tracing::warn!("brain links_all: {e}");
+                state.brain_view.edges.clear();
+            }
+        }
     }
 
     /// Shared mutation logic.
@@ -1264,6 +1298,7 @@ impl App {
                         Ok(entries) => {
                             state.brain_view.entries = entries;
                             state.brain_view.loaded = true;
+                            Self::refresh_brain_edges(state);
                         }
                         Err(e) => tracing::error!("brain query: {e}"),
                     }
@@ -1279,6 +1314,20 @@ impl App {
                     ).collect();
                     state.brain_view.open_drawers.insert(e.entry_type.clone());
                     state.brain_view.mode = BrainMode::Catalogue;
+                }
+                match state.brain.backlinks(&id) {
+                    Ok(backs) => state.brain_view.backlinks = backs,
+                    Err(e) => {
+                        tracing::warn!("brain backlinks({id}): {e}");
+                        state.brain_view.backlinks = Vec::new();
+                    }
+                }
+                match state.brain.related(&id, 6) {
+                    Ok(rel) => state.brain_view.related = rel,
+                    Err(e) => {
+                        tracing::warn!("brain related({id}): {e}");
+                        state.brain_view.related = Vec::new();
+                    }
                 }
                 state.brain_view.selected = Some(id);
                 Task::none()
@@ -1299,7 +1348,10 @@ impl App {
                     Ok(count) => {
                         tracing::info!("brain reindexed: {count} entries");
                         match state.brain.query("", QueryFilters::default()) {
-                            Ok(entries) => state.brain_view.entries = entries,
+                            Ok(entries) => {
+                                state.brain_view.entries = entries;
+                                Self::refresh_brain_edges(state);
+                            }
                             Err(e) => tracing::error!("brain query after reindex: {e}"),
                         }
                         state.brain_view.loaded = true;
@@ -1356,11 +1408,15 @@ impl App {
                             state.brain_view.hovered = None;
                             state.brain_view.markdown.clear();
                             state.brain_view.open_drawers.clear();
+                            state.brain_view.backlinks.clear();
+                            state.brain_view.related.clear();
+                            state.brain_view.edges.clear();
                             state.brain_view.loaded = false;
                             match state.brain.query("", QueryFilters::default()) {
                                 Ok(entries) => {
                                     state.brain_view.entries = entries;
                                     state.brain_view.loaded = true;
+                                    Self::refresh_brain_edges(state);
                                 }
                                 Err(e) => tracing::error!("brain query after catalogue switch: {e}"),
                             }
@@ -2367,6 +2423,103 @@ mod tests {
         assert!(app.brain_view.open_drawers.is_empty());
         assert_eq!(app.brain_view.entries.len(), 1);
         assert_eq!(app.brain_view.entries[0].id, "concepts/b.md");
+    }
+
+    #[test]
+    fn navigate_brain_populates_pinboard_edges_from_the_index() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("people")).unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("alice.md"),
+            "---\nname: Alice\n---\nManages [[bob]].",
+        )
+        .unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("bob.md"),
+            "---\nname: Bob\n---\nReports to [[alice]].",
+        )
+        .unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        assert!(m.brain_view.edges.is_empty());
+
+        let (m2, _) = m.update(Message::NavigateBrain);
+        // Alice <-> Bob's mutual link resolves to a single undirected
+        // node-index edge, computed once from `links_all()` rather than
+        // re-parsed per pinboard draw.
+        assert_eq!(m2.brain_view.edges.len(), 1);
+        let (a, b) = m2.brain_view.edges[0];
+        let ids: Vec<&str> =
+            [a, b].iter().map(|&i| m2.brain_view.entries[i].id.as_str()).collect();
+        assert!(ids.contains(&"people/alice.md"));
+        assert!(ids.contains(&"people/bob.md"));
+    }
+
+    #[test]
+    fn selecting_entry_populates_backlinks_and_related_from_the_index() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("people")).unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("alice.md"),
+            "---\nname: Alice\n---\nManages [[bob]].",
+        )
+        .unwrap();
+        std::fs::write(brain_dir.join("people").join("bob.md"), "---\nname: Bob\n---\nbody").unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild().unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m2, _) = m.update(Message::NavigateBrain);
+        assert!(m2.brain_view.backlinks.is_empty());
+        assert!(m2.brain_view.related.is_empty());
+
+        let (m3, _) = m2.update(Message::BrainSelectEntry("people/bob.md".into()));
+        assert_eq!(m3.brain_view.backlinks.len(), 1);
+        assert_eq!(m3.brain_view.backlinks[0].id, "people/alice.md");
+        assert!(
+            m3.brain_view.related.iter().any(|e| e.id == "people/alice.md"),
+            "alice directly links to bob, so alice should rank in bob's related list: {:?}",
+            m3.brain_view.related.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn switching_catalogue_clears_and_repopulates_pinboard_edges() {
+        let dir_a = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_a.join("people")).unwrap();
+        std::fs::write(dir_a.join("people").join("alice.md"), "Sees [[bob]].").unwrap();
+        std::fs::write(dir_a.join("people").join("bob.md"), "Sees [[alice]].").unwrap();
+
+        let dir_b = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_b.join("people")).unwrap();
+        std::fs::write(dir_b.join("people").join("carol.md"), "No links here.").unwrap();
+
+        let brain_a = Arc::new(BrainIndex::open(&dir_a).unwrap());
+        brain_a.rebuild().unwrap();
+        BrainIndex::open(&dir_b).unwrap().rebuild().unwrap();
+
+        let e = test_engine();
+        let mut app = base_with_brain(e, brain_a);
+        app.catalogues = vec![
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone() },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone() },
+        ];
+        let (app, _) = app.update(Message::NavigateBrain);
+        assert_eq!(
+            app.brain_view.edges.len(),
+            1,
+            "alice<->bob's mutual link should resolve to one edge in catalogue A"
+        );
+
+        let (app, _) = app.update(Message::BrainSwitchCatalogue(1));
+        assert!(
+            app.brain_view.edges.is_empty(),
+            "catalogue B has no links -- edges must be cleared, not left over from A"
+        );
     }
 
     #[test]

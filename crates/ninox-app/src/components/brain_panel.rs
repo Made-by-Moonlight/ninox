@@ -62,26 +62,6 @@ fn parse_wikilink_content(content: &str) -> (String, String) {
     (target, display)
 }
 
-/// `[[target]]`, `[[target|alias]]`, `[[target#heading]]` and
-/// `[[target#heading|alias]]` occurrences, in resolution-target form
-/// (heading/block suffix stripped, alias dropped) and in order.
-pub fn extract_wikilinks(body: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = body;
-    while let Some(start) = rest.find("[[") {
-        let after = &rest[start + 2..];
-        match after.find("]]") {
-            Some(end) => {
-                let (target, _display) = parse_wikilink_content(&after[..end]);
-                if !target.is_empty() { out.push(target); }
-                rest = &after[end + 2..];
-            }
-            None => break,
-        }
-    }
-    out
-}
-
 /// Percent-encode the characters that would otherwise break the
 /// `[text](dest)` CommonMark link syntax when used as a link *destination*
 /// (a bare space ends the destination early; unbalanced `(`/`)` end it too)
@@ -206,14 +186,6 @@ fn link_matches(link: &str, entry: &BrainEntry) -> bool {
 /// Resolve a clicked wikilink to an entry id.
 pub fn resolve_link<'a>(entries: &'a [BrainEntry], link: &str) -> Option<&'a BrainEntry> {
     entries.iter().find(|e| link_matches(link, e))
-}
-
-/// Entries whose bodies wikilink to `target` ("Cited by").
-pub fn backlinks_for<'a>(entries: &'a [BrainEntry], target: &BrainEntry) -> Vec<&'a BrainEntry> {
-    entries.iter()
-        .filter(|e| e.id != target.id)
-        .filter(|e| extract_wikilinks(&e.body).iter().any(|l| link_matches(l, target)))
-        .collect()
 }
 
 /// (category, count), taxonomy order first, then alphabetic for unknown types.
@@ -705,8 +677,9 @@ fn fm_row<'a>(s: &ColorScheme, key: &str, value: String) -> Element<'a, Message>
     .into()
 }
 
-/// A "cited by" backlink chip: mono id in a rule-bordered pill; press
-/// navigates to that entry.
+/// A specimen chip: mono id in a rule-bordered pill; press navigates to that
+/// entry. Shared by both the "cited by" backlinks row and the "related"
+/// row — same chip design, different source list.
 fn backlink_chip<'a>(s: &'a ColorScheme, entry: &'a BrainEntry) -> Element<'a, Message> {
     let id = entry.id.clone();
     button(text(entry.id.clone()).size(10.5).font(MONO))
@@ -789,7 +762,7 @@ fn reading_pane(app: &App) -> Element<'_, Message> {
             )
             .max_width(640.0);
 
-            let backs = backlinks_for(&app.brain_view.entries, e);
+            let backs = &app.brain_view.backlinks;
             let backlinks: Element<Message> = if backs.is_empty() {
                 Space::new(0, 0).into()
             } else {
@@ -806,6 +779,23 @@ fn reading_pane(app: &App) -> Element<'_, Message> {
                 .into()
             };
 
+            let related = &app.brain_view.related;
+            let related_section: Element<Message> = if related.is_empty() {
+                Space::new(0, 0).into()
+            } else {
+                let chips: Vec<Element<Message>> =
+                    related.iter().map(|b| backlink_chip(s, b)).collect();
+                column![
+                    Space::new(0, 22),
+                    dotted_rule(s.rule_dark),
+                    Space::new(0, 12),
+                    micro_label(&format!("Related — {} specimens", related.len()), s.faint).size(9.0),
+                    Space::new(0, 8),
+                    row(chips).spacing(6).wrap(),
+                ]
+                .into()
+            };
+
             column![
                 crumb,
                 Space::new(0, 14),
@@ -815,6 +805,7 @@ fn reading_pane(app: &App) -> Element<'_, Message> {
                 Space::new(0, 18),
                 body,
                 backlinks,
+                related_section,
             ]
             .into()
         }
@@ -845,41 +836,6 @@ mod tests {
             id: id.into(), entry_type: ty.into(), name: name.into(),
             tags: vec![], repos: vec![], updated: None, body: body.into(),
         }
-    }
-
-    #[test]
-    fn extracts_wikilinks() {
-        assert_eq!(
-            extract_wikilinks("passes [[frame-alignment]] before [[errors/scrollback-dup]] runs"),
-            vec!["frame-alignment".to_string(), "errors/scrollback-dup".to_string()]
-        );
-        assert!(extract_wikilinks("no links [here] or [[unclosed").is_empty());
-    }
-
-    #[test]
-    fn extracts_target_from_aliased_link() {
-        // `[[target|shown text]]` — the resolution target is the text
-        // before the `|`; the alias is dropped from the extracted list.
-        assert_eq!(
-            extract_wikilinks("see [[frame-alignment|the pattern]]"),
-            vec!["frame-alignment".to_string()]
-        );
-    }
-
-    #[test]
-    fn extracts_target_from_heading_link() {
-        // `[[target#section]]` and `[[target#^block]]` resolve to `target`
-        // — section/block anchors are stripped, not tracked.
-        assert_eq!(
-            extract_wikilinks("see [[frame-alignment#Rationale]] and [[frame-alignment#^abc123]]"),
-            vec!["frame-alignment".to_string(), "frame-alignment".to_string()]
-        );
-    }
-
-    #[test]
-    fn extracts_target_from_combined_heading_and_alias_link() {
-        // `[[a#b|c]]` — target "a", alias "c" (alias dropped for extraction).
-        assert_eq!(extract_wikilinks("see [[a#b|c]]"), vec!["a".to_string()]);
     }
 
     #[test]
@@ -945,29 +901,6 @@ mod tests {
             let encoded = percent_encode_wikilink_target(target);
             assert_eq!(percent_decode_wikilink_target(&encoded), target);
         }
-    }
-
-    #[test]
-    fn backlinks_match_by_name_or_id_stem() {
-        let a = entry("symbols/scrollback-buffer.md", "symbols", "ScrollbackBuffer", "…");
-        let b = entry("concepts/frame-alignment.md", "concepts", "frame-alignment",
-                      "owned by [[ScrollbackBuffer]]");
-        let c = entry("errors/scrollback-dup.md", "errors", "scrollback-dup", "unrelated");
-        let all = vec![a.clone(), b.clone(), c];
-        let backs = backlinks_for(&all, &a);
-        assert_eq!(backs.len(), 1);
-        assert_eq!(backs[0].id, b.id);
-    }
-
-    #[test]
-    fn backlinks_match_via_aliased_link_to_its_target() {
-        let a = entry("symbols/scrollback-buffer.md", "symbols", "ScrollbackBuffer", "…");
-        let b = entry("concepts/frame-alignment.md", "concepts", "frame-alignment",
-                      "owned by [[ScrollbackBuffer|the buffer]]");
-        let all = vec![a.clone(), b.clone()];
-        let backs = backlinks_for(&all, &a);
-        assert_eq!(backs.len(), 1);
-        assert_eq!(backs[0].id, b.id);
     }
 
     #[test]
