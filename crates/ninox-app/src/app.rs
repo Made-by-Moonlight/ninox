@@ -85,6 +85,7 @@ pub enum View {
     SessionDetail { session_id: SessionId, panel: DetailPanel },
     PrList,
     Brain,
+    Settings,
 }
 
 impl Default for View {
@@ -213,6 +214,8 @@ pub enum Message {
     PollSessions,
     NavigatePrList,
     NavigateBrain,
+    /// Opened from the sidebar footer's `Settings ▸` row.
+    NavigateSettings,
     BrainSelectEntry(String),
     /// The pinboard canvas's hovered node changed (including to/from `None`)
     /// — emitted only on change, never on every mouse move.
@@ -1402,6 +1405,13 @@ impl App {
                 Task::none()
             }
 
+            Message::NavigateSettings => {
+                state.view = View::Settings;
+                // Kick model discovery for the worker default's harness so
+                // the Workers card's picker has live options when it opens.
+                Self::ensure_models(state, &state.config.worker.harness.clone())
+            }
+
             Message::BrainSelectEntry(id) => {
                 if let Some(e) = state.brain_view.entries.iter().find(|e| e.id == id) {
                     state.brain_view.markdown = iced::widget::markdown::parse(
@@ -1780,6 +1790,7 @@ impl App {
             fleet_board::fleet_board,
             pr_list::pr_list,
             session_detail::session_detail,
+            settings_panel::settings_panel,
             sidebar::sidebar,
             spawn_modal::spawn_modal,
         };
@@ -1791,6 +1802,7 @@ impl App {
             View::SessionDetail { session_id, panel } => session_detail(state, session_id, panel),
             View::PrList => pr_list(state),
             View::Brain => brain_panel(state),
+            View::Settings => settings_panel(state),
         };
 
         let base: Element<Message> = container(
@@ -2108,6 +2120,16 @@ mod tests {
             fleet_filter:    FleetFilter::default(),
             last_fleet_scope: None,
         }
+    }
+
+    #[test]
+    fn navigate_settings_switches_view() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::NavigateSettings);
+        assert!(matches!(m.view, View::Settings));
+        // and back out via the TOC
+        let (m, _) = m.update(Message::NavigateFleet { scope: None });
+        assert!(matches!(m.view, View::FleetBoard { .. }));
     }
 
     #[test]

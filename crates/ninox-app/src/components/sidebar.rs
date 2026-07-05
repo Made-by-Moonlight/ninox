@@ -1,4 +1,3 @@
-use ninox_core::config::ThemeVariant;
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
     Alignment, Background, Border, Color, Element, Length, Padding,
@@ -230,8 +229,8 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     }
     let list = scrollable(column(items).width(Length::Fill)).height(Length::Fill);
 
-    // ── 5. Footer: theme dots ────────────────────────────────────────────────
-    let footer = theme_dots_footer(app);
+    // ── 5. Footer: `Settings ▸` (theme dots moved into the settings view) ───
+    let footer = settings_footer(app);
 
     let mut col_items: Vec<Element<Message>> = vec![
         masthead.into(),
@@ -380,45 +379,29 @@ fn tree_row<'a>(
         .into()
 }
 
-/// Footer: "THEME" microlabel + one dot per variant; selected dot ringed in accent.
-fn theme_dots_footer(app: &App) -> Element<'_, Message> {
+/// Footer: `Settings ▸` row — opens The Appendix (the theme dots relocated
+/// there; see `components::settings_panel::theme_card`).
+fn settings_footer(app: &App) -> Element<'_, Message> {
     let s = &app.scheme;
-    let mut dots = row![].spacing(6).align_y(Alignment::Center);
-    for variant in [ThemeVariant::Light, ThemeVariant::Dark, ThemeVariant::Ninox] {
-        let selected = app.active_variant == variant;
-        let fill = match variant {
-            ThemeVariant::Light => crate::theme::light().paper,
-            ThemeVariant::Dark | ThemeVariant::Ninox => crate::theme::dark().paper,
-        };
-        dots = dots.push(
-            button(
-                container(Space::new(0, 0)).width(14).height(Length::Fixed(14.0)).style(
-                    move |_| container::Style {
-                        background: Some(Background::Color(fill)),
-                        border: Border {
-                            color: if selected { s.accent } else { s.ink },
-                            width: if selected { 2.0 } else { 1.5 },
-                            radius: 7.0.into(),
-                        },
-                        ..Default::default()
-                    },
-                ),
-            )
-            .on_press(Message::SwitchTheme(variant))
-            .style(|_t, _st| button::Style { background: None, border: Border::default(), ..Default::default() })
-            .padding(0),
-        );
-    }
-    container(
+    let active = matches!(app.view, View::Settings);
+    button(
         row![
-            micro_label("Theme", s.ink_2).size(10.0),
+            micro_label("Settings", if active { s.ink } else { s.ink_2 }).size(10.0),
             Space::new(Length::Fill, 0),
-            dots,
+            text("▸").size(11).color(if active { s.accent } else { s.faint }),
         ]
         .align_y(Alignment::Center),
     )
+    .on_press(Message::NavigateSettings)
     .padding([12, 18])
     .width(Length::Fill)
+    .style(move |_t, status| button::Style {
+        background: (active || matches!(status, button::Status::Hovered))
+            .then_some(Background::Color(s.card)),
+        text_color: s.ink_2,
+        border: Border::default(),
+        ..Default::default()
+    })
     .into()
 }
 
