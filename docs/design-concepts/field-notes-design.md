@@ -135,6 +135,14 @@ the journal is open on the desk. It must NOT live in the folio bar (crowds the m
 toggle). Switching reopens the index for that catalogue and reloads the view. Sessions
 choose their catalogue at spawn time (see Spawn modal).
 
+**Adding a catalogue:** a small `+` at the right edge of the volume plate opens a
+journal-entry modal ("File a new *catalogue*"): Name (serif underlined input) and
+Path (mono underlined input, `~` expanded; the directory is created and the brain
+index initialized if missing). Confirming appends a `[[brain.catalogues]]` entry to
+`config.toml`, saves it, and switches the view to the new catalogue. Refusals
+(duplicate name, empty fields, unwritable path) surface inline as a vermilion ⚑
+line, exactly like the spawn modal's guards.
+
 ```toml
 # config.toml
 [[brain.catalogues]]
