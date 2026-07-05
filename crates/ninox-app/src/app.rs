@@ -554,27 +554,27 @@ impl App {
             }
 
             Message::SpawnFormName(v) => {
-                if let Some(f) = &mut state.spawn_modal { f.name = v; }
+                if let Some(f) = &mut state.spawn_modal { f.name = v; f.error = None; }
                 Task::none()
             }
 
             Message::SpawnFormKind(kind) => {
-                if let Some(f) = &mut state.spawn_modal { f.kind = kind; }
+                if let Some(f) = &mut state.spawn_modal { f.kind = kind; f.error = None; }
                 Task::none()
             }
 
             Message::SpawnFormWorkspace(v) => {
-                if let Some(f) = &mut state.spawn_modal { f.workspace = v; }
+                if let Some(f) = &mut state.spawn_modal { f.workspace = v; f.error = None; }
                 Task::none()
             }
 
             Message::SpawnFormAgent(idx) => {
-                if let Some(f) = &mut state.spawn_modal { f.agent_idx = idx; }
+                if let Some(f) = &mut state.spawn_modal { f.agent_idx = idx; f.error = None; }
                 Task::none()
             }
 
             Message::SpawnFormCatalogue(idx) => {
-                if let Some(f) = &mut state.spawn_modal { f.catalogue_idx = idx; }
+                if let Some(f) = &mut state.spawn_modal { f.catalogue_idx = idx; f.error = None; }
                 Task::none()
             }
 
@@ -589,6 +589,11 @@ impl App {
                 let Some(form) = state.spawn_modal.clone() else { return Task::none(); };
                 let name = form.name.trim().to_string();
                 if name.is_empty() {
+                    // Only reachable via keyboard submit — the SPAWN button is
+                    // disabled while the name is empty.
+                    if let Some(f) = &mut state.spawn_modal {
+                        f.error = Some("give this entry a name".to_string());
+                    }
                     return Task::none();
                 }
 
@@ -620,6 +625,9 @@ impl App {
                             // No workspace — keep the modal open (the UI also
                             // disables confirm, but SpawnFormConfirm must not
                             // silently proceed).
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some("workspace is required for a standalone session".to_string());
+                            }
                             return Task::none();
                         }
 
@@ -628,6 +636,9 @@ impl App {
                             // Bad path typed — keep the modal open rather than
                             // optimistically spawning a session that can never
                             // launch.
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!("workspace {workspace} does not exist"));
+                            }
                             return Task::none();
                         }
 
@@ -645,6 +656,11 @@ impl App {
                             // tmux-create (same session name) would then fail
                             // and mark the *hijacked* record Terminated. Keep
                             // the modal open so the user can rename instead.
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!(
+                                    "a session named {sid} already exists — pick another name"
+                                ));
+                            }
                             return Task::none();
                         }
                         state.spawn_modal = None;
@@ -741,6 +757,11 @@ impl App {
                             // orchestrator record, then fail tmux-create and
                             // mark the hijacked record Terminated. Keep the
                             // modal open so the user can rename instead.
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!(
+                                    "a session named {orch_id} already exists — pick another name"
+                                ));
+                            }
                             return Task::none();
                         }
                         state.spawn_modal = None;
@@ -2457,9 +2478,11 @@ mod tests {
         m = next;
 
         // No workspace supplied — confirm must no-op and leave the modal
-        // open so the user can fill it in.
+        // open so the user can fill it in, with an inline error explaining why.
         assert!(m.sessions.is_empty());
-        assert!(m.spawn_modal.is_some());
+        let form = m.spawn_modal.as_ref().expect("modal stays open");
+        let err = form.error.as_deref().expect("guard refusal must surface an error");
+        assert!(err.contains("workspace is required"), "unexpected error message: {err}");
     }
 
     #[test]
@@ -2511,10 +2534,12 @@ mod tests {
 
         // Bad path — confirm must no-op, keep the modal open for correction,
         // and never optimistically create a session.
-        assert!(m.spawn_modal.is_some());
         assert!(m.sessions.is_empty());
         assert!(m.orchestrators.is_empty());
         assert!(matches!(m.view, View::FleetBoard { .. }));
+        let form = m.spawn_modal.as_ref().expect("modal stays open");
+        let err = form.error.as_deref().expect("guard refusal must surface an error");
+        assert!(err.contains("does not exist"), "unexpected error message: {err}");
     }
 
     #[test]
@@ -2556,10 +2581,12 @@ mod tests {
         let (next, _) = m.update(Message::SpawnFormConfirm);
         m = next;
 
-        assert!(
-            m.spawn_modal.is_some(),
+        let form = m.spawn_modal.as_ref().expect(
             "a name colliding with an existing session id must keep the modal open, not overwrite it"
         );
+        let err = form.error.as_deref().expect("guard refusal must surface an error");
+        assert!(err.contains("solo-a"), "unexpected error message: {err}");
+        assert!(err.contains("already exists"), "unexpected error message: {err}");
         assert_eq!(m.sessions.len(), 1, "the colliding spawn must not create/overwrite any session");
         let unchanged = m.sessions.get("solo-a").expect("original session must still exist");
         assert_eq!(
@@ -2590,16 +2617,43 @@ mod tests {
         let (next, _) = m.update(Message::SpawnFormConfirm);
         m = next;
 
-        assert!(
-            m.spawn_modal.is_some(),
+        let form = m.spawn_modal.as_ref().expect(
             "a name colliding with an existing orchestrator id must keep the modal open"
         );
+        let err = form.error.as_deref().expect("guard refusal must surface an error");
+        assert!(err.contains("orch-a"), "unexpected error message: {err}");
+        assert!(err.contains("already exists"), "unexpected error message: {err}");
         assert_eq!(m.orchestrators.len(), 1, "no second orchestrator record should be created");
         assert_eq!(m.sessions.len(), 1, "the colliding spawn must not create/overwrite any session");
         let unchanged = m.sessions.get("orch-a").expect("original orchestrator session must still exist");
         assert_eq!(
             unchanged.started_at, original.started_at,
             "the original orchestrator session's record must be untouched by the rejected duplicate spawn"
+        );
+    }
+
+    #[test]
+    fn editing_spawn_form_name_clears_stale_guard_error() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-a".into()));
+        m = next;
+        // No workspace — confirm is blocked and sets an inline error.
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+        assert!(m.spawn_modal.as_ref().unwrap().error.is_some(), "guard refusal must set an error");
+
+        // Editing any field clears the stale error, even before it's fixed.
+        let (next, _) = m.update(Message::SpawnFormName("solo-b".into()));
+        m = next;
+        assert!(
+            m.spawn_modal.as_ref().unwrap().error.is_none(),
+            "editing a field must clear the stale guard error"
         );
     }
 

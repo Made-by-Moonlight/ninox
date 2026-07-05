@@ -55,6 +55,9 @@ pub struct SpawnForm {
     pub agent_idx:     usize,
     /// Index into `AppConfig::catalogue_options()` — applies to both kinds.
     pub catalogue_idx: usize,
+    /// Human-readable refusal reason from the last confirm attempt, if any.
+    /// Cleared whenever the user edits any field. Rendered above the footer.
+    pub error:         Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -259,8 +262,15 @@ pub fn spawn_modal<'a>(state: &'a App, form: &'a SpawnForm) -> Element<'a, Messa
     .spacing(12)
     .align_y(Alignment::Center);
 
+    // ── Guard-refusal feedback: a confirm attempt was blocked. Rendered
+    // above the footer so it reads as "why the button didn't do anything"
+    // rather than a form-field-level validation error.
+    let error_line: Option<Element<Message>> = form.error.as_ref().map(|msg| {
+        text(format!("⚑ {msg}")).size(11).font(SANS_BOLD).color(s.accent).into()
+    });
+
     // Final layout: Entry type → Name → Workspace (standalone only) →
-    // Catalogue → Agent·Model → footer.
+    // Catalogue → Agent·Model → error (if any) → footer.
     let mut body = column![kind_toggle, Space::new(0, 18), name_field]
         .padding([20, 24])
         .spacing(0);
@@ -271,9 +281,11 @@ pub fn spawn_modal<'a>(state: &'a App, form: &'a SpawnForm) -> Element<'a, Messa
         .push(Space::new(0, 18))
         .push(catalogue_field)
         .push(Space::new(0, 18))
-        .push(agent_field)
-        .push(Space::new(0, 22))
-        .push(footer);
+        .push(agent_field);
+    if let Some(err) = error_line {
+        body = body.push(Space::new(0, 14)).push(err);
+    }
+    body = body.push(Space::new(0, 22)).push(footer);
 
     let modal = container(column![header, hline(s.ink, 2.0), body])
         .width(Length::Fixed(470.0))
