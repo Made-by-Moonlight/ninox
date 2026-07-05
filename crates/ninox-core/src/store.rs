@@ -74,6 +74,7 @@ impl Store {
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
              ON CONFLICT(id) DO UPDATE SET
              status=excluded.status,cost_usd=excluded.cost_usd,
+             started_at=excluded.started_at,
              pr_number=excluded.pr_number,pr_id=excluded.pr_id,
              workspace_path=excluded.workspace_path,pid=excluded.pid,
              model=excluded.model,context_tokens=excluded.context_tokens,
@@ -368,6 +369,25 @@ mod tests {
         assert_eq!(found.catalogue_path.as_deref(), Some("/brains/x"));
         // list path decodes it too
         assert_eq!(store.list_sessions().unwrap()[0].catalogue_path.as_deref(), Some("/brains/x"));
+    }
+
+    /// A Re-file respawns the same session id with a fresh `started_at` —
+    /// the conflict-update path must persist it, or the in-memory time
+    /// silently reverts to the original spawn time on app restart.
+    #[test]
+    fn upsert_conflict_updates_started_at() {
+        let store = test_store();
+        let mut s = Session {
+            id: "s3".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 100,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+        };
+        store.upsert_session(&s).unwrap();
+        s.started_at = 200;
+        store.upsert_session(&s).unwrap();
+        assert_eq!(store.get_session("s3").unwrap().unwrap().started_at, 200);
     }
 
     #[test]

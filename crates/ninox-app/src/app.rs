@@ -487,14 +487,18 @@ impl App {
     /// do that (e.g. immediately for a window resize, or once at
     /// drag-release rather than every frame).
     /// Kick off `models_cmd` discovery for a harness (cached per app run —
-    /// including failures, which fall through to known_models).
-    fn ensure_models(state: &App, harness: &str) -> Task<Message> {
+    /// including failures, which fall through to known_models). Marks the
+    /// harness in-flight immediately (as a `None` entry — pickers fall
+    /// through to known_models until the result lands) so a second trigger
+    /// before completion doesn't spawn a duplicate subprocess.
+    fn ensure_models(state: &mut App, harness: &str) -> Task<Message> {
         if state.model_lists.contains_key(harness) {
             return Task::none();
         }
         let Some(cmd) = state.config.registry().spec(harness).models_cmd else {
             return Task::none();
         };
+        state.model_lists.insert(harness.to_string(), None);
         let h = harness.to_string();
         Task::future(async move {
             let models = crate::models::run_models_cmd(cmd).await;
@@ -741,6 +745,11 @@ impl App {
             }
 
             Message::SpawnFormHarness(h) => {
+                // Re-clicking the already-selected chip must not wipe the
+                // model choice (iced buttons fire on every press).
+                if state.spawn_modal.as_ref().is_some_and(|f| f.harness == h) {
+                    return Task::none();
+                }
                 let task = Self::ensure_models(state, &h);
                 if let Some(f) = &mut state.spawn_modal {
                     f.harness = h;
@@ -1539,6 +1548,11 @@ impl App {
             }
 
             Message::SettingsWorkerHarness(h) => {
+                // pick_list fires on re-selecting the current value — don't
+                // wipe (and re-save) the model for a no-op selection.
+                if state.config.worker.harness == h {
+                    return Task::none();
+                }
                 let task = Self::ensure_models(state, &h);
                 state.config.worker.harness = h;
                 // Clear the model — ids from one harness must not leak into

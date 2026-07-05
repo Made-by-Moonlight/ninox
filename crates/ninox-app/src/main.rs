@@ -133,6 +133,19 @@ async fn run_spawn(
     orchestrator_id: Option<String>,
 ) -> anyhow::Result<()> {
     let agent = config.worker.clone();
+    // Refuse worker-incapable harnesses BEFORE any side effect (worktree
+    // creation, session upsert) — bailing after the upsert would leave a
+    // permanent ghost "Working" session with no pid and no tmux session
+    // for poll_pids to reap.
+    let registry = config.registry();
+    if registry.spec(&agent.harness).worker_args.is_none() {
+        anyhow::bail!(
+            "harness '{}' has no verified worker mode (no worker_args in its spec) — \
+             pick a worker-capable harness in Settings or add worker_args under \
+             [harnesses.{}] in config.toml",
+            agent.harness, agent.harness,
+        );
+    }
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -218,15 +231,9 @@ async fn run_spawn(
     // -e PATH=..., because the login shell (-l) sources rc files that may
     // re-prepend Homebrew or nvm directories, pushing our wrapper behind the
     // real `gh`. By exporting PATH here we win the race after rc files run.
-    let registry = config.registry();
-    let Some(cmd_base) = registry.worker_cmd(&agent, &effective_prompt) else {
-        anyhow::bail!(
-            "harness '{}' has no verified worker mode (no worker_args in its spec) — \
-             pick a worker-capable harness in Settings or add worker_args under \
-             [harnesses.{}] in config.toml",
-            agent.harness, agent.harness,
-        );
-    };
+    let cmd_base = registry
+        .worker_cmd(&agent, &effective_prompt)
+        .expect("worker-capability checked before any side effect above");
     let cmd = format!(
         "export PATH='{}':\"$PATH\"; {}",
         ninox_bin_str.replace('\'', "'\\''"),
