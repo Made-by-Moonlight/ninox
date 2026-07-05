@@ -186,6 +186,23 @@ Task field** — sessions are interactive; spawning drops you into the session t
 Fields as underlined serif inputs; cost estimate, Cancel ghost + vermilion "Spawn ⬡"
 with offset shadow. Esc closes.
 
+### V. Settings — the appendix
+Opened from the sidebar footer (which becomes a `Settings ▸` row — the theme dots MOVE
+here). Folio: "The *appendix*" / SETTINGS. A single narrow column (~720px) of cards:
+
+- **Theme**: the light/dark/ninox dots (relocated from the footer) + a mono pointer to
+  the active theme file (`themes/field-notes.toml`).
+- **Harnesses**: one row per agent harness — ink-fill toggle, serif name, mono binary,
+  underlined mono default-model input (disabled until enabled). `claude-code` is the
+  locked-on DEFAULT; `codex`, `opencode`, `aider` and custom names (e.g. `freebuff` —
+  unknown harnesses run their name verbatim as the binary) are **off by default**.
+  Enabled harnesses appear as agent chips in the Spawn modal.
+- **Assignments**: which harness+model new Orchestrators and Workers use unless the
+  spawn entry overrides it (maps to config `[orchestrator]`/`[worker]`).
+
+Config: `[harnesses.<name>] enabled = bool, model = "..."` — serde-defaulted so
+existing configs keep parsing; claude-code implicitly enabled.
+
 ## 6. Interaction inventory
 
 - Keys: `1–3` views · `t` theme · `Esc` closes modal. Mockup deep links:

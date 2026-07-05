@@ -341,6 +341,30 @@ canvas{position:absolute;inset:0;width:100%;height:100%}
 .bpreview p{font-size:11px;line-height:1.6;color:var(--ink-2)}
 .bpreview p code{font-family:"Spline Sans Mono",monospace;font-size:10px;color:var(--accent)}
 
+/* ---------------- settings (the appendix) ---------------- */
+.set-body{flex:1;overflow-y:auto;padding:16px 28px 28px;display:flex;flex-direction:column;gap:16px;max-width:720px}
+.set-card{border:1px solid var(--rule-dark);border-radius:2px;background:var(--card);
+  padding:16px 20px;box-shadow:2px 3px 0 rgba(33,29,22,.12)}
+.set-card h3{font-family:"Newsreader",serif;font-size:17px;font-weight:500;font-style:italic;
+  margin-bottom:12px;border-bottom:1px dotted var(--rule-dark);padding-bottom:8px}
+.harness{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--rule)}
+.harness:last-child{border-bottom:none}
+.harness .tog{width:16px;height:16px;border:1.5px solid var(--ink);border-radius:2px;cursor:pointer;flex:none;
+  display:grid;place-items:center;font-size:11px;color:var(--card)}
+.harness .tog.on{background:var(--ink)}
+.harness .nm{font-family:"Newsreader",serif;font-size:15px;width:110px}
+.harness .bin{font-family:"Spline Sans Mono",monospace;font-size:10px;color:var(--faint);width:90px}
+.harness input{flex:1;background:transparent;border:none;border-bottom:1.5px solid var(--rule-dark);
+  font-family:"Spline Sans Mono",monospace;font-size:11px;color:var(--ink);padding:3px 2px;outline:none}
+.harness input:disabled{opacity:.35}
+.harness .lock{font-size:8.5px;font-weight:700;letter-spacing:.16em;color:var(--faint)}
+.role{display:flex;align-items:baseline;gap:14px;padding:7px 0}
+.role .lbl{font-size:9.5px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--faint);width:120px}
+.role .select{border-bottom:1.5px solid var(--rule-dark);padding:3px 2px;width:190px;
+  font-family:"Newsreader",serif;font-size:14px;display:flex;cursor:pointer}
+.role .select span{flex:1}
+.setfoot{font-family:"Spline Sans Mono",monospace;font-size:9.5px;color:var(--faint)}
+
 /* ---------------- spawn modal ---------------- */
 .backdrop{position:absolute;inset:0;background:rgba(33,29,22,.45);z-index:10;
   display:none;place-items:center;backdrop-filter:blur(1.5px)}
@@ -410,9 +434,9 @@ canvas{position:absolute;inset:0;width:100%;height:100%}
       <div class="row" data-nav="session"><span class="dot done"></span>release-bot<span class="rp">ninox</span></div>
     </nav>
 
-    <div class="side-foot">
-      Theme
-      <div class="theme-dots"><i class="td-light sel"></i><i class="td-dark"></i><i class="td-ninox"></i></div>
+    <div class="side-foot" data-nav="settings" style="cursor:pointer">
+      Settings
+      <span style="margin-left:auto;color:var(--faint)">&#9656;</span>
     </div>
   </aside>
 
@@ -708,6 +732,38 @@ $ <span class="cursor"></span></pre>
       </div>
     </section>
 
+    <!-- V. SETTINGS (the appendix) -->
+    <section class="view" id="view-settings">
+      <div class="folio">
+        <h1>The <i>appendix</i></h1>
+        <span class="date">SETTINGS</span>
+      </div>
+      <div class="set-body">
+        <div class="set-card">
+          <h3>Theme</h3>
+          <div style="display:flex;align-items:center;gap:10px">
+            <div class="theme-dots" style="margin-left:0"><i class="td-light sel"></i><i class="td-dark"></i><i class="td-ninox"></i></div>
+            <span class="setfoot">themes/field-notes.toml &mdash; edit to retheme; t toggles light/dark</span>
+          </div>
+        </div>
+        <div class="set-card">
+          <h3>Harnesses</h3>
+          <div class="harness"><span class="tog on">&#10003;</span><span class="nm">claude-code</span><span class="bin">claude</span><input value="claude-fable-5" /><span class="lock">DEFAULT</span></div>
+          <div class="harness"><span class="tog"></span><span class="nm">codex</span><span class="bin">codex</span><input placeholder="model&hellip;" disabled /></div>
+          <div class="harness"><span class="tog"></span><span class="nm">opencode</span><span class="bin">opencode</span><input placeholder="model&hellip;" disabled /></div>
+          <div class="harness"><span class="tog"></span><span class="nm">aider</span><span class="bin">aider</span><input placeholder="model&hellip;" disabled /></div>
+          <div class="harness"><span class="tog"></span><span class="nm"><i style="font-family:Newsreader;font-style:italic;color:var(--faint)">custom&hellip;</i></span><span class="bin">freebuff</span><input placeholder="model&hellip;" disabled /></div>
+          <div class="setfoot" style="margin-top:10px">off by default &mdash; enabled harnesses appear as agent chips when spawning</div>
+        </div>
+        <div class="set-card">
+          <h3>Assignments</h3>
+          <div class="role"><span class="lbl">Orchestrators</span><div class="select"><span>claude-code &middot; fable-5</span><span class="car">&#9662;</span></div></div>
+          <div class="role"><span class="lbl">Workers</span><div class="select"><span>claude-code &middot; fable-5</span><span class="car">&#9662;</span></div></div>
+          <div class="setfoot">what new sessions use unless the spawn entry overrides it</div>
+        </div>
+      </div>
+    </section>
+
     <!-- spawn modal -->
     <div class="backdrop" id="spawn-modal">
       <div class="modal">
@@ -782,6 +838,14 @@ document.querySelectorAll('[data-kind]').forEach(b=>b.addEventListener('click', 
   document.querySelectorAll('[data-kind]').forEach(x=>x.classList.toggle('on', x===b));
   document.getElementById('kind-worker').style.display =
     b.dataset.kind==='worker' ? 'block' : 'none';
+}));
+
+/* settings: harness toggle demo */
+document.querySelectorAll('.harness .tog').forEach(tg=>tg.addEventListener('click', ()=>{
+  if(tg.parentElement.querySelector('.lock')) return;   // default harness stays on
+  tg.classList.toggle('on');
+  tg.innerHTML = tg.classList.contains('on') ? '&#10003;' : '';
+  tg.parentElement.querySelector('input').disabled = !tg.classList.contains('on');
 }));
 
 /* theme switching — light / dark ("t" toggles too) */
