@@ -85,6 +85,7 @@ pub enum View {
     SessionDetail { session_id: SessionId, panel: DetailPanel },
     PrList,
     Brain,
+    Settings,
 }
 
 impl Default for View {
@@ -138,6 +139,12 @@ pub struct App {
     /// race, or was superseded by a fresh NavigateSession) apart from the
     /// currently-live client for the same session_id.
     next_client_generation: u64,
+    /// Per-app-run `models_cmd` discovery cache, keyed by harness name.
+    /// `Some(None)` = attempted and failed (pickers fall through to the
+    /// spec's known_models); absent = not attempted yet.
+    pub model_lists:     HashMap<String, Option<Vec<String>>>,
+    /// Settings-view UI state (custom-model input for the Workers card).
+    pub settings:        crate::components::settings_panel::SettingsState,
     pub spawn_modal:     Option<SpawnForm>,
     /// Add-a-catalogue journal-entry modal, opened from the `+` at the
     /// right edge of the brain view's volume plate. Exclusive with
@@ -177,7 +184,9 @@ pub enum Message {
     SpawnFormName(String),
     SpawnFormKind(crate::components::spawn_modal::SpawnKind),
     SpawnFormWorkspace(String),
-    SpawnFormAgent(usize),
+    SpawnFormHarness(String),
+    SpawnFormModel(String),
+    SpawnFormCustomModel(String),
     SpawnFormCatalogue(usize),
     SpawnFormConfirm,
     SpawnFormCancel,
@@ -191,6 +200,10 @@ pub enum Message {
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
     RemoveOrchestrator(OrchestratorId),
     RemoveSession(SessionId),
+    /// Kill the tmux session and respawn the same name/workspace with the
+    /// CURRENT registry settings (session header, beside Kill). On a
+    /// Terminated husk this "just spawns".
+    RefileSession(SessionId),
     SwitchTheme(ThemeVariant),
     // Raw key event from the global subscription — bytes are computed in the handler
     // where we have access to the terminal mode (APP_CURSOR changes arrow sequences).
@@ -207,6 +220,15 @@ pub enum Message {
     PollSessions,
     NavigatePrList,
     NavigateBrain,
+    /// Opened from the sidebar footer's `Settings ▸` row.
+    NavigateSettings,
+    /// Flip a harness's enabled flag (inert for the locked-on claude-code).
+    SettingsToggleHarness(String),
+    /// Workers card — the `[worker]` default `ninox spawn` launches.
+    SettingsWorkerHarness(String),
+    SettingsWorkerModel(String),
+    SettingsWorkerCustomModel(String),
+    SettingsWorkerCustomCommit,
     BrainSelectEntry(String),
     /// The pinboard canvas's hovered node changed (including to/from `None`)
     /// — emitted only on change, never on every mouse move.
@@ -234,10 +256,56 @@ pub enum Message {
         top_reached: bool,
     },
     OpenUrl(String),
+    /// `models_cmd` discovery finished for a harness (`None` = failed —
+    /// cached so pickers fall through to known_models without retrying).
+    ModelListLoaded { harness: String, models: Option<Vec<String>> },
     Noop,
 }
 
 // ---------------------------------------------------------------------------
+// Re-file — respawn a session onto current settings
+// ---------------------------------------------------------------------------
+
+/// Everything a Re-file needs, resolved against the CURRENT registry —
+/// settings changes apply to new spawns immediately and to existing
+/// sessions on Re-file; no silent in-place swaps (spec §V "Updating
+/// running sessions"). Pure so it's unit-testable without tmux.
+pub struct RefilePlan {
+    pub agent:          ninox_core::config::AgentConfig,
+    pub base_cmd:       String,
+    pub workspace:      String,
+    pub catalogue_path: String,
+    pub extra_env:      Vec<(String, String)>,
+}
+
+/// `None` when the session has no recorded workspace (nothing to respawn
+/// into). A worker re-files interactively — its original spawn prompt is
+/// not stored — but keeps its orchestrator attachment for the tree.
+pub fn refile_plan(
+    session: &Session,
+    is_orchestrator: bool,
+    config: &AppConfig,
+) -> Option<RefilePlan> {
+    let workspace = session.workspace_path.clone()?;
+    let agent = ninox_core::config::AgentConfig {
+        harness: session.agent_type.clone(),
+        model:   session.model.clone(),
+    };
+    let base_cmd = config.registry().interactive_cmd(&agent);
+    let catalogue_path = session.catalogue_path.clone()
+        .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
+    let extra_env = if is_orchestrator {
+        vec![
+            ("NINOX_ORCHESTRATOR_ID".to_string(), session.id.clone()),
+            ("AO_CALLER_TYPE".to_string(),        "orchestrator".to_string()),
+            ("ATHENE_CALLER_TYPE".to_string(),    "orchestrator".to_string()),
+        ]
+    } else {
+        Vec::new()
+    };
+    Some(RefilePlan { agent, base_cmd, workspace, catalogue_path, extra_env })
+}
+
 // ---------------------------------------------------------------------------
 // Keyboard → terminal byte conversion (static fn — no captures allowed by listen_with)
 // ---------------------------------------------------------------------------
@@ -335,6 +403,8 @@ impl App {
             clients:        HashMap::new(),
             reattach_attempted: std::collections::HashSet::new(),
             next_client_generation: 0,
+            model_lists:    HashMap::new(),
+            settings:       Default::default(),
             spawn_modal:    None,
             catalogue_modal: None,
             // Placeholders — corrected below by resize_terminals() using the
@@ -416,6 +486,26 @@ impl App {
     /// tmux pane needs resizing to match — callers decide whether/when to
     /// do that (e.g. immediately for a window resize, or once at
     /// drag-release rather than every frame).
+    /// Kick off `models_cmd` discovery for a harness (cached per app run —
+    /// including failures, which fall through to known_models). Marks the
+    /// harness in-flight immediately (as a `None` entry — pickers fall
+    /// through to known_models until the result lands) so a second trigger
+    /// before completion doesn't spawn a duplicate subprocess.
+    fn ensure_models(state: &mut App, harness: &str) -> Task<Message> {
+        if state.model_lists.contains_key(harness) {
+            return Task::none();
+        }
+        let Some(cmd) = state.config.registry().spec(harness).models_cmd else {
+            return Task::none();
+        };
+        state.model_lists.insert(harness.to_string(), None);
+        let h = harness.to_string();
+        Task::future(async move {
+            let models = crate::models::run_models_cmd(cmd).await;
+            Message::ModelListLoaded { harness: h, models }
+        })
+    }
+
     fn resize_terminals(state: &mut Self) -> Vec<(SessionId, u16, u16)> {
         use crate::components::session_detail::{TERM_CHROME_H, TERM_CHROME_W};
 
@@ -625,18 +715,18 @@ impl App {
             }
 
             Message::SpawnSession => {
-                // Default the agent chip to whatever's configured as the
-                // orchestrator agent in config.toml, if it matches one of
-                // the presets; otherwise fall back to the first preset.
-                let agent_idx = crate::components::spawn_modal::AGENT_PRESETS
-                    .iter()
-                    .position(|p| {
-                        p.harness == state.orchestrator_agent.harness
-                            && p.model.map(str::to_string) == state.orchestrator_agent.model
-                    })
-                    .unwrap_or(0);
-                state.spawn_modal = Some(SpawnForm { agent_idx, ..SpawnForm::default() });
-                Task::none()
+                // Preselect the remembered `[orchestrator]` agent when its
+                // harness is still enabled; otherwise the first enabled
+                // harness (claude-code is locked on, so there's always one).
+                let enabled = state.config.registry().enabled_names();
+                let (harness, model) = if enabled.contains(&state.orchestrator_agent.harness) {
+                    (state.orchestrator_agent.harness.clone(), state.orchestrator_agent.model.clone())
+                } else {
+                    (enabled.first().cloned().unwrap_or_else(|| "claude-code".into()), None)
+                };
+                let task = Self::ensure_models(state, &harness);
+                state.spawn_modal = Some(SpawnForm { harness, model, ..SpawnForm::default() });
+                task
             }
 
             Message::SpawnFormName(v) => {
@@ -654,8 +744,37 @@ impl App {
                 Task::none()
             }
 
-            Message::SpawnFormAgent(idx) => {
-                if let Some(f) = &mut state.spawn_modal { f.agent_idx = idx; f.error = None; }
+            Message::SpawnFormHarness(h) => {
+                // Re-clicking the already-selected chip must not wipe the
+                // model choice (iced buttons fire on every press).
+                if state.spawn_modal.as_ref().is_some_and(|f| f.harness == h) {
+                    return Task::none();
+                }
+                let task = Self::ensure_models(state, &h);
+                if let Some(f) = &mut state.spawn_modal {
+                    f.harness = h;
+                    f.model = None;
+                    f.custom_model = None;
+                    f.error = None;
+                }
+                task
+            }
+
+            Message::SpawnFormModel(v) => {
+                if let Some(f) = &mut state.spawn_modal {
+                    if v == crate::models::CUSTOM_SENTINEL {
+                        f.custom_model = Some(String::new());
+                    } else {
+                        f.custom_model = None;
+                        f.model = Some(v);
+                    }
+                    f.error = None;
+                }
+                Task::none()
+            }
+
+            Message::SpawnFormCustomModel(v) => {
+                if let Some(f) = &mut state.spawn_modal { f.custom_model = Some(v); f.error = None; }
                 Task::none()
             }
 
@@ -765,7 +884,7 @@ impl App {
             }
 
             Message::SpawnFormConfirm => {
-                use crate::components::spawn_modal::{SpawnKind, AGENT_PRESETS};
+                use crate::components::spawn_modal::SpawnKind;
 
                 let Some(form) = state.spawn_modal.clone() else { return Task::none(); };
                 let name = form.name.trim().to_string();
@@ -778,12 +897,14 @@ impl App {
                     return Task::none();
                 }
 
-                // Both kinds share the agent preset and brain catalogue.
-                let preset = AGENT_PRESETS.get(form.agent_idx).unwrap_or(&AGENT_PRESETS[0]);
+                // Both kinds share the agent (harness + model) and brain catalogue.
+                let registry = state.config.registry();
+                let spec = registry.spec(&form.harness);
                 let agent = ninox_core::config::AgentConfig {
-                    harness: preset.harness.to_string(),
-                    model:   preset.model.map(|m| m.to_string()),
+                    harness: form.harness.clone(),
+                    model:   crate::components::spawn_modal::effective_model(&form, &spec),
                 };
+                let base_cmd = registry.interactive_cmd(&agent);
                 let catalogue = state.config.catalogue_options()
                     .into_iter()
                     .nth(form.catalogue_idx)
@@ -846,6 +967,21 @@ impl App {
                         }
                         state.spawn_modal = None;
 
+                        // "[orchestrator] stays only as the Spawn modal's
+                        // remembered preselection" — remember the confirmed
+                        // agent choice for the next spawn (either kind).
+                        // Skipped when unchanged so routine spawns don't
+                        // touch config.toml on disk.
+                        if state.config.orchestrator.harness != agent.harness
+                            || state.config.orchestrator.model != agent.model
+                        {
+                            state.orchestrator_agent = agent.clone();
+                            state.config.orchestrator = agent.clone();
+                            if let Err(e) = state.config.save() {
+                                tracing::warn!("failed to save remembered agent preselection: {e}");
+                            }
+                        }
+
                         let session = Session {
                             id:              sid.clone(),
                             orchestrator_id: None,
@@ -861,6 +997,7 @@ impl App {
                             pid:             None,
                             model:           agent.model.clone(),
                             context_tokens:  None,
+                            catalogue_path:  Some(catalogue_path.clone()),
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -907,6 +1044,7 @@ impl App {
                                     repo,
                                     orchestrator_id: None,
                                     agent,
+                                    base_cmd,
                                     catalogue_path,
                                     extra_env:       Vec::new(),
                                     started_at:      ts_i64,
@@ -948,6 +1086,19 @@ impl App {
                         }
                         state.spawn_modal = None;
 
+                        // Remember the confirmed agent choice (see the
+                        // standalone arm) — `[orchestrator]` is the Spawn
+                        // modal's remembered preselection.
+                        if state.config.orchestrator.harness != agent.harness
+                            || state.config.orchestrator.model != agent.model
+                        {
+                            state.orchestrator_agent = agent.clone();
+                            state.config.orchestrator = agent.clone();
+                            if let Err(e) = state.config.save() {
+                                tracing::warn!("failed to save remembered agent preselection: {e}");
+                            }
+                        }
+
                         let orch = Orchestrator {
                             id:         orch_id,
                             name:       name.clone(),
@@ -980,6 +1131,7 @@ impl App {
                             pid:             None,
                             model:           agent.model.clone(),
                             context_tokens:  None,
+                            catalogue_path:  Some(catalogue_path.clone()),
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1019,6 +1171,7 @@ impl App {
                                     repo:            String::new(),
                                     orchestrator_id: None,
                                     agent:           orch_agent,
+                                    base_cmd,
                                     catalogue_path,
                                     extra_env,
                                     started_at:      ts_i64,
@@ -1089,6 +1242,56 @@ impl App {
                         tracing::error!("remove session {id}: {e}");
                     }
                     Message::Noop
+                })
+            }
+
+            Message::RefileSession(id) => {
+                let Some(session) = state.sessions.get(&id).cloned() else { return Task::none(); };
+                let is_orch = state.orchestrators.iter().any(|o| o.id == id);
+                let Some(plan) = refile_plan(&session, is_orch, &state.config) else {
+                    tracing::warn!("refile {id}: no workspace recorded, cannot respawn");
+                    return Task::none();
+                };
+                // Drop the live client/grid first so the old PTY doesn't
+                // fight the respawn for the same tmux session name.
+                state.clients.remove(&id);
+                state.terminals.remove(&id);
+
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let engine  = state.engine.clone();
+                let name    = session.name.clone();
+                let repo    = session.repo.clone();
+                let orch_id = session.orchestrator_id.clone();
+                Task::future(async move {
+                    // Ignore kill errors — a Terminated husk has no tmux
+                    // session, and Re-file on one "just spawns". The
+                    // respawn upserts the record back to Working with cost
+                    // 0; the usage poller re-ingests real spend from the
+                    // workspace transcript.
+                    let _ = ninox_core::tmux::kill_session(&id).await;
+                    let attach = crate::spawn_util::spawn_interactive_session(
+                        engine,
+                        crate::spawn_util::InteractiveSpawnParams {
+                            session_id:      id.clone(),
+                            name,
+                            workspace:       plan.workspace,
+                            repo,
+                            orchestrator_id: orch_id,
+                            agent:           plan.agent,
+                            base_cmd:        plan.base_cmd,
+                            catalogue_path:  plan.catalogue_path,
+                            extra_env:       plan.extra_env,
+                            started_at:      ts,
+                        },
+                    )
+                    .await;
+                    match attach {
+                        Some(argv) => Message::ClientAttach { session_id: id, argv },
+                        None       => Message::Noop,
+                    }
                 })
             }
 
@@ -1320,6 +1523,78 @@ impl App {
                 Task::none()
             }
 
+            Message::NavigateSettings => {
+                state.view = View::Settings;
+                // Kick model discovery for the worker default's harness so
+                // the Workers card's picker has live options when it opens.
+                Self::ensure_models(state, &state.config.worker.harness.clone())
+            }
+
+            Message::SettingsToggleHarness(name) => {
+                // claude-code is the locked-on default — inert by design.
+                if name == "claude-code" {
+                    return Task::none();
+                }
+                // Write the FULL effective spec with `enabled` flipped —
+                // config entries replace builtin specs wholesale, so a bare
+                // `{ enabled: true }` would wipe the builtin's args.
+                let mut spec = state.config.registry().spec(&name);
+                spec.enabled = !spec.enabled;
+                state.config.harnesses.insert(name.clone(), spec);
+                if let Err(e) = state.config.save() {
+                    tracing::warn!("failed to save config after toggling harness {name}: {e}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsWorkerHarness(h) => {
+                // pick_list fires on re-selecting the current value — don't
+                // wipe (and re-save) the model for a no-op selection.
+                if state.config.worker.harness == h {
+                    return Task::none();
+                }
+                let task = Self::ensure_models(state, &h);
+                state.config.worker.harness = h;
+                // Clear the model — ids from one harness must not leak into
+                // another's launch command.
+                state.config.worker.model = None;
+                state.settings.worker_custom = None;
+                if let Err(e) = state.config.save() {
+                    tracing::warn!("failed to save worker harness: {e}");
+                }
+                task
+            }
+
+            Message::SettingsWorkerModel(v) => {
+                if v == crate::models::CUSTOM_SENTINEL {
+                    state.settings.worker_custom =
+                        Some(state.config.worker.model.clone().unwrap_or_default());
+                    return Task::none();
+                }
+                state.settings.worker_custom = None;
+                state.config.worker.model = Some(v);
+                if let Err(e) = state.config.save() {
+                    tracing::warn!("failed to save worker model: {e}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsWorkerCustomModel(v) => {
+                state.settings.worker_custom = Some(v);
+                Task::none()
+            }
+
+            Message::SettingsWorkerCustomCommit => {
+                if let Some(v) = state.settings.worker_custom.take() {
+                    let t = v.trim();
+                    state.config.worker.model = (!t.is_empty()).then(|| t.to_string());
+                    if let Err(e) = state.config.save() {
+                        tracing::warn!("failed to save worker model: {e}");
+                    }
+                }
+                Task::none()
+            }
+
             Message::BrainSelectEntry(id) => {
                 if let Some(e) = state.brain_view.entries.iter().find(|e| e.id == id) {
                     state.brain_view.markdown = iced::widget::markdown::parse(
@@ -1539,6 +1814,11 @@ impl App {
                 Task::none()
             }
 
+            Message::ModelListLoaded { harness, models } => {
+                state.model_lists.insert(harness, models);
+                Task::none()
+            }
+
             Message::Noop => Task::none(),
         }
     }
@@ -1693,6 +1973,7 @@ impl App {
             fleet_board::fleet_board,
             pr_list::pr_list,
             session_detail::session_detail,
+            settings_panel::settings_panel,
             sidebar::sidebar,
             spawn_modal::spawn_modal,
         };
@@ -1704,6 +1985,7 @@ impl App {
             View::SessionDetail { session_id, panel } => session_detail(state, session_id, panel),
             View::PrList => pr_list(state),
             View::Brain => brain_panel(state),
+            View::Settings => settings_panel(state),
         };
 
         let base: Element<Message> = container(
@@ -2008,6 +2290,8 @@ mod tests {
             clients:        HashMap::new(),
             reattach_attempted: std::collections::HashSet::new(),
             next_client_generation: 0,
+            model_lists:    HashMap::new(),
+            settings:       Default::default(),
             spawn_modal:    None,
             catalogue_modal: None,
             terminal_cols:  140,
@@ -2020,6 +2304,90 @@ mod tests {
             fleet_filter:    FleetFilter::default(),
             last_fleet_scope: None,
         }
+    }
+
+    fn refile_session(id: &str) -> Session {
+        Session {
+            id: id.into(), orchestrator_id: None, name: id.into(), repo: String::new(),
+            status: SessionStatus::Terminated, agent_type: "claude-code".into(),
+            cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: Some("/tmp/ws".into()), pid: None,
+            model: Some("claude-opus-4-8".into()), context_tokens: None,
+            catalogue_path: Some("/brains/b".into()),
+        }
+    }
+
+    #[test]
+    fn refile_plan_resolves_agent_through_current_registry() {
+        let mut cfg = ninox_core::config::AppConfig::default();
+        // simulate a spec change since the session was filed
+        cfg.harnesses.insert("claude-code".to_string(), ninox_core::harness::HarnessSpec {
+            enabled: true,
+            binary:  Some("claude-nightly".into()),
+            interactive_args: vec!["--model".into(), "{model}".into()],
+            ..Default::default()
+        });
+        let session = refile_session("s1");
+        let plan = refile_plan(&session, false, &cfg).expect("plan");
+        assert_eq!(plan.base_cmd, "claude-nightly --model 'claude-opus-4-8'");
+        assert_eq!(plan.workspace, "/tmp/ws");
+        assert_eq!(plan.catalogue_path, "/brains/b");
+        assert!(plan.extra_env.is_empty());
+        assert_eq!(plan.agent.harness, "claude-code");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn refile_plan_orchestrator_gets_caller_env_and_no_workspace_means_no_plan() {
+        let cfg = ninox_core::config::AppConfig::default();
+        let mut session = refile_session("o1");
+        session.catalogue_path = None;
+        let plan = refile_plan(&session, true, &cfg).expect("plan");
+        assert!(plan.extra_env.iter().any(|(k, v)| k == "NINOX_ORCHESTRATOR_ID" && v == "o1"));
+        assert!(plan.extra_env.iter().any(|(k, _)| k == "ATHENE_CALLER_TYPE"));
+        // no recorded catalogue → default brain path
+        assert!(!plan.catalogue_path.is_empty());
+
+        session.workspace_path = None;
+        assert!(refile_plan(&session, true, &cfg).is_none());
+    }
+
+    #[test]
+    fn refile_message_drops_client_state_and_keeps_session() {
+        let e = test_engine();
+        let mut m = base(e);
+        let s = refile_session("s1");
+        m.sessions.insert("s1".into(), s);
+        m.terminals.insert("s1".into(), TerminalState::new(80, 24, None));
+        let (m, _) = m.update(Message::RefileSession("s1".into()));
+        // The stale grid is dropped so the respawned PTY starts clean; the
+        // session record itself stays (the respawn upserts it to Working).
+        assert!(!m.terminals.contains_key("s1"));
+        assert!(m.sessions.contains_key("s1"));
+    }
+
+    #[test]
+    fn navigate_settings_switches_view() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::NavigateSettings);
+        assert!(matches!(m.view, View::Settings));
+        // and back out via the TOC
+        let (m, _) = m.update(Message::NavigateFleet { scope: None });
+        assert!(matches!(m.view, View::FleetBoard { .. }));
+    }
+
+    #[test]
+    fn model_list_loaded_populates_cache() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::ModelListLoaded {
+            harness: "opencode".into(),
+            models:  Some(vec!["a".into()]),
+        });
+        assert_eq!(m.model_lists.get("opencode"), Some(&Some(vec!["a".to_string()])));
+        // A failed discovery is cached too — pickers fall through to
+        // known_models without retrying every render.
+        let (m, _) = m.update(Message::ModelListLoaded { harness: "aider".into(), models: None });
+        assert_eq!(m.model_lists.get("aider"), Some(&None));
     }
 
     #[test]
@@ -2039,7 +2407,7 @@ mod tests {
             pr_id:           None,
             workspace_path:  None,
             pid:             None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let (updated, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         assert!(updated.sessions.contains_key("s1"));
@@ -2101,7 +2469,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         m = next;
@@ -2147,7 +2515,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         }).unwrap();
         let engine = Engine::new(store);
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
@@ -2168,7 +2536,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.42,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         m = m2;
@@ -2196,7 +2564,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let _ = m.engine.store.upsert_session(&worker);
         let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(worker)));
@@ -2612,7 +2980,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 1.23,
             started_at: 0, pr_number: Some(42), pr_id: None,
             workspace_path: Some("/tmp/w".into()), pid: Some(1234),
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -2638,7 +3006,7 @@ mod tests {
                 agent_type: "claude-code".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -2688,7 +3056,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         // NavigateSession defaults to the Split panel, so switch to Terminal
@@ -2733,7 +3101,7 @@ mod tests {
                 agent_type: "claude-code".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -2812,7 +3180,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         let (m, _) = m.update(Message::NavigateSession("s1".into()));
@@ -2862,7 +3230,7 @@ mod tests {
                 agent_type: "c".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -2950,7 +3318,7 @@ mod tests {
                 agent_type: "c".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -3025,6 +3393,116 @@ mod tests {
             assert_ne!(m.active_variant, before);
             let m = press(m, "t");
             assert_eq!(m.active_variant, before);
+        });
+    }
+
+    #[test]
+    fn toggling_a_harness_enables_it_and_persists() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("toggle_harness_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            assert!(!m.config.registry().enabled_names().contains(&"codex".to_string()));
+            let (m, _) = m.update(Message::SettingsToggleHarness("codex".into()));
+            assert!(m.config.registry().enabled_names().contains(&"codex".to_string()));
+            // persisted: a fresh load sees it too, with the builtin's args
+            // intact (the toggle writes the full effective spec)
+            let loaded = ninox_core::config::AppConfig::load().unwrap();
+            assert!(loaded.registry().enabled_names().contains(&"codex".to_string()));
+            assert!(loaded.registry().spec("codex").worker_args.is_some());
+            // toggling back disables
+            let (m, _) = m.update(Message::SettingsToggleHarness("codex".into()));
+            assert!(!m.config.registry().enabled_names().contains(&"codex".to_string()));
+        });
+    }
+
+    #[test]
+    fn claude_code_toggle_is_inert() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("claude_toggle_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            let (m, _) = m.update(Message::SettingsToggleHarness("claude-code".into()));
+            assert!(m.config.registry().enabled_names().contains(&"claude-code".to_string()));
+            assert!(m.config.harnesses.is_empty(), "inert toggle must not write config");
+        });
+    }
+
+    #[test]
+    fn worker_harness_change_persists_and_clears_model() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("worker_harness_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            let (m, _) = m.update(Message::SettingsWorkerModel("claude-haiku-4-5".into()));
+            let (m, _) = m.update(Message::SettingsToggleHarness("codex".into()));
+            let (m, _) = m.update(Message::SettingsWorkerHarness("codex".into()));
+            assert_eq!(m.config.worker.harness, "codex");
+            assert!(m.config.worker.model.is_none(), "stale model must not leak across harnesses");
+            let loaded = ninox_core::config::AppConfig::load().unwrap();
+            assert_eq!(loaded.worker.harness, "codex");
+            assert!(loaded.worker.model.is_none());
+        });
+    }
+
+    #[test]
+    fn worker_model_pick_persists_and_custom_commits() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("worker_model_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            let (m, _) = m.update(Message::SettingsWorkerModel("claude-haiku-4-5".into()));
+            assert_eq!(m.config.worker.model.as_deref(), Some("claude-haiku-4-5"));
+
+            // custom… opens the input (seeded with the current model)
+            // without touching config
+            let (m, _) = m.update(Message::SettingsWorkerModel(crate::models::CUSTOM_SENTINEL.into()));
+            assert_eq!(m.settings.worker_custom.as_deref(), Some("claude-haiku-4-5"));
+            assert_eq!(m.config.worker.model.as_deref(), Some("claude-haiku-4-5"));
+
+            // typing + commit writes and closes custom mode
+            let (m, _) = m.update(Message::SettingsWorkerCustomModel("my-model".into()));
+            let (m, _) = m.update(Message::SettingsWorkerCustomCommit);
+            assert_eq!(m.config.worker.model.as_deref(), Some("my-model"));
+            assert!(m.settings.worker_custom.is_none());
+            let loaded = ninox_core::config::AppConfig::load().unwrap();
+            assert_eq!(loaded.worker.model.as_deref(), Some("my-model"));
+
+            // committing a blank custom clears the model (harness default)
+            let (m, _) = m.update(Message::SettingsWorkerModel(crate::models::CUSTOM_SENTINEL.into()));
+            let (m, _) = m.update(Message::SettingsWorkerCustomModel("   ".into()));
+            let (m, _) = m.update(Message::SettingsWorkerCustomCommit);
+            assert!(m.config.worker.model.is_none());
+        });
+    }
+
+    #[test]
+    fn spawn_confirm_remembers_agent_preselection() {
+        // Confirming a spawn with a CHANGED agent choice persists it as the
+        // `[orchestrator]` remembered preselection; redirect config writes
+        // to a tempfile so the real user config is never touched.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("remembered_preselection_config.toml");
+
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let mut m = base(test_engine());
+            let (next, _) = m.update(Message::SpawnSession);
+            m = next;
+            let (next, _) = m.update(Message::SpawnFormName("remember-me".into()));
+            m = next;
+            let (next, _) = m.update(Message::SpawnFormModel("claude-haiku-4-5".into()));
+            m = next;
+            let (next, _) = m.update(Message::SpawnFormConfirm);
+            m = next;
+
+            assert_eq!(m.orchestrator_agent.model.as_deref(), Some("claude-haiku-4-5"));
+            let loaded = ninox_core::config::AppConfig::load().unwrap();
+            assert_eq!(loaded.orchestrator.harness, "claude-code");
+            assert_eq!(loaded.orchestrator.model.as_deref(), Some("claude-haiku-4-5"));
+
+            // Reopening the modal preselects the remembered choice.
+            let (m, _) = m.update(Message::SpawnSession);
+            assert_eq!(m.spawn_modal.as_ref().unwrap().model.as_deref(), Some("claude-haiku-4-5"));
         });
     }
 
@@ -3203,7 +3681,9 @@ mod tests {
         m = next;
         let (next, _) = m.update(Message::SpawnFormWorkspace("~/proj/ninox".into()));
         m = next;
-        let (next, _) = m.update(Message::SpawnFormAgent(1));
+        let (next, _) = m.update(Message::SpawnFormHarness("codex".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormModel("gpt-4o".into()));
         m = next;
         let (next, _) = m.update(Message::SpawnFormCatalogue(0));
         m = next;
@@ -3212,8 +3692,37 @@ mod tests {
         assert_eq!(f.name, "theme-tokens");
         assert_eq!(f.kind, SpawnKind::Standalone);
         assert_eq!(f.workspace, "~/proj/ninox");
-        assert_eq!(f.agent_idx, 1);
+        assert_eq!(f.harness, "codex");
+        assert_eq!(f.model.as_deref(), Some("gpt-4o"));
         assert_eq!(f.catalogue_idx, 0);
+    }
+
+    #[test]
+    fn spawn_form_harness_switch_resets_model_and_custom_opens_input() {
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormModel("claude-haiku-4-5".into()));
+        m = next;
+        assert_eq!(m.spawn_modal.as_ref().unwrap().model.as_deref(), Some("claude-haiku-4-5"));
+
+        // custom… flips the picker into free-text mode without clobbering
+        // the last picked model (blank custom falls back to it on confirm).
+        let (next, _) = m.update(Message::SpawnFormModel(crate::models::CUSTOM_SENTINEL.into()));
+        m = next;
+        assert!(m.spawn_modal.as_ref().unwrap().custom_model.is_some());
+        let (next, _) = m.update(Message::SpawnFormCustomModel("my-model".into()));
+        m = next;
+        assert_eq!(m.spawn_modal.as_ref().unwrap().custom_model.as_deref(), Some("my-model"));
+
+        // Switching harness clears model state — stale model ids from one
+        // harness must not leak into another's launch command.
+        let (next, _) = m.update(Message::SpawnFormHarness("codex".into()));
+        m = next;
+        let f = m.spawn_modal.as_ref().unwrap();
+        assert_eq!(f.harness, "codex");
+        assert!(f.model.is_none());
+        assert!(f.custom_model.is_none());
     }
 
     #[test]
@@ -3450,7 +3959,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None,
+            model: None, context_tokens: None, catalogue_path: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         m = next;

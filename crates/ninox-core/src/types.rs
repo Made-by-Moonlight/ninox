@@ -35,6 +35,12 @@ pub struct Session {
     /// `None` until the usage poller has ingested at least one turn.
     #[serde(default)]
     pub context_tokens: Option<u64>,
+    /// Brain catalogue directory this session was spawned with (its
+    /// `NINOX_BRAIN`). Recorded so a Re-file can respawn the session
+    /// thinking with the same catalogue. `None` for sessions filed before
+    /// this field existed (Re-file falls back to the default brain).
+    #[serde(default)]
+    pub catalogue_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

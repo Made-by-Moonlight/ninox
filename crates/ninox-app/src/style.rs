@@ -2,7 +2,7 @@
 //! Spec: docs/design-concepts/field-notes-design.md §2–3.
 
 use iced::font::{Family, Stretch, Style as FontStyle, Weight};
-use iced::widget::{button, container, row, text, text_input, Space};
+use iced::widget::{button, container, pick_list, row, text, text_input, Space};
 use iced::{Alignment, Background, Border, Color, Element, Font, Length, Shadow, Vector};
 use ninox_core::types::{CIStatus, SessionStatus};
 
@@ -287,6 +287,18 @@ pub fn segmented_frame<'a, M: 'a>(s: &'a ColorScheme, segments: Vec<Element<'a, 
 /// border (the underline is a separate `hline`), `faint` icon/placeholder,
 /// `ink` value, and a 35%-alpha `accent` selection. Shared by the fleet/brain
 /// filter fields and the spawn modal's name/workspace fields.
+/// Bordered transparent `pick_list` style shared by the spawn modal's
+/// catalogue/model pickers and the settings Workers card.
+pub fn pick_style<'a>(s: &'a ColorScheme) -> impl Fn(&iced::Theme, pick_list::Status) -> pick_list::Style + 'a {
+    move |_theme, _status| pick_list::Style {
+        text_color: s.ink,
+        placeholder_color: s.faint,
+        handle_color: s.ink_2,
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border { color: s.rule_dark, width: 1.0, radius: 2.0.into() },
+    }
+}
+
 pub fn underlined_input_style(s: &ColorScheme) -> impl Fn(&iced::Theme, text_input::Status) -> text_input::Style + '_ {
     move |_theme, _status| text_input::Style {
         background: Background::Color(Color::TRANSPARENT),

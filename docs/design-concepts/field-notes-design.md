@@ -186,6 +186,82 @@ Task field** — sessions are interactive; spawning drops you into the session t
 Fields as underlined serif inputs; cost estimate, Cancel ghost + vermilion "Spawn ⬡"
 with offset shadow. Esc closes.
 
+### V. Settings — the appendix
+
+> **Implemented 2026-07-05** (`feat/settings-harnesses`; plan:
+> `docs/superpowers/plans/2026-07-05-settings-appendix.md`). Deliberate
+> deltas from the text below: substituted launch args are shell-quoted
+> (semantically identical to the old commands); a `[harnesses.<name>]`
+> config entry replaces the builtin spec wholesale (the Settings toggle
+> therefore writes the full effective spec); re-filed workers respawn
+> interactively — their original spawn prompt is not stored; aider ships
+> without a `models_cmd` (its `--list-models` needs a search argument —
+> supply one in config if wanted).
+Opened from the sidebar footer (which becomes a `Settings ▸` row — the theme dots MOVE
+here). Folio: "The *appendix*" / SETTINGS. A single narrow column (~720px) of cards:
+
+- **Theme**: the light/dark/ninox dots (relocated from the footer) + a mono pointer to
+  the active theme file (`themes/field-notes.toml`).
+- **Harnesses**: one row per agent harness — ink-fill toggle, serif name, mono
+  binary, and a mono `workers ✓/–` marker (whether the spec has verified
+  `worker_args`). NO model field here: interactive spawns always choose their model
+  in the Spawn modal, so a settings-level default would be dead configuration.
+  `claude-code` is the locked-on DEFAULT; `codex`, `opencode`, `aider` and custom
+  names (e.g. `freebuff` — unknown harnesses run their name verbatim as the binary)
+  are **off by default**. Enabled harnesses appear as agent chips in the Spawn modal;
+  picking a chip picks the harness, with a model picker beside it.
+- **Workers** (the one unmanned decision): what `ninox spawn` launches when
+  orchestrator agents spawn workers — a harness picker (enabled, worker-capable
+  harnesses only) + a **model picker** (maps to config `[worker]`;
+  `[orchestrator]` stays only as the Spawn modal's remembered preselection, not a
+  settings surface). Model pickers — here and in the Spawn modal — are selects, not
+  free text (users don't know model id strings), fed in precedence order:
+  (1) `models_cmd` output when the spec defines one and it succeeds (e.g.
+  `opencode models`, `aider --list-models`; run on demand, cached per app run,
+  warn-and-fall-through); (2) the spec's curated `known_models` (claude-code ships
+  fable-5 / opus-4.8 / sonnet-5 / haiku-4.5); (3) the currently-configured value.
+  The LAST entry is always `custom…`, revealing a mono free-text input as the
+  escape hatch.
+
+**Backend (registry, not enum):** harness definitions are DATA, not code — adding a
+future harness must require zero Rust changes. Each harness is a spec:
+
+```toml
+[harnesses.freebuff]            # any name; binary defaults to the name
+enabled = true
+binary  = "freebuff"
+model   = "fb-large"
+interactive_args = ["--model", "{model}"]
+worker_args      = ["--model", "{model}", "-p", "{prompt}"]
+known_models     = ["fb-large", "fb-mini"]   # curated fallback for the picker
+models_cmd       = ["freebuff", "models"]    # optional: live model discovery
+```
+
+The four known harnesses ship as compiled-in default specs (claude-code enabled,
+exact current launch shapes preserved); config entries override or extend the
+registry. Template vars: `{model}`, `{prompt}` — an arg element containing
+`{model}` is dropped entirely when no model is set. `AgentConfig { harness, model }`
+stays as the per-role/per-spawn pointer into the registry, and the existing
+`interactive_cmd`/`worker_cmd` call sites resolve through it. Serde-defaulted
+throughout — existing configs keep parsing unchanged.
+
+**Freebuff (researched 2026-07-05):** real harness — the free, ad-supported tier of
+Codebuff (CodebuffAI/codebuff monorepo, `freebuff/`), terminal agent with a Claude
+Code-like workflow. Binary `freebuff` (`npm install -g freebuff`); interactive =
+run bare in the workspace; model via `--model <name>`; `--yes` auto-approves. Ships
+as a compiled-in default spec (disabled): `interactive_args = ["--model", "{model}"]`.
+A one-shot/worker prompt mode is UNVERIFIED — the default spec omits `worker_args`
+(a harness without worker_args is selectable for orchestrators/standalone sessions
+but not offered for CLI worker spawns until someone supplies the args in config).
+
+**Updating running sessions:** sessions are processes — changing a harness spec,
+model, or binary version never mutates a live session. The mechanism: a per-session
+**Re-file** action (session header, beside Kill): kills the tmux session and
+respawns the same name/workspace with the CURRENT registry settings (this also
+subsumes the respawn-over-Terminated-husk gap — Re-file on a Terminated session
+just spawns). Settings changes therefore apply to new spawns immediately and to
+existing sessions on Re-file; no silent in-place swaps.
+
 ## 6. Interaction inventory
 
 - Keys: `1–3` views · `t` theme · `Esc` closes modal. Mockup deep links:

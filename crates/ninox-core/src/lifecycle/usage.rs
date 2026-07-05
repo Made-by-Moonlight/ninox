@@ -1,7 +1,7 @@
 //! Cost/token usage ingestion for interactive `claude-code` sessions.
 //!
 //! Ninox launches the real `claude` CLI interactively inside a tmux pane
-//! (see `AgentConfig::interactive_cmd`/`worker_cmd`) rather than driving it
+//! (see `harness::HarnessRegistry::interactive_cmd`/`worker_cmd`) rather than driving it
 //! through a scripted API, so there is no request/response boundary Ninox
 //! controls where a cost or token count could be captured directly. What
 //! *does* exist is the CLI's own on-disk transcript: every turn is appended

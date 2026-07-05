@@ -10,6 +10,7 @@ pub mod notification_panel;
 pub mod pr_list;
 pub mod scrollback;
 pub mod session_detail;
+pub mod settings_panel;
 pub mod sidebar;
 pub mod spawn_modal;
 pub mod terminal;

@@ -1,13 +1,14 @@
 mod app;
 mod components;
 mod input;
+mod models;
 mod spawn_util;
 mod style;
 mod theme;
 
 use spawn_util::{create_worker_worktree, repo_from_workspace};
 use ninox_core::{
-    config::{AgentConfig, AppConfig},
+    config::AppConfig,
     events::Engine,
     github::resolve_token,
     lifecycle::poller::Poller,
@@ -111,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     match args.command {
         Some(Command::Spawn { prompt, workspace, name, orchestrator_id }) => {
             let config = AppConfig::load().unwrap_or_default();
-            run_spawn(store, config.worker, prompt, workspace, name, orchestrator_id).await
+            run_spawn(store, config, prompt, workspace, name, orchestrator_id).await
         }
         Some(Command::Send { session_id, message }) => {
             ninox_core::tmux::send_keys(&session_id, &message).await
@@ -125,12 +126,26 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_spawn(
     store: Arc<Store>,
-    agent: AgentConfig,
+    config: AppConfig,
     prompt: String,
     workspace: String,
     name: Option<String>,
     orchestrator_id: Option<String>,
 ) -> anyhow::Result<()> {
+    let agent = config.worker.clone();
+    // Refuse worker-incapable harnesses BEFORE any side effect (worktree
+    // creation, session upsert) — bailing after the upsert would leave a
+    // permanent ghost "Working" session with no pid and no tmux session
+    // for poll_pids to reap.
+    let registry = config.registry();
+    if registry.spec(&agent.harness).worker_args.is_none() {
+        anyhow::bail!(
+            "harness '{}' has no verified worker mode (no worker_args in its spec) — \
+             pick a worker-capable harness in Settings or add worker_args under \
+             [harnesses.{}] in config.toml",
+            agent.harness, agent.harness,
+        );
+    }
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -203,6 +218,10 @@ async fn run_spawn(
         pid:             None,
         model:           agent.model.clone(),
         context_tokens:  None,
+        // The catalogue this worker thinks with — `NINOX_BRAIN` is
+        // forwarded from the orchestrator's own environment (see the env
+        // block below), so record the same value for Re-file.
+        catalogue_path:  std::env::var("NINOX_BRAIN").ok().filter(|s| !s.is_empty()),
     };
 
     store.upsert_session(&session)?;
@@ -212,7 +231,9 @@ async fn run_spawn(
     // -e PATH=..., because the login shell (-l) sources rc files that may
     // re-prepend Homebrew or nvm directories, pushing our wrapper behind the
     // real `gh`. By exporting PATH here we win the race after rc files run.
-    let cmd_base = agent.worker_cmd(&effective_prompt);
+    let cmd_base = registry
+        .worker_cmd(&agent, &effective_prompt)
+        .expect("worker-capability checked before any side effect above");
     let cmd = format!(
         "export PATH='{}':\"$PATH\"; {}",
         ninox_bin_str.replace('\'', "'\\''"),
