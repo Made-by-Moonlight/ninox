@@ -11,7 +11,10 @@ use iced::{Element, Subscription, Task, Theme};
 use tokio::sync::broadcast;
 
 use crate::{
-    components::{session_detail::DetailPanel, spawn_modal::SpawnForm, terminal::TerminalState},
+    components::{
+        catalogue_modal::CatalogueForm, session_detail::DetailPanel, spawn_modal::SpawnForm,
+        terminal::TerminalState,
+    },
     theme::{ColorScheme, Themes},
 };
 
@@ -117,6 +120,11 @@ pub struct App {
     /// currently-live client for the same session_id.
     next_client_generation: u64,
     pub spawn_modal:     Option<SpawnForm>,
+    /// Add-a-catalogue journal-entry modal, opened from the `+` at the
+    /// right edge of the brain view's volume plate. Exclusive with
+    /// `spawn_modal` in practice (spawn lives in other views); when both are
+    /// somehow set, rendering and Esc both give `spawn_modal` precedence.
+    pub catalogue_modal: Option<CatalogueForm>,
     /// Current terminal canvas dimensions, kept in sync by WindowResized.
     /// Used as the source of truth for all start_streaming + TerminalState::new calls.
     pub terminal_cols:   u16,
@@ -155,6 +163,13 @@ pub enum Message {
     SpawnFormCatalogue(usize),
     SpawnFormConfirm,
     SpawnFormCancel,
+    /// Opened from the `+` at the right edge of the brain view's volume
+    /// plate (`components::brain_panel::volume_plate`).
+    CatalogueModalOpen,
+    CatalogueFormName(String),
+    CatalogueFormPath(String),
+    CatalogueFormConfirm,
+    CatalogueFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
     RemoveOrchestrator(OrchestratorId),
     RemoveSession(SessionId),
@@ -301,6 +316,7 @@ impl App {
             reattach_attempted: std::collections::HashSet::new(),
             next_client_generation: 0,
             spawn_modal:    None,
+            catalogue_modal: None,
             // Placeholders — corrected below by resize_terminals() using the
             // real default window size, so this never drifts out of sync with
             // main.rs's iced::window::Settings::default() (1024x768).
@@ -596,6 +612,101 @@ impl App {
             Message::SpawnFormCancel => {
                 state.spawn_modal = None;
                 Task::none()
+            }
+
+            Message::CatalogueModalOpen => {
+                state.catalogue_modal = Some(CatalogueForm::default());
+                Task::none()
+            }
+
+            Message::CatalogueFormName(v) => {
+                if let Some(f) = &mut state.catalogue_modal { f.name = v; f.error = None; }
+                Task::none()
+            }
+
+            Message::CatalogueFormPath(v) => {
+                if let Some(f) = &mut state.catalogue_modal { f.path = v; f.error = None; }
+                Task::none()
+            }
+
+            Message::CatalogueFormCancel => {
+                state.catalogue_modal = None;
+                Task::none()
+            }
+
+            // Guard order mirrors the design spec: empty name, duplicate
+            // name (vs `catalogue_options()`), empty path, path exists but
+            // isn't a directory, then create/open failure. Each guard sets
+            // `form.error` and returns with the modal still open and
+            // `config.brain.catalogues` untouched.
+            Message::CatalogueFormConfirm => {
+                let Some(form) = state.catalogue_modal.clone() else { return Task::none(); };
+
+                let name = form.name.trim().to_string();
+                if name.is_empty() {
+                    if let Some(f) = &mut state.catalogue_modal {
+                        f.error = Some("give this catalogue a name".to_string());
+                    }
+                    return Task::none();
+                }
+
+                if state.config.catalogue_options().iter().any(|c| c.name == name) {
+                    if let Some(f) = &mut state.catalogue_modal {
+                        f.error = Some(format!("a catalogue named {name} already exists"));
+                    }
+                    return Task::none();
+                }
+
+                let path_input = form.path.trim().to_string();
+                if path_input.is_empty() {
+                    if let Some(f) = &mut state.catalogue_modal {
+                        f.error = Some("path is required".to_string());
+                    }
+                    return Task::none();
+                }
+
+                let expanded = crate::spawn_util::expand_tilde(&path_input);
+                let path = std::path::PathBuf::from(&expanded);
+                if path.exists() && !path.is_dir() {
+                    if let Some(f) = &mut state.catalogue_modal {
+                        f.error = Some(format!("{expanded} exists but isn't a directory"));
+                    }
+                    return Task::none();
+                }
+
+                if let Err(e) = std::fs::create_dir_all(&path) {
+                    if let Some(f) = &mut state.catalogue_modal {
+                        f.error = Some(format!("couldn't create {expanded}: {e}"));
+                    }
+                    return Task::none();
+                }
+
+                // Initialize the index — creates .index.db + .gitignore.
+                if let Err(e) = BrainIndex::open(&path) {
+                    if let Some(f) = &mut state.catalogue_modal {
+                        f.error = Some(format!("couldn't initialize brain index: {e}"));
+                    }
+                    return Task::none();
+                }
+
+                state.config.brain.catalogues.push(ninox_core::config::CatalogueRef {
+                    name: name.clone(),
+                    path: path.clone(),
+                });
+                if let Err(e) = state.config.save() {
+                    tracing::warn!("failed to save config after adding catalogue '{name}': {e}");
+                }
+                state.catalogues = state.config.catalogue_options();
+                let idx = state
+                    .catalogues
+                    .iter()
+                    .position(|c| c.path == path)
+                    .unwrap_or_else(|| state.catalogues.len().saturating_sub(1));
+
+                state.catalogue_modal = None;
+                // Reuse BrainSwitchCatalogue's handler logic to open the
+                // index for real and refresh the view.
+                App::apply(state, Message::BrainSwitchCatalogue(idx))
             }
 
             Message::SpawnFormConfirm => {
@@ -925,10 +1036,22 @@ impl App {
             }
 
             Message::RawKey { key, modifiers, text } => {
-                // Esc closes the spawn modal from anywhere.
+                // Esc closes the spawn modal from anywhere. Checked first —
+                // both can't be open in practice (spawn lives in other
+                // views), but if they somehow were, spawn takes precedence
+                // here just like it does in `iced_view`'s stacking order.
                 if state.spawn_modal.is_some() {
                     if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)) {
                         state.spawn_modal = None;
+                    }
+                    return Task::none();
+                }
+
+                // Esc closes the add-catalogue modal (Brain view's volume
+                // plate `+`) at the same precedence level.
+                if state.catalogue_modal.is_some() {
+                    if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)) {
+                        state.catalogue_modal = None;
                     }
                     return Task::none();
                 }
@@ -1478,6 +1601,7 @@ impl App {
         use iced::widget::{container, row};
         use crate::components::{
             brain_panel::brain_panel,
+            catalogue_modal::catalogue_modal,
             fleet_board::fleet_board,
             pr_list::pr_list,
             session_detail::session_detail,
@@ -1509,8 +1633,12 @@ impl App {
         })
         .into();
 
+        // Spawn wins on top if both were somehow set — exclusive in
+        // practice (spawn lives in other views).
         if let Some(form) = &state.spawn_modal {
             iced::widget::stack![base, spawn_modal(state, form)].into()
+        } else if let Some(form) = &state.catalogue_modal {
+            iced::widget::stack![base, catalogue_modal(state, form)].into()
         } else {
             base
         }
@@ -1794,6 +1922,7 @@ mod tests {
             reattach_attempted: std::collections::HashSet::new(),
             next_client_generation: 0,
             spawn_modal:    None,
+            catalogue_modal: None,
             terminal_cols:  140,
             terminal_rows:  50,
             window_width:   0.0,
@@ -2658,6 +2787,155 @@ mod tests {
             text:      None,
         });
         assert!(m.spawn_modal.is_none());
+    }
+
+    // ── Add-a-catalogue modal ────────────────────────────────────────────
+
+    #[test]
+    fn catalogue_modal_open_sets_a_blank_form() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::CatalogueModalOpen);
+        let form = m.catalogue_modal.as_ref().expect("modal opens");
+        assert!(form.name.is_empty());
+        assert!(form.path.is_empty());
+        assert!(form.error.is_none());
+    }
+
+    #[test]
+    fn catalogue_form_field_edits_update_state_and_clear_error() {
+        let m = base(test_engine());
+        let (mut m, _) = m.update(Message::CatalogueModalOpen);
+        m.catalogue_modal.as_mut().unwrap().error = Some("stale".to_string());
+        let (m, _) = m.update(Message::CatalogueFormName("ninox-dev".into()));
+        assert_eq!(m.catalogue_modal.as_ref().unwrap().name, "ninox-dev");
+        assert!(m.catalogue_modal.as_ref().unwrap().error.is_none());
+
+        let mut m = m;
+        m.catalogue_modal.as_mut().unwrap().error = Some("stale again".to_string());
+        let (m, _) = m.update(Message::CatalogueFormPath("~/brains/dev".into()));
+        assert_eq!(m.catalogue_modal.as_ref().unwrap().path, "~/brains/dev");
+        assert!(m.catalogue_modal.as_ref().unwrap().error.is_none());
+    }
+
+    #[test]
+    fn catalogue_form_cancel_closes_modal() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::CatalogueModalOpen);
+        assert!(m.catalogue_modal.is_some());
+        let (m, _) = m.update(Message::CatalogueFormCancel);
+        assert!(m.catalogue_modal.is_none());
+    }
+
+    #[test]
+    fn esc_closes_catalogue_modal() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::CatalogueModalOpen);
+        assert!(m.catalogue_modal.is_some());
+        let (m, _) = m.update(Message::RawKey {
+            key:       iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+            modifiers: iced::keyboard::Modifiers::default(),
+            text:      None,
+        });
+        assert!(m.catalogue_modal.is_none());
+    }
+
+    #[test]
+    fn confirm_guard_empty_name_keeps_modal_open_and_config_untouched() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::CatalogueModalOpen);
+        let before = m.config.brain.catalogues.clone();
+        let (m, _) = m.update(Message::CatalogueFormConfirm);
+        let form = m.catalogue_modal.as_ref().expect("modal stays open");
+        assert!(form.error.as_deref().unwrap().contains("name"), "{:?}", form.error);
+        assert_eq!(m.config.brain.catalogues, before);
+    }
+
+    #[test]
+    fn confirm_guard_duplicate_name_keeps_modal_open_and_config_untouched() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::CatalogueModalOpen);
+        // "default" is always present via `catalogue_options()`.
+        let (m, _) = m.update(Message::CatalogueFormName("default".into()));
+        let (m, _) = m.update(Message::CatalogueFormPath("/tmp/whatever-not-touched".into()));
+        let before = m.config.brain.catalogues.clone();
+        let (m, _) = m.update(Message::CatalogueFormConfirm);
+        let form = m.catalogue_modal.as_ref().expect("modal stays open");
+        assert!(form.error.as_deref().unwrap().contains("already exists"), "{:?}", form.error);
+        assert_eq!(m.config.brain.catalogues, before);
+    }
+
+    #[test]
+    fn confirm_guard_empty_path_keeps_modal_open_and_config_untouched() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::CatalogueModalOpen);
+        let (m, _) = m.update(Message::CatalogueFormName("ninox-dev".into()));
+        let before = m.config.brain.catalogues.clone();
+        let (m, _) = m.update(Message::CatalogueFormConfirm);
+        let form = m.catalogue_modal.as_ref().expect("modal stays open");
+        assert!(form.error.as_deref().unwrap().contains("path"), "{:?}", form.error);
+        assert_eq!(m.config.brain.catalogues, before);
+    }
+
+    #[test]
+    fn confirm_guard_path_exists_but_isnt_a_directory_keeps_modal_open_and_config_untouched() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("not-a-dir");
+        std::fs::write(&file_path, b"nope").unwrap();
+
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::CatalogueModalOpen);
+        let (m, _) = m.update(Message::CatalogueFormName("ninox-dev".into()));
+        let (m, _) = m.update(Message::CatalogueFormPath(file_path.to_string_lossy().to_string()));
+        let before = m.config.brain.catalogues.clone();
+        let (m, _) = m.update(Message::CatalogueFormConfirm);
+        let form = m.catalogue_modal.as_ref().expect("modal stays open");
+        assert!(form.error.as_deref().unwrap().contains("directory"), "{:?}", form.error);
+        assert_eq!(m.config.brain.catalogues, before);
+    }
+
+    #[test]
+    fn confirm_happy_path_files_a_new_catalogue_and_switches_to_it() {
+        // `CatalogueFormConfirm` calls `state.config.save()`, which writes
+        // to `AppConfig::config_path()`. Redirect that to a tempfile so
+        // this test never touches the real user config (see
+        // `t_toggles_light_dark` for the same pattern).
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("catalogue_happy_path_config.toml");
+        let catalogue_dir = dir.path().join("ninox-dev-brain");
+
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            let (m, _) = m.update(Message::CatalogueModalOpen);
+            let (m, _) = m.update(Message::CatalogueFormName("ninox-dev".into()));
+            let (m, _) = m.update(Message::CatalogueFormPath(
+                catalogue_dir.to_string_lossy().to_string(),
+            ));
+            let (m, _) = m.update(Message::CatalogueFormConfirm);
+
+            assert!(m.catalogue_modal.is_none(), "modal closes on success");
+            assert!(
+                m.config
+                    .brain
+                    .catalogues
+                    .iter()
+                    .any(|c| c.name == "ninox-dev" && c.path == catalogue_dir),
+                "config gains the new catalogue entry: {:?}",
+                m.config.brain.catalogues
+            );
+            assert!(
+                m.catalogues.iter().any(|c| c.name == "ninox-dev"),
+                "state.catalogues refreshed from config.catalogue_options()"
+            );
+            let idx = m.catalogues.iter().position(|c| c.name == "ninox-dev").unwrap();
+            assert_eq!(m.active_catalogue, idx, "active catalogue switches to the new one");
+            assert!(
+                catalogue_dir.join(".index.db").exists(),
+                "brain index initialized on disk"
+            );
+
+            let saved = std::fs::read_to_string(&config_path).unwrap();
+            assert!(saved.contains("ninox-dev"), "catalogue persisted to config.toml");
+        });
     }
 
     #[test]

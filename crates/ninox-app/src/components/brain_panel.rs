@@ -6,7 +6,7 @@ use iced::{
 use crate::app::{App, BrainMode, Message};
 use crate::style::{
     dotted_rule, hard_shadow, heavy_frame, hline, micro_label, shadow_alpha, stamp, vline, MONO,
-    MONO_MEDIUM, SERIF, SERIF_ITALIC, SERIF_MEDIUM,
+    MONO_MEDIUM, SANS_BOLD, SERIF, SERIF_ITALIC, SERIF_MEDIUM,
 };
 use crate::theme::ColorScheme;
 use ninox_core::BrainEntry;
@@ -298,12 +298,27 @@ fn volume_plate(app: &App) -> Element<'_, Message> {
         .into()
     };
 
+    // Add-a-catalogue affordance: visible always (even with a single, inert
+    // catalogue) — the only way to file a new one. Micro-sized, faint →
+    // accent on hover (mockup "Adding a catalogue").
+    let add_button = button(text("+").size(13).font(SANS_BOLD))
+        .on_press(Message::CatalogueModalOpen)
+        .padding([1, 7])
+        .style(move |_theme, status| button::Style {
+            background: None,
+            text_color: if status == button::Status::Hovered { s.accent } else { s.faint },
+            border: Border::default(),
+            ..Default::default()
+        });
+
     column![
         container(
             row![
                 micro_label("Catalogue", s.faint).size(8.5),
                 Space::new(Length::Fill, 0),
                 switcher,
+                Space::new(10, 0),
+                add_button,
             ]
             .align_y(Alignment::Center),
         )

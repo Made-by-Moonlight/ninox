@@ -65,13 +65,10 @@ pub struct SpawnForm {
 // ---------------------------------------------------------------------------
 
 /// A transparent, underlined `text_input` matching the ledger-field pattern
-/// used elsewhere (see `filter_bar::filter_bar`) but sized for a serif form field.
+/// used elsewhere (see `filter_bar::filter_bar`) but sized for a serif form
+/// field. Delegates to the shared helper (also used by `catalogue_modal`).
 fn styled_input<'a>(s: &'a ColorScheme, placeholder: &'a str, value: &'a str) -> text_input::TextInput<'a, Message> {
-    text_input(placeholder, value)
-        .font(SERIF)
-        .size(16)
-        .padding([4, 2])
-        .style(style::underlined_input_style(s))
+    style::serif_underlined_input(s, placeholder, value)
 }
 
 fn pick_style<'a>(s: &'a ColorScheme) -> impl Fn(&iced::Theme, pick_list::Status) -> pick_list::Style + 'a {

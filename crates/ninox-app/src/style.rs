@@ -279,6 +279,21 @@ pub fn underlined_input_style(s: &ColorScheme) -> impl Fn(&iced::Theme, text_inp
     }
 }
 
+/// Shared serif underlined input for journal-entry modal "Name" fields
+/// (spawn modal's session name, catalogue modal's catalogue name) — 16px
+/// Newsreader, `underlined_input_style` background/selection treatment.
+pub fn serif_underlined_input<'a>(
+    s: &'a ColorScheme,
+    placeholder: &'a str,
+    value: &'a str,
+) -> text_input::TextInput<'a, crate::app::Message> {
+    text_input(placeholder, value)
+        .font(SERIF)
+        .size(16)
+        .padding([4, 2])
+        .style(underlined_input_style(s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

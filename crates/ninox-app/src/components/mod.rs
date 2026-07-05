@@ -1,5 +1,6 @@
 pub mod brain_panel;
 pub mod brain_pinboard;
+pub mod catalogue_modal;
 pub mod filter_bar;
 pub mod fleet_board;
 pub mod folio;
