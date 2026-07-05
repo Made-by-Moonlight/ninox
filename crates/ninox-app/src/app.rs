@@ -98,9 +98,10 @@ pub struct App {
     pub sidebar:         SidebarState,
     pub view:            View,
     pub last_session:    Option<SessionId>,
-    /// Last panel the user chose per session — re-entering a session
-    /// restores it instead of resetting to the Split default (jarring).
-    pub panel_memory:    HashMap<SessionId, crate::components::session_detail::DetailPanel>,
+    /// The user's preferred worker panel — global, not per-session: the
+    /// last tab chosen in any session detail, applied when opening a
+    /// worker (resetting to Split on every navigation was jarring).
+    pub worker_panel:    crate::components::session_detail::DetailPanel,
     pub terminals:       HashMap<SessionId, TerminalState>,
     /// One hidden tmux client per on-screen session (the "view"). Dropping
     /// an entry kills the client process; the session itself stays detached
@@ -294,7 +295,7 @@ impl App {
             sidebar:        SidebarState::default(),
             view:           View::default(),
             last_session:   None,
-            panel_memory:   HashMap::new(),
+            worker_panel:   Default::default(),
             terminals:      HashMap::new(),
             clients:        HashMap::new(),
             reattach_attempted: std::collections::HashSet::new(),
@@ -462,7 +463,7 @@ impl App {
                 }
                 state.view = View::SessionDetail {
                     session_id: id.clone(),
-                    panel: state.panel_memory.get(&id).copied().unwrap_or_default(),
+                    panel: state.worker_panel,
                 };
                 // Drop every client that is no longer on screen — the tmux
                 // sessions stay detached and running.
@@ -866,9 +867,9 @@ impl App {
             }
 
             Message::SwitchDetailPanel(new_panel) => {
-                if let View::SessionDetail { session_id, panel } = &mut state.view {
+                if let View::SessionDetail { panel, .. } = &mut state.view {
                     *panel = new_panel;
-                    state.panel_memory.insert(session_id.clone(), new_panel);
+                    state.worker_panel = new_panel;
                 }
                 // Entering/leaving Split changes how much width the terminal
                 // canvas actually has, so the grid must be reflowed to match.
@@ -1787,7 +1788,7 @@ mod tests {
             sidebar:        SidebarState::default(),
             view:           View::FleetBoard { scope: None },
             last_session:   None,
-            panel_memory:   HashMap::new(),
+            worker_panel:   Default::default(),
             terminals:      HashMap::new(),
             clients:        HashMap::new(),
             reattach_attempted: std::collections::HashSet::new(),
@@ -1899,7 +1900,7 @@ mod tests {
     }
 
     #[test]
-    fn reentering_session_restores_last_panel() {
+    fn opening_worker_uses_global_preferred_panel() {
         use crate::components::session_detail::DetailPanel;
         let e = test_engine();
         let mut m = base(e);
@@ -1924,7 +1925,7 @@ mod tests {
         m = next;
         assert!(
             matches!(&m.view, View::SessionDetail { panel: DetailPanel::Terminal, .. }),
-            "re-entering must restore the last chosen panel, not reset to Split"
+            "opening a worker must use the global preferred panel, not reset to Split"
         );
     }
 
