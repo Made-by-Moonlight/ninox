@@ -15,19 +15,20 @@ name: Release
 #      the inter-crate version pins + Cargo.lock, commit
 #      `chore(release): vX.Y.Z` to main, and tag it.
 #   4. Create the GitHub release with notes grouped by commit type.
-#   5. Dispatch publish.yml, which pushes the new versions to crates.io via
-#      Trusted Publishing.
+#   5. The pushed version bump triggers publish.yml, which pushes the new
+#      versions to crates.io via Trusted Publishing.
 #
-# The very first run has no v* tag, so the whole history counts — that cuts
+# The very first run has no v* tag, so the whole history counts — that cut
 # the initial automated release covering everything since 0.1.0.
 #
-# Why the explicit dispatch in step 5: pushes and tags made with the
-# default GITHUB_TOKEN never trigger other workflows (GitHub's recursion
-# guard — which is also why this workflow can't loop on its own release
-# commit), but workflow_dispatch via the API is exempt.
-#
-# If main gains branch protection that blocks github-actions[bot] pushes,
-# add a bypass for the app/bot or this workflow's release commit will fail.
+# The release commit is pushed over SSH with the RELEASE_DEPLOY_KEY deploy
+# key — the "protect main" ruleset requires PRs + green CI on main and
+# grants deploy keys bypass, so this workflow's direct push is the one
+# sanctioned exception. Deploy-key pushes DO trigger workflows (unlike
+# GITHUB_TOKEN pushes), which is what fires publish.yml — and is loop-safe
+# here: the release push carries its own v* tag at HEAD, so the re-entrant
+# run sees no code changes since that tag and exits at the gate with
+# bump=none.
 
 on:
   push:
@@ -35,7 +36,6 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 concurrency:
   group: release
@@ -49,6 +49,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
       - name: Decide the bump from angular commits
         id: decide
@@ -82,7 +83,7 @@ jobs:
             echo "last_tag=$last_tag"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Bump versions, tag, release, publish
+      - name: Bump versions, tag, release
         if: steps.decide.outputs.bump != 'none'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -132,7 +133,3 @@ jobs:
 
           gh release create "v$next" --title "v$next" \
             --notes-file /tmp/release-notes.md --generate-notes
-
-          # Kick the crates.io publish (Trusted Publishing lives in
-          # publish.yml; bot-made pushes/tags don't trigger it by event).
-          gh workflow run publish.yml --ref main
