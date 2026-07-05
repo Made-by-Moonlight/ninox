@@ -394,9 +394,14 @@ impl App {
 
         // The actively-viewed session uses whatever panel it's actually
         // showing — only Split narrows the width; every other panel uses
-        // the full (non-info-panel) width.
+        // the full (non-info-panel) width. Orchestrator sessions render
+        // terminal-only at full width REGARDLESS of the stored panel (see
+        // `session_detail`'s `effective_panel`), so their sizing must match
+        // or tmux draws the session at Split width and dot-fills the rest.
         let active = match &state.view {
-            View::SessionDetail { session_id, panel: crate::components::session_detail::DetailPanel::Split } => {
+            View::SessionDetail { session_id, panel: crate::components::session_detail::DetailPanel::Split }
+                if !state.orchestrators.iter().any(|o| &o.id == session_id) =>
+            {
                 Some((session_id.clone(), bg_cols, bg_rows))
             }
             View::SessionDetail { session_id, .. } => {

@@ -147,6 +147,15 @@ impl TerminalState {
     }
 
     /// Resize the terminal grid to match a new canvas size.
+    /// Current live-grid size (cols, rows) — the emulator's actual
+    /// dimensions, which the session-detail title bar reports (the
+    /// app-level `terminal_cols/rows` are only the background/Split
+    /// sizing, not necessarily what this session was resized to).
+    pub fn grid_size(&self) -> (u16, u16) {
+        let grid = self.term.grid();
+        (grid.columns() as u16, grid.screen_lines() as u16)
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16) {
         use alacritty_terminal::term::test::TermSize;
         let size = TermSize::new(cols as usize, rows as usize);

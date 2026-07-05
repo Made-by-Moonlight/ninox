@@ -374,7 +374,12 @@ pub fn session_detail<'a>(
         .into()
     };
 
-    let tmux_line = format!("tmux · {} · {}×{}", session.id, app.terminal_cols, app.terminal_rows);
+    let (grid_cols, grid_rows) = app
+        .terminals
+        .get(session_id)
+        .map(|t| t.grid_size())
+        .unwrap_or((app.terminal_cols, app.terminal_rows));
+    let tmux_line = format!("tmux · {} · {}×{}", session.id, grid_cols, grid_rows);
     let status_word = crate::style::stamp_word(&session.status).to_lowercase();
 
     // ── Info pane ─────────────────────────────────────────────────────────────
