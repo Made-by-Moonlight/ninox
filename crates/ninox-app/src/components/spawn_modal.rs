@@ -36,13 +36,39 @@ pub struct AgentPreset {
     pub label:   &'static str,
     pub harness: &'static str,
     pub model:   Option<&'static str>,
+    /// Static (low, high) per-session cost estimate shown in the footer
+    /// until enough real history exists to replace it with a data-driven
+    /// average (see `estimate_text`). These are rough priors reflecting
+    /// relative model pricing — fable-5 highest, opus-4.8 middle, haiku-4.5
+    /// lowest — **not** live pricing; they're not wired to any pricing API.
+    pub est: (f64, f64),
 }
 
 pub const AGENT_PRESETS: &[AgentPreset] = &[
-    AgentPreset { label: "claude · fable-5",   harness: "claude-code", model: Some("claude-fable-5") },
-    AgentPreset { label: "claude · opus-4.8",  harness: "claude-code", model: Some("claude-opus-4-8") },
-    AgentPreset { label: "claude · haiku-4.5", harness: "claude-code", model: Some("claude-haiku-4-5") },
+    AgentPreset { label: "claude · fable-5",   harness: "claude-code", model: Some("claude-fable-5"),   est: (4.0, 8.0) },
+    AgentPreset { label: "claude · opus-4.8",  harness: "claude-code", model: Some("claude-opus-4-8"),  est: (2.0, 4.0) },
+    AgentPreset { label: "claude · haiku-4.5", harness: "claude-code", model: Some("claude-haiku-4-5"), est: (0.4, 1.2) },
 ];
+
+/// Minimum number of historical non-zero `cost_usd` samples (for the exact
+/// harness/model pairing) required before the footer estimate switches from
+/// the static rough-prior range to a data-driven average.
+const MIN_HISTORY_SAMPLES: usize = 3;
+
+/// Footer cost-estimate text for a preset. Falls back to the preset's
+/// static range until at least `MIN_HISTORY_SAMPLES` non-zero cost samples
+/// exist for that exact agent/model pairing (see `Store::cost_samples`,
+/// populated by the usage poller — `ninox_core::lifecycle::usage`/
+/// `poller::poll_usage`), then shows the historical per-session average.
+/// Pure function — no I/O — so it's unit-testable without a live store.
+pub fn estimate_text(preset: &AgentPreset, historical_costs: &[f64]) -> String {
+    if historical_costs.len() >= MIN_HISTORY_SAMPLES {
+        let avg = historical_costs.iter().sum::<f64>() / historical_costs.len() as f64;
+        format!("≈ ${avg:.2} / session · from {} filed", historical_costs.len())
+    } else {
+        format!("est. ${:.0}–{:.0} / session", preset.est.0, preset.est.1)
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct SpawnForm {
@@ -253,8 +279,14 @@ pub fn spawn_modal<'a>(state: &'a App, form: &'a SpawnForm) -> Element<'a, Messa
         }
     });
 
+    let selected_preset = AGENT_PRESETS.get(form.agent_idx).unwrap_or(&AGENT_PRESETS[0]);
+    let historical_costs = state.engine.store
+        .cost_samples(selected_preset.harness, selected_preset.model)
+        .unwrap_or_default();
+    let estimate = estimate_text(selected_preset, &historical_costs);
+
     let footer = row![
-        text("est. $2–4 / session").size(10).font(MONO).color(s.faint),
+        text(estimate).size(10).font(MONO).color(s.faint),
         Space::new(Length::Fill, 0),
         cancel_button,
         spawn_button,
@@ -311,4 +343,47 @@ pub fn spawn_modal<'a>(state: &'a App, form: &'a SpawnForm) -> Element<'a, Messa
             ..Default::default()
         })
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimate_text_falls_back_to_static_range_when_no_history() {
+        let preset = &AGENT_PRESETS[1]; // opus-4.8: est (2.0, 4.0)
+        assert_eq!(estimate_text(preset, &[]), "est. $2–4 / session");
+    }
+
+    #[test]
+    fn estimate_text_falls_back_below_min_sample_count() {
+        let preset = &AGENT_PRESETS[1];
+        // 2 samples — one short of MIN_HISTORY_SAMPLES (3).
+        assert_eq!(estimate_text(preset, &[1.0, 3.0]), "est. $2–4 / session");
+    }
+
+    #[test]
+    fn estimate_text_uses_historical_average_at_min_sample_count() {
+        let preset = &AGENT_PRESETS[0]; // fable-5
+        let costs = [3.0, 5.0, 4.0];
+        assert_eq!(estimate_text(preset, &costs), "≈ $4.00 / session · from 3 filed");
+    }
+
+    #[test]
+    fn estimate_text_reflects_preset_specific_ranges() {
+        // fable-5 highest, opus-4.8 middle, haiku-4.5 lowest.
+        assert_eq!(estimate_text(&AGENT_PRESETS[0], &[]), "est. $4–8 / session");
+        assert_eq!(estimate_text(&AGENT_PRESETS[1], &[]), "est. $2–4 / session");
+        assert_eq!(estimate_text(&AGENT_PRESETS[2], &[]), "est. $0–1 / session");
+    }
+
+    /// Preset ordering drives the footer text when `form.agent_idx` changes
+    /// (see `spawn_modal`'s footer wiring); this pins that each preset index
+    /// really does resolve to a distinct estimate.
+    #[test]
+    fn estimate_text_switches_when_agent_idx_changes() {
+        let texts: Vec<String> = AGENT_PRESETS.iter().map(|p| estimate_text(p, &[])).collect();
+        let unique: std::collections::HashSet<_> = texts.iter().collect();
+        assert_eq!(unique.len(), AGENT_PRESETS.len(), "each preset must have a distinct estimate");
+    }
 }
