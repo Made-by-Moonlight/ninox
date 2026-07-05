@@ -30,60 +30,90 @@ pub enum SpawnKind {
     Standalone,
 }
 
-/// A canned agent harness + model pairing offered as a chip in the modal.
-#[derive(Debug, Clone)]
-pub struct AgentPreset {
-    pub label:   &'static str,
-    pub harness: &'static str,
-    pub model:   Option<&'static str>,
-    /// Static (low, high) per-session cost estimate shown in the footer
-    /// until enough real history exists to replace it with a data-driven
-    /// average (see `estimate_text`). These are rough priors reflecting
-    /// relative model pricing — fable-5 highest, opus-4.8 middle, haiku-4.5
-    /// lowest — **not** live pricing; they're not wired to any pricing API.
-    pub est: (f64, f64),
-}
-
-pub const AGENT_PRESETS: &[AgentPreset] = &[
-    AgentPreset { label: "claude · fable-5",   harness: "claude-code", model: Some("claude-fable-5"),   est: (4.0, 8.0) },
-    AgentPreset { label: "claude · opus-4.8",  harness: "claude-code", model: Some("claude-opus-4-8"),  est: (2.0, 4.0) },
-    AgentPreset { label: "claude · haiku-4.5", harness: "claude-code", model: Some("claude-haiku-4-5"), est: (0.4, 1.2) },
-];
-
 /// Minimum number of historical non-zero `cost_usd` samples (for the exact
 /// harness/model pairing) required before the footer estimate switches from
 /// the static rough-prior range to a data-driven average.
 const MIN_HISTORY_SAMPLES: usize = 3;
 
-/// Footer cost-estimate text for a preset. Falls back to the preset's
-/// static range until at least `MIN_HISTORY_SAMPLES` non-zero cost samples
-/// exist for that exact agent/model pairing (see `Store::cost_samples`,
-/// populated by the usage poller — `ninox_core::lifecycle::usage`/
-/// `poller::poll_usage`), then shows the historical per-session average.
-/// Pure function — no I/O — so it's unit-testable without a live store.
-pub fn estimate_text(preset: &AgentPreset, historical_costs: &[f64]) -> String {
-    if historical_costs.len() >= MIN_HISTORY_SAMPLES {
-        let avg = historical_costs.iter().sum::<f64>() / historical_costs.len() as f64;
-        format!("≈ ${avg:.2} / session · from {} filed", historical_costs.len())
-    } else {
-        format!("est. ${:.0}–{:.0} / session", preset.est.0, preset.est.1)
+/// Rough static per-session priors for claude-code's curated models —
+/// relative pricing only (fable-5 highest, haiku-4.5 lowest), **not** wired
+/// to any pricing API. Everything else has no prior and builds its
+/// estimate from filed history.
+pub fn static_prior(harness: &str, model: Option<&str>) -> Option<(f64, f64)> {
+    if harness != "claude-code" {
+        return None;
+    }
+    match model {
+        Some("claude-fable-5")   => Some((4.0, 8.0)),
+        Some("claude-opus-4-8")  => Some((2.0, 4.0)),
+        Some("claude-sonnet-5")  => Some((1.0, 2.0)),
+        Some("claude-haiku-4-5") => Some((0.4, 1.2)),
+        _                        => None,
     }
 }
 
-#[derive(Debug, Clone, Default)]
+/// Footer cost-estimate text. Falls back to the static prior range until at
+/// least `MIN_HISTORY_SAMPLES` non-zero cost samples exist for the exact
+/// harness/model pairing (see `Store::cost_samples`, populated by the usage
+/// poller — `ninox_core::lifecycle::usage`/`poller::poll_usage`), then shows
+/// the historical per-session average. Pure function — no I/O — so it's
+/// unit-testable without a live store.
+pub fn estimate_text(prior: Option<(f64, f64)>, historical_costs: &[f64]) -> String {
+    if historical_costs.len() >= MIN_HISTORY_SAMPLES {
+        let avg = historical_costs.iter().sum::<f64>() / historical_costs.len() as f64;
+        format!("≈ ${avg:.2} / session · from {} filed", historical_costs.len())
+    } else if let Some((lo, hi)) = prior {
+        format!("est. ${lo:.0}–{hi:.0} / session")
+    } else {
+        "est. — builds from filed sessions".to_string()
+    }
+}
+
+/// The model a confirm would launch with: custom text (trimmed, non-empty)
+/// wins over the picker selection, which wins over the spec's default.
+pub fn effective_model(form: &SpawnForm, spec: &ninox_core::harness::HarnessSpec) -> Option<String> {
+    if let Some(c) = &form.custom_model {
+        let t = c.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    form.model.clone().or_else(|| spec.model.clone())
+}
+
+#[derive(Debug, Clone)]
 pub struct SpawnForm {
     pub kind:          SpawnKind,
     pub name:          String,
     /// Standalone kind only — user-supplied workspace path (tilde-expanded
     /// at confirm time). Required to confirm a standalone spawn.
     pub workspace:     String,
-    /// Index into `AGENT_PRESETS`.
-    pub agent_idx:     usize,
+    /// Selected harness name (one of the registry's enabled harnesses).
+    pub harness:       String,
+    /// Model chosen in the picker. `None` = harness default.
+    pub model:         Option<String>,
+    /// `Some` while the picker is in `custom…` mode; holds the typed text.
+    pub custom_model:  Option<String>,
     /// Index into `AppConfig::catalogue_options()` — applies to both kinds.
     pub catalogue_idx: usize,
     /// Human-readable refusal reason from the last confirm attempt, if any.
     /// Cleared whenever the user edits any field. Rendered above the footer.
     pub error:         Option<String>,
+}
+
+impl Default for SpawnForm {
+    fn default() -> Self {
+        Self {
+            kind:          SpawnKind::default(),
+            name:          String::new(),
+            workspace:     String::new(),
+            harness:       "claude-code".to_string(),
+            model:         None,
+            custom_model:  None,
+            catalogue_idx: 0,
+            error:         None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,17 +260,46 @@ pub fn spawn_modal<'a>(state: &'a App, form: &'a SpawnForm) -> Element<'a, Messa
         .into()
     };
 
-    // ── Agent · Model chips ──────────────────────────────────────────────────
-    let agent_chips = row(AGENT_PRESETS.iter().enumerate().map(|(i, preset)| {
-        chip(s, preset.label.to_string(), i == form.agent_idx, Message::SpawnFormAgent(i))
+    // ── Agent chips + Model picker ───────────────────────────────────────────
+    // One chip per ENABLED registry harness; picking a chip picks the
+    // harness, with a model picker beside it (options: models_cmd discovery
+    // → known_models → configured value, then `custom…` last).
+    let registry = state.config.registry();
+    let spec = registry.spec(&form.harness);
+    let agent_chips = row(registry.enabled_names().into_iter().map(|name| {
+        let selected = name == form.harness;
+        chip(s, name.clone(), selected, Message::SpawnFormHarness(name))
     }))
     .spacing(8);
-    let agent_field = column![
-        micro_label("Agent · Model", s.ink_2),
-        Space::new(0, 8),
-        agent_chips,
-    ]
-    .spacing(0);
+
+    let discovered = state.model_lists.get(&form.harness).and_then(|m| m.as_deref());
+    let configured = form.model.clone().or_else(|| spec.model.clone());
+    let options = crate::models::model_options(&spec, discovered, configured.as_deref());
+    let picker_selected = if form.custom_model.is_some() {
+        Some(crate::models::CUSTOM_SENTINEL.to_string())
+    } else {
+        configured
+    };
+    let model_picker = pick_list(options, picker_selected, Message::SpawnFormModel)
+        .placeholder("harness default")
+        .font(MONO)
+        .text_size(12)
+        .padding([6, 10])
+        .style(pick_style(s));
+
+    let agent_col = column![micro_label("Agent", s.ink_2), Space::new(0, 8), agent_chips].spacing(0);
+    let mut model_col = column![micro_label("Model", s.ink_2), Space::new(0, 8), model_picker].spacing(0);
+    if form.custom_model.is_some() {
+        model_col = model_col.push(Space::new(0, 6)).push(
+            text_input("model id", form.custom_model.as_deref().unwrap_or(""))
+                .on_input(Message::SpawnFormCustomModel)
+                .font(MONO)
+                .size(12)
+                .padding([4, 2])
+                .style(style::underlined_input_style(s)),
+        );
+    }
+    let agent_field = row![agent_col, Space::new(16, 0), model_col].align_y(Alignment::Start);
 
     // ── Footer: cost estimate + ghost Cancel + primary Spawn ────────────────
     let cancel_button = button(text("Cancel").size(11).font(SANS_BOLD).color(s.ink_2))
@@ -279,11 +338,11 @@ pub fn spawn_modal<'a>(state: &'a App, form: &'a SpawnForm) -> Element<'a, Messa
         }
     });
 
-    let selected_preset = AGENT_PRESETS.get(form.agent_idx).unwrap_or(&AGENT_PRESETS[0]);
+    let est_model = effective_model(form, &spec);
     let historical_costs = state.engine.store
-        .cost_samples(selected_preset.harness, selected_preset.model)
+        .cost_samples(&form.harness, est_model.as_deref())
         .unwrap_or_default();
-    let estimate = estimate_text(selected_preset, &historical_costs);
+    let estimate = estimate_text(static_prior(&form.harness, est_model.as_deref()), &historical_costs);
 
     let footer = row![
         text(estimate).size(10).font(MONO).color(s.faint),
@@ -350,40 +409,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn static_priors_cover_claude_models_only() {
+        assert_eq!(static_prior("claude-code", Some("claude-fable-5")),   Some((4.0, 8.0)));
+        assert_eq!(static_prior("claude-code", Some("claude-opus-4-8")),  Some((2.0, 4.0)));
+        assert_eq!(static_prior("claude-code", Some("claude-sonnet-5")),  Some((1.0, 2.0)));
+        assert_eq!(static_prior("claude-code", Some("claude-haiku-4-5")), Some((0.4, 1.2)));
+        assert_eq!(static_prior("claude-code", None), None);
+        assert_eq!(static_prior("codex", Some("gpt-4o")), None);
+    }
+
+    #[test]
     fn estimate_text_falls_back_to_static_range_when_no_history() {
-        let preset = &AGENT_PRESETS[1]; // opus-4.8: est (2.0, 4.0)
-        assert_eq!(estimate_text(preset, &[]), "est. $2–4 / session");
+        assert_eq!(estimate_text(Some((2.0, 4.0)), &[]), "est. $2–4 / session");
     }
 
     #[test]
     fn estimate_text_falls_back_below_min_sample_count() {
-        let preset = &AGENT_PRESETS[1];
         // 2 samples — one short of MIN_HISTORY_SAMPLES (3).
-        assert_eq!(estimate_text(preset, &[1.0, 3.0]), "est. $2–4 / session");
+        assert_eq!(estimate_text(Some((2.0, 4.0)), &[1.0, 3.0]), "est. $2–4 / session");
     }
 
     #[test]
     fn estimate_text_uses_historical_average_at_min_sample_count() {
-        let preset = &AGENT_PRESETS[0]; // fable-5
-        let costs = [3.0, 5.0, 4.0];
-        assert_eq!(estimate_text(preset, &costs), "≈ $4.00 / session · from 3 filed");
+        assert_eq!(estimate_text(Some((4.0, 8.0)), &[3.0, 5.0, 4.0]),
+                   "≈ $4.00 / session · from 3 filed");
+        // History wins even with no prior (e.g. a custom harness).
+        assert_eq!(estimate_text(None, &[3.0, 5.0, 4.0]),
+                   "≈ $4.00 / session · from 3 filed");
     }
 
     #[test]
-    fn estimate_text_reflects_preset_specific_ranges() {
-        // fable-5 highest, opus-4.8 middle, haiku-4.5 lowest.
-        assert_eq!(estimate_text(&AGENT_PRESETS[0], &[]), "est. $4–8 / session");
-        assert_eq!(estimate_text(&AGENT_PRESETS[1], &[]), "est. $2–4 / session");
-        assert_eq!(estimate_text(&AGENT_PRESETS[2], &[]), "est. $0–1 / session");
+    fn estimate_text_without_prior_or_history_says_so() {
+        assert_eq!(estimate_text(None, &[]), "est. — builds from filed sessions");
     }
 
-    /// Preset ordering drives the footer text when `form.agent_idx` changes
-    /// (see `spawn_modal`'s footer wiring); this pins that each preset index
-    /// really does resolve to a distinct estimate.
     #[test]
-    fn estimate_text_switches_when_agent_idx_changes() {
-        let texts: Vec<String> = AGENT_PRESETS.iter().map(|p| estimate_text(p, &[])).collect();
-        let unique: std::collections::HashSet<_> = texts.iter().collect();
-        assert_eq!(unique.len(), AGENT_PRESETS.len(), "each preset must have a distinct estimate");
+    fn effective_model_prefers_custom_text() {
+        let spec = ninox_core::harness::HarnessSpec { model: Some("spec-m".into()), ..Default::default() };
+        let mut f = SpawnForm {
+            model:        Some("picked".into()),
+            custom_model: Some("  typed  ".into()),
+            ..SpawnForm::default()
+        };
+        assert_eq!(effective_model(&f, &spec).as_deref(), Some("typed"));
+        f.custom_model = Some("   ".into());          // blank custom → picker value
+        assert_eq!(effective_model(&f, &spec).as_deref(), Some("picked"));
+        f.model = None;                                // nothing picked → spec default
+        assert_eq!(effective_model(&f, &spec).as_deref(), Some("spec-m"));
+    }
+
+    #[test]
+    fn default_form_selects_claude_code() {
+        assert_eq!(SpawnForm::default().harness, "claude-code");
     }
 }

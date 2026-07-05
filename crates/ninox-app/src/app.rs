@@ -181,7 +181,9 @@ pub enum Message {
     SpawnFormName(String),
     SpawnFormKind(crate::components::spawn_modal::SpawnKind),
     SpawnFormWorkspace(String),
-    SpawnFormAgent(usize),
+    SpawnFormHarness(String),
+    SpawnFormModel(String),
+    SpawnFormCustomModel(String),
     SpawnFormCatalogue(usize),
     SpawnFormConfirm,
     SpawnFormCancel,
@@ -649,19 +651,18 @@ impl App {
             }
 
             Message::SpawnSession => {
-                // Default the agent chip to whatever's configured as the
-                // orchestrator agent in config.toml, if it matches one of
-                // the presets; otherwise fall back to the first preset.
-                let agent_idx = crate::components::spawn_modal::AGENT_PRESETS
-                    .iter()
-                    .position(|p| {
-                        p.harness == state.orchestrator_agent.harness
-                            && p.model.map(str::to_string) == state.orchestrator_agent.model
-                    })
-                    .unwrap_or(0);
-                let harness = state.orchestrator_agent.harness.clone();
-                state.spawn_modal = Some(SpawnForm { agent_idx, ..SpawnForm::default() });
-                Self::ensure_models(state, &harness)
+                // Preselect the remembered `[orchestrator]` agent when its
+                // harness is still enabled; otherwise the first enabled
+                // harness (claude-code is locked on, so there's always one).
+                let enabled = state.config.registry().enabled_names();
+                let (harness, model) = if enabled.contains(&state.orchestrator_agent.harness) {
+                    (state.orchestrator_agent.harness.clone(), state.orchestrator_agent.model.clone())
+                } else {
+                    (enabled.first().cloned().unwrap_or_else(|| "claude-code".into()), None)
+                };
+                let task = Self::ensure_models(state, &harness);
+                state.spawn_modal = Some(SpawnForm { harness, model, ..SpawnForm::default() });
+                task
             }
 
             Message::SpawnFormName(v) => {
@@ -679,8 +680,32 @@ impl App {
                 Task::none()
             }
 
-            Message::SpawnFormAgent(idx) => {
-                if let Some(f) = &mut state.spawn_modal { f.agent_idx = idx; f.error = None; }
+            Message::SpawnFormHarness(h) => {
+                let task = Self::ensure_models(state, &h);
+                if let Some(f) = &mut state.spawn_modal {
+                    f.harness = h;
+                    f.model = None;
+                    f.custom_model = None;
+                    f.error = None;
+                }
+                task
+            }
+
+            Message::SpawnFormModel(v) => {
+                if let Some(f) = &mut state.spawn_modal {
+                    if v == crate::models::CUSTOM_SENTINEL {
+                        f.custom_model = Some(String::new());
+                    } else {
+                        f.custom_model = None;
+                        f.model = Some(v);
+                    }
+                    f.error = None;
+                }
+                Task::none()
+            }
+
+            Message::SpawnFormCustomModel(v) => {
+                if let Some(f) = &mut state.spawn_modal { f.custom_model = Some(v); f.error = None; }
                 Task::none()
             }
 
@@ -790,7 +815,7 @@ impl App {
             }
 
             Message::SpawnFormConfirm => {
-                use crate::components::spawn_modal::{SpawnKind, AGENT_PRESETS};
+                use crate::components::spawn_modal::SpawnKind;
 
                 let Some(form) = state.spawn_modal.clone() else { return Task::none(); };
                 let name = form.name.trim().to_string();
@@ -803,13 +828,14 @@ impl App {
                     return Task::none();
                 }
 
-                // Both kinds share the agent preset and brain catalogue.
-                let preset = AGENT_PRESETS.get(form.agent_idx).unwrap_or(&AGENT_PRESETS[0]);
+                // Both kinds share the agent (harness + model) and brain catalogue.
+                let registry = state.config.registry();
+                let spec = registry.spec(&form.harness);
                 let agent = ninox_core::config::AgentConfig {
-                    harness: preset.harness.to_string(),
-                    model:   preset.model.map(|m| m.to_string()),
+                    harness: form.harness.clone(),
+                    model:   crate::components::spawn_modal::effective_model(&form, &spec),
                 };
-                let base_cmd = state.config.registry().interactive_cmd(&agent);
+                let base_cmd = registry.interactive_cmd(&agent);
                 let catalogue = state.config.catalogue_options()
                     .into_iter()
                     .nth(form.catalogue_idx)
@@ -871,6 +897,21 @@ impl App {
                             return Task::none();
                         }
                         state.spawn_modal = None;
+
+                        // "[orchestrator] stays only as the Spawn modal's
+                        // remembered preselection" — remember the confirmed
+                        // agent choice for the next spawn (either kind).
+                        // Skipped when unchanged so routine spawns don't
+                        // touch config.toml on disk.
+                        if state.config.orchestrator.harness != agent.harness
+                            || state.config.orchestrator.model != agent.model
+                        {
+                            state.orchestrator_agent = agent.clone();
+                            state.config.orchestrator = agent.clone();
+                            if let Err(e) = state.config.save() {
+                                tracing::warn!("failed to save remembered agent preselection: {e}");
+                            }
+                        }
 
                         let session = Session {
                             id:              sid.clone(),
@@ -974,6 +1015,19 @@ impl App {
                             return Task::none();
                         }
                         state.spawn_modal = None;
+
+                        // Remember the confirmed agent choice (see the
+                        // standalone arm) — `[orchestrator]` is the Spawn
+                        // modal's remembered preselection.
+                        if state.config.orchestrator.harness != agent.harness
+                            || state.config.orchestrator.model != agent.model
+                        {
+                            state.orchestrator_agent = agent.clone();
+                            state.config.orchestrator = agent.clone();
+                            if let Err(e) = state.config.save() {
+                                tracing::warn!("failed to save remembered agent preselection: {e}");
+                            }
+                        }
 
                         let orch = Orchestrator {
                             id:         orch_id,
@@ -3077,6 +3131,36 @@ mod tests {
     }
 
     #[test]
+    fn spawn_confirm_remembers_agent_preselection() {
+        // Confirming a spawn with a CHANGED agent choice persists it as the
+        // `[orchestrator]` remembered preselection; redirect config writes
+        // to a tempfile so the real user config is never touched.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("remembered_preselection_config.toml");
+
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let mut m = base(test_engine());
+            let (next, _) = m.update(Message::SpawnSession);
+            m = next;
+            let (next, _) = m.update(Message::SpawnFormName("remember-me".into()));
+            m = next;
+            let (next, _) = m.update(Message::SpawnFormModel("claude-haiku-4-5".into()));
+            m = next;
+            let (next, _) = m.update(Message::SpawnFormConfirm);
+            m = next;
+
+            assert_eq!(m.orchestrator_agent.model.as_deref(), Some("claude-haiku-4-5"));
+            let loaded = ninox_core::config::AppConfig::load().unwrap();
+            assert_eq!(loaded.orchestrator.harness, "claude-code");
+            assert_eq!(loaded.orchestrator.model.as_deref(), Some("claude-haiku-4-5"));
+
+            // Reopening the modal preselects the remembered choice.
+            let (m, _) = m.update(Message::SpawnSession);
+            assert_eq!(m.spawn_modal.as_ref().unwrap().model.as_deref(), Some("claude-haiku-4-5"));
+        });
+    }
+
+    #[test]
     fn esc_closes_spawn_modal() {
         let m = base(test_engine());
         let (m, _) = m.update(Message::SpawnSession);
@@ -3251,7 +3335,9 @@ mod tests {
         m = next;
         let (next, _) = m.update(Message::SpawnFormWorkspace("~/proj/ninox".into()));
         m = next;
-        let (next, _) = m.update(Message::SpawnFormAgent(1));
+        let (next, _) = m.update(Message::SpawnFormHarness("codex".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormModel("gpt-4o".into()));
         m = next;
         let (next, _) = m.update(Message::SpawnFormCatalogue(0));
         m = next;
@@ -3260,8 +3346,37 @@ mod tests {
         assert_eq!(f.name, "theme-tokens");
         assert_eq!(f.kind, SpawnKind::Standalone);
         assert_eq!(f.workspace, "~/proj/ninox");
-        assert_eq!(f.agent_idx, 1);
+        assert_eq!(f.harness, "codex");
+        assert_eq!(f.model.as_deref(), Some("gpt-4o"));
         assert_eq!(f.catalogue_idx, 0);
+    }
+
+    #[test]
+    fn spawn_form_harness_switch_resets_model_and_custom_opens_input() {
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormModel("claude-haiku-4-5".into()));
+        m = next;
+        assert_eq!(m.spawn_modal.as_ref().unwrap().model.as_deref(), Some("claude-haiku-4-5"));
+
+        // custom… flips the picker into free-text mode without clobbering
+        // the last picked model (blank custom falls back to it on confirm).
+        let (next, _) = m.update(Message::SpawnFormModel(crate::models::CUSTOM_SENTINEL.into()));
+        m = next;
+        assert!(m.spawn_modal.as_ref().unwrap().custom_model.is_some());
+        let (next, _) = m.update(Message::SpawnFormCustomModel("my-model".into()));
+        m = next;
+        assert_eq!(m.spawn_modal.as_ref().unwrap().custom_model.as_deref(), Some("my-model"));
+
+        // Switching harness clears model state — stale model ids from one
+        // harness must not leak into another's launch command.
+        let (next, _) = m.update(Message::SpawnFormHarness("codex".into()));
+        m = next;
+        let f = m.spawn_modal.as_ref().unwrap();
+        assert_eq!(f.harness, "codex");
+        assert!(f.model.is_none());
+        assert!(f.custom_model.is_none());
     }
 
     #[test]

@@ -5,10 +5,8 @@
 use ninox_core::harness::HarnessSpec;
 
 /// The picker's escape hatch — selecting it reveals a mono free-text input.
-#[allow(dead_code)] // wired up by the spawn-modal/settings pickers
 pub const CUSTOM_SENTINEL: &str = "custom…";
 
-#[allow(dead_code)] // wired up by the spawn-modal/settings pickers
 pub fn model_options(
     spec:       &HarnessSpec,
     discovered: Option<&[String]>,
