@@ -7,8 +7,9 @@ use std::collections::HashMap;
 
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::{mouse, Color, Element, Length, Point, Rectangle, Renderer, Theme};
+use ninox_core::BrainEntry;
 
-use super::brain_panel::{category_color, extract_wikilinks, resolve_link};
+use super::brain_panel::category_color;
 use crate::app::{App, Message};
 
 /// A drawn specimen dot: canvas-space position, radius, category color, and
@@ -45,39 +46,39 @@ pub struct Pinboard<'a> {
 }
 
 impl<'a> Pinboard<'a> {
-    /// Lay out one [`Node`] per brain entry within `bounds`, sized by
-    /// outgoing wikilink count and flagged `hit` when the entry matches the
-    /// active search filter. Also returns each entry's parsed outgoing
-    /// wikilinks (same order as `nodes`/`self.app.brain_view.entries`) so
-    /// callers that also need the edges don't re-parse the body a second
-    /// time per draw.
-    fn nodes_and_links(&self, bounds: Rectangle) -> (Vec<Node>, Vec<Vec<String>>) {
+    /// Lay out one [`Node`] per brain entry within `bounds`, sized by node
+    /// degree (in `self.app.brain_view.edges`, resolved once per data change
+    /// — see `App::refresh_brain_edges` — never re-derived here) and flagged
+    /// `hit` when the entry matches the active search filter.
+    fn nodes(&self, bounds: Rectangle) -> Vec<Node> {
         let s = &self.app.scheme;
         let q = self.app.brain_view.filter.to_lowercase();
+
+        let mut degree = vec![0u32; self.app.brain_view.entries.len()];
+        for &(a, b) in &self.app.brain_view.edges {
+            if let Some(d) = degree.get_mut(a) {
+                *d += 1;
+            }
+            if let Some(d) = degree.get_mut(b) {
+                *d += 1;
+            }
+        }
+
         self.app
             .brain_view
             .entries
             .iter()
-            .map(|e| {
-                let links = extract_wikilinks(&e.body);
-                let node = Node {
-                    x: bounds.width * (0.05 + 0.90 * hash01(&e.id, 7)),
-                    y: bounds.height * (0.06 + 0.88 * hash01(&e.id, 13)),
-                    r: node_radius(links.len() as f32),
-                    color: category_color(s, &e.entry_type),
-                    hit: !q.is_empty()
-                        && (e.name.to_lowercase().contains(&q) || e.id.to_lowercase().contains(&q)),
-                    id: e.id.clone(),
-                };
-                (node, links)
+            .enumerate()
+            .map(|(i, e)| Node {
+                x: bounds.width * (0.05 + 0.90 * hash01(&e.id, 7)),
+                y: bounds.height * (0.06 + 0.88 * hash01(&e.id, 13)),
+                r: node_radius(degree.get(i).copied().unwrap_or(0) as f32),
+                color: category_color(s, &e.entry_type),
+                hit: !q.is_empty()
+                    && (e.name.to_lowercase().contains(&q) || e.id.to_lowercase().contains(&q)),
+                id: e.id.clone(),
             })
-            .unzip()
-    }
-
-    /// Lay out nodes only, discarding the parsed links (used where only
-    /// positions/radii are needed, e.g. click hit-testing).
-    fn nodes(&self, bounds: Rectangle) -> Vec<Node> {
-        self.nodes_and_links(bounds).0
+            .collect()
     }
 }
 
@@ -118,6 +119,35 @@ fn edge_key(a: usize, b: usize) -> (usize, usize) {
     }
 }
 
+/// Resolve `BrainIndex::links_all()`'s `(from_id, to_id)` string pairs into
+/// deduplicated, undirected node-index pairs against `entries`'s current
+/// order — the form the pinboard canvas draws from. Called once per data
+/// change (`App::refresh_brain_edges`, on `NavigateBrain` / `BrainReindex` /
+/// `BrainSwitchCatalogue`), never per draw.
+///
+/// A link endpoint that isn't in `entries` (index/entries drift, or a link
+/// to an id that no longer exists) is skipped rather than panicking; a
+/// mutual pair (A -> B and B -> A) collapses to one edge via [`edge_key`].
+pub(crate) fn resolve_edges(entries: &[BrainEntry], links: &[(String, String)]) -> Vec<(usize, usize)> {
+    let index: HashMap<&str, usize> =
+        entries.iter().enumerate().map(|(i, e)| (e.id.as_str(), i)).collect();
+    let mut seen: std::collections::HashSet<(usize, usize)> = Default::default();
+    let mut edges = Vec::new();
+    for (from, to) in links {
+        let (Some(&a), Some(&b)) = (index.get(from.as_str()), index.get(to.as_str())) else {
+            continue;
+        };
+        if a == b {
+            continue;
+        }
+        let key = edge_key(a, b);
+        if seen.insert(key) {
+            edges.push(key);
+        }
+    }
+    edges
+}
+
 /// Specimen dot radius: a 3px floor, growing with wikilink count, clamped to
 /// a 9px ceiling so heavily-linked notes don't overwhelm the board.
 fn node_radius(link_count: f32) -> f32 {
@@ -140,43 +170,30 @@ impl<'a> canvas::Program<Message> for Pinboard<'a> {
         // Node coordinates are frame-local (origin at 0,0), matching the
         // Frame's own coordinate space — not the window-relative `bounds`.
         let local_bounds = Rectangle { x: 0.0, y: 0.0, ..bounds };
-        let (nodes, links) = self.nodes_and_links(local_bounds);
+        let nodes = self.nodes(local_bounds);
 
-        // Dashed wikilink threads: faint ink by default, lit accent when
-        // either endpoint matches the active search. Deduped by undirected
-        // node-pair so a mutual link (A -> B and B -> A) is stroked once,
-        // not twice — the "lit" state is direction-independent (either
-        // endpoint hitting is enough), so dedup can't drop it.
+        // Dashed link threads: faint ink by default, lit accent when either
+        // endpoint matches the active search. Edges are precomputed
+        // node-index pairs (`App::refresh_brain_edges` /
+        // `resolve_edges`) — already deduped by undirected pair, so a
+        // mutual link (A -> B and B -> A) is stroked once, not twice.
         let ink_edge = Color { a: 0.18, ..s.ink };
-        let by_id: HashMap<&str, usize> =
-            nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
-        let mut drawn_edges: std::collections::HashSet<(usize, usize)> = Default::default();
-        for (e, entry_links) in self.app.brain_view.entries.iter().zip(&links) {
-            let Some(&a) = by_id.get(e.id.as_str()) else { continue };
-            for link in entry_links {
-                let Some(target) = resolve_link(&self.app.brain_view.entries, link) else { continue };
-                let Some(&b) = by_id.get(target.id.as_str()) else { continue };
-                if !drawn_edges.insert(edge_key(a, b)) {
-                    continue;
-                }
-                let lit = nodes[a].hit || nodes[b].hit;
-                frame.stroke(
-                    &Path::line(
-                        Point::new(nodes[a].x, nodes[a].y),
-                        Point::new(nodes[b].x, nodes[b].y),
-                    ),
-                    Stroke {
-                        style: canvas::Style::Solid(if lit {
-                            Color { a: 0.55, ..s.accent }
-                        } else {
-                            ink_edge
-                        }),
-                        width: 1.0,
-                        line_dash: canvas::LineDash { segments: &[3.0, 3.0], offset: 0 },
-                        ..Stroke::default()
-                    },
-                );
-            }
+        for &(a, b) in &self.app.brain_view.edges {
+            let (Some(na), Some(nb)) = (nodes.get(a), nodes.get(b)) else { continue };
+            let lit = na.hit || nb.hit;
+            frame.stroke(
+                &Path::line(Point::new(na.x, na.y), Point::new(nb.x, nb.y)),
+                Stroke {
+                    style: canvas::Style::Solid(if lit {
+                        Color { a: 0.55, ..s.accent }
+                    } else {
+                        ink_edge
+                    }),
+                    width: 1.0,
+                    line_dash: canvas::LineDash { segments: &[3.0, 3.0], offset: 0 },
+                    ..Stroke::default()
+                },
+            );
         }
 
         // Ink-outlined, category-colored specimen dots; search hits get a
@@ -322,46 +339,52 @@ mod tests {
         assert_eq!(edge_key(0, 0), (0, 0));
     }
 
-    /// Mirrors the dedup logic in `draw`: two entries that mutually wikilink
-    /// each other must collapse to exactly one edge, not two.
-    #[test]
-    fn mutual_wikilinks_dedup_to_one_edge() {
-        use ninox_core::BrainEntry;
-
-        let entries = vec![
-            BrainEntry {
-                id: "a.md".to_string(),
-                entry_type: "concepts".to_string(),
-                name: "a".to_string(),
-                tags: vec![],
-                repos: vec![],
-                updated: None,
-                body: "sees [[b]]".to_string(),
-            },
-            BrainEntry {
-                id: "b.md".to_string(),
-                entry_type: "concepts".to_string(),
-                name: "b".to_string(),
-                tags: vec![],
-                repos: vec![],
-                updated: None,
-                body: "sees [[a]]".to_string(),
-            },
-        ];
-
-        let by_id: HashMap<&str, usize> =
-            entries.iter().enumerate().map(|(i, e)| (e.id.as_str(), i)).collect();
-
-        let mut edges: std::collections::HashSet<(usize, usize)> = Default::default();
-        for e in &entries {
-            let Some(&a) = by_id.get(e.id.as_str()) else { continue };
-            for link in extract_wikilinks(&e.body) {
-                let Some(target) = resolve_link(&entries, &link) else { continue };
-                let Some(&b) = by_id.get(target.id.as_str()) else { continue };
-                edges.insert(edge_key(a, b));
-            }
+    fn entry(id: &str) -> BrainEntry {
+        BrainEntry {
+            id: id.to_string(),
+            entry_type: "concepts".to_string(),
+            name: id.to_string(),
+            tags: vec![],
+            repos: vec![],
+            updated: None,
+            body: String::new(),
         }
+    }
 
-        assert_eq!(edges.len(), 1, "mutual A<->B links should dedup to a single edge, got {edges:?}");
+    /// A mutual pair of resolved edges (A -> B and B -> A, as `links_all()`
+    /// would return for two entries that wikilink each other) must collapse
+    /// to exactly one undirected node-index pair, not two.
+    #[test]
+    fn resolve_edges_dedups_mutual_links() {
+        let entries = vec![entry("a.md"), entry("b.md")];
+        let links = vec![
+            ("a.md".to_string(), "b.md".to_string()),
+            ("b.md".to_string(), "a.md".to_string()),
+        ];
+        let edges = resolve_edges(&entries, &links);
+        assert_eq!(edges, vec![(0, 1)]);
+    }
+
+    /// A link endpoint that isn't in `entries` (stale id, index/entries
+    /// drift) is skipped, not a panic.
+    #[test]
+    fn resolve_edges_skips_unresolvable_ids() {
+        let entries = vec![entry("a.md"), entry("b.md")];
+        let links = vec![
+            ("a.md".to_string(), "b.md".to_string()),
+            ("a.md".to_string(), "missing.md".to_string()),
+            ("missing.md".to_string(), "b.md".to_string()),
+        ];
+        let edges = resolve_edges(&entries, &links);
+        assert_eq!(edges, vec![(0, 1)]);
+    }
+
+    /// A (degenerate) self-link is dropped rather than producing a (n, n)
+    /// self-edge.
+    #[test]
+    fn resolve_edges_drops_self_links() {
+        let entries = vec![entry("a.md")];
+        let links = vec![("a.md".to_string(), "a.md".to_string())];
+        assert!(resolve_edges(&entries, &links).is_empty());
     }
 }
