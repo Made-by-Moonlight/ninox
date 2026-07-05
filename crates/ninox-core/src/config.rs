@@ -1,6 +1,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf};
+
+use crate::harness::{HarnessRegistry, HarnessSpec};
 
 // ---------------------------------------------------------------------------
 // Theme
@@ -161,6 +163,12 @@ pub struct AppConfig {
     /// if present, else the built-in Field Notes palettes.
     #[serde(default)]
     pub theme_file: Option<String>,
+    /// Agent-harness registry overrides/extensions (`[harnesses.<name>]`).
+    /// Builtin specs for claude-code/codex/opencode/aider/freebuff apply
+    /// when a name is absent here. See `crate::harness`. Kept last so TOML
+    /// serialization emits this table-of-tables after every scalar field.
+    #[serde(default)]
+    pub harnesses: BTreeMap<String, HarnessSpec>,
 }
 
 impl Default for AppConfig {
@@ -175,11 +183,18 @@ impl Default for AppConfig {
             github_token:     None,
             brain:            BrainConfig::default(),
             theme_file:       None,
+            harnesses:        BTreeMap::new(),
         }
     }
 }
 
 impl AppConfig {
+    /// The effective harness registry: builtin specs overlaid by this
+    /// config's `[harnesses.*]` entries.
+    pub fn registry(&self) -> HarnessRegistry {
+        HarnessRegistry::from_config(&self.harnesses)
+    }
+
     /// Path to the knowledge-base (brain) directory.
     ///
     /// Honors the `NINOX_BRAIN` environment variable as an override: if

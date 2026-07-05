@@ -3,6 +3,7 @@ pub mod client;
 pub mod config;
 pub mod events;
 pub mod github;
+pub mod harness;
 pub mod hooks;
 pub mod lifecycle;
 pub mod plugin;
