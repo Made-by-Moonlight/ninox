@@ -180,12 +180,11 @@ async fn run_spawn(
              **Goal:** complete the task and open a pull request.\n\n\
              To message the orchestrator (e.g. when stuck or when the PR is open):\n\
              ```bash\n\
-             {bin} send {orch_id} \"<your message>\"\n\
+             ninox send {orch_id} \"<your message>\"\n\
              ```\n\
              Report back when: (a) you are blocked and need a decision, \
              or (b) the PR is open and the task is done.",
             orch_id = orch_id_env,
-            bin = ninox_bin_str,
         ));
     }
 

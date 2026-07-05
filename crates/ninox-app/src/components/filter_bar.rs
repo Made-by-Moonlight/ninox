@@ -16,7 +16,11 @@ pub fn filter_bar(app: &App) -> Element<'_, Message> {
         .padding([4, 2])
         .style(underlined_input_style(s));
 
-    let mut field_row = row![text("⌕").size(13).color(s.faint), Space::new(6, 0), input]
+    let mut field_row = row![
+        text("⌕").size(13).font(crate::style::GLYPH).color(s.faint),
+        Space::new(6, 0),
+        input
+    ]
         .align_y(Alignment::Center);
     if has_filter {
         field_row = field_row.push(

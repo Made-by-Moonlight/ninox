@@ -3,7 +3,7 @@
 
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
-    Alignment, Background, Border, Color, Element, Length, Padding,
+    Alignment, Background, Border, Color, Element, Length,
 };
 
 use crate::{
@@ -116,20 +116,37 @@ pub fn pr_list(app: &App) -> Element<'_, Message> {
     let now = Local::now();
     let month = crate::style::MONTHS[now.month0() as usize];
     let ledger_label = format!("LEDGER — {} {} {}", now.day(), month, now.year());
+    let open_count = prs.len();
 
-    let folio = container(
-        row![
-            text("Pull ").size(30).font(SERIF).color(s.ink),
-            text("requests").size(30).font(SERIF_ITALIC).color(s.ink),
-            Space::new(18, 0),
-            text(ledger_label).size(10.5).font(MONO).color(s.faint),
-            Space::new(Length::Fill, 0),
-            text(format!("{} open", prs.len())).size(10.5).font(MONO).color(s.ink_2),
-        ]
-        .align_y(Alignment::End),
-    )
-    .padding(Padding { top: 22.0, right: 28.0, bottom: 8.0, left: 28.0 })
-    .width(Length::Fill);
+    let folio = crate::components::folio::folio_scaffold(
+        app,
+        move || {
+            let s = &app.scheme;
+            row![
+                text("Pull ").size(30).font(SERIF).color(s.ink),
+                text("requests").size(30).font(SERIF_ITALIC).color(s.ink),
+                Space::new(18, 0),
+                text(ledger_label.clone())
+                    .size(10.5)
+                    .font(MONO)
+                    .color(s.faint)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .align_y(Alignment::End)
+            .into()
+        },
+        move || {
+            let s = &app.scheme;
+            vec![
+                text(format!("{open_count} open"))
+                    .size(10.5)
+                    .font(MONO)
+                    .color(s.ink_2)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into(),
+            ]
+        },
+    );
 
     let col_header = container(
         row![

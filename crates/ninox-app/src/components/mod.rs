@@ -2,6 +2,7 @@ pub mod brain_panel;
 pub mod brain_pinboard;
 pub mod filter_bar;
 pub mod fleet_board;
+pub mod folio;
 pub mod info_panel;
 pub mod inspector_panel;
 pub mod notification_panel;

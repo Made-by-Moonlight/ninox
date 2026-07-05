@@ -130,9 +130,10 @@ pub fn spawn_modal<'a>(state: &'a App, form: &'a SpawnForm) -> Element<'a, Messa
         micro_label("Entry type", s.ink_2),
         Space::new(0, 8),
         style::segmented_frame(s, vec![
-            style::toggle_segment(
+            style::toggle_segment_glyph(
                 s,
-                "⬡ Orchestrator",
+                "⬡",
+                "Orchestrator",
                 form.kind == SpawnKind::Orchestrator,
                 Message::SpawnFormKind(SpawnKind::Orchestrator),
             ),
@@ -233,11 +234,13 @@ pub fn spawn_modal<'a>(state: &'a App, form: &'a SpawnForm) -> Element<'a, Messa
             ..Default::default()
         });
 
+    let spawn_label_color = if can_submit { s.card } else { s.faint };
     let spawn_button = button(
-        text("SPAWN ⬡")
-            .size(12)
-            .font(SANS_BOLD)
-            .color(if can_submit { s.card } else { s.faint }),
+        row![
+            text("SPAWN ").size(12).font(SANS_BOLD).color(spawn_label_color),
+            text("⬡").size(12).font(style::GLYPH).color(spawn_label_color),
+        ]
+        .align_y(Alignment::Center),
     )
     .on_press_maybe(can_submit.then_some(Message::SpawnFormConfirm))
     .padding([9, 20])
@@ -266,7 +269,13 @@ pub fn spawn_modal<'a>(state: &'a App, form: &'a SpawnForm) -> Element<'a, Messa
     // above the footer so it reads as "why the button didn't do anything"
     // rather than a form-field-level validation error.
     let error_line: Option<Element<Message>> = form.error.as_ref().map(|msg| {
-        text(format!("⚑ {msg}")).size(11).font(SANS_BOLD).color(s.accent).into()
+        row![
+            text("⚑").size(11).font(style::GLYPH).color(s.accent),
+            Space::new(6, 0),
+            text(msg.clone()).size(11).font(SANS_BOLD).color(s.accent),
+        ]
+        .align_y(Alignment::Center)
+        .into()
     });
 
     // Final layout: Entry type → Name → Workspace (standalone only) →

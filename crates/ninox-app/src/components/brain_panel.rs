@@ -169,12 +169,12 @@ fn matches_filter(entry: &BrainEntry, filter: &str) -> bool {
 fn mode_toggle(app: &App) -> Element<'_, Message> {
     let s = &app.scheme;
     crate::style::segmented_frame(s, vec![
-        crate::style::toggle_segment(
-            s, "✦ Pinboard", app.brain_view.mode == BrainMode::Pinboard,
+        crate::style::toggle_segment_glyph(
+            s, "✦", "Pinboard", app.brain_view.mode == BrainMode::Pinboard,
             Message::BrainSetMode(BrainMode::Pinboard),
         ),
-        crate::style::toggle_segment(
-            s, "☰ Catalogue", app.brain_view.mode == BrainMode::Catalogue,
+        crate::style::toggle_segment_glyph(
+            s, "☰", "Catalogue", app.brain_view.mode == BrainMode::Catalogue,
             Message::BrainSetMode(BrainMode::Catalogue),
         ),
     ])
@@ -192,7 +192,11 @@ fn search_field(app: &App) -> Element<'_, Message> {
         .padding([4, 2])
         .style(crate::style::underlined_input_style(s));
 
-    let mut field_row = row![text("⌕").size(13).color(s.faint), Space::new(6, 0), input]
+    let mut field_row = row![
+        text("⌕").size(13).font(crate::style::GLYPH).color(s.faint),
+        Space::new(6, 0),
+        input
+    ]
         .align_y(Alignment::Center);
     if has_filter {
         field_row = field_row.push(
@@ -210,11 +214,11 @@ fn search_field(app: &App) -> Element<'_, Message> {
     column![field_row, hline(s.ink, 1.5)].width(Length::Fixed(230.0)).into()
 }
 
-/// Folio header: "The *brain*", SPECIMENS count, ✦/☰ mode toggle, underlined
-/// search, and a micro-label Reindex affordance.
-fn folio(app: &App) -> Element<'_, Message> {
+/// Micro-label Reindex affordance, bordered in `rule_dark`, `ink`-colored
+/// on hover.
+fn reindex_btn(app: &App) -> Element<'_, Message> {
     let s = &app.scheme;
-    let reindex_btn = button(micro_label("Reindex", s.ink_2))
+    button(micro_label("Reindex", s.ink_2))
         .on_press(Message::BrainReindex)
         .padding([4, 10])
         .style(move |_theme, status| button::Style {
@@ -222,24 +226,34 @@ fn folio(app: &App) -> Element<'_, Message> {
             text_color: if status == button::Status::Hovered { s.ink } else { s.ink_2 },
             border: Border { color: s.rule_dark, width: 1.0, radius: 2.0.into() },
             ..Default::default()
-        });
+        })
+        .into()
+}
 
-    row![
-        text("The ").size(34).font(SERIF).color(s.ink),
-        text("brain").size(34).font(SERIF_ITALIC).color(s.ink),
-        Space::new(18, 0),
-        text(format!("SPECIMENS — {}", app.brain_view.entries.len()))
-            .size(10.5).font(MONO).color(s.faint),
-        Space::new(18, 0),
-        mode_toggle(app),
-        Space::new(Length::Fill, 0),
-        search_field(app),
-        Space::new(18, 0),
-        reindex_btn,
-    ]
-    .align_y(Alignment::End)
-    .padding(iced::Padding { top: 22.0, right: 28.0, bottom: 8.0, left: 28.0 })
-    .into()
+/// Folio header: "The *brain*", SPECIMENS count, ✦/☰ mode toggle, underlined
+/// search, and a micro-label Reindex affordance. Wraps onto two rows at
+/// narrow widths via `folio::folio_scaffold` — see that module for why.
+fn folio(app: &App) -> Element<'_, Message> {
+    let count = app.brain_view.entries.len();
+    crate::components::folio::folio_scaffold(
+        app,
+        move || {
+            let s = &app.scheme;
+            row![
+                text("The ").size(34).font(SERIF).color(s.ink),
+                text("brain").size(34).font(SERIF_ITALIC).color(s.ink),
+                Space::new(18, 0),
+                text(format!("SPECIMENS — {count}"))
+                    .size(10.5)
+                    .font(MONO)
+                    .color(s.faint)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .align_y(Alignment::End)
+            .into()
+        },
+        move || vec![mode_toggle(app), search_field(app), reindex_btn(app)],
+    )
 }
 
 /// Volume plate — which catalogue is open. Lives at the head of the

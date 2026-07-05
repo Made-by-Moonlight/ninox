@@ -3,7 +3,7 @@
 
 use iced::font::{Family, Stretch, Style as FontStyle, Weight};
 use iced::widget::{button, container, row, text, text_input, Space};
-use iced::{Background, Border, Color, Element, Font, Length, Shadow, Vector};
+use iced::{Alignment, Background, Border, Color, Element, Font, Length, Shadow, Vector};
 use ninox_core::types::{CIStatus, SessionStatus};
 
 use crate::theme::ColorScheme;
@@ -34,6 +34,16 @@ pub const MONO: Font = Font {
     weight: Weight::Normal, stretch: Stretch::Normal, style: FontStyle::Normal,
 };
 pub const MONO_MEDIUM: Font = Font { weight: Weight::Medium, ..MONO };
+
+/// Font for the app's small set of dingbat glyphs (`⬡ ⌕ ✦ ☰ ⚑`) — none of
+/// which are covered by the bundled Newsreader/Archivo/Spline Sans Mono
+/// families and render as fallback tofu boxes without this. macOS ships
+/// these in Apple Symbols; other platforms fall back to the system default
+/// font (best-effort — not verified to cover every glyph there).
+#[cfg(target_os = "macos")]
+pub const GLYPH: Font = Font::with_name("Apple Symbols");
+#[cfg(not(target_os = "macos"))]
+pub const GLYPH: Font = Font::DEFAULT;
 
 // ── Hard offset shadows: no blur, ever ─────────────────────────────────────
 /// (card, hero, modal) shadow alphas for the active theme.
@@ -204,6 +214,32 @@ pub fn toggle_segment<'a, M: Clone + 'a>(s: &'a ColorScheme, label: &str, active
         .padding([5, 14])
         .style(segment_style(s, active, s.ink_2, Some(s.ink), Border::default(), Border::default()))
         .into()
+}
+
+/// Same as `toggle_segment`, for labels that lead with one of the app's
+/// dingbat glyphs (e.g. `"✦ Pinboard"`). Newsreader/Archivo don't cover
+/// `⬡ ⌕ ✦ ☰ ⚑`, so the glyph renders separately in `GLYPH` while the rest of
+/// the label keeps the normal micro-label (Archivo) treatment.
+pub fn toggle_segment_glyph<'a, M: Clone + 'a>(
+    s: &'a ColorScheme,
+    glyph: &str,
+    label: &str,
+    active: bool,
+    on_press: M,
+) -> Element<'a, M> {
+    let color = if active { s.card } else { s.ink_2 };
+    button(
+        row![
+            text(glyph.to_string()).size(9.5).font(GLYPH).color(color),
+            Space::new(5, 0),
+            micro_label(label, color),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .on_press(on_press)
+    .padding([5, 14])
+    .style(segment_style(s, active, s.ink_2, Some(s.ink), Border::default(), Border::default()))
+    .into()
 }
 
 /// The bordered, hard-shadowed frame around a `toggle_segment` row, with an

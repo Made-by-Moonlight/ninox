@@ -87,10 +87,10 @@ fn total_session_count(app: &App) -> usize {
 }
 
 /// Folio header row: split-weight serif title, "VOL." mono date stamp, the
-/// filter field, and a "shown/total" session count.
+/// filter field, and a "shown/total" session count. Wraps onto two rows at
+/// narrow widths via `folio::folio_scaffold` — see that module for why.
 fn folio<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Element<'a, Message> {
     use chrono::{Datelike, Local, Timelike};
-    let s = &app.scheme;
     let now = Local::now();
     let title = folio_title(now.hour());
     let month = crate::style::MONTHS[now.month0() as usize];
@@ -102,21 +102,38 @@ fn folio<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Element<'a, Mes
         .sum::<usize>()
         + board_sessions(app, &SessionStatus::Terminated, scope.map(|x| x.as_str())).len();
 
-    // Split the title so the last word is italic ("Morning *observations*").
-    let (head, tail) = title.rsplit_once(' ').unwrap_or(("", title.as_str()));
-    row![
-        text(format!("{head} ")).size(34).font(crate::style::SERIF).color(s.ink),
-        text(tail.to_owned()).size(34).font(crate::style::SERIF_ITALIC).color(s.ink),
-        Space::new(18, 0),
-        text(date_label).size(10.5).font(crate::style::MONO).color(s.faint),
-        Space::new(Length::Fill, 0),
-        filter_bar(app),
-        Space::new(18, 0),
-        text(format!("{shown}/{total} sessions")).size(10.5).font(crate::style::MONO).color(s.ink_2),
-    ]
-    .align_y(Alignment::End)
-    .padding(iced::Padding { top: 22.0, right: 28.0, bottom: 8.0, left: 28.0 })
-    .into()
+    crate::components::folio::folio_scaffold(
+        app,
+        move || {
+            let s = &app.scheme;
+            // Split the title so the last word is italic ("Morning *observations*").
+            let (head, tail) = title.rsplit_once(' ').unwrap_or(("", title.as_str()));
+            row![
+                text(format!("{head} ")).size(34).font(crate::style::SERIF).color(s.ink),
+                text(tail.to_owned()).size(34).font(crate::style::SERIF_ITALIC).color(s.ink),
+                Space::new(18, 0),
+                text(date_label.clone())
+                    .size(10.5)
+                    .font(crate::style::MONO)
+                    .color(s.faint)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .align_y(Alignment::End)
+            .into()
+        },
+        move || {
+            let s = &app.scheme;
+            vec![
+                filter_bar(app),
+                text(format!("{shown}/{total} sessions"))
+                    .size(10.5)
+                    .font(crate::style::MONO)
+                    .color(s.ink_2)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into(),
+            ]
+        },
+    )
 }
 
 /// 1.5px vermilion-bordered banner shown while any session needs attention.
@@ -131,7 +148,7 @@ fn attention_banner(app: &App) -> Option<Element<'_, Message>> {
     Some(
         container(
             row![
-                text("⚑").size(13).color(s.accent),
+                text("⚑").size(13).font(crate::style::GLYPH).color(s.accent),
                 Space::new(10, 0),
                 text(format!("{} require attention.", parts.join(" and ")))
                     .size(12).font(crate::style::SANS_BOLD).color(s.accent),
