@@ -589,6 +589,7 @@ fn reading_pane(app: &App) -> Element<'_, Message> {
         .as_ref()
         .and_then(|id| app.brain_view.entries.iter().find(|e| &e.id == id));
 
+    let is_empty = selected.is_none();
     let content: Element<Message> = match selected {
         None => container(text("Nothing pinned tonight.").size(15).font(SERIF_ITALIC).color(s.faint))
             .center_x(Length::Fill)
@@ -668,7 +669,15 @@ fn reading_pane(app: &App) -> Element<'_, Message> {
         }
     };
 
-    container(scrollable(content).height(Length::Fill))
+    // The empty state centers itself with Fill dimensions, which iced's
+    // scrollable forbids on its scroll axis (debug_assert panic) — so only
+    // real entry content (Shrink-height column) goes inside the scrollable.
+    let pane: Element<Message> = if is_empty {
+        content
+    } else {
+        scrollable(content).height(Length::Fill).into()
+    };
+    container(pane)
         .width(Length::Fill)
         .height(Length::Fill)
         .padding([28, 36])

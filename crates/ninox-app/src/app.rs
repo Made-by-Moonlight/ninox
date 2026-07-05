@@ -436,6 +436,17 @@ impl App {
 
             Message::NavigateSession(id) => {
                 state.last_session = Some(id.clone());
+                // Selecting an orchestrator auto-expands its workers in the
+                // sidebar tree; selecting one of its workers keeps it open.
+                if state.orchestrators.iter().any(|o| o.id == id) {
+                    state.sidebar.selected_orchestrator = Some(id.clone());
+                } else if let Some(orch_id) = state
+                    .sessions
+                    .get(&id)
+                    .and_then(|w| w.orchestrator_id.clone())
+                {
+                    state.sidebar.selected_orchestrator = Some(orch_id);
+                }
                 state.view = View::SessionDetail {
                     session_id: id.clone(),
                     panel: DetailPanel::default(),
