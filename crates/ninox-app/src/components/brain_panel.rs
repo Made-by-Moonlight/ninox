@@ -36,7 +36,35 @@ pub fn category_color(s: &ColorScheme, ty: &str) -> Color {
     }
 }
 
-/// `[[target]]` occurrences, in order.
+/// Parse the raw text between `[[` and `]]`, handling Obsidian's optional
+/// `|alias` display-text override and `#heading`/`#^block` suffix. Returns
+/// `(target, display)`:
+/// - `target` is used for resolution/backlink matching, with any
+///   `#heading`/`#^block` suffix stripped (section-level navigation is out
+///   of scope — links resolve to the whole entry).
+/// - `display` is the text rendered in the reading pane: the alias when
+///   present (`[[target#sec|label]]` → `label`), otherwise the original
+///   text as typed, `#section` included (`[[note#sec]]` → `note#sec`).
+///
+/// Embeds (`![[x]]`) are not special-cased — the leading `!` is left alone
+/// and `[[x]]` is parsed/linked normally, so an embed renders as a literal
+/// `!` immediately followed by a clickable link (out of scope: no image/
+/// block transclusion).
+fn parse_wikilink_content(content: &str) -> (String, String) {
+    let (before_pipe, display) = match content.find('|') {
+        Some(i) => (&content[..i], content[i + 1..].trim().to_string()),
+        None => (content, content.trim().to_string()),
+    };
+    let target = match before_pipe.find('#') {
+        Some(i) => before_pipe[..i].trim().to_string(),
+        None => before_pipe.trim().to_string(),
+    };
+    (target, display)
+}
+
+/// `[[target]]`, `[[target|alias]]`, `[[target#heading]]` and
+/// `[[target#heading|alias]]` occurrences, in resolution-target form
+/// (heading/block suffix stripped, alias dropped) and in order.
 pub fn extract_wikilinks(body: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = body;
@@ -44,8 +72,8 @@ pub fn extract_wikilinks(body: &str) -> Vec<String> {
         let after = &rest[start + 2..];
         match after.find("]]") {
             Some(end) => {
-                let target = after[..end].trim();
-                if !target.is_empty() { out.push(target.to_string()); }
+                let (target, _display) = parse_wikilink_content(&after[..end]);
+                if !target.is_empty() { out.push(target); }
                 rest = &after[end + 2..];
             }
             None => break,
@@ -95,9 +123,12 @@ pub fn percent_decode_wikilink_target(target: &str) -> String {
 }
 
 /// `[[x]]` → `[x](ninox-brain:x)` so the markdown widget renders clickable
-/// links. The destination is percent-encoded (see
-/// `percent_encode_wikilink_target`) since a raw target containing spaces or
-/// parens is invalid CommonMark and truncates the link at the first space.
+/// links — plus Obsidian's `[[x|alias]]` (display = alias) and
+/// `[[x#heading]]` (display keeps the `#heading`, link resolves to `x`; see
+/// `parse_wikilink_content`). The destination is always the bare, percent-
+/// encoded target (see `percent_encode_wikilink_target`) since a raw target
+/// containing spaces or parens is invalid CommonMark and truncates the link
+/// at the first space.
 pub fn preprocess_wikilinks(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut rest = body;
@@ -106,9 +137,9 @@ pub fn preprocess_wikilinks(body: &str) -> String {
         let after = &rest[start + 2..];
         match after.find("]]") {
             Some(end) => {
-                let target = after[..end].trim();
-                let encoded = percent_encode_wikilink_target(target);
-                out.push_str(&format!("[{target}](ninox-brain:{encoded})"));
+                let (target, display) = parse_wikilink_content(&after[..end]);
+                let encoded = percent_encode_wikilink_target(&target);
+                out.push_str(&format!("[{display}](ninox-brain:{encoded})"));
                 rest = &after[end + 2..];
             }
             None => { out.push_str("[["); rest = after; }
@@ -721,10 +752,73 @@ mod tests {
     }
 
     #[test]
+    fn extracts_target_from_aliased_link() {
+        // `[[target|shown text]]` — the resolution target is the text
+        // before the `|`; the alias is dropped from the extracted list.
+        assert_eq!(
+            extract_wikilinks("see [[frame-alignment|the pattern]]"),
+            vec!["frame-alignment".to_string()]
+        );
+    }
+
+    #[test]
+    fn extracts_target_from_heading_link() {
+        // `[[target#section]]` and `[[target#^block]]` resolve to `target`
+        // — section/block anchors are stripped, not tracked.
+        assert_eq!(
+            extract_wikilinks("see [[frame-alignment#Rationale]] and [[frame-alignment#^abc123]]"),
+            vec!["frame-alignment".to_string(), "frame-alignment".to_string()]
+        );
+    }
+
+    #[test]
+    fn extracts_target_from_combined_heading_and_alias_link() {
+        // `[[a#b|c]]` — target "a", alias "c" (alias dropped for extraction).
+        assert_eq!(extract_wikilinks("see [[a#b|c]]"), vec!["a".to_string()]);
+    }
+
+    #[test]
     fn preprocesses_wikilinks_to_brain_urls() {
         assert_eq!(
             preprocess_wikilinks("see [[frame-alignment]]."),
             "see [frame-alignment](ninox-brain:frame-alignment)."
+        );
+    }
+
+    #[test]
+    fn preprocesses_aliased_link_using_alias_as_display_text() {
+        assert_eq!(
+            preprocess_wikilinks("see [[frame-alignment|the pattern]]."),
+            "see [the pattern](ninox-brain:frame-alignment)."
+        );
+    }
+
+    #[test]
+    fn preprocesses_heading_link_displaying_the_full_original_text() {
+        // No alias — the display text is exactly as typed, `#section`
+        // included, while the link destination resolves to the bare target.
+        assert_eq!(
+            preprocess_wikilinks("see [[frame-alignment#Rationale]]."),
+            "see [frame-alignment#Rationale](ninox-brain:frame-alignment)."
+        );
+    }
+
+    #[test]
+    fn preprocesses_combined_heading_and_alias_link() {
+        assert_eq!(
+            preprocess_wikilinks("see [[a#b|c]]."),
+            "see [c](ninox-brain:a)."
+        );
+    }
+
+    #[test]
+    fn embeds_render_as_literal_bang_plus_link_out_of_scope() {
+        // `![[x]]` is not treated as a transclusion — the leading `!` is
+        // left untouched and `[[x]]` is preprocessed normally, so an embed
+        // renders as a literal "!" immediately followed by a clickable link.
+        assert_eq!(
+            preprocess_wikilinks("before ![[diagram]] after"),
+            "before ![diagram](ninox-brain:diagram) after"
         );
     }
 
@@ -755,6 +849,17 @@ mod tests {
                       "owned by [[ScrollbackBuffer]]");
         let c = entry("errors/scrollback-dup.md", "errors", "scrollback-dup", "unrelated");
         let all = vec![a.clone(), b.clone(), c];
+        let backs = backlinks_for(&all, &a);
+        assert_eq!(backs.len(), 1);
+        assert_eq!(backs[0].id, b.id);
+    }
+
+    #[test]
+    fn backlinks_match_via_aliased_link_to_its_target() {
+        let a = entry("symbols/scrollback-buffer.md", "symbols", "ScrollbackBuffer", "…");
+        let b = entry("concepts/frame-alignment.md", "concepts", "frame-alignment",
+                      "owned by [[ScrollbackBuffer|the buffer]]");
+        let all = vec![a.clone(), b.clone()];
         let backs = backlinks_for(&all, &a);
         assert_eq!(backs.len(), 1);
         assert_eq!(backs[0].id, b.id);
