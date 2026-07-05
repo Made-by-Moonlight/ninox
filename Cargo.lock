@@ -2756,6 +2756,7 @@ dependencies = [
  "dirs 5.0.1",
  "libc",
  "portable-pty",
+ "rayon",
  "reqwest",
  "rusqlite",
  "serde",
