@@ -200,8 +200,25 @@ here). Folio: "The *appendix*" / SETTINGS. A single narrow column (~720px) of ca
 - **Assignments**: which harness+model new Orchestrators and Workers use unless the
   spawn entry overrides it (maps to config `[orchestrator]`/`[worker]`).
 
-Config: `[harnesses.<name>] enabled = bool, model = "..."` — serde-defaulted so
-existing configs keep parsing; claude-code implicitly enabled.
+**Backend (registry, not enum):** harness definitions are DATA, not code — adding a
+future harness must require zero Rust changes. Each harness is a spec:
+
+```toml
+[harnesses.freebuff]            # any name; binary defaults to the name
+enabled = true
+binary  = "freebuff"
+model   = "fb-large"
+interactive_args = ["--model", "{model}"]
+worker_args      = ["--model", "{model}", "-p", "{prompt}"]
+```
+
+The four known harnesses ship as compiled-in default specs (claude-code enabled,
+exact current launch shapes preserved); config entries override or extend the
+registry. Template vars: `{model}`, `{prompt}` — an arg element containing
+`{model}` is dropped entirely when no model is set. `AgentConfig { harness, model }`
+stays as the per-role/per-spawn pointer into the registry, and the existing
+`interactive_cmd`/`worker_cmd` call sites resolve through it. Serde-defaulted
+throughout — existing configs keep parsing unchanged.
 
 ## 6. Interaction inventory
 
