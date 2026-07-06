@@ -997,6 +997,7 @@ impl App {
                             model:           agent.model.clone(),
                             context_tokens:  None,
                             catalogue_path:  Some(catalogue_path.clone()),
+                            claude_session_id: None, // set below, in Task 6
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1131,6 +1132,7 @@ impl App {
                             model:           agent.model.clone(),
                             context_tokens:  None,
                             catalogue_path:  Some(catalogue_path.clone()),
+                            claude_session_id: None, // set below, in Task 6
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -2407,6 +2409,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number, pr_id, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: None,
         }
     }
 
@@ -2538,6 +2541,7 @@ mod tests {
             workspace_path: Some("/tmp/ws".into()), pid: None,
             model: Some("claude-opus-4-8".into()), context_tokens: None,
             catalogue_path: Some("/brains/b".into()),
+            claude_session_id: None,
         }
     }
 
@@ -2634,6 +2638,7 @@ mod tests {
             workspace_path:  None,
             pid:             None,
             model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: None,
         };
         let (updated, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         assert!(updated.sessions.contains_key("s1"));
@@ -2696,6 +2701,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         m = next;
@@ -2742,6 +2748,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: None,
         }).unwrap();
         let engine = Engine::new(store);
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
@@ -2763,6 +2770,7 @@ mod tests {
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         m = m2;
@@ -2791,6 +2799,7 @@ mod tests {
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: None,
         };
         let _ = m.engine.store.upsert_session(&worker);
         let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(worker)));
@@ -3207,6 +3216,7 @@ mod tests {
             started_at: 0, pr_number: Some(42), pr_id: None,
             workspace_path: Some("/tmp/w".into()), pid: Some(1234),
             model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -3233,6 +3243,7 @@ mod tests {
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -3283,6 +3294,7 @@ mod tests {
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         // NavigateSession defaults to the Split panel, so switch to Terminal
@@ -3328,6 +3340,7 @@ mod tests {
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -3407,6 +3420,7 @@ mod tests {
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         let (m, _) = m.update(Message::NavigateSession("s1".into()));
@@ -3457,6 +3471,7 @@ mod tests {
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -3545,6 +3560,7 @@ mod tests {
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
             m = next;
@@ -4186,6 +4202,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
         m = next;

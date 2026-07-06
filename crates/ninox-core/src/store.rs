@@ -44,9 +44,10 @@ impl Store {
         // Migrations for columns added after initial release — idempotent so
         // both fresh and pre-existing databases end up with the same schema.
         for (col, ddl) in [
-            ("model",          "ALTER TABLE sessions ADD COLUMN model TEXT"),
-            ("context_tokens", "ALTER TABLE sessions ADD COLUMN context_tokens INTEGER"),
-            ("catalogue_path", "ALTER TABLE sessions ADD COLUMN catalogue_path TEXT"),
+            ("model",             "ALTER TABLE sessions ADD COLUMN model TEXT"),
+            ("context_tokens",    "ALTER TABLE sessions ADD COLUMN context_tokens INTEGER"),
+            ("catalogue_path",    "ALTER TABLE sessions ADD COLUMN catalogue_path TEXT"),
+            ("claude_session_id", "ALTER TABLE sessions ADD COLUMN claude_session_id TEXT"),
         ] {
             if !Self::column_exists(&conn, "sessions", col)? {
                 conn.execute(ddl, [])?;
@@ -70,20 +71,21 @@ impl Store {
         conn.execute(
             "INSERT INTO sessions (id,orchestrator_id,name,repo,status,agent_type,
              cost_usd,started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
-             catalogue_path)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             catalogue_path,claude_session_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
              ON CONFLICT(id) DO UPDATE SET
              status=excluded.status,cost_usd=excluded.cost_usd,
              started_at=excluded.started_at,
              pr_number=excluded.pr_number,pr_id=excluded.pr_id,
              workspace_path=excluded.workspace_path,pid=excluded.pid,
              model=excluded.model,context_tokens=excluded.context_tokens,
-             catalogue_path=excluded.catalogue_path",
+             catalogue_path=excluded.catalogue_path,
+             claude_session_id=excluded.claude_session_id",
             params![
                 s.id, s.orchestrator_id, s.name, s.repo, status, s.agent_type,
                 s.cost_usd, s.started_at, s.pr_number, s.pr_id,
                 s.workspace_path, s.pid, s.model, s.context_tokens,
-                s.catalogue_path
+                s.catalogue_path, s.claude_session_id
             ],
         )?;
         Ok(())
@@ -94,7 +96,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
-             catalogue_path
+             catalogue_path,claude_session_id
              FROM sessions ORDER BY started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -114,19 +116,20 @@ impl Store {
                 r.get::<_, Option<String>>(12)?,
                 r.get::<_, Option<i64>>(13)?,
                 r.get::<_, Option<String>>(14)?,
+                r.get::<_, Option<String>>(15)?,
             ))
         })?;
         rows.map(|r| {
             let (id, orchestrator_id, name, repo, status_str, agent_type,
                  cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
-                 model, context_tokens, catalogue_path) = r?;
+                 model, context_tokens, catalogue_path, claude_session_id) = r?;
             let status = serde_json::from_str(&format!("\"{status_str}\""))
                 .unwrap_or(SessionStatus::Working);
             Ok(Session {
                 id, orchestrator_id, name, repo, status, agent_type,
                 cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                 model, context_tokens: context_tokens.map(|v| v.max(0) as u64),
-                catalogue_path,
+                catalogue_path, claude_session_id,
             })
         })
         .collect()
@@ -137,7 +140,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
-             catalogue_path
+             catalogue_path,claude_session_id
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], |r| {
@@ -157,6 +160,7 @@ impl Store {
                 r.get::<_, Option<String>>(12)?,
                 r.get::<_, Option<i64>>(13)?,
                 r.get::<_, Option<String>>(14)?,
+                r.get::<_, Option<String>>(15)?,
             ))
         })?;
         match rows.next() {
@@ -164,14 +168,14 @@ impl Store {
             Some(r) => {
                 let (id, orchestrator_id, name, repo, status_str, agent_type,
                      cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
-                     model, context_tokens, catalogue_path) = r?;
+                     model, context_tokens, catalogue_path, claude_session_id) = r?;
                 let status = serde_json::from_str(&format!("\"{status_str}\""))
                     .unwrap_or(SessionStatus::Working);
                 Ok(Some(Session {
                     id, orchestrator_id, name, repo, status, agent_type,
                     cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                     model, context_tokens: context_tokens.map(|v| v.max(0) as u64),
-                    catalogue_path,
+                    catalogue_path, claude_session_id,
                 }))
             }
         }
@@ -312,7 +316,7 @@ mod tests {
             repo: "slievr/Athene".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, catalogue_path: None,
+            model: None, context_tokens: None, catalogue_path: None, claude_session_id: None,
         };
         store.upsert_session(&session).unwrap();
         let list = store.list_sessions().unwrap();
@@ -328,7 +332,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, catalogue_path: None,
+            model: None, context_tokens: None, catalogue_path: None, claude_session_id: None,
         };
         store.upsert_session(&s).unwrap();
         s.status = SessionStatus::Done;
@@ -346,7 +350,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, catalogue_path: None,
+            model: None, context_tokens: None, catalogue_path: None, claude_session_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap();
@@ -364,6 +368,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 1.5, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: Some("claude-fable-5".into()), context_tokens: Some(214_000), catalogue_path: None,
+            claude_session_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap().unwrap();
@@ -381,12 +386,41 @@ mod tests {
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: None, context_tokens: None,
             catalogue_path: Some("/brains/x".into()),
+            claude_session_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2").unwrap().unwrap();
         assert_eq!(found.catalogue_path.as_deref(), Some("/brains/x"));
         // list path decodes it too
         assert_eq!(store.list_sessions().unwrap()[0].catalogue_path.as_deref(), Some("/brains/x"));
+    }
+
+    #[test]
+    fn claude_session_id_round_trips() {
+        let store = test_store();
+        let s = Session {
+            id: "s3".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: Some("b7e0b3a0-0000-4000-8000-000000000001".into()),
+        };
+        store.upsert_session(&s).unwrap();
+        let found = store.get_session("s3").unwrap().unwrap();
+        assert_eq!(found.claude_session_id.as_deref(), Some("b7e0b3a0-0000-4000-8000-000000000001"));
+        // list path decodes it too
+        assert_eq!(
+            store.list_sessions().unwrap().iter().find(|x| x.id == "s3").unwrap().claude_session_id.as_deref(),
+            Some("b7e0b3a0-0000-4000-8000-000000000001"),
+        );
+
+        // None round-trips as None, not "" or "none"
+        let mut s2 = s.clone();
+        s2.id = "s4".into();
+        s2.claude_session_id = None;
+        store.upsert_session(&s2).unwrap();
+        assert_eq!(store.get_session("s4").unwrap().unwrap().claude_session_id, None);
     }
 
     /// A Re-file respawns the same session id with a fresh `started_at` —
@@ -400,7 +434,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 100,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, catalogue_path: None,
+            model: None, context_tokens: None, catalogue_path: None, claude_session_id: None,
         };
         store.upsert_session(&s).unwrap();
         s.started_at = 200;
@@ -440,6 +474,7 @@ mod tests {
                 agent_type: agent_type.into(), cost_usd: cost, started_at: 0,
                 pr_number: None, pr_id: None, workspace_path: None, pid: None,
                 model: model.map(String::from), context_tokens: None, catalogue_path: None,
+                claude_session_id: None,
             }).unwrap();
         }
         let samples = store.cost_samples("claude-code", Some("claude-fable-5")).unwrap();

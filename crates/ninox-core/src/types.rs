@@ -41,6 +41,13 @@ pub struct Session {
     /// this field existed (Re-file falls back to the default brain).
     #[serde(default)]
     pub catalogue_path: Option<String>,
+    /// UUID ninox assigned this session's `claude` CLI process at spawn
+    /// time (`--session-id <uuid>`), used to resume the exact same
+    /// conversation later (`--resume <uuid>`) if the tmux pane dies
+    /// out from under it (see `docs/superpowers/specs/2026-07-06-session-resume-design.md`).
+    /// `None` for legacy sessions and for harnesses with no `resume_args`.
+    #[serde(default)]
+    pub claude_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

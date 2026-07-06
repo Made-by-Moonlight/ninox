@@ -116,6 +116,7 @@ pub async fn spawn_interactive_session(
         model:           p.agent.model.clone(),
         context_tokens:  None,
         catalogue_path:  (!p.catalogue_path.is_empty()).then(|| p.catalogue_path.clone()),
+        claude_session_id: None, // set in Task 5
     };
     let _ = engine.store.upsert_session(&updated);
 

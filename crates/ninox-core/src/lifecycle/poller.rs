@@ -551,7 +551,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None,
             workspace_path: Some(workspace.into()), pid: None,
-            model: None, context_tokens: None, catalogue_path: None,
+            model: None, context_tokens: None, catalogue_path: None, claude_session_id: None,
         }
     }
 
