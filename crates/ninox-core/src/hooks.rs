@@ -7,16 +7,13 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionMetadata {
-    pub pr_number:     Option<u64>,
-    pub pr_url:        Option<String>,
-    pub branch:        Option<String>,
+    pub pr_number:  Option<u64>,
+    pub pr_url:     Option<String>,
+    pub branch:     Option<String>,
     /// Every PR the agent has reported creating, in creation order. The
     /// scalar `pr_number`/`pr_url` fields always mirror the latest one; this
     /// list is what lets the poller see PRs beyond the first.
-    pub pr_reports:    Vec<PrReport>,
-    /// Additional work the agent asked the orchestrator to schedule
-    /// (`ninox request-work`), oldest first.
-    pub work_requests: Vec<WorkRequest>,
+    pub pr_reports: Vec<PrReport>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,14 +22,15 @@ pub struct PrReport {
     pub url:    Option<String>,
 }
 
+/// Additional work a worker asked the orchestrator to schedule
+/// (`ninox request-work`). Stored one file per request under
+/// `{dir}/{session}.requests/` — never inside the shared `{session}.json`,
+/// which the gh/git bash wrappers rewrite concurrently and without locking.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkRequest {
     pub id:           String,
     pub description:  String,
     pub requested_at: i64,
-    /// Set once the poller has forwarded the request to the orchestrator so
-    /// it is never delivered twice.
-    pub delivered:    bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -231,77 +229,114 @@ pub fn read_session_metadata(dir: &Path, session_id: &str) -> Result<SessionMeta
         }
     }
 
-    let work_requests: Vec<WorkRequest> = map.get("workRequests")
-        .and_then(|v| v.as_array())
-        .map(|reqs| {
-            reqs.iter()
-                .filter_map(|r| {
-                    Some(WorkRequest {
-                        id:           r.get("id")?.as_str()?.to_string(),
-                        description:  r.get("description")?.as_str()?.to_string(),
-                        requested_at: r.get("requestedAt").and_then(|v| v.as_i64()).unwrap_or(0),
-                        delivered:    r.get("delivered").and_then(|v| v.as_bool()).unwrap_or(false),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(SessionMetadata { pr_number, pr_url, branch, pr_reports, work_requests })
+    Ok(SessionMetadata { pr_number, pr_url, branch, pr_reports })
 }
 
-/// Record a worker's request for additional work in its session metadata
-/// file (`ninox request-work`). The poller delivers undelivered requests to
-/// the orchestrator and marks them via [`mark_work_requests_delivered`].
+/// Record a worker's request for additional work (`ninox request-work`) as
+/// its own file under `{dir}/{session_id}.requests/`. One file per request
+/// keeps every writer single-owner: nothing here ever read-modify-writes the
+/// shared `{session_id}.json` the bash wrappers rewrite.
 pub fn append_work_request(dir: &Path, session_id: &str, description: &str) -> Result<WorkRequest> {
-    let path = metadata_path(dir, session_id);
-    let mut map = read_metadata_map(&path)?.unwrap_or_default();
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
 
-    let existing = map.get("workRequests").and_then(|v| v.as_array()).map_or(0, |a| a.len());
     let requested_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
+    // pid + per-process sequence make the id unique even when two workers
+    // (or one worker twice) request work in the same millisecond.
     let request = WorkRequest {
-        id: format!("wr-{session_id}-{requested_at}-{existing}"),
+        id: format!(
+            "wr-{requested_at}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ),
         description: description.to_string(),
         requested_at,
-        delivered: false,
     };
 
-    let entry = serde_json::json!({
+    let requests_dir = work_requests_dir(dir, session_id);
+    std::fs::create_dir_all(&requests_dir)?;
+    let path = requests_dir.join(format!("{}.json", request.id));
+    let body = serde_json::json!({
         "id":          request.id,
         "description": request.description,
         "requestedAt": request.requested_at,
-        "delivered":   request.delivered,
     });
-    match map.entry("workRequests".to_string())
-        .or_insert_with(|| serde_json::Value::Array(vec![]))
-    {
-        serde_json::Value::Array(arr) => arr.push(entry),
-        other => *other = serde_json::Value::Array(vec![entry]),
-    }
-
-    write_metadata_map(&path, &map)?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&body)?)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(request)
 }
 
-/// Flag the given work-request ids as delivered so the poller never forwards
-/// them to the orchestrator twice.
+/// Work requests not yet delivered to the orchestrator, oldest first.
+pub fn read_pending_work_requests(dir: &Path, session_id: &str) -> Result<Vec<WorkRequest>> {
+    let requests_dir = work_requests_dir(dir, session_id);
+    let entries = match std::fs::read_dir(&requests_dir) {
+        Ok(e)  => e,
+        Err(_) => return Ok(Vec::new()), // no directory → nothing pending
+    };
+    let mut requests: Vec<WorkRequest> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|e| {
+            let raw = std::fs::read_to_string(e.path()).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+            Some(WorkRequest {
+                id:           v.get("id")?.as_str()?.to_string(),
+                description:  v.get("description")?.as_str()?.to_string(),
+                requested_at: v.get("requestedAt").and_then(|t| t.as_i64()).unwrap_or(0),
+            })
+        })
+        .collect();
+    requests.sort_by(|a, b| a.requested_at.cmp(&b.requested_at).then(a.id.cmp(&b.id)));
+    Ok(requests)
+}
+
+/// Mark work requests delivered by renaming their file out of the pending
+/// set (`.json` → `.json.delivered`) — kept on disk as an audit trail.
 pub fn mark_work_requests_delivered(dir: &Path, session_id: &str, ids: &[String]) -> Result<()> {
-    let path = metadata_path(dir, session_id);
-    let Some(mut map) = read_metadata_map(&path)? else { return Ok(()) };
-    if let Some(serde_json::Value::Array(arr)) = map.get_mut("workRequests") {
-        for entry in arr.iter_mut() {
-            let matches = entry.get("id")
-                .and_then(|v| v.as_str())
-                .is_some_and(|id| ids.iter().any(|i| i == id));
-            if matches {
-                entry["delivered"] = serde_json::Value::Bool(true);
-            }
+    let requests_dir = work_requests_dir(dir, session_id);
+    for id in ids {
+        let path = requests_dir.join(format!("{id}.json"));
+        if path.exists() {
+            let delivered = requests_dir.join(format!("{id}.json.delivered"));
+            std::fs::rename(&path, &delivered)?;
         }
     }
-    write_metadata_map(&path, &map)
+    Ok(())
+}
+
+/// Extra PRs (beyond the session's tracked one) that have already been
+/// notified. Poller-owned side file — deliberately not the shared
+/// `{session}.json` (wrapper races) and not the `prs` table (whose ids are
+/// bare PR numbers and collide across repos).
+pub fn read_notified_extra_prs(dir: &Path, session_id: &str) -> Vec<u64> {
+    let path = notified_prs_path(dir, session_id);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<u64>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Append PR numbers to the session's notified-extra-PRs marker file.
+/// Only the poller writes this file, so read-modify-write is race-free.
+pub fn mark_extra_prs_notified(dir: &Path, session_id: &str, numbers: &[u64]) -> Result<()> {
+    let path = notified_prs_path(dir, session_id);
+    let mut notified = read_notified_extra_prs(dir, session_id);
+    for n in numbers {
+        if !notified.contains(n) {
+            notified.push(*n);
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_string(&notified)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +347,14 @@ fn metadata_path(dir: &Path, session_id: &str) -> PathBuf {
     dir.join(format!("{session_id}.json"))
 }
 
+fn work_requests_dir(dir: &Path, session_id: &str) -> PathBuf {
+    dir.join(format!("{session_id}.requests"))
+}
+
+fn notified_prs_path(dir: &Path, session_id: &str) -> PathBuf {
+    dir.join(format!("{session_id}.notified-prs.json"))
+}
+
 /// Load the raw metadata JSON object. `Ok(None)` when the file is missing or
 /// malformed — callers treat both as "no metadata yet".
 fn read_metadata_map(path: &Path) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
@@ -320,18 +363,6 @@ fn read_metadata_map(path: &Path) -> Result<Option<serde_json::Map<String, serde
     }
     let raw = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&raw).ok())
-}
-
-/// Atomic write (temp + rename), preserving keys we don't model — the same
-/// discipline the bash wrappers follow.
-fn write_metadata_map(path: &Path, map: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_string_pretty(map)?)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 /// The wrappers write numbers as JSON strings (jq `--arg`); accept both.
@@ -406,44 +437,69 @@ mod tests {
     }
 
     #[test]
-    fn append_work_request_accumulates_undelivered_requests() {
+    fn append_work_request_accumulates_pending_requests() {
         let dir = tempdir().unwrap();
         let first  = append_work_request(dir.path(), "s1", "Fix flaky auth test").unwrap();
         let second = append_work_request(dir.path(), "s1", "Migrate config loader").unwrap();
         assert_ne!(first.id, second.id, "each request needs a distinct id");
 
-        let m = read_session_metadata(dir.path(), "s1").unwrap();
-        assert_eq!(m.work_requests.len(), 2);
-        assert_eq!(m.work_requests[0].description, "Fix flaky auth test");
-        assert_eq!(m.work_requests[1].description, "Migrate config loader");
-        assert!(m.work_requests.iter().all(|r| !r.delivered));
+        let pending = read_pending_work_requests(dir.path(), "s1").unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].description, "Fix flaky auth test");
+        assert_eq!(pending[1].description, "Migrate config loader");
     }
 
+    /// Work requests must never touch the shared `{session}.json` — the gh/git
+    /// wrappers rewrite that file concurrently, and a read-modify-write from
+    /// another process could erase their updates (or vice versa).
     #[test]
-    fn append_work_request_preserves_existing_metadata_keys() {
+    fn append_work_request_leaves_shared_metadata_file_alone() {
         let dir = tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("s1.json"),
-            r#"{"agentReportedPrNumber": "42", "branch": "feat/x"}"#,
-        ).unwrap();
+        let shared = r#"{"agentReportedPrNumber": "42", "branch": "feat/x"}"#;
+        std::fs::write(dir.path().join("s1.json"), shared).unwrap();
         append_work_request(dir.path(), "s1", "New task").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("s1.json")).unwrap(),
+            shared,
+            "shared metadata JSON must be byte-identical after a work request",
+        );
         let m = read_session_metadata(dir.path(), "s1").unwrap();
         assert_eq!(m.pr_number, Some(42));
-        assert_eq!(m.branch.as_deref(), Some("feat/x"));
-        assert_eq!(m.work_requests.len(), 1);
+        assert_eq!(read_pending_work_requests(dir.path(), "s1").unwrap().len(), 1);
     }
 
     #[test]
-    fn mark_work_requests_delivered_flags_only_named_ids() {
+    fn mark_work_requests_delivered_removes_only_named_ids_from_pending() {
         let dir = tempdir().unwrap();
         let first = append_work_request(dir.path(), "s1", "task a").unwrap();
-        append_work_request(dir.path(), "s1", "task b").unwrap();
+        let second = append_work_request(dir.path(), "s1", "task b").unwrap();
 
         mark_work_requests_delivered(dir.path(), "s1", &[first.id.clone()]).unwrap();
 
-        let m = read_session_metadata(dir.path(), "s1").unwrap();
-        assert!(m.work_requests.iter().find(|r| r.id == first.id).unwrap().delivered);
-        assert_eq!(m.work_requests.iter().filter(|r| !r.delivered).count(), 1);
+        let pending = read_pending_work_requests(dir.path(), "s1").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, second.id);
+    }
+
+    #[test]
+    fn pending_work_requests_empty_when_none_recorded() {
+        let dir = tempdir().unwrap();
+        assert!(read_pending_work_requests(dir.path(), "s1").unwrap().is_empty());
+    }
+
+    /// The extra-PR "already notified" marker is a poller-owned side file —
+    /// never the shared `{session}.json`, and never keyed on the globally
+    /// collision-prone `prs.id`.
+    #[test]
+    fn notified_extra_prs_round_trip_and_accumulate() {
+        let dir = tempdir().unwrap();
+        assert!(read_notified_extra_prs(dir.path(), "s1").is_empty());
+        mark_extra_prs_notified(dir.path(), "s1", &[43, 44]).unwrap();
+        mark_extra_prs_notified(dir.path(), "s1", &[45]).unwrap();
+        let notified = read_notified_extra_prs(dir.path(), "s1");
+        assert_eq!(notified, vec![43, 44, 45]);
+        // Per-session, not global.
+        assert!(read_notified_extra_prs(dir.path(), "s2").is_empty());
     }
 
     #[test]

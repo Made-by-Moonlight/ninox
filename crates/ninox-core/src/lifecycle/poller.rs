@@ -56,6 +56,10 @@ impl Poller {
     // ── PID liveness ────────────────────────────────────────────────────────
 
     async fn poll_pids(&self) {
+        // Metadata first: a dying worker's last acts (PR create, work
+        // request) are processed before the reap below marks it Terminated.
+        self.sync_sessions_metadata(&AppConfig::sessions_dir()).await;
+
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
         for mut session in sessions {
             if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
@@ -66,13 +70,9 @@ impl Poller {
                     session.status = SessionStatus::Terminated;
                     let _ = self.engine.store.upsert_session(&session);
                     self.engine.emit(Event::SessionUpdated(session));
-                    continue;
                 }
             }
-
         }
-
-        self.sync_sessions_metadata(&AppConfig::sessions_dir()).await;
     }
 
     // ── Session metadata (wrapper hooks + `ninox request-work`) ────────────
@@ -85,6 +85,11 @@ impl Poller {
     async fn sync_sessions_metadata(&self, sessions_dir: &std::path::Path) {
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
         for mut session in sessions {
+            // Work requests are about *new* work, not this session — deliver
+            // them even when the requesting worker has already finished or
+            // died (a worker's last act is often "request follow-up, exit").
+            self.deliver_work_requests(&session, sessions_dir).await;
+
             if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
                 continue;
             }
@@ -107,84 +112,88 @@ impl Poller {
             }
 
             // -- Every reported PR beyond the tracked one --
-            if let Some(tracked) = session.pr_number {
-                let mut fresh: Vec<(u64, Option<String>)> = Vec::new();
-                for report in meta.pr_reports.iter().filter(|r| r.number != tracked) {
-                    // The store row doubles as the dedup marker, so extras
-                    // survive restarts without re-notifying.
-                    match self.engine.store.get_pr(report.number as i64) {
-                        Ok(None) => {}
-                        _        => continue,
-                    }
+            let Some(tracked) = session.pr_number else { continue };
+            let notified = hooks::read_notified_extra_prs(sessions_dir, &session.id);
+            let mut fresh: Vec<(u64, Option<String>)> = Vec::new();
+            for report in meta.pr_reports.iter()
+                .filter(|r| r.number != tracked && !notified.contains(&r.number))
+            {
+                // Record the extra PR in the ledger, but only when the row id
+                // (bare PR number — collides across repos) is free: never
+                // steal another session's row. Dedup lives in the side file,
+                // not here.
+                if let Ok(None) = self.engine.store.get_pr(report.number as i64) {
                     let url = report.url.clone().unwrap_or_else(|| {
                         format!("https://github.com/{}/pull/{}", session.repo, report.number)
                     });
-                    let pr = PR {
+                    let _ = self.engine.store.upsert_pr(&PR {
                         id:         report.number as i64,
                         number:     report.number,
                         title:      String::new(),
                         url,
                         body:       String::new(),
                         session_id: session.id.clone(),
-                    };
-                    if self.engine.store.upsert_pr(&pr).is_err() {
-                        continue;
-                    }
-                    self.engine.emit(Event::Notification(Notification {
-                        id:         format!("extra-pr-{}-{}", session.id, report.number),
-                        kind:       NotificationKind::ExtraPr,
-                        title:      format!("Extra PR — {}", session.name),
-                        body:       format!("#{} opened beyond tracked #{tracked}", report.number),
-                        session_id: Some(session.id.clone()),
-                        created_at: now_millis(),
-                    }));
-                    fresh.push((report.number, report.url.clone()));
+                    });
                 }
-                if !fresh.is_empty() {
-                    if let Some(orch) = session.orchestrator_id.clone() {
-                        let msg = crate::lifecycle::reactions::format_extra_pr_reaction(
-                            &session, tracked, &fresh,
-                        );
-                        if let Err(e) = self.engine.send_to_session(&orch, &msg).await {
-                            tracing::warn!("send extra-PR reaction to orchestrator {orch}: {e}");
-                        }
-                    }
-                }
-            }
-
-            // -- Work requests (`ninox request-work`) --
-            let undelivered: Vec<_> = meta.work_requests.iter()
-                .filter(|r| !r.delivered)
-                .cloned()
-                .collect();
-            if undelivered.is_empty() {
-                continue;
-            }
-            for request in &undelivered {
                 self.engine.emit(Event::Notification(Notification {
-                    id:         format!("work-request-{}", request.id),
-                    kind:       NotificationKind::WorkRequested,
-                    title:      format!("Work requested — {}", session.name),
-                    body:       request.description.clone(),
+                    id:         format!("extra-pr-{}-{}", session.id, report.number),
+                    kind:       NotificationKind::ExtraPr,
+                    title:      format!("Extra PR — {}", session.name),
+                    body:       format!("#{} opened beyond tracked #{tracked}", report.number),
                     session_id: Some(session.id.clone()),
                     created_at: now_millis(),
                 }));
-                if let Some(orch) = session.orchestrator_id.clone() {
-                    let msg = crate::lifecycle::reactions::format_work_request_reaction(
-                        &session, &request.description,
-                    );
-                    if let Err(e) = self.engine.send_to_session(&orch, &msg).await {
-                        tracing::warn!("send work request to orchestrator {orch}: {e}");
-                    }
+                fresh.push((report.number, report.url.clone()));
+            }
+            if fresh.is_empty() {
+                continue;
+            }
+            let numbers: Vec<u64> = fresh.iter().map(|(n, _)| *n).collect();
+            if let Err(e) = hooks::mark_extra_prs_notified(sessions_dir, &session.id, &numbers) {
+                tracing::warn!("mark extra PRs notified for {}: {e}", session.id);
+            }
+            if let Some(orch) = session.orchestrator_id.clone() {
+                let msg = crate::lifecycle::reactions::format_extra_pr_reaction(
+                    &session, tracked, &fresh,
+                );
+                if let Err(e) = self.engine.send_to_session(&orch, &msg).await {
+                    tracing::warn!("send extra-PR reaction to orchestrator {orch}: {e}");
                 }
             }
-            // Mark delivered even when the tmux nudge failed — the UI
-            // notification is already out, and retrying every tick would
-            // spam both channels.
-            let ids: Vec<String> = undelivered.iter().map(|r| r.id.clone()).collect();
-            if let Err(e) = hooks::mark_work_requests_delivered(sessions_dir, &session.id, &ids) {
-                tracing::warn!("mark work requests delivered for {}: {e}", session.id);
+        }
+    }
+
+    /// Forward every pending `ninox request-work` entry for this session to
+    /// the UI and the orchestrator, then move it out of the pending set.
+    async fn deliver_work_requests(&self, session: &crate::types::Session, sessions_dir: &std::path::Path) {
+        let pending = match hooks::read_pending_work_requests(sessions_dir, &session.id) {
+            Ok(p) if !p.is_empty() => p,
+            _ => return,
+        };
+        for request in &pending {
+            self.engine.emit(Event::Notification(Notification {
+                id:         format!("work-request-{}", request.id),
+                kind:       NotificationKind::WorkRequested,
+                title:      format!("Work requested — {}", session.name),
+                body:       request.description.clone(),
+                session_id: Some(session.id.clone()),
+                created_at: now_millis(),
+            }));
+            if let Some(orch) = session.orchestrator_id.clone() {
+                let msg = crate::lifecycle::reactions::format_work_request_reaction(
+                    session, &request.description,
+                );
+                if let Err(e) = self.engine.send_to_session(&orch, &msg).await {
+                    tracing::warn!("send work request to orchestrator {orch}: {e}");
+                }
             }
+        }
+        // Marked delivered even when the tmux nudge failed — the UI
+        // notification is already out, and retrying every tick would spam
+        // both channels.
+        let ids: Vec<String> = pending.iter().map(|r| r.id.clone()).collect();
+        if let Err(e) = hooks::mark_work_requests_delivered(sessions_dir, &session.id, &ids) {
+            tracing::warn!("mark work requests delivered for {}: {e}", session.id);
         }
     }
 
@@ -719,14 +728,98 @@ mod tests {
         assert!(notif.body.contains("Migrate the config loader"));
         assert_eq!(notif.session_id.as_deref(), Some("s1"));
 
-        let meta = hooks::read_session_metadata(sessions_dir.path(), "s1").unwrap();
-        assert!(meta.work_requests.iter().all(|r| r.delivered));
+        assert!(
+            hooks::read_pending_work_requests(sessions_dir.path(), "s1").unwrap().is_empty(),
+            "delivered requests must leave the pending set",
+        );
 
         poller.sync_sessions_metadata(sessions_dir.path()).await;
         let events = drain_events(&mut rx);
         assert!(
             !events.iter().any(|e| matches!(e, Event::Notification(_))),
             "delivered work requests must not fire again",
+        );
+    }
+
+    /// A worker can request work and exit before the next tick — the request
+    /// must still reach the orchestrator, not die with the session.
+    #[tokio::test]
+    async fn metadata_sync_delivers_work_requests_from_terminated_sessions() {
+        use crate::store::Store;
+
+        let sessions_dir = tempfile::tempdir().unwrap();
+        hooks::append_work_request(sessions_dir.path(), "s1", "Follow-up refactor").unwrap();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", "/ws");
+        session.status = SessionStatus::Terminated;
+        store.upsert_session(&session).unwrap();
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkRequested
+            )),
+            "work requests outlive their session",
+        );
+    }
+
+    /// Extra-PR dedup must not be fooled by an unrelated session in another
+    /// repo already owning the `prs` row for that number (prs.id is the bare
+    /// PR number, which collides across repos) — and must not steal that row.
+    #[tokio::test]
+    async fn extra_pr_detection_survives_cross_repo_pr_number_collision() {
+        use crate::store::Store;
+
+        let sessions_dir = tempfile::tempdir().unwrap();
+        let meta = serde_json::json!({
+            "agentReportedPrs": [
+                {"number": "7", "url": "https://github.com/org/repo-a/pull/7"},
+                {"number": "9", "url": "https://github.com/org/repo-a/pull/9"},
+            ],
+        });
+        std::fs::write(
+            sessions_dir.path().join("s1.json"),
+            serde_json::to_string(&meta).unwrap(),
+        ).unwrap();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", "/ws")).unwrap();
+        // Another repo's session already tracks its own PR #9.
+        let other = PR {
+            id: 9, number: 9, title: "other repo's PR".into(),
+            url: "https://github.com/org/repo-b/pull/9".into(),
+            body: String::new(), session_id: "other".into(),
+        };
+        store.upsert_pr(&other).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e, Event::Notification(n) if n.kind == crate::types::NotificationKind::ExtraPr
+            )),
+            "the collision must not suppress the extra-PR alert",
+        );
+        let row = store.get_pr(9).unwrap().unwrap();
+        assert_eq!(row.session_id, "other", "the other repo's row must not be stolen");
+        assert_eq!(row.url, "https://github.com/org/repo-b/pull/9");
+
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+        let events = drain_events(&mut rx);
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Notification(_))),
+            "dedup must hold across ticks even without a prs row of our own",
         );
     }
 
