@@ -203,10 +203,12 @@ impl BrainIndex {
                         "INSERT INTO embeddings (id, content_hash, vector) VALUES (?1, ?2, ?3)
                          ON CONFLICT(id) DO UPDATE SET content_hash = excluded.content_hash, vector = excluded.vector",
                     )?;
+                    let mut upserted = 0usize;
                     for ((rec, _, hash), vector) in to_embed.iter().zip(vectors.iter()) {
                         upsert.execute(params![rec.id, hash, vector_to_blob(vector)])?;
+                        upserted += 1;
                     }
-                    to_embed.len()
+                    upserted
                 }
                 Err(err) => {
                     tracing::warn!("brain: failed to embed {} entries: {err}", to_embed.len());
@@ -296,6 +298,7 @@ impl BrainIndex {
             None => Vec::new(),
         };
 
+        let fusion_ran = !semantic_ids.is_empty();
         let mut results: Vec<BrainEntry> = if semantic_ids.is_empty() {
             keyword_results
         } else {
@@ -321,7 +324,13 @@ impl BrainIndex {
             results.retain(|e| e.tags.iter().any(|t| t == tag));
         }
 
-        results.truncate(20);
+        // Cap only applies when semantic fusion actually happened — the
+        // no-embedder / no-semantic-contribution path stays exactly
+        // today's uncapped keyword behavior, matching the design spec's
+        // degradation guarantee.
+        if fusion_ran {
+            results.truncate(20);
+        }
         Ok(results)
     }
 
@@ -354,7 +363,7 @@ impl BrainIndex {
             let vector = blob_to_vector(&blob);
             scored.push((id, cosine_similarity(&query_vector, &vector)));
         }
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(20);
         Ok(scored.into_iter().map(|(id, _)| id).collect())
     }
@@ -1186,6 +1195,54 @@ mod tests {
             embedder.calls.load(Ordering::SeqCst),
             0,
             "empty-text queries must never touch the embedder"
+        );
+    }
+
+    /// Write `n` markdown files, each containing the shared keyword
+    /// "widgetronic" so a keyword search for it matches all of them.
+    fn write_many_matching_notes(dir: &Path, n: usize) {
+        let notes = dir.join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        for i in 0..n {
+            fs::write(
+                notes.join(format!("note{i}.md")),
+                format!("---\nname: Note {i}\n---\nAll about widgetronic devices, entry {i}."),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn query_without_embedder_returns_all_keyword_matches_uncapped() {
+        let (brain, dir) = make_brain();
+        write_many_matching_notes(dir.path(), 25);
+        brain.rebuild(None).unwrap();
+
+        let results = brain.query("widgetronic", None, QueryFilters::default()).unwrap();
+        assert_eq!(
+            results.len(),
+            25,
+            "the no-embedder keyword path must stay exactly today's uncapped behavior, not truncate to 20: {}",
+            results.len()
+        );
+    }
+
+    #[test]
+    fn query_hybrid_fusion_caps_at_20() {
+        let (brain, dir) = make_brain();
+        write_many_matching_notes(dir.path(), 25);
+
+        // FakeEmbedder succeeds for every input, so all 25 entries get
+        // embeddings and `semantic_candidates` always returns a non-empty
+        // (top-20) list — enough to force the fused path to actually run.
+        let embedder = FakeEmbedder::new(4);
+        brain.rebuild(Some(&embedder)).unwrap();
+
+        let results = brain.query("widgetronic", Some(&embedder), QueryFilters::default()).unwrap();
+        assert_eq!(
+            results.len(),
+            20,
+            "the fused (hybrid) path must still cap at 20 results"
         );
     }
 
