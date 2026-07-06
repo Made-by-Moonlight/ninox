@@ -13,6 +13,10 @@ fn repo_short(repo: &str) -> &str {
     repo.rsplit('/').next().unwrap_or(repo)
 }
 
+fn can_resume(status: &ninox_core::types::SessionStatus) -> bool {
+    matches!(status, ninox_core::types::SessionStatus::Interrupted)
+}
+
 // ── Terminal chrome budget ───────────────────────────────────────────────────
 //
 // `App::resize_terminals` picks a PTY grid size (cols/rows) from the window
@@ -281,6 +285,25 @@ pub fn session_detail<'a>(
             .into()
     };
 
+    let resume_btn: Element<Message> = if can_resume(&session.status) {
+        let sid = session_id.to_string();
+        button(crate::style::micro_label("Resume", s.status_review).size(10.0))
+            .on_press(Message::ResumeSession(sid))
+            .padding([6, 16])
+            .style(move |_theme, status| {
+                let hovered = matches!(status, button::Status::Hovered);
+                button::Style {
+                    background: hovered.then_some(Background::Color(s.status_review)),
+                    text_color: if hovered { s.card } else { s.status_review },
+                    border: Border { color: s.status_review, width: 1.5, radius: 2.0.into() },
+                    shadow: crate::style::hard_shadow(s, 2.0, 2.0, crate::style::shadow_alpha(s).0),
+                }
+            })
+            .into()
+    } else {
+        Space::new(0, 0).into()
+    };
+
     let kill_btn: Element<Message> = if !is_orchestrator {
         let sid = session_id.to_string();
         button(crate::style::micro_label("Kill", s.accent).size(10.0))
@@ -313,6 +336,8 @@ pub fn session_detail<'a>(
             text(cost).size(13).font(crate::style::MONO).color(s.ink_2),
             Space::new(14, 0),
             refile_btn,
+            Space::new(10, 0),
+            resume_btn,
             Space::new(10, 0),
             kill_btn,
         ]
@@ -459,4 +484,18 @@ pub fn session_detail<'a>(
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn can_resume_only_when_interrupted() {
+        use ninox_core::types::SessionStatus;
+        assert!(can_resume(&SessionStatus::Interrupted));
+        assert!(!can_resume(&SessionStatus::Working));
+        assert!(!can_resume(&SessionStatus::Terminated));
+        assert!(!can_resume(&SessionStatus::Done));
+    }
 }
