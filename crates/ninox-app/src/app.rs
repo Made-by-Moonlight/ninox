@@ -1822,7 +1822,7 @@ impl App {
             }
 
             Message::OpenUrl(url) => {
-                let _ = std::process::Command::new("open").arg(&url).spawn();
+                let _ = std::process::Command::new(open_url_program()).arg(&url).spawn();
                 Task::none()
             }
 
@@ -2069,6 +2069,32 @@ impl App {
 // ---------------------------------------------------------------------------
 // Orchestrator root setup
 // ---------------------------------------------------------------------------
+
+/// The platform command that opens a URL in the default browser.
+fn open_url_program() -> &'static str {
+    #[cfg(target_os = "macos")]
+    { "open" }
+    #[cfg(not(target_os = "macos"))]
+    { "xdg-open" }
+}
+
+/// Best browser URL for a session's tracked PR: the recorded PR's own URL
+/// when GitHub enrichment has produced one, otherwise constructed from the
+/// session's repo slug (works before enrichment / without a token). `None`
+/// when the session has no PR, or no repo to build a URL from.
+pub fn pr_url_for_session(
+    prs: &HashMap<PrId, PR>,
+    session: &Session,
+) -> Option<String> {
+    let number = session.pr_number?;
+    if let Some(pr) = session.pr_id.and_then(|id| prs.get(&id)) {
+        return Some(pr.url.clone());
+    }
+    if session.repo.is_empty() {
+        return None;
+    }
+    Some(format!("https://github.com/{}/pull/{number}", session.repo))
+}
 
 /// Seeds `~/.config/ninox/orchestrator/` (or the configured root) with the
 /// files that orchestrator sessions need: AGENTS.md (canonical, CLAUDE.md
@@ -2357,6 +2383,61 @@ mod tests {
     use super::*;
     use ninox_core::{events::Engine, store::Store};
     use tempfile::tempdir;
+
+    fn pr_session(pr_number: Option<u64>, pr_id: Option<i64>, repo: &str) -> Session {
+        Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: repo.into(), status: ninox_core::types::SessionStatus::PrOpen,
+            agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
+            pr_number, pr_id, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+        }
+    }
+
+    #[test]
+    fn pr_url_for_session_prefers_the_recorded_pr_url() {
+        let mut prs = HashMap::new();
+        prs.insert(7i64, ninox_core::types::PR {
+            id: 7, number: 7, title: "t".into(),
+            url: "https://github.com/org/repo/pull/7".into(),
+            body: String::new(), session_id: "s1".into(),
+        });
+        let session = pr_session(Some(7), Some(7), "org/repo");
+        assert_eq!(
+            pr_url_for_session(&prs, &session).as_deref(),
+            Some("https://github.com/org/repo/pull/7"),
+        );
+    }
+
+    /// Before the poller's GitHub enrichment has run (or with no token at
+    /// all) there is no PR record — the link must still work, constructed
+    /// from the session's repo slug.
+    #[test]
+    fn pr_url_for_session_falls_back_to_repo_slug() {
+        let prs = HashMap::new();
+        let session = pr_session(Some(9), None, "org/repo");
+        assert_eq!(
+            pr_url_for_session(&prs, &session).as_deref(),
+            Some("https://github.com/org/repo/pull/9"),
+        );
+    }
+
+    #[test]
+    fn pr_url_for_session_is_none_without_pr_or_repo() {
+        let prs = HashMap::new();
+        assert_eq!(pr_url_for_session(&prs, &pr_session(None, None, "org/repo")), None);
+        assert_eq!(pr_url_for_session(&prs, &pr_session(Some(9), None, "")), None);
+    }
+
+    /// The browser-open command must exist per platform — `open` is
+    /// macOS-only; Linux needs `xdg-open` (the README supports both).
+    #[test]
+    fn open_url_program_matches_platform() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(open_url_program(), "open");
+        #[cfg(target_os = "linux")]
+        assert_eq!(open_url_program(), "xdg-open");
+    }
 
     fn test_engine() -> Arc<Engine> {
         let s = Arc::new(

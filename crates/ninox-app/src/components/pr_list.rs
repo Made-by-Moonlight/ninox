@@ -56,7 +56,19 @@ fn pr_row<'a>(app: &'a App, pr: &'a PR) -> Element<'a, Message> {
         .unwrap_or_else(|| "—".to_string());
     let session_id = pr.session_id.clone();
 
-    button(
+    // Transparent-until-hover, shared by the navigate row and the open
+    // button so the two halves read as one ledger line.
+    let row_style = move |_t: &iced::Theme, status: button::Status| button::Style {
+        // Normal state stays transparent so the ledger's card background
+        // shows through; hover swaps to `paper` so it visibly differs.
+        background: matches!(status, button::Status::Hovered)
+            .then_some(Background::Color(s.paper)),
+        text_color: s.ink,
+        border: Border::default(),
+        ..Default::default()
+    };
+
+    let nav = button(
         row![
             container(
                 text(format!("#{}", pr.number)).size(12).font(MONO_MEDIUM).color(s.accent)
@@ -93,17 +105,26 @@ fn pr_row<'a>(app: &'a App, pr: &'a PR) -> Element<'a, Message> {
     )
     .on_press(Message::NavigateSession(session_id))
     .width(Length::Fill)
-    .style(move |_t, status| button::Style {
-        // Normal state stays transparent so the ledger's card background
-        // shows through; hover swaps to `paper` so it visibly differs.
-        background: matches!(status, button::Status::Hovered)
-            .then_some(Background::Color(s.paper)),
-        text_color: s.ink,
-        border: Border::default(),
-        ..Default::default()
-    })
-    .into()
+    .style(row_style);
+
+    // Sibling button (not nested — nested buttons fight over the click):
+    // opens the PR in the browser instead of navigating in-app.
+    let open = button(
+        container(text("↗").size(13).font(MONO_MEDIUM).color(s.accent))
+            .width(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center),
+    )
+    .on_press(Message::OpenUrl(pr.url.clone()))
+    .width(Length::Fixed(LINK_COL_WIDTH))
+    .padding([12, 0])
+    .style(row_style);
+
+    row![nav, open].align_y(Alignment::Center).into()
 }
+
+/// Width of the trailing open-in-browser column — shared with the header so
+/// the Cost column stays aligned.
+const LINK_COL_WIDTH: f32 = 42.0;
 
 pub fn pr_list(app: &App) -> Element<'_, Message> {
     use chrono::{Datelike, Local};
@@ -148,19 +169,27 @@ pub fn pr_list(app: &App) -> Element<'_, Message> {
         },
     );
 
+    // Two-part structure mirrors `pr_row` (padded cells filling, then the
+    // open-in-browser column) so the Cost header aligns with its values.
     let col_header = container(
         row![
-            container(micro_label("№", s.ink_2)).width(Length::Fixed(70.0)),
-            container(micro_label("Title", s.ink_2)).width(Length::Fill),
-            container(micro_label("Session", s.ink_2)).width(Length::Fixed(150.0)),
-            container(micro_label("Repo", s.ink_2)).width(Length::Fixed(120.0)),
-            container(micro_label("CI", s.ink_2)).width(Length::Fixed(130.0)),
-            container(micro_label("Cost", s.ink_2))
-                .width(Length::Fixed(70.0))
-                .align_x(iced::alignment::Horizontal::Right),
-        ]
-        .spacing(12)
-        .padding([12, 18]),
+            container(
+                row![
+                    container(micro_label("№", s.ink_2)).width(Length::Fixed(70.0)),
+                    container(micro_label("Title", s.ink_2)).width(Length::Fill),
+                    container(micro_label("Session", s.ink_2)).width(Length::Fixed(150.0)),
+                    container(micro_label("Repo", s.ink_2)).width(Length::Fixed(120.0)),
+                    container(micro_label("CI", s.ink_2)).width(Length::Fixed(130.0)),
+                    container(micro_label("Cost", s.ink_2))
+                        .width(Length::Fixed(70.0))
+                        .align_x(iced::alignment::Horizontal::Right),
+                ]
+                .spacing(12)
+                .padding([12, 18]),
+            )
+            .width(Length::Fill),
+            Space::new(LINK_COL_WIDTH, 0),
+        ],
     )
     .width(Length::Fill)
     .style(move |_| container::Style {
