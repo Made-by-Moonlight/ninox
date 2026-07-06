@@ -184,7 +184,7 @@ jobs:
           for i in $(seq 1 30); do
             if curl -fsS -H "Authorization: Bearer ${token}" \
                 "${endpoint}${index_path}" 2> /dev/null \
-                | grep -q "\"vers\":\"${version}\""; then
+                | jq -e -s --arg v "${version}" 'any(.[]; .vers == $v)' > /dev/null; then
               echo "${crate} ${version} is live in the index."
               exit 0
             fi
