@@ -1619,9 +1619,9 @@ impl App {
             }
 
             Message::BrainReindex => {
-                match state.brain.rebuild() {
-                    Ok(count) => {
-                        tracing::info!("brain reindexed: {count} entries");
+                match state.brain.rebuild(None) {
+                    Ok(stats) => {
+                        tracing::info!("brain reindexed: {} entries", stats.indexed);
                         match state.brain.query("", QueryFilters::default()) {
                             Ok(entries) => {
                                 state.brain_view.entries = entries;
@@ -2720,7 +2720,7 @@ mod tests {
         )
         .unwrap();
         let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let e = test_engine();
         let m = base_with_brain(e, brain);
@@ -2774,7 +2774,7 @@ mod tests {
         std::fs::create_dir_all(brain_dir.join("symbols")).unwrap();
         std::fs::write(brain_dir.join("symbols").join("x.md"), "---\nname: X\n---\nbody").unwrap();
         let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let e = test_engine();
         let app = base_with_brain(e, brain);
@@ -2817,12 +2817,12 @@ mod tests {
         std::fs::write(dir_b.join("concepts").join("b.md"), "b body").unwrap();
 
         let brain_a = Arc::new(BrainIndex::open(&dir_a).unwrap());
-        brain_a.rebuild().unwrap();
+        brain_a.rebuild(None).unwrap();
         // Seed dir_b's index too — `BrainSwitchCatalogue` opens a fresh
         // `BrainIndex` over the target path but does not rebuild it (matching
         // `NavigateBrain`'s lazy-load semantics), so the catalogue being
         // switched to must already be indexed on disk.
-        BrainIndex::open(&dir_b).unwrap().rebuild().unwrap();
+        BrainIndex::open(&dir_b).unwrap().rebuild(None).unwrap();
 
         let e = test_engine();
         let mut app = base_with_brain(e, brain_a);
@@ -2861,7 +2861,7 @@ mod tests {
         )
         .unwrap();
         let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let e = test_engine();
         let m = base_with_brain(e, brain);
@@ -2890,7 +2890,7 @@ mod tests {
         .unwrap();
         std::fs::write(brain_dir.join("people").join("bob.md"), "---\nname: Bob\n---\nbody").unwrap();
         let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let e = test_engine();
         let m = base_with_brain(e, brain);
@@ -2927,7 +2927,7 @@ mod tests {
         )
         .unwrap();
         let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let e = test_engine();
         let m = base_with_brain(e, brain);
@@ -2979,7 +2979,7 @@ mod tests {
         )
         .unwrap();
         let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let e = test_engine();
         let m = base_with_brain(e, brain);
@@ -3013,8 +3013,8 @@ mod tests {
         std::fs::write(dir_b.join("people").join("carol.md"), "No links here.").unwrap();
 
         let brain_a = Arc::new(BrainIndex::open(&dir_a).unwrap());
-        brain_a.rebuild().unwrap();
-        BrainIndex::open(&dir_b).unwrap().rebuild().unwrap();
+        brain_a.rebuild(None).unwrap();
+        BrainIndex::open(&dir_b).unwrap().rebuild(None).unwrap();
 
         let e = test_engine();
         let mut app = base_with_brain(e, brain_a);

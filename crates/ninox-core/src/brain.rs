@@ -1,3 +1,4 @@
+use crate::embeddings::Embedder;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::{params, functions::FunctionFlags, Connection};
@@ -97,17 +98,11 @@ impl BrainIndex {
         Ok(Self { conn: Mutex::new(conn), brain_path })
     }
 
-    /// Walk the brain directory, parse markdown files, and repopulate the index.
-    ///
-    /// Reading and parsing every file is embarrassingly parallel and is the
-    /// dominant cost for large vaults, so it runs across a rayon thread pool.
-    /// The results are then funneled through a single writer that performs
-    /// all inserts inside one transaction (rather than one implicit
-    /// transaction/fsync per file), which is what actually matters for
-    /// indexing thousands of files quickly on real disks.
-    ///
-    /// Returns the number of files indexed.
-    pub fn rebuild(&self) -> Result<usize> {
+    /// Walk the brain directory, parse markdown files, and repopulate the
+    /// index, then embed any new or changed entries (skipped entirely if
+    /// `embedder` is `None`, or if embedding a given entry fails — indexing
+    /// is never blocked by the embedding step).
+    pub fn rebuild(&self, embedder: Option<&dyn Embedder>) -> Result<RebuildStats> {
         // Cheap sequential walk to enumerate candidate files.
         let paths: Vec<PathBuf> = WalkDir::new(&self.brain_path)
             .follow_links(false)
@@ -127,7 +122,7 @@ impl BrainIndex {
         let tx = conn.transaction()?;
         tx.execute_batch("DELETE FROM entries; DELETE FROM entries_fts; DELETE FROM links;")?;
 
-        let count = records.len();
+        let indexed = records.len();
         {
             let mut insert_entry = tx.prepare(
                 "INSERT INTO entries (id, type, name, tags, repos, updated, body)
@@ -158,7 +153,89 @@ impl BrainIndex {
         // Rebuild the FTS index from the content table.
         conn.execute_batch("INSERT INTO entries_fts(entries_fts) VALUES('rebuild');")?;
 
-        Ok(count)
+        let (embedded, cached) = match embedder {
+            Some(embedder) => Self::sync_embeddings(&conn, &records, embedder)?,
+            None => (0, 0),
+        };
+
+        Ok(RebuildStats { indexed, embedded, cached })
+    }
+
+    /// Compute-or-reuse an embedding for every current record, then prune
+    /// embeddings for entries that no longer exist. Returns
+    /// `(newly_embedded, reused_from_cache)`. A failure embedding any single
+    /// batch is logged and treated as "not embedded" rather than
+    /// propagated — a broken model must never break `rebuild()`.
+    fn sync_embeddings(
+        conn: &Connection,
+        records: &[FileRecord],
+        embedder: &dyn Embedder,
+    ) -> Result<(usize, usize)> {
+        let mut cached_hashes: HashMap<String, i64> = HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT id, content_hash FROM embeddings")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            for row in rows {
+                let (id, hash) = row?;
+                cached_hashes.insert(id, hash);
+            }
+        }
+
+        let mut to_embed: Vec<(&FileRecord, String, i64)> = Vec::new();
+        let mut cached = 0usize;
+        for rec in records {
+            let text = embedding_text(rec);
+            let hash = content_hash(&text);
+            if cached_hashes.get(&rec.id) == Some(&hash) {
+                cached += 1;
+            } else {
+                to_embed.push((rec, text, hash));
+            }
+        }
+
+        let embedded = if to_embed.is_empty() {
+            0
+        } else {
+            let texts: Vec<String> = to_embed.iter().map(|(_, text, _)| text.clone()).collect();
+            match embedder.embed_batch(&texts) {
+                Ok(vectors) => {
+                    let mut upsert = conn.prepare(
+                        "INSERT INTO embeddings (id, content_hash, vector) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(id) DO UPDATE SET content_hash = excluded.content_hash, vector = excluded.vector",
+                    )?;
+                    for ((rec, _, hash), vector) in to_embed.iter().zip(vectors.iter()) {
+                        upsert.execute(params![rec.id, hash, vector_to_blob(vector)])?;
+                    }
+                    to_embed.len()
+                }
+                Err(err) => {
+                    tracing::warn!("brain: failed to embed {} entries: {err}", to_embed.len());
+                    0
+                }
+            }
+        };
+
+        // Prune embeddings for entries that no longer exist.
+        let live_ids: HashSet<&str> = records.iter().map(|r| r.id.as_str()).collect();
+        let mut stale: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn.prepare("SELECT id FROM embeddings")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for row in rows {
+                let id = row?;
+                if !live_ids.contains(id.as_str()) {
+                    stale.push(id);
+                }
+            }
+        }
+        if !stale.is_empty() {
+            let mut delete = conn.prepare("DELETE FROM embeddings WHERE id = ?1")?;
+            for id in &stale {
+                delete.execute(params![id])?;
+            }
+        }
+
+        Ok((embedded, cached))
     }
 
     /// Full-text search with optional filters.
@@ -499,6 +576,38 @@ fn sanitize_fts_query(text: &str) -> String {
         .join(" ")
 }
 
+/// Text an entry is embedded from: name plus body, truncated to a bounded
+/// length. Small embedding models have a limited token context; truncating
+/// to a character prefix is a pragmatic approximation, not a guarantee the
+/// whole document is represented (see the design spec's non-goals — full
+/// chunking is out of scope).
+fn embedding_text(rec: &FileRecord) -> String {
+    let mut text = format!("{}\n\n{}", rec.name, rec.body);
+    text.truncate(2000);
+    text
+}
+
+/// Non-cryptographic hash used purely to detect content changes between
+/// `rebuild()` calls. Not guaranteed stable across Rust/std versions — the
+/// worst case of that is one redundant re-embed after an upgrade, never a
+/// correctness problem, so no extra hashing dependency is justified.
+fn content_hash(text: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish() as i64
+}
+
+fn vector_to_blob(vector: &[f32]) -> Vec<u8> {
+    vector.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+fn blob_to_vector(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
 fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<BrainEntry> {
     let tags_json: String = r.get(3)?;
     let repos_json: String = r.get(4)?;
@@ -645,12 +754,155 @@ fn parse_frontmatter(text: &str) -> Frontmatter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embeddings::Embedder;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     fn make_brain() -> (BrainIndex, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let brain = BrainIndex::open(dir.path()).unwrap();
         (brain, dir)
+    }
+
+    /// Deterministic, call-counting fake — never touches the network or a
+    /// real model. The vector is derived from the text's length so distinct
+    /// inputs get distinct (but stable) vectors, which is enough for cache
+    /// and fusion tests without needing real semantic meaning.
+    struct FakeEmbedder {
+        calls: AtomicUsize,
+        dim: usize,
+    }
+
+    impl FakeEmbedder {
+        fn new(dim: usize) -> Self {
+            Self { calls: AtomicUsize::new(0), dim }
+        }
+    }
+
+    impl Embedder for FakeEmbedder {
+        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let seed = text.len() as f32;
+            Ok((0..self.dim).map(|i| seed + i as f32).collect())
+        }
+
+        fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            texts.iter().map(|t| self.embed(t)).collect()
+        }
+
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+    }
+
+    #[test]
+    fn rebuild_embeds_new_entries() {
+        let (brain, dir) = make_brain();
+        fs::create_dir_all(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes/a.md"), "# A\n\nSome content.").unwrap();
+
+        let embedder = FakeEmbedder::new(4);
+        let stats = brain.rebuild(Some(&embedder)).unwrap();
+
+        assert_eq!(stats.indexed, 1);
+        assert_eq!(stats.embedded, 1);
+        assert_eq!(stats.cached, 0);
+        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rebuild_reuses_cached_embedding_for_unchanged_content() {
+        let (brain, dir) = make_brain();
+        fs::create_dir_all(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes/a.md"), "# A\n\nSome content.").unwrap();
+
+        let embedder = FakeEmbedder::new(4);
+        brain.rebuild(Some(&embedder)).unwrap();
+        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
+
+        // Second rebuild, same content: must not re-embed.
+        let stats = brain.rebuild(Some(&embedder)).unwrap();
+        assert_eq!(stats.embedded, 0);
+        assert_eq!(stats.cached, 1);
+        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1, "should not re-embed unchanged content");
+    }
+
+    #[test]
+    fn rebuild_reembeds_changed_content() {
+        let (brain, dir) = make_brain();
+        let path = dir.path().join("notes");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("a.md"), "# A\n\nOriginal content.").unwrap();
+
+        let embedder = FakeEmbedder::new(4);
+        brain.rebuild(Some(&embedder)).unwrap();
+        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
+
+        fs::write(path.join("a.md"), "# A\n\nChanged content.").unwrap();
+        let stats = brain.rebuild(Some(&embedder)).unwrap();
+        assert_eq!(stats.embedded, 1);
+        assert_eq!(stats.cached, 0);
+        assert_eq!(embedder.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn rebuild_prunes_embeddings_for_deleted_entries() {
+        let (brain, dir) = make_brain();
+        let path = dir.path().join("notes");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("a.md"), "# A\n\nContent.").unwrap();
+
+        let embedder = FakeEmbedder::new(4);
+        brain.rebuild(Some(&embedder)).unwrap();
+
+        fs::remove_file(path.join("a.md")).unwrap();
+        brain.rebuild(Some(&embedder)).unwrap();
+
+        let conn = brain.conn.lock().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "embedding for the deleted entry should be pruned");
+    }
+
+    #[test]
+    fn rebuild_without_embedder_skips_embeddings_entirely() {
+        let (brain, dir) = make_brain();
+        fs::create_dir_all(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes/a.md"), "# A\n\nContent.").unwrap();
+
+        let stats = brain.rebuild(None).unwrap();
+        assert_eq!(stats.indexed, 1);
+        assert_eq!(stats.embedded, 0);
+        assert_eq!(stats.cached, 0);
+
+        let conn = brain.conn.lock().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// An embedder whose calls always fail — proves indexing is never
+    /// blocked by embedding failures.
+    struct FailingEmbedder;
+    impl Embedder for FailingEmbedder {
+        fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            anyhow::bail!("simulated embedder failure")
+        }
+        fn embed_batch(&self, _texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("simulated embedder failure")
+        }
+        fn dimension(&self) -> usize {
+            4
+        }
+    }
+
+    #[test]
+    fn rebuild_indexing_survives_embedder_failure() {
+        let (brain, dir) = make_brain();
+        fs::create_dir_all(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes/a.md"), "# A\n\nContent.").unwrap();
+
+        let stats = brain.rebuild(Some(&FailingEmbedder)).unwrap();
+        assert_eq!(stats.indexed, 1, "keyword indexing must succeed even if embedding fails");
+        assert_eq!(stats.embedded, 0);
     }
 
     #[test]
@@ -693,8 +945,8 @@ mod tests {
         )
         .unwrap();
 
-        let count = brain.rebuild().unwrap();
-        assert_eq!(count, 2);
+        let stats = brain.rebuild(None).unwrap();
+        assert_eq!(stats.indexed, 2);
     }
 
     #[test]
@@ -713,7 +965,7 @@ mod tests {
         )
         .unwrap();
 
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let results = brain.query("anyhow", QueryFilters::default()).unwrap();
         assert_eq!(results.len(), 1);
@@ -734,7 +986,7 @@ mod tests {
         )
         .unwrap();
 
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         for text in ["ninox-server", "foo:bar", "orchestrator\"", "-orchestrator"] {
             brain
@@ -757,7 +1009,7 @@ mod tests {
         fs::write(people.join("alice.md"), "Alice is a person.").unwrap();
         fs::write(projects.join("athene.md"), "Athene is a project.").unwrap();
 
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let results = brain
             .query("", QueryFilters { entry_type: Some("people".into()), tag: None })
@@ -859,7 +1111,7 @@ mod tests {
         )
         .unwrap();
 
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
         (brain, dir)
     }
 
@@ -987,10 +1239,10 @@ mod tests {
         let brain = BrainIndex::open(dir.path()).unwrap();
 
         let start = std::time::Instant::now();
-        let count = brain.rebuild().unwrap();
+        let stats = brain.rebuild(None).unwrap();
         let elapsed = start.elapsed();
 
-        assert_eq!(count, 500);
+        assert_eq!(stats.indexed, 500);
         println!("rebuild of 500 files took {elapsed:?}");
         // Generous ceiling: this is here to catch a catastrophic regression
         // (e.g. an accidental fsync-per-file reintroduction), not to pin
@@ -1006,10 +1258,10 @@ mod tests {
         let brain = BrainIndex::open(dir.path()).unwrap();
 
         let start = std::time::Instant::now();
-        let count = brain.rebuild().unwrap();
+        let stats = brain.rebuild(None).unwrap();
         let elapsed = start.elapsed();
 
-        assert_eq!(count, 5_000);
+        assert_eq!(stats.indexed, 5_000);
         println!("rebuild of 5,000 files took {elapsed:?}");
     }
 }

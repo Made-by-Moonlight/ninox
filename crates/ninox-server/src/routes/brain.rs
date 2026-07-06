@@ -24,8 +24,8 @@ struct IndexResponse {
 async fn rebuild_index(
     State(brain): State<Arc<BrainIndex>>,
 ) -> Result<Json<IndexResponse>, StatusCode> {
-    match brain.rebuild() {
-        Ok(count) => Ok(Json(IndexResponse { count })),
+    match brain.rebuild(None) {
+        Ok(stats) => Ok(Json(IndexResponse { count: stats.indexed })),
         Err(err) => {
             tracing::error!("brain rebuild: {err}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)

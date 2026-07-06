@@ -300,8 +300,8 @@ async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
 
     match action {
         BrainAction::Index => {
-            let count = brain.rebuild()?;
-            println!("indexed {count} entries");
+            let stats = brain.rebuild(None)?;
+            println!("indexed {} entries", stats.indexed);
         }
         BrainAction::Query { text, entry_type, tag } => {
             let filters = QueryFilters { entry_type, tag };
