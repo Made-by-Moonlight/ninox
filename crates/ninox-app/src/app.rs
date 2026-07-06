@@ -173,7 +173,7 @@ pub enum DragTarget { Sidebar, InfoPanel }
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    EngineEvent(Event),
+    EngineEvent(Box<Event>),
     NavigateFleet { scope: Option<OrchestratorId> },
     NavigateSession(SessionId),
     /// Attach argv resolved — spawn the hidden tmux client for this session.
@@ -701,7 +701,7 @@ impl App {
     /// Shared mutation logic.
     fn apply(state: &mut Self, message: Message) -> Task<Message> {
         match message {
-            Message::EngineEvent(event) => Self::handle_engine_event(state, event),
+            Message::EngineEvent(event) => Self::handle_engine_event(state, *event),
 
             Message::NavigateFleet { scope } => {
                 state.last_fleet_scope = scope.clone();
@@ -1244,7 +1244,6 @@ impl App {
                         let nm                = name;
                         let ts_i64            = ts as i64;
                         let orch_agent        = agent;
-                        let claude_session_id = claude_session_id;
 
                         Task::future(async move {
                             if let Err(e) = tokio::fs::create_dir_all(&ws).await {
@@ -2194,7 +2193,7 @@ impl App {
             async_stream::stream! {
                 loop {
                     match rx.recv().await {
-                        Ok(event)  => yield Message::EngineEvent(event),
+                        Ok(event)  => yield Message::EngineEvent(Box::new(event)),
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed)    => break,
                     }
@@ -2905,7 +2904,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             claude_session_id: None,
         };
-        let (updated, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (updated, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         assert!(updated.sessions.contains_key("s1"));
     }
 
@@ -2914,14 +2913,14 @@ mod tests {
         let e = test_engine();
         let mut m = base(e);
         for i in 0..55u32 {
-            let (next, _) = m.update(Message::EngineEvent(Event::Notification(Notification {
+            let (next, _) = m.update(Message::EngineEvent(Box::new(Event::Notification(Notification {
                 id:         i.to_string(),
                 kind:       NotificationKind::WorkerDone,
                 title:      "t".into(),
                 body:       "b".into(),
                 session_id: None,
                 created_at: 0,
-            })));
+            }))));
             m = next;
         }
         assert_eq!(m.notifications.len(), 50);
@@ -2987,7 +2986,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             claude_session_id: None,
         };
-        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;
 
         let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
@@ -3056,7 +3055,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             claude_session_id: None,
         };
-        let (m2, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = m2;
         // board_sessions(app, status, scope) returns sessions with that status
         let terminated = board_sessions(&m, &SessionStatus::Terminated, None);
@@ -3072,7 +3071,7 @@ mod tests {
         // Set up an orchestrator
         let o = Orchestrator { id: "o1".into(), name: "orch".into(), created_at: 0 };
         let _ = m.engine.store.upsert_orchestrator(&o);
-        let (next, _) = m.update(Message::EngineEvent(Event::OrchestratorSpawned(o)));
+        let (next, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorSpawned(o))));
         m = next;
 
         // Worker session under the orchestrator, already Done
@@ -3086,7 +3085,7 @@ mod tests {
             claude_session_id: None,
         };
         let _ = m.engine.store.upsert_session(&worker);
-        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(worker)));
+        let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(worker))));
         m = next;
         assert!(m.sessions.contains_key("w1"), "worker should be present before poll");
 
@@ -3475,11 +3474,11 @@ mod tests {
         let e = test_engine();
         let mut m = base(e);
         for id in ["n1", "n2", "n3"] {
-            let (next, _) = m.update(Message::EngineEvent(Event::Notification(Notification {
+            let (next, _) = m.update(Message::EngineEvent(Box::new(Event::Notification(Notification {
                 id: id.into(), kind: NotificationKind::WorkerDone,
                 title: "t".into(), body: "b".into(), session_id: None,
                 created_at: 0,
-            })));
+            }))));
             m = next;
         }
         assert_eq!(m.notifications.len(), 3);
@@ -3502,7 +3501,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             claude_session_id: None,
         };
-        let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
         let (m3, _) = m2.update(Message::SwitchDetailPanel(DetailPanel::Inspector));
         assert!(matches!(&m3.view, View::SessionDetail { panel: DetailPanel::Inspector, .. }));
@@ -3529,7 +3528,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             claude_session_id: None,
             };
-            let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+            let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
 
@@ -3580,7 +3579,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             claude_session_id: None,
         };
-        let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         // NavigateSession defaults to the Split panel, so switch to Terminal
         // first to establish the full-width baseline, then attach a terminal
         // directly rather than relying on the async PTY task.
@@ -3626,7 +3625,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             claude_session_id: None,
             };
-            let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+            let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
 
@@ -3706,7 +3705,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             claude_session_id: None,
         };
-        let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m, _) = m.update(Message::NavigateSession("s1".into()));
         let mut m = m;
         m.terminals.insert(
@@ -3727,11 +3726,11 @@ mod tests {
         let e = test_engine();
         let mut m = base(e);
         for id in ["a", "b"] {
-            let (next, _) = m.update(Message::EngineEvent(Event::Notification(Notification {
+            let (next, _) = m.update(Message::EngineEvent(Box::new(Event::Notification(Notification {
                 id: id.into(), kind: NotificationKind::WorkerDone,
                 title: "t".into(), body: "b".into(), session_id: None,
                 created_at: 0,
-            })));
+            }))));
             m = next;
         }
         let (m2, _) = m.update(Message::DismissAllNotifications);
@@ -3757,7 +3756,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             claude_session_id: None,
             };
-            let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+            let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
         assert_eq!(attention_count(&m), 2); // ci_failed + review_pending
@@ -3815,10 +3814,10 @@ mod tests {
         // The OLD client's reader thread now surfaces its terminal
         // ClientClosed, tagged with the OLD generation. This must be
         // ignored — the currently-live client must survive intact.
-        let (m5, _) = m.update(Message::EngineEvent(Event::ClientClosed {
+        let (m5, _) = m.update(Message::EngineEvent(Box::new(Event::ClientClosed {
             session_id: sid.clone(),
             generation: old_generation,
-        }));
+        })));
         m = m5;
 
         assert!(m.clients.contains_key(&sid), "a stale ClientClosed must not remove the current client");
@@ -3846,7 +3845,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             claude_session_id: None,
             };
-            let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+            let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
         let (m2, _) = m.update(Message::FleetFilterQuery("auth".into()));
@@ -4488,7 +4487,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             claude_session_id: None,
         };
-        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;
         let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
         m = next;
