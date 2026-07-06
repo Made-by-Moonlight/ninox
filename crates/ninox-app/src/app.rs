@@ -903,7 +903,8 @@ impl App {
                     harness: form.harness.clone(),
                     model:   crate::components::spawn_modal::effective_model(&form, &spec),
                 };
-                let base_cmd = registry.interactive_cmd(&agent);
+                let claude_session_id = ninox_core::harness::new_claude_session_id();
+                let base_cmd = registry.interactive_cmd(&agent, &claude_session_id);
                 let catalogue = state.config.catalogue_options()
                     .into_iter()
                     .nth(form.catalogue_idx)
@@ -997,7 +998,7 @@ impl App {
                             model:           agent.model.clone(),
                             context_tokens:  None,
                             catalogue_path:  Some(catalogue_path.clone()),
-                            claude_session_id: None, // set below, in Task 6
+                            claude_session_id: Some(claude_session_id.clone()),
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1048,6 +1049,8 @@ impl App {
                                     catalogue_path,
                                     extra_env:       Vec::new(),
                                     started_at:      ts_i64,
+                                    claude_session_id,
+                                    failure_status:  ninox_core::SessionStatus::Terminated,
                                 },
                             )
                             .await;
@@ -1132,7 +1135,7 @@ impl App {
                             model:           agent.model.clone(),
                             context_tokens:  None,
                             catalogue_path:  Some(catalogue_path.clone()),
-                            claude_session_id: None, // set below, in Task 6
+                            claude_session_id: Some(claude_session_id.clone()),
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1143,11 +1146,12 @@ impl App {
                             panel:      DetailPanel::Terminal,
                         };
 
-                        let engine     = state.engine.clone();
-                        let sid        = orch.id.clone();
-                        let nm         = name;
-                        let ts_i64     = ts as i64;
-                        let orch_agent = agent;
+                        let engine            = state.engine.clone();
+                        let sid               = orch.id.clone();
+                        let nm                = name;
+                        let ts_i64            = ts as i64;
+                        let orch_agent        = agent;
+                        let claude_session_id = claude_session_id;
 
                         Task::future(async move {
                             if let Err(e) = tokio::fs::create_dir_all(&ws).await {
@@ -1175,6 +1179,8 @@ impl App {
                                     catalogue_path,
                                     extra_env,
                                     started_at:      ts_i64,
+                                    claude_session_id,
+                                    failure_status:  ninox_core::SessionStatus::Terminated,
                                 },
                             )
                             .await;
@@ -2688,6 +2694,25 @@ mod tests {
 
         // The newly spawned orchestrator's session must be remembered as the
         // last-visited session so NavigateLastSession can return to it.
+    }
+
+    #[test]
+    fn orchestrator_spawn_persists_a_claude_session_id() {
+        let e = test_engine();
+        let mut m = base(e);
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("my-feature".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        let orch_id = &m.orchestrators[0].id;
+        let session = m.sessions.get(orch_id).expect("session recorded optimistically");
+        assert!(
+            session.claude_session_id.is_some(),
+            "a fresh UUID must be recorded at spawn time",
+        );
     }
 
     #[test]
