@@ -46,8 +46,11 @@ name: Publish to CodeArtifact
 # never assumes or hardcodes any particular AWS account, domain, or role.
 #
 # Auth flow: aws-actions/configure-aws-credentials assumes the IAM role via
-# OIDC, then `aws codeartifact login --tool cargo` configures the local
-# Cargo registry credentials for the publish steps below.
+# OIDC. The AWS CLI's `codeartifact login` helper does not support Cargo (its
+# --tool only accepts dotnet/npm/nuget/pip/swift/twine), so the "Configure
+# Cargo for CodeArtifact" step below fetches a token directly with
+# `get-authorization-token` and points Cargo at the registry via
+# CARGO_REGISTRIES_<NAME>_* environment variables instead.
 
 on:
   workflow_dispatch:
@@ -116,10 +119,14 @@ jobs:
           crate="$1"
           version="$2"
           for i in $(seq 1 30); do
-            if aws codeartifact describe-package-version \
+            origin_type=$(aws codeartifact describe-package-version \
                 --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
                 --repository "$CODEARTIFACT_REPOSITORY" --format cargo \
-                --package "${crate}" --package-version "${version}" > /dev/null 2>&1; then
+                --package "${crate}" --package-version "${version}" \
+                --query 'packageVersion.origin.originType' --output text 2>/dev/null || echo "NONE")
+            # originType distinguishes a version we actually published (INTERNAL) from one
+            # merely cached from an upstream connection like crates.io (EXTERNAL/UNKNOWN).
+            if [ "$origin_type" = "INTERNAL" ]; then
               echo "${crate} ${version} is live."
               exit 0
             fi
@@ -142,24 +149,50 @@ jobs:
             crate="${entry##*:}"
             version=$(echo "$metadata" | jq -r --arg n "$crate" '.packages[] | select(.name==$n) | .version')
             echo "${key}_version=${version}" >> "$GITHUB_OUTPUT"
-            if aws codeartifact describe-package-version \
+            origin_type=$(aws codeartifact describe-package-version \
                 --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
                 --repository "$CODEARTIFACT_REPOSITORY" --format cargo \
-                --package "${crate}" --package-version "${version}" > /dev/null 2>&1; then
+                --package "${crate}" --package-version "${version}" \
+                --query 'packageVersion.origin.originType' --output text 2>/dev/null || echo "NONE")
+            # Only an INTERNAL origin means we actually published this version ourselves.
+            # EXTERNAL/UNKNOWN means the version just got cached from an upstream
+            # connection (e.g. crates.io) and must not be mistaken for a real publish.
+            if [ "$origin_type" = "INTERNAL" ]; then
               echo "${crate} ${version} is already published — skipping."
               echo "${key}_publish=false" >> "$GITHUB_OUTPUT"
             else
-              echo "${crate} ${version} is not yet published — will publish."
+              echo "${crate} ${version} is not yet published (origin: ${origin_type}) — will publish."
               echo "${key}_publish=true" >> "$GITHUB_OUTPUT"
             fi
           done
 
-      - name: Log in to CodeArtifact Cargo registry
+      - name: Configure Cargo for CodeArtifact
         if: steps.config.outputs.configured == 'true'
         run: |
-          aws codeartifact login --tool cargo \
+          set -euo pipefail
+          # `aws codeartifact login` has no Cargo support (--tool only accepts
+          # dotnet/npm/nuget/pip/swift/twine), so fetch a token directly and wire
+          # up the registry ourselves, per the CodeArtifact Cargo docs.
+          token=$(aws codeartifact get-authorization-token \
             --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
-            --repository "$CODEARTIFACT_REPOSITORY" --region "$AWS_REGION"
+            --region "$AWS_REGION" --query authorizationToken --output text)
+          echo "::add-mask::${token}"
+
+          # Cargo's env-var mapping uppercases the registry name and turns
+          # dots/dashes into underscores (registries.foo-bar.token ->
+          # CARGO_REGISTRIES_FOO_BAR_TOKEN).
+          registry_env=$(echo "$CODEARTIFACT_REPOSITORY" | tr 'a-z.-' 'A-Z__')
+          index_url="sparse+https://${CODEARTIFACT_DOMAIN}-${CODEARTIFACT_DOMAIN_OWNER}.d.codeartifact.${AWS_REGION}.amazonaws.com/cargo/${CODEARTIFACT_REPOSITORY}/"
+
+          {
+            echo "CARGO_REGISTRIES_${registry_env}_INDEX=${index_url}"
+            # cargo:token (not cargo:token-from-stdout) — AWS's docs warn the
+            # latter doesn't trim the token correctly during `cargo publish`.
+            echo "CARGO_REGISTRIES_${registry_env}_CREDENTIAL_PROVIDER=cargo:token"
+            # Raw token, no "Bearer " prefix — Cargo adds that itself when it
+            # sends the Authorization header.
+            echo "CARGO_REGISTRIES_${registry_env}_TOKEN=${token}"
+          } >> "$GITHUB_ENV"
 
       - name: Publish ninox-core
         if: steps.config.outputs.configured == 'true' && steps.plan.outputs.core_publish == 'true'
