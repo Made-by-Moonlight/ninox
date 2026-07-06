@@ -65,6 +65,7 @@ fn status_str(status: &ninox_core::types::SessionStatus) -> &'static str {
         ninox_core::types::SessionStatus::Mergeable     => "mergeable",
         ninox_core::types::SessionStatus::Done          => "done",
         ninox_core::types::SessionStatus::Terminated    => "terminated",
+        ninox_core::types::SessionStatus::Interrupted   => "interrupted",
     }
 }
 

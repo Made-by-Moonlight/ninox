@@ -59,6 +59,7 @@ impl ColorScheme {
             ReviewPending      => self.status_review,
             Mergeable          => self.status_mergeable,
             Done | Terminated  => self.status_done,
+            Interrupted        => self.status_review,
         }
     }
 

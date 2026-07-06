@@ -9,6 +9,14 @@ pub type PrId           = i64;
 pub enum SessionStatus {
     Spawning, Working, PrOpen, CiFailed,
     ReviewPending, Mergeable, Done, Terminated,
+    /// Its tmux pane died along with the private tmux server (e.g. a
+    /// reboot) rather than exiting on its own. Distinct from `Terminated`
+    /// ("gone for good") — an `Interrupted` session has a
+    /// `claude_session_id` and a harness capable of `--resume`, so the
+    /// user can pick the exact same conversation back up. Never set
+    /// silently: only the startup reconciliation in `app.rs` assigns it,
+    /// and only a user-triggered Resume action clears it.
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,5 +166,13 @@ mod tests {
         }"#;
         let n: Notification = serde_json::from_str(json).expect("valid payload must deserialize");
         assert_eq!(n.created_at, 12345);
+    }
+
+    #[test]
+    fn interrupted_status_serializes_snake_case() {
+        let json = serde_json::to_string(&SessionStatus::Interrupted).unwrap();
+        assert_eq!(json, "\"interrupted\"");
+        let back: SessionStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, SessionStatus::Interrupted);
     }
 }
