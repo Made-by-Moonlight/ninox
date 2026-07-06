@@ -48,11 +48,15 @@ name: Publish to CodeArtifact
 # Auth flow: aws-actions/configure-aws-credentials assumes the IAM role via
 # OIDC, then the "Configure Cargo for CodeArtifact" step wires Cargo up by
 # hand — `aws codeartifact login` has no cargo tool, so it writes
-# ~/.cargo/config.toml itself (sparse index + cargo:token credential
-# provider) and feeds `cargo login` an auth token from
-# `aws codeartifact get-authorization-token`. That step also replaces the
-# crates-io source with the CodeArtifact repository, so dependency
-# resolution during publish verification goes through CodeArtifact too:
+# ~/.cargo/config.toml itself: the repository's sparse index as a named
+# registry, plus a cargo:token-from-stdout credential provider that runs
+# `aws codeartifact get-authorization-token` whenever Cargo needs
+# credentials. Cargo sends that token verbatim in the Authorization
+# header — no "Bearer " prefix; the registry rejects a prefixed token
+# with 401 — and minting on demand means no token is stored on disk and
+# no publish can outlive one. That step also replaces the crates-io
+# source with the CodeArtifact repository, so dependency resolution
+# during publish verification goes through CodeArtifact too:
 # already-published ninox crates come from the repository itself (the
 # package-group origin controls block them from the crates.io upstream)
 # and third-party crates come through the crates.io pull-through cache.
@@ -103,12 +107,12 @@ jobs:
         with:
           role-to-assume: ${{ env.CODEARTIFACT_PUBLISH_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-          # This session (and the Cargo auth token minted from it, whose
-          # lifetime is capped by the session's) has to outlive the whole
-          # publish. 1 h is a comfortable budget: the same three-crate
-          # verify-and-publish flow takes ~5 min against crates.io on this
-          # runner class, and first-time pull-through ingestion doesn't
-          # change the order of magnitude.
+          # This session has to outlive the whole publish (Cargo auth
+          # tokens are minted from it on demand, so they can't expire
+          # mid-run on their own). 1 h is a comfortable budget: the same
+          # three-crate verify-and-publish flow takes ~5 min against
+          # crates.io on this runner class, and first-time pull-through
+          # ingestion doesn't change the order of magnitude.
           role-duration-seconds: 3600
 
       # A transient AWS error here must not be mistaken for "not published"
@@ -182,7 +186,7 @@ jobs:
           # ours): first two chars / next two chars / full name.
           index_path="${crate:0:2}/${crate:2:2}/${crate}"
           for i in $(seq 1 30); do
-            if curl -fsS -H "Authorization: Bearer ${token}" \
+            if curl -fsS -u "aws:${token}" \
                 "${endpoint}${index_path}" 2> /dev/null \
                 | jq -e -s --arg v "${version}" 'any(.[]; .vers == $v)' > /dev/null; then
               echo "${crate} ${version} is live in the index."
@@ -197,12 +201,15 @@ jobs:
           chmod +x /tmp/wait-for-crate.sh
 
       # `aws codeartifact login` doesn't support cargo as a --tool, so this
-      # configures Cargo by hand, following the CodeArtifact cargo docs:
-      # a named registry with the repository's sparse index for publishing,
-      # crates-io source replacement so dependency resolution during publish
-      # verification also goes through CodeArtifact, and a cargo:token
-      # credential provider fed by `cargo login` (the registry expects the
-      # literal token value "Bearer <auth token>").
+      # configures Cargo by hand, following the CodeArtifact cargo docs for
+      # Linux: a named registry with the repository's sparse index for
+      # publishing, crates-io source replacement so dependency resolution
+      # during publish verification also goes through CodeArtifact, and a
+      # cargo:token-from-stdout credential provider that mints a fresh
+      # authorization token from the job's AWS credentials whenever Cargo
+      # asks for one. Cargo sends that token verbatim in the Authorization
+      # header — the registry expects the raw token, no "Bearer " prefix —
+      # and nothing token-like is ever written to disk.
       - name: Configure Cargo for CodeArtifact
         if: steps.config.outputs.configured == 'true' && steps.plan.outputs.any_publish == 'true'
         run: |
@@ -211,23 +218,15 @@ jobs:
             --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
             --repository "$CODEARTIFACT_REPOSITORY" --format cargo \
             --query repositoryEndpoint --output text)
-          token=$(aws codeartifact get-authorization-token \
-            --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
-            --query authorizationToken --output text)
-          echo "::add-mask::${token}"
           mkdir -p ~/.cargo
           cat > ~/.cargo/config.toml <<EOF
           [registries.${CODEARTIFACT_REPOSITORY}]
           index = "sparse+${endpoint}"
-          credential-provider = "cargo:token"
+          credential-provider = "cargo:token-from-stdout aws codeartifact get-authorization-token --domain ${CODEARTIFACT_DOMAIN} --domain-owner ${CODEARTIFACT_DOMAIN_OWNER} --region ${AWS_REGION} --query authorizationToken --output text"
 
           [source.crates-io]
           replace-with = "${CODEARTIFACT_REPOSITORY}"
-
-          [registry]
-          global-credential-providers = ["cargo:token"]
           EOF
-          printf 'Bearer %s\n' "${token}" | cargo login --registry "$CODEARTIFACT_REPOSITORY"
 
       - name: Publish ninox-core
         if: steps.config.outputs.configured == 'true' && steps.plan.outputs.core_publish == 'true'
