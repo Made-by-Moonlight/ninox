@@ -46,6 +46,47 @@ pub fn parse_payload(raw: &str) -> ParsedPayload {
     }
 }
 
+/// Find the session whose `workspace_path` matches the hook payload's
+/// working directory (the same correlation `usage::ingest_usage_for_workspace`
+/// already relies on — no session-ID plumbing needed) and apply whichever
+/// fields the payload carries. Fields the payload doesn't carry (absent or
+/// null in this invocation) are left untouched, never zeroed. An existing
+/// `model` is never overwritten (mirrors `poller::poll_usage`'s behavior).
+///
+/// Returns `Ok(true)` iff a matching session was found, regardless of
+/// whether any field actually changed value.
+pub fn apply_update(store: &crate::store::Store, payload: &ParsedPayload) -> anyhow::Result<bool> {
+    let Some(workspace) = &payload.workspace_dir else { return Ok(false) };
+
+    let sessions = store.list_sessions()?;
+    let Some(mut session) = sessions.into_iter()
+        .find(|s| s.workspace_path.as_deref() == Some(workspace.as_str()))
+    else {
+        return Ok(false);
+    };
+
+    if let Some(cost) = payload.cost_usd {
+        session.cost_usd = cost;
+    }
+    if let Some(pct) = payload.context_used_pct {
+        session.context_used_pct = Some(pct);
+    }
+    if let Some(tokens) = payload.context_total_tokens {
+        session.context_total_tokens = Some(tokens);
+    }
+    if let Some(size) = payload.context_window_size {
+        session.context_window_size = Some(size);
+    }
+    if session.model.is_none() {
+        if let Some(model) = &payload.model {
+            session.model = Some(model.clone());
+        }
+    }
+
+    store.upsert_session(&session)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +158,111 @@ mod tests {
     fn cwd_fallback_used_when_workspace_absent() {
         let p = parse_payload(r#"{"cwd": "/fallback/dir"}"#);
         assert_eq!(p.workspace_dir.as_deref(), Some("/fallback/dir"));
+    }
+
+    use crate::store::Store;
+    use crate::types::{Session, SessionStatus};
+
+    fn test_session(id: &str, workspace: &str) -> Session {
+        Session {
+            id: id.into(), orchestrator_id: None, name: id.into(),
+            repo: String::new(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None,
+            workspace_path: Some(workspace.into()), pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+        }
+    }
+
+    fn test_store() -> Store {
+        let dir = tempfile::tempdir().unwrap();
+        Store::open(dir.path().join("t.db")).unwrap()
+    }
+
+    #[test]
+    fn apply_update_writes_matched_session() {
+        let store = test_store();
+        store.upsert_session(&test_session("s1", "/ws")).unwrap();
+
+        let payload = ParsedPayload {
+            workspace_dir: Some("/ws".into()),
+            model: Some("Opus 4.8".into()),
+            cost_usd: Some(2.60),
+            context_used_pct: Some(62.0),
+            context_total_tokens: Some(124_000),
+            context_window_size: Some(200_000),
+        };
+        let found = apply_update(&store, &payload).unwrap();
+        assert!(found);
+
+        let s = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(s.cost_usd, 2.60);
+        assert_eq!(s.context_used_pct, Some(62.0));
+        assert_eq!(s.context_total_tokens, Some(124_000));
+        assert_eq!(s.context_window_size, Some(200_000));
+        assert_eq!(s.model.as_deref(), Some("Opus 4.8"));
+    }
+
+    #[test]
+    fn apply_update_returns_false_for_unmatched_workspace() {
+        let store = test_store();
+        store.upsert_session(&test_session("s1", "/ws")).unwrap();
+
+        let payload = ParsedPayload {
+            workspace_dir: Some("/does/not/match".into()),
+            ..Default::default()
+        };
+        let found = apply_update(&store, &payload).unwrap();
+        assert!(!found);
+        // Untouched.
+        assert_eq!(store.get_session("s1").unwrap().unwrap().cost_usd, 0.0);
+    }
+
+    #[test]
+    fn apply_update_with_no_workspace_dir_is_a_noop() {
+        let store = test_store();
+        store.upsert_session(&test_session("s1", "/ws")).unwrap();
+        let found = apply_update(&store, &ParsedPayload::default()).unwrap();
+        assert!(!found);
+    }
+
+    #[test]
+    fn apply_update_leaves_absent_fields_untouched() {
+        let store = test_store();
+        let mut seed = test_session("s1", "/ws");
+        seed.cost_usd = 1.0;
+        seed.context_used_pct = Some(10.0);
+        store.upsert_session(&seed).unwrap();
+
+        // Payload only carries cost — context fields absent.
+        let payload = ParsedPayload {
+            workspace_dir: Some("/ws".into()),
+            cost_usd: Some(5.0),
+            ..Default::default()
+        };
+        apply_update(&store, &payload).unwrap();
+
+        let s = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(s.cost_usd, 5.0);
+        assert_eq!(s.context_used_pct, Some(10.0), "untouched, payload didn't carry this field");
+    }
+
+    #[test]
+    fn apply_update_does_not_overwrite_existing_model() {
+        let store = test_store();
+        let mut seed = test_session("s1", "/ws");
+        seed.model = Some("claude-opus-4-8".into());
+        store.upsert_session(&seed).unwrap();
+
+        let payload = ParsedPayload {
+            workspace_dir: Some("/ws".into()),
+            model: Some("Opus 4.8".into()), // hook's display name differs from the stored model id
+            ..Default::default()
+        };
+        apply_update(&store, &payload).unwrap();
+
+        let s = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(s.model.as_deref(), Some("claude-opus-4-8"), "existing model id is preserved");
     }
 }
