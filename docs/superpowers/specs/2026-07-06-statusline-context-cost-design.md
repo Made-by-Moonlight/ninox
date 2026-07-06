@@ -167,20 +167,39 @@ line from updating and get cancelled mid-run if a new update fires):
 
 ### Settings wiring
 
-`crates/ninox-app/src/app.rs` (~line 2368), where Ninox writes a fresh
-`.claude/settings.json` for a newly spawned session's worktree, gains a
-`statusLine` entry alongside the existing `PreToolUse` hook:
+Ninox writes `.claude/settings.json` in exactly one place today:
+`setup_orchestrator_root` (`crates/ninox-app/src/app.rs`, ~line 2368),
+called once per orchestrator root, alongside the existing `PreToolUse`
+subagent-blocker hook. Worker sessions — spawned into their own worktree by
+`create_worker_worktree` (`crates/ninox-app/src/spawn_util.rs`) — get no
+`.claude/` config at all today; they simply inherit whatever's already in
+the repo. Since worker sessions are exactly the ones doing the token-heavy
+work, this feature needs to add a settings write to both places, not just
+extend the existing one:
 
-```rust
-let settings = serde_json::json!({
-    "hooks": { /* unchanged */ },
-    "statusLine": {
-        "type": "command",
-        "command": format!("{ninox_bin} statusline"),
-        "refreshInterval": 20
-    }
-});
-```
+1. `setup_orchestrator_root`'s existing settings JSON gains a `statusLine`
+   entry alongside the `PreToolUse` hook:
+
+   ```rust
+   let settings = serde_json::json!({
+       "hooks": { /* unchanged */ },
+       "statusLine": {
+           "type": "command",
+           "command": format!("{ninox_bin} statusline"),
+           "refreshInterval": 20
+       }
+   });
+   ```
+
+2. `create_worker_worktree` gains a new best-effort step after creating the
+   worktree: write a minimal `.claude/settings.json` containing only the
+   `statusLine` key (no hooks — the subagent-blocker hook is an
+   orchestrator-only concern and isn't part of this feature's scope for
+   workers) when none already exists.
+
+Both writes are guarded by "only write when absent" — a pre-existing
+`.claude/settings.json` (orchestrator root, or a worktree branch that
+already carries one) is never touched.
 
 This is added only inside the existing `if !settings_path.exists()` guard —
 identical to today's behavior, a pre-existing `.claude/settings.json` (e.g.
