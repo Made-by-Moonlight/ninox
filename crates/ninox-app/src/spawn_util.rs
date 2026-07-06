@@ -409,7 +409,7 @@ mod persistence_probe {
                 agent:           AgentConfig::default(),
                 base_cmd:        ninox_core::config::AppConfig::default()
                                      .registry()
-                                     .interactive_cmd(&AgentConfig::default()),
+                                     .interactive_cmd(&AgentConfig::default(), "probe-fixed-id"),
                 catalogue_path:  String::new(),
                 extra_env:       Vec::new(),
                 started_at:      0,
@@ -459,7 +459,7 @@ mod persistence_probe {
                 agent:           AgentConfig::default(),
                 base_cmd:        ninox_core::config::AppConfig::default()
                                      .registry()
-                                     .interactive_cmd(&AgentConfig::default()),
+                                     .interactive_cmd(&AgentConfig::default(), "probe-fixed-id"),
                 catalogue_path:  String::new(),
                 extra_env:       Vec::new(),
                 started_at:      0,
