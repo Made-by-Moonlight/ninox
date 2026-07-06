@@ -149,7 +149,7 @@ impl BrainIndex {
     pub fn query(&self, text: &str, filters: QueryFilters) -> Result<Vec<BrainEntry>> {
         let conn = self.conn.lock().unwrap();
 
-        if text.is_empty() && filters.entry_type.is_none() && filters.tag.is_none() {
+        if text.trim().is_empty() && filters.entry_type.is_none() && filters.tag.is_none() {
             // Return all entries when no constraints given
             let mut stmt = conn.prepare(
                 "SELECT id, type, name, tags, repos, updated, body FROM entries ORDER BY name",
@@ -160,7 +160,7 @@ impl BrainIndex {
             return Ok(entries);
         }
 
-        if text.is_empty() {
+        if text.trim().is_empty() {
             // Filter-only query
             let mut stmt = conn.prepare(
                 "SELECT id, type, name, tags, repos, updated, body FROM entries
@@ -183,7 +183,7 @@ impl BrainIndex {
              WHERE entries_fts MATCH ?1
              ORDER BY rank",
         )?;
-        let rows = stmt.query_map(params![text], row_to_entry)?;
+        let rows = stmt.query_map(params![sanitize_fts_query(text)], row_to_entry)?;
         let mut results: Vec<BrainEntry> =
             rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
@@ -469,6 +469,20 @@ fn process_file(brain_path: &Path, path: &Path) -> Option<FileRecord> {
     Some(FileRecord { id: rel, entry_type, name, tags, repos, updated, body: parsed.body, links })
 }
 
+/// Turn free-form user search text into an FTS5 query string that can't be
+/// misinterpreted as query syntax. Raw text handed straight to `MATCH`
+/// exposes FTS5's operators (`-` for NOT, `:` for column filters, unmatched
+/// `"` for phrases, etc.), so e.g. searching for `ninox-server` or `foo:bar`
+/// throws a SQL error instead of finding matches. Wrapping each
+/// whitespace-separated token in `"..."` (doubling internal quotes) forces
+/// every token to be matched literally.
+fn sanitize_fts_query(text: &str) -> String {
+    text.split_whitespace()
+        .map(|tok| format!("\"{}\"", tok.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<BrainEntry> {
     let tags_json: String = r.get(3)?;
     let repos_json: String = r.get(4)?;
@@ -676,6 +690,33 @@ mod tests {
         let results = brain.query("anyhow", QueryFilters::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Rust Tips");
+    }
+
+    /// FTS5 treats `-`, `:`, and unmatched `"` as query-syntax operators.
+    /// Raw user search text containing them (e.g. a hyphenated crate name)
+    /// must not surface as a SQL error.
+    #[test]
+    fn query_tolerates_special_characters() {
+        let (brain, dir) = make_brain();
+        let dir_path = dir.path().join("repos");
+        fs::create_dir_all(&dir_path).unwrap();
+        fs::write(
+            dir_path.join("ninox-server.md"),
+            "---\nname: ninox-server\n---\nHTTP API for ninox-server.",
+        )
+        .unwrap();
+
+        brain.rebuild().unwrap();
+
+        for text in ["ninox-server", "foo:bar", "orchestrator\"", "-orchestrator"] {
+            brain
+                .query(text, QueryFilters::default())
+                .unwrap_or_else(|e| panic!("query({text:?}) should not error, got: {e}"));
+        }
+
+        let results = brain.query("ninox-server", QueryFilters::default()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "ninox-server");
     }
 
     #[test]
