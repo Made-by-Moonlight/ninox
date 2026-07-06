@@ -2,8 +2,6 @@
 
 Ninox is a native desktop agent orchestrator — built in Rust with [Iced](https://github.com/iced-rs/iced). It embeds its own orchestrator engine directly and runs a GPU-accelerated UI: no Electron, no bundled browser. Running Ninox starts the engine with its own SQLite store and an HTTP/WebSocket API server.
 
-> This repo was split out of the [Athene](https://github.com/Made-by-Moonlight/Athene) monorepo's `athene/` directory, history intact. Crates and identifiers have since been renamed from `athene-*` to `ninox-*`; Ninox is now the standalone successor rather than a companion app.
-
 ## Prerequisites
 
 - Rust toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
