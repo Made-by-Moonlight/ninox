@@ -1,0 +1,178 @@
+name: Publish to CodeArtifact
+
+# Private-registry counterpart to publish.yml (crates.io). This repo is
+# mirrored to a second, private remote that isn't linked from here. Both
+# remotes carry an identical copy of every workflow file (mirrored history,
+# no `if: github.repository == ...` gates anywhere). Per-repo behavior comes
+# entirely from repo settings, not YAML conditions:
+#   - this (public) repo:  this workflow is disabled
+#                           (`gh workflow disable publish-codeartifact.yml`)
+#   - the private mirror:  publish.yml and release.yml are disabled
+#                           (`gh workflow disable publish.yml`,
+#                            `gh workflow disable release.yml`)
+#                           ci.yml and this workflow stay enabled.
+#
+# As belt-and-braces on top of that disable scheme, this workflow also no-ops
+# gracefully (see "Check CodeArtifact configuration" below) if its required
+# repo variables aren't set — so even an accidental re-enable on the wrong
+# repo does nothing.
+#
+# Publishes ninox-core, ninox-server, and ninox (the native app binary crate)
+# to a private Cargo registry hosted on AWS CodeArtifact, in dependency
+# order, using GitHub OIDC to assume an AWS IAM role — no long-lived AWS
+# keys stored in this repo. Each crate is only actually published if its
+# current Cargo.toml version isn't already live in the CodeArtifact
+# repository, so merges that don't bump a version are a no-op — bump a
+# crate's version in the PR you want released, same as publish.yml.
+#
+# Required repo variables (Settings → Secrets and variables → Actions →
+# Variables), all unset by default so this workflow no-ops until configured:
+#   AWS_REGION                    AWS region of the CodeArtifact domain
+#   CODEARTIFACT_DOMAIN           the CodeArtifact domain name
+#   CODEARTIFACT_DOMAIN_OWNER     AWS account ID that owns the domain
+#   CODEARTIFACT_REPOSITORY       the CodeArtifact repository name — this
+#                                 also becomes the Cargo registry name used
+#                                 by `cargo publish --registry`
+#   CODEARTIFACT_PUBLISH_ROLE_ARN ARN of the IAM role this workflow assumes
+#                                 via OIDC (a plain repo variable is fine —
+#                                 role ARNs aren't secret; a repo secret of
+#                                 the same name also works if preferred)
+#
+# One-time setup needed on the private mirror before this can publish
+# anything: a CodeArtifact repository that accepts the "cargo" package
+# format, an IAM role that trusts this repo's GitHub OIDC identity and is
+# scoped to publish into that repository, and the five repo variables above
+# set to the real values. This workflow only reads those variables — it
+# never assumes or hardcodes any particular AWS account, domain, or role.
+#
+# Auth flow: aws-actions/configure-aws-credentials assumes the IAM role via
+# OIDC, then `aws codeartifact login --tool cargo` configures the local
+# Cargo registry credentials for the publish steps below.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write # AWS OIDC — no long-lived credentials
+
+concurrency:
+  group: publish-codeartifact
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    env:
+      CODEARTIFACT_DOMAIN: ${{ vars.CODEARTIFACT_DOMAIN }}
+      CODEARTIFACT_DOMAIN_OWNER: ${{ vars.CODEARTIFACT_DOMAIN_OWNER }}
+      CODEARTIFACT_REPOSITORY: ${{ vars.CODEARTIFACT_REPOSITORY }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      CODEARTIFACT_PUBLISH_ROLE_ARN: ${{ vars.CODEARTIFACT_PUBLISH_ROLE_ARN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Check CodeArtifact configuration
+        id: config
+        run: |
+          if [ -z "$CODEARTIFACT_DOMAIN" ] || [ -z "$CODEARTIFACT_DOMAIN_OWNER" ] || \
+             [ -z "$CODEARTIFACT_REPOSITORY" ] || [ -z "$AWS_REGION" ] || \
+             [ -z "$CODEARTIFACT_PUBLISH_ROLE_ARN" ]; then
+            echo "::notice::CodeArtifact publishing isn't configured on this repository (one or more of AWS_REGION, CODEARTIFACT_DOMAIN, CODEARTIFACT_DOMAIN_OWNER, CODEARTIFACT_REPOSITORY, CODEARTIFACT_PUBLISH_ROLE_ARN repo variables is unset) — skipping. See the header of this workflow for required setup."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install system dependencies
+        if: steps.config.outputs.configured == 'true'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            pkg-config
+
+      - name: Configure AWS credentials
+        if: steps.config.outputs.configured == 'true'
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
+        with:
+          role-to-assume: ${{ env.CODEARTIFACT_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 3600
+
+      - name: Install wait-for-crate helper
+        if: steps.config.outputs.configured == 'true'
+        run: |
+          cat <<'SCRIPT' > /tmp/wait-for-crate.sh
+          #!/usr/bin/env bash
+          set -euo pipefail
+          crate="$1"
+          version="$2"
+          for i in $(seq 1 30); do
+            if aws codeartifact describe-package-version \
+                --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+                --repository "$CODEARTIFACT_REPOSITORY" --format cargo \
+                --package "${crate}" --package-version "${version}" > /dev/null 2>&1; then
+              echo "${crate} ${version} is live."
+              exit 0
+            fi
+            echo "Waiting for ${crate} ${version} to appear (attempt ${i})..."
+            sleep 10
+          done
+          echo "Timed out waiting for ${crate} ${version}." >&2
+          exit 1
+          SCRIPT
+          chmod +x /tmp/wait-for-crate.sh
+
+      - name: Determine publish plan
+        id: plan
+        if: steps.config.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          for entry in core:ninox-core server:ninox-server app:ninox; do
+            key="${entry%%:*}"
+            crate="${entry##*:}"
+            version=$(echo "$metadata" | jq -r --arg n "$crate" '.packages[] | select(.name==$n) | .version')
+            echo "${key}_version=${version}" >> "$GITHUB_OUTPUT"
+            if aws codeartifact describe-package-version \
+                --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+                --repository "$CODEARTIFACT_REPOSITORY" --format cargo \
+                --package "${crate}" --package-version "${version}" > /dev/null 2>&1; then
+              echo "${crate} ${version} is already published — skipping."
+              echo "${key}_publish=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "${crate} ${version} is not yet published — will publish."
+              echo "${key}_publish=true" >> "$GITHUB_OUTPUT"
+            fi
+          done
+
+      - name: Log in to CodeArtifact Cargo registry
+        if: steps.config.outputs.configured == 'true'
+        run: |
+          aws codeartifact login --tool cargo \
+            --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --repository "$CODEARTIFACT_REPOSITORY" --region "$AWS_REGION"
+
+      - name: Publish ninox-core
+        if: steps.config.outputs.configured == 'true' && steps.plan.outputs.core_publish == 'true'
+        run: |
+          cargo publish -p ninox-core --registry "$CODEARTIFACT_REPOSITORY"
+          /tmp/wait-for-crate.sh ninox-core "${{ steps.plan.outputs.core_version }}"
+
+      - name: Publish ninox-server
+        if: steps.config.outputs.configured == 'true' && steps.plan.outputs.server_publish == 'true'
+        run: |
+          cargo publish -p ninox-server --registry "$CODEARTIFACT_REPOSITORY"
+          /tmp/wait-for-crate.sh ninox-server "${{ steps.plan.outputs.server_version }}"
+
+      - name: Publish ninox
+        if: steps.config.outputs.configured == 'true' && steps.plan.outputs.app_publish == 'true'
+        run: cargo publish -p ninox --registry "$CODEARTIFACT_REPOSITORY"
