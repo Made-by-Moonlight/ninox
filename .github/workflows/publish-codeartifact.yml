@@ -46,8 +46,16 @@ name: Publish to CodeArtifact
 # never assumes or hardcodes any particular AWS account, domain, or role.
 #
 # Auth flow: aws-actions/configure-aws-credentials assumes the IAM role via
-# OIDC, then `aws codeartifact login --tool cargo` configures the local
-# Cargo registry credentials for the publish steps below.
+# OIDC, then the "Configure Cargo for CodeArtifact" step wires Cargo up by
+# hand — `aws codeartifact login` has no cargo tool, so it writes
+# ~/.cargo/config.toml itself (sparse index + cargo:token credential
+# provider) and feeds `cargo login` an auth token from
+# `aws codeartifact get-authorization-token`. That step also replaces the
+# crates-io source with the CodeArtifact repository, so dependency
+# resolution during publish verification goes through CodeArtifact too:
+# already-published ninox crates come from the repository itself (the
+# package-group origin controls block them from the crates.io upstream)
+# and third-party crates come through the crates.io pull-through cache.
 
 on:
   workflow_dispatch:
@@ -154,12 +162,38 @@ jobs:
             fi
           done
 
-      - name: Log in to CodeArtifact Cargo registry
+      # `aws codeartifact login` doesn't support cargo as a --tool, so this
+      # configures Cargo by hand, following the CodeArtifact cargo docs:
+      # a named registry with the repository's sparse index for publishing,
+      # crates-io source replacement so dependency resolution during publish
+      # verification also goes through CodeArtifact, and a cargo:token
+      # credential provider fed by `cargo login` (the registry expects the
+      # literal token value "Bearer <auth token>").
+      - name: Configure Cargo for CodeArtifact
         if: steps.config.outputs.configured == 'true'
         run: |
-          aws codeartifact login --tool cargo \
+          set -euo pipefail
+          endpoint=$(aws codeartifact get-repository-endpoint \
             --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
-            --repository "$CODEARTIFACT_REPOSITORY" --region "$AWS_REGION"
+            --repository "$CODEARTIFACT_REPOSITORY" --format cargo \
+            --query repositoryEndpoint --output text)
+          token=$(aws codeartifact get-authorization-token \
+            --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --query authorizationToken --output text)
+          echo "::add-mask::${token}"
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml <<EOF
+          [registries.${CODEARTIFACT_REPOSITORY}]
+          index = "sparse+${endpoint}"
+          credential-provider = "cargo:token"
+
+          [source.crates-io]
+          replace-with = "${CODEARTIFACT_REPOSITORY}"
+
+          [registry]
+          global-credential-providers = ["cargo:token"]
+          EOF
+          printf 'Bearer %s\n' "${token}" | cargo login --registry "$CODEARTIFACT_REPOSITORY"
 
       - name: Publish ninox-core
         if: steps.config.outputs.configured == 'true' && steps.plan.outputs.core_publish == 'true'
