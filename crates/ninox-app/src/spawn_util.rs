@@ -53,9 +53,11 @@ pub struct InteractiveSpawnParams {
 /// caller can emit `Message::ClientAttach` and render it immediately at the
 /// right size (the attached-client flow sizes the PTY to the real panel).
 /// On tmux failure (e.g. the workspace path is bad) the session is marked
-/// `Terminated` in the store, a `SessionUpdated` event is emitted so the UI
-/// shows "Session exited" instead of a session stuck in Working forever, and
-/// `None` is returned.
+/// with the caller-supplied `p.failure_status` in the store (`Terminated`
+/// for a fresh spawn or Re-file, `Interrupted` for Resume — see
+/// `InteractiveSpawnParams::failure_status`), a `SessionUpdated` event is
+/// emitted so the UI reflects the new status instead of a session stuck in
+/// Working forever, and `None` is returned.
 pub async fn spawn_interactive_session(
     engine: Arc<Engine>,
     p: InteractiveSpawnParams,

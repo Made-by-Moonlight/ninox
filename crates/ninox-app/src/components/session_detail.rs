@@ -425,6 +425,7 @@ pub fn session_detail<'a>(
         use ninox_core::types::SessionStatus;
         let placeholder = match session.status {
             SessionStatus::Terminated | SessionStatus::Done => "Session exited",
+            SessionStatus::Interrupted => "Session interrupted — click Resume to continue",
             _ => "Terminal connecting…",
         };
         container(
