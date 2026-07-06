@@ -143,7 +143,10 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Brain { action }) => {
             run_brain(action).await
         }
-        Some(Command::Statusline) => unreachable!("handled before startup side effects above"),
+        Some(Command::Statusline) => {
+            run_statusline(db_path);
+            Ok(())
+        }
         None => run_tui(store, args.port, args.headless).await,
     }
 }
