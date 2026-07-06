@@ -1,4 +1,4 @@
-use ninox_core::{BrainEntry, BrainIndex, QueryFilters};
+use ninox_core::{embeddings::Embedder, BrainEntry, BrainIndex, QueryFilters};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -8,24 +8,36 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-pub fn brain_router(brain: Arc<BrainIndex>) -> Router {
+#[derive(Clone)]
+pub struct BrainState {
+    pub brain: Arc<BrainIndex>,
+    pub embedder: Option<Arc<dyn Embedder>>,
+}
+
+pub fn brain_router(brain: Arc<BrainIndex>, embedder: Option<Arc<dyn Embedder>>) -> Router {
     Router::new()
         .route("/index", post(rebuild_index))
         .route("/query", get(query_entries))
         .route("/entry/*path", get(get_entry))
-        .with_state(brain)
+        .with_state(BrainState { brain, embedder })
 }
 
 #[derive(Serialize)]
 struct IndexResponse {
     count: usize,
+    embedded: usize,
+    cached: usize,
 }
 
 async fn rebuild_index(
-    State(brain): State<Arc<BrainIndex>>,
+    State(state): State<BrainState>,
 ) -> Result<Json<IndexResponse>, StatusCode> {
-    match brain.rebuild(None) {
-        Ok(stats) => Ok(Json(IndexResponse { count: stats.indexed })),
+    match state.brain.rebuild(state.embedder.as_deref()) {
+        Ok(stats) => Ok(Json(IndexResponse {
+            count: stats.indexed,
+            embedded: stats.embedded,
+            cached: stats.cached,
+        })),
         Err(err) => {
             tracing::error!("brain rebuild: {err}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -42,7 +54,7 @@ struct QueryParams {
 }
 
 async fn query_entries(
-    State(brain): State<Arc<BrainIndex>>,
+    State(state): State<BrainState>,
     Query(params): Query<QueryParams>,
 ) -> Result<Json<Vec<BrainEntry>>, StatusCode> {
     let text = params.q.unwrap_or_default();
@@ -50,7 +62,7 @@ async fn query_entries(
         entry_type: params.entry_type,
         tag: params.tag,
     };
-    match brain.query(&text, None, filters) {
+    match state.brain.query(&text, state.embedder.as_deref(), filters) {
         Ok(entries) => Ok(Json(entries)),
         Err(err) => {
             tracing::error!("brain query: {err}");
@@ -60,10 +72,10 @@ async fn query_entries(
 }
 
 async fn get_entry(
-    State(brain): State<Arc<BrainIndex>>,
+    State(state): State<BrainState>,
     Path(path): Path<String>,
 ) -> Result<Json<BrainEntry>, StatusCode> {
-    match brain.get(&path) {
+    match state.brain.get(&path) {
         Ok(Some(entry)) => Ok(Json(entry)),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(err) => {

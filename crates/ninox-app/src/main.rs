@@ -361,6 +361,18 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
     }
 
     let brain = Arc::new(BrainIndex::open(&brain_path)?);
+    let embedder: Option<Arc<dyn ninox_core::embeddings::Embedder>> =
+        match tokio::task::spawn_blocking(ninox_core::embeddings::FastEmbedEmbedder::try_new).await {
+            Ok(Ok(embedder)) => Some(Arc::new(embedder) as Arc<dyn ninox_core::embeddings::Embedder>),
+            Ok(Err(err)) => {
+                tracing::warn!("brain: embedding model unavailable, semantic search disabled: {err}");
+                None
+            }
+            Err(join_err) => {
+                tracing::warn!("brain: embedder init task panicked: {join_err}");
+                None
+            }
+        };
     let engine = match resolve_token(config.github_token.clone()) {
         Some(token) => Engine::new_with_github(Arc::clone(&store), token),
         None        => Engine::new(Arc::clone(&store)),
@@ -376,8 +388,9 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
     tokio::spawn({
         let e = engine.clone();
         let b = brain.clone();
+        let emb = embedder.clone();
         async move {
-            if let Err(err) = ninox_server::start(e, b, port).await {
+            if let Err(err) = ninox_server::start(e, b, emb, port).await {
                 tracing::error!("server: {err}");
             }
         }
