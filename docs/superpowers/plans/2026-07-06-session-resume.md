@@ -1780,7 +1780,6 @@ Update the folio's `shown` count (captured in full during planning: `COLUMNS.ite
 ```
 
 `board_sessions` itself is untouched by this step and keeps its existing callers (e.g. `attention_count` still needs exact-status matching, not the column-merge rule).
-```
 
 - [ ] **Step 4: Add the bulk "Resume all (N)" control and `Message::ResumeAllSessions`**
 
