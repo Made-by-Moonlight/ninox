@@ -1510,6 +1510,9 @@ impl App {
 
             Message::NavigateBrain => {
                 if !state.brain_view.loaded {
+                    // `None`: the GUI brain panel is keyword-only for now — wiring it to the
+                    // same embedder the server constructs at startup is a natural follow-up,
+                    // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
                     match state.brain.query("", None, QueryFilters::default()) {
                         Ok(entries) => {
                             state.brain_view.entries = entries;
@@ -1619,9 +1622,15 @@ impl App {
             }
 
             Message::BrainReindex => {
+                // `None`: the GUI brain panel is keyword-only for now — wiring it to the
+                // same embedder the server constructs at startup is a natural follow-up,
+                // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
                 match state.brain.rebuild(None) {
                     Ok(stats) => {
                         tracing::info!("brain reindexed: {} entries", stats.indexed);
+                        // `None`: the GUI brain panel is keyword-only for now — wiring it to the
+                        // same embedder the server constructs at startup is a natural follow-up,
+                        // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
                         match state.brain.query("", None, QueryFilters::default()) {
                             Ok(entries) => {
                                 state.brain_view.entries = entries;
@@ -1703,6 +1712,9 @@ impl App {
                             state.brain_view.related.clear();
                             state.brain_view.edges.clear();
                             state.brain_view.loaded = false;
+                            // `None`: the GUI brain panel is keyword-only for now — wiring it to the
+                            // same embedder the server constructs at startup is a natural follow-up,
+                            // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
                             match state.brain.query("", None, QueryFilters::default()) {
                                 Ok(entries) => {
                                     state.brain_view.entries = entries;
@@ -2210,7 +2222,8 @@ extra configuration.
 
 ## 1. Query first
 
-Before writing a new entry, check whether one already exists:
+`brain query` blends keyword and semantic matches automatically — no new
+syntax needed. Before writing a new entry, check whether one already exists:
 
 ```bash
 {ninox_bin} brain query "<name or concept>"
@@ -4096,6 +4109,7 @@ mod tests {
         assert!(skill.contains("ninox brain query"));
         assert!(skill.contains("ninox brain index"));
         assert!(skill.contains("ninox brain show"));
+        assert!(skill.contains("blends keyword and semantic matches"));
 
         let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
         assert!(
