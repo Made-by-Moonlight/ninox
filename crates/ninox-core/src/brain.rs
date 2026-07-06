@@ -31,6 +31,17 @@ pub struct QueryFilters {
     pub tag: Option<String>,
 }
 
+/// Result of a `BrainIndex::rebuild()` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebuildStats {
+    /// Entries (files) indexed this run.
+    pub indexed: usize,
+    /// Entries newly embedded this run (content changed or never embedded).
+    pub embedded: usize,
+    /// Entries whose cached embedding was reused because content is unchanged.
+    pub cached: usize,
+}
+
 // ---------------------------------------------------------------------------
 // BrainIndex
 // ---------------------------------------------------------------------------
@@ -63,7 +74,12 @@ impl BrainIndex {
                  USING fts5(name, tags, body, content=entries, content_rowid=rowid);
              CREATE TABLE IF NOT EXISTS links (from_id TEXT NOT NULL, target TEXT NOT NULL);
              CREATE INDEX IF NOT EXISTS links_from ON links(from_id);
-             CREATE INDEX IF NOT EXISTS links_target ON links(target);",
+             CREATE INDEX IF NOT EXISTS links_target ON links(target);
+             CREATE TABLE IF NOT EXISTS embeddings (
+                 id           TEXT PRIMARY KEY,
+                 content_hash INTEGER NOT NULL,
+                 vector       BLOB NOT NULL
+             );",
         )?;
         // Expose `stem(x)` to SQL so link-resolution queries can share the
         // same "stem(target) == stem(id)" rule used in Rust, without
@@ -647,6 +663,18 @@ mod tests {
         assert!(gi.exists());
         let content = fs::read_to_string(&gi).unwrap();
         assert!(content.contains(".index.db"));
+    }
+
+    #[test]
+    fn open_creates_embeddings_table() {
+        let (brain, _dir) = make_brain();
+        let conn = brain.conn.lock().unwrap();
+        // A query against the table succeeding at all (vs. an SQL error)
+        // proves the table exists with these columns.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
