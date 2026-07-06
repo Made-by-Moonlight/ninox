@@ -86,6 +86,7 @@ mod tests {
             started_at: 0, pr_number: Some(7), pr_id: Some(7),
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
         }
     }
 

@@ -221,6 +221,7 @@ async fn run_spawn(
         // forwarded from the orchestrator's own environment (see the env
         // block below), so record the same value for Re-file.
         catalogue_path:  std::env::var("NINOX_BRAIN").ok().filter(|s| !s.is_empty()),
+        context_used_pct: None, context_total_tokens: None, context_window_size: None,
     };
 
     store.upsert_session(&session)?;
