@@ -131,15 +131,16 @@ pub async fn spawn_interactive_session(
 
 /// The tmux env for an app-spawned interactive session (Orchestrator or
 /// Standalone): the shared NINOX_BIN/NINOX_CONFIG/NINOX_BRAIN vars, session
-/// metadata attribution (`ATHENE_SESSION`/`ATHENE_DATA_DIR` — consumed by
-/// the gh/git wrapper scripts in `ninox_core::hooks` and by the usage
-/// poller's cost/token ingestion), plus any kind-specific extra vars.
+/// metadata attribution (`NINOX_SESSION`/`NINOX_DATA_DIR`, plus the legacy
+/// `ATHENE_*` aliases — consumed by the gh/git wrapper scripts in
+/// `ninox_core::hooks` and by the usage poller's cost/token ingestion),
+/// plus any kind-specific extra vars.
 ///
 /// Factored out from [`spawn_interactive_session`] for unit testing: this is
-/// the fix for the gap where app-spawned sessions never set
-/// `ATHENE_SESSION`/`ATHENE_DATA_DIR` (only the CLI worker path in
-/// `main.rs::run_spawn` did), making PR/branch metadata capture and cost
-/// attribution silently invisible for orchestrators and standalone spawns.
+/// the fix for the gap where app-spawned sessions never set the session
+/// attribution vars (only the CLI worker path in `main.rs::run_spawn` did),
+/// making PR/branch metadata capture and cost attribution silently
+/// invisible for orchestrators and standalone spawns.
 fn interactive_env_vars<'a>(
     ninox_bin:      &'a str,
     ninox_config:   &'a str,
@@ -152,6 +153,10 @@ fn interactive_env_vars<'a>(
         ("NINOX_BIN",       ninox_bin),
         ("NINOX_CONFIG",    ninox_config),
         ("NINOX_BRAIN",     catalogue_path),
+        ("NINOX_SESSION",   session_id),
+        ("NINOX_DATA_DIR",  sessions_dir),
+        // Legacy names: wrapper scripts installed by an older ninox read
+        // these; kept until those installs are gone.
         ("ATHENE_SESSION",  session_id),
         ("ATHENE_DATA_DIR", sessions_dir),
     ];
@@ -262,11 +267,15 @@ mod tests {
     /// scripts can't record PR/branch metadata and the usage poller can't
     /// attribute a workspace's cost/token ingestion back to a session id.
     #[test]
-    fn interactive_env_vars_includes_athene_attribution() {
+    fn interactive_env_vars_includes_session_attribution() {
         let extra = vec![("NINOX_ORCHESTRATOR_ID".to_string(), "orch-1".to_string())];
         let env = interactive_env_vars(
             "/usr/local/bin/ninox", "/cfg/config.toml", "/brain", "sess-1", "/data/sessions", &extra,
         );
+        assert!(env.contains(&("NINOX_SESSION", "sess-1")));
+        assert!(env.contains(&("NINOX_DATA_DIR", "/data/sessions")));
+        // Legacy ATHENE_* names still exported for wrapper scripts installed
+        // by an older ninox.
         assert!(env.contains(&("ATHENE_SESSION", "sess-1")));
         assert!(env.contains(&("ATHENE_DATA_DIR", "/data/sessions")));
         assert!(env.contains(&("NINOX_ORCHESTRATOR_ID", "orch-1")));
