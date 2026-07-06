@@ -171,6 +171,11 @@ pub struct App {
 #[derive(Debug, Clone, Copy)]
 pub enum DragTarget { Sidebar, InfoPanel }
 
+// `Session` grew when statusline context/cost fields were added, and `EngineEvent(Event)`
+// wraps it by value; boxing `Event`'s Session-carrying variants would ripple across every
+// call site that constructs or matches on `Event::SessionUpdated`/`SessionSpawned` across
+// the workspace, which is out of scope here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Message {
     EngineEvent(Event),
