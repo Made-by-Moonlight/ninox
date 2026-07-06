@@ -18,7 +18,7 @@
 //! `message.model`. Since each Ninox session (orchestrator subdirectory,
 //! standalone worktree, or CLI worker worktree) runs in its own dedicated
 //! workspace directory, that directory is a reliable 1:1 key back to the
-//! session — no `ATHENE_SESSION`-style attribution needed for this part.
+//! session — no `NINOX_SESSION`-style attribution needed for this part.
 //!
 //! There is no on-disk USD figure to read, so cost is estimated from token
 //! counts against a small built-in pricing table. These are **rough

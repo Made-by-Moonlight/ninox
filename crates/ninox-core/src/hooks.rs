@@ -43,8 +43,6 @@ pub struct WorkRequest {
 /// Env vars consumed at runtime (injected by ninox when spawning the tmux session):
 ///   NINOX_SESSION     — session ID used as metadata filename
 ///   NINOX_DATA_DIR    — directory where {NINOX_SESSION}.json lives
-/// (legacy ATHENE_SESSION / ATHENE_DATA_DIR are honored as fallbacks so the
-/// scripts still work when spawned by an older ninox)
 const GH_WRAPPER: &str = r#"#!/usr/bin/env bash
 # Ninox gh wrapper — intercepts gh pr create to record PR metadata.
 set -euo pipefail
@@ -69,8 +67,8 @@ if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
     _output=$("$_real_gh" "$@" 2>&1)
     _exit=$?
     echo "$_output"
-    _nx_session="${NINOX_SESSION:-${ATHENE_SESSION:-}}"
-    _nx_data_dir="${NINOX_DATA_DIR:-${ATHENE_DATA_DIR:-}}"
+    _nx_session="${NINOX_SESSION:-}"
+    _nx_data_dir="${NINOX_DATA_DIR:-}"
     if [[ $_exit -eq 0 && -n "$_nx_session" && -n "$_nx_data_dir" ]]; then
         _pr_url=$(echo "$_output" | grep -oE 'https?://[^/]+/[^/]+/[^/]+/pull/[0-9]+' | head -1)
         if [[ -n "$_pr_url" ]]; then
@@ -141,8 +139,8 @@ fi
 _exit=$?
 
 # On success, capture branch name for checkout -b / switch -c.
-_nx_session="${NINOX_SESSION:-${ATHENE_SESSION:-}}"
-_nx_data_dir="${NINOX_DATA_DIR:-${ATHENE_DATA_DIR:-}}"
+_nx_session="${NINOX_SESSION:-}"
+_nx_data_dir="${NINOX_DATA_DIR:-}"
 if [[ $_exit -eq 0 && -n "$_nx_session" && -n "$_nx_data_dir" ]]; then
     _branch=""
     if [[ "${1:-}" == "checkout" && "${2:-}" == "-b" && -n "${3:-}" ]]; then
@@ -474,14 +472,14 @@ mod tests {
         assert_eq!(pending[1].description, "Migrate config loader");
     }
 
-    /// The wrapper scripts must prefer the NINOX_* env names and keep the
-    /// legacy ATHENE_* names as fallback, so they work under both a new and
-    /// an old spawner during the rename transition.
+    /// The wrapper scripts read only the NINOX_* env names — the legacy
+    /// ATHENE_* transition fallbacks are gone.
     #[test]
-    fn wrapper_scripts_prefer_ninox_env_with_athene_fallback() {
+    fn wrapper_scripts_read_only_ninox_env() {
         for wrapper in [GH_WRAPPER, GIT_WRAPPER] {
-            assert!(wrapper.contains("${NINOX_SESSION:-${ATHENE_SESSION:-}}"));
-            assert!(wrapper.contains("${NINOX_DATA_DIR:-${ATHENE_DATA_DIR:-}}"));
+            assert!(wrapper.contains("${NINOX_SESSION:-}"));
+            assert!(wrapper.contains("${NINOX_DATA_DIR:-}"));
+            assert!(!wrapper.contains("ATHENE"));
         }
     }
 

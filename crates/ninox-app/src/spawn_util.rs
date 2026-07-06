@@ -131,10 +131,9 @@ pub async fn spawn_interactive_session(
 
 /// The tmux env for an app-spawned interactive session (Orchestrator or
 /// Standalone): the shared NINOX_BIN/NINOX_CONFIG/NINOX_BRAIN vars, session
-/// metadata attribution (`NINOX_SESSION`/`NINOX_DATA_DIR`, plus the legacy
-/// `ATHENE_*` aliases — consumed by the gh/git wrapper scripts in
-/// `ninox_core::hooks` and by the usage poller's cost/token ingestion),
-/// plus any kind-specific extra vars.
+/// metadata attribution (`NINOX_SESSION`/`NINOX_DATA_DIR` — consumed by
+/// the gh/git wrapper scripts in `ninox_core::hooks` and by the usage
+/// poller's cost/token ingestion), plus any kind-specific extra vars.
 ///
 /// Factored out from [`spawn_interactive_session`] for unit testing: this is
 /// the fix for the gap where app-spawned sessions never set the session
@@ -150,15 +149,11 @@ fn interactive_env_vars<'a>(
     extra_env:      &'a [(String, String)],
 ) -> Vec<(&'a str, &'a str)> {
     let mut env: Vec<(&str, &str)> = vec![
-        ("NINOX_BIN",       ninox_bin),
-        ("NINOX_CONFIG",    ninox_config),
-        ("NINOX_BRAIN",     catalogue_path),
-        ("NINOX_SESSION",   session_id),
-        ("NINOX_DATA_DIR",  sessions_dir),
-        // Legacy names: wrapper scripts installed by an older ninox read
-        // these; kept until those installs are gone.
-        ("ATHENE_SESSION",  session_id),
-        ("ATHENE_DATA_DIR", sessions_dir),
+        ("NINOX_BIN",      ninox_bin),
+        ("NINOX_CONFIG",   ninox_config),
+        ("NINOX_BRAIN",    catalogue_path),
+        ("NINOX_SESSION",  session_id),
+        ("NINOX_DATA_DIR", sessions_dir),
     ];
     for (k, v) in extra_env {
         env.push((k.as_str(), v.as_str()));
@@ -261,8 +256,8 @@ mod tests {
     }
 
     /// Regression test for the gap where app-spawned sessions (both
-    /// Orchestrator and Standalone kinds) never set `ATHENE_SESSION`/
-    /// `ATHENE_DATA_DIR`, unlike the CLI worker path (`main.rs::run_spawn`,
+    /// Orchestrator and Standalone kinds) never set `NINOX_SESSION`/
+    /// `NINOX_DATA_DIR`, unlike the CLI worker path (`main.rs::run_spawn`,
     /// see `worker_env_vars` there). Without these, the gh/git wrapper
     /// scripts can't record PR/branch metadata and the usage poller can't
     /// attribute a workspace's cost/token ingestion back to a session id.
@@ -274,10 +269,8 @@ mod tests {
         );
         assert!(env.contains(&("NINOX_SESSION", "sess-1")));
         assert!(env.contains(&("NINOX_DATA_DIR", "/data/sessions")));
-        // Legacy ATHENE_* names still exported for wrapper scripts installed
-        // by an older ninox.
-        assert!(env.contains(&("ATHENE_SESSION", "sess-1")));
-        assert!(env.contains(&("ATHENE_DATA_DIR", "/data/sessions")));
+        // The legacy ATHENE_* transition names are gone.
+        assert!(!env.iter().any(|(k, _)| k.starts_with("ATHENE_")));
         assert!(env.contains(&("NINOX_ORCHESTRATOR_ID", "orch-1")));
     }
 }
@@ -335,7 +328,7 @@ mod persistence_probe {
     /// End-to-end proof that the cost/context tracking fix works against a
     /// REAL `claude` session, driven exactly the way the app drives one:
     /// spawn via `spawn_interactive_session` (the code path that used to be
-    /// missing `ATHENE_SESSION`/`ATHENE_DATA_DIR`), send one cheap prompt,
+    /// missing `NINOX_SESSION`/`NINOX_DATA_DIR`), send one cheap prompt,
     /// then assert the usage poller's ingestion (`ninox_core::lifecycle::
     /// usage::ingest_usage_for_workspace`) picks up a non-zero cost and
     /// context-token count from the real `~/.claude/projects/...` transcript

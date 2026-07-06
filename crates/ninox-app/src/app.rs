@@ -298,10 +298,6 @@ pub fn refile_plan(
         vec![
             ("NINOX_ORCHESTRATOR_ID".to_string(), session.id.clone()),
             ("NINOX_CALLER_TYPE".to_string(),     "orchestrator".to_string()),
-            // Legacy names read by subagent-blocker hooks written before
-            // the NINOX_* rename.
-            ("AO_CALLER_TYPE".to_string(),        "orchestrator".to_string()),
-            ("ATHENE_CALLER_TYPE".to_string(),    "orchestrator".to_string()),
         ]
     } else {
         Vec::new()
@@ -1161,10 +1157,6 @@ impl App {
                             let extra_env = vec![
                                 ("NINOX_ORCHESTRATOR_ID".to_string(), sid.clone()),
                                 ("NINOX_CALLER_TYPE".to_string(),     "orchestrator".to_string()),
-                                // Legacy names read by subagent-blocker hooks
-                                // written before the NINOX_* rename.
-                                ("AO_CALLER_TYPE".to_string(),        "orchestrator".to_string()),
-                                ("ATHENE_CALLER_TYPE".to_string(),    "orchestrator".to_string()),
                             ];
 
                             let attach_sid = sid.clone();
@@ -2352,7 +2344,7 @@ empty brain is no better than no brain at all.
     // subagent-blocker hook — always overwritten.
     let blocker = r#"#!/usr/bin/env node
 const { readFileSync } = require("node:fs");
-const callerType = process.env.NINOX_CALLER_TYPE || process.env.ATHENE_CALLER_TYPE || process.env.AO_CALLER_TYPE || "";
+const callerType = process.env.NINOX_CALLER_TYPE || "";
 if (callerType !== "orchestrator") process.exit(0);
 let raw = "";
 try { raw = readFileSync(0, "utf-8"); } catch { process.exit(0); }
@@ -2577,8 +2569,8 @@ mod tests {
         let plan = refile_plan(&session, true, &cfg).expect("plan");
         assert!(plan.extra_env.iter().any(|(k, v)| k == "NINOX_ORCHESTRATOR_ID" && v == "o1"));
         assert!(plan.extra_env.iter().any(|(k, _)| k == "NINOX_CALLER_TYPE"));
-        // Legacy name kept while old subagent-blocker hooks are in the wild.
-        assert!(plan.extra_env.iter().any(|(k, _)| k == "ATHENE_CALLER_TYPE"));
+        // The legacy ATHENE_/AO_ transition names are gone.
+        assert!(!plan.extra_env.iter().any(|(k, _)| k == "ATHENE_CALLER_TYPE" || k == "AO_CALLER_TYPE"));
         // no recorded catalogue → default brain path
         assert!(!plan.catalogue_path.is_empty());
 
