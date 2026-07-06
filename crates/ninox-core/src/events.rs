@@ -102,11 +102,13 @@ impl Engine {
     /// Kill all worker sessions belonging to an orchestrator, delete from DB, emit events.
     pub async fn remove_orchestrator(&self, orchestrator_id: &str) -> anyhow::Result<()> {
         let workers = self.store.sessions_by_orchestrator(orchestrator_id)?;
+        let sessions_dir = crate::config::AppConfig::sessions_dir();
         for session in &workers {
             let _ = crate::tmux::kill_session(&session.id).await;
             if let Some(ref wp) = session.workspace_path {
                 remove_worker_worktree(wp, &session.id).await;
             }
+            crate::hooks::remove_session_artifacts(&sessions_dir, &session.id);
         }
         // Also kill the orchestrator's own tmux session (same id as orchestrator).
         let _ = crate::tmux::kill_session(orchestrator_id).await;
@@ -126,6 +128,9 @@ impl Engine {
                 remove_worker_worktree(wp, session_id).await;
             }
         }
+        crate::hooks::remove_session_artifacts(
+            &crate::config::AppConfig::sessions_dir(), session_id,
+        );
         self.store.delete_session(session_id)?;
         self.emit(Event::SessionDone(session_id.to_string()));
         Ok(())

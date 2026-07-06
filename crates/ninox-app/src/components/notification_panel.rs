@@ -20,6 +20,8 @@ fn kind_label(kind: &NotificationKind) -> &'static str {
         NotificationKind::PrNeedsAttention => "PR",
         NotificationKind::MergeConflict    => "Conflict",
         NotificationKind::WorkerDone       => "Done",
+        NotificationKind::WorkRequested    => "Work",
+        NotificationKind::ExtraPr          => "Extra PR",
     }
 }
 
@@ -30,6 +32,8 @@ fn kind_color(kind: &NotificationKind, s: &ColorScheme) -> Color {
         NotificationKind::PrNeedsAttention => s.status_pr_open,
         NotificationKind::MergeConflict    => s.status_ci_failed,
         NotificationKind::WorkerDone       => s.status_done,
+        NotificationKind::WorkRequested    => s.status_pr_open,
+        NotificationKind::ExtraPr          => s.status_review,
     }
 }
 

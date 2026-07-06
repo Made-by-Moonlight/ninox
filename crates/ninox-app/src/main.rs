@@ -58,6 +58,13 @@ enum Command {
         /// Message text to inject (Enter is sent automatically)
         message: String,
     },
+    /// Ask the orchestrator to schedule additional work discovered outside
+    /// this worker's task (used by workers; Ninox delivers it and the
+    /// orchestrator spawns a dedicated worker)
+    RequestWork {
+        /// Description of the additional work
+        description: String,
+    },
     /// Knowledge base operations
     Brain {
         #[command(subcommand)]
@@ -116,6 +123,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Send { session_id, message }) => {
             ninox_core::tmux::send_keys(&session_id, &message).await
+        }
+        Some(Command::RequestWork { description }) => {
+            run_request_work(&description)
         }
         Some(Command::Brain { action }) => {
             run_brain(action).await
@@ -189,18 +199,7 @@ async fn run_spawn(
     // orchestrator's ID, and how to communicate back when done or stuck.
     let mut effective_prompt = prompt;
     if !orch_id_env.is_empty() {
-        effective_prompt.push_str(&format!(
-            "\n\n---\n\
-             Ninox session `{id}` · orchestrator `{orch_id}`\n\n\
-             **Goal:** complete the task and open a pull request.\n\n\
-             To message the orchestrator (e.g. when stuck or when the PR is open):\n\
-             ```bash\n\
-             ninox send {orch_id} \"<your message>\"\n\
-             ```\n\
-             Report back when: (a) you are blocked and need a decision, \
-             or (b) the PR is open and the task is done.",
-            orch_id = orch_id_env,
-        ));
+        effective_prompt.push_str(&worker_context_footer(&id, &orch_id_env));
     }
 
     let session = Session {
@@ -265,6 +264,29 @@ async fn run_spawn(
     Ok(())
 }
 
+/// The context footer appended to every worker's task prompt: its own
+/// session id, its orchestrator's id, the channels back to the orchestrator,
+/// and the one-worker-one-PR scope rule.
+fn worker_context_footer(id: &str, orch_id: &str) -> String {
+    format!(
+        "\n\n---\n\
+         Ninox session `{id}` · orchestrator `{orch_id}`\n\n\
+         **Goal:** complete the task and open a pull request.\n\n\
+         **Scope:** one worker, one task, one pull request. If you discover \
+         additional work outside this task, do not do it and do not open \
+         another PR — hand it to the orchestrator instead:\n\
+         ```bash\n\
+         ninox request-work \"<description of the additional work>\"\n\
+         ```\n\
+         To message the orchestrator (e.g. when stuck or when the PR is open):\n\
+         ```bash\n\
+         ninox send {orch_id} \"<your message>\"\n\
+         ```\n\
+         Report back when: (a) you are blocked and need a decision, \
+         or (b) the PR is open and the task is done.",
+    )
+}
+
 /// The tmux env for a spawned worker: always the session id + data dir, plus
 /// whichever of orchestrator id / brain path / config path are actually
 /// present (an empty `orch_id` or `None` env value is omitted rather than
@@ -292,6 +314,34 @@ fn worker_env_vars<'a>(
     env_vec
 }
 
+
+/// `ninox request-work` — record a work request in this worker's session
+/// metadata. The engine's poller notices it within one tick, notifies the
+/// UI, and forwards it to the orchestrator's terminal.
+fn run_request_work(description: &str) -> anyhow::Result<()> {
+    let description = description.trim();
+    if description.is_empty() {
+        anyhow::bail!("request-work needs a non-empty description of the work");
+    }
+    let session_id = std::env::var("ATHENE_SESSION")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!(
+            "ATHENE_SESSION is not set — `ninox request-work` only works inside \
+             a Ninox worker session"
+        ))?;
+    let sessions_dir = std::env::var("ATHENE_DATA_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(AppConfig::sessions_dir);
+    let request = ninox_core::hooks::append_work_request(&sessions_dir, &session_id, description)?;
+    println!(
+        "work request {} recorded — the orchestrator will be asked to spawn a worker for it",
+        request.id,
+    );
+    Ok(())
+}
 
 async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
     let config = AppConfig::load().unwrap_or_default();
@@ -472,7 +522,23 @@ fn has_display() -> bool {
 
 #[cfg(test)]
 mod worker_env_tests {
-    use super::worker_env_vars;
+    use super::{worker_context_footer, worker_env_vars};
+
+    #[test]
+    fn worker_footer_scopes_to_one_pr_and_routes_extra_work_to_request_work() {
+        let footer = worker_context_footer("w1", "orch1");
+        assert!(footer.contains("`w1`"), "must name the worker's own session");
+        assert!(footer.contains("ninox send orch1"), "must keep the message-back channel");
+        assert!(footer.contains("ninox request-work"), "must offer the work-request channel");
+        assert!(
+            footer.to_lowercase().contains("do not"),
+            "must forbid doing out-of-scope work / opening extra PRs",
+        );
+        assert!(
+            footer.contains("one pull request") || footer.contains("one PR"),
+            "must state the one-worker-one-PR contract",
+        );
+    }
 
     #[test]
     fn forwards_brain_and_config_when_present() {

@@ -34,6 +34,45 @@ pub fn format_review_reaction(_session: &Session, comments: &[Comment]) -> Strin
     msg
 }
 
+/// Format a work-request reaction for the *orchestrator*: a worker found
+/// additional work outside its task and wants a new worker spawned for it.
+pub fn format_work_request_reaction(worker: &Session, description: &str) -> String {
+    format!(
+        "[Ninox] Worker `{id}` requested additional work it discovered outside its task:\n\n\
+         {description}\n\n\
+         If this should be done, spawn a new worker for it (`ninox spawn`). \
+         Do not ask the requesting worker to widen its own PR — one worker, one task, one PR.",
+        id = worker.id,
+    )
+}
+
+/// Format an extra-PR reaction for the *orchestrator*: a worker opened PRs
+/// beyond the one its session tracks. `extras` is every untracked (number,
+/// url) pair, oldest first.
+pub fn format_extra_pr_reaction(
+    worker:     &Session,
+    tracked_pr: u64,
+    extras:     &[(u64, Option<String>)],
+) -> String {
+    let mut msg = format!(
+        "[Ninox] Worker `{id}` opened {count} PR{plural} beyond its tracked PR #{tracked_pr}:\n",
+        id     = worker.id,
+        count  = extras.len(),
+        plural = if extras.len() == 1 { "" } else { "s" },
+    );
+    for (number, url) in extras {
+        match url {
+            Some(u) => msg.push_str(&format!("  - #{number} ({u})\n")),
+            None    => msg.push_str(&format!("  - #{number}\n")),
+        }
+    }
+    msg.push_str(
+        "\nOne worker, one PR — Ninox only tracks the first. Review each extra PR and \
+         either close it or hand it to a dedicated worker so CI and reviews are tracked.",
+    );
+    msg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +112,30 @@ mod tests {
         assert!(msg.contains("src/main.rs:42"));
         assert!(msg.contains("Rename this variable"));
         assert!(msg.contains("reviewer"));
+    }
+
+    #[test]
+    fn work_request_reaction_tells_orchestrator_to_spawn() {
+        let worker = mock_session();
+        let msg = format_work_request_reaction(&worker, "Migrate the config loader to TOML");
+        assert!(msg.contains("s1"), "must name the requesting worker");
+        assert!(msg.contains("Migrate the config loader to TOML"));
+        assert!(msg.contains("ninox spawn"), "must point at the spawn path, not the worker");
+        assert!(msg.to_lowercase().contains("do not"), "must forbid widening the worker's scope");
+    }
+
+    #[test]
+    fn extra_pr_reaction_names_every_extra_pr_and_the_tracked_one() {
+        let worker = mock_session(); // tracked PR #7
+        let extras = vec![
+            (9u64,  Some("https://github.com/org/repo/pull/9".to_string())),
+            (11u64, None),
+        ];
+        let msg = format_extra_pr_reaction(&worker, 7, &extras);
+        assert!(msg.contains("#7"), "must name the tracked PR");
+        assert!(msg.contains("#9") && msg.contains("#11"), "must list every extra PR");
+        assert!(msg.contains("https://github.com/org/repo/pull/9"));
+        assert!(msg.contains("s1"));
     }
 
     #[test]
