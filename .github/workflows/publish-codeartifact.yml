@@ -186,7 +186,7 @@ jobs:
           # ours): first two chars / next two chars / full name.
           index_path="${crate:0:2}/${crate:2:2}/${crate}"
           for i in $(seq 1 30); do
-            if curl -fsS -u "aws:${token}" \
+            if curl -fsS -H "Authorization: ${token}" \
                 "${endpoint}${index_path}" 2> /dev/null \
                 | jq -e -s --arg v "${version}" 'any(.[]; .vers == $v)' > /dev/null; then
               echo "${crate} ${version} is live in the index."
@@ -269,7 +269,7 @@ jobs:
           PY
           # Touch every index file; 404s (never-cached crates) and other
           # errors are fine — the point is triggering the refreshes.
-          xargs -P 16 -I{} curl -fs -o /dev/null --max-time 30 -u "aws:${token}" "${endpoint}{}" \
+          xargs -P 16 -I{} curl -fs -o /dev/null --max-time 30 -H "Authorization: ${token}" "${endpoint}{}" \
             < /tmp/index-paths.txt || true
           echo "Touched $(wc -l < /tmp/index-paths.txt) index files; polling until the lockfile resolves..."
           for i in $(seq 1 40); do
