@@ -237,7 +237,17 @@ pub fn session_detail<'a>(
     let is_orchestrator = app.orchestrators.iter().any(|o| o.id == session_id);
 
     let pr_stamp: Element<Message> = match session.pr_number {
-        Some(n) => crate::style::stamp(&format!("PR #{n}"), ci_color.unwrap_or(s.status_pr_open)),
+        Some(n) => {
+            let stamp = crate::style::stamp(&format!("PR #{n}"), ci_color.unwrap_or(s.status_pr_open));
+            // Clickable when a browser URL is resolvable — opens the PR.
+            match crate::app::pr_url_for_session(&app.prs, session) {
+                Some(url) => iced::widget::mouse_area(stamp)
+                    .interaction(iced::mouse::Interaction::Pointer)
+                    .on_press(Message::OpenUrl(url))
+                    .into(),
+                None => stamp,
+            }
+        }
         None => Space::new(0, 0).into(),
     };
 

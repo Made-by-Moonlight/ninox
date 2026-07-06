@@ -16,6 +16,28 @@ fn field<'a>(label: &'static str, value: String, s: &'a ColorScheme) -> Element<
     .into()
 }
 
+/// A key/value row whose value opens `url` in the browser when clicked.
+fn link_field<'a>(
+    label: &'static str,
+    value: String,
+    url: String,
+    s: &'a ColorScheme,
+) -> Element<'a, Message> {
+    row![
+        container(crate::style::micro_label(label, s.faint)).width(Length::Fixed(180.0)),
+        iced::widget::rich_text![
+            iced::widget::span(value)
+                .color(s.accent)
+                .underline(true)
+                .link(Message::OpenUrl(url))
+        ]
+        .size(11.5)
+        .font(crate::style::MONO),
+    ]
+    .align_y(Alignment::Center)
+    .into()
+}
+
 /// Renders the `Burn` field per the Field Notes kv-sheet spec
 /// (`docs/design-concepts/03-field-notes.html`: `<dt>Burn</dt><dd><b>$3.60</b> · 214k tokens</dd>`) —
 /// dollar cost plus the current context-window occupancy, once the usage
@@ -62,7 +84,10 @@ pub fn inspector_panel<'a>(app: &'a App, session: &'a Session) -> Element<'a, Me
         field("Agent",          session.agent_type.clone(), s),
         field("Orchestrator",   orchestrator_name.to_string(), s),
         field("Burn",           format_burn(session.cost_usd, session.context_tokens), s),
-        field("PR",             session.pr_number.map(|n| format!("#{n}")).unwrap_or("—".into()), s),
+        match (session.pr_number, crate::app::pr_url_for_session(&app.prs, session)) {
+            (Some(n), Some(url)) => link_field("PR", format!("#{n}"), url, s),
+            (n, _) => field("PR", n.map(|n| format!("#{n}")).unwrap_or("—".into()), s),
+        },
         field("PID",            session.pid.map(|p| p.to_string()).unwrap_or("—".into()), s),
         field("Workspace",      session.workspace_path.clone().unwrap_or("—".into()), s),
         field("Started (unix)", session.started_at.to_string(), s),
