@@ -209,6 +209,9 @@ pub enum Message {
     /// still resumable — see `resume_plan`). Unlike `RefileSession`, this
     /// reuses the existing id instead of minting a fresh one.
     ResumeSession(SessionId),
+    /// Fan out to one `Message::ResumeSession` per currently `Interrupted`
+    /// session — the Fleet board's bulk "Resume all (N)" control.
+    ResumeAllSessions,
     SwitchTheme(ThemeVariant),
     // Raw key event from the global subscription — bytes are computed in the handler
     // where we have access to the terminal mode (APP_CURSOR changes arrow sequences).
@@ -1440,6 +1443,16 @@ impl App {
                         None       => Message::Noop,
                     }
                 })
+            }
+
+            Message::ResumeAllSessions => {
+                let ids: Vec<SessionId> = state.sessions.values()
+                    .filter(|s| matches!(s.status, ninox_core::SessionStatus::Interrupted))
+                    .map(|s| s.id.clone())
+                    .collect();
+                Task::batch(ids.into_iter().map(|id| {
+                    Task::done(Message::ResumeSession(id))
+                }))
             }
 
             Message::RawKey { key, modifiers, text } => {
