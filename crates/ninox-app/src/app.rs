@@ -285,13 +285,14 @@ pub fn refile_plan(
     session: &Session,
     is_orchestrator: bool,
     config: &AppConfig,
+    claude_session_id: &str,
 ) -> Option<RefilePlan> {
     let workspace = session.workspace_path.clone()?;
     let agent = ninox_core::config::AgentConfig {
         harness: session.agent_type.clone(),
         model:   session.model.clone(),
     };
-    let base_cmd = config.registry().interactive_cmd(&agent);
+    let base_cmd = config.registry().interactive_cmd(&agent, claude_session_id);
     let catalogue_path = session.catalogue_path.clone()
         .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
     let extra_env = if is_orchestrator {
@@ -1254,7 +1255,8 @@ impl App {
             Message::RefileSession(id) => {
                 let Some(session) = state.sessions.get(&id).cloned() else { return Task::none(); };
                 let is_orch = state.orchestrators.iter().any(|o| o.id == id);
-                let Some(plan) = refile_plan(&session, is_orch, &state.config) else {
+                let claude_session_id = ninox_core::harness::new_claude_session_id();
+                let Some(plan) = refile_plan(&session, is_orch, &state.config, &claude_session_id) else {
                     tracing::warn!("refile {id}: no workspace recorded, cannot respawn");
                     return Task::none();
                 };
@@ -1291,6 +1293,8 @@ impl App {
                             catalogue_path:  plan.catalogue_path,
                             extra_env:       plan.extra_env,
                             started_at:      ts,
+                            claude_session_id,
+                            failure_status:  ninox_core::SessionStatus::Terminated,
                         },
                     )
                     .await;
@@ -2562,7 +2566,7 @@ mod tests {
             ..Default::default()
         });
         let session = refile_session("s1");
-        let plan = refile_plan(&session, false, &cfg).expect("plan");
+        let plan = refile_plan(&session, false, &cfg, "fresh-uuid").expect("plan");
         assert_eq!(plan.base_cmd, "claude-nightly --model 'claude-opus-4-8'");
         assert_eq!(plan.workspace, "/tmp/ws");
         assert_eq!(plan.catalogue_path, "/brains/b");
@@ -2576,7 +2580,7 @@ mod tests {
         let cfg = ninox_core::config::AppConfig::default();
         let mut session = refile_session("o1");
         session.catalogue_path = None;
-        let plan = refile_plan(&session, true, &cfg).expect("plan");
+        let plan = refile_plan(&session, true, &cfg, "fresh-uuid").expect("plan");
         assert!(plan.extra_env.iter().any(|(k, v)| k == "NINOX_ORCHESTRATOR_ID" && v == "o1"));
         assert!(plan.extra_env.iter().any(|(k, _)| k == "NINOX_CALLER_TYPE"));
         // The legacy ATHENE_/AO_ transition names are gone.
@@ -2585,7 +2589,17 @@ mod tests {
         assert!(!plan.catalogue_path.is_empty());
 
         session.workspace_path = None;
-        assert!(refile_plan(&session, true, &cfg).is_none());
+        assert!(refile_plan(&session, true, &cfg, "fresh-uuid").is_none());
+    }
+
+    #[test]
+    fn refile_plan_uses_the_freshly_generated_id_not_the_stale_one() {
+        let cfg = ninox_core::config::AppConfig::default();
+        let mut session = refile_session("s1");
+        session.claude_session_id = Some("stale-id-from-before".into());
+        let plan = refile_plan(&session, false, &cfg, "brand-new-id").expect("plan");
+        assert!(plan.base_cmd.contains("brand-new-id"));
+        assert!(!plan.base_cmd.contains("stale-id-from-before"));
     }
 
     #[test]
