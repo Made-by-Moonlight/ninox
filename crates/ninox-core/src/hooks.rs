@@ -493,7 +493,7 @@ mod tests {
         let first = append_work_request(dir.path(), "s1", "task a").unwrap();
         let second = append_work_request(dir.path(), "s1", "task b").unwrap();
 
-        mark_work_requests_delivered(dir.path(), "s1", &[first.id.clone()]).unwrap();
+        mark_work_requests_delivered(dir.path(), "s1", std::slice::from_ref(&first.id)).unwrap();
 
         let pending = read_pending_work_requests(dir.path(), "s1").unwrap();
         assert_eq!(pending.len(), 1);
