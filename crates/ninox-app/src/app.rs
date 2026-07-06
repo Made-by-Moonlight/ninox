@@ -2161,6 +2161,19 @@ Send instructions or follow-ups to a worker using its session ID:
 {ninox_bin} send ath-123-auth-fix "Focus on the token refresh path first"
 ```
 
+## Work Requests (Worker → Orchestrator)
+
+Workers are scoped to one task and one PR. When a worker discovers additional
+work, it runs `{ninox_bin} request-work "<description>"` and Ninox forwards
+the request to you as a `[Ninox] Worker … requested additional work` message.
+
+When one arrives: decide whether the work is worth doing, and if so
+spawn a new worker for it with `{ninox_bin} spawn`. **Never** tell a worker to widen
+its own task or PR — extra scope always gets its own worker. Ninox will also
+warn you (`[Ninox] Worker … opened N PRs beyond its tracked PR`) if a worker
+opens extra PRs anyway; review each extra PR and either close it or hand it
+to a dedicated worker.
+
 ## The Rule
 
 **Never use the Agent tool for implementation work.** All implementation goes
@@ -4096,6 +4109,28 @@ mod tests {
         assert!(
             matches!(m.view, View::PrList),
             "\"1\" must not navigate while the spawn modal is open"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_skill_teaches_work_request_handling() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+
+        let skill = std::fs::read_to_string(
+            root.join("skills").join("spawn-worker").join("SKILL.md"),
+        ).unwrap();
+        assert!(
+            skill.contains("request-work"),
+            "skill must explain the worker→orchestrator work-request channel"
+        );
+        assert!(
+            skill.contains("spawn a new worker") || skill.contains("spawn a dedicated worker"),
+            "skill must tell the orchestrator to spawn a worker for requested work"
+        );
+        assert!(
+            skill.to_lowercase().contains("never") && skill.to_lowercase().contains("widen"),
+            "skill must forbid widening an existing worker's scope"
         );
     }
 

@@ -84,6 +84,12 @@ pub struct Comment {
 #[serde(rename_all = "snake_case")]
 pub enum NotificationKind {
     CiFailure, AgentStuck, PrNeedsAttention, MergeConflict, WorkerDone,
+    /// A worker asked the orchestrator to schedule additional work it
+    /// discovered outside its own task (`ninox request-work`).
+    WorkRequested,
+    /// A worker opened a PR beyond the one its session tracks — one worker,
+    /// one PR is the contract, so this needs orchestrator attention.
+    ExtraPr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +125,18 @@ mod tests {
         }"#;
         let n: Notification = serde_json::from_str(json).expect("missing created_at must not error");
         assert_eq!(n.created_at, 0);
+    }
+
+    #[test]
+    fn notification_kind_serde_covers_work_requested_and_extra_pr() {
+        for (kind, wire) in [
+            (NotificationKind::WorkRequested, "\"work_requested\""),
+            (NotificationKind::ExtraPr,       "\"extra_pr\""),
+        ] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
+            let parsed: NotificationKind = serde_json::from_str(wire).unwrap();
+            assert_eq!(parsed, kind);
+        }
     }
 
     #[test]

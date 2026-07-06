@@ -235,6 +235,24 @@ impl Store {
         Ok(())
     }
 
+    pub fn get_pr(&self, id: PrId) -> Result<Option<PR>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, number, title, url, body, session_id FROM prs WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([id], |r| {
+            Ok(PR {
+                id:         r.get(0)?,
+                number:     r.get(1)?,
+                title:      r.get(2)?,
+                url:        r.get(3)?,
+                body:       r.get(4)?,
+                session_id: r.get(5)?,
+            })
+        })?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
     pub fn upsert_ci_status(&self, ci: &CIStatus) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -388,6 +406,22 @@ mod tests {
         s.started_at = 200;
         store.upsert_session(&s).unwrap();
         assert_eq!(store.get_session("s3").unwrap().unwrap().started_at, 200);
+    }
+
+    #[test]
+    fn get_pr_round_trips_and_misses_cleanly() {
+        let store = test_store();
+        assert!(store.get_pr(9).unwrap().is_none());
+        let pr = PR {
+            id: 9, number: 9, title: "t".into(),
+            url: "https://github.com/org/repo/pull/9".into(),
+            body: String::new(), session_id: "s1".into(),
+        };
+        store.upsert_pr(&pr).unwrap();
+        let found = store.get_pr(9).unwrap().unwrap();
+        assert_eq!(found.number, 9);
+        assert_eq!(found.session_id, "s1");
+        assert_eq!(found.url, pr.url);
     }
 
     #[test]
