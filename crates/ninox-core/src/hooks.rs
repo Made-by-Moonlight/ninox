@@ -296,16 +296,35 @@ pub fn read_pending_work_requests(dir: &Path, session_id: &str) -> Result<Vec<Wo
 
 /// Mark work requests delivered by renaming their file out of the pending
 /// set (`.json` → `.json.delivered`) — kept on disk as an audit trail.
+/// Best-effort per id: one failed rename must not leave *later* ids pending
+/// (they would be fully re-delivered next tick); the first error is
+/// returned after every id has been attempted.
 pub fn mark_work_requests_delivered(dir: &Path, session_id: &str, ids: &[String]) -> Result<()> {
     let requests_dir = work_requests_dir(dir, session_id);
+    let mut first_err: Option<std::io::Error> = None;
     for id in ids {
         let path = requests_dir.join(format!("{id}.json"));
         if path.exists() {
             let delivered = requests_dir.join(format!("{id}.json.delivered"));
-            std::fs::rename(&path, &delivered)?;
+            if let Err(e) = std::fs::rename(&path, &delivered) {
+                first_err.get_or_insert(e);
+            }
         }
     }
-    Ok(())
+    match first_err {
+        Some(e) => Err(e.into()),
+        None    => Ok(()),
+    }
+}
+
+/// Delete every metadata artifact for a session: the shared JSON, the
+/// work-request directory, and the notified-PRs marker. Best-effort — used
+/// when a session is removed, so a later session reusing the same id
+/// doesn't inherit stale suppressions or pending requests.
+pub fn remove_session_artifacts(dir: &Path, session_id: &str) {
+    let _ = std::fs::remove_file(metadata_path(dir, session_id));
+    let _ = std::fs::remove_dir_all(work_requests_dir(dir, session_id));
+    let _ = std::fs::remove_file(notified_prs_path(dir, session_id));
 }
 
 /// Extra PRs (beyond the session's tracked one) that have already been
@@ -485,6 +504,29 @@ mod tests {
     fn pending_work_requests_empty_when_none_recorded() {
         let dir = tempdir().unwrap();
         assert!(read_pending_work_requests(dir.path(), "s1").unwrap().is_empty());
+    }
+
+    /// Removing a session must clear every metadata artifact, or a reused
+    /// session id (they're slugified human-chosen names) inherits the old
+    /// session's notified-PR suppressions and stale pending requests.
+    #[test]
+    fn remove_session_artifacts_clears_all_files_for_that_session_only() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("s1.json"), "{}").unwrap();
+        append_work_request(dir.path(), "s1", "task").unwrap();
+        mark_extra_prs_notified(dir.path(), "s1", &[9]).unwrap();
+        std::fs::write(dir.path().join("s2.json"), "{}").unwrap();
+        append_work_request(dir.path(), "s2", "other").unwrap();
+
+        remove_session_artifacts(dir.path(), "s1");
+
+        assert!(!dir.path().join("s1.json").exists());
+        assert!(!dir.path().join("s1.requests").exists());
+        assert!(!dir.path().join("s1.notified-prs.json").exists());
+        assert!(dir.path().join("s2.json").exists(), "other sessions untouched");
+        assert_eq!(read_pending_work_requests(dir.path(), "s2").unwrap().len(), 1);
+        // Idempotent on a session with no artifacts.
+        remove_session_artifacts(dir.path(), "missing");
     }
 
     /// The extra-PR "already notified" marker is a poller-owned side file —

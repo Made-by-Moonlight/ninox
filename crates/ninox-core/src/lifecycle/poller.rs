@@ -113,15 +113,12 @@ impl Poller {
 
             // -- Every reported PR beyond the tracked one --
             let Some(tracked) = session.pr_number else { continue };
-            let notified = hooks::read_notified_extra_prs(sessions_dir, &session.id);
-            let mut fresh: Vec<(u64, Option<String>)> = Vec::new();
-            for report in meta.pr_reports.iter()
-                .filter(|r| r.number != tracked && !notified.contains(&r.number))
-            {
-                // Record the extra PR in the ledger, but only when the row id
-                // (bare PR number — collides across repos) is free: never
-                // steal another session's row. Dedup lives in the side file,
-                // not here.
+
+            // Ledger rows first, every tick: a store error at notification
+            // time must only defer the row to the next tick, never lose it.
+            // Only write when the row id (bare PR number — collides across
+            // repos) is free: never steal another session's row.
+            for report in meta.pr_reports.iter().filter(|r| r.number != tracked) {
                 if let Ok(None) = self.engine.store.get_pr(report.number as i64) {
                     let url = report.url.clone().unwrap_or_else(|| {
                         format!("https://github.com/{}/pull/{}", session.repo, report.number)
@@ -135,6 +132,14 @@ impl Poller {
                         session_id: session.id.clone(),
                     });
                 }
+            }
+
+            // Notifications second, deduped via the poller-owned side file.
+            let notified = hooks::read_notified_extra_prs(sessions_dir, &session.id);
+            let mut fresh: Vec<(u64, Option<String>)> = Vec::new();
+            for report in meta.pr_reports.iter()
+                .filter(|r| r.number != tracked && !notified.contains(&r.number))
+            {
                 self.engine.emit(Event::Notification(Notification {
                     id:         format!("extra-pr-{}-{}", session.id, report.number),
                     kind:       NotificationKind::ExtraPr,
@@ -766,6 +771,48 @@ mod tests {
                 e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkRequested
             )),
             "work requests outlive their session",
+        );
+    }
+
+    /// The ledger row for an extra PR is best-effort at notification time (a
+    /// busy store must not kill the alert) — but it must self-heal on later
+    /// ticks rather than be lost forever, and healing must not re-notify.
+    #[tokio::test]
+    async fn extra_pr_ledger_row_backfills_after_notification_without_renotifying() {
+        use crate::store::Store;
+
+        let sessions_dir = tempfile::tempdir().unwrap();
+        let meta = serde_json::json!({
+            "agentReportedPrs": [
+                {"number": "7", "url": "https://github.com/org/repo/pull/7"},
+                {"number": "9", "url": "https://github.com/org/repo/pull/9"},
+            ],
+        });
+        std::fs::write(
+            sessions_dir.path().join("s1.json"),
+            serde_json::to_string(&meta).unwrap(),
+        ).unwrap();
+        // Simulate "notified previously, but the row write failed that tick".
+        hooks::mark_extra_prs_notified(sessions_dir.path(), "s1", &[9]).unwrap();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", "/ws")).unwrap();
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        assert!(
+            store.get_pr(9).unwrap().is_some(),
+            "already-notified extra PR must still get its ledger row backfilled",
+        );
+        let events = drain_events(&mut rx);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e, Event::Notification(n) if n.kind == crate::types::NotificationKind::ExtraPr
+            )),
+            "backfilling the row must not re-notify",
         );
     }
 
