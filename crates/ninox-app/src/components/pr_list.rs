@@ -57,7 +57,8 @@ fn pr_row<'a>(app: &'a App, pr: &'a PR) -> Element<'a, Message> {
     let session_id = pr.session_id.clone();
 
     // Transparent-until-hover, shared by the navigate row and the open
-    // button so the two halves read as one ledger line.
+    // button (each half highlights independently on hover — that's the
+    // affordance boundary between "go to session" and "open in browser").
     let row_style = move |_t: &iced::Theme, status: button::Status| button::Style {
         // Normal state stays transparent so the ledger's card background
         // shows through; hover swaps to `paper` so it visibly differs.
@@ -116,7 +117,9 @@ fn pr_row<'a>(app: &'a App, pr: &'a PR) -> Element<'a, Message> {
     )
     .on_press(Message::OpenUrl(pr.url.clone()))
     .width(Length::Fixed(LINK_COL_WIDTH))
-    .padding([12, 0])
+    // 17 = nav's default button padding (5) + its inner row padding (12),
+    // so both halves are the same height.
+    .padding([17, 0])
     .style(row_style);
 
     row![nav, open].align_y(Alignment::Center).into()

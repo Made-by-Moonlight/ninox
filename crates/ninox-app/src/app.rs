@@ -2087,7 +2087,12 @@ pub fn pr_url_for_session(
     session: &Session,
 ) -> Option<String> {
     let number = session.pr_number?;
-    if let Some(pr) = session.pr_id.and_then(|id| prs.get(&id)) {
+    // `prs` is keyed by bare PR number, which collides across repos — only
+    // trust a row recorded for this very session.
+    if let Some(pr) = session.pr_id
+        .and_then(|id| prs.get(&id))
+        .filter(|pr| pr.session_id == session.id)
+    {
         return Some(pr.url.clone());
     }
     if session.repo.is_empty() {
@@ -2419,6 +2424,24 @@ mod tests {
         assert_eq!(
             pr_url_for_session(&prs, &session).as_deref(),
             Some("https://github.com/org/repo/pull/9"),
+        );
+    }
+
+    /// `prs` is keyed by bare PR number, which collides across repos — a
+    /// row recorded for another session must not serve its URL here; the
+    /// repo-slug fallback is the correct answer.
+    #[test]
+    fn pr_url_for_session_ignores_another_sessions_colliding_pr_row() {
+        let mut prs = HashMap::new();
+        prs.insert(5i64, ninox_core::types::PR {
+            id: 5, number: 5, title: "other".into(),
+            url: "https://github.com/org/other-repo/pull/5".into(),
+            body: String::new(), session_id: "someone-else".into(),
+        });
+        let session = pr_session(Some(5), Some(5), "org/repo");
+        assert_eq!(
+            pr_url_for_session(&prs, &session).as_deref(),
+            Some("https://github.com/org/repo/pull/5"),
         );
     }
 
