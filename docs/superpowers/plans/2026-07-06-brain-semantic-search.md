@@ -15,7 +15,7 @@
 - Query text gets the instruction prefix `"Represent this sentence for searching relevant passages: "`; passage/entry text never does.
 - No `--limit` CLI flag, no similarity threshold, no document chunking beyond a fixed truncation, no reranking model, no ANN/vector index. These are explicit non-goals in the spec — do not add them.
 - `rebuild()` and `query()` degrade to exactly today's keyword-only behavior when passed `embedder: None`. This must hold for every code path touched.
-- `cargo test --workspace` must never require network access or the real ONNX model. All new logic is tested through `Embedder`-trait fakes.
+- The non-ignored `cargo test --workspace` suite must never download or run the real ONNX model — all new logic is tested through `Embedder`-trait fakes, and any test needing the real model is `#[ignore]`d. Building `ninox-core` at all (a prerequisite of running any test in the workspace) does require network access on a machine with no cached ONNX Runtime binary — this is `ort`'s (fastembed's ONNX backend) `download-binaries` build step, a disclosed and accepted trade-off of choosing `fastembed` over hand-rolling inference (see the design spec's "Approach" section). This is a correction to this constraint's original wording, made after Task 3's review surfaced that the original phrasing ("must never require network access", full stop) was broader than what was actually approved or achievable — normal environments (CI runners, dev machines) have network access, so this doesn't block anything in practice.
 
 ---
 
