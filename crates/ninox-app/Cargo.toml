@@ -28,3 +28,11 @@ ttf-parser = "0.25"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Used only to drive `iced::Task<Message>` (returned from `App::update`) to
+# completion synchronously in tests — e.g. the ResumeSession/RefileSession
+# failure-path regression tests, which need to observe the store mutation
+# the Task's async block performs. Both are already transitive deps of
+# `iced` at the exact versions pinned here (see Cargo.lock), so this adds
+# no new dependency, just a direct edge to what's already resolved.
+iced_runtime = "0.13"
+futures = "0.3"

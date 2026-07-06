@@ -204,6 +204,11 @@ pub enum Message {
     /// CURRENT registry settings (session header, beside Kill). On a
     /// Terminated husk this "just spawns".
     RefileSession(SessionId),
+    /// Relaunch an `Interrupted` session by continuing its stored
+    /// `claude_session_id` (tmux pane gone, but the Claude session id is
+    /// still resumable — see `resume_plan`). Unlike `RefileSession`, this
+    /// reuses the existing id instead of minting a fresh one.
+    ResumeSession(SessionId),
     SwitchTheme(ThemeVariant),
     // Raw key event from the global subscription — bytes are computed in the handler
     // where we have access to the terminal mode (APP_CURSOR changes arrow sequences).
@@ -338,6 +343,36 @@ pub fn refile_plan(
         model:   session.model.clone(),
     };
     let base_cmd = config.registry().interactive_cmd(&agent, claude_session_id);
+    let catalogue_path = session.catalogue_path.clone()
+        .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
+    let extra_env = if is_orchestrator {
+        vec![
+            ("NINOX_ORCHESTRATOR_ID".to_string(), session.id.clone()),
+            ("NINOX_CALLER_TYPE".to_string(),     "orchestrator".to_string()),
+        ]
+    } else {
+        Vec::new()
+    };
+    Some(RefilePlan { agent, base_cmd, workspace, catalogue_path, extra_env })
+}
+
+/// Like `refile_plan`, but rebuilds via `resume_cmd` (continuing the
+/// existing `claude_session_id`) instead of `interactive_cmd` (starting
+/// fresh). `None` when there's no workspace to resume into OR no stored
+/// `claude_session_id` OR the harness can't resume (`resume_cmd` returns
+/// `None`) — any of which means there's nothing to relaunch into.
+pub fn resume_plan(
+    session: &Session,
+    is_orchestrator: bool,
+    config: &AppConfig,
+) -> Option<RefilePlan> {
+    let workspace = session.workspace_path.clone()?;
+    let claude_session_id = session.claude_session_id.as_deref()?;
+    let agent = ninox_core::config::AgentConfig {
+        harness: session.agent_type.clone(),
+        model:   session.model.clone(),
+    };
+    let base_cmd = config.registry().resume_cmd(&agent, claude_session_id)?;
     let catalogue_path = session.catalogue_path.clone()
         .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
     let extra_env = if is_orchestrator {
@@ -1349,6 +1384,54 @@ impl App {
                             started_at:      ts,
                             claude_session_id,
                             failure_status:  ninox_core::SessionStatus::Terminated,
+                        },
+                    )
+                    .await;
+                    match attach {
+                        Some(argv) => Message::ClientAttach { session_id: id, argv },
+                        None       => Message::Noop,
+                    }
+                })
+            }
+
+            Message::ResumeSession(id) => {
+                let Some(session) = state.sessions.get(&id).cloned() else { return Task::none(); };
+                let is_orch = state.orchestrators.iter().any(|o| o.id == id);
+                let Some(plan) = resume_plan(&session, is_orch, &state.config) else {
+                    tracing::warn!("resume {id}: no workspace/claude_session_id/resume-capable harness, cannot resume");
+                    return Task::none();
+                };
+                let Some(claude_session_id) = session.claude_session_id.clone() else {
+                    return Task::none(); // unreachable: resume_plan already required this
+                };
+                state.clients.remove(&id);
+                state.terminals.remove(&id);
+
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let engine  = state.engine.clone();
+                let name    = session.name.clone();
+                let repo    = session.repo.clone();
+                let orch_id = session.orchestrator_id.clone();
+                Task::future(async move {
+                    let _ = ninox_core::tmux::kill_session(&id).await;
+                    let attach = crate::spawn_util::spawn_interactive_session(
+                        engine,
+                        crate::spawn_util::InteractiveSpawnParams {
+                            session_id:      id.clone(),
+                            name,
+                            workspace:       plan.workspace,
+                            repo,
+                            orchestrator_id: orch_id,
+                            agent:           plan.agent,
+                            base_cmd:        plan.base_cmd,
+                            catalogue_path:  plan.catalogue_path,
+                            extra_env:       plan.extra_env,
+                            started_at:      ts,
+                            claude_session_id,
+                            failure_status:  ninox_core::SessionStatus::Interrupted,
                         },
                     )
                     .await;
@@ -2668,6 +2751,101 @@ mod tests {
         // session record itself stays (the respawn upserts it to Working).
         assert!(!m.terminals.contains_key("s1"));
         assert!(m.sessions.contains_key("s1"));
+    }
+
+    #[test]
+    fn resume_plan_builds_a_resume_command_from_the_stored_id() {
+        let cfg = ninox_core::config::AppConfig::default();
+        let mut session = refile_session("s1");
+        session.claude_session_id = Some("stored-uuid".into());
+        let plan = resume_plan(&session, false, &cfg).expect("plan");
+        assert!(plan.base_cmd.contains("--resume"));
+        assert!(plan.base_cmd.contains("stored-uuid"));
+        assert_eq!(plan.workspace, "/tmp/ws");
+    }
+
+    #[test]
+    fn resume_plan_none_without_a_stored_claude_session_id() {
+        let cfg = ninox_core::config::AppConfig::default();
+        let session = refile_session("s1"); // claude_session_id: None by default in this fixture
+        assert!(resume_plan(&session, false, &cfg).is_none());
+    }
+
+    #[test]
+    fn resume_message_relaunches_and_attaches() {
+        let e = test_engine();
+        let mut m = base(e);
+        let mut s = refile_session("s1");
+        s.status = SessionStatus::Interrupted;
+        s.claude_session_id = Some("stored-uuid".into());
+        m.sessions.insert("s1".into(), s.clone());
+        m.engine.store.upsert_session(&s).unwrap();
+        m.terminals.insert("s1".into(), TerminalState::new(80, 24, None));
+        let (m, _) = m.update(Message::ResumeSession("s1".into()));
+        // Mirrors `refile_message_drops_client_state_and_keeps_session`:
+        // the stale grid is dropped so the respawned PTY starts clean; the
+        // session record itself stays (the respawn upserts it to Working).
+        // Actually executing the returned `Task` needs a real async
+        // executor driving a real tmux server — that end-to-end behavior is
+        // covered by `resume_message_keeps_status_interrupted_when_tmux_create_fails`
+        // below; this test only checks the synchronous state `update()`
+        // itself mutates, same as its Re-file twin.
+        assert!(!m.terminals.contains_key("s1"));
+        assert!(m.sessions.contains_key("s1"));
+    }
+
+    #[tokio::test]
+    async fn resume_message_keeps_status_interrupted_when_tmux_create_fails() {
+        // Driving `Message::ResumeSession`'s `Task` to completion needs a
+        // real async executor — no other test in this file does that for a
+        // `Task<Message>` (the closest sibling, `stale_client_closed_...`,
+        // drives real tmux calls directly, not the `Task` an `update()` call
+        // returns), so this uses `iced_runtime::task::into_stream` +
+        // `futures::StreamExt` to run it for real, exactly the way iced's
+        // own runtime would.
+        //
+        // Triggering a real `tmux::create_session` failure here can't reuse
+        // the collision trick `spawn_util::spawn_failure_uses_the_caller_supplied_failure_status`
+        // uses (pre-create a live session under the same id so `new-session`
+        // collides with tmux's own "duplicate session" error): unlike that
+        // test, which calls `spawn_interactive_session` directly, the real
+        // `Message::ResumeSession` handler kills any live tmux session under
+        // the same id *first* (`ninox_core::tmux::kill_session`) before
+        // creating the new one — so a pre-created collision would just get
+        // killed and the respawn would succeed. And a bad `-c <workspace>`
+        // path (the brief's literal suggestion) doesn't reliably fail
+        // `tmux new-session` on this machine's tmux either (3.6a returns
+        // exit 0 and only the spawned shell dies asynchronously — the same
+        // finding Task 5 made). Instead, a NUL byte embedded in the
+        // workspace path makes the underlying `Command::spawn` fail
+        // deterministically — Rust validates argv for interior NULs before
+        // ever exec'ing tmux — independent of tmux version and unaffected
+        // by the preceding `kill_session` call (whose own args don't
+        // contain the workspace path).
+        use futures::StreamExt;
+
+        let e = test_engine();
+        let mut m = base(e);
+        let mut s = refile_session("s1");
+        s.status = SessionStatus::Interrupted;
+        s.claude_session_id = Some("stored-uuid".into());
+        s.workspace_path = Some("/definitely/does/not/exist/ever\0".into());
+        m.sessions.insert("s1".into(), s.clone());
+        m.engine.store.upsert_session(&s).unwrap();
+
+        let (m, task) = m.update(Message::ResumeSession("s1".into()));
+        let mut stream = iced_runtime::task::into_stream(task)
+            .expect("ResumeSession must produce a real Task, not Task::none()");
+        // `Task::future` yields exactly one `Action::Output(message)`; drive
+        // it to completion and ignore the resulting `Message` (Noop on the
+        // failure path this test forces).
+        let _ = stream.next().await;
+
+        let session = m.engine.store.get_session("s1").unwrap().unwrap();
+        assert!(
+            matches!(session.status, SessionStatus::Interrupted),
+            "a failed Resume must stay Interrupted (retryable), not fall back to Terminated",
+        );
     }
 
     #[test]
