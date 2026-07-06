@@ -202,6 +202,8 @@ async fn run_spawn(
         effective_prompt.push_str(&worker_context_footer(&id, &orch_id_env));
     }
 
+    let claude_session_id = ninox_core::harness::new_claude_session_id();
+
     let session = Session {
         id:              id.clone(),
         orchestrator_id,
@@ -221,6 +223,7 @@ async fn run_spawn(
         // forwarded from the orchestrator's own environment (see the env
         // block below), so record the same value for Re-file.
         catalogue_path:  std::env::var("NINOX_BRAIN").ok().filter(|s| !s.is_empty()),
+        claude_session_id: Some(claude_session_id.clone()),
     };
 
     store.upsert_session(&session)?;
@@ -231,7 +234,7 @@ async fn run_spawn(
     // re-prepend Homebrew or nvm directories, pushing our wrapper behind the
     // real `gh`. By exporting PATH here we win the race after rc files run.
     let cmd_base = registry
-        .worker_cmd(&agent, &effective_prompt)
+        .worker_cmd(&agent, &effective_prompt, &claude_session_id)
         .expect("worker-capability checked before any side effect above");
     let cmd = format!(
         "export PATH='{}':\"$PATH\"; {}",

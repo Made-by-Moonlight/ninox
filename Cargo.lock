@@ -3443,7 +3443,9 @@ dependencies = [
  "chrono",
  "clap",
  "dirs 5.0.1",
+ "futures",
  "iced",
+ "iced_runtime",
  "ninox-core",
  "ninox-server",
  "notify-rust",
@@ -3477,6 +3479,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "uuid",
  "walkdir",
 ]
 

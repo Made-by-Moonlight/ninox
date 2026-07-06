@@ -89,6 +89,7 @@ mod tests {
                 model: None,
                 context_tokens: None,
                 catalogue_path: None,
+                claude_session_id: None,
             })
             .unwrap();
         let app = sessions_router(engine);
@@ -126,6 +127,7 @@ mod tests {
                 model: None,
                 context_tokens: None,
                 catalogue_path: None,
+                claude_session_id: None,
             })
             .unwrap();
         let response = sessions_router(engine)

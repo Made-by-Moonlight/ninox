@@ -31,6 +31,7 @@ pub fn filtered_sessions(app: &App) -> Vec<&Session> {
     }).collect()
 }
 
+#[cfg(test)]
 pub fn board_sessions<'a>(
     app: &'a App,
     status: &SessionStatus,
@@ -55,6 +56,50 @@ pub fn attention_count(app: &App) -> usize {
     app.sessions.values().filter(|s| {
         matches!(s.status, SessionStatus::CiFailed | SessionStatus::ReviewPending)
     }).count()
+}
+
+pub fn interrupted_count(app: &App) -> usize {
+    app.sessions.values().filter(|s| matches!(s.status, SessionStatus::Interrupted)).count()
+}
+
+/// Whether a session with `session_status` is shown under a column whose
+/// header status is `col_status` — either an exact match, or one of the
+/// two "closed-ish"/"stuck-ish" foldings the board applies: `Terminated`
+/// sessions appear under `Done`, and `Interrupted` sessions appear under
+/// `Working` (a session that was mid-task and got cut off belongs with
+/// the sessions still working, not with the ones that finished).
+fn column_absorbs(col_status: &SessionStatus, session_status: &SessionStatus) -> bool {
+    use SessionStatus::*;
+    session_status == col_status
+        || (*col_status == Done && *session_status == Terminated)
+        || (*col_status == Working && *session_status == Interrupted)
+}
+
+/// Like `board_sessions`, but matches via `column_absorbs` instead of exact
+/// status equality — this is what a column actually renders. Duplicates
+/// `board_sessions`' query/orchestrator/scope filtering by design rather
+/// than calling it twice and merging (Terminated-under-Done was previously
+/// done that way, via a base call plus a conditional `.extend()` — adding
+/// a second folded status that way would mean a third additive call, and
+/// still wouldn't help `folio`'s `shown` count reuse the same rule).
+pub fn column_sessions<'a>(
+    app: &'a App,
+    col_status: &SessionStatus,
+    scope: Option<&str>,
+) -> Vec<&'a Session> {
+    let q = app.fleet_filter.query.to_lowercase();
+    let orch_ids: std::collections::HashSet<&str> =
+        app.orchestrators.iter().map(|o| o.id.as_str()).collect();
+    let mut sessions: Vec<&Session> = app.sessions.values().filter(|s| {
+        column_absorbs(col_status, &s.status)
+            && !orch_ids.contains(s.id.as_str())
+            && scope.is_none_or(|oid| s.orchestrator_id.as_deref() == Some(oid))
+            && (q.is_empty()
+                || s.name.to_lowercase().contains(&q)
+                || s.repo.to_lowercase().contains(&q))
+    }).collect();
+    sessions.sort_by(|a, b| a.name.cmp(&b.name));
+    sessions
 }
 
 /// "Morning observations" / … by local hour (spec §5 folio header).
@@ -98,9 +143,8 @@ fn folio<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Element<'a, Mes
 
     let total = total_session_count(app);
     let shown = COLUMNS.iter()
-        .map(|c| board_sessions(app, &c.status, scope.map(|x| x.as_str())).len())
-        .sum::<usize>()
-        + board_sessions(app, &SessionStatus::Terminated, scope.map(|x| x.as_str())).len();
+        .map(|c| column_sessions(app, &c.status, scope.map(|x| x.as_str())).len())
+        .sum::<usize>();
 
     crate::components::folio::folio_scaffold(
         app,
@@ -108,6 +152,7 @@ fn folio<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Element<'a, Mes
             let s = &app.scheme;
             // Split the title so the last word is italic ("Morning *observations*").
             let (head, tail) = title.rsplit_once(' ').unwrap_or(("", title.as_str()));
+            let n = interrupted_count(app);
             row![
                 text(format!("{head} ")).size(34).font(crate::style::SERIF).color(s.ink),
                 text(tail.to_owned()).size(34).font(crate::style::SERIF_ITALIC).color(s.ink),
@@ -117,6 +162,24 @@ fn folio<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Element<'a, Mes
                     .font(crate::style::MONO)
                     .color(s.faint)
                     .wrapping(iced::widget::text::Wrapping::None),
+                if n > 0 { Space::new(14, 0) } else { Space::new(0, 0) },
+                if n > 0 {
+                    button(crate::style::micro_label(&format!("Resume all ({n})"), s.status_review).size(9.5))
+                        .on_press(Message::ResumeAllSessions)
+                        .padding([4, 10])
+                        .style(move |_theme, status| {
+                            let hovered = matches!(status, button::Status::Hovered);
+                            iced::widget::button::Style {
+                                background: hovered.then_some(Background::Color(s.status_review)),
+                                text_color: if hovered { s.card } else { s.status_review },
+                                border: Border { color: s.status_review, width: 1.5, radius: 2.0.into() },
+                                shadow: crate::style::hard_shadow(s, 2.0, 2.0, crate::style::shadow_alpha(s).0),
+                            }
+                        })
+                        .into()
+                } else {
+                    Element::<Message>::from(Space::new(0, 0))
+                },
             ]
             .align_y(Alignment::End)
             .into()
@@ -301,10 +364,7 @@ pub fn fleet_board<'a>(app: &'a App, scope: Option<&'a OrchestratorId>) -> Eleme
             .iter()
             .enumerate()
             .map(|(i, col)| {
-                let mut col_sessions = board_sessions(app, &col.status, scope.map(|s| s.as_str()));
-                if col.status == SessionStatus::Done {
-                    col_sessions.extend(board_sessions(app, &SessionStatus::Terminated, scope.map(|s| s.as_str())));
-                }
+                let col_sessions = column_sessions(app, &col.status, scope.map(|s| s.as_str()));
                 let cards: Vec<Element<Message>> = col_sessions
                     .iter()
                     .map(|s| session_card(app, s))
@@ -345,5 +405,16 @@ mod tests {
         assert_eq!(folio_title(13), "Afternoon observations");
         assert_eq!(folio_title(19), "Evening observations");
         assert_eq!(folio_title(2),  "Night observations");
+    }
+
+    #[test]
+    fn column_absorbs_matches_done_terminated_and_working_interrupted() {
+        use SessionStatus::*;
+        assert!(column_absorbs(&Done, &Terminated));
+        assert!(column_absorbs(&Working, &Interrupted));
+        assert!(column_absorbs(&Working, &Working)); // exact match still counts
+        assert!(!column_absorbs(&Done, &Interrupted));
+        assert!(!column_absorbs(&Working, &Terminated));
+        assert!(!column_absorbs(&PrOpen, &Terminated));
     }
 }
