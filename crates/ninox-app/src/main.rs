@@ -299,6 +299,10 @@ fn worker_env_vars<'a>(
     ninox_config: Option<&'a str>,
 ) -> Vec<(&'a str, &'a str)> {
     let mut env_vec: Vec<(&str, &str)> = vec![
+        ("NINOX_SESSION",   id),
+        ("NINOX_DATA_DIR",  sessions_dir),
+        // Legacy names: wrapper scripts installed by an older ninox read
+        // these; kept until those installs are gone.
         ("ATHENE_SESSION",  id),
         ("ATHENE_DATA_DIR", sessions_dir),
     ];
@@ -323,16 +327,16 @@ fn run_request_work(description: &str) -> anyhow::Result<()> {
     if description.is_empty() {
         anyhow::bail!("request-work needs a non-empty description of the work");
     }
-    let session_id = std::env::var("ATHENE_SESSION")
-        .ok()
-        .filter(|s| !s.is_empty())
+    let session_id = ["NINOX_SESSION", "ATHENE_SESSION"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|s| !s.is_empty()))
         .ok_or_else(|| anyhow::anyhow!(
-            "ATHENE_SESSION is not set — `ninox request-work` only works inside \
+            "NINOX_SESSION is not set — `ninox request-work` only works inside \
              a Ninox worker session"
         ))?;
-    let sessions_dir = std::env::var("ATHENE_DATA_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
+    let sessions_dir = ["NINOX_DATA_DIR", "ATHENE_DATA_DIR"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|s| !s.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(AppConfig::sessions_dir);
     let request = ninox_core::hooks::append_work_request(&sessions_dir, &session_id, description)?;
@@ -546,6 +550,10 @@ mod worker_env_tests {
         assert!(env.contains(&("NINOX_ORCHESTRATOR_ID", "orch1")));
         assert!(env.contains(&("NINOX_BRAIN", "/brain.db")));
         assert!(env.contains(&("NINOX_CONFIG", "/cfg.toml")));
+        assert!(env.contains(&("NINOX_SESSION", "w1")));
+        assert!(env.contains(&("NINOX_DATA_DIR", "/data")));
+        // Legacy names still exported so wrapper scripts installed by an
+        // older ninox keep attributing metadata until they're overwritten.
         assert!(env.contains(&("ATHENE_SESSION", "w1")));
         assert!(env.contains(&("ATHENE_DATA_DIR", "/data")));
     }

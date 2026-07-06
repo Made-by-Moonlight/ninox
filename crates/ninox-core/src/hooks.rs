@@ -41,8 +41,10 @@ pub struct WorkRequest {
 /// from output, and writes it to the session metadata JSON file.
 ///
 /// Env vars consumed at runtime (injected by ninox when spawning the tmux session):
-///   ATHENE_SESSION    — session ID used as metadata filename
-///   ATHENE_DATA_DIR   — directory where {ATHENE_SESSION}.json lives
+///   NINOX_SESSION     — session ID used as metadata filename
+///   NINOX_DATA_DIR    — directory where {NINOX_SESSION}.json lives
+/// (legacy ATHENE_SESSION / ATHENE_DATA_DIR are honored as fallbacks so the
+/// scripts still work when spawned by an older ninox)
 const GH_WRAPPER: &str = r#"#!/usr/bin/env bash
 # Ninox gh wrapper — intercepts gh pr create to record PR metadata.
 set -euo pipefail
@@ -67,11 +69,13 @@ if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
     _output=$("$_real_gh" "$@" 2>&1)
     _exit=$?
     echo "$_output"
-    if [[ $_exit -eq 0 && -n "${ATHENE_SESSION:-}" && -n "${ATHENE_DATA_DIR:-}" ]]; then
+    _nx_session="${NINOX_SESSION:-${ATHENE_SESSION:-}}"
+    _nx_data_dir="${NINOX_DATA_DIR:-${ATHENE_DATA_DIR:-}}"
+    if [[ $_exit -eq 0 && -n "$_nx_session" && -n "$_nx_data_dir" ]]; then
         _pr_url=$(echo "$_output" | grep -oE 'https?://[^/]+/[^/]+/[^/]+/pull/[0-9]+' | head -1)
         if [[ -n "$_pr_url" ]]; then
             _pr_num=$(echo "$_pr_url" | grep -oE '[0-9]+$')
-            _meta_file="${ATHENE_DATA_DIR}/${ATHENE_SESSION}.json"
+            _meta_file="${_nx_data_dir}/${_nx_session}.json"
             mkdir -p "$(dirname "$_meta_file")"
             _tmp="${_meta_file}.tmp.$$"
             if [[ -f "$_meta_file" ]]; then
@@ -137,7 +141,9 @@ fi
 _exit=$?
 
 # On success, capture branch name for checkout -b / switch -c.
-if [[ $_exit -eq 0 && -n "${ATHENE_SESSION:-}" && -n "${ATHENE_DATA_DIR:-}" ]]; then
+_nx_session="${NINOX_SESSION:-${ATHENE_SESSION:-}}"
+_nx_data_dir="${NINOX_DATA_DIR:-${ATHENE_DATA_DIR:-}}"
+if [[ $_exit -eq 0 && -n "$_nx_session" && -n "$_nx_data_dir" ]]; then
     _branch=""
     if [[ "${1:-}" == "checkout" && "${2:-}" == "-b" && -n "${3:-}" ]]; then
         _branch="${3}"
@@ -145,7 +151,7 @@ if [[ $_exit -eq 0 && -n "${ATHENE_SESSION:-}" && -n "${ATHENE_DATA_DIR:-}" ]]; 
         _branch="${3}"
     fi
     if [[ -n "$_branch" ]]; then
-        _meta_file="${ATHENE_DATA_DIR}/${ATHENE_SESSION}.json"
+        _meta_file="${_nx_data_dir}/${_nx_session}.json"
         mkdir -p "$(dirname "$_meta_file")"
         if command -v jq &>/dev/null; then
             _tmp="${_meta_file}.tmp.$$"
@@ -466,6 +472,17 @@ mod tests {
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].description, "Fix flaky auth test");
         assert_eq!(pending[1].description, "Migrate config loader");
+    }
+
+    /// The wrapper scripts must prefer the NINOX_* env names and keep the
+    /// legacy ATHENE_* names as fallback, so they work under both a new and
+    /// an old spawner during the rename transition.
+    #[test]
+    fn wrapper_scripts_prefer_ninox_env_with_athene_fallback() {
+        for wrapper in [GH_WRAPPER, GIT_WRAPPER] {
+            assert!(wrapper.contains("${NINOX_SESSION:-${ATHENE_SESSION:-}}"));
+            assert!(wrapper.contains("${NINOX_DATA_DIR:-${ATHENE_DATA_DIR:-}}"));
+        }
     }
 
     /// Work requests must never touch the shared `{session}.json` — the gh/git

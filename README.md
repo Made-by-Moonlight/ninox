@@ -1,10 +1,8 @@
 # Ninox
 
-Ninox is the native desktop app for [Athene](https://github.com/Made-by-Moonlight/Athene) — built in Rust with [Iced](https://github.com/iced-rs/iced). It embeds its own orchestrator engine directly and runs a GPU-accelerated UI: no Electron, no bundled browser.
+Ninox is a native desktop agent orchestrator — built in Rust with [Iced](https://github.com/iced-rs/iced). It embeds its own orchestrator engine directly and runs a GPU-accelerated UI: no Electron, no bundled browser. Running Ninox starts the engine with its own SQLite store and an HTTP/WebSocket API server.
 
-The app and Athene's Node.js stack **work in tandem**. Running Ninox starts a fresh engine with its own SQLite store and HTTP server; the Athene web dashboard continues to work against either backend unchanged.
-
-> This repo was split out of the [Athene](https://github.com/Made-by-Moonlight/Athene) monorepo's `athene/` directory, history intact. Crates and identifiers have since been renamed from `athene-*` to `ninox-*`.
+> This repo was split out of the [Athene](https://github.com/Made-by-Moonlight/Athene) monorepo's `athene/` directory, history intact. Crates and identifiers have since been renamed from `athene-*` to `ninox-*`; Ninox is now the standalone successor rather than a companion app.
 
 ## Prerequisites
 
@@ -32,7 +30,7 @@ cargo build --release -p ninox
 ./target/release/ninox --port 9090 --db ~/.local/share/ninox/ninox.db
 ```
 
-The HTTP server always starts on `127.0.0.1:8080` (or `--port`). Athene's web dashboard can connect to it at that address exactly as it connects to the Node.js backend.
+The HTTP server always starts on `127.0.0.1:8080` (or `--port`), exposing the engine's HTTP/WebSocket API.
 
 ## Configuration
 
