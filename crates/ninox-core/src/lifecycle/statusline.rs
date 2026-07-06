@@ -87,6 +87,34 @@ pub fn apply_update(store: &crate::store::Store, payload: &ParsedPayload) -> any
     Ok(true)
 }
 
+/// Render the visible text for Claude Code's statusline row. Kept cheap and
+/// dependency-free (no shell-outs) per Claude Code's own docs: slow scripts
+/// block the line from updating and get cancelled mid-run if a new update
+/// fires. Always returns a non-empty string — an all-absent payload still
+/// renders `[Claude] 📁 ` rather than nothing, since empty stdout blanks
+/// the statusline entirely.
+pub fn render_line(payload: &ParsedPayload) -> String {
+    let model = payload.model.as_deref().unwrap_or("Claude");
+    let dir = payload.workspace_dir.as_deref()
+        .and_then(|d| d.rsplit(['/', '\\']).next())
+        .unwrap_or("");
+
+    let mut line = format!("[{model}] \u{1F4C1} {dir}");
+
+    if let Some(pct) = payload.context_used_pct {
+        let pct = pct.round().clamp(0.0, 100.0) as u32;
+        let filled = (pct / 10) as usize;
+        let bar = "\u{2593}".repeat(filled) + &"\u{2591}".repeat(10 - filled);
+        let color = if pct >= 90 { "\x1b[31m" } else if pct >= 70 { "\x1b[33m" } else { "\x1b[32m" };
+        line.push_str(&format!(" | {color}{bar} {pct}%\x1b[0m"));
+    }
+    if let Some(cost) = payload.cost_usd {
+        line.push_str(&format!(" | ${cost:.2}"));
+    }
+
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +292,62 @@ mod tests {
 
         let s = store.get_session("s1").unwrap().unwrap();
         assert_eq!(s.model.as_deref(), Some("claude-opus-4-8"), "existing model id is preserved");
+    }
+
+    #[test]
+    fn render_line_full_payload() {
+        let payload = ParsedPayload {
+            workspace_dir: Some("/Users/x/repo/.claude/worktrees/my-worktree".into()),
+            model: Some("Opus 4.8".into()),
+            cost_usd: Some(2.60),
+            context_used_pct: Some(62.0),
+            context_total_tokens: Some(124_000),
+            context_window_size: Some(200_000),
+        };
+        let line = render_line(&payload);
+        assert!(line.starts_with("[Opus 4.8] \u{1F4C1} my-worktree"), "got: {line}");
+        assert!(line.contains("62%"), "got: {line}");
+        assert!(line.contains("$2.60"), "got: {line}");
+    }
+
+    #[test]
+    fn render_line_omits_context_bar_when_pct_absent() {
+        let payload = ParsedPayload {
+            workspace_dir: Some("/x/y".into()),
+            model: Some("Opus".into()),
+            cost_usd: Some(1.00),
+            ..Default::default()
+        };
+        let line = render_line(&payload);
+        assert!(line.contains("$1.00"));
+        assert!(!line.contains('%'));
+    }
+
+    #[test]
+    fn render_line_omits_cost_when_absent() {
+        let payload = ParsedPayload {
+            workspace_dir: Some("/x/y".into()),
+            model: Some("Opus".into()),
+            context_used_pct: Some(10.0),
+            ..Default::default()
+        };
+        let line = render_line(&payload);
+        assert!(line.contains("10%"));
+        assert!(!line.contains('$'));
+    }
+
+    #[test]
+    fn render_line_minimal_fallback_with_no_data() {
+        let line = render_line(&ParsedPayload::default());
+        assert_eq!(line, "[Claude] \u{1F4C1} ");
+    }
+
+    #[test]
+    fn render_line_color_thresholds() {
+        let payload_at = |pct: f64| ParsedPayload { context_used_pct: Some(pct), ..Default::default() };
+        assert!(render_line(&payload_at(69.0)).contains("\x1b[32m"), "under 70 is green");
+        assert!(render_line(&payload_at(70.0)).contains("\x1b[33m"), "70-89 is yellow");
+        assert!(render_line(&payload_at(89.0)).contains("\x1b[33m"));
+        assert!(render_line(&payload_at(90.0)).contains("\x1b[31m"), "90+ is red");
     }
 }
