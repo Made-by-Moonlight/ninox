@@ -2380,6 +2380,11 @@ process.exit(0);
                     "matcher": "Task|Agent",
                     "hooks": [{"type": "command", "command": "node .claude/subagent-blocker.cjs", "timeout": 2000}]
                 }]
+            },
+            "statusLine": {
+                "type": "command",
+                "command": format!("{ninox_bin} statusline"),
+                "refreshInterval": 20
             }
         });
         fs::write(&settings_path, serde_json::to_string_pretty(&settings)?).await?;
@@ -4277,5 +4282,33 @@ mod tests {
             agents_md.contains(&skill_path.display().to_string()),
             "AGENTS.md should point orchestrators at the brain skill"
         );
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_configures_statusline() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, "/path/to/ninox", "/cfg.toml").await.unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".claude").join("settings.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(settings["statusLine"]["type"], "command");
+        assert_eq!(settings["statusLine"]["command"], "/path/to/ninox statusline");
+        assert_eq!(settings["statusLine"]["refreshInterval"], 20);
+        // The existing subagent-blocker hook must still be present.
+        assert!(settings["hooks"]["PreToolUse"].is_array());
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_never_overwrites_existing_settings_json() {
+        let root = tempdir().unwrap().keep();
+        let claude_dir = root.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("settings.json"), r#"{"userCustom": true}"#).unwrap();
+
+        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+
+        let contents = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        assert_eq!(contents, r#"{"userCustom": true}"#, "pre-existing settings.json must be left byte-for-byte alone");
     }
 }
