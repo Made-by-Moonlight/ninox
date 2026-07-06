@@ -278,6 +278,51 @@ pub struct RefilePlan {
     pub extra_env:      Vec<(String, String)>,
 }
 
+/// Decide what a session's status becomes when its tmux pane is found
+/// gone at startup. `has_resume_args` is the harness's capability (from
+/// `HarnessRegistry::resume_cmd(...).is_some()` against a placeholder id —
+/// callers don't have a real command to build yet, just the capability
+/// check), not whether resume has ever been attempted.
+fn reconciled_status_for_dead_session(
+    claude_session_id: &Option<String>,
+    has_resume_args:   bool,
+) -> SessionStatus {
+    if claude_session_id.is_some() && has_resume_args {
+        SessionStatus::Interrupted
+    } else {
+        SessionStatus::Terminated
+    }
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+
+    #[test]
+    fn session_with_id_and_resumable_harness_becomes_interrupted() {
+        assert_eq!(
+            reconciled_status_for_dead_session(&Some("uuid-1".into()), true),
+            SessionStatus::Interrupted,
+        );
+    }
+
+    #[test]
+    fn legacy_session_without_id_becomes_terminated() {
+        assert_eq!(
+            reconciled_status_for_dead_session(&None, true),
+            SessionStatus::Terminated,
+        );
+    }
+
+    #[test]
+    fn session_under_non_resumable_harness_becomes_terminated_even_with_an_id() {
+        assert_eq!(
+            reconciled_status_for_dead_session(&Some("uuid-1".into()), false),
+            SessionStatus::Terminated,
+        );
+    }
+}
+
 /// `None` when the session has no recorded workspace (nothing to respawn
 /// into). A worker re-files interactively — its original spawn prompt is
 /// not stored — but keeps its orchestrator attachment for the tree.
@@ -439,17 +484,26 @@ impl App {
                 }
             };
 
+            let registry = AppConfig::load().unwrap_or_default().registry();
+
             for session in sessions {
                 if matches!(
                     session.status,
-                    SessionStatus::Done | SessionStatus::Terminated
+                    SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted
                 ) {
                     continue;
                 }
 
                 if !tmux::has_session(&session.id).await {
+                    let agent = ninox_core::config::AgentConfig {
+                        harness: session.agent_type.clone(),
+                        model:   session.model.clone(),
+                    };
+                    let has_resume_args = registry.resume_cmd(&agent, "placeholder").is_some();
                     let mut dead = session.clone();
-                    dead.status = SessionStatus::Terminated;
+                    dead.status = reconciled_status_for_dead_session(
+                        &session.claude_session_id, has_resume_args,
+                    );
                     let _ = engine.store.upsert_session(&dead);
                     engine.emit(CoreEvent::SessionUpdated(dead));
                 }

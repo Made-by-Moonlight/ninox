@@ -62,7 +62,7 @@ impl Poller {
 
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
         for mut session in sessions {
-            if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
+            if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted) {
                 continue;
             }
             if let Some(pid) = session.pid {
@@ -90,7 +90,7 @@ impl Poller {
             // died (a worker's last act is often "request follow-up, exit").
             self.deliver_work_requests(&session, sessions_dir).await;
 
-            if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
+            if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted) {
                 continue;
             }
             let Ok(meta) = hooks::read_session_metadata(sessions_dir, &session.id) else {
@@ -213,7 +213,7 @@ impl Poller {
     async fn poll_usage(&self) {
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
         for mut session in sessions {
-            if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
+            if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted) {
                 continue;
             }
             let Some(workspace) = session.workspace_path.clone() else { continue };
@@ -242,7 +242,7 @@ impl Poller {
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
 
         for session in sessions {
-            if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
+            if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted) {
                 continue;
             }
             let Some(pr_number) = session.pr_number else { continue };
@@ -441,7 +441,7 @@ fn derive_session_status(
     has_changes_requested: bool,
 ) -> SessionStatus {
     // Terminal states are never overwritten.
-    if matches!(current, SessionStatus::Done | SessionStatus::Terminated) {
+    if matches!(current, SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted) {
         return current.clone();
     }
     if pr_status.merged {
@@ -553,6 +553,27 @@ mod tests {
             workspace_path: Some(workspace.into()), pid: None,
             model: None, context_tokens: None, catalogue_path: None, claude_session_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn poll_pids_leaves_interrupted_sessions_alone() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("interrupted-1", "/ws");
+        s.status = SessionStatus::Interrupted;
+        s.pid = Some(999_999); // a pid that is almost certainly dead
+        store.upsert_session(&s).unwrap();
+        let engine = Engine::new(store.clone());
+        let poller = Poller::new(engine);
+
+        poller.poll_pids().await;
+
+        let after = store.get_session("interrupted-1").unwrap().unwrap();
+        assert!(
+            matches!(after.status, SessionStatus::Interrupted),
+            "poll_pids must not re-terminate an Interrupted session just because its stale pid is dead",
+        );
     }
 
     /// End-to-end (within-process) proof that the poller closes the gap
