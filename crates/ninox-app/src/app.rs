@@ -1510,7 +1510,10 @@ impl App {
 
             Message::NavigateBrain => {
                 if !state.brain_view.loaded {
-                    match state.brain.query("", QueryFilters::default()) {
+                    // `None`: the GUI brain panel is keyword-only for now — wiring it to the
+                    // same embedder the server constructs at startup is a natural follow-up,
+                    // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
+                    match state.brain.query("", None, QueryFilters::default()) {
                         Ok(entries) => {
                             state.brain_view.entries = entries;
                             state.brain_view.loaded = true;
@@ -1619,10 +1622,16 @@ impl App {
             }
 
             Message::BrainReindex => {
-                match state.brain.rebuild() {
-                    Ok(count) => {
-                        tracing::info!("brain reindexed: {count} entries");
-                        match state.brain.query("", QueryFilters::default()) {
+                // `None`: the GUI brain panel is keyword-only for now — wiring it to the
+                // same embedder the server constructs at startup is a natural follow-up,
+                // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
+                match state.brain.rebuild(None) {
+                    Ok(stats) => {
+                        tracing::info!("brain reindexed: {} entries", stats.indexed);
+                        // `None`: the GUI brain panel is keyword-only for now — wiring it to the
+                        // same embedder the server constructs at startup is a natural follow-up,
+                        // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
+                        match state.brain.query("", None, QueryFilters::default()) {
                             Ok(entries) => {
                                 state.brain_view.entries = entries;
                                 Self::refresh_brain_edges(state);
@@ -1703,7 +1712,10 @@ impl App {
                             state.brain_view.related.clear();
                             state.brain_view.edges.clear();
                             state.brain_view.loaded = false;
-                            match state.brain.query("", QueryFilters::default()) {
+                            // `None`: the GUI brain panel is keyword-only for now — wiring it to the
+                            // same embedder the server constructs at startup is a natural follow-up,
+                            // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
+                            match state.brain.query("", None, QueryFilters::default()) {
                                 Ok(entries) => {
                                     state.brain_view.entries = entries;
                                     state.brain_view.loaded = true;
@@ -2060,8 +2072,8 @@ impl App {
 
 /// Seeds `~/.config/ninox/orchestrator/` (or the configured root) with the
 /// files that orchestrator sessions need: AGENTS.md (canonical, CLAUDE.md
-/// symlinks to it), spawn-worker skill, set-agent-config skill, and the
-/// subagent-blocker PreToolUse hook.
+/// symlinks to it), spawn-worker skill, set-agent-config skill, brain skill,
+/// and the subagent-blocker PreToolUse hook.
 ///
 /// AGENTS.md and settings.json are skipped if already present (user-editable).
 /// Skill files and the blocker are always overwritten to stay in sync.
@@ -2075,12 +2087,15 @@ pub async fn setup_orchestrator_root(
     let claude_dir       = root.join(".claude");
     let spawn_skill_dir  = root.join("skills").join("spawn-worker");
     let config_skill_dir = root.join("skills").join("set-agent-config");
+    let brain_skill_dir  = root.join("skills").join("brain");
     fs::create_dir_all(&claude_dir).await?;
     fs::create_dir_all(&spawn_skill_dir).await?;
     fs::create_dir_all(&config_skill_dir).await?;
+    fs::create_dir_all(&brain_skill_dir).await?;
 
     let spawn_skill_path  = spawn_skill_dir.join("SKILL.md");
     let config_skill_path = config_skill_dir.join("SKILL.md");
+    let brain_skill_path  = brain_skill_dir.join("SKILL.md");
 
     // AGENTS.md is canonical; CLAUDE.md symlinks to it.
     let agents_md_path = root.join("AGENTS.md");
@@ -2090,9 +2105,11 @@ pub async fn setup_orchestrator_root(
              Before doing anything else, read and follow: `{spawn_skill}`\n\n\
              ## Available Skills\n\n\
              - `{spawn_skill}` — spawning worker sessions\n\
-             - `{config_skill}` — changing agent harness or model\n",
+             - `{config_skill}` — changing agent harness or model\n\
+             - `{brain_skill}` — reading and writing the shared knowledge brain\n",
             spawn_skill  = spawn_skill_path.display(),
             config_skill = config_skill_path.display(),
+            brain_skill  = brain_skill_path.display(),
         );
         fs::write(&agents_md_path, body).await?;
     }
@@ -2189,6 +2206,98 @@ Use the Edit tool to update the relevant field. Changes take effect on the next 
         config_path = config_path,
     );
     fs::write(&config_skill_path, config_skill_content).await?;
+
+    // brain skill — always overwritten.
+    let brain_skill_content = format!(
+        r#"# Read and Write the Brain
+
+The brain is Ninox's persistent, shared knowledge store. As you explore
+codebases you discover things — where a type is defined, how two repos
+relate, why a decision was made. Without a place to put that, every new
+session starts cold. Write it down so the next orchestrator doesn't have to
+rediscover it.
+
+Your session's brain is already resolved — these commands act on it with no
+extra configuration.
+
+## 1. Query first
+
+`brain query` blends keyword and semantic matches automatically — no new
+syntax needed. Before writing a new entry, check whether one already exists:
+
+```bash
+{ninox_bin} brain query "<name or concept>"
+```
+
+Narrow with filters:
+
+```bash
+{ninox_bin} brain query "<text>" --entry-type repo
+{ninox_bin} brain query "<text>" --tag auth
+```
+
+If a relevant entry exists, update it instead of creating a duplicate.
+
+## 2. Write a fact
+
+Create or update a Markdown file under the section that fits, then rebuild
+the index:
+
+```
+repos/          where repositories live, their purpose, entry points
+symbols/        where types, functions, and modules are defined
+concepts/       domain terminology and mental models
+patterns/       conventions and recurring implementation shapes
+decisions/      why something was built a certain way (ADRs)
+architecture/   how the system is structured — components, data flows
+relationships/  how repos, services, and teams connect
+errors/         known failure modes and how to resolve them
+```
+
+Each file needs YAML frontmatter followed by Markdown body:
+
+```markdown
+---
+type: repo
+name: my-crate
+tags: [auth, core]
+repos: [my-crate]
+updated: 2026-07-06
+---
+
+# my-crate
+
+Entry point: `src/main.rs`
+Build: `cargo build`
+
+Facts, not prose. Link related entries with `[[other-entry]]`.
+```
+
+Then rebuild the index so the write becomes queryable:
+
+```bash
+{ninox_bin} brain index
+```
+
+## 3. Read for context
+
+At the start of work in unfamiliar territory, query before exploring:
+
+```bash
+{ninox_bin} brain query "" --entry-type architecture
+{ninox_bin} brain query "" --entry-type repo
+{ninox_bin} brain show <path-from-a-query-result>
+```
+
+## The Rule
+
+**Query before writing, write what you find, query before exploring.** The
+brain only helps the next orchestrator if you keep it current — a stale or
+empty brain is no better than no brain at all.
+"#,
+        ninox_bin = ninox_bin,
+    );
+    fs::write(&brain_skill_path, brain_skill_content).await?;
 
     // subagent-blocker hook — always overwritten.
     let blocker = r#"#!/usr/bin/env node
@@ -2624,7 +2733,7 @@ mod tests {
         )
         .unwrap();
         let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let e = test_engine();
         let m = base_with_brain(e, brain);
@@ -2678,7 +2787,7 @@ mod tests {
         std::fs::create_dir_all(brain_dir.join("symbols")).unwrap();
         std::fs::write(brain_dir.join("symbols").join("x.md"), "---\nname: X\n---\nbody").unwrap();
         let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let e = test_engine();
         let app = base_with_brain(e, brain);
@@ -2721,12 +2830,12 @@ mod tests {
         std::fs::write(dir_b.join("concepts").join("b.md"), "b body").unwrap();
 
         let brain_a = Arc::new(BrainIndex::open(&dir_a).unwrap());
-        brain_a.rebuild().unwrap();
+        brain_a.rebuild(None).unwrap();
         // Seed dir_b's index too — `BrainSwitchCatalogue` opens a fresh
         // `BrainIndex` over the target path but does not rebuild it (matching
         // `NavigateBrain`'s lazy-load semantics), so the catalogue being
         // switched to must already be indexed on disk.
-        BrainIndex::open(&dir_b).unwrap().rebuild().unwrap();
+        BrainIndex::open(&dir_b).unwrap().rebuild(None).unwrap();
 
         let e = test_engine();
         let mut app = base_with_brain(e, brain_a);
@@ -2765,7 +2874,7 @@ mod tests {
         )
         .unwrap();
         let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let e = test_engine();
         let m = base_with_brain(e, brain);
@@ -2794,7 +2903,7 @@ mod tests {
         .unwrap();
         std::fs::write(brain_dir.join("people").join("bob.md"), "---\nname: Bob\n---\nbody").unwrap();
         let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let e = test_engine();
         let m = base_with_brain(e, brain);
@@ -2831,7 +2940,7 @@ mod tests {
         )
         .unwrap();
         let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let e = test_engine();
         let m = base_with_brain(e, brain);
@@ -2883,7 +2992,7 @@ mod tests {
         )
         .unwrap();
         let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let e = test_engine();
         let m = base_with_brain(e, brain);
@@ -2917,8 +3026,8 @@ mod tests {
         std::fs::write(dir_b.join("people").join("carol.md"), "No links here.").unwrap();
 
         let brain_a = Arc::new(BrainIndex::open(&dir_a).unwrap());
-        brain_a.rebuild().unwrap();
-        BrainIndex::open(&dir_b).unwrap().rebuild().unwrap();
+        brain_a.rebuild(None).unwrap();
+        BrainIndex::open(&dir_b).unwrap().rebuild(None).unwrap();
 
         let e = test_engine();
         let mut app = base_with_brain(e, brain_a);
@@ -3987,6 +4096,25 @@ mod tests {
         assert!(
             matches!(m.view, View::PrList),
             "\"1\" must not navigate while the spawn modal is open"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_seeds_brain_skill() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+
+        let skill_path = root.join("skills").join("brain").join("SKILL.md");
+        let skill = std::fs::read_to_string(&skill_path).unwrap();
+        assert!(skill.contains("ninox brain query"));
+        assert!(skill.contains("ninox brain index"));
+        assert!(skill.contains("ninox brain show"));
+        assert!(skill.contains("blends keyword and semantic matches"));
+
+        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(
+            agents_md.contains(&skill_path.display().to_string()),
+            "AGENTS.md should point orchestrators at the brain skill"
         );
     }
 }

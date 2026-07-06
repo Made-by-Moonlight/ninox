@@ -1,6 +1,7 @@
 pub mod brain;
 pub mod client;
 pub mod config;
+pub mod embeddings;
 pub mod events;
 pub mod github;
 pub mod harness;

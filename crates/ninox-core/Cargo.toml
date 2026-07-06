@@ -14,6 +14,7 @@ rusqlite   = { workspace = true, features = ["functions"] }
 anyhow     = { workspace = true }
 toml       = { workspace = true }
 dirs       = { workspace = true }
+fastembed  = { workspace = true }
 tracing    = { workspace = true }
 tokio-util = { workspace = true }
 libc       = { workspace = true }

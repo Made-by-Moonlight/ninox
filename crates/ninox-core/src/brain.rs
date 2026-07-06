@@ -1,3 +1,4 @@
+use crate::embeddings::{cosine_similarity, reciprocal_rank_fusion, Embedder, QUERY_INSTRUCTION_PREFIX};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::{params, functions::FunctionFlags, Connection};
@@ -29,6 +30,17 @@ pub struct BrainEntry {
 pub struct QueryFilters {
     pub entry_type: Option<String>,
     pub tag: Option<String>,
+}
+
+/// Result of a `BrainIndex::rebuild()` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebuildStats {
+    /// Entries (files) indexed this run.
+    pub indexed: usize,
+    /// Entries newly embedded this run (content changed or never embedded).
+    pub embedded: usize,
+    /// Entries whose cached embedding was reused because content is unchanged.
+    pub cached: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -63,7 +75,12 @@ impl BrainIndex {
                  USING fts5(name, tags, body, content=entries, content_rowid=rowid);
              CREATE TABLE IF NOT EXISTS links (from_id TEXT NOT NULL, target TEXT NOT NULL);
              CREATE INDEX IF NOT EXISTS links_from ON links(from_id);
-             CREATE INDEX IF NOT EXISTS links_target ON links(target);",
+             CREATE INDEX IF NOT EXISTS links_target ON links(target);
+             CREATE TABLE IF NOT EXISTS embeddings (
+                 id           TEXT PRIMARY KEY,
+                 content_hash INTEGER NOT NULL,
+                 vector       BLOB NOT NULL
+             );",
         )?;
         // Expose `stem(x)` to SQL so link-resolution queries can share the
         // same "stem(target) == stem(id)" rule used in Rust, without
@@ -81,17 +98,11 @@ impl BrainIndex {
         Ok(Self { conn: Mutex::new(conn), brain_path })
     }
 
-    /// Walk the brain directory, parse markdown files, and repopulate the index.
-    ///
-    /// Reading and parsing every file is embarrassingly parallel and is the
-    /// dominant cost for large vaults, so it runs across a rayon thread pool.
-    /// The results are then funneled through a single writer that performs
-    /// all inserts inside one transaction (rather than one implicit
-    /// transaction/fsync per file), which is what actually matters for
-    /// indexing thousands of files quickly on real disks.
-    ///
-    /// Returns the number of files indexed.
-    pub fn rebuild(&self) -> Result<usize> {
+    /// Walk the brain directory, parse markdown files, and repopulate the
+    /// index, then embed any new or changed entries (skipped entirely if
+    /// `embedder` is `None`, or if embedding a given entry fails — indexing
+    /// is never blocked by the embedding step).
+    pub fn rebuild(&self, embedder: Option<&dyn Embedder>) -> Result<RebuildStats> {
         // Cheap sequential walk to enumerate candidate files.
         let paths: Vec<PathBuf> = WalkDir::new(&self.brain_path)
             .follow_links(false)
@@ -111,7 +122,7 @@ impl BrainIndex {
         let tx = conn.transaction()?;
         tx.execute_batch("DELETE FROM entries; DELETE FROM entries_fts; DELETE FROM links;")?;
 
-        let count = records.len();
+        let indexed = records.len();
         {
             let mut insert_entry = tx.prepare(
                 "INSERT INTO entries (id, type, name, tags, repos, updated, body)
@@ -142,14 +153,107 @@ impl BrainIndex {
         // Rebuild the FTS index from the content table.
         conn.execute_batch("INSERT INTO entries_fts(entries_fts) VALUES('rebuild');")?;
 
-        Ok(count)
+        let (embedded, cached) = match embedder {
+            Some(embedder) => Self::sync_embeddings(&conn, &records, embedder)?,
+            None => (0, 0),
+        };
+
+        Ok(RebuildStats { indexed, embedded, cached })
     }
 
-    /// Full-text search with optional filters.
-    pub fn query(&self, text: &str, filters: QueryFilters) -> Result<Vec<BrainEntry>> {
+    /// Compute-or-reuse an embedding for every current record, then prune
+    /// embeddings for entries that no longer exist. Returns
+    /// `(newly_embedded, reused_from_cache)`. A failure embedding any single
+    /// batch is logged and treated as "not embedded" rather than
+    /// propagated — a broken model must never break `rebuild()`.
+    fn sync_embeddings(
+        conn: &Connection,
+        records: &[FileRecord],
+        embedder: &dyn Embedder,
+    ) -> Result<(usize, usize)> {
+        let mut cached_hashes: HashMap<String, i64> = HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT id, content_hash FROM embeddings")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            for row in rows {
+                let (id, hash) = row?;
+                cached_hashes.insert(id, hash);
+            }
+        }
+
+        let mut to_embed: Vec<(&FileRecord, String, i64)> = Vec::new();
+        let mut cached = 0usize;
+        for rec in records {
+            let text = embedding_text(rec);
+            let hash = content_hash(&text);
+            if cached_hashes.get(&rec.id) == Some(&hash) {
+                cached += 1;
+            } else {
+                to_embed.push((rec, text, hash));
+            }
+        }
+
+        let embedded = if to_embed.is_empty() {
+            0
+        } else {
+            let texts: Vec<String> = to_embed.iter().map(|(_, text, _)| text.clone()).collect();
+            match embedder.embed_batch(&texts) {
+                Ok(vectors) => {
+                    let mut upsert = conn.prepare(
+                        "INSERT INTO embeddings (id, content_hash, vector) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(id) DO UPDATE SET content_hash = excluded.content_hash, vector = excluded.vector",
+                    )?;
+                    let mut upserted = 0usize;
+                    for ((rec, _, hash), vector) in to_embed.iter().zip(vectors.iter()) {
+                        upsert.execute(params![rec.id, hash, vector_to_blob(vector)])?;
+                        upserted += 1;
+                    }
+                    upserted
+                }
+                Err(err) => {
+                    tracing::warn!("brain: failed to embed {} entries: {err}", to_embed.len());
+                    0
+                }
+            }
+        };
+
+        // Prune embeddings for entries that no longer exist.
+        let live_ids: HashSet<&str> = records.iter().map(|r| r.id.as_str()).collect();
+        let mut stale: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn.prepare("SELECT id FROM embeddings")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for row in rows {
+                let id = row?;
+                if !live_ids.contains(id.as_str()) {
+                    stale.push(id);
+                }
+            }
+        }
+        if !stale.is_empty() {
+            let mut delete = conn.prepare("DELETE FROM embeddings WHERE id = ?1")?;
+            for id in &stale {
+                delete.execute(params![id])?;
+            }
+        }
+
+        Ok((embedded, cached))
+    }
+
+    /// Hybrid full-text + semantic search. When `text` is non-empty and
+    /// `embedder` is `Some`, blends the existing FTS5 keyword ranking with
+    /// vector similarity via Reciprocal Rank Fusion. Falls back to exactly
+    /// today's keyword-only (or filter-only) behavior when `text` is empty
+    /// or `embedder` is `None`.
+    pub fn query(
+        &self,
+        text: &str,
+        embedder: Option<&dyn Embedder>,
+        filters: QueryFilters,
+    ) -> Result<Vec<BrainEntry>> {
         let conn = self.conn.lock().unwrap();
 
-        if text.is_empty() && filters.entry_type.is_none() && filters.tag.is_none() {
+        if text.trim().is_empty() && filters.entry_type.is_none() && filters.tag.is_none() {
             // Return all entries when no constraints given
             let mut stmt = conn.prepare(
                 "SELECT id, type, name, tags, repos, updated, body FROM entries ORDER BY name",
@@ -160,7 +264,7 @@ impl BrainIndex {
             return Ok(entries);
         }
 
-        if text.is_empty() {
+        if text.trim().is_empty() {
             // Filter-only query
             let mut stmt = conn.prepare(
                 "SELECT id, type, name, tags, repos, updated, body FROM entries
@@ -176,6 +280,7 @@ impl BrainIndex {
             return Ok(results);
         }
 
+        // Keyword leg: existing FTS5 ranking, as an ordered id list.
         let mut stmt = conn.prepare(
             "SELECT e.id, e.type, e.name, e.tags, e.repos, e.updated, e.body
              FROM entries_fts
@@ -183,11 +288,35 @@ impl BrainIndex {
              WHERE entries_fts MATCH ?1
              ORDER BY rank",
         )?;
-        let rows = stmt.query_map(params![text], row_to_entry)?;
-        let mut results: Vec<BrainEntry> =
-            rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt.query_map(params![sanitize_fts_query(text)], row_to_entry)?;
+        let keyword_results: Vec<BrainEntry> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let keyword_ids: Vec<String> = keyword_results.iter().map(|e| e.id.clone()).collect();
 
-        // Post-filter by type and tag
+        // Semantic leg: top-20 by cosine similarity, if an embedder is available.
+        let semantic_ids: Vec<String> = match embedder {
+            Some(embedder) => Self::semantic_candidates(&conn, embedder, text)?,
+            None => Vec::new(),
+        };
+
+        let fusion_ran = !semantic_ids.is_empty();
+        let mut results: Vec<BrainEntry> = if semantic_ids.is_empty() {
+            keyword_results
+        } else {
+            let fused = reciprocal_rank_fusion(&[keyword_ids, semantic_ids], 60.0);
+            let mut by_id: HashMap<String, BrainEntry> =
+                keyword_results.into_iter().map(|e| (e.id.clone(), e)).collect();
+            let mut fused_results = Vec::with_capacity(fused.len());
+            for (id, _score) in fused {
+                if let Some(entry) = by_id.remove(&id) {
+                    fused_results.push(entry);
+                } else if let Some(entry) = get_by_id(&conn, &id)? {
+                    fused_results.push(entry);
+                }
+            }
+            fused_results
+        };
+
+        // Post-filter by type and tag.
         if let Some(ref et) = filters.entry_type {
             results.retain(|e| &e.entry_type == et);
         }
@@ -195,7 +324,48 @@ impl BrainIndex {
             results.retain(|e| e.tags.iter().any(|t| t == tag));
         }
 
+        // Cap only applies when semantic fusion actually happened — the
+        // no-embedder / no-semantic-contribution path stays exactly
+        // today's uncapped keyword behavior, matching the design spec's
+        // degradation guarantee.
+        if fusion_ran {
+            results.truncate(20);
+        }
         Ok(results)
+    }
+
+    /// Top-20 entry ids by cosine similarity to `text`, embedded with the
+    /// query-instruction prefix Arctic Embed expects for asymmetric
+    /// retrieval. Returns an empty list (never an error) if embedding the
+    /// query text fails — a broken embedder degrades to keyword-only
+    /// results, it never fails the whole query.
+    fn semantic_candidates(
+        conn: &Connection,
+        embedder: &dyn Embedder,
+        text: &str,
+    ) -> Result<Vec<String>> {
+        let query_vector = match embedder.embed(&format!("{QUERY_INSTRUCTION_PREFIX}{text}")) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!("brain: failed to embed query text: {err}");
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut stmt = conn.prepare("SELECT id, vector FROM embeddings")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+
+        let mut scored: Vec<(String, f32)> = Vec::new();
+        for row in rows {
+            let (id, blob) = row?;
+            let vector = blob_to_vector(&blob);
+            scored.push((id, cosine_similarity(&query_vector, &vector)));
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(20);
+        Ok(scored.into_iter().map(|(id, _)| id).collect())
     }
 
     /// Fetch a single entry by its relative path id.
@@ -469,6 +639,52 @@ fn process_file(brain_path: &Path, path: &Path) -> Option<FileRecord> {
     Some(FileRecord { id: rel, entry_type, name, tags, repos, updated, body: parsed.body, links })
 }
 
+/// Turn free-form user search text into an FTS5 query string that can't be
+/// misinterpreted as query syntax. Raw text handed straight to `MATCH`
+/// exposes FTS5's operators (`-` for NOT, `:` for column filters, unmatched
+/// `"` for phrases, etc.), so e.g. searching for `ninox-server` or `foo:bar`
+/// throws a SQL error instead of finding matches. Wrapping each
+/// whitespace-separated token in `"..."` (doubling internal quotes) forces
+/// every token to be matched literally.
+fn sanitize_fts_query(text: &str) -> String {
+    text.split_whitespace()
+        .map(|tok| format!("\"{}\"", tok.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Text an entry is embedded from: name plus body, truncated to a bounded
+/// length. Small embedding models have a limited token context; truncating
+/// to a character prefix is a pragmatic approximation, not a guarantee the
+/// whole document is represented (see the design spec's non-goals — full
+/// chunking is out of scope).
+fn embedding_text(rec: &FileRecord) -> String {
+    let mut text = format!("{}\n\n{}", rec.name, rec.body);
+    text.truncate(2000);
+    text
+}
+
+/// Non-cryptographic hash used purely to detect content changes between
+/// `rebuild()` calls. Not guaranteed stable across Rust/std versions — the
+/// worst case of that is one redundant re-embed after an upgrade, never a
+/// correctness problem, so no extra hashing dependency is justified.
+fn content_hash(text: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish() as i64
+}
+
+fn vector_to_blob(vector: &[f32]) -> Vec<u8> {
+    vector.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+fn blob_to_vector(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
 fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<BrainEntry> {
     let tags_json: String = r.get(3)?;
     let repos_json: String = r.get(4)?;
@@ -615,12 +831,155 @@ fn parse_frontmatter(text: &str) -> Frontmatter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embeddings::Embedder;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     fn make_brain() -> (BrainIndex, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let brain = BrainIndex::open(dir.path()).unwrap();
         (brain, dir)
+    }
+
+    /// Deterministic, call-counting fake — never touches the network or a
+    /// real model. The vector is derived from the text's length so distinct
+    /// inputs get distinct (but stable) vectors, which is enough for cache
+    /// and fusion tests without needing real semantic meaning.
+    struct FakeEmbedder {
+        calls: AtomicUsize,
+        dim: usize,
+    }
+
+    impl FakeEmbedder {
+        fn new(dim: usize) -> Self {
+            Self { calls: AtomicUsize::new(0), dim }
+        }
+    }
+
+    impl Embedder for FakeEmbedder {
+        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let seed = text.len() as f32;
+            Ok((0..self.dim).map(|i| seed + i as f32).collect())
+        }
+
+        fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            texts.iter().map(|t| self.embed(t)).collect()
+        }
+
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+    }
+
+    #[test]
+    fn rebuild_embeds_new_entries() {
+        let (brain, dir) = make_brain();
+        fs::create_dir_all(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes/a.md"), "# A\n\nSome content.").unwrap();
+
+        let embedder = FakeEmbedder::new(4);
+        let stats = brain.rebuild(Some(&embedder)).unwrap();
+
+        assert_eq!(stats.indexed, 1);
+        assert_eq!(stats.embedded, 1);
+        assert_eq!(stats.cached, 0);
+        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rebuild_reuses_cached_embedding_for_unchanged_content() {
+        let (brain, dir) = make_brain();
+        fs::create_dir_all(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes/a.md"), "# A\n\nSome content.").unwrap();
+
+        let embedder = FakeEmbedder::new(4);
+        brain.rebuild(Some(&embedder)).unwrap();
+        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
+
+        // Second rebuild, same content: must not re-embed.
+        let stats = brain.rebuild(Some(&embedder)).unwrap();
+        assert_eq!(stats.embedded, 0);
+        assert_eq!(stats.cached, 1);
+        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1, "should not re-embed unchanged content");
+    }
+
+    #[test]
+    fn rebuild_reembeds_changed_content() {
+        let (brain, dir) = make_brain();
+        let path = dir.path().join("notes");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("a.md"), "# A\n\nOriginal content.").unwrap();
+
+        let embedder = FakeEmbedder::new(4);
+        brain.rebuild(Some(&embedder)).unwrap();
+        assert_eq!(embedder.calls.load(Ordering::SeqCst), 1);
+
+        fs::write(path.join("a.md"), "# A\n\nChanged content.").unwrap();
+        let stats = brain.rebuild(Some(&embedder)).unwrap();
+        assert_eq!(stats.embedded, 1);
+        assert_eq!(stats.cached, 0);
+        assert_eq!(embedder.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn rebuild_prunes_embeddings_for_deleted_entries() {
+        let (brain, dir) = make_brain();
+        let path = dir.path().join("notes");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("a.md"), "# A\n\nContent.").unwrap();
+
+        let embedder = FakeEmbedder::new(4);
+        brain.rebuild(Some(&embedder)).unwrap();
+
+        fs::remove_file(path.join("a.md")).unwrap();
+        brain.rebuild(Some(&embedder)).unwrap();
+
+        let conn = brain.conn.lock().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "embedding for the deleted entry should be pruned");
+    }
+
+    #[test]
+    fn rebuild_without_embedder_skips_embeddings_entirely() {
+        let (brain, dir) = make_brain();
+        fs::create_dir_all(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes/a.md"), "# A\n\nContent.").unwrap();
+
+        let stats = brain.rebuild(None).unwrap();
+        assert_eq!(stats.indexed, 1);
+        assert_eq!(stats.embedded, 0);
+        assert_eq!(stats.cached, 0);
+
+        let conn = brain.conn.lock().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// An embedder whose calls always fail — proves indexing is never
+    /// blocked by embedding failures.
+    struct FailingEmbedder;
+    impl Embedder for FailingEmbedder {
+        fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            anyhow::bail!("simulated embedder failure")
+        }
+        fn embed_batch(&self, _texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("simulated embedder failure")
+        }
+        fn dimension(&self) -> usize {
+            4
+        }
+    }
+
+    #[test]
+    fn rebuild_indexing_survives_embedder_failure() {
+        let (brain, dir) = make_brain();
+        fs::create_dir_all(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes/a.md"), "# A\n\nContent.").unwrap();
+
+        let stats = brain.rebuild(Some(&FailingEmbedder)).unwrap();
+        assert_eq!(stats.indexed, 1, "keyword indexing must succeed even if embedding fails");
+        assert_eq!(stats.embedded, 0);
     }
 
     #[test]
@@ -633,6 +992,18 @@ mod tests {
         assert!(gi.exists());
         let content = fs::read_to_string(&gi).unwrap();
         assert!(content.contains(".index.db"));
+    }
+
+    #[test]
+    fn open_creates_embeddings_table() {
+        let (brain, _dir) = make_brain();
+        let conn = brain.conn.lock().unwrap();
+        // A query against the table succeeding at all (vs. an SQL error)
+        // proves the table exists with these columns.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -651,8 +1022,8 @@ mod tests {
         )
         .unwrap();
 
-        let count = brain.rebuild().unwrap();
-        assert_eq!(count, 2);
+        let stats = brain.rebuild(None).unwrap();
+        assert_eq!(stats.indexed, 2);
     }
 
     #[test]
@@ -671,11 +1042,38 @@ mod tests {
         )
         .unwrap();
 
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
-        let results = brain.query("anyhow", QueryFilters::default()).unwrap();
+        let results = brain.query("anyhow", None, QueryFilters::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Rust Tips");
+    }
+
+    /// FTS5 treats `-`, `:`, and unmatched `"` as query-syntax operators.
+    /// Raw user search text containing them (e.g. a hyphenated crate name)
+    /// must not surface as a SQL error.
+    #[test]
+    fn query_tolerates_special_characters() {
+        let (brain, dir) = make_brain();
+        let dir_path = dir.path().join("repos");
+        fs::create_dir_all(&dir_path).unwrap();
+        fs::write(
+            dir_path.join("ninox-server.md"),
+            "---\nname: ninox-server\n---\nHTTP API for ninox-server.",
+        )
+        .unwrap();
+
+        brain.rebuild(None).unwrap();
+
+        for text in ["ninox-server", "foo:bar", "orchestrator\"", "-orchestrator"] {
+            brain
+                .query(text, None, QueryFilters::default())
+                .unwrap_or_else(|e| panic!("query({text:?}) should not error, got: {e}"));
+        }
+
+        let results = brain.query("ninox-server", None, QueryFilters::default()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "ninox-server");
     }
 
     #[test]
@@ -688,13 +1086,164 @@ mod tests {
         fs::write(people.join("alice.md"), "Alice is a person.").unwrap();
         fs::write(projects.join("athene.md"), "Athene is a project.").unwrap();
 
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
 
         let results = brain
-            .query("", QueryFilters { entry_type: Some("people".into()), tag: None })
+            .query("", None, QueryFilters { entry_type: Some("people".into()), tag: None })
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry_type, "people");
+    }
+
+    #[test]
+    fn query_surfaces_semantic_match_with_no_keyword_overlap() {
+        let (brain, dir) = make_brain();
+        let notes = dir.path().join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        // Deliberately no shared words with the query text below.
+        fs::write(notes.join("outage.md"), "---\nname: 401 debugging notes\n---\nHow we diagnosed the outage.").unwrap();
+        fs::write(notes.join("coffee.md"), "---\nname: Coffee notes\n---\nBest beans for espresso.").unwrap();
+
+        // A fake embedder that makes "auth failures" and "401 debugging
+        // notes" cosine-similar (same first dimension marker) while
+        // "Coffee notes" is dissimilar — enough to prove the fusion path
+        // runs end-to-end without needing the real model.
+        struct SemanticFakeEmbedder;
+        impl Embedder for SemanticFakeEmbedder {
+            fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+                if text.contains("auth") || text.contains("401") || text.contains("outage") {
+                    Ok(vec![1.0, 0.0])
+                } else {
+                    Ok(vec![0.0, 1.0])
+                }
+            }
+            fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimension(&self) -> usize {
+                2
+            }
+        }
+
+        let embedder = SemanticFakeEmbedder;
+        brain.rebuild(Some(&embedder)).unwrap();
+
+        // No shared vocabulary with either file's title/body at all, so the
+        // keyword leg alone would return nothing for this query.
+        let results = brain.query("auth failures", Some(&embedder), QueryFilters::default()).unwrap();
+        assert!(
+            results.iter().any(|e| e.id == "notes/outage.md"),
+            "expected the semantically related entry to surface: {results:?}"
+        );
+        // The design applies no similarity threshold (see the spec's
+        // "Query flow" section) — a dissimilar entry may still appear, it
+        // must just rank below the related one if both are present.
+        let outage_rank = results.iter().position(|e| e.id == "notes/outage.md").unwrap();
+        if let Some(coffee_rank) = results.iter().position(|e| e.id == "notes/coffee.md") {
+            assert!(
+                outage_rank < coffee_rank,
+                "the semantically related entry should outrank the unrelated one: {results:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_degrades_gracefully_when_embedder_fails_at_query_time() {
+        let (brain, dir) = make_brain();
+        let notes = dir.path().join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(notes.join("rust.md"), "---\nname: Rust Tips\n---\nUse anyhow for error handling.").unwrap();
+
+        // Indexed without embeddings (embedder is only used at query time
+        // here), then queried with an embedder whose every call fails.
+        brain.rebuild(None).unwrap();
+        let results = brain.query("anyhow", Some(&FailingEmbedder), QueryFilters::default()).unwrap();
+
+        assert_eq!(
+            results.len(),
+            1,
+            "a failing embedder must degrade to keyword-only results, not fail the whole query"
+        );
+        assert_eq!(results[0].name, "Rust Tips");
+    }
+
+    #[test]
+    fn query_without_embedder_matches_current_keyword_only_behavior() {
+        let (brain, dir) = make_brain();
+        let notes = dir.path().join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(notes.join("rust.md"), "---\nname: Rust Tips\n---\nUse anyhow for error handling.").unwrap();
+        brain.rebuild(None).unwrap();
+
+        let results = brain.query("anyhow", None, QueryFilters::default()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Rust Tips");
+    }
+
+    #[test]
+    fn query_empty_text_ignores_embedder() {
+        let (brain, dir) = make_brain();
+        fs::create_dir_all(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes/a.md"), "# A\n\nContent.").unwrap();
+        let embedder = FakeEmbedder::new(4);
+        brain.rebuild(Some(&embedder)).unwrap();
+        embedder.calls.store(0, Ordering::SeqCst);
+
+        let results = brain.query("", Some(&embedder), QueryFilters::default()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            embedder.calls.load(Ordering::SeqCst),
+            0,
+            "empty-text queries must never touch the embedder"
+        );
+    }
+
+    /// Write `n` markdown files, each containing the shared keyword
+    /// "widgetronic" so a keyword search for it matches all of them.
+    fn write_many_matching_notes(dir: &Path, n: usize) {
+        let notes = dir.join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        for i in 0..n {
+            fs::write(
+                notes.join(format!("note{i}.md")),
+                format!("---\nname: Note {i}\n---\nAll about widgetronic devices, entry {i}."),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn query_without_embedder_returns_all_keyword_matches_uncapped() {
+        let (brain, dir) = make_brain();
+        write_many_matching_notes(dir.path(), 25);
+        brain.rebuild(None).unwrap();
+
+        let results = brain.query("widgetronic", None, QueryFilters::default()).unwrap();
+        assert_eq!(
+            results.len(),
+            25,
+            "the no-embedder keyword path must stay exactly today's uncapped behavior, not truncate to 20: {}",
+            results.len()
+        );
+    }
+
+    #[test]
+    fn query_hybrid_fusion_caps_at_20() {
+        let (brain, dir) = make_brain();
+        write_many_matching_notes(dir.path(), 25);
+
+        // FakeEmbedder succeeds for every input, so all 25 entries get
+        // embeddings and `semantic_candidates` always returns a non-empty
+        // (top-20) list — enough to force the fused path to actually run.
+        let embedder = FakeEmbedder::new(4);
+        brain.rebuild(Some(&embedder)).unwrap();
+
+        let results = brain.query("widgetronic", Some(&embedder), QueryFilters::default()).unwrap();
+        assert_eq!(
+            results.len(),
+            20,
+            "the fused (hybrid) path must still cap at 20 results"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -790,7 +1339,7 @@ mod tests {
         )
         .unwrap();
 
-        brain.rebuild().unwrap();
+        brain.rebuild(None).unwrap();
         (brain, dir)
     }
 
@@ -918,10 +1467,10 @@ mod tests {
         let brain = BrainIndex::open(dir.path()).unwrap();
 
         let start = std::time::Instant::now();
-        let count = brain.rebuild().unwrap();
+        let stats = brain.rebuild(None).unwrap();
         let elapsed = start.elapsed();
 
-        assert_eq!(count, 500);
+        assert_eq!(stats.indexed, 500);
         println!("rebuild of 500 files took {elapsed:?}");
         // Generous ceiling: this is here to catch a catastrophic regression
         // (e.g. an accidental fsync-per-file reintroduction), not to pin
@@ -937,10 +1486,10 @@ mod tests {
         let brain = BrainIndex::open(dir.path()).unwrap();
 
         let start = std::time::Instant::now();
-        let count = brain.rebuild().unwrap();
+        let stats = brain.rebuild(None).unwrap();
         let elapsed = start.elapsed();
 
-        assert_eq!(count, 5_000);
+        assert_eq!(stats.indexed, 5_000);
         println!("rebuild of 5,000 files took {elapsed:?}");
     }
 }

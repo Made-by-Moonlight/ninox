@@ -300,12 +300,17 @@ async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
 
     match action {
         BrainAction::Index => {
-            let count = brain.rebuild()?;
-            println!("indexed {count} entries");
+            let embedder = try_build_embedder();
+            let stats = brain.rebuild(embedder.as_deref())?;
+            println!(
+                "indexed {} entries ({} embedded, {} cached)",
+                stats.indexed, stats.embedded, stats.cached
+            );
         }
         BrainAction::Query { text, entry_type, tag } => {
+            let embedder = if text.trim().is_empty() { None } else { try_build_embedder() };
             let filters = QueryFilters { entry_type, tag };
-            let entries = brain.query(&text, filters)?;
+            let entries = brain.query(&text, embedder.as_deref(), filters)?;
             for entry in &entries {
                 println!("{} ({}) — {}", entry.name, entry.entry_type, entry.id);
             }
@@ -322,6 +327,20 @@ async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Attempt to construct the local embedding model, falling back to `None`
+/// (keyword-only search) on any failure — offline first run, corrupted
+/// model cache, unsupported platform, etc. Embedding is an enhancement
+/// layer; it must never be a hard dependency of `brain index`/`brain query`.
+fn try_build_embedder() -> Option<Arc<dyn ninox_core::embeddings::Embedder>> {
+    match ninox_core::embeddings::FastEmbedEmbedder::try_new() {
+        Ok(embedder) => Some(Arc::new(embedder)),
+        Err(err) => {
+            tracing::warn!("brain: embedding model unavailable, falling back to keyword-only search: {err}");
+            None
+        }
+    }
 }
 
 async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> anyhow::Result<()> {
@@ -342,6 +361,18 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
     }
 
     let brain = Arc::new(BrainIndex::open(&brain_path)?);
+    let embedder: Option<Arc<dyn ninox_core::embeddings::Embedder>> =
+        match tokio::task::spawn_blocking(ninox_core::embeddings::FastEmbedEmbedder::try_new).await {
+            Ok(Ok(embedder)) => Some(Arc::new(embedder) as Arc<dyn ninox_core::embeddings::Embedder>),
+            Ok(Err(err)) => {
+                tracing::warn!("brain: embedding model unavailable, semantic search disabled: {err}");
+                None
+            }
+            Err(join_err) => {
+                tracing::warn!("brain: embedder init task panicked: {join_err}");
+                None
+            }
+        };
     let engine = match resolve_token(config.github_token.clone()) {
         Some(token) => Engine::new_with_github(Arc::clone(&store), token),
         None        => Engine::new(Arc::clone(&store)),
@@ -357,8 +388,9 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
     tokio::spawn({
         let e = engine.clone();
         let b = brain.clone();
+        let emb = embedder.clone();
         async move {
-            if let Err(err) = ninox_server::start(e, b, port).await {
+            if let Err(err) = ninox_server::start(e, b, emb, port).await {
                 tracing::error!("server: {err}");
             }
         }
