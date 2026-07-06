@@ -228,6 +228,73 @@ jobs:
           replace-with = "${CODEARTIFACT_REPOSITORY}"
           EOF
 
+      # CodeArtifact serves crates.io metadata from a regional cache that,
+      # for infrequently requested crates, refreshes only when the crate's
+      # index file is requested — the first request returns the stale
+      # version list and triggers an asynchronous update. Cargo stops
+      # resolving at the first crate whose locked version is missing, so
+      # left to itself it discovers stale crates one publish attempt at a
+      # time. Instead: request the index file of every registry dependency
+      # in Cargo.lock up front (kicking off all the refreshes at once),
+      # then poll `cargo fetch --locked` until the index can satisfy the
+      # whole lockfile.
+      - name: Wait for CodeArtifact index to cover Cargo.lock
+        if: steps.config.outputs.configured == 'true' && steps.plan.outputs.any_publish == 'true'
+        run: |
+          set -euo pipefail
+          endpoint=$(aws codeartifact get-repository-endpoint \
+            --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --repository "$CODEARTIFACT_REPOSITORY" --format cargo \
+            --query repositoryEndpoint --output text)
+          token=$(aws codeartifact get-authorization-token \
+            --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --query authorizationToken --output text)
+          echo "::add-mask::${token}"
+          # Every registry-sourced package in the lockfile (workspace
+          # members have no `source`), mapped to its sparse-index path.
+          python3 - <<'PY' > /tmp/index-paths.txt
+          import tomllib
+          with open("Cargo.lock", "rb") as f:
+              lock = tomllib.load(f)
+          for raw in sorted({p["name"] for p in lock["package"] if "source" in p}):
+              name = raw.lower()  # index paths are lowercased per the registry spec
+              if len(name) == 1:
+                  print(f"1/{name}")
+              elif len(name) == 2:
+                  print(f"2/{name}")
+              elif len(name) == 3:
+                  print(f"3/{name[0]}/{name}")
+              else:
+                  print(f"{name[:2]}/{name[2:4]}/{name}")
+          PY
+          # Touch every index file; 404s (never-cached crates) and other
+          # errors are fine — the point is triggering the refreshes.
+          xargs -P 16 -I{} curl -fs -o /dev/null --max-time 30 -u "aws:${token}" "${endpoint}{}" \
+            < /tmp/index-paths.txt || true
+          echo "Touched $(wc -l < /tmp/index-paths.txt) index files; polling until the lockfile resolves..."
+          for i in $(seq 1 40); do
+            if cargo fetch --locked > /tmp/cargo-fetch.log 2>&1; then
+              echo "Index covers the whole lockfile (attempt ${i})."
+              exit 0
+            fi
+            # Only an index that hasn't caught up yet is worth waiting out;
+            # anything else (stale lockfile, auth, network) won't improve
+            # with retries, so surface it immediately.
+            if ! grep -q "failed to select a version\|not found in registry" /tmp/cargo-fetch.log; then
+              echo "cargo fetch failed with a non-index error:" >&2
+              tail -n 20 /tmp/cargo-fetch.log >&2
+              exit 1
+            fi
+            grep -m1 "failed to select a version" /tmp/cargo-fetch.log || tail -n 3 /tmp/cargo-fetch.log
+            if [ "$i" -lt 40 ]; then
+              echo "Index still refreshing (attempt ${i}/40) — retrying in 30s..."
+              sleep 30
+            fi
+          done
+          echo "Timed out waiting for the CodeArtifact index to include all locked versions." >&2
+          tail -n 20 /tmp/cargo-fetch.log >&2
+          exit 1
+
       - name: Publish ninox-core
         if: steps.config.outputs.configured == 'true' && steps.plan.outputs.core_publish == 'true'
         run: |
