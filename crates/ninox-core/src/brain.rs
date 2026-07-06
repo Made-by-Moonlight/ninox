@@ -1,4 +1,4 @@
-use crate::embeddings::Embedder;
+use crate::embeddings::{cosine_similarity, reciprocal_rank_fusion, Embedder, QUERY_INSTRUCTION_PREFIX};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::{params, functions::FunctionFlags, Connection};
@@ -238,8 +238,17 @@ impl BrainIndex {
         Ok((embedded, cached))
     }
 
-    /// Full-text search with optional filters.
-    pub fn query(&self, text: &str, filters: QueryFilters) -> Result<Vec<BrainEntry>> {
+    /// Hybrid full-text + semantic search. When `text` is non-empty and
+    /// `embedder` is `Some`, blends the existing FTS5 keyword ranking with
+    /// vector similarity via Reciprocal Rank Fusion. Falls back to exactly
+    /// today's keyword-only (or filter-only) behavior when `text` is empty
+    /// or `embedder` is `None`.
+    pub fn query(
+        &self,
+        text: &str,
+        embedder: Option<&dyn Embedder>,
+        filters: QueryFilters,
+    ) -> Result<Vec<BrainEntry>> {
         let conn = self.conn.lock().unwrap();
 
         if text.trim().is_empty() && filters.entry_type.is_none() && filters.tag.is_none() {
@@ -269,6 +278,7 @@ impl BrainIndex {
             return Ok(results);
         }
 
+        // Keyword leg: existing FTS5 ranking, as an ordered id list.
         let mut stmt = conn.prepare(
             "SELECT e.id, e.type, e.name, e.tags, e.repos, e.updated, e.body
              FROM entries_fts
@@ -277,10 +287,33 @@ impl BrainIndex {
              ORDER BY rank",
         )?;
         let rows = stmt.query_map(params![sanitize_fts_query(text)], row_to_entry)?;
-        let mut results: Vec<BrainEntry> =
-            rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let keyword_results: Vec<BrainEntry> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let keyword_ids: Vec<String> = keyword_results.iter().map(|e| e.id.clone()).collect();
 
-        // Post-filter by type and tag
+        // Semantic leg: top-20 by cosine similarity, if an embedder is available.
+        let semantic_ids: Vec<String> = match embedder {
+            Some(embedder) => Self::semantic_candidates(&conn, embedder, text)?,
+            None => Vec::new(),
+        };
+
+        let mut results: Vec<BrainEntry> = if semantic_ids.is_empty() {
+            keyword_results
+        } else {
+            let fused = reciprocal_rank_fusion(&[keyword_ids, semantic_ids], 60.0);
+            let mut by_id: HashMap<String, BrainEntry> =
+                keyword_results.into_iter().map(|e| (e.id.clone(), e)).collect();
+            let mut fused_results = Vec::with_capacity(fused.len());
+            for (id, _score) in fused {
+                if let Some(entry) = by_id.remove(&id) {
+                    fused_results.push(entry);
+                } else if let Some(entry) = get_by_id(&conn, &id)? {
+                    fused_results.push(entry);
+                }
+            }
+            fused_results
+        };
+
+        // Post-filter by type and tag.
         if let Some(ref et) = filters.entry_type {
             results.retain(|e| &e.entry_type == et);
         }
@@ -288,7 +321,42 @@ impl BrainIndex {
             results.retain(|e| e.tags.iter().any(|t| t == tag));
         }
 
+        results.truncate(20);
         Ok(results)
+    }
+
+    /// Top-20 entry ids by cosine similarity to `text`, embedded with the
+    /// query-instruction prefix Arctic Embed expects for asymmetric
+    /// retrieval. Returns an empty list (never an error) if embedding the
+    /// query text fails — a broken embedder degrades to keyword-only
+    /// results, it never fails the whole query.
+    fn semantic_candidates(
+        conn: &Connection,
+        embedder: &dyn Embedder,
+        text: &str,
+    ) -> Result<Vec<String>> {
+        let query_vector = match embedder.embed(&format!("{QUERY_INSTRUCTION_PREFIX}{text}")) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!("brain: failed to embed query text: {err}");
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut stmt = conn.prepare("SELECT id, vector FROM embeddings")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+
+        let mut scored: Vec<(String, f32)> = Vec::new();
+        for row in rows {
+            let (id, blob) = row?;
+            let vector = blob_to_vector(&blob);
+            scored.push((id, cosine_similarity(&query_vector, &vector)));
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scored.truncate(20);
+        Ok(scored.into_iter().map(|(id, _)| id).collect())
     }
 
     /// Fetch a single entry by its relative path id.
@@ -967,7 +1035,7 @@ mod tests {
 
         brain.rebuild(None).unwrap();
 
-        let results = brain.query("anyhow", QueryFilters::default()).unwrap();
+        let results = brain.query("anyhow", None, QueryFilters::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Rust Tips");
     }
@@ -990,11 +1058,11 @@ mod tests {
 
         for text in ["ninox-server", "foo:bar", "orchestrator\"", "-orchestrator"] {
             brain
-                .query(text, QueryFilters::default())
+                .query(text, None, QueryFilters::default())
                 .unwrap_or_else(|e| panic!("query({text:?}) should not error, got: {e}"));
         }
 
-        let results = brain.query("ninox-server", QueryFilters::default()).unwrap();
+        let results = brain.query("ninox-server", None, QueryFilters::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "ninox-server");
     }
@@ -1012,10 +1080,113 @@ mod tests {
         brain.rebuild(None).unwrap();
 
         let results = brain
-            .query("", QueryFilters { entry_type: Some("people".into()), tag: None })
+            .query("", None, QueryFilters { entry_type: Some("people".into()), tag: None })
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry_type, "people");
+    }
+
+    #[test]
+    fn query_surfaces_semantic_match_with_no_keyword_overlap() {
+        let (brain, dir) = make_brain();
+        let notes = dir.path().join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        // Deliberately no shared words with the query text below.
+        fs::write(notes.join("outage.md"), "---\nname: 401 debugging notes\n---\nHow we diagnosed the outage.").unwrap();
+        fs::write(notes.join("coffee.md"), "---\nname: Coffee notes\n---\nBest beans for espresso.").unwrap();
+
+        // A fake embedder that makes "auth failures" and "401 debugging
+        // notes" cosine-similar (same first dimension marker) while
+        // "Coffee notes" is dissimilar — enough to prove the fusion path
+        // runs end-to-end without needing the real model.
+        struct SemanticFakeEmbedder;
+        impl Embedder for SemanticFakeEmbedder {
+            fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+                if text.contains("auth") || text.contains("401") || text.contains("outage") {
+                    Ok(vec![1.0, 0.0])
+                } else {
+                    Ok(vec![0.0, 1.0])
+                }
+            }
+            fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+                texts.iter().map(|t| self.embed(t)).collect()
+            }
+            fn dimension(&self) -> usize {
+                2
+            }
+        }
+
+        let embedder = SemanticFakeEmbedder;
+        brain.rebuild(Some(&embedder)).unwrap();
+
+        // No shared vocabulary with either file's title/body at all, so the
+        // keyword leg alone would return nothing for this query.
+        let results = brain.query("auth failures", Some(&embedder), QueryFilters::default()).unwrap();
+        assert!(
+            results.iter().any(|e| e.id == "notes/outage.md"),
+            "expected the semantically related entry to surface: {results:?}"
+        );
+        // The design applies no similarity threshold (see the spec's
+        // "Query flow" section) — a dissimilar entry may still appear, it
+        // must just rank below the related one if both are present.
+        let outage_rank = results.iter().position(|e| e.id == "notes/outage.md").unwrap();
+        if let Some(coffee_rank) = results.iter().position(|e| e.id == "notes/coffee.md") {
+            assert!(
+                outage_rank < coffee_rank,
+                "the semantically related entry should outrank the unrelated one: {results:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_degrades_gracefully_when_embedder_fails_at_query_time() {
+        let (brain, dir) = make_brain();
+        let notes = dir.path().join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(notes.join("rust.md"), "---\nname: Rust Tips\n---\nUse anyhow for error handling.").unwrap();
+
+        // Indexed without embeddings (embedder is only used at query time
+        // here), then queried with an embedder whose every call fails.
+        brain.rebuild(None).unwrap();
+        let results = brain.query("anyhow", Some(&FailingEmbedder), QueryFilters::default()).unwrap();
+
+        assert_eq!(
+            results.len(),
+            1,
+            "a failing embedder must degrade to keyword-only results, not fail the whole query"
+        );
+        assert_eq!(results[0].name, "Rust Tips");
+    }
+
+    #[test]
+    fn query_without_embedder_matches_current_keyword_only_behavior() {
+        let (brain, dir) = make_brain();
+        let notes = dir.path().join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(notes.join("rust.md"), "---\nname: Rust Tips\n---\nUse anyhow for error handling.").unwrap();
+        brain.rebuild(None).unwrap();
+
+        let results = brain.query("anyhow", None, QueryFilters::default()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Rust Tips");
+    }
+
+    #[test]
+    fn query_empty_text_ignores_embedder() {
+        let (brain, dir) = make_brain();
+        fs::create_dir_all(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes/a.md"), "# A\n\nContent.").unwrap();
+        let embedder = FakeEmbedder::new(4);
+        brain.rebuild(Some(&embedder)).unwrap();
+        embedder.calls.store(0, Ordering::SeqCst);
+
+        let results = brain.query("", Some(&embedder), QueryFilters::default()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            embedder.calls.load(Ordering::SeqCst),
+            0,
+            "empty-text queries must never touch the embedder"
+        );
     }
 
     // -----------------------------------------------------------------

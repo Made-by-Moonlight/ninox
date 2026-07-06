@@ -1510,7 +1510,7 @@ impl App {
 
             Message::NavigateBrain => {
                 if !state.brain_view.loaded {
-                    match state.brain.query("", QueryFilters::default()) {
+                    match state.brain.query("", None, QueryFilters::default()) {
                         Ok(entries) => {
                             state.brain_view.entries = entries;
                             state.brain_view.loaded = true;
@@ -1622,7 +1622,7 @@ impl App {
                 match state.brain.rebuild(None) {
                     Ok(stats) => {
                         tracing::info!("brain reindexed: {} entries", stats.indexed);
-                        match state.brain.query("", QueryFilters::default()) {
+                        match state.brain.query("", None, QueryFilters::default()) {
                             Ok(entries) => {
                                 state.brain_view.entries = entries;
                                 Self::refresh_brain_edges(state);
@@ -1703,7 +1703,7 @@ impl App {
                             state.brain_view.related.clear();
                             state.brain_view.edges.clear();
                             state.brain_view.loaded = false;
-                            match state.brain.query("", QueryFilters::default()) {
+                            match state.brain.query("", None, QueryFilters::default()) {
                                 Ok(entries) => {
                                     state.brain_view.entries = entries;
                                     state.brain_view.loaded = true;

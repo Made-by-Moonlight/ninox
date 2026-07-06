@@ -305,7 +305,7 @@ async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
         }
         BrainAction::Query { text, entry_type, tag } => {
             let filters = QueryFilters { entry_type, tag };
-            let entries = brain.query(&text, filters)?;
+            let entries = brain.query(&text, None, filters)?;
             for entry in &entries {
                 println!("{} ({}) — {}", entry.name, entry.entry_type, entry.id);
             }

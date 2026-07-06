@@ -50,7 +50,7 @@ async fn query_entries(
         entry_type: params.entry_type,
         tag: params.tag,
     };
-    match brain.query(&text, filters) {
+    match brain.query(&text, None, filters) {
         Ok(entries) => Ok(Json(entries)),
         Err(err) => {
             tracing::error!("brain query: {err}");
