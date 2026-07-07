@@ -250,11 +250,17 @@ async fn ensure_statusline_settings(worktree_path: &std::path::Path) {
     if settings_path.exists() {
         return;
     }
-    let ninox_bin = ninox_core::config::AppConfig::ninox_bin_dir().display().to_string();
+    let ninox_bin = ninox_core::config::AppConfig::ninox_bin_dir().join("ninox").display().to_string();
+    // Single-quote the binary path (mirroring the PATH-prepend quoting above
+    // in `spawn_interactive_session`): the default macOS config dir is
+    // `~/Library/Application Support/...`, which contains a space, so an
+    // unquoted path here would be split into two argv tokens by the shell
+    // that ultimately runs this command and never resolve to the binary.
+    let ninox_bin_quoted = format!("'{}'", ninox_bin.replace('\'', "'\\''"));
     let settings = serde_json::json!({
         "statusLine": {
             "type": "command",
-            "command": format!("{ninox_bin} statusline"),
+            "command": format!("{ninox_bin_quoted} statusline"),
             "refreshInterval": 20
         }
     });
@@ -300,7 +306,16 @@ mod tests {
             &std::fs::read_to_string(&settings_path).unwrap(),
         ).unwrap();
         assert_eq!(settings["statusLine"]["type"], "command");
-        assert!(settings["statusLine"]["command"].as_str().unwrap().ends_with("statusline"));
+        let command = settings["statusLine"]["command"].as_str().unwrap();
+        // The binary path is single-quoted (it may contain spaces, e.g. the
+        // default macOS config dir `~/Library/Application Support/...`), so
+        // extract the first quoted token rather than splitting on whitespace.
+        let bin_path = command
+            .strip_prefix('\'')
+            .and_then(|rest| rest.split('\'').next())
+            .unwrap();
+        assert!(bin_path.ends_with("/ninox"), "expected a path to the ninox binary, got: {bin_path}");
+        assert!(command.ends_with("statusline"));
     }
 
     #[tokio::test]
