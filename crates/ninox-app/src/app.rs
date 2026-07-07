@@ -2383,7 +2383,7 @@ process.exit(0);
             },
             "statusLine": {
                 "type": "command",
-                "command": format!("{ninox_bin} statusline"),
+                "command": format!("'{}' statusline", ninox_bin.replace('\'', "'\\''")),
                 "refreshInterval": 20
             }
         });
@@ -4293,7 +4293,7 @@ mod tests {
             &std::fs::read_to_string(root.join(".claude").join("settings.json")).unwrap(),
         ).unwrap();
         assert_eq!(settings["statusLine"]["type"], "command");
-        assert_eq!(settings["statusLine"]["command"], "/path/to/ninox statusline");
+        assert_eq!(settings["statusLine"]["command"], "'/path/to/ninox' statusline");
         assert_eq!(settings["statusLine"]["refreshInterval"], 20);
         // The existing subagent-blocker hook must still be present.
         assert!(settings["hooks"]["PreToolUse"].is_array());
