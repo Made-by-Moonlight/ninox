@@ -533,6 +533,7 @@ mod tests {
             pid: None, model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: claude_session_id.map(String::from),
+            terminal_at: None,
         }
     }
 

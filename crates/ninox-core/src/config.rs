@@ -104,6 +104,41 @@ impl Default for BrainHarvestConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Session retention configuration
+// ---------------------------------------------------------------------------
+
+/// How long a completed session record lingers after reaching a terminal
+/// state before the poller's retention sweep purges it — giving the fleet
+/// board a grace window to show what just finished instead of it vanishing
+/// the instant `Done`/`Terminated` is set. See
+/// `ninox_core::lifecycle::poller::Poller::sweep_retired_sessions`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRetentionConfig {
+    /// Days a `Done`/`Terminated` session stays queryable after reaching
+    /// that terminal state. Default: 2.
+    #[serde(default = "default_done_retention_days")]
+    pub done_retention_days: u64,
+}
+
+fn default_done_retention_days() -> u64 {
+    2
+}
+
+impl Default for SessionRetentionConfig {
+    fn default() -> Self {
+        Self { done_retention_days: default_done_retention_days() }
+    }
+}
+
+impl SessionRetentionConfig {
+    /// The retention window expressed in milliseconds, for comparison
+    /// against `Session::terminal_at` (Unix epoch milliseconds).
+    pub fn retention_millis(&self) -> i64 {
+        self.done_retention_days as i64 * 24 * 60 * 60 * 1000
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App configuration
 // ---------------------------------------------------------------------------
 
@@ -133,6 +168,10 @@ pub struct AppConfig {
     /// Background brain-harvest toggle. See `BrainHarvestConfig`.
     #[serde(default)]
     pub brain_harvest: BrainHarvestConfig,
+    /// Grace-period retention for completed session records — see
+    /// `SessionRetentionConfig`.
+    #[serde(default)]
+    pub session_retention: SessionRetentionConfig,
     /// Theme file name (resolves to `~/.config/ninox/themes/<name>.toml`) or
     /// an absolute/`~`-relative path. `None` uses `themes/field-notes.toml`
     /// if present, else the built-in Field Notes palettes.
@@ -158,6 +197,7 @@ impl Default for AppConfig {
             github_token:     None,
             brain:            BrainConfig::default(),
             brain_harvest:    BrainHarvestConfig::default(),
+            session_retention: SessionRetentionConfig::default(),
             theme_file:       None,
             harnesses:        BTreeMap::new(),
         }
@@ -334,6 +374,19 @@ mod tests {
     #[test]
     fn default_theme_is_dark() {
         assert_eq!(AppConfig::default().theme, ThemeVariant::Dark);
+    }
+
+    #[test]
+    fn session_retention_defaults_to_two_days() {
+        let cfg = SessionRetentionConfig::default();
+        assert_eq!(cfg.done_retention_days, 2);
+        assert_eq!(cfg.retention_millis(), 2 * 24 * 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn missing_session_retention_field_defaults() {
+        let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert_eq!(cfg.session_retention.done_retention_days, 2);
     }
 
     #[test]
