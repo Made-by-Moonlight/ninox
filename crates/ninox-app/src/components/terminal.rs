@@ -282,10 +282,24 @@ pub struct TerminalWidget<'a> {
 }
 
 impl<'a> TerminalWidget<'a> {
-    /// Every clickable link span in viewport row `row`, from OSC 8
-    /// hyperlinks (live grid or cached history) or a bare-URL fallback scan.
-    fn row_link_spans(&self, row: usize) -> Vec<crate::components::links::LinkSpan> {
-        use crate::components::links::{find_links, LinkCell};
+    /// The link-detection view of viewport row `row`: each cell's rendered
+    /// character plus its OSC 8 hyperlink URI, if any, from either the live
+    /// grid or cached scrollback history. Empty if `row` is out of bounds or
+    /// the scrollback line isn't cached.
+    ///
+    /// The live-grid branch has to clone each cell's `Hyperlink` out of the
+    /// grid (there's no way to borrow one directly), so callers must pass in
+    /// `hyperlink_storage` to own those clones for at least as long as the
+    /// returned `LinkCell`s (which borrow their URI strings from it) are used.
+    fn row_link_cells<'b>(
+        &self,
+        row: usize,
+        hyperlink_storage: &'b mut Vec<Option<alacritty_terminal::term::cell::Hyperlink>>,
+    ) -> Vec<crate::components::links::LinkCell<'b>>
+    where
+        'a: 'b,
+    {
+        use crate::components::links::LinkCell;
 
         let grid = self.state.term.grid();
         let cols = grid.columns();
@@ -300,32 +314,31 @@ impl<'a> TerminalWidget<'a> {
             let Some(cells) = self.state.scrollback.line_above((-logical - 1) as usize) else {
                 return Vec::new();
             };
-            let link_cells: Vec<LinkCell> = cells
-                .iter()
-                .map(|c| LinkCell { c: c.c, hyperlink: c.hyperlink.as_deref() })
-                .collect();
-            find_links(&link_cells)
+            cells.iter().map(|c| LinkCell { c: c.c, hyperlink: c.hyperlink.as_deref() }).collect()
         } else {
             use alacritty_terminal::index::{Column, Line};
             let line = Line(logical);
-            let hyperlinks: Vec<Option<alacritty_terminal::term::cell::Hyperlink>> =
-                (0..cols).map(|c| grid[line][Column(c)].hyperlink()).collect();
-            let link_cells: Vec<LinkCell> = (0..cols)
+            *hyperlink_storage = (0..cols).map(|c| grid[line][Column(c)].hyperlink()).collect();
+            (0..cols)
                 .map(|c| LinkCell {
                     c: grid[line][Column(c)].c,
-                    hyperlink: hyperlinks[c].as_ref().map(|h| h.uri()),
+                    hyperlink: hyperlink_storage[c].as_ref().map(|h| h.uri()),
                 })
-                .collect();
-            find_links(&link_cells)
+                .collect()
         }
+    }
+
+    /// Every clickable link span in viewport row `row`, from OSC 8
+    /// hyperlinks (live grid or cached history) or a bare-URL fallback scan.
+    fn row_link_spans(&self, row: usize) -> Vec<crate::components::links::LinkSpan> {
+        let mut hyperlink_storage = Vec::new();
+        crate::components::links::find_links(&self.row_link_cells(row, &mut hyperlink_storage))
     }
 
     /// The URL under viewport cell (col, row), if any.
     fn link_at(&self, col: usize, row: usize) -> Option<String> {
-        self.row_link_spans(row)
-            .into_iter()
-            .find(|s| col >= s.start_col && col <= s.end_col)
-            .map(|s| s.url)
+        let mut hyperlink_storage = Vec::new();
+        crate::components::links::link_at(&self.row_link_cells(row, &mut hyperlink_storage), col)
     }
 }
 
