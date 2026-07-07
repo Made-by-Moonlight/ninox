@@ -130,6 +130,7 @@ pub async fn spawn_interactive_session(
         catalogue_path:  (!p.catalogue_path.is_empty()).then(|| p.catalogue_path.clone()),
         context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: Some(p.claude_session_id),
+        terminal_at: None,
     };
     let _ = engine.store.upsert_session(&updated);
 
@@ -758,6 +759,7 @@ mod tests {
             catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some("fixed-uuid".into()),
+            terminal_at: None,
         }).unwrap();
 
         let ws = tempdir().unwrap().keep().to_string_lossy().to_string();

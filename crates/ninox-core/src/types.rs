@@ -74,6 +74,18 @@ pub struct Session {
     /// `None` for legacy sessions and for harnesses with no `resume_args`.
     #[serde(default)]
     pub claude_session_id: Option<String>,
+    /// Unix epoch milliseconds when this session reached a terminal status
+    /// (`Done`/`Terminated`) via the automatic lifecycle poller — set by
+    /// `poll_pids` on natural process exit and by merge detection in
+    /// `poll_github`. Gates the retention sweep
+    /// (`Poller::sweep_retired_sessions`) that purges the record from the
+    /// store/fleet board after `SessionRetentionConfig::done_retention_days`.
+    /// `None` for non-terminal sessions and for terminal sessions produced
+    /// by a direct user action (`terminate_session`/`remove_session`),
+    /// which the sweep purges on sight rather than holding for the grace
+    /// period. `#[serde(default)]` for wire/DB back-compat.
+    #[serde(default)]
+    pub terminal_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

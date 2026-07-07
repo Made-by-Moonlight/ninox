@@ -261,6 +261,7 @@ async fn run_spawn(
         catalogue_path:  std::env::var("NINOX_BRAIN").ok().filter(|s| !s.is_empty()),
         context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: Some(claude_session_id.clone()),
+        terminal_at: None,
     };
 
     store.upsert_session(&session)?;
