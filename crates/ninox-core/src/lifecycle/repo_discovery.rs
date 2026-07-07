@@ -5,7 +5,7 @@
 
 use crate::github::split_repo;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -28,8 +28,11 @@ pub struct RepoIdentity {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Discovery {
     pub repos: Vec<RepoIdentity>,
-    /// repo name -> extra worktree paths observed beyond the canonical `path`.
-    pub extra_worktrees: Vec<(String, Vec<PathBuf>)>,
+    /// Index into `repos` -> extra worktree paths observed beyond that
+    /// repo's canonical `path`. Keyed by index rather than name: two
+    /// distinct repos (different remote owners) can share the same short
+    /// name, and a name-keyed lookup would silently pick the wrong one.
+    pub extra_worktrees: Vec<(usize, Vec<PathBuf>)>,
 }
 
 /// Scan `candidates`, resolving each to its canonical repo root (the git
@@ -56,26 +59,29 @@ pub fn discover(candidates: &[PathBuf]) -> Discovery {
             observed.into_iter().filter(|p| p != &canonical).collect();
         extras.sort();
         extras.dedup();
-        if !extras.is_empty() {
-            extra_worktrees.push((identity.name.clone(), extras));
-        }
+
+        let index = repos.len();
         repos.push(identity);
+        if !extras.is_empty() {
+            extra_worktrees.push((index, extras));
+        }
     }
 
     Discovery { repos, extra_worktrees }
 }
 
-/// Repos sharing the same remote owner/org, keyed by owner — only groups with
-/// two or more members (a lone repo isn't a relationship). Ordered by owner
-/// name for deterministic output.
-pub fn group_by_owner(repos: &[RepoIdentity]) -> Vec<(String, Vec<String>)> {
-    let mut by_owner: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for repo in repos {
+/// Repos sharing the same remote owner/org, as (entry id, name) pairs keyed
+/// by owner — only groups with two or more members (a lone repo isn't a
+/// relationship). `ids` must be index-aligned with `repos` (see
+/// [`repo_entry_ids`]). Ordered by owner name for deterministic output.
+pub fn group_by_owner(repos: &[RepoIdentity], ids: &[String]) -> Vec<(String, Vec<(String, String)>)> {
+    let mut by_owner: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for (repo, id) in repos.iter().zip(ids) {
         if let Some(owner) = &repo.remote_owner {
-            by_owner.entry(owner.clone()).or_default().push(repo.name.clone());
+            by_owner.entry(owner.clone()).or_default().push((id.clone(), repo.name.clone()));
         }
     }
-    by_owner.into_iter().filter(|(_, names)| names.len() > 1).collect()
+    by_owner.into_iter().filter(|(_, members)| members.len() > 1).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -282,15 +288,49 @@ fn package_json_entry_points(root: &Path) -> Vec<String> {
 // Markdown generation (pure — no I/O)
 // ---------------------------------------------------------------------------
 
-/// Brain entry id (relative path) for `repo`'s `repos/` entry.
-pub fn repo_entry_id(repo_name: &str) -> String {
-    format!("repos/{}.md", crate::slugify(repo_name))
+/// One `repos/` entry id per `repos[i]` (index-aligned). Entries whose
+/// slugified name collides with another discovered repo's are disambiguated
+/// by prefixing the remote owner — e.g. `repos/acme-widget.md` alongside
+/// `repos/other-widget.md`, instead of both silently wanting
+/// `repos/widget.md` (which would make discovery overwrite one repo's entry
+/// with the other's). Two remoteless repos that happen to share a directory
+/// name are left undisambiguated — there's no other mechanical signal to
+/// tell them apart.
+pub fn repo_entry_ids(repos: &[RepoIdentity]) -> Vec<String> {
+    let base_slugs: Vec<String> = repos.iter().map(|r| crate::slugify(&r.name)).collect();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for slug in &base_slugs {
+        *counts.entry(slug.as_str()).or_insert(0) += 1;
+    }
+
+    repos
+        .iter()
+        .zip(base_slugs.iter())
+        .map(|(repo, base)| {
+            if counts[base.as_str()] > 1 {
+                if let Some(owner) = &repo.remote_owner {
+                    return format!("repos/{}-{}.md", crate::slugify(owner), base);
+                }
+            }
+            format!("repos/{base}.md")
+        })
+        .collect()
 }
 
-/// Brain entry id for the `relationships/` entry recording `repo_name`'s
-/// extra worktrees.
-pub fn worktree_relationship_id(repo_name: &str) -> String {
-    format!("relationships/{}-worktrees.md", crate::slugify(repo_name))
+/// The slug portion of a `repos/` entry id (e.g. `"widget"` from
+/// `"repos/widget.md"`), used to derive relationship entry ids that stay
+/// consistent with however [`repo_entry_ids`] disambiguated that repo.
+fn entry_slug(repo_entry_id: &str) -> &str {
+    repo_entry_id
+        .strip_prefix("repos/")
+        .and_then(|s| s.strip_suffix(".md"))
+        .unwrap_or(repo_entry_id)
+}
+
+/// Brain entry id for the `relationships/` entry recording the extra
+/// worktrees of the repo whose own `repos/` entry id is `repo_entry_id`.
+pub fn worktree_relationship_id(repo_entry_id: &str) -> String {
+    format!("relationships/{}-worktrees.md", entry_slug(repo_entry_id))
 }
 
 /// Brain entry id for the `relationships/` entry recording repos that share
@@ -324,11 +364,16 @@ pub fn repo_entry_markdown(repo: &RepoIdentity, updated: &str) -> String {
     )
 }
 
-/// Render the "extra worktrees" relationship for `repo`.
-pub fn worktree_relationship_markdown(repo: &RepoIdentity, worktrees: &[PathBuf], updated: &str) -> String {
-    let slug = crate::slugify(&repo.name);
+/// Render the "extra worktrees" relationship for `repo`, whose own `repos/`
+/// entry id is `repo_entry_id` (see [`repo_entry_ids`]).
+pub fn worktree_relationship_markdown(
+    repo: &RepoIdentity,
+    repo_entry_id: &str,
+    worktrees: &[PathBuf],
+    updated: &str,
+) -> String {
     let mut body = format!(
-        "# {name} worktrees\n\nAdditional git worktrees observed for [[repos/{slug}|{name}]] \
+        "# {name} worktrees\n\nAdditional git worktrees observed for [[{repo_entry_id}|{name}]] \
          beyond its canonical location `{canonical}`:\n\n",
         name = repo.name,
         canonical = repo.path.display(),
@@ -344,16 +389,17 @@ pub fn worktree_relationship_markdown(repo: &RepoIdentity, worktrees: &[PathBuf]
 }
 
 /// Render the "shared remote owner" relationship for a group of repos owned
-/// by `owner`.
-pub fn shared_org_relationship_markdown(owner: &str, repo_names: &[String], updated: &str) -> String {
+/// by `owner`. `members` is a list of (entry id, name) pairs, as produced by
+/// [`group_by_owner`].
+pub fn shared_org_relationship_markdown(owner: &str, members: &[(String, String)], updated: &str) -> String {
     let mut body = format!("# {owner} org\n\nRepos sharing the `{owner}` remote owner/org:\n\n");
-    for name in repo_names {
-        body.push_str(&format!("- [[repos/{}|{}]]\n", crate::slugify(name), name));
+    for (id, name) in members {
+        body.push_str(&format!("- [[{id}|{name}]]\n"));
     }
 
     format!(
         "---\ntype: relationship\nname: {owner}-org\ntags: [org]\nrepos: [{repos}]\nupdated: {updated}\n---\n\n{body}",
-        repos = repo_names.join(", "),
+        repos = members.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>().join(", "),
     )
 }
 
@@ -436,7 +482,7 @@ mod tests {
         assert_eq!(discovery.repos[0].path, repo);
 
         assert_eq!(discovery.extra_worktrees.len(), 1);
-        assert_eq!(discovery.extra_worktrees[0].0, "widget");
+        assert_eq!(discovery.extra_worktrees[0].0, 0, "index into discovery.repos");
         assert_eq!(discovery.extra_worktrees[0].1, vec![worktree]);
     }
 
@@ -573,8 +619,48 @@ mod tests {
             identity("lonely", Some("solo-corp")),
             identity("no-remote", None),
         ];
-        let groups = group_by_owner(&repos);
-        assert_eq!(groups, vec![("acme".to_string(), vec!["widget".to_string(), "gadget".to_string()])]);
+        let ids = repo_entry_ids(&repos);
+        let groups = group_by_owner(&repos, &ids);
+        assert_eq!(
+            groups,
+            vec![(
+                "acme".to_string(),
+                vec![
+                    ("repos/widget.md".to_string(), "widget".to_string()),
+                    ("repos/gadget.md".to_string(), "gadget".to_string()),
+                ],
+            )]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // repo_entry_ids
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn repo_entry_ids_slugify_names_when_unique() {
+        let repos = vec![identity("Ninox Core", Some("acme"))];
+        assert_eq!(repo_entry_ids(&repos), vec!["repos/ninox-core.md".to_string()]);
+    }
+
+    #[test]
+    fn repo_entry_ids_disambiguate_same_name_different_owner() {
+        // Two distinct repos both named "widget" under different owners must
+        // not collide on the same repos/widget.md entry — that would make
+        // discovery silently overwrite one repo's brain entry with the
+        // other's on every run.
+        let repos = vec![identity("widget", Some("acme")), identity("widget", Some("other"))];
+        let ids = repo_entry_ids(&repos);
+        assert_eq!(ids, vec!["repos/acme-widget.md".to_string(), "repos/other-widget.md".to_string()]);
+    }
+
+    #[test]
+    fn repo_entry_ids_leave_remoteless_collision_undisambiguated() {
+        // No remote owner to disambiguate with — an inherent limit, not a
+        // regression: there's simply no other mechanical signal available.
+        let repos = vec![identity("widget", None), identity("widget", None)];
+        let ids = repo_entry_ids(&repos);
+        assert_eq!(ids, vec!["repos/widget.md".to_string(), "repos/widget.md".to_string()]);
     }
 
     // -----------------------------------------------------------------
@@ -606,33 +692,39 @@ mod tests {
     }
 
     #[test]
-    fn repo_entry_id_slugifies_name() {
-        assert_eq!(repo_entry_id("Ninox Core"), "repos/ninox-core.md");
-    }
-
-    #[test]
     fn worktree_relationship_markdown_lists_every_worktree() {
         let repo = identity("widget", Some("acme"));
         let worktrees = vec![PathBuf::from("/w/wt1"), PathBuf::from("/w/wt2")];
-        let md = worktree_relationship_markdown(&repo, &worktrees, "2026-07-07");
+        let md = worktree_relationship_markdown(&repo, "repos/widget.md", &worktrees, "2026-07-07");
 
         assert!(md.contains("type: relationship"));
         assert!(md.contains("repos: [widget]"));
-        assert!(md.contains("[[repos/widget|widget]]"));
+        assert!(md.contains("[[repos/widget.md|widget]]"));
         assert!(md.contains("/w/wt1"));
         assert!(md.contains("/w/wt2"));
+    }
+
+    #[test]
+    fn worktree_relationship_id_stays_consistent_with_a_disambiguated_repo_id() {
+        assert_eq!(
+            worktree_relationship_id("repos/acme-widget.md"),
+            "relationships/acme-widget-worktrees.md"
+        );
     }
 
     #[test]
     fn shared_org_relationship_markdown_links_every_repo() {
         let md = shared_org_relationship_markdown(
             "acme",
-            &["widget".to_string(), "gadget".to_string()],
+            &[
+                ("repos/widget.md".to_string(), "widget".to_string()),
+                ("repos/gadget.md".to_string(), "gadget".to_string()),
+            ],
             "2026-07-07",
         );
         assert!(md.contains("type: relationship"));
         assert!(md.contains("repos: [widget, gadget]"));
-        assert!(md.contains("[[repos/widget|widget]]"));
-        assert!(md.contains("[[repos/gadget|gadget]]"));
+        assert!(md.contains("[[repos/widget.md|widget]]"));
+        assert!(md.contains("[[repos/gadget.md|gadget]]"));
     }
 }

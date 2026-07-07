@@ -444,9 +444,10 @@ async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()>
 /// Queries the brain for each entry's id before writing (mirroring the
 /// "query first" convention `docs/BRAIN.md` and the harvest prompt in
 /// `lifecycle::brain_harvest` teach) purely to report new-vs-updated counts —
-/// the write itself is idempotent regardless, since a repo's entry id is
-/// deterministic (`repos/<slug>.md`), so re-running overwrites the same file
-/// rather than creating a duplicate under a different name.
+/// the write itself is idempotent regardless, since each repo's entry id is
+/// deterministic (see `repo_discovery::repo_entry_ids`), so re-running
+/// overwrites the same file rather than creating a duplicate under a
+/// different name.
 fn run_discover_repos(
     brain: &BrainIndex,
     brain_path: &std::path::Path,
@@ -473,31 +474,28 @@ fn run_discover_repos(
     }
 
     let discovery = repo_discovery::discover(&candidates);
+    let ids = repo_discovery::repo_entry_ids(&discovery.repos);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     let mut new_count = 0usize;
     let mut updated_count = 0usize;
-    for repo in &discovery.repos {
-        let id = repo_discovery::repo_entry_id(&repo.name);
-        if brain.get(&id)?.is_some() { updated_count += 1 } else { new_count += 1 }
-        write_brain_entry(brain_path, &id, &repo_discovery::repo_entry_markdown(repo, &today))?;
+    for (repo, id) in discovery.repos.iter().zip(&ids) {
+        if brain.get(id)?.is_some() { updated_count += 1 } else { new_count += 1 }
+        write_brain_entry(brain_path, id, &repo_discovery::repo_entry_markdown(repo, &today))?;
     }
 
-    for (name, worktrees) in &discovery.extra_worktrees {
-        let repo = discovery
-            .repos
-            .iter()
-            .find(|r| &r.name == name)
-            .expect("a worktree group's repo is always also in discovery.repos");
-        let id = repo_discovery::worktree_relationship_id(name);
-        let markdown = repo_discovery::worktree_relationship_markdown(repo, worktrees, &today);
+    for (repo_index, worktrees) in &discovery.extra_worktrees {
+        let repo = &discovery.repos[*repo_index];
+        let repo_id = &ids[*repo_index];
+        let id = repo_discovery::worktree_relationship_id(repo_id);
+        let markdown = repo_discovery::worktree_relationship_markdown(repo, repo_id, worktrees, &today);
         write_brain_entry(brain_path, &id, &markdown)?;
     }
 
-    let org_groups = repo_discovery::group_by_owner(&discovery.repos);
-    for (owner, repo_names) in &org_groups {
+    let org_groups = repo_discovery::group_by_owner(&discovery.repos, &ids);
+    for (owner, members) in &org_groups {
         let id = repo_discovery::shared_org_relationship_id(owner);
-        let markdown = repo_discovery::shared_org_relationship_markdown(owner, repo_names, &today);
+        let markdown = repo_discovery::shared_org_relationship_markdown(owner, members, &today);
         write_brain_entry(brain_path, &id, &markdown)?;
     }
 
