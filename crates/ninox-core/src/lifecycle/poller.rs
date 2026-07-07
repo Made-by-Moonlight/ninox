@@ -15,6 +15,10 @@ use crate::{
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
+/// Last-seen `(cost_usd, context_used_pct, context_total_tokens)` snapshot per session.
+/// Used by `poll_context_updates` to detect external changes.
+type ContextSnapshot = (f64, Option<f64>, Option<u64>);
+
 /// Unix epoch milliseconds "now" — used to stamp `Notification::created_at`.
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -29,7 +33,7 @@ pub struct Poller {
     /// Last-seen `(cost_usd, context_used_pct, context_total_tokens)` per
     /// session, used solely to detect changes written externally by the
     /// `ninox statusline` subcommand — see `poll_context_updates`.
-    context_cache:    Arc<std::sync::Mutex<HashMap<String, (f64, Option<f64>, Option<u64>)>>>,
+    context_cache:    Arc<std::sync::Mutex<HashMap<String, ContextSnapshot>>>,
 }
 
 impl Poller {
