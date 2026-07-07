@@ -221,7 +221,14 @@ impl Poller {
         };
 
         let prompt         = brain_harvest::build_harvest_prompt(&session.id, &diff);
-        let brain_path      = config.resolved_brain_path();
+        // Prefer the session's own catalogue — set from that worker's
+        // `NINOX_BRAIN` at spawn time (see `main.rs::run_spawn`,
+        // `spawn_util::interactive_env_vars`) — over the global default, so
+        // the harvest writes to the same vault the worker itself thinks
+        // with, not always the default catalogue.
+        let brain_path: PathBuf = session.catalogue_path.clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config.resolved_brain_path());
         let workspace_path: PathBuf = workspace.into();
         let runner          = self.harvest_runner.clone();
         let session_id      = session.id.clone();
