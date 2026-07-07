@@ -1031,15 +1031,46 @@ impl App {
                             return Task::none();
                         }
 
-                        let workspace = crate::spawn_util::expand_tilde(&workspace_input);
+                        let mut workspace = crate::spawn_util::expand_tilde(&workspace_input);
                         if !std::path::Path::new(&workspace).exists() {
-                            // Bad path typed — keep the modal open rather than
-                            // optimistically spawning a session that can never
-                            // launch.
-                            if let Some(f) = &mut state.spawn_modal {
-                                f.error = Some(format!("workspace {workspace} does not exist"));
+                            // The path doesn't exist yet — if it's nested
+                            // under a git repo (e.g. this project's own
+                            // `<repo>/.claude/worktrees/<branch>` convention),
+                            // treat it as a request for a brand-new worktree
+                            // rather than rejecting outright.
+                            let ws_path = std::path::Path::new(&workspace).to_path_buf();
+                            let repo_root = ws_path.parent().and_then(crate::spawn_util::find_repo_root);
+
+                            match repo_root {
+                                Some(root) => {
+                                    let branch = ws_path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or(&workspace)
+                                        .to_string();
+                                    match crate::spawn_util::create_worktree_at(&root, &ws_path, &branch) {
+                                        Ok(created) => workspace = created,
+                                        Err(e) => {
+                                            if let Some(f) = &mut state.spawn_modal {
+                                                f.error = Some(format!(
+                                                    "failed to create worktree at {workspace}: {e}"
+                                                ));
+                                            }
+                                            return Task::none();
+                                        }
+                                    }
+                                }
+                                None => {
+                                    // Bad path typed, no enclosing git repo —
+                                    // keep the modal open rather than
+                                    // optimistically spawning a session that
+                                    // can never launch.
+                                    if let Some(f) = &mut state.spawn_modal {
+                                        f.error = Some(format!("workspace {workspace} does not exist"));
+                                    }
+                                    return Task::none();
+                                }
                             }
-                            return Task::none();
                         }
 
                         let ts = SystemTime::now()
@@ -4404,6 +4435,142 @@ mod tests {
         let form = m.spawn_modal.as_ref().expect("modal stays open");
         let err = form.error.as_deref().expect("guard refusal must surface an error");
         assert!(err.contains("does not exist"), "unexpected error message: {err}");
+    }
+
+    /// Minimal real git repo, mirroring `spawn_util::tests::init_git_repo` —
+    /// `create_worktree_at` shells out to real `git`.
+    fn init_git_repo() -> std::path::PathBuf {
+        let dir = tempdir().unwrap().keep();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", dir.to_str().unwrap()])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), "x").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    #[test]
+    fn standalone_confirm_with_missing_path_under_git_repo_auto_creates_worktree() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        let repo = init_git_repo();
+        let missing = repo.join(".claude").join("worktrees").join("feat-new-thing");
+        let missing_str = missing.to_string_lossy().to_string();
+        assert!(!missing.exists(), "sanity: the typed path must not exist yet");
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-autocreate".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace(missing_str.clone()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        assert!(
+            m.spawn_modal.is_none(),
+            "auto-created worktree must let spawn proceed, got error: {:?}",
+            m.spawn_modal.as_ref().and_then(|f| f.error.clone())
+        );
+        let sess = m.sessions.get("solo-autocreate").expect("session created against the auto-created worktree");
+        assert_eq!(sess.workspace_path.as_deref(), Some(missing_str.as_str()));
+        assert!(missing.join(".git").exists(), "the typed path must now be a real git worktree");
+
+        let out = std::process::Command::new("git")
+            .args(["-C", &missing_str, "branch", "--show-current"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "feat-new-thing",
+            "branch name must be derived from the missing path's final component"
+        );
+    }
+
+    #[test]
+    fn standalone_confirm_with_missing_path_reuses_existing_branch() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        let repo = init_git_repo();
+        let missing = repo.join(".claude").join("worktrees").join("feat-existing");
+        let missing_str = missing.to_string_lossy().to_string();
+
+        // Pre-create the branch (and worktree), then remove just the
+        // worktree registration so the path is missing again but the
+        // branch survives — exercising the "already exists" fallback.
+        crate::spawn_util::create_worktree_at(&repo, &missing, "feat-existing").unwrap();
+        std::process::Command::new("git")
+            .args(["-C", &repo.to_string_lossy(), "worktree", "remove", "--force", &missing_str])
+            .output()
+            .unwrap();
+        assert!(!missing.exists(), "sanity: worktree dir removed but branch remains");
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-reuse".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace(missing_str.clone()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        assert!(
+            m.spawn_modal.is_none(),
+            "re-checking out an existing branch must let spawn proceed, got error: {:?}",
+            m.spawn_modal.as_ref().and_then(|f| f.error.clone())
+        );
+        assert!(m.sessions.contains_key("solo-reuse"));
+        let out = std::process::Command::new("git")
+            .args(["-C", &missing_str, "branch", "--show-current"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "feat-existing");
+    }
+
+    #[test]
+    fn standalone_confirm_surfaces_the_git_error_when_worktree_creation_fails() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        // The branch derived from the second missing path's final component
+        // ("dup-branch") is already checked out in another worktree in the
+        // same repo, so `create_worktree_at`'s fallback (checkout without
+        // `-b`) fails too — a real git error create_worktree_at can surface.
+        let repo = init_git_repo();
+        crate::spawn_util::create_worktree_at(&repo, &repo.join("first"), "dup-branch").unwrap();
+        let missing = repo.join(".claude").join("worktrees").join("dup-branch");
+        let missing_str = missing.to_string_lossy().to_string();
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-conflict".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace(missing_str.clone()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        assert!(m.sessions.is_empty(), "a failed auto-create must not spawn a session");
+        assert!(!missing.exists(), "a failed auto-create must not leave a half-created worktree dir");
+        let form = m.spawn_modal.as_ref().expect("modal stays open on worktree-creation failure");
+        let err = form.error.as_deref().expect("guard refusal must surface an error");
+        assert!(err.contains("failed to create worktree"), "unexpected error message: {err}");
     }
 
     #[test]
