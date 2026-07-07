@@ -32,7 +32,9 @@ pub fn find_links(row: &[LinkCell]) -> Vec<LinkSpan> {
             while col < row.len() && row[col].hyperlink == Some(uri) {
                 col += 1;
             }
-            spans.push(LinkSpan { start_col: start, end_col: col - 1, url: uri.to_string() });
+            if uri.starts_with("http://") || uri.starts_with("https://") {
+                spans.push(LinkSpan { start_col: start, end_col: col - 1, url: uri.to_string() });
+            }
         } else {
             col += 1;
         }
@@ -152,6 +154,15 @@ mod tests {
             cell.hyperlink = Some("http://example.com");
         }
         assert_eq!(find_links(&row).len(), 1);
+    }
+
+    #[test]
+    fn non_http_osc8_hyperlink_produces_no_span() {
+        let mut row = row_from("click me");
+        for cell in &mut row {
+            cell.hyperlink = Some("file:///etc/passwd");
+        }
+        assert!(find_links(&row).is_empty());
     }
 
     #[test]
