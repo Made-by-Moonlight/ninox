@@ -128,6 +128,7 @@ pub async fn spawn_interactive_session(
         model:           p.agent.model.clone(),
         context_tokens:  None,
         catalogue_path:  (!p.catalogue_path.is_empty()).then(|| p.catalogue_path.clone()),
+        context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: Some(p.claude_session_id),
     };
     let _ = engine.store.upsert_session(&updated);
@@ -229,6 +230,7 @@ pub async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Res
         .context("git worktree add")?;
 
     if out.status.success() {
+        ensure_statusline_settings(&worktree_path).await;
         return Ok(worktree_str);
     }
 
@@ -241,12 +243,45 @@ pub async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Res
             .await
             .context("git worktree add (existing branch)")?;
         if out2.status.success() {
+            ensure_statusline_settings(&worktree_path).await;
             return Ok(worktree_str);
         }
         anyhow::bail!("{}", String::from_utf8_lossy(&out2.stderr).trim());
     }
 
     anyhow::bail!("{}", stderr.trim());
+}
+
+/// Write a minimal `.claude/settings.json` (`statusLine` only) into a
+/// freshly created worker worktree, unless one already exists (e.g.
+/// checked into the branch). Best-effort: any failure here must never fail
+/// worktree creation itself, so errors are swallowed rather than
+/// propagated.
+async fn ensure_statusline_settings(worktree_path: &std::path::Path) {
+    let claude_dir = worktree_path.join(".claude");
+    let settings_path = claude_dir.join("settings.json");
+    if settings_path.exists() {
+        return;
+    }
+    let ninox_bin = ninox_core::config::AppConfig::ninox_bin_dir().join("ninox").display().to_string();
+    // Single-quote the binary path (mirroring the PATH-prepend quoting above
+    // in `spawn_interactive_session`): the default macOS config dir is
+    // `~/Library/Application Support/...`, which contains a space, so an
+    // unquoted path here would be split into two argv tokens by the shell
+    // that ultimately runs this command and never resolve to the binary.
+    let ninox_bin_quoted = format!("'{}'", ninox_bin.replace('\'', "'\\''"));
+    let settings = serde_json::json!({
+        "statusLine": {
+            "type": "command",
+            "command": format!("{ninox_bin_quoted} statusline"),
+            "refreshInterval": 20
+        }
+    });
+    if tokio::fs::create_dir_all(&claude_dir).await.is_ok() {
+        if let Ok(body) = serde_json::to_string_pretty(&settings) {
+            let _ = tokio::fs::write(&settings_path, body).await;
+        }
+    }
 }
 
 const WORKER_BRAIN_SKILL: &str = r#"---
@@ -409,6 +444,93 @@ pub async fn seed_worker_brain_skill(workspace: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    /// Minimal real git repo so `git worktree add` has a commit to branch
+    /// from — `create_worker_worktree` shells out to real `git`.
+    fn init_git_repo() -> std::path::PathBuf {
+        let dir = tempdir().unwrap().keep();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", dir.to_str().unwrap()])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), "x").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    #[tokio::test]
+    async fn create_worker_worktree_writes_statusline_settings() {
+        let repo = init_git_repo();
+        let worktree = create_worker_worktree(repo.to_str().unwrap(), "test-session-1").await.unwrap();
+
+        let settings_path = std::path::Path::new(&worktree).join(".claude").join("settings.json");
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&settings_path).unwrap(),
+        ).unwrap();
+        assert_eq!(settings["statusLine"]["type"], "command");
+        let command = settings["statusLine"]["command"].as_str().unwrap();
+        // The binary path is single-quoted (it may contain spaces, e.g. the
+        // default macOS config dir `~/Library/Application Support/...`), so
+        // extract the first quoted token rather than splitting on whitespace.
+        let bin_path = command
+            .strip_prefix('\'')
+            .and_then(|rest| rest.split('\'').next())
+            .unwrap();
+        assert!(bin_path.ends_with("/ninox"), "expected a path to the ninox binary, got: {bin_path}");
+        assert!(command.ends_with("statusline"));
+    }
+
+    #[tokio::test]
+    async fn create_worker_worktree_preserves_existing_settings_json() {
+        // Simulate a worktree whose branch already carries a checked-in
+        // .claude/settings.json (e.g. from a prior run on the same branch
+        // name) by pre-creating it in the repo before the worktree exists —
+        // easiest here is to create the worktree once, seed a custom
+        // settings.json into it, remove the worktree registration, then
+        // re-run create_worker_worktree against the same still-existing
+        // branch (the "branch already exists" checkout path).
+        //
+        // The custom settings.json must be committed to the branch (not
+        // merely written to disk): `git worktree remove --force` deletes the
+        // entire worktree directory, uncommitted files included, so an
+        // uncommitted file would simply vanish along with the worktree and
+        // this test would pass for the wrong reason (or fail regardless of
+        // whether `ensure_statusline_settings` respects an existing file).
+        // Committing it is also the realistic scenario the production
+        // docstring describes: "unless one already exists (e.g. checked
+        // into the branch)".
+        let repo = init_git_repo();
+        let first = create_worker_worktree(repo.to_str().unwrap(), "test-session-2").await.unwrap();
+        let settings_path = std::path::Path::new(&first).join(".claude").join("settings.json");
+        std::fs::write(&settings_path, r#"{"userCustom": true}"#).unwrap();
+        std::process::Command::new("git")
+            .args(["-C", &first, "add", ".claude/settings.json"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", &first, "commit", "-q", "-m", "custom settings"])
+            .output()
+            .unwrap();
+
+        std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "worktree", "remove", "--force", &first])
+            .output()
+            .unwrap();
+
+        let second = create_worker_worktree(repo.to_str().unwrap(), "test-session-2").await.unwrap();
+        let contents = std::fs::read_to_string(
+            std::path::Path::new(&second).join(".claude").join("settings.json"),
+        ).unwrap();
+        assert_eq!(contents, r#"{"userCustom": true}"#);
+    }
 
     #[test]
     fn expand_tilde_leaves_absolute_paths_alone() {
@@ -493,7 +615,9 @@ mod tests {
             repo: String::new(), status: SessionStatus::Working, agent_type: "claude-code".into(),
             cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None, model: None, context_tokens: None,
-            catalogue_path: None, claude_session_id: Some("fixed-uuid".into()),
+            catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: Some("fixed-uuid".into()),
         }).unwrap();
 
         let ws = tempdir().unwrap().keep().to_string_lossy().to_string();

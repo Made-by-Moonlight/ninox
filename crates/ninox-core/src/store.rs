@@ -13,6 +13,7 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.execute_batch("
             PRAGMA journal_mode=WAL;
+            PRAGMA busy_timeout=5000;
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY, orchestrator_id TEXT,
                 name TEXT NOT NULL, repo TEXT NOT NULL,
@@ -44,10 +45,13 @@ impl Store {
         // Migrations for columns added after initial release — idempotent so
         // both fresh and pre-existing databases end up with the same schema.
         for (col, ddl) in [
-            ("model",             "ALTER TABLE sessions ADD COLUMN model TEXT"),
-            ("context_tokens",    "ALTER TABLE sessions ADD COLUMN context_tokens INTEGER"),
-            ("catalogue_path",    "ALTER TABLE sessions ADD COLUMN catalogue_path TEXT"),
-            ("claude_session_id", "ALTER TABLE sessions ADD COLUMN claude_session_id TEXT"),
+            ("model",                "ALTER TABLE sessions ADD COLUMN model TEXT"),
+            ("context_tokens",       "ALTER TABLE sessions ADD COLUMN context_tokens INTEGER"),
+            ("catalogue_path",       "ALTER TABLE sessions ADD COLUMN catalogue_path TEXT"),
+            ("context_used_pct",     "ALTER TABLE sessions ADD COLUMN context_used_pct REAL"),
+            ("context_total_tokens", "ALTER TABLE sessions ADD COLUMN context_total_tokens INTEGER"),
+            ("context_window_size",  "ALTER TABLE sessions ADD COLUMN context_window_size INTEGER"),
+            ("claude_session_id",    "ALTER TABLE sessions ADD COLUMN claude_session_id TEXT"),
         ] {
             if !Self::column_exists(&conn, "sessions", col)? {
                 conn.execute(ddl, [])?;
@@ -71,8 +75,9 @@ impl Store {
         conn.execute(
             "INSERT INTO sessions (id,orchestrator_id,name,repo,status,agent_type,
              cost_usd,started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
-             catalogue_path,claude_session_id)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             catalogue_path,context_used_pct,context_total_tokens,context_window_size,
+             claude_session_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
              ON CONFLICT(id) DO UPDATE SET
              status=excluded.status,cost_usd=excluded.cost_usd,
              started_at=excluded.started_at,
@@ -80,12 +85,16 @@ impl Store {
              workspace_path=excluded.workspace_path,pid=excluded.pid,
              model=excluded.model,context_tokens=excluded.context_tokens,
              catalogue_path=excluded.catalogue_path,
+             context_used_pct=excluded.context_used_pct,
+             context_total_tokens=excluded.context_total_tokens,
+             context_window_size=excluded.context_window_size,
              claude_session_id=excluded.claude_session_id",
             params![
                 s.id, s.orchestrator_id, s.name, s.repo, status, s.agent_type,
                 s.cost_usd, s.started_at, s.pr_number, s.pr_id,
                 s.workspace_path, s.pid, s.model, s.context_tokens,
-                s.catalogue_path, s.claude_session_id
+                s.catalogue_path, s.context_used_pct, s.context_total_tokens,
+                s.context_window_size, s.claude_session_id
             ],
         )?;
         Ok(())
@@ -96,7 +105,8 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
-             catalogue_path,claude_session_id
+             catalogue_path,context_used_pct,context_total_tokens,context_window_size,
+             claude_session_id
              FROM sessions ORDER BY started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -116,20 +126,28 @@ impl Store {
                 r.get::<_, Option<String>>(12)?,
                 r.get::<_, Option<i64>>(13)?,
                 r.get::<_, Option<String>>(14)?,
-                r.get::<_, Option<String>>(15)?,
+                r.get::<_, Option<f64>>(15)?,
+                r.get::<_, Option<i64>>(16)?,
+                r.get::<_, Option<i64>>(17)?,
+                r.get::<_, Option<String>>(18)?,
             ))
         })?;
         rows.map(|r| {
             let (id, orchestrator_id, name, repo, status_str, agent_type,
                  cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
-                 model, context_tokens, catalogue_path, claude_session_id) = r?;
+                 model, context_tokens, catalogue_path, context_used_pct,
+                 context_total_tokens, context_window_size, claude_session_id) = r?;
             let status = serde_json::from_str(&format!("\"{status_str}\""))
                 .unwrap_or(SessionStatus::Working);
             Ok(Session {
                 id, orchestrator_id, name, repo, status, agent_type,
                 cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                 model, context_tokens: context_tokens.map(|v| v.max(0) as u64),
-                catalogue_path, claude_session_id,
+                catalogue_path,
+                context_used_pct,
+                context_total_tokens: context_total_tokens.map(|v| v.max(0) as u64),
+                context_window_size: context_window_size.map(|v| v.max(0) as u64),
+                claude_session_id,
             })
         })
         .collect()
@@ -140,7 +158,8 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
-             catalogue_path,claude_session_id
+             catalogue_path,context_used_pct,context_total_tokens,context_window_size,
+             claude_session_id
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], |r| {
@@ -160,7 +179,10 @@ impl Store {
                 r.get::<_, Option<String>>(12)?,
                 r.get::<_, Option<i64>>(13)?,
                 r.get::<_, Option<String>>(14)?,
-                r.get::<_, Option<String>>(15)?,
+                r.get::<_, Option<f64>>(15)?,
+                r.get::<_, Option<i64>>(16)?,
+                r.get::<_, Option<i64>>(17)?,
+                r.get::<_, Option<String>>(18)?,
             ))
         })?;
         match rows.next() {
@@ -168,14 +190,19 @@ impl Store {
             Some(r) => {
                 let (id, orchestrator_id, name, repo, status_str, agent_type,
                      cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
-                     model, context_tokens, catalogue_path, claude_session_id) = r?;
+                     model, context_tokens, catalogue_path, context_used_pct,
+                     context_total_tokens, context_window_size, claude_session_id) = r?;
                 let status = serde_json::from_str(&format!("\"{status_str}\""))
                     .unwrap_or(SessionStatus::Working);
                 Ok(Some(Session {
                     id, orchestrator_id, name, repo, status, agent_type,
                     cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                     model, context_tokens: context_tokens.map(|v| v.max(0) as u64),
-                    catalogue_path, claude_session_id,
+                    catalogue_path,
+                    context_used_pct,
+                    context_total_tokens: context_total_tokens.map(|v| v.max(0) as u64),
+                    context_window_size: context_window_size.map(|v| v.max(0) as u64),
+                    claude_session_id,
                 }))
             }
         }
@@ -316,7 +343,9 @@ mod tests {
             repo: "slievr/Athene".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, catalogue_path: None, claude_session_id: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         };
         store.upsert_session(&session).unwrap();
         let list = store.list_sessions().unwrap();
@@ -332,7 +361,9 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, catalogue_path: None, claude_session_id: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         };
         store.upsert_session(&s).unwrap();
         s.status = SessionStatus::Done;
@@ -350,7 +381,9 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, catalogue_path: None, claude_session_id: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap();
@@ -368,6 +401,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 1.5, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: Some("claude-fable-5".into()), context_tokens: Some(214_000), catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
         };
         store.upsert_session(&s).unwrap();
@@ -386,6 +420,7 @@ mod tests {
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: None, context_tokens: None,
             catalogue_path: Some("/brains/x".into()),
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
         };
         store.upsert_session(&s).unwrap();
@@ -404,6 +439,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some("b7e0b3a0-0000-4000-8000-000000000001".into()),
         };
         store.upsert_session(&s).unwrap();
@@ -434,7 +470,9 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 100,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, catalogue_path: None, claude_session_id: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         };
         store.upsert_session(&s).unwrap();
         s.started_at = 200;
@@ -459,6 +497,48 @@ mod tests {
     }
 
     #[test]
+    fn context_fields_round_trip() {
+        let store = test_store();
+        let s = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 2.6, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: Some(62.0),
+            context_total_tokens: Some(124_000),
+            context_window_size: Some(200_000),
+            claude_session_id: None,
+        };
+        store.upsert_session(&s).unwrap();
+        let found = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(found.context_used_pct, Some(62.0));
+        assert_eq!(found.context_total_tokens, Some(124_000));
+        assert_eq!(found.context_window_size, Some(200_000));
+        // list path decodes it too
+        assert_eq!(store.list_sessions().unwrap()[0].context_used_pct, Some(62.0));
+    }
+
+    #[test]
+    fn context_fields_default_to_none() {
+        let store = test_store();
+        let s = Session {
+            id: "s2".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
+        };
+        store.upsert_session(&s).unwrap();
+        let found = store.get_session("s2").unwrap().unwrap();
+        assert_eq!(found.context_used_pct, None);
+        assert_eq!(found.context_total_tokens, None);
+        assert_eq!(found.context_window_size, None);
+    }
+
+    #[test]
     fn cost_samples_filters_by_agent_and_model_and_excludes_zero() {
         let store = test_store();
         for (id, agent_type, model, cost) in [
@@ -474,6 +554,7 @@ mod tests {
                 agent_type: agent_type.into(), cost_usd: cost, started_at: 0,
                 pr_number: None, pr_id: None, workspace_path: None, pid: None,
                 model: model.map(String::from), context_tokens: None, catalogue_path: None,
+                context_used_pct: None, context_total_tokens: None, context_window_size: None,
                 claude_session_id: None,
             }).unwrap();
         }

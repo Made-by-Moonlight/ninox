@@ -49,6 +49,24 @@ pub struct Session {
     /// this field existed (Re-file falls back to the default brain).
     #[serde(default)]
     pub catalogue_path: Option<String>,
+    /// Percentage (0-100) of the context window used, as last reported by
+    /// Claude Code's own `statusLine` hook (`context_window.used_percentage`
+    /// — see `ninox_core::lifecycle::statusline`). More accurate than
+    /// `context_tokens` because it accounts for the model's actual window
+    /// size and Claude Code's auto-compact buffer. `None` until the
+    /// statusline hook has fired at least once for this session.
+    #[serde(default)]
+    pub context_used_pct: Option<f64>,
+    /// Current context-window token count from the same hook payload
+    /// (`context_window.total_input_tokens`). `None` until the hook fires.
+    #[serde(default)]
+    pub context_total_tokens: Option<u64>,
+    /// The model's maximum context window size in tokens, from the same
+    /// hook payload (`context_window.context_window_size` — 200000 by
+    /// default, 1000000 for extended-context models). `None` until the
+    /// hook fires.
+    #[serde(default)]
+    pub context_window_size: Option<u64>,
     /// UUID ninox assigned this session's `claude` CLI process at spawn
     /// time (`--session-id <uuid>`), used to resume the exact same
     /// conversation later (`--resume <uuid>`) if the tmux pane dies

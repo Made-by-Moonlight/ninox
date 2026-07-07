@@ -15,6 +15,10 @@ use crate::{
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
+/// Last-seen `(cost_usd, context_used_pct, context_total_tokens)` snapshot per session.
+/// Used by `poll_context_updates` to detect external changes.
+type ContextSnapshot = (f64, Option<f64>, Option<u64>);
+
 /// Unix epoch milliseconds "now" — used to stamp `Notification::created_at`.
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -26,6 +30,10 @@ fn now_millis() -> i64 {
 pub struct Poller {
     engine:           Arc<Engine>,
     enrichment_cache: Arc<std::sync::Mutex<EnrichmentCache>>,
+    /// Last-seen `(cost_usd, context_used_pct, context_total_tokens)` per
+    /// session, used solely to detect changes written externally by the
+    /// `ninox statusline` subcommand — see `poll_context_updates`.
+    context_cache:    Arc<std::sync::Mutex<HashMap<String, ContextSnapshot>>>,
 }
 
 impl Poller {
@@ -33,6 +41,7 @@ impl Poller {
         Self {
             engine,
             enrichment_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            context_cache:    Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -46,7 +55,10 @@ impl Poller {
         loop {
             tokio::select! {
                 _ = token.cancelled()      => break,
-                _ = pid_interval.tick()    => self.poll_pids().await,
+                _ = pid_interval.tick()    => {
+                    self.poll_pids().await;
+                    self.poll_context_updates().await;
+                }
                 _ = usage_interval.tick()  => self.poll_usage().await,
                 _ = github_interval.tick() => self.poll_github().await,
             }
@@ -231,6 +243,38 @@ impl Poller {
                 session.model = snapshot.model;
             }
             let _ = self.engine.store.upsert_session(&session);
+            self.engine.emit(Event::SessionUpdated(session));
+        }
+    }
+
+    // ── Statusline-sourced cost/context updates (external writer) ──────────
+
+    /// The `ninox statusline` subcommand (invoked by Claude Code's own
+    /// `statusLine` hook — see `lifecycle::statusline`) writes cost/context
+    /// fields directly into the store from a separate short-lived process.
+    /// Unlike every other poll method, this data doesn't arrive via a
+    /// read-modify-write cycle this poller drives, so there's nothing to
+    /// diff against except a cache of the last-seen values. Detects
+    /// external changes and re-broadcasts them as `SessionUpdated` so the
+    /// GUI picks them up.
+    async fn poll_context_updates(&self) {
+        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+        let mut changed = Vec::new();
+        {
+            let mut cache = self.context_cache.lock().unwrap();
+            for session in sessions {
+                let key = (session.cost_usd, session.context_used_pct, session.context_total_tokens);
+                // `None` means this session has never been cached — seed it
+                // silently rather than treating "no prior state" as a change
+                // (that would spam an event for every session on startup).
+                if let Some(prev) = cache.insert(session.id.clone(), key) {
+                    if prev != key {
+                        changed.push(session);
+                    }
+                }
+            }
+        }
+        for session in changed {
             self.engine.emit(Event::SessionUpdated(session));
         }
     }
@@ -551,7 +595,9 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None,
             workspace_path: Some(workspace.into()), pid: None,
-            model: None, context_tokens: None, catalogue_path: None, claude_session_id: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         }
     }
 
@@ -632,6 +678,49 @@ mod tests {
             .expect("SessionUpdated should be emitted")
             .unwrap();
         assert!(matches!(evt, Event::SessionUpdated(s) if s.id == "s1" && s.cost_usd > 0.0));
+    }
+
+    /// The `ninox statusline` subcommand (a separate short-lived process)
+    /// writes cost/context fields directly into the store — outside any
+    /// read-modify-write cycle this poller drives. This proves the diff
+    /// cache detects that external write and re-broadcasts it, and that an
+    /// untouched session generates no spurious event.
+    #[tokio::test]
+    async fn poll_context_updates_emits_only_for_changed_sessions() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s1 = test_session("s1", "/ws1");
+        let s2 = test_session("s2", "/ws2");
+        store.upsert_session(&s1).unwrap();
+        store.upsert_session(&s2).unwrap();
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        // First tick establishes the baseline — nothing to diff against yet,
+        // so it must not emit for sessions that already exist with no prior
+        // cached state.
+        poller.poll_context_updates().await;
+        let baseline_events = drain_events(&mut rx);
+        assert!(baseline_events.is_empty(), "no prior cached state means no change to report");
+
+        // Simulate the statusline hook writing directly into the store for s1 only.
+        s1.context_used_pct = Some(42.0);
+        s1.cost_usd = 3.5;
+        store.upsert_session(&s1).unwrap();
+
+        poller.poll_context_updates().await;
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 1, "only the changed session should emit");
+        assert!(matches!(
+            &events[0],
+            Event::SessionUpdated(s) if s.id == "s1" && s.context_used_pct == Some(42.0) && s.cost_usd == 3.5
+        ));
+
+        // A third tick with no further changes emits nothing.
+        poller.poll_context_updates().await;
+        assert!(drain_events(&mut rx).is_empty());
     }
 
     /// Drain every event currently buffered on the receiver.

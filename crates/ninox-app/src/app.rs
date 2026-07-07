@@ -171,6 +171,11 @@ pub struct App {
 #[derive(Debug, Clone, Copy)]
 pub enum DragTarget { Sidebar, InfoPanel }
 
+// `Session` grew when statusline context/cost fields were added, and `EngineEvent(Event)`
+// wraps it by value; boxing `Event`'s Session-carrying variants would ripple across every
+// call site that constructs or matches on `Event::SessionUpdated`/`SessionSpawned` across
+// the workspace, which is out of scope here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Message {
     EngineEvent(Box<Event>),
@@ -1091,6 +1096,7 @@ impl App {
                             model:           agent.model.clone(),
                             context_tokens:  None,
                             catalogue_path:  Some(catalogue_path.clone()),
+                            context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
                         };
                         let _ = state.engine.store.upsert_session(&session);
@@ -1231,6 +1237,7 @@ impl App {
                             model:           agent.model.clone(),
                             context_tokens:  None,
                             catalogue_path:  Some(catalogue_path.clone()),
+                            context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
                         };
                         let _ = state.engine.store.upsert_session(&session);
@@ -2554,6 +2561,11 @@ process.exit(0);
                     "matcher": "Task|Agent",
                     "hooks": [{"type": "command", "command": "node .claude/subagent-blocker.cjs", "timeout": 2000}]
                 }]
+            },
+            "statusLine": {
+                "type": "command",
+                "command": format!("'{}' statusline", ninox_bin.replace('\'', "'\\''")),
+                "refreshInterval": 20
             }
         });
         fs::write(&settings_path, serde_json::to_string_pretty(&settings)?).await?;
@@ -2588,6 +2600,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number, pr_id, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
         }
     }
@@ -2720,6 +2733,7 @@ mod tests {
             workspace_path: Some("/tmp/ws".into()), pid: None,
             model: Some("claude-opus-4-8".into()), context_tokens: None,
             catalogue_path: Some("/brains/b".into()),
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
         }
     }
@@ -2922,6 +2936,7 @@ mod tests {
             workspace_path:  None,
             pid:             None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
         };
         let (updated, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3004,6 +3019,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3051,6 +3067,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
         }).unwrap();
         let engine = Engine::new(store);
@@ -3073,6 +3090,7 @@ mod tests {
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3102,6 +3120,7 @@ mod tests {
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
         };
         let _ = m.engine.store.upsert_session(&worker);
@@ -3519,6 +3538,7 @@ mod tests {
             started_at: 0, pr_number: Some(42), pr_id: None,
             workspace_path: Some("/tmp/w".into()), pid: Some(1234),
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3546,6 +3566,7 @@ mod tests {
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3597,6 +3618,7 @@ mod tests {
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3643,6 +3665,7 @@ mod tests {
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3723,6 +3746,7 @@ mod tests {
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3774,6 +3798,7 @@ mod tests {
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3863,6 +3888,7 @@ mod tests {
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -4505,6 +4531,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -4594,5 +4621,33 @@ mod tests {
             agents_md.contains(&skill_path.display().to_string()),
             "AGENTS.md should point orchestrators at the brain skill"
         );
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_configures_statusline() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, "/path/to/ninox", "/cfg.toml").await.unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".claude").join("settings.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(settings["statusLine"]["type"], "command");
+        assert_eq!(settings["statusLine"]["command"], "'/path/to/ninox' statusline");
+        assert_eq!(settings["statusLine"]["refreshInterval"], 20);
+        // The existing subagent-blocker hook must still be present.
+        assert!(settings["hooks"]["PreToolUse"].is_array());
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_never_overwrites_existing_settings_json() {
+        let root = tempdir().unwrap().keep();
+        let claude_dir = root.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("settings.json"), r#"{"userCustom": true}"#).unwrap();
+
+        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+
+        let contents = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        assert_eq!(contents, r#"{"userCustom": true}"#, "pre-existing settings.json must be left byte-for-byte alone");
     }
 }

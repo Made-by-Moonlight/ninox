@@ -2,4 +2,5 @@ pub mod enrichment;
 pub mod poller;
 pub mod probe;
 pub mod reactions;
+pub mod statusline;
 pub mod usage;

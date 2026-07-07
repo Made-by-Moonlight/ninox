@@ -39,11 +39,29 @@ fn link_field<'a>(
 }
 
 /// Renders the `Burn` field per the Field Notes kv-sheet spec
-/// (`docs/design-concepts/03-field-notes.html`: `<dt>Burn</dt><dd><b>$3.60</b> · 214k tokens</dd>`) —
-/// dollar cost plus the current context-window occupancy, once the usage
-/// poller (`ninox_core::lifecycle::usage`/`poller::poll_usage`) has ingested
-/// at least one turn. Falls back to just the dollar figure until then.
-fn format_burn(cost_usd: f64, context_tokens: Option<u64>) -> String {
+/// (`docs/design-concepts/03-field-notes.html`), preferring the
+/// statusline-sourced context percentage (`ninox_core::lifecycle::
+/// statusline`, more accurate — accounts for window size and the
+/// auto-compact buffer) over the transcript-derived raw token count
+/// (`ninox_core::lifecycle::usage`) when all three statusline fields are
+/// present.
+fn format_burn(
+    cost_usd:             f64,
+    context_tokens:       Option<u64>,
+    context_used_pct:     Option<f64>,
+    context_total_tokens: Option<u64>,
+    context_window_size:  Option<u64>,
+) -> String {
+    if let (Some(pct), Some(total), Some(size)) =
+        (context_used_pct, context_total_tokens, context_window_size)
+    {
+        return format!(
+            "${cost_usd:.2} · {}% context ({}/{})",
+            pct.round() as i64,
+            format_tokens_k(total),
+            format_tokens_k(size),
+        );
+    }
     match context_tokens {
         Some(t) => format!("${cost_usd:.2} · {} tokens", format_tokens_k(t)),
         None    => format!("${cost_usd:.2}"),
@@ -84,7 +102,13 @@ pub fn inspector_panel<'a>(app: &'a App, session: &'a Session) -> Element<'a, Me
         field("Status",         status_str(&session.status).to_string(), s),
         field("Agent",          session.agent_type.clone(), s),
         field("Orchestrator",   orchestrator_name.to_string(), s),
-        field("Burn",           format_burn(session.cost_usd, session.context_tokens), s),
+        field("Burn",           format_burn(
+            session.cost_usd,
+            session.context_tokens,
+            session.context_used_pct,
+            session.context_total_tokens,
+            session.context_window_size,
+        ), s),
         match (session.pr_number, crate::app::pr_url_for_session(&app.prs, session)) {
             (Some(n), Some(url)) => link_field("PR", format!("#{n}"), url, s),
             (n, _) => field("PR", n.map(|n| format!("#{n}")).unwrap_or("—".into()), s),
@@ -120,13 +144,33 @@ mod tests {
 
     #[test]
     fn format_burn_matches_design_spec_example() {
-        // docs/design-concepts/03-field-notes.html: `$3.60 · 214k tokens`.
-        assert_eq!(format_burn(3.60, Some(214_000)), "$3.60 · 214k tokens");
+        assert_eq!(
+            format_burn(3.60, Some(214_000), None, None, None),
+            "$3.60 · 214k tokens",
+        );
     }
 
     #[test]
     fn format_burn_omits_tokens_when_unknown() {
-        assert_eq!(format_burn(0.0, None), "$0.00");
+        assert_eq!(format_burn(0.0, None, None, None, None), "$0.00");
+    }
+
+    #[test]
+    fn format_burn_uses_statusline_context_when_present() {
+        assert_eq!(
+            format_burn(2.60, Some(999_999), Some(62.0), Some(124_000), Some(200_000)),
+            "$2.60 · 62% context (124k/200k)",
+        );
+    }
+
+    #[test]
+    fn format_burn_falls_back_when_statusline_context_partially_absent() {
+        // context_window_size missing — not enough to render the new format,
+        // falls back to the transcript-based token count.
+        assert_eq!(
+            format_burn(1.00, Some(50_000), Some(25.0), Some(50_000), None),
+            "$1.00 · 50k tokens",
+        );
     }
 
     #[test]

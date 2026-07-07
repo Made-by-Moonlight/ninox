@@ -216,7 +216,9 @@ mod tests {
             repo: "r".into(), status: crate::types::SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, catalogue_path: None, claude_session_id: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(store);
@@ -243,7 +245,9 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: Some(1), pr_id: Some(1),
             workspace_path: None, pid: None,
-            model: None, context_tokens: None, catalogue_path: None, claude_session_id: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(Arc::clone(&store));

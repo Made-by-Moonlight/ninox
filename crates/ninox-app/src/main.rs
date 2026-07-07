@@ -70,6 +70,10 @@ enum Command {
         #[command(subcommand)]
         action: BrainAction,
     },
+    /// Emit a Claude Code statusline and record cost/context usage for the
+    /// session at this workspace. Invoked by Claude Code's own `statusLine`
+    /// hook (see `.claude/settings.json`), not intended for direct use.
+    Statusline,
 }
 
 #[derive(Subcommand)]
@@ -98,6 +102,15 @@ enum BrainAction {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+
+    // Fires on every assistant turn (event-driven) or every `refreshInterval`
+    // seconds for every session Ninox spawns — must stay fast and never
+    // trigger the tmux-config/wrapper-hook/self-shim setup below, none of
+    // which this subcommand needs.
+    if matches!(args.command, Some(Command::Statusline)) {
+        run_statusline(args.db.unwrap_or_else(default_db_path));
+        return Ok(());
+    }
 
     if let Err(e) = tmux::write_server_config() {
         eprintln!("failed to write tmux config: {e}");
@@ -129,6 +142,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Brain { action }) => {
             run_brain(action).await
+        }
+        Some(Command::Statusline) => {
+            run_statusline(db_path);
+            Ok(())
         }
         None => run_tui(store, args.port, args.headless).await,
     }
@@ -226,6 +243,7 @@ async fn run_spawn(
         // forwarded from the orchestrator's own environment (see the env
         // block below), so record the same value for Re-file.
         catalogue_path:  std::env::var("NINOX_BRAIN").ok().filter(|s| !s.is_empty()),
+        context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: Some(claude_session_id.clone()),
     };
 
@@ -347,6 +365,25 @@ fn run_request_work(description: &str) -> anyhow::Result<()> {
         request.id,
     );
     Ok(())
+}
+
+/// Handler for `ninox statusline`. Never returns an error and never
+/// panics: any failure (bad JSON, no store, no matching session) degrades
+/// to printing the minimal fallback line so Claude Code's statusline row
+/// never goes blank. See `ninox_core::lifecycle::statusline` for the
+/// actual parsing/update/render logic — this is a thin I/O wrapper.
+fn run_statusline(db_path: PathBuf) {
+    use std::io::Read;
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+
+    let payload = ninox_core::lifecycle::statusline::parse_payload(&input);
+
+    if let Ok(store) = Store::open(&db_path) {
+        let _ = ninox_core::lifecycle::statusline::apply_update(&store, &payload);
+    }
+
+    println!("{}", ninox_core::lifecycle::statusline::render_line(&payload));
 }
 
 async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
