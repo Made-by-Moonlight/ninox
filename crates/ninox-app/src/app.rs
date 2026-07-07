@@ -4542,6 +4542,38 @@ mod tests {
     }
 
     #[test]
+    fn standalone_confirm_surfaces_the_git_error_when_worktree_creation_fails() {
+        use crate::components::spawn_modal::SpawnKind;
+
+        // The branch derived from the second missing path's final component
+        // ("dup-branch") is already checked out in another worktree in the
+        // same repo, so `create_worktree_at`'s fallback (checkout without
+        // `-b`) fails too — a real git error create_worktree_at can surface.
+        let repo = init_git_repo();
+        crate::spawn_util::create_worktree_at(&repo, &repo.join("first"), "dup-branch").unwrap();
+        let missing = repo.join(".claude").join("worktrees").join("dup-branch");
+        let missing_str = missing.to_string_lossy().to_string();
+
+        let mut m = base(test_engine());
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("solo-conflict".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormWorkspace(missing_str.clone()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        assert!(m.sessions.is_empty(), "a failed auto-create must not spawn a session");
+        assert!(!missing.exists(), "a failed auto-create must not leave a half-created worktree dir");
+        let form = m.spawn_modal.as_ref().expect("modal stays open on worktree-creation failure");
+        let err = form.error.as_deref().expect("guard refusal must surface an error");
+        assert!(err.contains("failed to create worktree"), "unexpected error message: {err}");
+    }
+
+    #[test]
     fn standalone_confirm_with_duplicate_name_keeps_modal_open_and_original_untouched() {
         use crate::components::spawn_modal::SpawnKind;
 

@@ -212,12 +212,27 @@ pub fn repo_from_workspace(workspace: &str) -> Option<String> {
 /// Returns the worktree path on success. If the branch name already exists
 /// (e.g. a previous run with the same name), the existing branch is checked
 /// out rather than creating a new one.
+///
+/// Runs the (blocking) [`create_worktree_at`] core on a `spawn_blocking`
+/// thread: this fn is always awaited from inside `Task::future` on the
+/// app's shared tokio runtime, and `git worktree add` does a full working-
+/// tree checkout, not the cheap metadata query `repo_from_workspace` does —
+/// running it directly on the calling task would tie up a runtime worker
+/// thread for that whole checkout.
 pub async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Result<String> {
-    let worktree_path = std::path::Path::new(repo)
-        .join(".claude")
-        .join("worktrees")
-        .join(session_id);
-    create_worktree_at(std::path::Path::new(repo), &worktree_path, session_id)
+    use anyhow::Context as _;
+
+    let repo = repo.to_string();
+    let session_id = session_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let worktree_path = std::path::Path::new(&repo)
+            .join(".claude")
+            .join("worktrees")
+            .join(&session_id);
+        create_worktree_at(std::path::Path::new(&repo), &worktree_path, &session_id)
+    })
+    .await
+    .context("worktree creation task panicked")?
 }
 
 /// Walk up from `start` (inclusive) looking for the nearest ancestor
@@ -584,6 +599,36 @@ mod tests {
     fn find_repo_root_returns_none_with_no_git_ancestor() {
         let dir = tempdir().unwrap().keep();
         assert_eq!(find_repo_root(&dir.join("nested").join("deeper")), None);
+    }
+
+    #[test]
+    fn find_repo_root_recognizes_a_linked_worktrees_gitfile() {
+        let repo = init_git_repo();
+        let worktree = repo.join("wt1");
+        create_worktree_at(&repo, &worktree, "wt1-branch").unwrap();
+        assert!(
+            worktree.join(".git").is_file(),
+            "sanity: a linked worktree's .git is a gitfile, not a directory"
+        );
+
+        let nested = worktree.join("nested").join("deeper");
+        assert_eq!(find_repo_root(&nested), Some(worktree.clone()));
+    }
+
+    #[test]
+    fn create_worktree_at_fails_when_branch_is_checked_out_in_another_worktree() {
+        let repo = init_git_repo();
+        let first = repo.join("first");
+        create_worktree_at(&repo, &first, "dup-branch").unwrap();
+
+        let second = repo.join("second");
+        let result = create_worktree_at(&repo, &second, "dup-branch");
+
+        assert!(
+            result.is_err(),
+            "checking out a branch already active in another worktree must fail, not silently succeed"
+        );
+        assert!(!second.exists(), "the failed attempt must not leave a half-created worktree dir");
     }
 
     #[test]
