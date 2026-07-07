@@ -6,7 +6,7 @@ mod spawn_util;
 mod style;
 mod theme;
 
-use spawn_util::{create_worker_worktree, repo_from_workspace};
+use spawn_util::{create_worker_worktree, repo_from_workspace, seed_worker_brain_skill};
 use ninox_core::{
     config::AppConfig,
     events::Engine,
@@ -181,6 +181,9 @@ async fn run_spawn(
             workspace.clone()
         }
     };
+    if let Err(e) = seed_worker_brain_skill(&effective_workspace).await {
+        tracing::warn!("failed to seed brain skill for {id}: {e}");
+    }
 
     // Derive the GitHub repo slug from the workspace's git remote so that
     // poll_github can call the GitHub API with the correct owner/repo.
