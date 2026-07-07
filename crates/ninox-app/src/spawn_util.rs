@@ -750,11 +750,17 @@ mod tests {
             .status()
             .await
             .unwrap();
-        tokio::process::Command::new("git")
-            .args(["-C", &ws, "commit", "-q", "-m", "tracked"])
+        let commit_status = tokio::process::Command::new("git")
+            .args([
+                "-C", &ws,
+                "-c", "user.email=test@example.com",
+                "-c", "user.name=Test",
+                "commit", "-q", "-m", "tracked",
+            ])
             .status()
             .await
             .unwrap();
+        assert!(commit_status.success(), "git commit must succeed to simulate a tracked copy");
 
         let result = seed_worker_brain_skill(&ws).await;
         assert!(result.is_err(), "must refuse to silently overwrite a tracked copy");
@@ -769,11 +775,27 @@ mod tests {
         let repo_dir = tempdir().unwrap();
         let repo = repo_dir.path().to_str().unwrap().to_string();
         tokio::process::Command::new("git").args(["init", "-q", &repo]).status().await.unwrap();
-        tokio::process::Command::new("git")
-            .args(["-C", &repo, "commit", "-q", "-m", "init", "--allow-empty"])
+        // `-c user.email=`/`-c user.name=` — a bare `git commit` fails with
+        // "Please tell me who you are" on any machine/CI runner with no
+        // global git identity configured. That failure was previously
+        // silent here (`.status()` only checks the command actually ran,
+        // not that it exited 0), so the commit silently no-opped, `git
+        // worktree add -b` below then had no commit to branch from and
+        // fell back to an orphan branch, and the test failed later with a
+        // confusing, unrelated-looking assertion on the exclude file
+        // instead of a clear "commit failed" error. `.success()` below
+        // makes that failure mode loud instead of silent.
+        let commit_status = tokio::process::Command::new("git")
+            .args([
+                "-C", &repo,
+                "-c", "user.email=test@example.com",
+                "-c", "user.name=Test",
+                "commit", "-q", "-m", "init", "--allow-empty",
+            ])
             .status()
             .await
             .unwrap();
+        assert!(commit_status.success(), "git commit must succeed to give the worktree a branch point");
 
         let worktree_path = repo_dir.path().join("wt");
         let worktree = worktree_path.to_str().unwrap().to_string();
