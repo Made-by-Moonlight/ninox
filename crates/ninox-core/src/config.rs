@@ -81,6 +81,29 @@ pub struct CatalogueRef {
 }
 
 // ---------------------------------------------------------------------------
+// Brain harvest configuration
+// ---------------------------------------------------------------------------
+
+/// Opt-in-by-default background knowledge capture: when a worker session's
+/// PR is first detected, a short-lived `claude -p` subprocess reads its diff
+/// and writes facts into the brain vault. See `lifecycle::brain_harvest`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrainHarvestConfig {
+    #[serde(default = "default_brain_harvest_enabled")]
+    pub enabled: bool,
+}
+
+fn default_brain_harvest_enabled() -> bool {
+    true
+}
+
+impl Default for BrainHarvestConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App configuration
 // ---------------------------------------------------------------------------
 
@@ -107,6 +130,9 @@ pub struct AppConfig {
     /// Knowledge base (brain) configuration.
     #[serde(default)]
     pub brain: BrainConfig,
+    /// Background brain-harvest toggle. See `BrainHarvestConfig`.
+    #[serde(default)]
+    pub brain_harvest: BrainHarvestConfig,
     /// Theme file name (resolves to `~/.config/ninox/themes/<name>.toml`) or
     /// an absolute/`~`-relative path. `None` uses `themes/field-notes.toml`
     /// if present, else the built-in Field Notes palettes.
@@ -131,6 +157,7 @@ impl Default for AppConfig {
             worker:           AgentConfig::default(),
             github_token:     None,
             brain:            BrainConfig::default(),
+            brain_harvest:    BrainHarvestConfig::default(),
             theme_file:       None,
             harnesses:        BTreeMap::new(),
         }
@@ -256,6 +283,37 @@ impl AppConfig {
     }
 }
 
+/// Serializes tests that mutate process-global env vars (`NINOX_CONFIG`,
+/// `NINOX_BRAIN`) against each other — `cargo test` runs test fns on
+/// parallel threads, so without this guard one test's env mutation could
+/// leak into another's read. `pub(crate)` and shared with
+/// `lifecycle::poller`'s tests, which also mutate `NINOX_CONFIG`.
+#[cfg(test)]
+pub(crate) static ENV_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Set `key=value` for the duration of `f`, restoring the prior value (or
+/// unsetting it) afterward. Serialized via `ENV_TEST_GUARD` since env vars
+/// are process-global state shared across parallel test threads. Mirrors
+/// `ninox_app::app::tests::with_env_override`.
+#[cfg(test)]
+pub(crate) fn with_env_override<T>(
+    key: &str,
+    value: impl AsRef<std::ffi::OsStr>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let prior = std::env::var(key).ok();
+    std::env::set_var(key, value);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+    match prior {
+        Some(v) => std::env::set_var(key, v),
+        None    => std::env::remove_var(key),
+    }
+    result.unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,34 +361,6 @@ mod tests {
         assert!(cfg.resolved_orchestrator_root().ends_with("ninox/orchestrator"));
     }
 
-    /// Serializes tests that mutate process-global env vars (`NINOX_CONFIG`,
-    /// `NINOX_BRAIN`) against each other — `cargo test` runs test fns on
-    /// parallel threads, so without this guard one test's env mutation could
-    /// leak into another's read.
-    static ENV_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Set `key=value` for the duration of `f`, restoring the prior value
-    /// (or unsetting it) afterward. Serialized via `ENV_TEST_GUARD` since env
-    /// vars are process-global state shared across parallel test threads.
-    /// Mirrors `ninox_app::app::tests::with_env_override`.
-    fn with_env_override<T>(
-        key: &str,
-        value: impl AsRef<std::ffi::OsStr>,
-        f: impl FnOnce() -> T,
-    ) -> T {
-        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var(key).ok();
-        std::env::set_var(key, value);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-
-        match prior {
-            Some(v) => std::env::set_var(key, v),
-            None    => std::env::remove_var(key),
-        }
-        result.unwrap()
-    }
-
     #[test]
     fn config_path_honors_ninox_config_env() {
         let dir = tempdir().unwrap();
@@ -363,6 +393,24 @@ mod tests {
         assert_eq!(options.len(), 1);
         assert_eq!(options[0].name, "default");
         assert_eq!(options[0].path, cfg.resolved_brain_path());
+    }
+
+    #[test]
+    fn brain_harvest_defaults_to_enabled() {
+        assert!(AppConfig::default().brain_harvest.enabled);
+    }
+
+    #[test]
+    fn brain_harvest_missing_table_defaults_to_enabled() {
+        let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert!(cfg.brain_harvest.enabled);
+    }
+
+    #[test]
+    fn brain_harvest_can_be_disabled_via_config() {
+        let toml_src = "port = 8080\nfont_size = 13.0\n\n[brain_harvest]\nenabled = false\n";
+        let cfg: AppConfig = toml::from_str(toml_src).unwrap();
+        assert!(!cfg.brain_harvest.enabled);
     }
 
     #[test]

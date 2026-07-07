@@ -4,15 +4,16 @@ use crate::{
     github::{split_repo, CheckRun},
     hooks,
     lifecycle::{
+        brain_harvest::{self, ClaudeHarvestRunner, HarvestRunner},
         enrichment::EnrichmentCache,
         probe::is_pid_alive,
         usage,
     },
     types::{
-        CIStatus, Comment, Notification, NotificationKind, PrId, SessionStatus, PR,
+        CIStatus, Comment, Notification, NotificationKind, PrId, Session, SessionStatus, PR,
     },
 };
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 /// Last-seen `(cost_usd, context_used_pct, context_total_tokens)` snapshot per session.
@@ -34,14 +35,23 @@ pub struct Poller {
     /// session, used solely to detect changes written externally by the
     /// `ninox statusline` subcommand — see `poll_context_updates`.
     context_cache:    Arc<std::sync::Mutex<HashMap<String, ContextSnapshot>>>,
+    /// Runs the brain-harvest subprocess (real `claude -p` in production).
+    /// Injectable so tests can fake success/failure without spawning a real
+    /// process — see `sync_sessions_metadata`'s `trigger_brain_harvest`.
+    harvest_runner:   Arc<dyn HarvestRunner>,
 }
 
 impl Poller {
     pub fn new(engine: Arc<Engine>) -> Self {
+        Self::new_with_harvest_runner(engine, Arc::new(ClaudeHarvestRunner))
+    }
+
+    pub fn new_with_harvest_runner(engine: Arc<Engine>, harvest_runner: Arc<dyn HarvestRunner>) -> Self {
         Self {
             engine,
             enrichment_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             context_cache:    Arc::new(std::sync::Mutex::new(HashMap::new())),
+            harvest_runner,
         }
     }
 
@@ -126,6 +136,7 @@ impl Poller {
                         "session {} PR #{} detected via metadata hook",
                         session.id, first.number
                     );
+                    self.trigger_brain_harvest(&session).await;
                 }
             }
 
@@ -184,6 +195,49 @@ impl Poller {
                 }
             }
         }
+    }
+
+    /// Fire a background brain-harvest attempt for a session whose PR was
+    /// just detected. Reuses the caller's `pr_number.is_none()` guard as its
+    /// only dedup — this is called from exactly one call site, itself
+    /// guaranteed to fire once per session lifetime, so no second dedup
+    /// layer is needed here.
+    ///
+    /// Diff computation runs on this poll tick (a couple of cheap, local
+    /// `git` calls); only the `claude -p` subprocess itself — which may take
+    /// a while — is handed off via `tokio::spawn` so it can never stall the
+    /// poll loop. Any failure (disabled config, no workspace, trivial diff,
+    /// or the subprocess itself failing) is logged at most and never
+    /// propagates back into `sync_sessions_metadata`.
+    async fn trigger_brain_harvest(&self, session: &Session) {
+        let config = AppConfig::load().unwrap_or_default();
+        if !config.brain_harvest.enabled {
+            return;
+        }
+        let Some(workspace) = session.workspace_path.clone() else { return };
+        let Some(diff) = brain_harvest::compute_nontrivial_diff(std::path::Path::new(&workspace)).await else {
+            tracing::info!("brain harvest skipped for {}: no non-trivial diff", session.id);
+            return;
+        };
+
+        let prompt         = brain_harvest::build_harvest_prompt(&session.id, &diff);
+        // Prefer the session's own catalogue — set from that worker's
+        // `NINOX_BRAIN` at spawn time (see `main.rs::run_spawn`,
+        // `spawn_util::interactive_env_vars`) — over the global default, so
+        // the harvest writes to the same vault the worker itself thinks
+        // with, not always the default catalogue.
+        let brain_path: PathBuf = session.catalogue_path.clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config.resolved_brain_path());
+        let workspace_path: PathBuf = workspace.into();
+        let runner          = self.harvest_runner.clone();
+        let session_id      = session.id.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = runner.run(prompt, workspace_path, brain_path).await {
+                tracing::warn!("brain harvest failed for session {session_id}: {e}");
+            }
+        });
     }
 
     /// Forward every pending `ninox request-work` entry for this session to
@@ -1419,5 +1473,288 @@ mod tests {
         poller.poll_github().await;
         let events = drain_events(&mut rx);
         assert_eq!(failures(&events), 1, "must notify again after recovering and failing anew");
+    }
+
+    // ── Brain harvest ────────────────────────────────────────────────────────
+
+    use std::{future::Future, pin::Pin};
+
+    /// Records every call it receives on `calls` and resolves with a
+    /// caller-configured outcome — never spawns a real process or touches
+    /// the network.
+    struct FakeHarvestRunner {
+        calls:   tokio::sync::mpsc::UnboundedSender<(String, PathBuf, PathBuf)>,
+        outcome: Result<(), String>,
+    }
+
+    impl HarvestRunner for FakeHarvestRunner {
+        fn run(
+            &self,
+            prompt:     String,
+            workspace:  PathBuf,
+            brain_path: PathBuf,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+            let _ = self.calls.send((prompt, workspace, brain_path));
+            let outcome = self.outcome.clone();
+            Box::pin(async move {
+                outcome.map_err(|e| anyhow::anyhow!(e))
+            })
+        }
+    }
+
+    /// A repo on an explicit `main` branch (so default-branch detection is
+    /// deterministic regardless of the machine's `init.defaultBranch`),
+    /// checked out onto `feature_branch` with an optional extra commit —
+    /// this is the diff `compute_nontrivial_diff` sees.
+    fn init_diff_repo(feature_branch: &str, extra_file: Option<(&str, &str)>) -> std::path::PathBuf {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", dir.to_str().unwrap()])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), "x").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        run(&["checkout", "-q", "-b", feature_branch]);
+        if let Some((name, contents)) = extra_file {
+            std::fs::write(dir.join(name), contents).unwrap();
+            run(&["add", name]);
+            run(&["commit", "-q", "-m", "feature work"]);
+        }
+        dir
+    }
+
+    /// Point `NINOX_CONFIG` at a path that doesn't exist, so `AppConfig::load()`
+    /// falls back to `AppConfig::default()` (brain harvest enabled) rather
+    /// than risking a real config file on the machine running the tests.
+    fn nonexistent_config_path() -> std::path::PathBuf {
+        tempfile::tempdir().unwrap().keep().join("nonexistent-ninox-config.toml")
+    }
+
+    /// A worker session whose PR was just detected, with a real non-trivial
+    /// diff on its branch, triggers exactly one background harvest attempt —
+    /// and never a second one on a later tick, since `pr_number.is_none()`
+    /// has already flipped.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn metadata_sync_triggers_brain_harvest_exactly_once_on_pr_detection() {
+        use crate::{config::ENV_TEST_GUARD, store::Store};
+
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("NINOX_CONFIG").ok();
+        std::env::set_var("NINOX_CONFIG", nonexistent_config_path());
+
+        let repo = init_diff_repo("feature-1", Some(("src.rs", "fn main() {}\n")));
+        let workspace = repo.to_str().unwrap().to_string();
+
+        let sessions_dir = tempfile::tempdir().unwrap();
+        let meta = serde_json::json!({"agentReportedPrNumber": "9"});
+        std::fs::write(sessions_dir.path().join("s1.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", &workspace)).unwrap();
+        let engine = Engine::new(store.clone());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runner = Arc::new(FakeHarvestRunner { calls: tx, outcome: Ok(()) });
+        let poller = Poller::new_with_harvest_runner(engine, runner);
+
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        let (prompt, ..) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("harvest should be attempted")
+            .expect("channel should not be closed");
+        assert!(prompt.contains("src.rs") && prompt.contains("fn main"), "prompt must include the diff");
+
+        // Second tick: pr_number is already Some, so the transition guard
+        // must not fire the harvest again.
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+        assert!(rx.try_recv().is_err(), "harvest must fire exactly once per session");
+
+        match prior {
+            Some(v) => std::env::set_var("NINOX_CONFIG", v),
+            None    => std::env::remove_var("NINOX_CONFIG"),
+        }
+    }
+
+    /// A worker spawned against a non-default catalogue (`session.catalogue_path`,
+    /// set from that worker's own `NINOX_BRAIN` at spawn time — see
+    /// `ninox_app::main::run_spawn`) must have its harvest write to that same
+    /// catalogue, not silently fall back to the global default brain path.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn metadata_sync_brain_harvest_prefers_session_catalogue_path_over_default() {
+        use crate::{config::ENV_TEST_GUARD, store::Store};
+
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("NINOX_CONFIG").ok();
+        std::env::set_var("NINOX_CONFIG", nonexistent_config_path());
+
+        let repo = init_diff_repo("feature-catalogue", Some(("src.rs", "fn main() {}\n")));
+        let workspace = repo.to_str().unwrap().to_string();
+
+        let sessions_dir = tempfile::tempdir().unwrap();
+        let meta = serde_json::json!({"agentReportedPrNumber": "13"});
+        std::fs::write(sessions_dir.path().join("s1.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.catalogue_path = Some("/custom/brain-catalogue".to_string());
+        store.upsert_session(&session).unwrap();
+        let engine = Engine::new(store.clone());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runner = Arc::new(FakeHarvestRunner { calls: tx, outcome: Ok(()) });
+        let poller = Poller::new_with_harvest_runner(engine, runner);
+
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        let (_, _, brain_path) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("harvest should be attempted")
+            .expect("channel should not be closed");
+        assert_eq!(
+            brain_path, PathBuf::from("/custom/brain-catalogue"),
+            "harvest must target the session's own catalogue, not the global default",
+        );
+
+        match prior {
+            Some(v) => std::env::set_var("NINOX_CONFIG", v),
+            None    => std::env::remove_var("NINOX_CONFIG"),
+        }
+    }
+
+    /// `brain_harvest.enabled = false` must suppress the harvest entirely —
+    /// PR detection itself proceeds exactly as it would with it enabled.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn metadata_sync_skips_brain_harvest_when_disabled() {
+        use crate::{config::ENV_TEST_GUARD, store::Store};
+
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        std::fs::write(&config_path, "port = 8080\nfont_size = 13.0\n\n[brain_harvest]\nenabled = false\n").unwrap();
+        let prior = std::env::var("NINOX_CONFIG").ok();
+        std::env::set_var("NINOX_CONFIG", &config_path);
+
+        let repo = init_diff_repo("feature-2", Some(("src.rs", "fn main() {}\n")));
+        let workspace = repo.to_str().unwrap().to_string();
+
+        let sessions_dir = tempfile::tempdir().unwrap();
+        let meta = serde_json::json!({"agentReportedPrNumber": "10"});
+        std::fs::write(sessions_dir.path().join("s1.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", &workspace)).unwrap();
+        let engine = Engine::new(store.clone());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runner = Arc::new(FakeHarvestRunner { calls: tx, outcome: Ok(()) });
+        let poller = Poller::new_with_harvest_runner(engine, runner);
+
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        assert!(rx.try_recv().is_err(), "harvest must not fire when brain_harvest.enabled = false");
+        let session = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(session.pr_number, Some(10), "PR detection must be unaffected by the disabled harvest");
+        assert!(matches!(session.status, SessionStatus::PrOpen));
+
+        match prior {
+            Some(v) => std::env::set_var("NINOX_CONFIG", v),
+            None    => std::env::remove_var("NINOX_CONFIG"),
+        }
+    }
+
+    /// A session whose branch has no diff against the default branch yet
+    /// must not trigger a harvest — nothing worth recording, and no point
+    /// invoking an LLM call for it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn metadata_sync_skips_brain_harvest_for_trivial_diff() {
+        use crate::{config::ENV_TEST_GUARD, store::Store};
+
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("NINOX_CONFIG").ok();
+        std::env::set_var("NINOX_CONFIG", nonexistent_config_path());
+
+        // No extra commit — the feature branch is identical to main.
+        let repo = init_diff_repo("feature-3", None);
+        let workspace = repo.to_str().unwrap().to_string();
+
+        let sessions_dir = tempfile::tempdir().unwrap();
+        let meta = serde_json::json!({"agentReportedPrNumber": "11"});
+        std::fs::write(sessions_dir.path().join("s1.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", &workspace)).unwrap();
+        let engine = Engine::new(store.clone());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runner = Arc::new(FakeHarvestRunner { calls: tx, outcome: Ok(()) });
+        let poller = Poller::new_with_harvest_runner(engine, runner);
+
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        assert!(rx.try_recv().is_err(), "harvest must not fire for an empty diff");
+
+        match prior {
+            Some(v) => std::env::set_var("NINOX_CONFIG", v),
+            None    => std::env::remove_var("NINOX_CONFIG"),
+        }
+    }
+
+    /// A failing harvest subprocess must not affect the rest of
+    /// `sync_sessions_metadata` — the session still transitions to `PrOpen`
+    /// normally, and the failure is swallowed rather than propagated.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn metadata_sync_survives_a_failing_brain_harvest() {
+        use crate::{config::ENV_TEST_GUARD, store::Store};
+
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("NINOX_CONFIG").ok();
+        std::env::set_var("NINOX_CONFIG", nonexistent_config_path());
+
+        let repo = init_diff_repo("feature-4", Some(("src.rs", "fn main() {}\n")));
+        let workspace = repo.to_str().unwrap().to_string();
+
+        let sessions_dir = tempfile::tempdir().unwrap();
+        let meta = serde_json::json!({"agentReportedPrNumber": "12"});
+        std::fs::write(sessions_dir.path().join("s1.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", &workspace)).unwrap();
+        let engine = Engine::new(store.clone());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runner = Arc::new(FakeHarvestRunner {
+            calls:   tx,
+            outcome: Err("simulated claude -p failure".to_string()),
+        });
+        let poller = Poller::new_with_harvest_runner(engine, runner);
+
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        let session = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(session.pr_number, Some(12), "PR detection must succeed regardless of harvest outcome");
+        assert!(matches!(session.status, SessionStatus::PrOpen));
+
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the failing harvest must still be attempted")
+            .expect("channel should not be closed");
+
+        match prior {
+            Some(v) => std::env::set_var("NINOX_CONFIG", v),
+            None    => std::env::remove_var("NINOX_CONFIG"),
+        }
     }
 }
