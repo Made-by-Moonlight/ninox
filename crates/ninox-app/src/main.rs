@@ -96,6 +96,23 @@ enum BrainAction {
         /// Relative path of the entry (e.g. people/alice.md)
         path: String,
     },
+    /// Package the brain's Markdown source into a portable .tar.gz archive
+    /// (excludes the derived .index.db)
+    Export {
+        /// Output path for the archive, e.g. brain.tar.gz
+        output: PathBuf,
+    },
+    /// Extract a `ninox brain export` archive and rebuild the index
+    Import {
+        /// Path to the archive to import
+        input: PathBuf,
+        /// Import into this brain path instead of the resolved default
+        #[arg(long)]
+        into: Option<PathBuf>,
+        /// Overwrite entries that already exist in the target brain
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -389,10 +406,10 @@ fn run_statusline(db_path: PathBuf) {
 async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
     let config = AppConfig::load().unwrap_or_default();
     let brain_path = config.resolved_brain_path();
-    let brain = BrainIndex::open(&brain_path)?;
 
     match action {
         BrainAction::Index => {
+            let brain = BrainIndex::open(&brain_path)?;
             let embedder = try_build_embedder();
             let stats = brain.rebuild(embedder.as_deref())?;
             println!(
@@ -401,6 +418,7 @@ async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
             );
         }
         BrainAction::Query { text, entry_type, tag } => {
+            let brain = BrainIndex::open(&brain_path)?;
             let embedder = if text.trim().is_empty() { None } else { try_build_embedder() };
             let filters = QueryFilters { entry_type, tag };
             let entries = brain.query(&text, embedder.as_deref(), filters)?;
@@ -409,6 +427,7 @@ async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
             }
         }
         BrainAction::Show { path } => {
+            let brain = BrainIndex::open(&brain_path)?;
             match brain.get(&path)? {
                 Some(entry) => println!("{}", serde_json::to_string_pretty(&entry)?),
                 None => {
@@ -416,6 +435,33 @@ async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+        BrainAction::Export { output } => {
+            let stats = ninox_core::brain_archive::export(&brain_path, &output)?;
+            println!("exported {} entries to {}", stats.files, output.display());
+        }
+        BrainAction::Import { input, into, force } => {
+            let target = into.unwrap_or(brain_path);
+            let stats = ninox_core::brain_archive::import(&input, &target, force)?;
+            println!("imported {} entries into {}", stats.imported, target.display());
+            if !stats.skipped.is_empty() {
+                eprintln!(
+                    "skipped {} conflicting entr{} already present in the target brain (use --force to overwrite):",
+                    stats.skipped.len(),
+                    if stats.skipped.len() == 1 { "y" } else { "ies" }
+                );
+                for path in &stats.skipped {
+                    eprintln!("  {}", path.display());
+                }
+            }
+
+            let brain = BrainIndex::open(&target)?;
+            let embedder = try_build_embedder();
+            let rebuild_stats = brain.rebuild(embedder.as_deref())?;
+            println!(
+                "indexed {} entries ({} embedded, {} cached)",
+                rebuild_stats.indexed, rebuild_stats.embedded, rebuild_stats.cached
+            );
         }
     }
 
