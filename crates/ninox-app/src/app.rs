@@ -1120,6 +1120,9 @@ impl App {
                                         workspace.clone()
                                     }
                                 };
+                            if let Err(e) = crate::spawn_util::seed_worker_brain_skill(&effective_ws).await {
+                                tracing::warn!("failed to seed brain skill for {sid}: {e}");
+                            }
 
                             // Repo slug from the base workspace's git remote so
                             // poll_github can talk to the right owner/repo.
