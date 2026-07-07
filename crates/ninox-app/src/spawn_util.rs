@@ -735,7 +735,7 @@ mod tests {
                 started_at:        0,
                 claude_session_id: "fixed-uuid-for-test".into(),
                 failure_status:    SessionStatus::Terminated,
-            summary:           None,
+                summary:           None,
             },
         )
         .await;
@@ -794,7 +794,7 @@ mod tests {
                 started_at:        0,
                 claude_session_id: "fixed-uuid".into(),
                 failure_status:    SessionStatus::Interrupted,
-            summary:           None,
+                summary:           None,
             },
         )
         .await;
@@ -1007,7 +1007,7 @@ mod persistence_probe {
                 started_at:      0,
                 claude_session_id: "probe-fixed-id".into(),
                 failure_status:  ninox_core::SessionStatus::Terminated,
-            summary:           None,
+                summary:           None,
             },
         )
         .await;
@@ -1058,7 +1058,7 @@ mod persistence_probe {
                 started_at:      0,
                 claude_session_id: "probe-fixed-id".into(),
                 failure_status:  ninox_core::SessionStatus::Terminated,
-            summary:           None,
+                summary:           None,
             },
         )
         .await;
