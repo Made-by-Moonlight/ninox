@@ -22,6 +22,23 @@ fn repo_short(repo: &str) -> &str {
 /// its conversation can be continued. Delegates to `resume_plan` itself
 /// (rather than re-deriving the same checks) so the button can never drift
 /// from what actually happens on click.
+/// "Resume" and "Restart" are the exact same action on the exact same
+/// button (kill the pane if one exists, relaunch with the session's stored
+/// `claude_session_id` so the conversation continues) — only the label
+/// changes, because "Resume" reads as nonsensical on a session that isn't
+/// dead. `can_resume`'s availability is deliberately liveness-agnostic (see
+/// its own doc comment): a currently-alive session can use this same
+/// mechanism to pick up a newer `claude` binary or plugin/MCP update
+/// without losing conversation context, which is exactly what a live
+/// session's "Restart" button is for.
+fn resume_label(status: &ninox_core::types::SessionStatus) -> &'static str {
+    use ninox_core::types::SessionStatus::*;
+    match status {
+        Done | Terminated | Interrupted => "Resume",
+        _ => "Restart",
+    }
+}
+
 fn can_resume(session: &Session, is_orchestrator: bool, config: &AppConfig) -> bool {
     crate::app::resume_plan(session, is_orchestrator, config).is_some()
 }
@@ -296,7 +313,7 @@ pub fn session_detail<'a>(
 
     let resume_btn: Element<Message> = if can_resume(session, is_orchestrator, &app.config) {
         let sid = session_id.to_string();
-        button(crate::style::micro_label("Resume", s.status_review).size(10.0))
+        button(crate::style::micro_label(resume_label(&session.status), s.status_review).size(10.0))
             .on_press(Message::ResumeSession(sid))
             .padding([6, 16])
             .style(move |_theme, status| {
@@ -512,6 +529,7 @@ mod tests {
             pr_number: None, pr_id: None,
             workspace_path: workspace_path.map(String::from),
             pid: None, model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: claude_session_id.map(String::from),
         }
     }
@@ -530,6 +548,17 @@ mod tests {
                 can_resume(&s, false, &cfg),
                 "expected resumable regardless of status when an id is stored",
             );
+        }
+    }
+
+    #[test]
+    fn resume_labeled_restart_when_alive_resume_when_dead() {
+        use SessionStatus::*;
+        for status in [Spawning, Working, PrOpen, CiFailed, ReviewPending, Mergeable] {
+            assert_eq!(resume_label(&status), "Restart", "{status:?} should read Restart");
+        }
+        for status in [Done, Terminated, Interrupted] {
+            assert_eq!(resume_label(&status), "Resume", "{status:?} should read Resume");
         }
     }
 
