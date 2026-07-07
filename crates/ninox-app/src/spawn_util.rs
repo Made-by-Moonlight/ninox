@@ -213,38 +213,77 @@ pub fn repo_from_workspace(workspace: &str) -> Option<String> {
 /// (e.g. a previous run with the same name), the existing branch is checked
 /// out rather than creating a new one.
 pub async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Result<String> {
-    use anyhow::Context as _;
-    use tokio::process::Command;
-
     let worktree_path = std::path::Path::new(repo)
         .join(".claude")
         .join("worktrees")
         .join(session_id);
-    let worktree_str = worktree_path.to_string_lossy().to_string();
+    create_worktree_at(std::path::Path::new(repo), &worktree_path, session_id)
+}
 
-    // Attempt 1: create a fresh branch named after the session.
+/// Walk up from `start` (inclusive) looking for the nearest ancestor
+/// directory containing a `.git` entry — either a real repo's `.git`
+/// directory, or a linked worktree's `.git` gitfile. `start` itself need
+/// not exist (or even have existing ancestors) since this only ever calls
+/// `Path::exists`, which returns `false` rather than erroring for missing
+/// paths — used by the Standalone spawn-modal's auto-create path, where
+/// the user-typed workspace is by definition missing.
+///
+/// Returns `None` if no such ancestor is found before the filesystem root.
+pub fn find_repo_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        if d.join(".git").exists() {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Core `git worktree add` logic shared by [`create_worker_worktree`]
+/// (always nests under `{repo}/.claude/worktrees/{session_id}`) and the
+/// Standalone spawn-modal's auto-create path (targets the exact user-typed
+/// path via [`find_repo_root`]).
+///
+/// Returns the target path (stringified) on success. If `branch` already
+/// exists (e.g. a previous run with the same name), the existing branch is
+/// checked out rather than creating a new one. Blocking (not async): called
+/// directly from the modal's synchronous confirm handler, which cannot
+/// `.await`; mirrors the blocking `git` calls already used elsewhere in
+/// this module (e.g. `repo_from_workspace`) even when invoked from async
+/// call sites.
+pub fn create_worktree_at(
+    repo_root: &std::path::Path,
+    target: &std::path::Path,
+    branch: &str,
+) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    use std::process::Command;
+
+    let repo_str = repo_root.to_string_lossy().to_string();
+    let target_str = target.to_string_lossy().to_string();
+
+    // Attempt 1: create a fresh branch named after `branch`.
     let out = Command::new("git")
-        .args(["-C", repo, "worktree", "add", &worktree_str, "-b", session_id])
+        .args(["-C", &repo_str, "worktree", "add", &target_str, "-b", branch])
         .output()
-        .await
         .context("git worktree add")?;
 
     if out.status.success() {
-        ensure_statusline_settings(&worktree_path).await;
-        return Ok(worktree_str);
+        ensure_statusline_settings(target);
+        return Ok(target_str);
     }
 
     // Attempt 2: branch already exists — check it out without -b.
     let stderr = String::from_utf8_lossy(&out.stderr);
     if stderr.contains("already exists") {
         let out2 = Command::new("git")
-            .args(["-C", repo, "worktree", "add", &worktree_str, session_id])
+            .args(["-C", &repo_str, "worktree", "add", &target_str, branch])
             .output()
-            .await
             .context("git worktree add (existing branch)")?;
         if out2.status.success() {
-            ensure_statusline_settings(&worktree_path).await;
-            return Ok(worktree_str);
+            ensure_statusline_settings(target);
+            return Ok(target_str);
         }
         anyhow::bail!("{}", String::from_utf8_lossy(&out2.stderr).trim());
     }
@@ -257,7 +296,7 @@ pub async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Res
 /// checked into the branch). Best-effort: any failure here must never fail
 /// worktree creation itself, so errors are swallowed rather than
 /// propagated.
-async fn ensure_statusline_settings(worktree_path: &std::path::Path) {
+fn ensure_statusline_settings(worktree_path: &std::path::Path) {
     let claude_dir = worktree_path.join(".claude");
     let settings_path = claude_dir.join("settings.json");
     if settings_path.exists() {
@@ -277,9 +316,9 @@ async fn ensure_statusline_settings(worktree_path: &std::path::Path) {
             "refreshInterval": 20
         }
     });
-    if tokio::fs::create_dir_all(&claude_dir).await.is_ok() {
+    if std::fs::create_dir_all(&claude_dir).is_ok() {
         if let Ok(body) = serde_json::to_string_pretty(&settings) {
-            let _ = tokio::fs::write(&settings_path, body).await;
+            let _ = std::fs::write(&settings_path, body);
         }
     }
 }
@@ -530,6 +569,62 @@ mod tests {
             std::path::Path::new(&second).join(".claude").join("settings.json"),
         ).unwrap();
         assert_eq!(contents, r#"{"userCustom": true}"#);
+    }
+
+    #[test]
+    fn find_repo_root_walks_up_to_the_nearest_git_ancestor() {
+        let repo = init_git_repo();
+        let nested = repo.join(".claude").join("worktrees").join("does-not-exist-yet");
+        // `nested` itself is never created — find_repo_root must not require
+        // the path being resolved to exist, only its ancestors.
+        assert_eq!(find_repo_root(&nested), Some(repo.clone()));
+    }
+
+    #[test]
+    fn find_repo_root_returns_none_with_no_git_ancestor() {
+        let dir = tempdir().unwrap().keep();
+        assert_eq!(find_repo_root(&dir.join("nested").join("deeper")), None);
+    }
+
+    #[test]
+    fn create_worktree_at_creates_exact_target_path_on_new_branch() {
+        let repo = init_git_repo();
+        let target = repo.join(".claude").join("worktrees").join("feat-new-thing");
+
+        let created = create_worktree_at(&repo, &target, "feat-new-thing").unwrap();
+
+        assert_eq!(created, target.to_string_lossy());
+        assert!(target.join(".git").exists());
+        let out = std::process::Command::new("git")
+            .args(["-C", &created, "branch", "--show-current"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "feat-new-thing");
+        // ensure_statusline_settings must still run for this path, same as
+        // the create_worker_worktree callers get.
+        assert!(target.join(".claude").join("settings.json").exists());
+    }
+
+    #[test]
+    fn create_worktree_at_checks_out_existing_branch_when_it_already_exists() {
+        let repo = init_git_repo();
+        let target = repo.join(".claude").join("worktrees").join("feat-existing");
+
+        let first = create_worktree_at(&repo, &target, "feat-existing").unwrap();
+        std::process::Command::new("git")
+            .args(["-C", &repo.to_string_lossy(), "worktree", "remove", "--force", &first])
+            .output()
+            .unwrap();
+        assert!(!target.exists(), "sanity: worktree dir removed but branch remains");
+
+        let second = create_worktree_at(&repo, &target, "feat-existing").unwrap();
+
+        assert_eq!(second, target.to_string_lossy());
+        let out = std::process::Command::new("git")
+            .args(["-C", &second, "branch", "--show-current"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "feat-existing");
     }
 
     #[test]
