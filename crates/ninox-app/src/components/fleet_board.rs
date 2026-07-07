@@ -229,6 +229,18 @@ fn attention_banner(app: &App) -> Option<Element<'_, Message>> {
     )
 }
 
+/// Clips a session summary to a sane single-card length so an unusually
+/// long spawn-prompt first line can't blow out the card height.
+fn truncate_summary(summary: &str) -> String {
+    const MAX_CHARS: usize = 90;
+    if summary.chars().count() <= MAX_CHARS {
+        summary.to_string()
+    } else {
+        let clipped: String = summary.chars().take(MAX_CHARS).collect();
+        format!("{clipped}…")
+    }
+}
+
 fn session_card<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
     let s = &app.scheme;
     let st_color = s.status_color(&session.status);
@@ -239,22 +251,38 @@ fn session_card<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> 
     } else {
         session.repo.clone()
     };
-    button(
-        column![
-            text(&session.name).size(16).font(crate::style::SERIF_MEDIUM).color(s.ink),
-            Space::new(0, 2),
-            text(repo_line).size(9.5).font(crate::style::MONO).color(s.faint),
-            Space::new(0, 9),
-            crate::style::dotted_rule(s.rule_dark),
-            row![
-                crate::style::stamp(word, st_color),
-                Space::new(Length::Fill, 0),
-                text(format!("${:.2}", session.cost_usd))
-                    .size(11.5).font(crate::style::MONO_MEDIUM).color(s.ink),
-            ]
-            .align_y(Alignment::Center),
+
+    let mut body: Vec<Element<Message>> = vec![
+        text(&session.name).size(16).font(crate::style::SERIF_MEDIUM).color(s.ink).into(),
+        Space::new(0, 2).into(),
+        text(repo_line).size(9.5).font(crate::style::MONO).color(s.faint).into(),
+    ];
+    if let Some(summary) = session.summary.as_deref().filter(|sum| !sum.is_empty()) {
+        body.push(Space::new(0, 4).into());
+        body.push(
+            text(truncate_summary(summary))
+                .size(10.5)
+                .font(crate::style::SANS)
+                .color(s.ink_2)
+                .into(),
+        );
+    }
+    body.push(Space::new(0, 9).into());
+    body.push(crate::style::dotted_rule(s.rule_dark));
+    body.push(
+        row![
+            crate::style::stamp(word, st_color),
+            Space::new(Length::Fill, 0),
+            text(format!("${:.2}", session.cost_usd))
+                .size(11.5).font(crate::style::MONO_MEDIUM).color(s.ink),
         ]
-        .padding(iced::Padding { top: 12.0, right: 13.0, bottom: 10.0, left: 13.0 }),
+        .align_y(Alignment::Center)
+        .into(),
+    );
+
+    button(
+        column(body)
+            .padding(iced::Padding { top: 12.0, right: 13.0, bottom: 10.0, left: 13.0 }),
     )
     .on_press(Message::NavigateSession(session.id.clone()))
     .width(Length::Fill)
@@ -416,5 +444,18 @@ mod tests {
         assert!(!column_absorbs(&Done, &Interrupted));
         assert!(!column_absorbs(&Working, &Terminated));
         assert!(!column_absorbs(&PrOpen, &Terminated));
+    }
+
+    #[test]
+    fn truncate_summary_leaves_short_text_untouched() {
+        assert_eq!(truncate_summary("Fix flaky CI"), "Fix flaky CI");
+    }
+
+    #[test]
+    fn truncate_summary_clips_long_text_with_ellipsis() {
+        let long = "a".repeat(120);
+        let clipped = truncate_summary(&long);
+        assert_eq!(clipped.chars().count(), 91); // 90 chars + "…"
+        assert!(clipped.ends_with('…'));
     }
 }

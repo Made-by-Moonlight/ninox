@@ -52,6 +52,7 @@ impl Store {
             ("context_total_tokens", "ALTER TABLE sessions ADD COLUMN context_total_tokens INTEGER"),
             ("context_window_size",  "ALTER TABLE sessions ADD COLUMN context_window_size INTEGER"),
             ("claude_session_id",    "ALTER TABLE sessions ADD COLUMN claude_session_id TEXT"),
+            ("summary",              "ALTER TABLE sessions ADD COLUMN summary TEXT"),
         ] {
             if !Self::column_exists(&conn, "sessions", col)? {
                 conn.execute(ddl, [])?;
@@ -76,8 +77,8 @@ impl Store {
             "INSERT INTO sessions (id,orchestrator_id,name,repo,status,agent_type,
              cost_usd,started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+             claude_session_id,summary)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)
              ON CONFLICT(id) DO UPDATE SET
              repo=excluded.repo,
              status=excluded.status,cost_usd=excluded.cost_usd,
@@ -89,13 +90,14 @@ impl Store {
              context_used_pct=excluded.context_used_pct,
              context_total_tokens=excluded.context_total_tokens,
              context_window_size=excluded.context_window_size,
-             claude_session_id=excluded.claude_session_id",
+             claude_session_id=excluded.claude_session_id,
+             summary=excluded.summary",
             params![
                 s.id, s.orchestrator_id, s.name, s.repo, status, s.agent_type,
                 s.cost_usd, s.started_at, s.pr_number, s.pr_id,
                 s.workspace_path, s.pid, s.model, s.context_tokens,
                 s.catalogue_path, s.context_used_pct, s.context_total_tokens,
-                s.context_window_size, s.claude_session_id
+                s.context_window_size, s.claude_session_id, s.summary
             ],
         )?;
         Ok(())
@@ -107,7 +109,7 @@ impl Store {
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id
+             claude_session_id,summary
              FROM sessions ORDER BY started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -131,13 +133,14 @@ impl Store {
                 r.get::<_, Option<i64>>(16)?,
                 r.get::<_, Option<i64>>(17)?,
                 r.get::<_, Option<String>>(18)?,
+                r.get::<_, Option<String>>(19)?,
             ))
         })?;
         rows.map(|r| {
             let (id, orchestrator_id, name, repo, status_str, agent_type,
                  cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                  model, context_tokens, catalogue_path, context_used_pct,
-                 context_total_tokens, context_window_size, claude_session_id) = r?;
+                 context_total_tokens, context_window_size, claude_session_id, summary) = r?;
             let status = serde_json::from_str(&format!("\"{status_str}\""))
                 .unwrap_or(SessionStatus::Working);
             Ok(Session {
@@ -149,6 +152,7 @@ impl Store {
                 context_total_tokens: context_total_tokens.map(|v| v.max(0) as u64),
                 context_window_size: context_window_size.map(|v| v.max(0) as u64),
                 claude_session_id,
+                summary,
             })
         })
         .collect()
@@ -160,7 +164,7 @@ impl Store {
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id
+             claude_session_id,summary
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], |r| {
@@ -184,6 +188,7 @@ impl Store {
                 r.get::<_, Option<i64>>(16)?,
                 r.get::<_, Option<i64>>(17)?,
                 r.get::<_, Option<String>>(18)?,
+                r.get::<_, Option<String>>(19)?,
             ))
         })?;
         match rows.next() {
@@ -192,7 +197,7 @@ impl Store {
                 let (id, orchestrator_id, name, repo, status_str, agent_type,
                      cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                      model, context_tokens, catalogue_path, context_used_pct,
-                     context_total_tokens, context_window_size, claude_session_id) = r?;
+                     context_total_tokens, context_window_size, claude_session_id, summary) = r?;
                 let status = serde_json::from_str(&format!("\"{status_str}\""))
                     .unwrap_or(SessionStatus::Working);
                 Ok(Some(Session {
@@ -204,6 +209,7 @@ impl Store {
                     context_total_tokens: context_total_tokens.map(|v| v.max(0) as u64),
                     context_window_size: context_window_size.map(|v| v.max(0) as u64),
                     claude_session_id,
+                    summary,
                 }))
             }
         }
@@ -347,6 +353,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
         };
         store.upsert_session(&session).unwrap();
         let list = store.list_sessions().unwrap();
@@ -365,6 +372,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
         };
         store.upsert_session(&s).unwrap();
         s.status = SessionStatus::Done;
@@ -389,6 +397,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
         };
         store.upsert_session(&s).unwrap();
         s.repo = "OwnerB/repoB".into();
@@ -408,6 +417,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap();
@@ -427,6 +437,7 @@ mod tests {
             model: Some("claude-fable-5".into()), context_tokens: Some(214_000), catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap().unwrap();
@@ -446,12 +457,43 @@ mod tests {
             catalogue_path: Some("/brains/x".into()),
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2").unwrap().unwrap();
         assert_eq!(found.catalogue_path.as_deref(), Some("/brains/x"));
         // list path decodes it too
         assert_eq!(store.list_sessions().unwrap()[0].catalogue_path.as_deref(), Some("/brains/x"));
+    }
+
+    #[test]
+    fn summary_round_trips() {
+        let store = test_store();
+        let s = Session {
+            id: "s2b".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
+            summary: Some("Fix flaky CI on the auth suite".into()),
+        };
+        store.upsert_session(&s).unwrap();
+        let found = store.get_session("s2b").unwrap().unwrap();
+        assert_eq!(found.summary.as_deref(), Some("Fix flaky CI on the auth suite"));
+        // list path decodes it too
+        assert_eq!(
+            store.list_sessions().unwrap().iter().find(|x| x.id == "s2b").unwrap().summary.as_deref(),
+            Some("Fix flaky CI on the auth suite"),
+        );
+
+        // None round-trips as None, not "" or "none"
+        let mut s2 = s.clone();
+        s2.id = "s2c".into();
+        s2.summary = None;
+        store.upsert_session(&s2).unwrap();
+        assert_eq!(store.get_session("s2c").unwrap().unwrap().summary, None);
     }
 
     #[test]
@@ -465,6 +507,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some("b7e0b3a0-0000-4000-8000-000000000001".into()),
+            summary: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s3").unwrap().unwrap();
@@ -497,6 +540,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
         };
         store.upsert_session(&s).unwrap();
         s.started_at = 200;
@@ -533,6 +577,7 @@ mod tests {
             context_total_tokens: Some(124_000),
             context_window_size: Some(200_000),
             claude_session_id: None,
+            summary: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap().unwrap();
@@ -554,6 +599,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2").unwrap().unwrap();
@@ -579,7 +625,7 @@ mod tests {
                 pr_number: None, pr_id: None, workspace_path: None, pid: None,
                 model: model.map(String::from), context_tokens: None, catalogue_path: None,
                 context_used_pct: None, context_total_tokens: None, context_window_size: None,
-                claude_session_id: None,
+                claude_session_id: None, summary: None,
             }).unwrap();
         }
         let samples = store.cost_samples("claude-code", Some("claude-fable-5")).unwrap();

@@ -93,6 +93,7 @@ mod tests {
                 context_total_tokens: None,
                 context_window_size: None,
                 claude_session_id: None,
+                summary: None,
             })
             .unwrap();
         let app = sessions_router(engine);
@@ -134,6 +135,7 @@ mod tests {
                 context_total_tokens: None,
                 context_window_size: None,
                 claude_session_id: None,
+                summary: None,
             })
             .unwrap();
         let response = sessions_router(engine)
