@@ -298,45 +298,74 @@ impl Poller {
             let Some(pr_number) = session.pr_number else { continue };
 
             // -- PR state — try the repo on record first (the common case,
-            // no extra requests), then every other configured remote. Repos
-            // here routinely have a personal `origin` alongside an internal
-            // mirror; a PR that actually lives against the mirror must not
-            // 404-and-stall forever just because `session.repo` points at
-            // `origin`. --
-            let candidates = self.pr_status_candidates(&session);
-            if candidates.is_empty() {
-                continue;
-            }
-            let mut found: Option<(String, crate::github::PrStatus)> = None;
+            // no extra requests, and the only case where reusing the same
+            // numeric `pr_number` is valid: it was recorded *for that repo
+            // specifically*). If that 404s, DO NOT retry the same
+            // `pr_number` against another remote's repo — PR numbers are a
+            // per-repository sequence with no cross-repo relationship, so a
+            // different repo (e.g. an internal mirror) can easily have some
+            // unrelated PR at that same number. Instead, match on the
+            // session's actual branch, the same way `poll_pr_reconciliation`
+            // does, and adopt whatever PR number that repo's branch match
+            // actually has. --
+            let mut found: Option<(String, u64, crate::github::PrStatus)> = None;
             let mut last_err: Option<anyhow::Error> = None;
-            for repo_slug in &candidates {
-                let Some((owner, repo)) = split_repo(repo_slug) else { continue };
-                match gh.get_pr_status(&owner, &repo, pr_number).await {
-                    Ok(s)  => { found = Some((repo_slug.clone(), s)); break; }
-                    Err(e) => last_err = Some(e),
+            let mut attempted = false;
+            if !session.repo.is_empty() {
+                if let Some((owner, repo)) = split_repo(&session.repo) {
+                    attempted = true;
+                    match gh.get_pr_status(&owner, &repo, pr_number).await {
+                        Ok(s)  => found = Some((session.repo.clone(), pr_number, s)),
+                        Err(e) => last_err = Some(e),
+                    }
                 }
             }
-            let Some((resolved_repo, pr_status)) = found else {
+            if found.is_none() {
+                if let Some(workspace) = session.workspace_path.clone() {
+                    if let Some(branch) = crate::github::current_branch(&workspace) {
+                        for repo_slug in crate::github::candidate_repos(&workspace) {
+                            if repo_slug == session.repo {
+                                continue; // already tried above
+                            }
+                            let Some((owner, repo)) = split_repo(&repo_slug) else { continue };
+                            attempted = true;
+                            let pr_ref = match gh.find_open_pr_for_branch(&owner, &repo, &branch).await {
+                                Ok(Some(r)) => r,
+                                Ok(None)    => continue,
+                                Err(e)      => { last_err = Some(e); continue; }
+                            };
+                            match gh.get_pr_status(&owner, &repo, pr_ref.number).await {
+                                Ok(s)  => { found = Some((repo_slug, pr_ref.number, s)); break; }
+                                Err(e) => { last_err = Some(e); continue; }
+                            }
+                        }
+                    }
+                }
+            }
+            if !attempted {
+                continue; // nothing parseable to check — same as pre-fallback behavior
+            }
+            let Some((resolved_repo, pr_number, pr_status)) = found else {
                 if let Some(e) = last_err {
-                    tracing::warn!(
-                        "github pr status for {} (tried {} repo(s)): {e}",
-                        session.id, candidates.len(),
-                    );
+                    tracing::warn!("github pr status for {}: {e}", session.id);
                 }
                 self.notify_github_lookup_failed(&session);
                 continue;
             };
             self.clear_github_lookup_failed(&session.id);
 
-            // Self-heal: the PR was found against a different remote than
-            // the one on record — persist it so future ticks go straight
-            // there instead of re-discovering it via fallback every time.
-            if resolved_repo != session.repo {
+            // Self-heal: the PR was found against a different remote (and
+            // possibly a different PR number in that remote's own sequence)
+            // than the one on record — persist it so future ticks go
+            // straight there instead of re-discovering it via fallback
+            // every time.
+            if resolved_repo != session.repo || Some(pr_number) != session.pr_number {
                 tracing::info!(
-                    "session {} repo corrected {} -> {resolved_repo}",
-                    session.id, session.repo,
+                    "session {} repo/PR corrected {}#{:?} -> {resolved_repo}#{pr_number}",
+                    session.id, session.repo, session.pr_number,
                 );
                 session.repo = resolved_repo;
+                session.pr_number = Some(pr_number);
                 let _ = self.engine.store.upsert_session(&session);
             }
             let Some((owner, repo)) = split_repo(&session.repo) else { continue };
@@ -503,24 +532,6 @@ impl Poller {
                 }
             }
         }
-    }
-
-    /// Repo slugs to try `get_pr_status` against for `session`, in order:
-    /// the repo already on record (no extra requests in the common case),
-    /// then every other remote configured in its workspace.
-    fn pr_status_candidates(&self, session: &crate::types::Session) -> Vec<String> {
-        let mut candidates = Vec::new();
-        if !session.repo.is_empty() {
-            candidates.push(session.repo.clone());
-        }
-        if let Some(workspace) = &session.workspace_path {
-            for repo in crate::github::candidate_repos(workspace) {
-                if !candidates.contains(&repo) {
-                    candidates.push(repo);
-                }
-            }
-        }
-        candidates
     }
 
     /// Emit a `GithubLookupFailed` notification once per run of consecutive
@@ -1148,20 +1159,23 @@ mod tests {
 
     #[derive(Default)]
     struct FakeGithub {
-        pr_status_ok:   std::sync::Mutex<HashMap<(String, String), crate::github::PrStatus>>,
+        /// Keyed by (owner, repo, pr_number) — PR numbers are per-repo, so a
+        /// fake that ignored the number couldn't catch a cross-repo number
+        /// collision bug.
+        pr_status_ok:   std::sync::Mutex<HashMap<(String, String, u64), crate::github::PrStatus>>,
         branch_matches: std::sync::Mutex<HashMap<(String, String, String), crate::github::PrRef>>,
-        /// (owner, repo) pairs `get_pr_status` was actually called with, in order.
-        calls: std::sync::Mutex<Vec<(String, String)>>,
+        /// (owner, repo, pr_number) triples `get_pr_status` was actually called with, in order.
+        calls: std::sync::Mutex<Vec<(String, String, u64)>>,
     }
 
     #[async_trait::async_trait]
     impl crate::github::GithubApi for FakeGithub {
-        async fn get_pr_status(&self, owner: &str, repo: &str, _pr_number: u64) -> anyhow::Result<crate::github::PrStatus> {
-            self.calls.lock().unwrap().push((owner.to_string(), repo.to_string()));
+        async fn get_pr_status(&self, owner: &str, repo: &str, pr_number: u64) -> anyhow::Result<crate::github::PrStatus> {
+            self.calls.lock().unwrap().push((owner.to_string(), repo.to_string(), pr_number));
             self.pr_status_ok.lock().unwrap()
-                .get(&(owner.to_string(), repo.to_string()))
+                .get(&(owner.to_string(), repo.to_string(), pr_number))
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("404 for {owner}/{repo}"))
+                .ok_or_else(|| anyhow::anyhow!("404 for {owner}/{repo}#{pr_number}"))
         }
         async fn get_ci_checks(&self, _owner: &str, _repo: &str, _head_sha: &str) -> anyhow::Result<Vec<CheckRun>> {
             Ok(vec![])
@@ -1253,7 +1267,11 @@ mod tests {
     /// (`origin`) 404s, but the PR actually lives against a second
     /// configured remote (an internal mirror) — `poll_github` must fall
     /// back to it instead of silently stalling, and self-heal `session.repo`
-    /// so later ticks go straight there.
+    /// (and `session.pr_number`, since PR numbers are per-repo) so later
+    /// ticks go straight there. The mirror's real PR is deliberately given a
+    /// *different* number (99, not the tracked 50) — a repo whose branch
+    /// match is only found by matching the branch, not by coincidentally
+    /// reusing the same numeric `pr_number`.
     #[tokio::test]
     async fn poll_github_falls_back_to_other_remote_when_recorded_repo_404s() {
         use crate::store::Store;
@@ -1265,14 +1283,18 @@ mod tests {
         let workspace = repo_dir.path().to_string_lossy().to_string();
 
         let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.branch_matches.lock().unwrap().insert(
+            ("OwnerB".to_string(), "repoB".to_string(), "worker-branch".to_string()),
+            crate::github::PrRef { number: 99, url: "https://github.com/OwnerB/repoB/pull/99".into() },
+        );
         fake.pr_status_ok.lock().unwrap().insert(
-            ("OwnerB".to_string(), "repoB".to_string()),
+            ("OwnerB".to_string(), "repoB".to_string(), 99),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 99, head_sha: "abc".into(),
             },
         );
-        // OwnerA/repoA has no entry — get_pr_status errors, simulating a 404.
+        // OwnerA/repoA#50 has no entry — get_pr_status errors, simulating a 404.
 
         let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
         let mut session = test_session("s1", &workspace);
@@ -1287,12 +1309,65 @@ mod tests {
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert_eq!(updated.repo, "OwnerB/repoB", "session.repo must self-heal to the remote that actually has the PR");
+        assert_eq!(updated.pr_number, Some(99), "must adopt the mirror's own PR number, not reuse the tracked repo's number");
 
         let calls = fake.calls.lock().unwrap().clone();
         assert_eq!(
             calls,
-            vec![("OwnerA".to_string(), "repoA".to_string()), ("OwnerB".to_string(), "repoB".to_string())],
-            "the repo on record must be tried first, the other remote only as fallback",
+            vec![("OwnerA".to_string(), "repoA".to_string(), 50), ("OwnerB".to_string(), "repoB".to_string(), 99)],
+            "the repo on record must be tried first (by its own number), the mirror only as a branch-matched fallback",
+        );
+    }
+
+    /// The bug this guards against: PR numbers are a per-repository
+    /// sequence with no cross-repo relationship. If the recorded repo 404s,
+    /// a *different*, unrelated repo can easily have some PR at the exact
+    /// same number purely by coincidence. Blindly retrying the tracked
+    /// number against that repo would silently adopt the wrong PR. Since
+    /// that unrelated PR's head branch doesn't match this session's branch,
+    /// the branch-matching fallback must not adopt it — even though a
+    /// `get_pr_status` for that same number would have "succeeded".
+    #[tokio::test]
+    async fn poll_github_does_not_adopt_an_unrelated_pr_that_shares_the_tracked_number() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[
+            ("origin", "https://github.com/OwnerA/repoA.git"),
+            ("mirror", "https://github.com/OwnerB/repoB.git"),
+        ]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        // OwnerB/repoB happens to have *some* PR #50 too, but it's unrelated
+        // — its branch doesn't match, so no `branch_matches` entry for it.
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("OwnerB".to_string(), "repoB".to_string(), 50),
+            crate::github::PrStatus {
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "someone else's unrelated PR".into(), number: 50, head_sha: "zzz".into(),
+            },
+        );
+        // OwnerA/repoA#50 has no entry — get_pr_status errors, simulating a 404.
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.repo = "OwnerA/repoA".into();
+        session.pr_number = Some(50);
+        store.upsert_session(&session).unwrap();
+
+        let engine = github_engine(store.clone(), fake.clone());
+        let poller = Poller::new(engine);
+
+        poller.poll_github().await;
+
+        let updated = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(updated.repo, "OwnerA/repoA", "must not adopt the mirror just because it happens to have a same-numbered PR");
+        assert_eq!(updated.pr_number, Some(50));
+
+        let calls = fake.calls.lock().unwrap().clone();
+        assert!(
+            !calls.contains(&("OwnerB".to_string(), "repoB".to_string(), 50)),
+            "must never retry the tracked number against another repo's get_pr_status: {calls:?}",
         );
     }
 
@@ -1331,7 +1406,7 @@ mod tests {
 
         // Recovery.
         fake.pr_status_ok.lock().unwrap().insert(
-            ("OwnerA".to_string(), "repoA".to_string()),
+            ("OwnerA".to_string(), "repoA".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
                 title: "t".into(), number: 50, head_sha: "abc".into(),

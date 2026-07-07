@@ -82,6 +82,11 @@ for _arg in "$@"; do
         --repo=*|--hostname=*)
             continue
             ;;
+        -R?*)
+            # Cuddled short-flag form gh's parser also accepts, e.g.
+            # `-Rowner/repo` (no space) — value is embedded, nothing to skip.
+            continue
+            ;;
     esac
     _positional+=("$_arg")
 done
@@ -689,6 +694,7 @@ mod tests {
             vec!["-R", "org/repo"],
             vec!["--repo", "org/repo"],
             vec!["--repo=org/repo"],
+            vec!["-Rorg/repo"],
         ] {
             let real_gh_dir = fake_real_gh("https://github.com/org/repo/pull/99");
             let data_dir = tempdir().unwrap();
