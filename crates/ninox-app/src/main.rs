@@ -249,6 +249,7 @@ async fn run_spawn(
         context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: Some(claude_session_id.clone()),
         summary,
+        terminal_at: None,
     };
 
     store.upsert_session(&session)?;

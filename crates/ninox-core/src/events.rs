@@ -180,6 +180,7 @@ impl Engine {
 
         if let Some(mut session) = self.store.get_session(session_id)? {
             session.status = crate::types::SessionStatus::Done;
+            session.terminal_at = Some(crate::lifecycle::poller::now_millis());
             self.store.upsert_session(&session)?;
             self.emit(Event::SessionUpdated(session));
         }
@@ -235,6 +236,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(store);
@@ -245,6 +247,13 @@ mod tests {
         let evt = rx.recv().await.unwrap();
         if let Event::SessionUpdated(s) = evt {
             assert!(matches!(s.status, crate::types::SessionStatus::Terminated));
+            assert_eq!(
+                s.terminal_at, None,
+                "user-initiated terminate_session must not stamp terminal_at — \
+                 that's reserved for the automatic lifecycle path, so this \
+                 session is purged on sight rather than held for the \
+                 retention grace period",
+            );
         } else {
             panic!("expected SessionUpdated");
         }
@@ -265,6 +274,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(Arc::clone(&store));
@@ -275,6 +285,11 @@ mod tests {
         let evt = rx.recv().await.unwrap();
         if let Event::SessionUpdated(s) = evt {
             assert!(matches!(s.status, crate::types::SessionStatus::Done));
+            assert!(
+                s.terminal_at.is_some(),
+                "cleanup_session must stamp terminal_at so the retention sweep can hold this \
+                 record for the fleet board's grace window instead of purging it on sight",
+            );
         } else {
             panic!("expected SessionUpdated");
         }

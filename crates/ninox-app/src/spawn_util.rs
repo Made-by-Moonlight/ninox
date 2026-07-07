@@ -135,6 +135,7 @@ pub async fn spawn_interactive_session(
         context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: Some(p.claude_session_id),
         summary:         p.summary,
+        terminal_at:     None,
     };
     let _ = engine.store.upsert_session(&updated);
 
@@ -765,6 +766,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some("fixed-uuid".into()),
             summary: None,
+            terminal_at: None,
         }).unwrap();
 
         let ws = tempdir().unwrap().keep().to_string_lossy().to_string();

@@ -1130,6 +1130,7 @@ impl App {
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
                             summary:         None,
+                            terminal_at:         None,
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1273,6 +1274,7 @@ impl App {
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
                             summary:         None,
+                            terminal_at:         None,
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1673,40 +1675,39 @@ impl App {
                 let orch_ids: std::collections::HashSet<&str> =
                     state.orchestrators.iter().map(|o| o.id.as_str()).collect();
 
-                // Remove terminated/done sessions from state and DB — includes
-                // both standalone sessions and workers under orchestrators.
-                let to_clean: Vec<SessionId> = state.sessions.values()
-                    .filter(|s| {
-                        matches!(s.status, SessionStatus::Done | SessionStatus::Terminated)
-                        && !orch_ids.contains(s.id.as_str())
-                    })
-                    .map(|s| s.id.clone())
+                // A completed (Done/Terminated) session lingers on the board
+                // for a configurable grace period after finishing — see
+                // `ninox_core::lifecycle::poller::Poller::sweep_retired_sessions`,
+                // which is the sole place that actually deletes the store
+                // record once that window elapses. This handler must not
+                // race that retention logic by deleting eagerly on status
+                // alone; it only mirrors the store, dropping from `state`
+                // whatever has genuinely vanished from it (already purged by
+                // the sweep, or by a direct user removal).
+                let db_ids: std::collections::HashSet<&str> =
+                    db_sessions.iter().map(|s| s.id.as_str()).collect();
+                let to_clean: Vec<SessionId> = state.sessions.keys()
+                    .filter(|id| !db_ids.contains(id.as_str()) && !orch_ids.contains(id.as_str()))
+                    .cloned()
                     .collect();
                 for id in &to_clean {
                     state.sessions.remove(id);
                     state.terminals.remove(id);
                 }
-                let engine_clean = state.engine.clone();
-                let to_clean_clone = to_clean.clone();
 
-                // Add genuinely new active sessions (spawned by ninox spawn).
-                // PTY streaming is NOT started here — NavigateSession handles that
-                // on demand with the correct window dimensions.
+                // Add genuinely new sessions (spawned by `ninox spawn`, or a
+                // completed session not yet tracked in `state`) — including
+                // Done/Terminated ones, which stay visible until the sweep
+                // above purges their store record. PTY streaming is NOT
+                // started here — NavigateSession handles that on demand with
+                // the correct window dimensions.
                 for session in db_sessions {
-                    if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
-                        continue;
-                    }
                     if !state.sessions.contains_key(&session.id) {
                         state.sessions.insert(session.id.clone(), session);
                     }
                 }
 
-                Task::future(async move {
-                    for id in to_clean_clone {
-                        let _ = engine_clean.store.delete_session(&id);
-                    }
-                    Message::Noop
-                })
+                Task::none()
             }
 
             Message::NavigatePrList => {
@@ -2642,6 +2643,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
         }
     }
 
@@ -2776,6 +2778,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
         }
     }
 
@@ -2980,6 +2983,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
         };
         let (updated, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         assert!(updated.sessions.contains_key("s1"));
@@ -3064,6 +3068,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;
@@ -3113,6 +3118,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
         }).unwrap();
         let engine = Engine::new(store);
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
@@ -3137,6 +3143,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = m2;
@@ -3146,8 +3153,15 @@ mod tests {
         assert_eq!(terminated[0].id, "t1");
     }
 
+    /// A Done worker must survive `PollSessions` while its store record is
+    /// still within the retention grace period — the old behavior (instant
+    /// removal on status alone) gave the fleet board no window to show what
+    /// just completed. Only once the record is actually gone from the store
+    /// (here simulated directly, standing in for
+    /// `Poller::sweep_retired_sessions` having purged it) must the board
+    /// drop it.
     #[test]
-    fn poll_sessions_removes_done_worker_from_sidebar() {
+    fn poll_sessions_keeps_done_worker_until_purged_from_store() {
         let e = test_engine();
         let mut m = base(e);
 
@@ -3168,16 +3182,65 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: Some(0),
         };
         let _ = m.engine.store.upsert_session(&worker);
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(worker))));
         m = next;
         assert!(m.sessions.contains_key("w1"), "worker should be present before poll");
 
-        // PollSessions should clean up the done worker
+        // Still present after a poll tick — the record is still in the
+        // store, so the board must not drop it just because it's Done.
         let (next, _) = m.update(Message::PollSessions);
         m = next;
-        assert!(!m.sessions.contains_key("w1"), "done worker must be removed by PollSessions");
+        assert!(
+            m.sessions.contains_key("w1"),
+            "Done worker must survive PollSessions while its retention window hasn't elapsed",
+        );
+
+        // Once the retention sweep has actually purged the record...
+        m.engine.store.delete_session("w1").unwrap();
+        let (next, _) = m.update(Message::PollSessions);
+        m = next;
+        assert!(
+            !m.sessions.contains_key("w1"),
+            "a session purged from the store must disappear from the board on the next poll",
+        );
+    }
+
+    /// An orchestrator's own session (tracked in `state.sessions` alongside
+    /// its workers) must never be dropped from the board by `PollSessions`
+    /// even if it's briefly absent from a given `list_sessions()` read —
+    /// mirrors the retention sweep's own orchestrator exemption.
+    #[test]
+    fn poll_sessions_never_drops_orchestrator_sessions() {
+        let e = test_engine();
+        let mut m = base(e);
+
+        let o = Orchestrator { id: "o1".into(), name: "orch".into(), created_at: 0 };
+        let _ = m.engine.store.upsert_orchestrator(&o);
+        let (next, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorSpawned(o))));
+        m = next;
+
+        // The orchestrator's own session row is untracked in the sessions
+        // table (e.g. not yet written) — PollSessions must not evict it from
+        // `state.sessions` just because `db_sessions` doesn't contain it.
+        m.sessions.insert("o1".into(), Session {
+            id: "o1".into(), orchestrator_id: None, name: "orch".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0,
+            started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
+            summary: None,
+            terminal_at: None,
+        });
+
+        let (next, _) = m.update(Message::PollSessions);
+        m = next;
+        assert!(m.sessions.contains_key("o1"), "orchestrator sessions must never be auto-dropped");
     }
 
     #[test]
@@ -3587,6 +3650,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -3616,6 +3680,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -3669,6 +3734,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         // NavigateSession defaults to the Split panel, so switch to Terminal
@@ -3717,6 +3783,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -3799,6 +3866,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m, _) = m.update(Message::NavigateSession("s1".into()));
@@ -3852,6 +3920,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -3943,6 +4012,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -4723,6 +4793,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
+            terminal_at: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;
