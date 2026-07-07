@@ -10,10 +10,11 @@ pub const FETCH_CHUNK: i64 = 300;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StyledCell {
-    pub c:     char,
-    pub fg:    Color,
-    pub bg:    Color,
-    pub flags: Flags,
+    pub c:         char,
+    pub fg:        Color,
+    pub bg:        Color,
+    pub flags:     Flags,
+    pub hyperlink: Option<String>,
 }
 
 pub type StyledLine = Vec<StyledCell>;
@@ -54,7 +55,13 @@ pub fn parse_capture(bytes: &[u8], cols: u16) -> Vec<StyledLine> {
         let mut cells: StyledLine = (0..grid.columns())
             .map(|col| {
                 let cell = &grid[line][Column(col)];
-                StyledCell { c: cell.c, fg: cell.fg, bg: cell.bg, flags: cell.flags }
+                StyledCell {
+                    c:         cell.c,
+                    fg:        cell.fg,
+                    bg:        cell.bg,
+                    flags:     cell.flags,
+                    hyperlink: cell.hyperlink().map(|h| h.uri().to_string()),
+                }
             })
             .collect();
         // Trim trailing default-blank cells so rendering can skip them.
@@ -144,6 +151,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_capture_preserves_hyperlink() {
+        let bytes = b"\x1b]8;;http://example.com\x1b\\click me\x1b]8;;\x1b\\\n";
+        let lines = parse_capture(bytes, 40);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0][0].hyperlink.as_deref(), Some("http://example.com"));
+        assert_eq!(lines[0][7].hyperlink.as_deref(), Some("http://example.com"));
+    }
+
+    #[test]
     fn scroll_bookkeeping_requests_fetch_at_cache_edge() {
         let mut sb = Scrollback::default();
         // Empty cache: any scroll up needs a fetch.
@@ -178,6 +194,7 @@ mod tests {
             fg: alacritty_terminal::vte::ansi::Color::Named(alacritty_terminal::vte::ansi::NamedColor::Foreground),
             bg: alacritty_terminal::vte::ansi::Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background),
             flags: alacritty_terminal::term::cell::Flags::empty(),
+            hyperlink: None,
         }];
         // Oldest-first storage: a then b; b is directly above the screen.
         sb.absorb(vec![mk('a'), mk('b')], -2, true);
