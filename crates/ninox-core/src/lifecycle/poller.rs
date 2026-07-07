@@ -13,7 +13,12 @@ use crate::{
         CIStatus, Comment, Notification, NotificationKind, PrId, Session, SessionStatus, PR,
     },
 };
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 
 /// Last-seen `(cost_usd, context_used_pct, context_total_tokens)` snapshot per session.
@@ -28,6 +33,19 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// Best-effort extraction of a human-readable message from a
+/// `JoinError::into_panic()` payload — used so a panicking `HarvestRunner`
+/// is diagnosable in logs instead of silently swallowed.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 pub struct Poller {
     engine:           Arc<Engine>,
     enrichment_cache: Arc<std::sync::Mutex<EnrichmentCache>>,
@@ -39,6 +57,14 @@ pub struct Poller {
     /// Injectable so tests can fake success/failure without spawning a real
     /// process — see `sync_sessions_metadata`'s `trigger_brain_harvest`.
     harvest_runner:   Arc<dyn HarvestRunner>,
+    /// One lock per resolved brain vault path, created on first use. Held
+    /// across a harvest's `HarvestRunner::run` call so two sessions whose
+    /// harvests target the same vault (the common case: both on the global
+    /// default catalogue) never run their `claude -p` — and its `ninox
+    /// brain index` — concurrently against it. Never pruned: the number of
+    /// distinct vault paths in play is bounded by the number of configured
+    /// catalogues, not by session count.
+    vault_locks:      Arc<std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl Poller {
@@ -52,7 +78,25 @@ impl Poller {
             enrichment_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             context_cache:    Arc::new(std::sync::Mutex::new(HashMap::new())),
             harvest_runner,
+            vault_locks:      Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The (created-on-first-use) lock for a given vault path — see
+    /// `vault_locks`.
+    fn vault_lock(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        // Canonicalize so two syntactically different paths to the same
+        // physical vault (trailing slash, symlink) share one lock. Falls
+        // back to the raw path when it doesn't exist yet (e.g. a vault
+        // that hasn't been written to before) — that harvest still gets
+        // its own lock, just not deduplicated against a not-yet-existing
+        // twin, which can't race with anything yet either.
+        let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let mut locks = self.vault_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     pub async fn start(self, token: CancellationToken) {
@@ -203,24 +247,21 @@ impl Poller {
     /// guaranteed to fire once per session lifetime, so no second dedup
     /// layer is needed here.
     ///
-    /// Diff computation runs on this poll tick (a couple of cheap, local
-    /// `git` calls); only the `claude -p` subprocess itself — which may take
-    /// a while — is handed off via `tokio::spawn` so it can never stall the
-    /// poll loop. Any failure (disabled config, no workspace, trivial diff,
-    /// or the subprocess itself failing) is logged at most and never
-    /// propagates back into `sync_sessions_metadata`.
+    /// Diff computation (a couple of local `git` subprocess calls) AND the
+    /// `claude -p` subprocess itself both run inside a single `tokio::spawn`
+    /// — nothing about harvesting, however slow, may stall this poll tick's
+    /// processing of other sessions. Any failure (disabled config, no
+    /// workspace, trivial diff, or the subprocess itself failing) is logged
+    /// at most and never propagates back into `sync_sessions_metadata`. A
+    /// second, supervising spawn awaits the harvest task purely to log a
+    /// panic that would otherwise be silent.
     async fn trigger_brain_harvest(&self, session: &Session) {
         let config = AppConfig::load().unwrap_or_default();
         if !config.brain_harvest.enabled {
             return;
         }
         let Some(workspace) = session.workspace_path.clone() else { return };
-        let Some(diff) = brain_harvest::compute_nontrivial_diff(std::path::Path::new(&workspace)).await else {
-            tracing::info!("brain harvest skipped for {}: no non-trivial diff", session.id);
-            return;
-        };
-
-        let prompt         = brain_harvest::build_harvest_prompt(&session.id, &diff);
+        let workspace_path: PathBuf = workspace.into();
         // Prefer the session's own catalogue — set from that worker's
         // `NINOX_BRAIN` at spawn time (see `main.rs::run_spawn`,
         // `spawn_util::interactive_env_vars`) — over the global default, so
@@ -229,13 +270,38 @@ impl Poller {
         let brain_path: PathBuf = session.catalogue_path.clone()
             .map(PathBuf::from)
             .unwrap_or_else(|| config.resolved_brain_path());
-        let workspace_path: PathBuf = workspace.into();
-        let runner          = self.harvest_runner.clone();
-        let session_id      = session.id.clone();
+        let runner       = self.harvest_runner.clone();
+        let session_id    = session.id.clone();
+        let panic_session_id = session_id.clone();
+        let vault_lock   = self.vault_lock(&brain_path);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
+            let Some(diff) = brain_harvest::compute_nontrivial_diff(&workspace_path).await else {
+                tracing::info!("brain harvest skipped for {session_id}: no non-trivial diff");
+                return;
+            };
+            let prompt = brain_harvest::build_harvest_prompt(&session_id, &diff);
+
+            // Serialize concurrent harvests that share a vault — two
+            // `claude -p` subprocesses running `ninox brain index` against
+            // the same vault at once can race on the index write.
+            let _guard = vault_lock.lock().await;
             if let Err(e) = runner.run(prompt, workspace_path, brain_path).await {
                 tracing::warn!("brain harvest failed for session {session_id}: {e}");
+            }
+        });
+
+        tokio::spawn(async move {
+            if let Err(join_err) = handle.await {
+                if join_err.is_panic() {
+                    let payload = join_err.into_panic();
+                    tracing::warn!(
+                        "brain harvest task panicked for session {panic_session_id}: {}",
+                        panic_message(payload.as_ref()),
+                    );
+                } else {
+                    tracing::warn!("brain harvest task for session {panic_session_id} was cancelled");
+                }
             }
         });
     }
@@ -1756,5 +1822,210 @@ mod tests {
             Some(v) => std::env::set_var("NINOX_CONFIG", v),
             None    => std::env::remove_var("NINOX_CONFIG"),
         }
+    }
+
+    /// Captures every `tracing` event's formatted `message` field so tests
+    /// can assert on log output without a real logging backend.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl CapturedLogs {
+        fn contains(&self, needle: &str) -> bool {
+            self.0.lock().unwrap().iter().any(|m| m.contains(needle))
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.0);
+        }
+    }
+
+    /// A `HarvestRunner` whose returned future panics as soon as it's
+    /// polled — stands in for a bug inside the real harvest subprocess
+    /// plumbing, to prove a panic is logged rather than silently lost.
+    struct PanickingHarvestRunner;
+
+    impl HarvestRunner for PanickingHarvestRunner {
+        fn run(
+            &self,
+            _prompt: String,
+            _workspace: PathBuf,
+            _brain_path: PathBuf,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+            Box::pin(async move { panic!("simulated harvest panic") })
+        }
+    }
+
+    /// A panicking `HarvestRunner` must produce a logged warning — the
+    /// `tokio::spawn` `JoinHandle` is otherwise discarded and a panic would
+    /// be completely silent (see `trigger_brain_harvest`'s supervising
+    /// spawn).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn metadata_sync_logs_a_warning_when_harvest_task_panics() {
+        use crate::{config::ENV_TEST_GUARD, store::Store};
+        use tracing_subscriber::{layer::SubscriberExt, Registry};
+
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("NINOX_CONFIG").ok();
+        std::env::set_var("NINOX_CONFIG", nonexistent_config_path());
+
+        let logs = CapturedLogs::default();
+        let _log_guard = tracing::subscriber::set_default(Registry::default().with(logs.clone()));
+
+        let repo = init_diff_repo("feature-panic", Some(("src.rs", "fn main() {}\n")));
+        let workspace = repo.to_str().unwrap().to_string();
+
+        let sessions_dir = tempfile::tempdir().unwrap();
+        let meta = serde_json::json!({"agentReportedPrNumber": "20"});
+        std::fs::write(sessions_dir.path().join("s1.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", &workspace)).unwrap();
+        let engine = Engine::new(store.clone());
+
+        let poller = Poller::new_with_harvest_runner(engine, Arc::new(PanickingHarvestRunner));
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        // The harvest + its supervising task are detached spawns; poll
+        // until the panic has been caught and logged, bounded so a
+        // regression fails the test instead of hanging.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !logs.contains("brain harvest task panicked") {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for the panic to be logged");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        match prior {
+            Some(v) => std::env::set_var("NINOX_CONFIG", v),
+            None    => std::env::remove_var("NINOX_CONFIG"),
+        }
+    }
+
+    /// Records whether it ever observed two overlapping `run()` calls —
+    /// proves the per-vault lock actually serializes concurrent harvests
+    /// targeting the same brain path, rather than merely happening not to
+    /// race in this particular run.
+    struct OverlapDetectingHarvestRunner {
+        calls:      tokio::sync::mpsc::UnboundedSender<()>,
+        active:     Arc<std::sync::atomic::AtomicUsize>,
+        overlapped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl HarvestRunner for OverlapDetectingHarvestRunner {
+        fn run(
+            &self,
+            _prompt: String,
+            _workspace: PathBuf,
+            _brain_path: PathBuf,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+            let _ = self.calls.send(());
+            let active = self.active.clone();
+            let overlapped = self.overlapped.clone();
+            Box::pin(async move {
+                if active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                    overlapped.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    /// Two sessions whose harvests target the same (default) brain vault —
+    /// neither sets `catalogue_path`, so both resolve to
+    /// `config.resolved_brain_path()` — must never have their
+    /// `HarvestRunner::run` calls (which, in production, both invoke `ninox
+    /// brain index`) overlap.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn concurrent_harvests_to_the_same_vault_do_not_overlap() {
+        use crate::{config::ENV_TEST_GUARD, store::Store};
+
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("NINOX_CONFIG").ok();
+        std::env::set_var("NINOX_CONFIG", nonexistent_config_path());
+
+        let repo1 = init_diff_repo("feature-vault-1", Some(("a.rs", "fn a() {}\n")));
+        let repo2 = init_diff_repo("feature-vault-2", Some(("b.rs", "fn b() {}\n")));
+
+        let sessions_dir = tempfile::tempdir().unwrap();
+        for (id, pr) in [("s1", "30"), ("s2", "31")] {
+            let meta = serde_json::json!({"agentReportedPrNumber": pr});
+            std::fs::write(sessions_dir.path().join(format!("{id}.json")), serde_json::to_string(&meta).unwrap()).unwrap();
+        }
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", repo1.to_str().unwrap())).unwrap();
+        store.upsert_session(&test_session("s2", repo2.to_str().unwrap())).unwrap();
+        let engine = Engine::new(store.clone());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overlapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner = Arc::new(OverlapDetectingHarvestRunner {
+            calls: tx, active: active.clone(), overlapped: overlapped.clone(),
+        });
+        let poller = Poller::new_with_harvest_runner(engine, runner);
+
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("both harvests should be attempted")
+                .expect("channel should not be closed");
+        }
+        // Let the (lock-serialized) second call finish its simulated work
+        // so `overlapped` reflects the full run.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert!(
+            !overlapped.load(std::sync::atomic::Ordering::SeqCst),
+            "concurrent harvests to the same vault must not run HarvestRunner::run concurrently",
+        );
+
+        match prior {
+            Some(v) => std::env::set_var("NINOX_CONFIG", v),
+            None    => std::env::remove_var("NINOX_CONFIG"),
+        }
+    }
+
+    /// Two syntactically different paths to the same physical vault (here:
+    /// a trailing slash) must resolve to the same lock — otherwise two
+    /// harvests using differently-spelled `catalogue_path`s for the same
+    /// vault could still run `ninox brain index` concurrently, silently
+    /// defeating the point of the lock.
+    #[test]
+    fn vault_lock_treats_equivalent_paths_as_the_same_vault() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let engine = Engine::new(store);
+        let poller = Poller::new_with_harvest_runner(engine, Arc::new(ClaudeHarvestRunner));
+
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().to_path_buf();
+        let with_trailing_slash = PathBuf::from(format!("{}/", canonical.display()));
+
+        let lock_a = poller.vault_lock(&canonical);
+        let lock_b = poller.vault_lock(&with_trailing_slash);
+
+        assert!(
+            Arc::ptr_eq(&lock_a, &lock_b),
+            "syntactically different paths to the same physical vault must share one lock",
+        );
     }
 }
