@@ -1397,9 +1397,13 @@ impl App {
                     k != &id && s.orchestrator_id.as_deref() != Some(id.as_str())
                 });
                 state.terminals.remove(&id);
+                state.diffs.remove(&id);
                 // Drop clients for the orchestrator itself and any worker
                 // sessions removed above — only surviving sessions keep theirs.
                 state.clients.retain(|sid, _| state.sessions.contains_key(sid));
+                // Same for diffs: the orchestrator's own removal is handled
+                // above, this catches its removed workers.
+                state.diffs.retain(|sid, _| state.sessions.contains_key(sid));
                 state.sidebar.expanded_orchestrators.remove(&id);
                 let engine = state.engine.clone();
                 Task::future(async move {
@@ -1417,6 +1421,7 @@ impl App {
                 state.sessions.remove(&id);
                 state.terminals.remove(&id);
                 state.clients.remove(&id);
+                state.diffs.remove(&id);
                 let engine = state.engine.clone();
                 Task::future(async move {
                     if let Err(e) = engine.remove_session(&id).await {
@@ -1438,6 +1443,10 @@ impl App {
                 // fight the respawn for the same tmux session name.
                 state.clients.remove(&id);
                 state.terminals.remove(&id);
+                // Re-file respawns the same id onto a fresh workspace/branch
+                // — the cached diff is for the OLD incarnation and would
+                // otherwise flash stale content until the next fetch.
+                state.diffs.remove(&id);
 
                 let ts = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -1491,6 +1500,10 @@ impl App {
                 };
                 state.clients.remove(&id);
                 state.terminals.remove(&id);
+                // Same id, relaunched — the pane died and may come back onto
+                // a different pty/branch state; drop the cached diff so the
+                // Diff panel refetches instead of showing the pre-resume text.
+                state.diffs.remove(&id);
 
                 let ts = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -1719,6 +1732,7 @@ impl App {
                 for id in &to_clean {
                     state.sessions.remove(id);
                     state.terminals.remove(id);
+                    state.diffs.remove(id);
                 }
                 let engine_clean = state.engine.clone();
                 let to_clean_clone = to_clean.clone();
@@ -2126,6 +2140,7 @@ impl App {
                 state.terminals.remove(&id);
                 // A done session is definitionally not viewable.
                 state.clients.remove(&id);
+                state.diffs.remove(&id);
                 Task::none()
             }
 
@@ -2164,6 +2179,7 @@ impl App {
                     View::SessionDetail { session_id: sid, .. } if sid == &session_id);
                 state.clients.remove(&session_id);
                 state.terminals.remove(&session_id);
+                state.diffs.remove(&session_id);
                 // One automatic reattach for unexpected deaths (tmux server
                 // restart); repeated failures fall through to the
                 // "Terminal connecting…" placeholder.
@@ -2891,6 +2907,17 @@ mod tests {
     }
 
     #[test]
+    fn refile_message_drops_the_cached_diff_from_the_prior_incarnation() {
+        let e = test_engine();
+        let mut m = base(e);
+        let s = refile_session("s1");
+        m.sessions.insert("s1".into(), s);
+        m.diffs.insert("s1".into(), Some("stale diff text".into()));
+        let (m, _) = m.update(Message::RefileSession("s1".into()));
+        assert!(!m.diffs.contains_key("s1"), "re-file must not leave the old workspace's diff cached");
+    }
+
+    #[test]
     fn resume_plan_builds_a_resume_command_from_the_stored_id() {
         let cfg = ninox_core::config::AppConfig::default();
         let mut session = refile_session("s1");
@@ -2929,6 +2956,20 @@ mod tests {
         // itself mutates, same as its Re-file twin.
         assert!(!m.terminals.contains_key("s1"));
         assert!(m.sessions.contains_key("s1"));
+    }
+
+    #[test]
+    fn resume_message_drops_the_cached_diff_from_before_the_pane_died() {
+        let e = test_engine();
+        let mut m = base(e);
+        let mut s = refile_session("s1");
+        s.status = SessionStatus::Interrupted;
+        s.claude_session_id = Some("stored-uuid".into());
+        m.sessions.insert("s1".into(), s.clone());
+        m.engine.store.upsert_session(&s).unwrap();
+        m.diffs.insert("s1".into(), Some("stale diff text".into()));
+        let (m, _) = m.update(Message::ResumeSession("s1".into()));
+        assert!(!m.diffs.contains_key("s1"), "resume must not leave the pre-resume diff cached");
     }
 
     #[tokio::test]
@@ -3223,6 +3264,79 @@ mod tests {
         let (next, _) = m.update(Message::PollSessions);
         m = next;
         assert!(!m.sessions.contains_key("w1"), "done worker must be removed by PollSessions");
+    }
+
+    #[test]
+    fn poll_sessions_drops_the_cached_diff_for_a_cleaned_up_session() {
+        let e = test_engine();
+        let mut m = base(e);
+        let s = Session {
+            id: "w1".into(), orchestrator_id: None, name: "worker".into(),
+            repo: "r".into(), status: SessionStatus::Done,
+            agent_type: "c".into(), cost_usd: 0.0,
+            started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
+        };
+        let _ = m.engine.store.upsert_session(&s);
+        let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
+        m = next;
+        m.diffs.insert("w1".into(), Some("stale diff text".into()));
+
+        let (next, _) = m.update(Message::PollSessions);
+        m = next;
+        assert!(!m.diffs.contains_key("w1"), "cleaned-up session must not leak its cached diff");
+    }
+
+    #[test]
+    fn remove_session_drops_the_cached_diff() {
+        let e = test_engine();
+        let mut m = base(e);
+        let s = refile_session("s1");
+        m.sessions.insert("s1".into(), s);
+        m.diffs.insert("s1".into(), Some("stale diff text".into()));
+        let (m, _) = m.update(Message::RemoveSession("s1".into()));
+        assert!(!m.diffs.contains_key("s1"));
+    }
+
+    #[test]
+    fn remove_orchestrator_drops_cached_diffs_for_it_and_its_workers() {
+        let e = test_engine();
+        let mut m = base(e);
+        let o = Orchestrator { id: "o1".into(), name: "orch".into(), created_at: 0 };
+        let worker = Session {
+            id: "w1".into(), orchestrator_id: Some("o1".into()), name: "worker".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0,
+            started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
+        };
+        let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorSpawned(o))));
+        m = m2;
+        let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(worker))));
+        m = m2;
+        m.diffs.insert("o1".into(), Some("stale orch diff".into()));
+        m.diffs.insert("w1".into(), Some("stale worker diff".into()));
+
+        let (m, _) = m.update(Message::RemoveOrchestrator("o1".into()));
+        assert!(!m.diffs.contains_key("o1"));
+        assert!(!m.diffs.contains_key("w1"));
+    }
+
+    #[test]
+    fn session_done_event_drops_the_cached_diff() {
+        let e = test_engine();
+        let mut m = base(e);
+        let s = refile_session("s1");
+        m.sessions.insert("s1".into(), s);
+        m.diffs.insert("s1".into(), Some("stale diff text".into()));
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionDone("s1".into()))));
+        assert!(!m.diffs.contains_key("s1"));
     }
 
     #[test]
