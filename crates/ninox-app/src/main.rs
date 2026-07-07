@@ -454,6 +454,12 @@ async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
                     eprintln!("  {}", path.display());
                 }
             }
+            if !stats.failed.is_empty() {
+                eprintln!("failed to extract {} entr{}:", stats.failed.len(), if stats.failed.len() == 1 { "y" } else { "ies" });
+                for (path, err) in &stats.failed {
+                    eprintln!("  {}: {err}", path.display());
+                }
+            }
 
             let brain = BrainIndex::open(&target)?;
             let embedder = try_build_embedder();
@@ -462,6 +468,10 @@ async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
                 "indexed {} entries ({} embedded, {} cached)",
                 rebuild_stats.indexed, rebuild_stats.embedded, rebuild_stats.cached
             );
+
+            if !stats.skipped.is_empty() || !stats.failed.is_empty() {
+                std::process::exit(1);
+            }
         }
     }
 
