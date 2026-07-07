@@ -767,6 +767,7 @@ mod tests {
                 fg: Color::Named(NamedColor::Foreground),
                 bg: Color::Named(NamedColor::Background),
                 flags: Flags::empty(),
+                hyperlink: None,
             }).collect()
         };
         // Oldest first — "history two" sits directly above the live screen.
