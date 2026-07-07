@@ -118,6 +118,10 @@ pub struct App {
     pub prs:             HashMap<PrId, PR>,
     pub ci_status:       HashMap<PrId, CIStatus>,
     pub review_threads:  HashMap<PrId, Vec<Comment>>,
+    /// On-demand `git diff` text per session's workspace (`ensure_diff`).
+    /// Absent = not fetched yet (render "Loading…"); `Some(None)` = fetched,
+    /// no diff (no workspace recorded, or a clean working tree).
+    pub diffs:           HashMap<SessionId, Option<String>>,
     pub notifications:   VecDeque<Notification>,
     pub sidebar:         SidebarState,
     pub view:            View,
@@ -272,6 +276,10 @@ pub enum Message {
     /// `models_cmd` discovery finished for a harness (`None` = failed —
     /// cached so pickers fall through to known_models without retrying).
     ModelListLoaded { harness: String, models: Option<Vec<String>> },
+    /// An on-demand `git diff` fetch (`ensure_diff`) resolved for a
+    /// session's workspace — `diff: None` means no workspace recorded, or a
+    /// clean diff against the default branch, not an error.
+    DiffFetched { session_id: SessionId, diff: Option<String> },
     Noop,
 }
 
@@ -483,6 +491,7 @@ impl App {
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
+            diffs:          HashMap::new(),
             notifications:  VecDeque::new(),
             sidebar:        SidebarState::default(),
             view:           View::default(),
@@ -600,6 +609,26 @@ impl App {
         Task::future(async move {
             let models = crate::models::run_models_cmd(cmd).await;
             Message::ModelListLoaded { harness: h, models }
+        })
+    }
+
+    /// Kick off an on-demand `git diff` fetch for `session_id`'s workspace.
+    /// Unlike `ensure_models`, this always re-runs rather than caching on
+    /// first success: a live, in-progress session's diff changes as the
+    /// worker commits, so callers re-issue this every time the Diff panel
+    /// is opened or the session poll ticks while it's on screen.
+    fn ensure_diff(state: &mut App, session_id: &str) -> Task<Message> {
+        let Some(workspace) = state.sessions.get(session_id).and_then(|s| s.workspace_path.clone()) else {
+            state.diffs.insert(session_id.to_string(), None);
+            return Task::none();
+        };
+        let sid = session_id.to_string();
+        Task::future(async move {
+            let diff = ninox_core::lifecycle::brain_harvest::compute_diff(
+                std::path::Path::new(&workspace),
+            )
+            .await;
+            Message::DiffFetched { session_id: sid, diff }
         })
     }
 
@@ -742,8 +771,14 @@ impl App {
                 state.terminals.remove(&id);
                 Self::resize_terminals(state);
 
+                let diff_task = if state.worker_panel == DetailPanel::Diff {
+                    Self::ensure_diff(state, &id)
+                } else {
+                    Task::none()
+                };
+
                 let engine = state.engine.clone();
-                Task::future(async move {
+                let attach_task = Task::future(async move {
                     if !ninox_core::tmux::has_session(&id).await {
                         if let Ok(Some(mut s)) = engine.store.get_session(&id) {
                             s.status = ninox_core::types::SessionStatus::Terminated;
@@ -758,7 +793,8 @@ impl App {
                     }
                     let argv = ninox_core::tmux::attach_args(&id).await;
                     Message::ClientAttach { session_id: id, argv }
-                })
+                });
+                Task::batch(vec![diff_task, attach_task])
             }
 
             Message::ClientAttach { session_id, argv } => {
@@ -1327,10 +1363,13 @@ impl App {
             }
 
             Message::SwitchDetailPanel(new_panel) => {
-                if let View::SessionDetail { panel, .. } = &mut state.view {
+                let session_id = if let View::SessionDetail { session_id, panel } = &mut state.view {
                     *panel = new_panel;
                     state.worker_panel = new_panel;
-                }
+                    Some(session_id.clone())
+                } else {
+                    None
+                };
                 // Entering/leaving Split changes how much width the terminal
                 // canvas actually has, so the grid must be reflowed to match.
                 let resized = Self::resize_terminals(state);
@@ -1339,7 +1378,10 @@ impl App {
                         client.resize(cols, rows);
                     }
                 }
-                Task::none()
+                match (new_panel, session_id) {
+                    (DetailPanel::Diff, Some(sid)) => Self::ensure_diff(state, &sid),
+                    _ => Task::none(),
+                }
             }
 
             Message::RemoveOrchestrator(id) => {
@@ -1693,12 +1735,24 @@ impl App {
                     }
                 }
 
-                Task::future(async move {
+                let cleanup_task = Task::future(async move {
                     for id in to_clean_clone {
                         let _ = engine_clean.store.delete_session(&id);
                     }
                     Message::Noop
-                })
+                });
+
+                // Refresh the diff for whatever session is on the Diff panel
+                // right now — a live session's diff changes as the worker
+                // commits, so this is the "keeps updating" tick for it.
+                let diff_task = match &state.view {
+                    View::SessionDetail { session_id, panel: DetailPanel::Diff } => {
+                        Self::ensure_diff(state, &session_id.clone())
+                    }
+                    _ => Task::none(),
+                };
+
+                Task::batch(vec![cleanup_task, diff_task])
             }
 
             Message::NavigatePrList => {
@@ -2028,6 +2082,11 @@ impl App {
 
             Message::ModelListLoaded { harness, models } => {
                 state.model_lists.insert(harness, models);
+                Task::none()
+            }
+
+            Message::DiffFetched { session_id, diff } => {
+                state.diffs.insert(session_id, diff);
                 Task::none()
             }
 
@@ -2732,6 +2791,7 @@ mod tests {
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
+            diffs:          HashMap::new(),
             notifications:  VecDeque::new(),
             sidebar:        SidebarState::default(),
             view:           View::FleetBoard { scope: None },
@@ -3576,6 +3636,42 @@ mod tests {
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
         let (m3, _) = m2.update(Message::SwitchDetailPanel(DetailPanel::Inspector));
         assert!(matches!(&m3.view, View::SessionDetail { panel: DetailPanel::Inspector, .. }));
+    }
+
+    #[test]
+    fn switching_to_diff_panel_without_a_workspace_marks_no_diff_synchronously() {
+        use crate::components::session_detail::DetailPanel;
+        let e = test_engine();
+        let m = base(e);
+        let s = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 1.23,
+            started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
+        };
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
+        let (m2, _) = m.update(Message::NavigateSession("s1".into()));
+        let (m3, _) = m2.update(Message::SwitchDetailPanel(DetailPanel::Diff));
+        assert!(matches!(&m3.view, View::SessionDetail { panel: DetailPanel::Diff, .. }));
+        assert_eq!(m3.diffs.get("s1"), Some(&None));
+    }
+
+    #[test]
+    fn diff_fetched_stores_the_result_by_session_id() {
+        let e = test_engine();
+        let m = base(e);
+        let (m, _) = m.update(Message::DiffFetched {
+            session_id: "s1".into(),
+            diff: Some("diff --git a/x b/x\n+hello\n".into()),
+        });
+        assert_eq!(
+            m.diffs.get("s1"),
+            Some(&Some("diff --git a/x b/x\n+hello\n".to_string())),
+        );
     }
 
     #[test]
