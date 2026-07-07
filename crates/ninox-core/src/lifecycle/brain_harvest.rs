@@ -52,9 +52,16 @@ const HARVEST_ENV_PASSTHROUGH: &[&str] = &[
 /// "not enabled in this context" and fails outright, even though permission
 /// checks are otherwise bypassed. Exactly what the harvest prompt asks for —
 /// `Bash` for `ninox brain query`/`ninox brain index`, `Read`/`Write`/`Edit`
-/// for the brain's Markdown files — and nothing with network reach
-/// (`WebFetch`/`WebSearch`) or the ability to spawn further agents (`Task`),
-/// which would otherwise widen a successful prompt injection's blast radius.
+/// for the brain's Markdown files.
+///
+/// This removes `WebFetch`/`WebSearch`/`Task`/etc. as *registered tool
+/// names*, but is NOT a network or filesystem sandbox: `Bash` is required
+/// (for the two `ninox brain` commands above) and trivially provides
+/// network egress (`curl`, a Python one-liner, ...) and can read anything
+/// under `$HOME` the OS lets this user read — `~/.ssh`, `~/.config/gh`,
+/// cloud credential files, etc. A prompt injection that successfully
+/// hijacks the harvest can still exfiltrate data via `Bash`; this allowlist
+/// only forecloses the tool-registration-level shortcuts, not that path.
 const HARVEST_TOOLS: &str = "Bash,Read,Write,Edit";
 
 /// Runs the harvest subprocess. Production code uses [`ClaudeHarvestRunner`];
@@ -479,6 +486,24 @@ mod tests {
         assert_ne!(prompt_a, prompt_b, "identical inputs must still produce differently-nonced prompts");
         assert!(prompt_a.contains("BEGIN UNTRUSTED DIFF"));
         assert!(prompt_a.contains("END UNTRUSTED DIFF"));
+    }
+
+    /// The `--tools` allowlist must actually be wired into the constructed
+    /// command — unlike env vars, `Command::get_args()` faithfully reflects
+    /// `.args()` calls, so this is a real (not tautological) regression
+    /// guard: a future refactor that drops `--tools` would fail this test.
+    #[test]
+    fn claude_command_registers_only_the_harvest_tool_allowlist() {
+        let cmd = build_claude_command("prompt text", Path::new("/workspace"), Path::new("/brain/vault"));
+        let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
+
+        let tools_idx = args.iter().position(|a| a == "--tools").expect("--tools flag must be present");
+        assert_eq!(
+            args.get(tools_idx + 1),
+            Some(&HARVEST_TOOLS.to_string()),
+            "--tools must be followed by exactly the harvest's tool allowlist",
+        );
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
     }
 
     /// When neither `origin/HEAD` nor a local `main`/`master` branch exists,
