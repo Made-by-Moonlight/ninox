@@ -334,8 +334,28 @@ pub async fn seed_worker_brain_skill(workspace: &str) -> anyhow::Result<()> {
         .join(".claude")
         .join("skills")
         .join("brain");
+    let skill_path = skill_dir.join("SKILL.md");
+
+    // Guard against clobbering a copy that somehow already got committed
+    // (e.g. a branch created before this exclude mechanism existed, or a
+    // manual `git add -f`). Ignoring an already-tracked file is a no-op in
+    // git — overwriting it here would silently rewrite committed content
+    // that a later `git commit -am` would then happily pick up, exactly
+    // what the exclude step below is meant to prevent.
+    let tracked = tokio::process::Command::new("git")
+        .args(["-C", workspace, "ls-files", "--error-unmatch", ".claude/skills/brain/SKILL.md"])
+        .output()
+        .await;
+    if let Ok(out) = tracked {
+        if out.status.success() {
+            anyhow::bail!(
+                "brain skill file is already tracked in this repo — skipping write to avoid touching committed content"
+            );
+        }
+    }
+
     fs::create_dir_all(&skill_dir).await.context("create .claude/skills/brain")?;
-    fs::write(skill_dir.join("SKILL.md"), WORKER_BRAIN_SKILL)
+    fs::write(&skill_path, WORKER_BRAIN_SKILL)
         .await
         .context("write brain SKILL.md")?;
 
@@ -364,13 +384,23 @@ pub async fn seed_worker_brain_skill(workspace: &str) -> anyhow::Result<()> {
         if let Some(parent) = exclude_path.parent() {
             fs::create_dir_all(parent).await.context("create info dir")?;
         }
-        let mut updated = existing;
-        if !updated.is_empty() && !updated.ends_with('\n') {
-            updated.push('\n');
+        // Append-only (never a whole-file read-modify-write): even if two
+        // spawns race on the same shared `info/exclude`, the worst case is
+        // a harmless duplicate line, never a lost concurrent edit.
+        use tokio::io::AsyncWriteExt;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&exclude_path)
+            .await
+            .context("open info/exclude for append")?;
+        let mut buf = String::new();
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            buf.push('\n');
         }
-        updated.push_str(EXCLUDE_LINE);
-        updated.push('\n');
-        fs::write(&exclude_path, updated).await.context("write info/exclude")?;
+        buf.push_str(EXCLUDE_LINE);
+        buf.push('\n');
+        file.write_all(buf.as_bytes()).await.context("append info/exclude")?;
     }
 
     Ok(())
@@ -577,6 +607,73 @@ mod tests {
             "skill file must still be written even outside a git repo"
         );
         assert!(!dir.path().join(".git").exists(), "test setup sanity check: no git repo here");
+    }
+
+    #[tokio::test]
+    async fn seed_worker_brain_skill_refuses_to_overwrite_a_tracked_copy() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git").args(["init", "-q", &ws]).status().await.unwrap();
+
+        // Simulate a pre-existing tracked copy, e.g. committed before this
+        // exclude mechanism existed.
+        let skill_dir = dir.path().join(".claude").join("skills").join("brain");
+        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+        tokio::fs::write(skill_dir.join("SKILL.md"), "tracked content\n").await.unwrap();
+        tokio::process::Command::new("git")
+            .args(["-C", &ws, "add", ".claude/skills/brain/SKILL.md"])
+            .status()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["-C", &ws, "commit", "-q", "-m", "tracked"])
+            .status()
+            .await
+            .unwrap();
+
+        let result = seed_worker_brain_skill(&ws).await;
+        assert!(result.is_err(), "must refuse to silently overwrite a tracked copy");
+
+        let content = tokio::fs::read_to_string(skill_dir.join("SKILL.md")).await.unwrap();
+        assert_eq!(content, "tracked content\n", "tracked content must be left untouched");
+    }
+
+    #[tokio::test]
+    async fn seed_worker_brain_skill_targets_shared_common_dir_from_a_worktree() {
+        use tempfile::tempdir;
+        let repo_dir = tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git").args(["init", "-q", &repo]).status().await.unwrap();
+        tokio::process::Command::new("git")
+            .args(["-C", &repo, "commit", "-q", "-m", "init", "--allow-empty"])
+            .status()
+            .await
+            .unwrap();
+
+        let worktree_path = repo_dir.path().join("wt");
+        let worktree = worktree_path.to_str().unwrap().to_string();
+        tokio::process::Command::new("git")
+            .args(["-C", &repo, "worktree", "add", &worktree, "-b", "wt-branch"])
+            .status()
+            .await
+            .unwrap();
+
+        seed_worker_brain_skill(&worktree).await.unwrap();
+
+        // The exclude must land in the MAIN repo's shared .git/info/exclude,
+        // not anywhere under the linked worktree's own (file-based) .git.
+        let exclude = tokio::fs::read_to_string(
+            repo_dir.path().join(".git").join("info").join("exclude"),
+        )
+        .await
+        .unwrap();
+        assert!(exclude.lines().any(|l| l.trim() == ".claude/skills/brain/"));
+
+        assert!(
+            worktree_path.join(".claude").join("skills").join("brain").join("SKILL.md").exists(),
+            "skill file must be written into the worktree itself"
+        );
     }
 }
 
