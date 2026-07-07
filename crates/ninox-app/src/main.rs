@@ -600,6 +600,7 @@ mod discover_repos_tests {
             context_total_tokens: None,
             context_window_size: None,
             claude_session_id: None,
+            terminal_at: None,
         }
     }
 
