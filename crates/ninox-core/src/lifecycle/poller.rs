@@ -60,7 +60,13 @@ impl Poller {
                     self.poll_context_updates().await;
                 }
                 _ = usage_interval.tick()  => self.poll_usage().await,
-                _ = github_interval.tick() => self.poll_github().await,
+                _ = github_interval.tick() => {
+                    // Reconciliation first: a session whose PR the poller
+                    // hasn't adopted yet has no `pr_number` for `poll_github`
+                    // to enrich, so it must run before (not instead of) it.
+                    self.poll_pr_reconciliation().await;
+                    self.poll_github().await;
+                }
             }
         }
     }
@@ -285,18 +291,55 @@ impl Poller {
         let Some(gh) = &self.engine.github else { return };
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
 
-        for session in sessions {
+        for mut session in sessions {
             if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted) {
                 continue;
             }
             let Some(pr_number) = session.pr_number else { continue };
-            let Some((owner, repo)) = split_repo(&session.repo) else { continue };
 
-            // -- PR state --
-            let pr_status = match gh.get_pr_status(&owner, &repo, pr_number).await {
-                Ok(s)  => s,
-                Err(e) => { tracing::warn!("github pr status: {e}"); continue }
+            // -- PR state — try the repo on record first (the common case,
+            // no extra requests), then every other configured remote. Repos
+            // here routinely have a personal `origin` alongside an internal
+            // mirror; a PR that actually lives against the mirror must not
+            // 404-and-stall forever just because `session.repo` points at
+            // `origin`. --
+            let candidates = self.pr_status_candidates(&session);
+            if candidates.is_empty() {
+                continue;
+            }
+            let mut found: Option<(String, crate::github::PrStatus)> = None;
+            let mut last_err: Option<anyhow::Error> = None;
+            for repo_slug in &candidates {
+                let Some((owner, repo)) = split_repo(repo_slug) else { continue };
+                match gh.get_pr_status(&owner, &repo, pr_number).await {
+                    Ok(s)  => { found = Some((repo_slug.clone(), s)); break; }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            let Some((resolved_repo, pr_status)) = found else {
+                if let Some(e) = last_err {
+                    tracing::warn!(
+                        "github pr status for {} (tried {} repo(s)): {e}",
+                        session.id, candidates.len(),
+                    );
+                }
+                self.notify_github_lookup_failed(&session);
+                continue;
             };
+            self.clear_github_lookup_failed(&session.id);
+
+            // Self-heal: the PR was found against a different remote than
+            // the one on record — persist it so future ticks go straight
+            // there instead of re-discovering it via fallback every time.
+            if resolved_repo != session.repo {
+                tracing::info!(
+                    "session {} repo corrected {} -> {resolved_repo}",
+                    session.id, session.repo,
+                );
+                session.repo = resolved_repo;
+                let _ = self.engine.store.upsert_session(&session);
+            }
+            let Some((owner, repo)) = split_repo(&session.repo) else { continue };
 
             let pr_id: PrId = pr_number as i64;
 
@@ -456,6 +499,107 @@ impl Poller {
                     );
                     if let Err(e) = self.engine.send_to_session(&session.id, &msg).await {
                         tracing::warn!("send review reaction to {}: {e}", session.id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Repo slugs to try `get_pr_status` against for `session`, in order:
+    /// the repo already on record (no extra requests in the common case),
+    /// then every other remote configured in its workspace.
+    fn pr_status_candidates(&self, session: &crate::types::Session) -> Vec<String> {
+        let mut candidates = Vec::new();
+        if !session.repo.is_empty() {
+            candidates.push(session.repo.clone());
+        }
+        if let Some(workspace) = &session.workspace_path {
+            for repo in crate::github::candidate_repos(workspace) {
+                if !candidates.contains(&repo) {
+                    candidates.push(repo);
+                }
+            }
+        }
+        candidates
+    }
+
+    /// Emit a `GithubLookupFailed` notification once per run of consecutive
+    /// failures — deduped the same way `ci_reaction_sent` dedupes CI-failure
+    /// reactions, via the enrichment cache.
+    fn notify_github_lookup_failed(&self, session: &crate::types::Session) {
+        let already_notified = {
+            let mut cache = self.enrichment_cache.lock().unwrap();
+            let state = cache.entry(session.id.clone()).or_default();
+            let already = state.github_lookup_failed_notified;
+            state.github_lookup_failed_notified = true;
+            already
+        };
+        if already_notified {
+            return;
+        }
+        self.engine.emit(Event::Notification(Notification {
+            id:         format!("github-lookup-failed-{}", session.id),
+            kind:       NotificationKind::GithubLookupFailed,
+            title:      format!("GitHub lookup failing — {}", session.name),
+            body:       "PR status/CI/review polling failed against every configured remote"
+                .to_string(),
+            session_id: Some(session.id.clone()),
+            created_at: now_millis(),
+        }));
+    }
+
+    /// Clear the dedup flag once a lookup succeeds again — the next failure
+    /// (if any) gets its own fresh notification.
+    fn clear_github_lookup_failed(&self, session_id: &str) {
+        let mut cache = self.enrichment_cache.lock().unwrap();
+        if let Some(state) = cache.get_mut(session_id) {
+            state.github_lookup_failed_notified = false;
+        }
+    }
+
+    // ── PR reconciliation (active fallback) ─────────────────────────────────
+
+    /// For every non-terminal session that has no tracked PR yet, actively
+    /// check whether a PR already exists for its branch — independent of
+    /// whether the wrapped `gh pr create` ever ran (a manual `git push` +
+    /// PR opened via the GitHub web UI, `hub`, a shell alias, or the wrapper
+    /// simply missing an unrecognized `gh` invocation shape all leave
+    /// `pr_number` at `None` forever without this). Tries every configured
+    /// remote, not just `origin`, for the same dual-remote reason as
+    /// `poll_github`'s fallback.
+    async fn poll_pr_reconciliation(&self) {
+        let Some(gh) = &self.engine.github else { return };
+        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+
+        for mut session in sessions {
+            if session.pr_number.is_some() {
+                continue;
+            }
+            if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted) {
+                continue;
+            }
+            let Some(workspace) = session.workspace_path.clone() else { continue };
+            let Some(branch) = crate::github::current_branch(&workspace) else { continue };
+
+            for repo_slug in crate::github::candidate_repos(&workspace) {
+                let Some((owner, repo)) = split_repo(&repo_slug) else { continue };
+                match gh.find_open_pr_for_branch(&owner, &repo, &branch).await {
+                    Ok(Some(pr_ref)) => {
+                        session.pr_number = Some(pr_ref.number);
+                        session.repo      = repo_slug.clone();
+                        session.status    = SessionStatus::PrOpen;
+                        let _ = self.engine.store.upsert_session(&session);
+                        self.engine.emit(Event::SessionUpdated(session.clone()));
+                        tracing::info!(
+                            "session {} PR #{} detected via reconciliation ({repo_slug}, branch {branch})",
+                            session.id, pr_ref.number,
+                        );
+                        break;
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!("reconciliation lookup {repo_slug} branch {branch}: {e}");
+                        continue;
                     }
                 }
             }
@@ -996,5 +1140,209 @@ mod tests {
         let unchanged = store.get_session("no-ws").unwrap().unwrap();
         assert_eq!(unchanged.cost_usd, 0.0);
         assert_eq!(unchanged.context_tokens, None);
+    }
+
+    // ── GithubApi fake — drives poll_github/poll_pr_reconciliation with no
+    // network access, so the dual-remote fallback and reconciliation logic
+    // can be exercised deterministically. ───────────────────────────────────
+
+    #[derive(Default)]
+    struct FakeGithub {
+        pr_status_ok:   std::sync::Mutex<HashMap<(String, String), crate::github::PrStatus>>,
+        branch_matches: std::sync::Mutex<HashMap<(String, String, String), crate::github::PrRef>>,
+        /// (owner, repo) pairs `get_pr_status` was actually called with, in order.
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::github::GithubApi for FakeGithub {
+        async fn get_pr_status(&self, owner: &str, repo: &str, _pr_number: u64) -> anyhow::Result<crate::github::PrStatus> {
+            self.calls.lock().unwrap().push((owner.to_string(), repo.to_string()));
+            self.pr_status_ok.lock().unwrap()
+                .get(&(owner.to_string(), repo.to_string()))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("404 for {owner}/{repo}"))
+        }
+        async fn get_ci_checks(&self, _owner: &str, _repo: &str, _head_sha: &str) -> anyhow::Result<Vec<CheckRun>> {
+            Ok(vec![])
+        }
+        async fn get_review_threads(&self, _owner: &str, _repo: &str, _pr_number: u64) -> anyhow::Result<Vec<crate::github::ReviewThread>> {
+            Ok(vec![])
+        }
+        async fn find_open_pr_for_branch(&self, owner: &str, repo: &str, branch: &str) -> anyhow::Result<Option<crate::github::PrRef>> {
+            Ok(self.branch_matches.lock().unwrap()
+                .get(&(owner.to_string(), repo.to_string(), branch.to_string()))
+                .cloned())
+        }
+    }
+
+    fn init_git_repo(branch: &str, remotes: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_string_lossy().to_string();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-C", &workspace]).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["commit", "--allow-empty", "-q", "-m", "init"]);
+        run(&["checkout", "-q", "-b", branch]);
+        for (name, url) in remotes {
+            run(&["remote", "add", name, url]);
+        }
+        dir
+    }
+
+    fn github_engine(store: std::sync::Arc<crate::store::Store>, gh: std::sync::Arc<FakeGithub>) -> std::sync::Arc<Engine> {
+        Engine::new_with_github_api(store, gh as std::sync::Arc<dyn crate::github::GithubApi>)
+    }
+
+    /// The core acceptance criterion: a PR opened without the wrapped `gh pr
+    /// create` ever running (no metadata file at all) must still end up
+    /// adopted, purely from an active branch lookup against a configured
+    /// remote.
+    #[tokio::test]
+    async fn poll_pr_reconciliation_adopts_pr_found_without_wrapper_metadata() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.branch_matches.lock().unwrap().insert(
+            ("Owner".to_string(), "repo".to_string(), "worker-branch".to_string()),
+            crate::github::PrRef { number: 77, url: "https://github.com/Owner/repo/pull/77".into() },
+        );
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", &workspace)).unwrap();
+        let engine = github_engine(store.clone(), fake);
+        let poller = Poller::new(engine);
+
+        poller.poll_pr_reconciliation().await;
+
+        let session = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(session.pr_number, Some(77), "no wrapper metadata was ever written — reconciliation must still find it");
+        assert!(matches!(session.status, SessionStatus::PrOpen));
+        assert_eq!(session.repo, "Owner/repo");
+    }
+
+    #[tokio::test]
+    async fn poll_pr_reconciliation_leaves_sessions_with_no_matching_pr_untouched() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default()); // no branch matches configured
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", &workspace)).unwrap();
+        let engine = github_engine(store.clone(), fake);
+        let poller = Poller::new(engine);
+
+        poller.poll_pr_reconciliation().await;
+
+        let session = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(session.pr_number, None);
+    }
+
+    /// The dual-remote gap from the bug report: the session's recorded repo
+    /// (`origin`) 404s, but the PR actually lives against a second
+    /// configured remote (an internal mirror) — `poll_github` must fall
+    /// back to it instead of silently stalling, and self-heal `session.repo`
+    /// so later ticks go straight there.
+    #[tokio::test]
+    async fn poll_github_falls_back_to_other_remote_when_recorded_repo_404s() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[
+            ("origin", "https://github.com/OwnerA/repoA.git"),
+            ("mirror", "https://github.com/OwnerB/repoB.git"),
+        ]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("OwnerB".to_string(), "repoB".to_string()),
+            crate::github::PrStatus {
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "t".into(), number: 50, head_sha: "abc".into(),
+            },
+        );
+        // OwnerA/repoA has no entry — get_pr_status errors, simulating a 404.
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.repo = "OwnerA/repoA".into();
+        session.pr_number = Some(50);
+        store.upsert_session(&session).unwrap();
+
+        let engine = github_engine(store.clone(), fake.clone());
+        let poller = Poller::new(engine);
+
+        poller.poll_github().await;
+
+        let updated = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(updated.repo, "OwnerB/repoB", "session.repo must self-heal to the remote that actually has the PR");
+
+        let calls = fake.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![("OwnerA".to_string(), "repoA".to_string()), ("OwnerB".to_string(), "repoB".to_string())],
+            "the repo on record must be tried first, the other remote only as fallback",
+        );
+    }
+
+    /// When every configured remote fails, that must be visible — not just
+    /// a `tracing::warn!` — but deduped so it doesn't spam every tick, and
+    /// re-armed once the session recovers and then fails again.
+    #[tokio::test]
+    async fn poll_github_notifies_once_when_every_remote_fails_and_rearms_after_recovery() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/OwnerA/repoA.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default()); // always 404s
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.repo = "OwnerA/repoA".into();
+        session.pr_number = Some(50);
+        store.upsert_session(&session).unwrap();
+
+        let engine = github_engine(store.clone(), fake.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github().await;
+        let events = drain_events(&mut rx);
+        let failures = |evs: &[Event]| evs.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::GithubLookupFailed
+        )).count();
+        assert_eq!(failures(&events), 1, "first failure must notify");
+
+        poller.poll_github().await;
+        let events = drain_events(&mut rx);
+        assert_eq!(failures(&events), 0, "repeated failure must not re-notify");
+
+        // Recovery.
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("OwnerA".to_string(), "repoA".to_string()),
+            crate::github::PrStatus {
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "t".into(), number: 50, head_sha: "abc".into(),
+            },
+        );
+        poller.poll_github().await;
+
+        // Fails again — must notify again, since recovery cleared the flag.
+        fake.pr_status_ok.lock().unwrap().clear();
+        poller.poll_github().await;
+        let events = drain_events(&mut rx);
+        assert_eq!(failures(&events), 1, "must notify again after recovering and failing anew");
     }
 }

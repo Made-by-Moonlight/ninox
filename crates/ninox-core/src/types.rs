@@ -123,6 +123,10 @@ pub enum NotificationKind {
     /// A worker opened a PR beyond the one its session tracks — one worker,
     /// one PR is the contract, so this needs orchestrator attention.
     ExtraPr,
+    /// GitHub status/CI/review polling for a session's tracked PR failed
+    /// against every configured remote (not just a transient error) — status
+    /// enrichment has silently stalled for this session until it recovers.
+    GithubLookupFailed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

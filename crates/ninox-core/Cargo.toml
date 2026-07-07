@@ -23,6 +23,7 @@ walkdir    = { workspace = true }
 rayon      = { workspace = true }
 portable-pty = "0.8"
 uuid       = { version = "1", features = ["v4"] }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tempfile   = "3"
