@@ -1,5 +1,5 @@
 use crate::{
-    config::AppConfig,
+    config::{AppConfig, SessionRetentionConfig},
     events::{Engine, Event},
     github::{split_repo, CheckRun},
     hooks,
@@ -25,8 +25,10 @@ use tokio_util::sync::CancellationToken;
 /// Used by `poll_context_updates` to detect external changes.
 type ContextSnapshot = (f64, Option<f64>, Option<u64>);
 
-/// Unix epoch milliseconds "now" — used to stamp `Notification::created_at`.
-fn now_millis() -> i64 {
+/// Unix epoch milliseconds "now" — used to stamp `Notification::created_at`
+/// and `Session::terminal_at`. `pub(crate)` so `events::cleanup_session` can
+/// stamp the same clock when it marks a session `Done`.
+pub(crate) fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -112,6 +114,10 @@ impl Poller {
                 _ = pid_interval.tick()    => {
                     self.poll_pids().await;
                     self.poll_context_updates().await;
+                    let retention = AppConfig::load()
+                        .unwrap_or_default()
+                        .session_retention;
+                    self.sweep_retired_sessions(&retention).await;
                 }
                 _ = usage_interval.tick()  => self.poll_usage().await,
                 _ = github_interval.tick() => {
@@ -140,6 +146,7 @@ impl Poller {
             if let Some(pid) = session.pid {
                 if !is_pid_alive(pid) {
                     session.status = SessionStatus::Terminated;
+                    session.terminal_at = Some(now_millis());
                     let _ = self.engine.store.upsert_session(&session);
                     self.engine.emit(Event::SessionUpdated(session));
                 }
@@ -412,7 +419,14 @@ impl Poller {
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
 
         for mut session in sessions {
-            if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted) {
+            // Only `Done` is excluded here — a session already has its PR's
+            // merge handled by definition once `Done`. `Terminated` (the
+            // worker's own process exited, typically once its PR is merely
+            // *open*) and `Interrupted` sessions may still have a PR whose
+            // fate hasn't resolved yet, so they must keep being polled or a
+            // later merge becomes permanently invisible (no status update,
+            // no notification) the instant the process dies.
+            if matches!(session.status, SessionStatus::Done) {
                 continue;
             }
             let Some(pr_number) = session.pr_number else { continue };
@@ -493,23 +507,7 @@ impl Poller {
             let pr_id: PrId = pr_number as i64;
 
             // -- Merge detection — handle before CI (no point polling CI on merged PR) --
-            if pr_status.merged && !matches!(session.status, SessionStatus::Done) {
-                self.engine.emit(Event::Notification(Notification {
-                    id:         format!("merged-{}", session.id),
-                    kind:       NotificationKind::WorkerDone,
-                    title:      format!("PR merged — {}", session.name),
-                    body:       format!("#{} merged successfully", pr_number),
-                    session_id: Some(session.id.clone()),
-                    created_at: now_millis(),
-                }));
-                if let Err(e) = self.engine.cleanup_session(&session.id).await {
-                    tracing::warn!("cleanup_session {}: {e}", session.id);
-                }
-                // Remove enrichment state for this session — it's done
-                {
-                    let mut cache = self.enrichment_cache.lock().unwrap();
-                    cache.remove(&session.id);
-                }
+            if self.handle_merge_detection(&session, pr_number, pr_status.merged).await {
                 continue; // skip further enrichment for this session
             }
 
@@ -736,6 +734,95 @@ impl Poller {
             }
         }
     }
+    /// Handle a freshly-fetched PR status's merge state for `session`.
+    /// Returns `true` when the merge was handled this call (the caller
+    /// should skip further CI/review enrichment for the session this tick);
+    /// `false` when there's nothing to do (not merged, or already `Done` —
+    /// reusing the status transition itself as the one-shot dedup guard, so
+    /// a session can never fire this reaction twice).
+    ///
+    /// Extracted from `poll_github` so it's directly unit-testable without a
+    /// live GitHub client — `poll_github` only needs the client to fetch
+    /// `pr_status` in the first place; this handles the resulting state
+    /// unconditionally.
+    async fn handle_merge_detection(
+        &self,
+        session:    &Session,
+        pr_number:  u64,
+        pr_merged:  bool,
+    ) -> bool {
+        if !pr_merged || matches!(session.status, SessionStatus::Done) {
+            return false;
+        }
+        self.engine.emit(Event::Notification(Notification {
+            id:         format!("merged-{}", session.id),
+            kind:       NotificationKind::WorkerDone,
+            title:      format!("PR merged — {}", session.name),
+            body:       format!("#{} merged successfully", pr_number),
+            session_id: Some(session.id.clone()),
+            created_at: now_millis(),
+        }));
+        // Code-level completion guarantee for the orchestrator — independent
+        // of whether the worker's own agent ever reports back before exiting.
+        if let Some(orch) = session.orchestrator_id.clone() {
+            let msg = crate::lifecycle::reactions::format_worker_done_reaction(session, pr_number);
+            if let Err(e) = self.engine.send_to_session(&orch, &msg).await {
+                tracing::warn!("send worker-done reaction to orchestrator {orch}: {e}");
+            }
+        }
+        if let Err(e) = self.engine.cleanup_session(&session.id).await {
+            tracing::warn!("cleanup_session {}: {e}", session.id);
+        }
+        // Remove enrichment state for this session — it's done
+        {
+            let mut cache = self.enrichment_cache.lock().unwrap();
+            cache.remove(&session.id);
+        }
+        true
+    }
+
+    // ── Retention sweep ──────────────────────────────────────────────────────
+
+    /// Purge `Done`/`Terminated` session records whose terminal state was
+    /// reached more than `retention`'s window ago — gives the fleet board a
+    /// grace period to show what just completed instead of the record
+    /// vanishing the instant the poller marks it done (see
+    /// `Session::terminal_at`). Sessions with no `terminal_at` (a terminal
+    /// state reached via a direct user action —
+    /// `Engine::terminate_session`/`Engine::remove_session` — rather than
+    /// this automatic lifecycle path) have no grace period and are purged
+    /// on sight, preserving today's immediate disappearance for those
+    /// actions. Orchestrator sessions are never purged this way.
+    async fn sweep_retired_sessions(&self, retention: &SessionRetentionConfig) {
+        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+        let Ok(orchestrators) = self.engine.store.list_orchestrators() else { return };
+        let orch_ids: std::collections::HashSet<&str> =
+            orchestrators.iter().map(|o| o.id.as_str()).collect();
+
+        let now = now_millis();
+        let retention_ms = retention.retention_millis();
+
+        for session in sessions {
+            if !matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
+                continue;
+            }
+            if orch_ids.contains(session.id.as_str()) {
+                continue;
+            }
+            let expired = match session.terminal_at {
+                Some(t) => now.saturating_sub(t) >= retention_ms,
+                None    => true,
+            };
+            if !expired {
+                continue;
+            }
+            if let Err(e) = self.engine.store.delete_session(&session.id) {
+                tracing::warn!("purge retired session {}: {e}", session.id);
+                continue;
+            }
+            self.engine.emit(Event::SessionDone(session.id));
+        }
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -873,6 +960,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            terminal_at: None,
         }
     }
 
@@ -2027,5 +2115,191 @@ mod tests {
             Arc::ptr_eq(&lock_a, &lock_b),
             "syntactically different paths to the same physical vault must share one lock",
         );
+    }
+    /// The confirmed bug: a worker's process typically exits (`Terminated`)
+    /// once its PR is merely *open*, well before that PR merges. Merge
+    /// detection must still run for `Terminated` sessions, not just
+    /// `Working`/`PrOpen` — otherwise the later merge becomes permanently
+    /// invisible the instant the process dies.
+    #[tokio::test]
+    async fn merge_detection_fires_for_terminated_session() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Terminated;
+        s.orchestrator_id = Some("orch1".into());
+        s.pr_number = Some(42);
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        let handled = poller.handle_merge_detection(&s, 42, true).await;
+        assert!(handled, "merge detection must run for a Terminated session");
+
+        let after = store.get_session("w1").unwrap().unwrap();
+        assert!(matches!(after.status, SessionStatus::Done), "merged session transitions to Done");
+        assert!(after.terminal_at.is_some(), "Done via merge detection must stamp terminal_at");
+
+        let events = drain_events(&mut rx);
+        let merged_notifs = events.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+        )).count();
+        assert_eq!(merged_notifs, 1, "exactly one WorkerDone notification for the merge");
+    }
+
+    /// The orchestrator must receive exactly one worker-done reaction per
+    /// merged session — calling merge detection again for an already-`Done`
+    /// session (as the next poll tick would, reading the updated status back
+    /// from the store) must be a no-op, not a duplicate notification.
+    #[tokio::test]
+    async fn merge_detection_does_not_fire_twice_for_the_same_session() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::PrOpen;
+        s.orchestrator_id = Some("orch1".into());
+        s.pr_number = Some(7);
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        let first = poller.handle_merge_detection(&s, 7, true).await;
+        assert!(first, "first tick handles the merge");
+
+        // Simulate the next poll tick re-reading the (now Done) session from
+        // the store before calling merge detection again.
+        let updated = store.get_session("w1").unwrap().unwrap();
+        let second = poller.handle_merge_detection(&updated, 7, true).await;
+        assert!(!second, "an already-Done session must not re-fire merge detection");
+
+        let events = drain_events(&mut rx);
+        let merged_notifs = events.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+        )).count();
+        assert_eq!(merged_notifs, 1, "no duplicate WorkerDone notification across ticks");
+    }
+
+    #[tokio::test]
+    async fn handle_merge_detection_is_noop_when_pr_not_merged() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let s = test_session("w1", "/ws");
+        store.upsert_session(&s).unwrap();
+        let engine = Engine::new(store.clone());
+        let poller = Poller::new(engine);
+
+        let handled = poller.handle_merge_detection(&s, 1, false).await;
+        assert!(!handled);
+        assert!(matches!(store.get_session("w1").unwrap().unwrap().status, SessionStatus::Working));
+    }
+
+    /// A session past the retention window is purged; one still within the
+    /// window survives. Time is injected via `terminal_at` (computed off the
+    /// real clock, offset by the retention window) rather than sleeping, and
+    /// the retention config is passed in directly rather than read from
+    /// `AppConfig::load()` — mirroring `sync_sessions_metadata`'s pattern of
+    /// taking its directory as a parameter so tests can control it exactly.
+    #[tokio::test]
+    async fn sweep_retired_sessions_purges_only_past_the_retention_window() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let retention = SessionRetentionConfig { done_retention_days: 2 };
+        let now = now_millis();
+        let retention_ms = retention.retention_millis();
+
+        let mut expired = test_session("expired", "/ws");
+        expired.status = SessionStatus::Done;
+        expired.terminal_at = Some(now - retention_ms - 1_000);
+        store.upsert_session(&expired).unwrap();
+
+        let mut fresh = test_session("fresh", "/ws");
+        fresh.status = SessionStatus::Done;
+        fresh.terminal_at = Some(now - 1_000);
+        store.upsert_session(&fresh).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.sweep_retired_sessions(&retention).await;
+
+        assert!(store.get_session("expired").unwrap().is_none(), "past-retention session must be purged");
+        assert!(store.get_session("fresh").unwrap().is_some(), "within-retention session must survive");
+
+        let events = drain_events(&mut rx);
+        assert!(events.iter().any(|e| matches!(e, Event::SessionDone(id) if id == "expired")));
+    }
+
+    /// A session terminated via a direct user action
+    /// (`terminate_session`/`remove_session`) never gets `terminal_at`
+    /// stamped — those must stay "immediate", so the sweep purges them on
+    /// sight rather than holding them for the grace period.
+    #[tokio::test]
+    async fn sweep_retired_sessions_purges_sessions_with_no_terminal_at_immediately() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("user-killed", "/ws");
+        s.status = SessionStatus::Terminated;
+        s.terminal_at = None;
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let poller = Poller::new(engine);
+
+        poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
+
+        assert!(store.get_session("user-killed").unwrap().is_none());
+    }
+
+    /// An orchestrator's own session row must never be auto-purged by the
+    /// retention sweep, no matter its status or how stale `terminal_at` is.
+    #[tokio::test]
+    async fn sweep_retired_sessions_never_purges_orchestrator_sessions() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_orchestrator(&crate::types::Orchestrator {
+            id: "orch1".into(), name: "orch".into(), created_at: 0,
+        }).unwrap();
+        let mut s = test_session("orch1", "/ws");
+        s.status = SessionStatus::Done;
+        s.terminal_at = Some(0); // maximally stale
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let poller = Poller::new(engine);
+
+        poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
+
+        assert!(store.get_session("orch1").unwrap().is_some(), "orchestrator sessions are never auto-purged");
+    }
+
+    /// Active (non-terminal) sessions are left alone by the sweep regardless
+    /// of `terminal_at`.
+    #[tokio::test]
+    async fn sweep_retired_sessions_ignores_non_terminal_sessions() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("still-working", "/ws");
+        s.status = SessionStatus::Working;
+        s.terminal_at = None;
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let poller = Poller::new(engine);
+
+        poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
+
+        assert!(store.get_session("still-working").unwrap().is_some());
     }
 }
