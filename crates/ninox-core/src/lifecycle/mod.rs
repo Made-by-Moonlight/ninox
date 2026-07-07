@@ -1,3 +1,4 @@
+pub mod brain_harvest;
 pub mod enrichment;
 pub mod poller;
 pub mod probe;
