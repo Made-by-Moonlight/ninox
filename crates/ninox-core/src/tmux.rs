@@ -2,8 +2,31 @@ use anyhow::{Context, Result};
 use tokio::process::Command;
 
 /// Name of the private tmux server socket all ninox sessions live on.
-/// Isolates ninox from the user's own tmux server and ~/.tmux.conf.
-const SOCKET: &str = "ninox";
+/// Isolates ninox from the user's own tmux server and ~/.tmux.conf — and,
+/// via `is_test_binary`, isolates the test suite's own tmux server from the
+/// real running app's. Without this, `cargo test` (or manually clearing a
+/// stale "duplicate session" test collision with `tmux -L ninox
+/// kill-server`) kills the user's actual live orchestrator/worker panes,
+/// since tests and the production app previously shared this exact socket.
+/// Not a `const` because it depends on that runtime check.
+pub(crate) fn socket() -> &'static str {
+    if is_test_binary() { "ninox-test" } else { "ninox" }
+}
+
+/// Cargo places every test/bench/example binary's compiled output under
+/// `target/<profile>/deps/` (e.g. `target/debug/deps/ninox_core-<hash>`),
+/// while the real `cargo build`/`cargo run` binary lives directly at
+/// `target/<profile>/<name>` with no `deps` path component. Checking for
+/// that segment is a reliable, zero-config way to tell "am I a test binary"
+/// apart from "am I the real app" — no env var, no per-test setup required,
+/// so it can't race under parallel test execution the way a shared env var
+/// would (see `lifecycle::usage::ENV_TEST_GUARD` for a case where that
+/// exact hazard already had to be worked around once in this codebase).
+fn is_test_binary() -> bool {
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|p| p.components().any(|c| c.as_os_str() == "deps"))
+}
 
 /// Parse a `tmux -V` version string (e.g. "tmux 3.4" or "tmux 3.5a") into
 /// (major, minor). Unparseable input degrades to (0, 0) so version checks
@@ -61,10 +84,11 @@ fn server_config_for_version(version: (u32, u32)) -> String {
 }
 
 fn config_path() -> std::path::PathBuf {
+    let file = if is_test_binary() { "tmux-test.conf" } else { "tmux.conf" };
     dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("ninox")
-        .join("tmux.conf")
+        .join(file)
 }
 
 /// Write the ninox tmux server config. Called once at startup so config
@@ -84,7 +108,7 @@ pub fn write_server_config() -> Result<std::path::PathBuf> {
 /// by `ensure_server_ready` (see its doc comment for why `-f` on every
 /// invocation is not safe to rely on).
 fn socket_args() -> Vec<String> {
-    vec!["-L".into(), SOCKET.into()]
+    vec!["-L".into(), socket().into()]
 }
 
 /// Fail fast if tmux is missing or older than 3.2 (extended-keys support).
@@ -141,8 +165,8 @@ async fn ensure_server_ready() {
         // `source-file` re-applies our (possibly newer) config explicitly —
         // this is also what makes "rewritten on every app start" true for a
         // long-lived server, not just for the file on disk.
-        let _ = run_raw(&["-L", SOCKET, "-f", &conf, "start-server"]).await;
-        let _ = run_raw(&["-L", SOCKET, "source-file", &conf]).await;
+        let _ = run_raw(&["-L", socket(), "-f", &conf, "start-server"]).await;
+        let _ = run_raw(&["-L", socket(), "source-file", &conf]).await;
     }).await;
 }
 
@@ -445,6 +469,18 @@ mod tests {
                 .unwrap()
                 .as_millis()
         )
+    }
+
+    /// The whole point of `is_test_binary`: every test in this suite must
+    /// resolve to the isolated socket, never the real app's `"ninox"` — this
+    /// is what stops `cargo test` (run by a developer with the real app open)
+    /// from ever touching, or a stale-session cleanup from ever killing, a
+    /// live session the user is actually using.
+    #[test]
+    fn tests_resolve_to_the_isolated_socket_not_the_real_apps() {
+        assert!(is_test_binary(), "the test binary itself must be detected as a test binary");
+        assert_eq!(socket(), "ninox-test");
+        assert_ne!(socket(), "ninox");
     }
 
     #[tokio::test]

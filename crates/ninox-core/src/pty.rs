@@ -153,8 +153,14 @@ mod tests {
     }
 
     fn unique_id() -> String {
+        // Millis alone collide when parallel test threads start within the
+        // same tick, producing duplicate tmux session names; a per-process
+        // counter guarantees uniqueness regardless of clock resolution (see
+        // the same fix in tmux.rs's and client.rs's unique_id).
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         format!(
-            "pt-{}",
+            "pt-{}-{n}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

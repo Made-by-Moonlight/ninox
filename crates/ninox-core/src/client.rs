@@ -221,14 +221,14 @@ mod tests {
 
         // window-size latest: the window follows the (only) client's PTY size.
         let out = tokio::process::Command::new("tmux")
-            .args(["-L", "ninox", "display-message", "-p", "-t", &id, "#{window_width}x#{window_height}"])
+            .args(["-L", tmux::socket(), "display-message", "-p", "-t", &id, "#{window_width}x#{window_height}"])
             .output().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "97x41");
 
         client.resize(80, 24);
         sleep(Duration::from_millis(500)).await;
         let out = tokio::process::Command::new("tmux")
-            .args(["-L", "ninox", "display-message", "-p", "-t", &id, "#{window_width}x#{window_height}"])
+            .args(["-L", tmux::socket(), "display-message", "-p", "-t", &id, "#{window_width}x#{window_height}"])
             .output().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "80x24");
 
