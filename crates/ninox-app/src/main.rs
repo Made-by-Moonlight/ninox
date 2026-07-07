@@ -11,7 +11,7 @@ use ninox_core::{
     config::AppConfig,
     events::Engine,
     github::resolve_token,
-    lifecycle::poller::Poller,
+    lifecycle::{poller::Poller, repo_discovery},
     slugify,
     store::Store,
     tmux,
@@ -96,6 +96,17 @@ enum BrainAction {
         /// Relative path of the entry (e.g. people/alice.md)
         path: String,
     },
+    /// Scan known repo workspaces and write their location, remote, and
+    /// purpose into `repos/`, plus mechanically detectable relationships
+    /// (shared worktrees, shared remote owner) into `relationships/`.
+    /// Re-running updates existing entries in place rather than duplicating
+    /// them.
+    DiscoverRepos {
+        /// Workspace paths to scan. Defaults to every workspace_path
+        /// recorded in the session store (i.e. every repo a worker has ever
+        /// been spawned into) when none are given.
+        paths: Vec<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -141,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
             run_request_work(&description)
         }
         Some(Command::Brain { action }) => {
-            run_brain(action).await
+            run_brain(action, store).await
         }
         Some(Command::Statusline) => {
             run_statusline(db_path);
@@ -386,7 +397,7 @@ fn run_statusline(db_path: PathBuf) {
     println!("{}", ninox_core::lifecycle::statusline::render_line(&payload));
 }
 
-async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
+async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()> {
     let config = AppConfig::load().unwrap_or_default();
     let brain_path = config.resolved_brain_path();
     let brain = BrainIndex::open(&brain_path)?;
@@ -417,8 +428,102 @@ async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
                 }
             }
         }
+        BrainAction::DiscoverRepos { paths } => {
+            run_discover_repos(&brain, &brain_path, &store, paths)?;
+        }
     }
 
+    Ok(())
+}
+
+/// `ninox brain discover-repos` — scan `paths` (or, if empty, every
+/// workspace_path the session store has ever recorded) and write what's
+/// mechanically derivable about each repo into `repos/`, plus any
+/// mechanically detectable relationships into `relationships/`.
+///
+/// Queries the brain for each entry's id before writing (mirroring the
+/// "query first" convention `docs/BRAIN.md` and the harvest prompt in
+/// `lifecycle::brain_harvest` teach) purely to report new-vs-updated counts —
+/// the write itself is idempotent regardless, since a repo's entry id is
+/// deterministic (`repos/<slug>.md`), so re-running overwrites the same file
+/// rather than creating a duplicate under a different name.
+fn run_discover_repos(
+    brain: &BrainIndex,
+    brain_path: &std::path::Path,
+    store: &Store,
+    paths: Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    let candidates = if paths.is_empty() {
+        store
+            .list_sessions()?
+            .into_iter()
+            .filter_map(|s| s.workspace_path)
+            .map(PathBuf::from)
+            .collect()
+    } else {
+        paths
+    };
+
+    if candidates.is_empty() {
+        println!(
+            "no candidate workspaces — pass one or more paths, or spawn a worker first \
+             so the session store has a workspace_path to scan"
+        );
+        return Ok(());
+    }
+
+    let discovery = repo_discovery::discover(&candidates);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    let mut new_count = 0usize;
+    let mut updated_count = 0usize;
+    for repo in &discovery.repos {
+        let id = repo_discovery::repo_entry_id(&repo.name);
+        if brain.get(&id)?.is_some() { updated_count += 1 } else { new_count += 1 }
+        write_brain_entry(brain_path, &id, &repo_discovery::repo_entry_markdown(repo, &today))?;
+    }
+
+    for (name, worktrees) in &discovery.extra_worktrees {
+        let repo = discovery
+            .repos
+            .iter()
+            .find(|r| &r.name == name)
+            .expect("a worktree group's repo is always also in discovery.repos");
+        let id = repo_discovery::worktree_relationship_id(name);
+        let markdown = repo_discovery::worktree_relationship_markdown(repo, worktrees, &today);
+        write_brain_entry(brain_path, &id, &markdown)?;
+    }
+
+    let org_groups = repo_discovery::group_by_owner(&discovery.repos);
+    for (owner, repo_names) in &org_groups {
+        let id = repo_discovery::shared_org_relationship_id(owner);
+        let markdown = repo_discovery::shared_org_relationship_markdown(owner, repo_names, &today);
+        write_brain_entry(brain_path, &id, &markdown)?;
+    }
+
+    let embedder = try_build_embedder();
+    let stats = brain.rebuild(embedder.as_deref())?;
+    println!(
+        "discovered {} repo(s) ({} new, {} updated), {} worktree relationship(s), \
+         {} shared-org relationship(s) — indexed {} entries",
+        discovery.repos.len(),
+        new_count,
+        updated_count,
+        discovery.extra_worktrees.len(),
+        org_groups.len(),
+        stats.indexed,
+    );
+    Ok(())
+}
+
+/// Write a brain entry's Markdown content to `brain_path/id`, creating its
+/// parent section directory (e.g. `repos/`) if needed.
+fn write_brain_entry(brain_path: &std::path::Path, id: &str, content: &str) -> anyhow::Result<()> {
+    let path = brain_path.join(id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
     Ok(())
 }
 

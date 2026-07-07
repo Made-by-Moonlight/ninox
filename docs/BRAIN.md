@@ -46,10 +46,25 @@ Each orchestrator uses exactly one brain. Brains are never merged — when a pro
 ## CLI
 
 ```
-ninox brain index              rebuild the index from the brain files
-ninox brain query <text>       full-text search; add --type or --tag to filter
-ninox brain show <path>        print a single entry
+ninox brain index                    rebuild the index from the brain files
+ninox brain query <text>             full-text search; add --type or --tag to filter
+ninox brain show <path>              print a single entry
+ninox brain discover-repos [paths]   scan repos and write repos/ + relationships/ entries
 ```
+
+`discover-repos` mechanically populates `repos/` and `relationships/` instead
+of relying on an orchestrator to notice and write them by hand: given one or
+more workspace paths (or, if none are given, every `workspace_path` the
+session store has ever recorded — i.e. every repo a worker has been spawned
+into), it derives each repo's canonical on-disk location, remote, purpose
+(from its README/Cargo.toml/package.json), and entry points, then records any
+mechanically detectable relationships — repos that are git worktrees of the
+same underlying repository, and repos sharing a remote owner/org. It queries
+the brain before writing, so re-running it updates existing entries rather
+than duplicating them, and reindexes when done. It's a one-shot command today
+— running it automatically (e.g. once per newly-seen `workspace_path` at
+spawn time, the way [[brain-harvest]] triggers on PR-open) is a natural
+follow-up, not yet implemented.
 
 ## For orchestrators
 
