@@ -287,21 +287,23 @@ pub fn session_detail<'a>(
     // spawns"). Disabled (faint, no press) when the session has no
     // recorded workspace to respawn into — the handler would refuse
     // anyway, but a clickable button that silently does nothing reads
-    // as broken.
+    // as broken. Styled in the same accent/warning color as Kill — it
+    // kills any live pane and discards the existing conversation, the
+    // same destructive severity as Kill, not a neutral action.
     let refile_btn: Element<Message> = {
         let can_refile = session.workspace_path.is_some();
         let sid = session_id.to_string();
-        let label_color = if can_refile { s.ink_2 } else { s.faint };
+        let label_color = if can_refile { s.accent } else { s.faint };
         button(crate::style::micro_label("Re-file", label_color).size(10.0))
             .on_press_maybe(can_refile.then_some(Message::RefileSession(sid)))
             .padding([6, 16])
             .style(move |_theme, status| {
                 let hovered = can_refile && matches!(status, button::Status::Hovered);
                 button::Style {
-                    background: hovered.then_some(Background::Color(s.ink)),
+                    background: hovered.then_some(Background::Color(s.accent)),
                     text_color: if hovered { s.card } else { label_color },
                     border: Border {
-                        color: if can_refile { s.ink_2 } else { s.rule_dark },
+                        color: if can_refile { s.accent } else { s.rule_dark },
                         width: 1.5,
                         radius: 2.0.into(),
                     },
