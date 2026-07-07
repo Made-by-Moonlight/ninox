@@ -8,13 +8,22 @@ use crate::{
     components::{info_panel::info_panel, inspector_panel::inspector_panel, terminal::{TerminalWidget, FONT_SIZE}},
     theme::ColorScheme,
 };
+use ninox_core::{config::AppConfig, types::Session};
 
 fn repo_short(repo: &str) -> &str {
     repo.rsplit('/').next().unwrap_or(repo)
 }
 
-fn can_resume(status: &ninox_core::types::SessionStatus) -> bool {
-    matches!(status, ninox_core::types::SessionStatus::Interrupted)
+/// Whether Resume should be offered for `session` — driven entirely by what's
+/// stored (a `claude_session_id`, a `workspace_path`, a resume-capable
+/// harness), never by the session's current status. A Terminated session
+/// with a recorded id is just as resumable as an Interrupted one; status
+/// only affects how the fleet board *displays* a dead session, not whether
+/// its conversation can be continued. Delegates to `resume_plan` itself
+/// (rather than re-deriving the same checks) so the button can never drift
+/// from what actually happens on click.
+fn can_resume(session: &Session, is_orchestrator: bool, config: &AppConfig) -> bool {
+    crate::app::resume_plan(session, is_orchestrator, config).is_some()
 }
 
 // ── Terminal chrome budget ───────────────────────────────────────────────────
@@ -285,7 +294,7 @@ pub fn session_detail<'a>(
             .into()
     };
 
-    let resume_btn: Element<Message> = if can_resume(&session.status) {
+    let resume_btn: Element<Message> = if can_resume(session, is_orchestrator, &app.config) {
         let sid = session_id.to_string();
         button(crate::style::micro_label("Resume", s.status_review).size(10.0))
             .on_press(Message::ResumeSession(sid))
@@ -490,13 +499,59 @@ pub fn session_detail<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ninox_core::types::SessionStatus;
+
+    fn session_with(
+        status: SessionStatus,
+        claude_session_id: Option<&str>,
+        workspace_path: Option<&str>,
+    ) -> Session {
+        Session {
+            id: "s1".into(), orchestrator_id: None, name: "s1".into(), repo: String::new(),
+            status, agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None,
+            workspace_path: workspace_path.map(String::from),
+            pid: None, model: None, context_tokens: None, catalogue_path: None,
+            claude_session_id: claude_session_id.map(String::from),
+        }
+    }
 
     #[test]
-    fn can_resume_only_when_interrupted() {
-        use ninox_core::types::SessionStatus;
-        assert!(can_resume(&SessionStatus::Interrupted));
-        assert!(!can_resume(&SessionStatus::Working));
-        assert!(!can_resume(&SessionStatus::Terminated));
-        assert!(!can_resume(&SessionStatus::Done));
+    fn resume_available_whenever_id_is_stored_regardless_of_status() {
+        let cfg = AppConfig::default();
+        for status in [
+            SessionStatus::Terminated,
+            SessionStatus::Interrupted,
+            SessionStatus::Working,
+            SessionStatus::Done,
+        ] {
+            let s = session_with(status, Some("uuid-1"), Some("/tmp/ws"));
+            assert!(
+                can_resume(&s, false, &cfg),
+                "expected resumable regardless of status when an id is stored",
+            );
+        }
+    }
+
+    #[test]
+    fn resume_unavailable_without_a_stored_claude_session_id() {
+        let cfg = AppConfig::default();
+        let s = session_with(SessionStatus::Terminated, None, Some("/tmp/ws"));
+        assert!(!can_resume(&s, false, &cfg));
+    }
+
+    #[test]
+    fn resume_unavailable_without_a_workspace() {
+        let cfg = AppConfig::default();
+        let s = session_with(SessionStatus::Terminated, Some("uuid-1"), None);
+        assert!(!can_resume(&s, false, &cfg));
+    }
+
+    #[test]
+    fn resume_unavailable_for_harness_without_resume_args() {
+        let cfg = AppConfig::default();
+        let mut s = session_with(SessionStatus::Terminated, Some("uuid-1"), Some("/tmp/ws"));
+        s.agent_type = "codex".into();
+        assert!(!can_resume(&s, false, &cfg));
     }
 }
