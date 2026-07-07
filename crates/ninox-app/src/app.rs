@@ -1126,6 +1126,9 @@ impl App {
                                         workspace.clone()
                                     }
                                 };
+                            if let Err(e) = crate::spawn_util::seed_worker_brain_skill(&effective_ws).await {
+                                tracing::warn!("failed to seed brain skill for {sid}: {e}");
+                            }
 
                             // Repo slug from the base workspace's git remote so
                             // poll_github can talk to the right owner/repo.
@@ -2281,10 +2284,11 @@ pub async fn setup_orchestrator_root(
 ) -> anyhow::Result<()> {
     use tokio::fs;
 
-    let claude_dir       = root.join(".claude");
-    let spawn_skill_dir  = root.join("skills").join("spawn-worker");
-    let config_skill_dir = root.join("skills").join("set-agent-config");
-    let brain_skill_dir  = root.join("skills").join("brain");
+    let claude_dir        = root.join(".claude");
+    let claude_skills_dir = claude_dir.join("skills");
+    let spawn_skill_dir   = claude_skills_dir.join("spawn-worker");
+    let config_skill_dir  = claude_skills_dir.join("set-agent-config");
+    let brain_skill_dir   = claude_skills_dir.join("brain");
     fs::create_dir_all(&claude_dir).await?;
     fs::create_dir_all(&spawn_skill_dir).await?;
     fs::create_dir_all(&config_skill_dir).await?;
@@ -2323,7 +2327,12 @@ pub async fn setup_orchestrator_root(
 
     // spawn-worker skill — always overwritten.
     let spawn_skill_content = format!(
-        r#"# Spawn a Worker, Not a Subagent
+        r#"---
+name: spawn-worker
+description: Use before starting any implementation task as a Ninox orchestrator — spawn a worker session instead of doing the work yourself.
+---
+
+# Spawn a Worker, Not a Subagent
 
 You are a **Ninox orchestrator agent**. You coordinate — you do not implement.
 
@@ -2389,7 +2398,12 @@ through `{ninox_bin} spawn`. Read-only Explore/Plan agents are permitted.
 
     // set-agent-config skill — always overwritten.
     let config_skill_content = format!(
-        r#"# Set Ninox Agent Config
+        r#"---
+name: set-agent-config
+description: Use when the user asks to change the orchestrator's or worker's agent harness or model.
+---
+
+# Set Ninox Agent Config
 
 Use this skill when the user asks to change the agent harness or model.
 
@@ -2419,7 +2433,12 @@ Use the Edit tool to update the relevant field. Changes take effect on the next 
 
     // brain skill — always overwritten.
     let brain_skill_content = format!(
-        r#"# Read and Write the Brain
+        r#"---
+name: brain
+description: Read and write Ninox's shared knowledge brain. Use before exploring unfamiliar code (query first) and as soon as you learn something worth keeping — write it down, don't wait until the end.
+---
+
+# Read and Write the Brain
 
 The brain is Ninox's persistent, shared knowledge store. As you explore
 codebases you discover things — where a type is defined, how two repos
@@ -2501,9 +2520,10 @@ At the start of work in unfamiliar territory, query before exploring:
 
 ## The Rule
 
-**Query before writing, write what you find, query before exploring.** The
-brain only helps the next orchestrator if you keep it current — a stale or
-empty brain is no better than no brain at all.
+**Before exploring anything unfamiliar, query first.** As soon as you learn
+something a future session would want to know — don't wait until the end
+of your session — write it down and index it. A stale or empty brain is no
+better than no brain at all.
 "#,
         ninox_bin = ninox_bin,
     );
@@ -4549,8 +4569,11 @@ mod tests {
         setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
 
         let skill = std::fs::read_to_string(
-            root.join("skills").join("spawn-worker").join("SKILL.md"),
+            root.join(".claude").join("skills").join("spawn-worker").join("SKILL.md"),
         ).unwrap();
+        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
+        assert!(skill.contains("name: spawn-worker"));
+        assert!(skill.contains("description:"));
         assert!(
             skill.contains("request-work"),
             "skill must explain the worker→orchestrator work-request channel"
@@ -4566,12 +4589,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_agent_config_skill_has_frontmatter() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+
+        let skill = std::fs::read_to_string(
+            root.join(".claude").join("skills").join("set-agent-config").join("SKILL.md"),
+        ).unwrap();
+        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
+        assert!(skill.contains("name: set-agent-config"));
+        assert!(skill.contains("description:"));
+    }
+
+    #[tokio::test]
     async fn setup_orchestrator_root_seeds_brain_skill() {
         let root = tempdir().unwrap().keep();
         setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
 
-        let skill_path = root.join("skills").join("brain").join("SKILL.md");
+        let skill_path = root.join(".claude").join("skills").join("brain").join("SKILL.md");
         let skill = std::fs::read_to_string(&skill_path).unwrap();
+        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
+        assert!(skill.contains("name: brain"));
+        assert!(skill.contains("description:"));
         assert!(skill.contains("ninox brain query"));
         assert!(skill.contains("ninox brain index"));
         assert!(skill.contains("ninox brain show"));
