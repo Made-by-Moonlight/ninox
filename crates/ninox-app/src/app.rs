@@ -178,7 +178,7 @@ pub enum DragTarget { Sidebar, InfoPanel }
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Message {
-    EngineEvent(Event),
+    EngineEvent(Box<Event>),
     NavigateFleet { scope: Option<OrchestratorId> },
     NavigateSession(SessionId),
     /// Attach argv resolved — spawn the hidden tmux client for this session.
@@ -209,6 +209,14 @@ pub enum Message {
     /// CURRENT registry settings (session header, beside Kill). On a
     /// Terminated husk this "just spawns".
     RefileSession(SessionId),
+    /// Relaunch an `Interrupted` session by continuing its stored
+    /// `claude_session_id` (tmux pane gone, but the Claude session id is
+    /// still resumable — see `resume_plan`). Unlike `RefileSession`, this
+    /// reuses the existing id instead of minting a fresh one.
+    ResumeSession(SessionId),
+    /// Fan out to one `Message::ResumeSession` per currently `Interrupted`
+    /// session — the Fleet board's bulk "Resume all (N)" control.
+    ResumeAllSessions,
     SwitchTheme(ThemeVariant),
     // Raw key event from the global subscription — bytes are computed in the handler
     // where we have access to the terminal mode (APP_CURSOR changes arrow sequences).
@@ -283,6 +291,51 @@ pub struct RefilePlan {
     pub extra_env:      Vec<(String, String)>,
 }
 
+/// Decide what a session's status becomes when its tmux pane is found
+/// gone at startup. `has_resume_args` is the harness's capability (from
+/// `HarnessRegistry::resume_cmd(...).is_some()` against a placeholder id —
+/// callers don't have a real command to build yet, just the capability
+/// check), not whether resume has ever been attempted.
+fn reconciled_status_for_dead_session(
+    claude_session_id: &Option<String>,
+    has_resume_args:   bool,
+) -> SessionStatus {
+    if claude_session_id.is_some() && has_resume_args {
+        SessionStatus::Interrupted
+    } else {
+        SessionStatus::Terminated
+    }
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+
+    #[test]
+    fn session_with_id_and_resumable_harness_becomes_interrupted() {
+        assert_eq!(
+            reconciled_status_for_dead_session(&Some("uuid-1".into()), true),
+            SessionStatus::Interrupted,
+        );
+    }
+
+    #[test]
+    fn legacy_session_without_id_becomes_terminated() {
+        assert_eq!(
+            reconciled_status_for_dead_session(&None, true),
+            SessionStatus::Terminated,
+        );
+    }
+
+    #[test]
+    fn session_under_non_resumable_harness_becomes_terminated_even_with_an_id() {
+        assert_eq!(
+            reconciled_status_for_dead_session(&Some("uuid-1".into()), false),
+            SessionStatus::Terminated,
+        );
+    }
+}
+
 /// `None` when the session has no recorded workspace (nothing to respawn
 /// into). A worker re-files interactively — its original spawn prompt is
 /// not stored — but keeps its orchestrator attachment for the tree.
@@ -290,13 +343,44 @@ pub fn refile_plan(
     session: &Session,
     is_orchestrator: bool,
     config: &AppConfig,
+    claude_session_id: &str,
 ) -> Option<RefilePlan> {
     let workspace = session.workspace_path.clone()?;
     let agent = ninox_core::config::AgentConfig {
         harness: session.agent_type.clone(),
         model:   session.model.clone(),
     };
-    let base_cmd = config.registry().interactive_cmd(&agent);
+    let base_cmd = config.registry().interactive_cmd(&agent, claude_session_id);
+    let catalogue_path = session.catalogue_path.clone()
+        .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
+    let extra_env = if is_orchestrator {
+        vec![
+            ("NINOX_ORCHESTRATOR_ID".to_string(), session.id.clone()),
+            ("NINOX_CALLER_TYPE".to_string(),     "orchestrator".to_string()),
+        ]
+    } else {
+        Vec::new()
+    };
+    Some(RefilePlan { agent, base_cmd, workspace, catalogue_path, extra_env })
+}
+
+/// Like `refile_plan`, but rebuilds via `resume_cmd` (continuing the
+/// existing `claude_session_id`) instead of `interactive_cmd` (starting
+/// fresh). `None` when there's no workspace to resume into OR no stored
+/// `claude_session_id` OR the harness can't resume (`resume_cmd` returns
+/// `None`) — any of which means there's nothing to relaunch into.
+pub fn resume_plan(
+    session: &Session,
+    is_orchestrator: bool,
+    config: &AppConfig,
+) -> Option<RefilePlan> {
+    let workspace = session.workspace_path.clone()?;
+    let claude_session_id = session.claude_session_id.as_deref()?;
+    let agent = ninox_core::config::AgentConfig {
+        harness: session.agent_type.clone(),
+        model:   session.model.clone(),
+    };
+    let base_cmd = config.registry().resume_cmd(&agent, claude_session_id)?;
     let catalogue_path = session.catalogue_path.clone()
         .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
     let extra_env = if is_orchestrator {
@@ -443,17 +527,26 @@ impl App {
                 }
             };
 
+            let registry = AppConfig::load().unwrap_or_default().registry();
+
             for session in sessions {
                 if matches!(
                     session.status,
-                    SessionStatus::Done | SessionStatus::Terminated
+                    SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted
                 ) {
                     continue;
                 }
 
                 if !tmux::has_session(&session.id).await {
+                    let agent = ninox_core::config::AgentConfig {
+                        harness: session.agent_type.clone(),
+                        model:   session.model.clone(),
+                    };
+                    let has_resume_args = registry.resume_cmd(&agent, "placeholder").is_some();
                     let mut dead = session.clone();
-                    dead.status = SessionStatus::Terminated;
+                    dead.status = reconciled_status_for_dead_session(
+                        &session.claude_session_id, has_resume_args,
+                    );
                     let _ = engine.store.upsert_session(&dead);
                     engine.emit(CoreEvent::SessionUpdated(dead));
                 }
@@ -613,7 +706,7 @@ impl App {
     /// Shared mutation logic.
     fn apply(state: &mut Self, message: Message) -> Task<Message> {
         match message {
-            Message::EngineEvent(event) => Self::handle_engine_event(state, event),
+            Message::EngineEvent(event) => Self::handle_engine_event(state, *event),
 
             Message::NavigateFleet { scope } => {
                 state.last_fleet_scope = scope.clone();
@@ -908,7 +1001,8 @@ impl App {
                     harness: form.harness.clone(),
                     model:   crate::components::spawn_modal::effective_model(&form, &spec),
                 };
-                let base_cmd = registry.interactive_cmd(&agent);
+                let claude_session_id = ninox_core::harness::new_claude_session_id();
+                let base_cmd = registry.interactive_cmd(&agent, &claude_session_id);
                 let catalogue = state.config.catalogue_options()
                     .into_iter()
                     .nth(form.catalogue_idx)
@@ -1003,6 +1097,7 @@ impl App {
                             context_tokens:  None,
                             catalogue_path:  Some(catalogue_path.clone()),
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+                            claude_session_id: Some(claude_session_id.clone()),
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1053,6 +1148,8 @@ impl App {
                                     catalogue_path,
                                     extra_env:       Vec::new(),
                                     started_at:      ts_i64,
+                                    claude_session_id,
+                                    failure_status:  ninox_core::SessionStatus::Terminated,
                                 },
                             )
                             .await;
@@ -1138,6 +1235,7 @@ impl App {
                             context_tokens:  None,
                             catalogue_path:  Some(catalogue_path.clone()),
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+                            claude_session_id: Some(claude_session_id.clone()),
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1148,11 +1246,11 @@ impl App {
                             panel:      DetailPanel::Terminal,
                         };
 
-                        let engine     = state.engine.clone();
-                        let sid        = orch.id.clone();
-                        let nm         = name;
-                        let ts_i64     = ts as i64;
-                        let orch_agent = agent;
+                        let engine            = state.engine.clone();
+                        let sid               = orch.id.clone();
+                        let nm                = name;
+                        let ts_i64            = ts as i64;
+                        let orch_agent        = agent;
 
                         Task::future(async move {
                             if let Err(e) = tokio::fs::create_dir_all(&ws).await {
@@ -1180,6 +1278,8 @@ impl App {
                                     catalogue_path,
                                     extra_env,
                                     started_at:      ts_i64,
+                                    claude_session_id,
+                                    failure_status:  ninox_core::SessionStatus::Terminated,
                                 },
                             )
                             .await;
@@ -1253,7 +1353,8 @@ impl App {
             Message::RefileSession(id) => {
                 let Some(session) = state.sessions.get(&id).cloned() else { return Task::none(); };
                 let is_orch = state.orchestrators.iter().any(|o| o.id == id);
-                let Some(plan) = refile_plan(&session, is_orch, &state.config) else {
+                let claude_session_id = ninox_core::harness::new_claude_session_id();
+                let Some(plan) = refile_plan(&session, is_orch, &state.config, &claude_session_id) else {
                     tracing::warn!("refile {id}: no workspace recorded, cannot respawn");
                     return Task::none();
                 };
@@ -1290,6 +1391,8 @@ impl App {
                             catalogue_path:  plan.catalogue_path,
                             extra_env:       plan.extra_env,
                             started_at:      ts,
+                            claude_session_id,
+                            failure_status:  ninox_core::SessionStatus::Terminated,
                         },
                     )
                     .await;
@@ -1298,6 +1401,64 @@ impl App {
                         None       => Message::Noop,
                     }
                 })
+            }
+
+            Message::ResumeSession(id) => {
+                let Some(session) = state.sessions.get(&id).cloned() else { return Task::none(); };
+                let is_orch = state.orchestrators.iter().any(|o| o.id == id);
+                let Some(plan) = resume_plan(&session, is_orch, &state.config) else {
+                    tracing::warn!("resume {id}: no workspace/claude_session_id/resume-capable harness, cannot resume");
+                    return Task::none();
+                };
+                let Some(claude_session_id) = session.claude_session_id.clone() else {
+                    return Task::none(); // unreachable: resume_plan already required this
+                };
+                state.clients.remove(&id);
+                state.terminals.remove(&id);
+
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let engine  = state.engine.clone();
+                let name    = session.name.clone();
+                let repo    = session.repo.clone();
+                let orch_id = session.orchestrator_id.clone();
+                Task::future(async move {
+                    let _ = ninox_core::tmux::kill_session(&id).await;
+                    let attach = crate::spawn_util::spawn_interactive_session(
+                        engine,
+                        crate::spawn_util::InteractiveSpawnParams {
+                            session_id:      id.clone(),
+                            name,
+                            workspace:       plan.workspace,
+                            repo,
+                            orchestrator_id: orch_id,
+                            agent:           plan.agent,
+                            base_cmd:        plan.base_cmd,
+                            catalogue_path:  plan.catalogue_path,
+                            extra_env:       plan.extra_env,
+                            started_at:      ts,
+                            claude_session_id,
+                            failure_status:  ninox_core::SessionStatus::Interrupted,
+                        },
+                    )
+                    .await;
+                    match attach {
+                        Some(argv) => Message::ClientAttach { session_id: id, argv },
+                        None       => Message::Noop,
+                    }
+                })
+            }
+
+            Message::ResumeAllSessions => {
+                let ids: Vec<SessionId> = state.sessions.values()
+                    .filter(|s| matches!(s.status, ninox_core::SessionStatus::Interrupted))
+                    .map(|s| s.id.clone())
+                    .collect();
+                Task::batch(ids.into_iter().map(|id| {
+                    Task::done(Message::ResumeSession(id))
+                }))
             }
 
             Message::RawKey { key, modifiers, text } => {
@@ -2039,7 +2200,7 @@ impl App {
             async_stream::stream! {
                 loop {
                     match rx.recv().await {
-                        Ok(event)  => yield Message::EngineEvent(event),
+                        Ok(event)  => yield Message::EngineEvent(Box::new(event)),
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed)    => break,
                     }
@@ -2420,6 +2581,7 @@ mod tests {
             pr_number, pr_id, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         }
     }
 
@@ -2552,6 +2714,7 @@ mod tests {
             model: Some("claude-opus-4-8".into()), context_tokens: None,
             catalogue_path: Some("/brains/b".into()),
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         }
     }
 
@@ -2566,7 +2729,7 @@ mod tests {
             ..Default::default()
         });
         let session = refile_session("s1");
-        let plan = refile_plan(&session, false, &cfg).expect("plan");
+        let plan = refile_plan(&session, false, &cfg, "fresh-uuid").expect("plan");
         assert_eq!(plan.base_cmd, "claude-nightly --model 'claude-opus-4-8'");
         assert_eq!(plan.workspace, "/tmp/ws");
         assert_eq!(plan.catalogue_path, "/brains/b");
@@ -2580,7 +2743,7 @@ mod tests {
         let cfg = ninox_core::config::AppConfig::default();
         let mut session = refile_session("o1");
         session.catalogue_path = None;
-        let plan = refile_plan(&session, true, &cfg).expect("plan");
+        let plan = refile_plan(&session, true, &cfg, "fresh-uuid").expect("plan");
         assert!(plan.extra_env.iter().any(|(k, v)| k == "NINOX_ORCHESTRATOR_ID" && v == "o1"));
         assert!(plan.extra_env.iter().any(|(k, _)| k == "NINOX_CALLER_TYPE"));
         // The legacy ATHENE_/AO_ transition names are gone.
@@ -2589,7 +2752,17 @@ mod tests {
         assert!(!plan.catalogue_path.is_empty());
 
         session.workspace_path = None;
-        assert!(refile_plan(&session, true, &cfg).is_none());
+        assert!(refile_plan(&session, true, &cfg, "fresh-uuid").is_none());
+    }
+
+    #[test]
+    fn refile_plan_uses_the_freshly_generated_id_not_the_stale_one() {
+        let cfg = ninox_core::config::AppConfig::default();
+        let mut session = refile_session("s1");
+        session.claude_session_id = Some("stale-id-from-before".into());
+        let plan = refile_plan(&session, false, &cfg, "brand-new-id").expect("plan");
+        assert!(plan.base_cmd.contains("brand-new-id"));
+        assert!(!plan.base_cmd.contains("stale-id-from-before"));
     }
 
     #[test]
@@ -2604,6 +2777,101 @@ mod tests {
         // session record itself stays (the respawn upserts it to Working).
         assert!(!m.terminals.contains_key("s1"));
         assert!(m.sessions.contains_key("s1"));
+    }
+
+    #[test]
+    fn resume_plan_builds_a_resume_command_from_the_stored_id() {
+        let cfg = ninox_core::config::AppConfig::default();
+        let mut session = refile_session("s1");
+        session.claude_session_id = Some("stored-uuid".into());
+        let plan = resume_plan(&session, false, &cfg).expect("plan");
+        assert!(plan.base_cmd.contains("--resume"));
+        assert!(plan.base_cmd.contains("stored-uuid"));
+        assert_eq!(plan.workspace, "/tmp/ws");
+    }
+
+    #[test]
+    fn resume_plan_none_without_a_stored_claude_session_id() {
+        let cfg = ninox_core::config::AppConfig::default();
+        let session = refile_session("s1"); // claude_session_id: None by default in this fixture
+        assert!(resume_plan(&session, false, &cfg).is_none());
+    }
+
+    #[test]
+    fn resume_message_relaunches_and_attaches() {
+        let e = test_engine();
+        let mut m = base(e);
+        let mut s = refile_session("s1");
+        s.status = SessionStatus::Interrupted;
+        s.claude_session_id = Some("stored-uuid".into());
+        m.sessions.insert("s1".into(), s.clone());
+        m.engine.store.upsert_session(&s).unwrap();
+        m.terminals.insert("s1".into(), TerminalState::new(80, 24, None));
+        let (m, _) = m.update(Message::ResumeSession("s1".into()));
+        // Mirrors `refile_message_drops_client_state_and_keeps_session`:
+        // the stale grid is dropped so the respawned PTY starts clean; the
+        // session record itself stays (the respawn upserts it to Working).
+        // Actually executing the returned `Task` needs a real async
+        // executor driving a real tmux server — that end-to-end behavior is
+        // covered by `resume_message_keeps_status_interrupted_when_tmux_create_fails`
+        // below; this test only checks the synchronous state `update()`
+        // itself mutates, same as its Re-file twin.
+        assert!(!m.terminals.contains_key("s1"));
+        assert!(m.sessions.contains_key("s1"));
+    }
+
+    #[tokio::test]
+    async fn resume_message_keeps_status_interrupted_when_tmux_create_fails() {
+        // Driving `Message::ResumeSession`'s `Task` to completion needs a
+        // real async executor — no other test in this file does that for a
+        // `Task<Message>` (the closest sibling, `stale_client_closed_...`,
+        // drives real tmux calls directly, not the `Task` an `update()` call
+        // returns), so this uses `iced_runtime::task::into_stream` +
+        // `futures::StreamExt` to run it for real, exactly the way iced's
+        // own runtime would.
+        //
+        // Triggering a real `tmux::create_session` failure here can't reuse
+        // the collision trick `spawn_util::spawn_failure_uses_the_caller_supplied_failure_status`
+        // uses (pre-create a live session under the same id so `new-session`
+        // collides with tmux's own "duplicate session" error): unlike that
+        // test, which calls `spawn_interactive_session` directly, the real
+        // `Message::ResumeSession` handler kills any live tmux session under
+        // the same id *first* (`ninox_core::tmux::kill_session`) before
+        // creating the new one — so a pre-created collision would just get
+        // killed and the respawn would succeed. And a bad `-c <workspace>`
+        // path (the brief's literal suggestion) doesn't reliably fail
+        // `tmux new-session` on this machine's tmux either (3.6a returns
+        // exit 0 and only the spawned shell dies asynchronously — the same
+        // finding Task 5 made). Instead, a NUL byte embedded in the
+        // workspace path makes the underlying `Command::spawn` fail
+        // deterministically — Rust validates argv for interior NULs before
+        // ever exec'ing tmux — independent of tmux version and unaffected
+        // by the preceding `kill_session` call (whose own args don't
+        // contain the workspace path).
+        use futures::StreamExt;
+
+        let e = test_engine();
+        let mut m = base(e);
+        let mut s = refile_session("s1");
+        s.status = SessionStatus::Interrupted;
+        s.claude_session_id = Some("stored-uuid".into());
+        s.workspace_path = Some("/definitely/does/not/exist/ever\0".into());
+        m.sessions.insert("s1".into(), s.clone());
+        m.engine.store.upsert_session(&s).unwrap();
+
+        let (m, task) = m.update(Message::ResumeSession("s1".into()));
+        let mut stream = iced_runtime::task::into_stream(task)
+            .expect("ResumeSession must produce a real Task, not Task::none()");
+        // `Task::future` yields exactly one `Action::Output(message)`; drive
+        // it to completion and ignore the resulting `Message` (Noop on the
+        // failure path this test forces).
+        let _ = stream.next().await;
+
+        let session = m.engine.store.get_session("s1").unwrap().unwrap();
+        assert!(
+            matches!(session.status, SessionStatus::Interrupted),
+            "a failed Resume must stay Interrupted (retryable), not fall back to Terminated",
+        );
     }
 
     #[test]
@@ -2649,8 +2917,9 @@ mod tests {
             pid:             None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         };
-        let (updated, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (updated, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         assert!(updated.sessions.contains_key("s1"));
     }
 
@@ -2659,14 +2928,14 @@ mod tests {
         let e = test_engine();
         let mut m = base(e);
         for i in 0..55u32 {
-            let (next, _) = m.update(Message::EngineEvent(Event::Notification(Notification {
+            let (next, _) = m.update(Message::EngineEvent(Box::new(Event::Notification(Notification {
                 id:         i.to_string(),
                 kind:       NotificationKind::WorkerDone,
                 title:      "t".into(),
                 body:       "b".into(),
                 session_id: None,
                 created_at: 0,
-            })));
+            }))));
             m = next;
         }
         assert_eq!(m.notifications.len(), 50);
@@ -2701,6 +2970,25 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_spawn_persists_a_claude_session_id() {
+        let e = test_engine();
+        let mut m = base(e);
+        let (next, _) = m.update(Message::SpawnSession);
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormName("my-feature".into()));
+        m = next;
+        let (next, _) = m.update(Message::SpawnFormConfirm);
+        m = next;
+
+        let orch_id = &m.orchestrators[0].id;
+        let session = m.sessions.get(orch_id).expect("session recorded optimistically");
+        assert!(
+            session.claude_session_id.is_some(),
+            "a fresh UUID must be recorded at spawn time",
+        );
+    }
+
+    #[test]
     fn opening_worker_uses_global_preferred_panel() {
         use crate::components::session_detail::DetailPanel;
         let e = test_engine();
@@ -2712,8 +3000,9 @@ mod tests {
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         };
-        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;
 
         let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
@@ -2759,6 +3048,7 @@ mod tests {
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         }).unwrap();
         let engine = Engine::new(store);
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
@@ -2781,8 +3071,9 @@ mod tests {
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         };
-        let (m2, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = m2;
         // board_sessions(app, status, scope) returns sessions with that status
         let terminated = board_sessions(&m, &SessionStatus::Terminated, None);
@@ -2798,7 +3089,7 @@ mod tests {
         // Set up an orchestrator
         let o = Orchestrator { id: "o1".into(), name: "orch".into(), created_at: 0 };
         let _ = m.engine.store.upsert_orchestrator(&o);
-        let (next, _) = m.update(Message::EngineEvent(Event::OrchestratorSpawned(o)));
+        let (next, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorSpawned(o))));
         m = next;
 
         // Worker session under the orchestrator, already Done
@@ -2810,9 +3101,10 @@ mod tests {
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         };
         let _ = m.engine.store.upsert_session(&worker);
-        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(worker)));
+        let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(worker))));
         m = next;
         assert!(m.sessions.contains_key("w1"), "worker should be present before poll");
 
@@ -3201,11 +3493,11 @@ mod tests {
         let e = test_engine();
         let mut m = base(e);
         for id in ["n1", "n2", "n3"] {
-            let (next, _) = m.update(Message::EngineEvent(Event::Notification(Notification {
+            let (next, _) = m.update(Message::EngineEvent(Box::new(Event::Notification(Notification {
                 id: id.into(), kind: NotificationKind::WorkerDone,
                 title: "t".into(), body: "b".into(), session_id: None,
                 created_at: 0,
-            })));
+            }))));
             m = next;
         }
         assert_eq!(m.notifications.len(), 3);
@@ -3227,8 +3519,9 @@ mod tests {
             workspace_path: Some("/tmp/w".into()), pid: Some(1234),
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         };
-        let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
         let (m3, _) = m2.update(Message::SwitchDetailPanel(DetailPanel::Inspector));
         assert!(matches!(&m3.view, View::SessionDetail { panel: DetailPanel::Inspector, .. }));
@@ -3254,8 +3547,9 @@ mod tests {
                 workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
             };
-            let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+            let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
 
@@ -3305,8 +3599,9 @@ mod tests {
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         };
-        let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         // NavigateSession defaults to the Split panel, so switch to Terminal
         // first to establish the full-width baseline, then attach a terminal
         // directly rather than relying on the async PTY task.
@@ -3351,8 +3646,9 @@ mod tests {
                 workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
             };
-            let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+            let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
 
@@ -3431,8 +3727,9 @@ mod tests {
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         };
-        let (m, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m, _) = m.update(Message::NavigateSession("s1".into()));
         let mut m = m;
         m.terminals.insert(
@@ -3453,11 +3750,11 @@ mod tests {
         let e = test_engine();
         let mut m = base(e);
         for id in ["a", "b"] {
-            let (next, _) = m.update(Message::EngineEvent(Event::Notification(Notification {
+            let (next, _) = m.update(Message::EngineEvent(Box::new(Event::Notification(Notification {
                 id: id.into(), kind: NotificationKind::WorkerDone,
                 title: "t".into(), body: "b".into(), session_id: None,
                 created_at: 0,
-            })));
+            }))));
             m = next;
         }
         let (m2, _) = m.update(Message::DismissAllNotifications);
@@ -3482,8 +3779,9 @@ mod tests {
                 workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
             };
-            let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+            let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
         assert_eq!(attention_count(&m), 2); // ci_failed + review_pending
@@ -3541,10 +3839,10 @@ mod tests {
         // The OLD client's reader thread now surfaces its terminal
         // ClientClosed, tagged with the OLD generation. This must be
         // ignored — the currently-live client must survive intact.
-        let (m5, _) = m.update(Message::EngineEvent(Event::ClientClosed {
+        let (m5, _) = m.update(Message::EngineEvent(Box::new(Event::ClientClosed {
             session_id: sid.clone(),
             generation: old_generation,
-        }));
+        })));
         m = m5;
 
         assert!(m.clients.contains_key(&sid), "a stale ClientClosed must not remove the current client");
@@ -3571,8 +3869,9 @@ mod tests {
                 workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
             };
-            let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+            let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
         let (m2, _) = m.update(Message::FleetFilterQuery("auth".into()));
@@ -4213,8 +4512,9 @@ mod tests {
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
         };
-        let (next, _) = m.update(Message::EngineEvent(Event::SessionSpawned(s)));
+        let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;
         let (next, _) = m.update(Message::NavigateSession("sess-a".into()));
         m = next;

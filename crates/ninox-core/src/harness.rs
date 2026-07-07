@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AgentConfig;
 
-/// One harness definition. Template vars in args: `{model}`, `{prompt}`.
+/// One harness definition. Template vars in args: `{model}`, `{prompt}`,
+/// `{session_id}`.
 /// An element containing `{model}` is dropped entirely when no model is
 /// set — together with the immediately preceding `-`-prefixed literal flag
 /// (so `["--model", "{model}"]` vanishes as a pair).
@@ -34,6 +35,12 @@ pub struct HarnessSpec {
     /// this harness: selectable interactively, never offered for workers.
     #[serde(default)]
     pub worker_args: Option<Vec<String>>,
+    /// Args for resuming a previously-interrupted session by its
+    /// `claude_session_id`. Empty = this harness can't resume — a session
+    /// under it never gets `SessionStatus::Interrupted` (see the reconciliation
+    /// logic in `app.rs`) and never shows a Resume affordance.
+    #[serde(default)]
+    pub resume_args: Vec<String>,
     /// Curated fallback for the model picker.
     #[serde(default)]
     pub known_models: Vec<String>,
@@ -57,12 +64,18 @@ fn builtin_specs() -> BTreeMap<String, HarnessSpec> {
     m.insert("claude-code".to_string(), HarnessSpec {
         enabled:          true,
         binary:           Some("claude".into()),
-        interactive_args: vec!["--model".into(), "{model}".into()],
+        interactive_args: vec!["--session-id".into(), "{session_id}".into(), "--model".into(), "{model}".into()],
         worker_args:      Some(vec![
             "--dangerously-skip-permissions".into(),
+            "--session-id".into(), "{session_id}".into(),
             "--model".into(), "{model}".into(),
             "--".into(), "{prompt}".into(),
         ]),
+        resume_args: vec![
+            "--dangerously-skip-permissions".into(),
+            "--resume".into(), "{session_id}".into(),
+            "--model".into(), "{model}".into(),
+        ],
         known_models:     vec![
             "claude-fable-5".into(),
             "claude-opus-4-8".into(),
@@ -139,21 +152,40 @@ impl HarnessRegistry {
     }
 
     /// Interactive launch command (orchestrator / standalone sessions).
-    pub fn interactive_cmd(&self, agent: &AgentConfig) -> String {
+    /// `claude_session_id` is the UUID ninox generated for this spawn (see
+    /// `new_claude_session_id`) — always required so every claude-code
+    /// session is resumable from birth.
+    pub fn interactive_cmd(&self, agent: &AgentConfig, claude_session_id: &str) -> String {
         let spec   = self.spec(&agent.harness);
         let binary = spec.binary.clone().unwrap_or_else(|| agent.harness.clone());
         let model  = agent.model.as_deref().or(spec.model.as_deref());
-        join_cmd(binary, expand_args(&spec.interactive_args, model, None))
+        join_cmd(binary, expand_args(&spec.interactive_args, model, None, claude_session_id))
     }
 
     /// Worker launch command, or `None` when the spec has no `worker_args`
     /// (worker mode unverified for this harness).
-    pub fn worker_cmd(&self, agent: &AgentConfig, prompt: &str) -> Option<String> {
+    pub fn worker_cmd(&self, agent: &AgentConfig, prompt: &str, claude_session_id: &str) -> Option<String> {
         let spec   = self.spec(&agent.harness);
         let wargs  = spec.worker_args.as_ref()?;
         let binary = spec.binary.clone().unwrap_or_else(|| agent.harness.clone());
         let model  = agent.model.as_deref().or(spec.model.as_deref());
-        Some(join_cmd(binary, expand_args(wargs, model, Some(prompt))))
+        Some(join_cmd(binary, expand_args(wargs, model, Some(prompt), claude_session_id)))
+    }
+
+    /// Resume command for a previously-interrupted session, or `None` when
+    /// the harness has no `resume_args` (resume unsupported). Always
+    /// rebuilds from `interactive`-style args (never `worker_args`) — a
+    /// resumed session already has its original prompt in the transcript;
+    /// replaying it via `worker_args`' trailing `-- {prompt}` would
+    /// re-inject a stale instruction instead of continuing.
+    pub fn resume_cmd(&self, agent: &AgentConfig, claude_session_id: &str) -> Option<String> {
+        let spec = self.spec(&agent.harness);
+        if spec.resume_args.is_empty() {
+            return None;
+        }
+        let binary = spec.binary.clone().unwrap_or_else(|| agent.harness.clone());
+        let model  = agent.model.as_deref().or(spec.model.as_deref());
+        Some(join_cmd(binary, expand_args(&spec.resume_args, model, None, claude_session_id)))
     }
 }
 
@@ -161,12 +193,12 @@ fn join_cmd(binary: String, args: Vec<String>) -> String {
     if args.is_empty() { binary } else { format!("{} {}", binary, args.join(" ")) }
 }
 
-/// Expand `{model}`/`{prompt}` in an arg list. When `model` is `None`, an
-/// element containing `{model}` is dropped — along with the immediately
-/// preceding `-`-prefixed literal flag, so a `["--model", "{model}"]` pair
-/// vanishes cleanly. Substituted elements are shell-quoted; literals pass
-/// through verbatim.
-fn expand_args(args: &[String], model: Option<&str>, prompt: Option<&str>) -> Vec<String> {
+/// Expand `{model}`/`{prompt}`/`{session_id}` in an arg list. When `model` is
+/// `None`, an element containing `{model}` is dropped — along with the
+/// immediately preceding `-`-prefixed literal flag, so a `["--model",
+/// "{model}"]` pair vanishes cleanly. Substituted elements are shell-quoted;
+/// literals pass through verbatim.
+fn expand_args(args: &[String], model: Option<&str>, prompt: Option<&str>, claude_session_id: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -183,11 +215,12 @@ fn expand_args(args: &[String], model: Option<&str>, prompt: Option<&str>) -> Ve
             i += 1;
             continue;
         }
-        let had_placeholder = a.contains("{model}") || a.contains("{prompt}");
+        let had_placeholder = a.contains("{model}") || a.contains("{prompt}") || a.contains("{session_id}");
         let mut s = a.replace("{model}", model.unwrap_or(""));
         if let Some(p) = prompt {
             s = s.replace("{prompt}", p);
         }
+        s = s.replace("{session_id}", claude_session_id);
         out.push(if had_placeholder { shell_quote(&s) } else { s });
         i += 1;
     }
@@ -196,6 +229,13 @@ fn expand_args(args: &[String], model: Option<&str>, prompt: Option<&str>) -> Ve
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// A fresh UUID for `--session-id`/`--resume`. Generated by ninox at every
+/// spawn (and at every Re-file, which discards the old conversation and
+/// starts a new one) — never by the harness itself.
+pub fn new_claude_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 #[cfg(test)]
@@ -215,42 +255,43 @@ mod tests {
 
     #[test]
     fn interactive_cmd_claude_with_model() {
-        assert_eq!(reg().interactive_cmd(&agent("claude-code", Some("claude-opus-4-5"))),
-                   "claude --model 'claude-opus-4-5'");
+        assert_eq!(reg().interactive_cmd(&agent("claude-code", Some("claude-opus-4-5")), "sess-1"),
+                   "claude --session-id 'sess-1' --model 'claude-opus-4-5'");
     }
 
     #[test]
     fn interactive_cmd_claude_without_model_is_bare() {
-        assert_eq!(reg().interactive_cmd(&agent("claude-code", None)), "claude");
+        assert_eq!(reg().interactive_cmd(&agent("claude-code", None), "sess-1"),
+                   "claude --session-id 'sess-1'");
     }
 
     #[test]
     fn worker_cmd_claude_code() {
-        assert_eq!(reg().worker_cmd(&agent("claude-code", None), "Fix the bug").unwrap(),
-                   "claude --dangerously-skip-permissions -- 'Fix the bug'");
+        assert_eq!(reg().worker_cmd(&agent("claude-code", None), "Fix the bug", "sess-1").unwrap(),
+                   "claude --dangerously-skip-permissions --session-id 'sess-1' -- 'Fix the bug'");
     }
 
     #[test]
     fn worker_cmd_claude_code_with_model() {
-        assert_eq!(reg().worker_cmd(&agent("claude-code", Some("claude-opus-4-5")), "Fix the bug").unwrap(),
-                   "claude --dangerously-skip-permissions --model 'claude-opus-4-5' -- 'Fix the bug'");
+        assert_eq!(reg().worker_cmd(&agent("claude-code", Some("claude-opus-4-5")), "Fix the bug", "sess-1").unwrap(),
+                   "claude --dangerously-skip-permissions --session-id 'sess-1' --model 'claude-opus-4-5' -- 'Fix the bug'");
     }
 
     #[test]
     fn worker_cmd_codex() {
-        assert_eq!(reg().worker_cmd(&agent("codex", Some("gpt-4o")), "do the thing").unwrap(),
+        assert_eq!(reg().worker_cmd(&agent("codex", Some("gpt-4o")), "do the thing", "sess-1").unwrap(),
                    "codex --model 'gpt-4o' -p 'do the thing'");
     }
 
     #[test]
     fn worker_cmd_aider_uses_message_flag() {
-        assert_eq!(reg().worker_cmd(&agent("aider", None), "fix it").unwrap(),
+        assert_eq!(reg().worker_cmd(&agent("aider", None), "fix it", "sess-1").unwrap(),
                    "aider --message 'fix it'");
     }
 
     #[test]
     fn worker_cmd_quotes_single_quotes_in_prompt() {
-        assert_eq!(reg().worker_cmd(&agent("codex", None), "don't break").unwrap(),
+        assert_eq!(reg().worker_cmd(&agent("codex", None), "don't break", "sess-1").unwrap(),
                    "codex -p 'don'\\''t break'");
     }
 
@@ -258,9 +299,9 @@ mod tests {
 
     #[test]
     fn unknown_harness_runs_its_name_verbatim() {
-        assert_eq!(reg().interactive_cmd(&agent("mytool", None)), "mytool");
+        assert_eq!(reg().interactive_cmd(&agent("mytool", None), "sess-1"), "mytool");
         // No worker_args on a synthesized spec → not worker-capable.
-        assert!(reg().worker_cmd(&agent("mytool", None), "p").is_none());
+        assert!(reg().worker_cmd(&agent("mytool", None), "p", "sess-1").is_none());
     }
 
     #[test]
@@ -269,7 +310,7 @@ mod tests {
         let fb = r.spec("freebuff");
         assert!(!fb.enabled);
         assert!(fb.worker_args.is_none());
-        assert_eq!(r.interactive_cmd(&agent("freebuff", Some("fb-large"))),
+        assert_eq!(r.interactive_cmd(&agent("freebuff", Some("fb-large")), "sess-1"),
                    "freebuff --model 'fb-large'");
     }
 
@@ -295,7 +336,7 @@ mod tests {
             ..HarnessSpec::default()
         });
         let r = HarnessRegistry::from_config(&over);
-        assert_eq!(r.interactive_cmd(&agent("codex", Some("o3"))), "codex-nightly --model 'o3'");
+        assert_eq!(r.interactive_cmd(&agent("codex", Some("o3")), "sess-1"), "codex-nightly --model 'o3'");
         assert!(r.enabled_names().contains(&"codex".to_string()));
     }
 
@@ -309,7 +350,7 @@ mod tests {
         });
         let r = HarnessRegistry::from_config(&over);
         // binary defaults to the harness name
-        assert_eq!(r.worker_cmd(&agent("freebuff2", None), "go").unwrap(), "freebuff2 -p 'go'");
+        assert_eq!(r.worker_cmd(&agent("freebuff2", None), "go", "sess-1").unwrap(), "freebuff2 -p 'go'");
     }
 
     #[test]
@@ -330,8 +371,38 @@ mod tests {
             ..HarnessSpec::default()
         });
         let r = HarnessRegistry::from_config(&over);
-        assert_eq!(r.interactive_cmd(&agent("codex", Some("chosen"))), "codex --model 'chosen'");
-        assert_eq!(r.interactive_cmd(&agent("codex", None)),           "codex --model 'spec-default'");
+        assert_eq!(r.interactive_cmd(&agent("codex", Some("chosen")), "sess-1"), "codex --model 'chosen'");
+        assert_eq!(r.interactive_cmd(&agent("codex", None), "sess-1"),           "codex --model 'spec-default'");
+    }
+
+    #[test]
+    fn resume_cmd_claude_code_with_model() {
+        assert_eq!(
+            reg().resume_cmd(&agent("claude-code", Some("claude-opus-4-5")), "sess-1").unwrap(),
+            "claude --dangerously-skip-permissions --resume 'sess-1' --model 'claude-opus-4-5'"
+        );
+    }
+
+    #[test]
+    fn resume_cmd_claude_code_without_model() {
+        assert_eq!(
+            reg().resume_cmd(&agent("claude-code", None), "sess-1").unwrap(),
+            "claude --dangerously-skip-permissions --resume 'sess-1'"
+        );
+    }
+
+    #[test]
+    fn resume_cmd_none_for_harness_without_resume_args() {
+        // codex's builtin spec has no resume_args — resuming isn't supported.
+        assert!(reg().resume_cmd(&agent("codex", Some("gpt-4o")), "sess-1").is_none());
+    }
+
+    #[test]
+    fn new_claude_session_id_returns_distinct_uuids() {
+        let a = new_claude_session_id();
+        let b = new_claude_session_id();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 36); // UUID v4 string form, e.g. 8-4-4-4-12 hex groups
     }
 
     #[test]

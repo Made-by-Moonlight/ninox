@@ -83,6 +83,7 @@ fn status_str(status: &ninox_core::types::SessionStatus) -> &'static str {
         ninox_core::types::SessionStatus::Mergeable     => "mergeable",
         ninox_core::types::SessionStatus::Done          => "done",
         ninox_core::types::SessionStatus::Terminated    => "terminated",
+        ninox_core::types::SessionStatus::Interrupted   => "interrupted",
     }
 }
 
@@ -177,5 +178,18 @@ mod tests {
         assert_eq!(format_tokens_k(214_389), "214k");
         assert_eq!(format_tokens_k(500), "1k");
         assert_eq!(format_tokens_k(0), "0k");
+    }
+
+    #[test]
+    fn status_str_covers_all_variants() {
+        assert_eq!(status_str(&ninox_core::types::SessionStatus::Spawning), "spawning");
+        assert_eq!(status_str(&ninox_core::types::SessionStatus::Working), "working");
+        assert_eq!(status_str(&ninox_core::types::SessionStatus::PrOpen), "pr_open");
+        assert_eq!(status_str(&ninox_core::types::SessionStatus::CiFailed), "ci_failed");
+        assert_eq!(status_str(&ninox_core::types::SessionStatus::ReviewPending), "review_pending");
+        assert_eq!(status_str(&ninox_core::types::SessionStatus::Mergeable), "mergeable");
+        assert_eq!(status_str(&ninox_core::types::SessionStatus::Done), "done");
+        assert_eq!(status_str(&ninox_core::types::SessionStatus::Terminated), "terminated");
+        assert_eq!(status_str(&ninox_core::types::SessionStatus::Interrupted), "interrupted");
     }
 }

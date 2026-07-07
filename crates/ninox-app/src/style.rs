@@ -115,6 +115,7 @@ pub fn stamp_word(status: &SessionStatus) -> &'static str {
         Mergeable          => "Ready",
         Done               => "Filed",
         Terminated         => "Closed",
+        Interrupted        => "Interrupted",
     }
 }
 
@@ -340,6 +341,7 @@ mod tests {
         assert_eq!(stamp_word(&SessionStatus::Mergeable),     "Ready");
         assert_eq!(stamp_word(&SessionStatus::Done),          "Filed");
         assert_eq!(stamp_word(&SessionStatus::Terminated),    "Closed");
+        assert_eq!(stamp_word(&SessionStatus::Interrupted),   "Interrupted");
     }
 
     #[test]

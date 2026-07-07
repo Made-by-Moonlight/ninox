@@ -1,6 +1,6 @@
 [package]
 name        = "ninox-core"
-version     = "0.5.1"
+version     = "0.6.0"
 edition     = "2021"
 description = "Engine core for the Ninox native app: session lifecycle, config, and storage."
 license     = "MIT"
@@ -22,6 +22,7 @@ reqwest    = { workspace = true }
 walkdir    = { workspace = true }
 rayon      = { workspace = true }
 portable-pty = "0.8"
+uuid       = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile   = "3"

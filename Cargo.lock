@@ -3434,7 +3434,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "ninox"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -3443,7 +3443,9 @@ dependencies = [
  "chrono",
  "clap",
  "dirs 5.0.1",
+ "futures",
  "iced",
+ "iced_runtime",
  "ninox-core",
  "ninox-server",
  "notify-rust",
@@ -3459,7 +3461,7 @@ dependencies = [
 
 [[package]]
 name = "ninox-core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -3477,12 +3479,13 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "uuid",
  "walkdir",
 ]
 
 [[package]]
 name = "ninox-server"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
