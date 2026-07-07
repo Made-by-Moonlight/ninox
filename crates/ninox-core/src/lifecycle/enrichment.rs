@@ -13,6 +13,11 @@ pub struct EnrichmentState {
     pub ci_reaction_sent: bool,
     /// Whether a reaction has already been sent for current review set.
     pub review_reaction_sent: bool,
+    /// Whether a `GithubLookupFailed` notification has already been sent
+    /// for the session's current run of consecutive lookup failures —
+    /// cleared as soon as a lookup succeeds again, mirroring
+    /// `ci_reaction_sent`'s reset-on-recovery behavior.
+    pub github_lookup_failed_notified: bool,
 }
 
 pub type EnrichmentCache = HashMap<SessionId, EnrichmentState>;

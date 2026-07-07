@@ -79,6 +79,7 @@ impl Store {
              claude_session_id)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
              ON CONFLICT(id) DO UPDATE SET
+             repo=excluded.repo,
              status=excluded.status,cost_usd=excluded.cost_usd,
              started_at=excluded.started_at,
              pr_number=excluded.pr_number,pr_id=excluded.pr_id,
@@ -371,6 +372,29 @@ mod tests {
         let list = store.list_sessions().unwrap();
         assert_eq!(list.len(), 1);
         assert!(matches!(list[0].status, SessionStatus::Done));
+    }
+
+    /// The poller's dual-remote self-heal (`session.repo` corrected once a
+    /// PR is found against a different remote than the one on record)
+    /// depends on `repo` being an updatable column, not just a write-once
+    /// field set at insert time.
+    #[test]
+    fn upsert_updates_repo() {
+        let store = test_store();
+        let mut s = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "OwnerA/repoA".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
+        };
+        store.upsert_session(&s).unwrap();
+        s.repo = "OwnerB/repoB".into();
+        store.upsert_session(&s).unwrap();
+        let updated = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(updated.repo, "OwnerB/repoB");
     }
 
     #[test]

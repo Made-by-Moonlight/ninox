@@ -3464,6 +3464,7 @@ name = "ninox-core"
 version = "0.8.3"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dirs 5.0.1",
  "fastembed",
  "libc",

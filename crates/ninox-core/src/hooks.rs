@@ -62,8 +62,40 @@ if [[ -z "$_real_gh" ]]; then
     exit 1
 fi
 
+# Detect `pr create` regardless of preceding global flags (`-R`, `--repo`,
+# `--hostname`, with or without `=`) — argv-position matching alone
+# (`$1==pr && $2==create`) misses `gh -R owner/repo pr create` entirely,
+# silently falling through to the real gh with no metadata capture.
+_is_pr_create=false
+_skip_next=false
+_positional=()
+for _arg in "$@"; do
+    if $_skip_next; then
+        _skip_next=false
+        continue
+    fi
+    case "$_arg" in
+        -R|--repo|--hostname)
+            _skip_next=true
+            continue
+            ;;
+        --repo=*|--hostname=*)
+            continue
+            ;;
+        -R?*)
+            # Cuddled short-flag form gh's parser also accepts, e.g.
+            # `-Rowner/repo` (no space) — value is embedded, nothing to skip.
+            continue
+            ;;
+    esac
+    _positional+=("$_arg")
+done
+if [[ "${_positional[0]:-}" == "pr" && "${_positional[1]:-}" == "create" ]]; then
+    _is_pr_create=true
+fi
+
 # Run the real gh and tee output so we can parse it.
-if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
+if $_is_pr_create; then
     _output=$("$_real_gh" "$@" 2>&1)
     _exit=$?
     echo "$_output"
@@ -88,8 +120,7 @@ if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
                     '. + {"agentReportedPrUrl": $url, "agentReportedPrNumber": $num, "agentReportedState": "pr_created"}
                      | .agentReportedPrs = ((.agentReportedPrs // []) + [{"number": $num, "url": $url}])' \
                     > "$_tmp" && mv "$_tmp" "$_meta_file"
-            else
-                # Fallback: node (likely available alongside gh).
+            elif command -v node &>/dev/null; then
                 # PR URL and number are passed via env vars, not interpolated into the
                 # script string, to avoid shell injection from external GitHub output.
                 NINOX_PR_URL="$_pr_url" NINOX_PR_NUM="$_pr_num" node -e "
@@ -105,7 +136,9 @@ if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
                         .concat([{ number: num, url: url }]);
                     fs.writeFileSync(f + '.tmp.\$\$', JSON.stringify(m,null,2));
                     fs.renameSync(f + '.tmp.\$\$', f);
-                " 2>/dev/null || true
+                " 2>/dev/null || echo "ninox: warning: node failed to record PR metadata for $_pr_url" >&2
+            else
+                echo "ninox: warning: neither jq nor node found — PR metadata for $_pr_url was not recorded" >&2
             fi
         fi
     fi
@@ -609,5 +642,93 @@ mod tests {
     #[test]
     fn gh_wrapper_appends_to_pr_list() {
         assert!(GH_WRAPPER.contains("agentReportedPrs"));
+    }
+
+    /// A missing jq *and* node must be diagnosable, not a silent no-op —
+    /// the wrapper previously dropped the write with `|| true` and no trace.
+    #[test]
+    fn gh_wrapper_warns_when_neither_jq_nor_node_available() {
+        assert!(GH_WRAPPER.contains("neither jq nor node"));
+    }
+
+    /// Runs the real `GH_WRAPPER` script as a subprocess against a fake
+    /// "real gh" that just echoes a PR URL, proving the argv scan actually
+    /// detects `pr create` end to end — not just via string matching on the
+    /// script source.
+    fn run_gh_wrapper(args: &[&str], path_extra: &std::path::Path, session: &str, data_dir: &std::path::Path)
+        -> std::process::Output
+    {
+        let wrapper_dir = tempdir().unwrap();
+        let wrapper_path = wrapper_dir.path().join("gh");
+        write_executable(wrapper_path.clone(), GH_WRAPPER).unwrap();
+        let path_env = format!(
+            "{}:{}",
+            path_extra.display(),
+            std::env::var("PATH").unwrap_or_default(),
+        );
+        std::process::Command::new(&wrapper_path)
+            .args(args)
+            .env("PATH", path_env)
+            .env("NINOX_SESSION", session)
+            .env("NINOX_DATA_DIR", data_dir.to_string_lossy().to_string())
+            .output()
+            .expect("failed to run gh wrapper")
+    }
+
+    fn fake_real_gh(pr_url: &str) -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        write_executable(
+            dir.path().join("gh"),
+            &format!("#!/usr/bin/env bash\necho 'Created pull request {pr_url}'\n"),
+        ).unwrap();
+        dir
+    }
+
+    /// `gh -R owner/repo pr create ...` and `gh --repo owner/repo pr create
+    /// ...` must both be detected — a global flag before the subcommand
+    /// previously made the wrapper fall straight through to real gh with no
+    /// metadata capture at all.
+    #[test]
+    fn gh_wrapper_detects_pr_create_behind_global_repo_flags() {
+        for extra_args in [
+            vec!["-R", "org/repo"],
+            vec!["--repo", "org/repo"],
+            vec!["--repo=org/repo"],
+            vec!["-Rorg/repo"],
+        ] {
+            let real_gh_dir = fake_real_gh("https://github.com/org/repo/pull/99");
+            let data_dir = tempdir().unwrap();
+
+            let mut args = extra_args.clone();
+            args.extend(["pr", "create", "--title", "t", "--body", "b"]);
+
+            let output = run_gh_wrapper(&args, real_gh_dir.path(), "s1", data_dir.path());
+            assert!(
+                output.status.success(),
+                "wrapper failed for {extra_args:?}: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let meta = read_session_metadata(data_dir.path(), "s1").unwrap();
+            assert_eq!(
+                meta.pr_number, Some(99),
+                "flags {extra_args:?} should still be detected as pr create",
+            );
+        }
+    }
+
+    /// Regression guard: non-`pr create` invocations (even with the same
+    /// global flags) must still pass straight through with no metadata
+    /// write — the argv scan must not become overly eager.
+    #[test]
+    fn gh_wrapper_does_not_intercept_non_pr_create_invocations() {
+        let real_gh_dir = fake_real_gh("https://github.com/org/repo/pull/99");
+        let data_dir = tempdir().unwrap();
+
+        let output = run_gh_wrapper(
+            &["-R", "org/repo", "pr", "list"],
+            real_gh_dir.path(), "s1", data_dir.path(),
+        );
+        assert!(output.status.success());
+        assert!(!data_dir.path().join("s1.json").exists());
     }
 }

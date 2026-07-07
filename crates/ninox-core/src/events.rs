@@ -1,4 +1,4 @@
-use crate::{github::GitHubClient, store::Store, types::*};
+use crate::{github::{GitHubClient, GithubApi}, store::Store, types::*};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{broadcast, Mutex};
 
@@ -33,7 +33,7 @@ pub struct Engine {
     /// Sending () to the stored sender stops the running reader immediately.
     stream_cancel: Mutex<HashMap<SessionId, tokio::sync::oneshot::Sender<()>>>,
     /// Optional GitHub API client. None when no token is configured.
-    pub github: Option<GitHubClient>,
+    pub github: Option<Arc<dyn GithubApi>>,
 }
 
 impl Engine {
@@ -50,13 +50,28 @@ impl Engine {
 
     pub fn new_with_github(store: Arc<Store>, token: String) -> Arc<Self> {
         let (tx, _) = broadcast::channel(256);
-        let github = GitHubClient::new(token).ok();
+        let github = GitHubClient::new(token).ok()
+            .map(|c| Arc::new(c) as Arc<dyn GithubApi>);
         Arc::new(Self {
             store,
             tx,
             pty_writers:   Mutex::new(HashMap::new()),
             stream_cancel: Mutex::new(HashMap::new()),
             github,
+        })
+    }
+
+    /// Construct an `Engine` with a caller-supplied `GithubApi` — the
+    /// dependency-injection seam tests use to drive the GitHub-enrichment
+    /// poller against a fake instead of the real network.
+    pub fn new_with_github_api(store: Arc<Store>, github: Arc<dyn GithubApi>) -> Arc<Self> {
+        let (tx, _) = broadcast::channel(256);
+        Arc::new(Self {
+            store,
+            tx,
+            pty_writers:   Mutex::new(HashMap::new()),
+            stream_cancel: Mutex::new(HashMap::new()),
+            github:        Some(github),
         })
     }
 

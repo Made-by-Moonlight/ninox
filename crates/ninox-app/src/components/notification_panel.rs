@@ -22,6 +22,7 @@ fn kind_label(kind: &NotificationKind) -> &'static str {
         NotificationKind::WorkerDone       => "Done",
         NotificationKind::WorkRequested    => "Work",
         NotificationKind::ExtraPr          => "Extra PR",
+        NotificationKind::GithubLookupFailed => "GitHub",
     }
 }
 
@@ -34,6 +35,7 @@ fn kind_color(kind: &NotificationKind, s: &ColorScheme) -> Color {
         NotificationKind::WorkerDone       => s.status_done,
         NotificationKind::WorkRequested    => s.status_pr_open,
         NotificationKind::ExtraPr          => s.status_review,
+        NotificationKind::GithubLookupFailed => s.status_ci_failed,
     }
 }
 
