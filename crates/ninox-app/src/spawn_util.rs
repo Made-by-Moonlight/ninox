@@ -249,6 +249,133 @@ pub async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Res
     anyhow::bail!("{}", stderr.trim());
 }
 
+const WORKER_BRAIN_SKILL: &str = r#"---
+name: brain
+description: Read and write Ninox's shared knowledge brain. Use before touching code you haven't seen before, and before finishing your task.
+---
+
+# Read and Write the Brain
+
+The brain is Ninox's persistent, shared knowledge store. Your session's
+brain is already resolved via `NINOX_BRAIN` — these commands act on it with
+no extra configuration.
+
+## Before exploring unfamiliar code
+
+Query first — it blends keyword and semantic matches automatically:
+
+```bash
+ninox brain query "<name or concept>"
+```
+
+If a relevant entry exists, read it before you start digging through files
+yourself. It may save you the exploration entirely.
+
+## Before you finish
+
+Write down anything you discovered that the next session — orchestrator or
+worker — would otherwise have to rediscover: where something lives, why
+it's built the way it is, a gotcha you hit. Create or update a Markdown
+file under the section that fits:
+
+```
+repos/          where repositories live, their purpose, entry points
+symbols/        where types, functions, and modules are defined
+concepts/       domain terminology and mental models
+patterns/       conventions and recurring implementation shapes
+decisions/      why something was built a certain way (ADRs)
+architecture/   how the system is structured — components, data flows
+relationships/  how repos, services, and teams connect
+errors/         known failure modes and how to resolve them
+```
+
+Each file needs YAML frontmatter followed by a Markdown body:
+
+```markdown
+---
+type: repo
+name: my-crate
+tags: [auth, core]
+repos: [my-crate]
+updated: 2026-07-06
+---
+
+# my-crate
+
+Entry point: `src/main.rs`
+Build: `cargo build`
+
+Facts, not prose. Link related entries with `[[other-entry]]`.
+```
+
+Then rebuild the index so the write becomes queryable:
+
+```bash
+ninox brain index
+```
+
+## The Rule
+
+**Query before touching unfamiliar code. Write down what you found before
+you're done.** A stale or empty brain is no better than no brain at all.
+"#;
+
+/// Writes a worker-flavored brain skill into `workspace` so a spawned
+/// worker/standalone session sees "brain" as a real Claude Code skill from
+/// the moment it starts, and makes sure the file can never end up in a
+/// commit. Best-effort: any failure here should be logged and swallowed by
+/// the caller, not treated as fatal to the spawn (mirrors how
+/// `setup_orchestrator_root`'s own failures are handled in `main.rs`).
+pub async fn seed_worker_brain_skill(workspace: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use tokio::fs;
+
+    let skill_dir = std::path::Path::new(workspace)
+        .join(".claude")
+        .join("skills")
+        .join("brain");
+    fs::create_dir_all(&skill_dir).await.context("create .claude/skills/brain")?;
+    fs::write(skill_dir.join("SKILL.md"), WORKER_BRAIN_SKILL)
+        .await
+        .context("write brain SKILL.md")?;
+
+    let out = tokio::process::Command::new("git")
+        .args(["-C", workspace, "rev-parse", "--git-common-dir"])
+        .output()
+        .await
+        .context("git rev-parse --git-common-dir")?;
+    if !out.status.success() {
+        // Not a git repo (or git unavailable) — nothing to protect against
+        // a commit; the skill file itself is still written above.
+        return Ok(());
+    }
+
+    let common_dir_raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let common_dir = if std::path::Path::new(&common_dir_raw).is_absolute() {
+        std::path::PathBuf::from(&common_dir_raw)
+    } else {
+        std::path::Path::new(workspace).join(&common_dir_raw)
+    };
+    let exclude_path = common_dir.join("info").join("exclude");
+
+    const EXCLUDE_LINE: &str = ".claude/skills/brain/";
+    let existing = fs::read_to_string(&exclude_path).await.unwrap_or_default();
+    if !existing.lines().any(|l| l.trim() == EXCLUDE_LINE) {
+        if let Some(parent) = exclude_path.parent() {
+            fs::create_dir_all(parent).await.context("create info dir")?;
+        }
+        let mut updated = existing;
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(EXCLUDE_LINE);
+        updated.push('\n');
+        fs::write(&exclude_path, updated).await.context("write info/exclude")?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +505,78 @@ mod tests {
             matches!(session.status, SessionStatus::Interrupted),
             "failure_status must be honored, not hardcoded to Terminated",
         );
+    }
+
+    #[tokio::test]
+    async fn seed_worker_brain_skill_writes_skill_with_frontmatter() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git")
+            .args(["init", "-q", &ws])
+            .status()
+            .await
+            .unwrap();
+
+        seed_worker_brain_skill(&ws).await.unwrap();
+
+        let skill = tokio::fs::read_to_string(
+            dir.path().join(".claude").join("skills").join("brain").join("SKILL.md"),
+        )
+        .await
+        .unwrap();
+        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
+        assert!(skill.contains("name: brain"));
+        assert!(skill.contains("description:"));
+        assert!(skill.contains("ninox brain query"));
+    }
+
+    #[tokio::test]
+    async fn seed_worker_brain_skill_excludes_itself_from_git_idempotently() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git")
+            .args(["init", "-q", &ws])
+            .status()
+            .await
+            .unwrap();
+
+        seed_worker_brain_skill(&ws).await.unwrap();
+        seed_worker_brain_skill(&ws).await.unwrap();
+
+        let exclude = tokio::fs::read_to_string(dir.path().join(".git").join("info").join("exclude"))
+            .await
+            .unwrap();
+        let count = exclude.lines().filter(|l| l.trim() == ".claude/skills/brain/").count();
+        assert_eq!(count, 1, "the exclude line must appear exactly once, not duplicated");
+
+        // The whole point of the exclude: the skill file must never show up
+        // as untracked/stageable in this repo.
+        let status = tokio::process::Command::new("git")
+            .args(["-C", &ws, "status", "--porcelain"])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "the brain skill file must be excluded from git status, not merely present on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_worker_brain_skill_skips_exclude_when_not_a_git_repo() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+
+        seed_worker_brain_skill(&ws).await.unwrap();
+
+        assert!(
+            dir.path().join(".claude").join("skills").join("brain").join("SKILL.md").exists(),
+            "skill file must still be written even outside a git repo"
+        );
+        assert!(!dir.path().join(".git").exists(), "test setup sanity check: no git repo here");
     }
 }
 
