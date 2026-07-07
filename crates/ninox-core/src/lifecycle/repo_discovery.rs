@@ -339,9 +339,37 @@ pub fn shared_org_relationship_id(owner: &str) -> String {
     format!("relationships/{}-org.md", crate::slugify(owner))
 }
 
+/// Sanitizes `raw` for safe embedding in this brain's hand-rolled YAML
+/// frontmatter (see `brain::parse_frontmatter` / `extract_wikilinks`), which
+/// is not a full YAML parser: it detects flow sequences by a literal
+/// `[`...`]` wrapper and splits them on literal commas, trims (rather than
+/// un-escapes) quote characters from scalars, and terminates a wikilink
+/// alias at the first `]]` or `|`. A mechanically-derived repo name can come
+/// from a directory's basename when there's no git remote to name it from —
+/// and a directory name can contain anything the filesystem allows,
+/// including commas, brackets, and quotes that would otherwise corrupt
+/// `tags: [repo]` / `repos: [<name>]`, truncate a scalar, or break a
+/// `[[id|name]]` wikilink. GitHub-derived names/owners never trip this
+/// (slugs are restricted to `[A-Za-z0-9._-]`), but sanitizing unconditionally
+/// keeps every code path safe by construction rather than relying on that
+/// being permanently true.
+fn sanitize_for_frontmatter(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| match c {
+            '[' | ']' | '{' | '}' | ',' | '"' | '\'' | '#' | ':' | '|' => ' ',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() { "unnamed".to_string() } else { collapsed }
+}
+
 /// Render `repo` as a `repos/` brain entry.
 pub fn repo_entry_markdown(repo: &RepoIdentity, updated: &str) -> String {
-    let mut body = format!("# {}\n\n- Path: `{}`\n", repo.name, repo.path.display());
+    let name = sanitize_for_frontmatter(&repo.name);
+    let mut body = format!("# {name}\n\n- Path: `{}`\n", repo.path.display());
     if let Some(url) = &repo.remote_url {
         body.push_str(&format!("- Remote: {url}\n"));
     }
@@ -358,10 +386,7 @@ pub fn repo_entry_markdown(repo: &RepoIdentity, updated: &str) -> String {
         body.push_str(&format!("\n{purpose}\n"));
     }
 
-    format!(
-        "---\ntype: repo\nname: {name}\ntags: [repo]\nrepos: [{name}]\nupdated: {updated}\n---\n\n{body}",
-        name = repo.name,
-    )
+    format!("---\ntype: repo\nname: {name}\ntags: [repo]\nrepos: [{name}]\nupdated: {updated}\n---\n\n{body}")
 }
 
 /// Render the "extra worktrees" relationship for `repo`, whose own `repos/`
@@ -372,10 +397,10 @@ pub fn worktree_relationship_markdown(
     worktrees: &[PathBuf],
     updated: &str,
 ) -> String {
+    let name = sanitize_for_frontmatter(&repo.name);
     let mut body = format!(
         "# {name} worktrees\n\nAdditional git worktrees observed for [[{repo_entry_id}|{name}]] \
          beyond its canonical location `{canonical}`:\n\n",
-        name = repo.name,
         canonical = repo.path.display(),
     );
     for wt in worktrees {
@@ -384,7 +409,6 @@ pub fn worktree_relationship_markdown(
 
     format!(
         "---\ntype: relationship\nname: {name}-worktrees\ntags: [worktree]\nrepos: [{name}]\nupdated: {updated}\n---\n\n{body}",
-        name = repo.name,
     )
 }
 
@@ -392,14 +416,18 @@ pub fn worktree_relationship_markdown(
 /// by `owner`. `members` is a list of (entry id, name) pairs, as produced by
 /// [`group_by_owner`].
 pub fn shared_org_relationship_markdown(owner: &str, members: &[(String, String)], updated: &str) -> String {
+    let owner = sanitize_for_frontmatter(owner);
     let mut body = format!("# {owner} org\n\nRepos sharing the `{owner}` remote owner/org:\n\n");
+    let mut names = Vec::with_capacity(members.len());
     for (id, name) in members {
+        let name = sanitize_for_frontmatter(name);
         body.push_str(&format!("- [[{id}|{name}]]\n"));
+        names.push(name);
     }
 
     format!(
         "---\ntype: relationship\nname: {owner}-org\ntags: [org]\nrepos: [{repos}]\nupdated: {updated}\n---\n\n{body}",
-        repos = members.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>().join(", "),
+        repos = names.join(", "),
     )
 }
 
@@ -689,6 +717,40 @@ mod tests {
         assert!(md.contains("git@github.com:acme/widget.git"));
         assert!(md.contains("src/main.rs"));
         assert!(md.contains("Widgets, but fast"));
+    }
+
+    /// A directory basename (the identity fallback when there's no git
+    /// remote to name a repo from) can contain anything the filesystem
+    /// allows. Before sanitization, a name like this would corrupt
+    /// `repos: [...]` into two bogus entries (`my` and `repo] [oops]`)
+    /// instead of the one real repo name — proven here against the actual
+    /// brain parser, not just a string-contains check on the generated text.
+    #[test]
+    fn repo_entry_markdown_survives_a_name_with_yaml_breaking_characters() {
+        let repo = RepoIdentity {
+            name: "my, repo] [oops]".to_string(),
+            path: PathBuf::from("/home/x/weird"),
+            remote_url: None,
+            remote_owner: None,
+            remote_repo: None,
+            purpose: None,
+            entry_points: Vec::new(),
+        };
+        let md = repo_entry_markdown(&repo, "2026-07-07");
+
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("repos")).unwrap();
+        std::fs::write(dir.path().join("repos/weird.md"), &md).unwrap();
+
+        let brain = crate::brain::BrainIndex::open(dir.path()).unwrap();
+        brain.rebuild(None).unwrap();
+
+        let entry = brain
+            .get("repos/weird.md")
+            .unwrap()
+            .expect("entry indexed despite an unusual name");
+        assert_eq!(entry.name, "my repo oops");
+        assert_eq!(entry.repos, vec!["my repo oops".to_string()]);
     }
 
     #[test]

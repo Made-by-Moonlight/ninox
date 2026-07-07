@@ -19,7 +19,12 @@ use ninox_core::{
     BrainIndex, QueryFilters,
 };
 use clap::{Parser, Subcommand};
-use std::{path::PathBuf, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
@@ -429,7 +434,10 @@ async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()>
             }
         }
         BrainAction::DiscoverRepos { paths } => {
-            run_discover_repos(&brain, &brain_path, &store, paths)?;
+            // Each catalogue group discovered below opens its own
+            // BrainIndex (see run_discover_repos) rather than reusing
+            // `brain` above, since candidates can span multiple catalogues.
+            run_discover_repos(&brain_path, &store, paths)?;
         }
     }
 
@@ -448,24 +456,39 @@ async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()>
 /// deterministic (see `repo_discovery::repo_entry_ids`), so re-running
 /// overwrites the same file rather than creating a duplicate under a
 /// different name.
+///
+/// Candidate workspaces are grouped by the brain catalogue that should
+/// receive their discovery output, and each group is discovered and written
+/// independently. When `paths` are given explicitly on the CLI, they all go
+/// to `default_brain_path` (this invocation's own resolved brain — the
+/// caller picked it on purpose, same as `ninox brain index`/`query`/`show`).
+/// When defaulting to every known session's `workspace_path`, each session's
+/// own recorded `catalogue_path` (its `NINOX_BRAIN` at spawn time — see
+/// `Session::catalogue_path`) takes precedence over `default_brain_path` —
+/// the same rule `Poller::trigger_brain_harvest` follows, and for the same
+/// reason: a worker spawned against a non-default catalogue must have its
+/// facts land in that catalogue, not silently in whichever brain happens to
+/// be default for this CLI invocation.
 fn run_discover_repos(
-    brain: &BrainIndex,
-    brain_path: &std::path::Path,
+    default_brain_path: &std::path::Path,
     store: &Store,
     paths: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
-    let candidates = if paths.is_empty() {
-        store
-            .list_sessions()?
-            .into_iter()
-            .filter_map(|s| s.workspace_path)
-            .map(PathBuf::from)
-            .collect()
+    let mut groups: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    if paths.is_empty() {
+        for session in store.list_sessions()? {
+            let Some(workspace) = session.workspace_path else { continue };
+            let catalogue = session
+                .catalogue_path
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_brain_path.to_path_buf());
+            groups.entry(catalogue).or_default().push(PathBuf::from(workspace));
+        }
     } else {
-        paths
-    };
+        groups.insert(default_brain_path.to_path_buf(), paths);
+    }
 
-    if candidates.is_empty() {
+    if groups.is_empty() {
         println!(
             "no candidate workspaces — pass one or more paths, or spawn a worker first \
              so the session store has a workspace_path to scan"
@@ -473,7 +496,18 @@ fn run_discover_repos(
         return Ok(());
     }
 
-    let discovery = repo_discovery::discover(&candidates);
+    for (catalogue_path, candidates) in groups {
+        discover_repos_into_catalogue(&catalogue_path, &candidates)?;
+    }
+    Ok(())
+}
+
+/// Discover repos among `candidates` and write the results into the single
+/// brain catalogue at `catalogue_path`. See [`run_discover_repos`] for how
+/// candidates are grouped by catalogue before reaching here.
+fn discover_repos_into_catalogue(catalogue_path: &std::path::Path, candidates: &[PathBuf]) -> anyhow::Result<()> {
+    let brain = BrainIndex::open(catalogue_path)?;
+    let discovery = repo_discovery::discover(candidates);
     let ids = repo_discovery::repo_entry_ids(&discovery.repos);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
@@ -481,7 +515,7 @@ fn run_discover_repos(
     let mut updated_count = 0usize;
     for (repo, id) in discovery.repos.iter().zip(&ids) {
         if brain.get(id)?.is_some() { updated_count += 1 } else { new_count += 1 }
-        write_brain_entry(brain_path, id, &repo_discovery::repo_entry_markdown(repo, &today))?;
+        write_brain_entry(catalogue_path, id, &repo_discovery::repo_entry_markdown(repo, &today))?;
     }
 
     for (repo_index, worktrees) in &discovery.extra_worktrees {
@@ -489,21 +523,22 @@ fn run_discover_repos(
         let repo_id = &ids[*repo_index];
         let id = repo_discovery::worktree_relationship_id(repo_id);
         let markdown = repo_discovery::worktree_relationship_markdown(repo, repo_id, worktrees, &today);
-        write_brain_entry(brain_path, &id, &markdown)?;
+        write_brain_entry(catalogue_path, &id, &markdown)?;
     }
 
     let org_groups = repo_discovery::group_by_owner(&discovery.repos, &ids);
     for (owner, members) in &org_groups {
         let id = repo_discovery::shared_org_relationship_id(owner);
         let markdown = repo_discovery::shared_org_relationship_markdown(owner, members, &today);
-        write_brain_entry(brain_path, &id, &markdown)?;
+        write_brain_entry(catalogue_path, &id, &markdown)?;
     }
 
     let embedder = try_build_embedder();
     let stats = brain.rebuild(embedder.as_deref())?;
     println!(
-        "discovered {} repo(s) ({} new, {} updated), {} worktree relationship(s), \
+        "[{}] discovered {} repo(s) ({} new, {} updated), {} worktree relationship(s), \
          {} shared-org relationship(s) — indexed {} entries",
+        catalogue_path.display(),
         discovery.repos.len(),
         new_count,
         updated_count,
@@ -523,6 +558,93 @@ fn write_brain_entry(brain_path: &std::path::Path, id: &str, content: &str) -> a
     }
     std::fs::write(path, content)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod discover_repos_tests {
+    use super::run_discover_repos;
+    use ninox_core::{store::Store, types::{Session, SessionStatus}};
+    use std::path::Path;
+
+    fn init_repo(dir: &Path, remote: &str) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["remote", "add", "origin", remote]);
+        run(&["commit", "-q", "--allow-empty", "-m", "init"]);
+    }
+
+    fn session(id: &str, workspace: &Path, catalogue_path: Option<&Path>) -> Session {
+        Session {
+            id: id.to_string(),
+            orchestrator_id: None,
+            name: id.to_string(),
+            repo: String::new(),
+            status: SessionStatus::Working,
+            agent_type: "claude-code".to_string(),
+            cost_usd: 0.0,
+            started_at: 0,
+            pr_number: None,
+            pr_id: None,
+            workspace_path: Some(workspace.to_string_lossy().to_string()),
+            pid: None,
+            model: None,
+            context_tokens: None,
+            catalogue_path: catalogue_path.map(|p| p.to_string_lossy().to_string()),
+            context_used_pct: None,
+            context_total_tokens: None,
+            context_window_size: None,
+            claude_session_id: None,
+        }
+    }
+
+    /// Mirrors `Poller::trigger_brain_harvest`'s existing rule (see
+    /// `poller.rs`'s `metadata_sync_brain_harvest_prefers_session_catalogue_path_over_default`
+    /// test): a session spawned against a non-default catalogue must have
+    /// its discovered repo facts land in that catalogue, not silently in
+    /// whichever brain happens to be default for this CLI invocation.
+    #[test]
+    fn discover_repos_routes_each_session_to_its_own_catalogue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default_brain = tmp.path().join("default-brain");
+        let other_brain = tmp.path().join("other-brain");
+
+        let repo_default = tmp.path().join("repo-default");
+        let repo_other = tmp.path().join("repo-other");
+        std::fs::create_dir_all(&repo_default).unwrap();
+        std::fs::create_dir_all(&repo_other).unwrap();
+        init_repo(&repo_default, "git@github.com:acme/repo-default.git");
+        init_repo(&repo_other, "git@github.com:acme/repo-other.git");
+
+        let store = Store::open(tmp.path().join("store.db")).unwrap();
+        // No catalogue_path recorded -- must fall back to the default brain.
+        store.upsert_session(&session("s-default", &repo_default, None)).unwrap();
+        // Spawned against a non-default catalogue -- must land there instead.
+        store.upsert_session(&session("s-other", &repo_other, Some(&other_brain))).unwrap();
+
+        run_discover_repos(&default_brain, &store, Vec::new()).unwrap();
+
+        assert!(
+            default_brain.join("repos/repo-default.md").exists(),
+            "session with no catalogue_path must land in the default brain"
+        );
+        assert!(
+            !default_brain.join("repos/repo-other.md").exists(),
+            "must not leak the other session's repo into the default brain"
+        );
+        assert!(
+            other_brain.join("repos/repo-other.md").exists(),
+            "session with a catalogue_path must land in its own brain"
+        );
+        assert!(
+            !other_brain.join("repos/repo-default.md").exists(),
+            "must not leak the default session's repo into the other catalogue"
+        );
+    }
 }
 
 /// Attempt to construct the local embedding model, falling back to `None`

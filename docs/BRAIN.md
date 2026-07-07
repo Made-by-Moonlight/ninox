@@ -66,6 +66,14 @@ than duplicating them, and reindexes when done. It's a one-shot command today
 spawn time, the way [[brain-harvest]] triggers on PR-open) is a natural
 follow-up, not yet implemented.
 
+When defaulting to every recorded `workspace_path`, sessions can span more
+than one catalogue: a session spawned against a non-default brain (its own
+`NINOX_BRAIN`) has that path recorded as its `catalogue_path`, and discovery
+writes that session's repo into its own catalogue rather than into this
+invocation's default brain — the same per-session catalogue rule
+[[brain-harvest]] follows. Passing explicit paths on the CLI always targets
+this invocation's own resolved brain, matching `index`/`query`/`show`.
+
 ## For orchestrators
 
 The intended loop is simple:
