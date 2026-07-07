@@ -239,6 +239,9 @@ pub struct SelectionState {
     dragging: bool,
     /// Whether the cursor moved after the press (distinguishes click from drag).
     moved: bool,
+    /// Whether the cell under the cursor is currently part of a clickable
+    /// link — drives the pointer cursor via `mouse_interaction`.
+    hovering_link: bool,
 }
 
 impl SelectionState {
@@ -278,6 +281,54 @@ pub struct TerminalWidget<'a> {
     pub session_ids: Vec<String>,
 }
 
+impl<'a> TerminalWidget<'a> {
+    /// Every clickable link span in viewport row `row`, from OSC 8
+    /// hyperlinks (live grid or cached history) or a bare-URL fallback scan.
+    fn row_link_spans(&self, row: usize) -> Vec<crate::components::links::LinkSpan> {
+        use crate::components::links::{find_links, LinkCell};
+
+        let grid = self.state.term.grid();
+        let cols = grid.columns();
+        let rows = grid.screen_lines();
+        if row >= rows {
+            return Vec::new();
+        }
+        let offset = self.state.scrollback.offset as i32;
+        let logical = row as i32 - offset;
+
+        if logical < 0 {
+            let Some(cells) = self.state.scrollback.line_above((-logical - 1) as usize) else {
+                return Vec::new();
+            };
+            let link_cells: Vec<LinkCell> = cells
+                .iter()
+                .map(|c| LinkCell { c: c.c, hyperlink: c.hyperlink.as_deref() })
+                .collect();
+            find_links(&link_cells)
+        } else {
+            use alacritty_terminal::index::{Column, Line};
+            let line = Line(logical);
+            let hyperlinks: Vec<Option<alacritty_terminal::term::cell::Hyperlink>> =
+                (0..cols).map(|c| grid[line][Column(c)].hyperlink()).collect();
+            let link_cells: Vec<LinkCell> = (0..cols)
+                .map(|c| LinkCell {
+                    c: grid[line][Column(c)].c,
+                    hyperlink: hyperlinks[c].as_ref().map(|h| h.uri()),
+                })
+                .collect();
+            find_links(&link_cells)
+        }
+    }
+
+    /// The URL under viewport cell (col, row), if any.
+    fn link_at(&self, col: usize, row: usize) -> Option<String> {
+        self.row_link_spans(row)
+            .into_iter()
+            .find(|s| col >= s.start_col && col <= s.end_col)
+            .map(|s| s.url)
+    }
+}
+
 impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
     type State = SelectionState;
 
@@ -308,24 +359,46 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                 return (iced::widget::canvas::event::Status::Captured, None);
             }
 
-            Event::Mouse(MouseEvent::CursorMoved { .. }) if state.dragging => {
-                if let Some(pos) = cursor.position_in(bounds) {
-                    let cell = SelectionState::pixel_to_cell(pos.x, pos.y, cell_w, cell_h, cols, rows);
-                    if state.anchor != Some(cell) {
-                        state.moved = true;
+            Event::Mouse(MouseEvent::CursorMoved { .. }) => {
+                // Hover-link detection runs regardless of drag state, so the pointer
+                // cursor still reflects the cell under the mouse mid-drag.
+                let hovering = cursor
+                    .position_in(bounds)
+                    .map(|pos| SelectionState::pixel_to_cell(pos.x, pos.y, cell_w, cell_h, cols, rows))
+                    .is_some_and(|(col, row)| self.link_at(col, row).is_some());
+                state.hovering_link = hovering;
+
+                if state.dragging {
+                    if let Some(pos) = cursor.position_in(bounds) {
+                        let cell = SelectionState::pixel_to_cell(pos.x, pos.y, cell_w, cell_h, cols, rows);
+                        if state.anchor != Some(cell) {
+                            state.moved = true;
+                        }
+                        state.end = Some(cell);
+                        self.state.cache.clear();
                     }
-                    state.end = Some(cell);
-                    self.state.cache.clear();
+                    return (iced::widget::canvas::event::Status::Captured, None);
                 }
-                return (iced::widget::canvas::event::Status::Captured, None);
+                return (iced::widget::canvas::event::Status::Ignored, None);
+            }
+
+            Event::Mouse(MouseEvent::CursorLeft) => {
+                state.hovering_link = false;
+                return (iced::widget::canvas::event::Status::Ignored, None);
             }
 
             Event::Mouse(MouseEvent::ButtonReleased(Button::Left)) if state.dragging => {
                 state.dragging = false;
                 if !state.moved {
-                    // Single click — check for a session ID under the cursor.
+                    // Single click — a link takes priority over session-ID navigation.
                     if let (Some((col, row)), Some(pos)) = (state.anchor, cursor.position_in(bounds)) {
                         let _ = pos; // bounds-checked via anchor
+                        if let Some(url) = self.link_at(col, row) {
+                            state.anchor = None;
+                            state.end    = None;
+                            return (iced::widget::canvas::event::Status::Captured,
+                                    Some(Message::OpenUrl(url)));
+                        }
                         let word = word_at(self.state.term.grid(), col, row);
                         if self.session_ids.iter().any(|id| id == &word) {
                             state.anchor = None;
@@ -433,14 +506,16 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                     else {
                         continue;
                     };
+                    let link_spans = self.row_link_spans(row);
                     for (col, cell) in cells.iter().enumerate().take(cols) {
                         let x = col as f32 * cell_w;
                         let is_selected = cell_is_selected(sel, row, col);
+                        let is_link = link_spans.iter().any(|s| col >= s.start_col && col <= s.end_col);
                         draw_cell(
                             frame, x, y, cell_w, cell_h, self.font_size,
                             cell.c, cell.fg, cell.bg, cell.flags,
                             false, // cursor never draws in history
-                            cursor_shape, is_selected,
+                            cursor_shape, is_selected, is_link,
                             colors, &self.ansi, term_bg, term_fg, cursor_color,
                         );
                     }
@@ -448,6 +523,7 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                 }
 
                 let line = Line(logical);
+                let link_spans = self.row_link_spans(row);
                 for col in 0..cols {
                     let column = Column(col);
                     let cell = &grid[line][column];
@@ -458,11 +534,12 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                     let is_cursor =
                         offset == 0 && cursor_point.line == line && cursor_point.column == column;
                     let is_selected = cell_is_selected(sel, row, col);
+                    let is_link = link_spans.iter().any(|s| col >= s.start_col && col <= s.end_col);
 
                     draw_cell(
                         frame, x, y, cell_w, cell_h, self.font_size,
                         cell.c, cell.fg, cell.bg, cell.flags,
-                        is_cursor, cursor_shape, is_selected,
+                        is_cursor, cursor_shape, is_selected, is_link,
                         colors, &self.ansi, term_bg, term_fg, cursor_color,
                     );
                 }
@@ -470,6 +547,19 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
         });
 
         vec![geometry]
+    }
+
+    fn mouse_interaction(
+        &self,
+        state: &Self::State,
+        _bounds: Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> iced::mouse::Interaction {
+        if state.hovering_link {
+            iced::mouse::Interaction::Pointer
+        } else {
+            iced::mouse::Interaction::default()
+        }
     }
 }
 
@@ -510,6 +600,7 @@ fn draw_cell(
     is_cursor: bool,
     cursor_shape: CursorShape,
     is_selected: bool,
+    is_link: bool,
     colors: &alacritty_terminal::term::color::Colors,
     ansi: &[IcedColor; 16],
     term_bg: IcedColor,
@@ -592,7 +683,7 @@ fn draw_cell(
 
     // Decoration strokes — drawn in the resolved (post-transform) fg color.
     let baseline = y + cell_h - 2.0;
-    if flags.contains(Flags::UNDERLINE) {
+    if flags.contains(Flags::UNDERLINE) || is_link {
         stroke_line(frame, x, baseline, x + cell_w, baseline, fg);
     }
     if flags.contains(Flags::DOUBLE_UNDERLINE) {
@@ -822,5 +913,119 @@ mod tests {
         // NOT the old hardcoded 1.4 approximation.
         assert!(h > 13.0 * 1.1 && h < 13.0 * 1.5, "height {h}");
         assert!((h - 13.0 * 1.4).abs() > 0.01, "height must be measured, not the 1.4 guess");
+    }
+
+    fn test_widget<'a>(state: &'a TerminalState) -> TerminalWidget<'a> {
+        TerminalWidget {
+            state,
+            session_id:   String::new(),
+            font_size:    FONT_SIZE,
+            terminal_bg:  IcedColor::BLACK,
+            terminal_fg:  IcedColor::WHITE,
+            cursor_color: IcedColor::WHITE,
+            ansi:         [IcedColor::BLACK; 16],
+            session_ids:  vec![],
+        }
+    }
+
+    #[test]
+    fn row_link_spans_detects_osc8_hyperlink_on_live_grid() {
+        let mut s = TerminalState::new(80, 5, None);
+        s.process(b"\x1b]8;;http://example.com\x1b\\click me\x1b]8;;\x1b\\");
+        let widget = test_widget(&s);
+        let spans = widget.row_link_spans(0);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].url, "http://example.com");
+        assert_eq!(spans[0].start_col, 0);
+        assert_eq!(spans[0].end_col, 7);
+    }
+
+    #[test]
+    fn row_link_spans_detects_bare_url_on_live_grid() {
+        let mut s = TerminalState::new(80, 5, None);
+        s.process(b"see http://example.com/path for docs");
+        let widget = test_widget(&s);
+        let spans = widget.row_link_spans(0);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].url, "http://example.com/path");
+    }
+
+    #[test]
+    fn link_at_returns_none_outside_any_span() {
+        let mut s = TerminalState::new(80, 5, None);
+        s.process(b"see http://example.com/path for docs");
+        let widget = test_widget(&s);
+        assert_eq!(widget.link_at(0, 0), None); // inside "see "
+        assert_eq!(widget.link_at(5, 0), Some("http://example.com/path".to_string()));
+    }
+
+    #[test]
+    fn hovering_a_link_sets_pointer_cursor() {
+        use iced::widget::canvas::Program;
+
+        let mut s = TerminalState::new(80, 5, None);
+        s.process(b"see http://example.com/path for docs");
+        let widget = test_widget(&s);
+        let (cell_w, cell_h) = cell_size(FONT_SIZE);
+        let bounds = Rectangle::new(iced::Point::ORIGIN, Size::new(80.0 * cell_w, 5.0 * cell_h));
+        let mut state = SelectionState::default();
+
+        // Column 5 sits inside "http://example.com/path".
+        let hover_pos = iced::Point::new(5.0 * cell_w + 1.0, 0.5 * cell_h);
+        widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::CursorMoved { position: hover_pos }),
+            bounds,
+            iced::mouse::Cursor::Available(hover_pos),
+        );
+        assert_eq!(
+            widget.mouse_interaction(&state, bounds, iced::mouse::Cursor::Available(hover_pos)),
+            iced::mouse::Interaction::Pointer
+        );
+
+        // Column 0 ("s" of "see") is not a link.
+        let no_link_pos = iced::Point::new(0.5 * cell_w, 0.5 * cell_h);
+        widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::CursorMoved { position: no_link_pos }),
+            bounds,
+            iced::mouse::Cursor::Available(no_link_pos),
+        );
+        assert_eq!(
+            widget.mouse_interaction(&state, bounds, iced::mouse::Cursor::Available(no_link_pos)),
+            iced::mouse::Interaction::default()
+        );
+    }
+
+    #[test]
+    fn clicking_a_link_emits_open_url() {
+        use iced::mouse::Button;
+        use iced::widget::canvas::Program;
+
+        let mut s = TerminalState::new(80, 5, None);
+        s.process(b"see http://example.com/path for docs");
+        let widget = test_widget(&s);
+        let (cell_w, cell_h) = cell_size(FONT_SIZE);
+        let bounds = Rectangle::new(iced::Point::ORIGIN, Size::new(80.0 * cell_w, 5.0 * cell_h));
+        let mut state = SelectionState::default();
+        let pos = iced::Point::new(5.0 * cell_w + 1.0, 0.5 * cell_h);
+        let cursor = iced::mouse::Cursor::Available(pos);
+
+        widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::ButtonPressed(Button::Left)),
+            bounds,
+            cursor,
+        );
+        let (_, message) = widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::ButtonReleased(Button::Left)),
+            bounds,
+            cursor,
+        );
+        match message {
+            Some(Message::OpenUrl(url)) => assert_eq!(url, "http://example.com/path"),
+            other => panic!("expected OpenUrl, got {other:?}"),
+        }
     }
 }
