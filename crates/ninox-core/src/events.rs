@@ -120,10 +120,7 @@ impl Engine {
         let sessions_dir = crate::config::AppConfig::sessions_dir();
         for session in &workers {
             let _ = crate::tmux::kill_session(&session.id).await;
-            if let Some(ref wp) = session.workspace_path {
-                remove_worker_worktree(wp, &session.id).await;
-            }
-            crate::hooks::remove_session_artifacts(&sessions_dir, &session.id);
+            remove_worktree_and_artifacts(&session.id, session.workspace_path.as_deref(), &sessions_dir).await;
         }
         // Also kill the orchestrator's own tmux session (same id as orchestrator).
         let _ = crate::tmux::kill_session(orchestrator_id).await;
@@ -138,14 +135,11 @@ impl Engine {
     /// Kill the tmux session and delete it from the DB entirely.
     pub async fn remove_session(&self, session_id: &str) -> anyhow::Result<()> {
         let _ = crate::tmux::kill_session(session_id).await;
-        if let Ok(Some(session)) = self.store.get_session(session_id) {
-            if let Some(ref wp) = session.workspace_path {
-                remove_worker_worktree(wp, session_id).await;
-            }
-        }
-        crate::hooks::remove_session_artifacts(
-            &crate::config::AppConfig::sessions_dir(), session_id,
-        );
+        let workspace_path = self.store.get_session(session_id).ok().flatten()
+            .and_then(|s| s.workspace_path);
+        remove_worktree_and_artifacts(
+            session_id, workspace_path.as_deref(), &crate::config::AppConfig::sessions_dir(),
+        ).await;
         self.store.delete_session(session_id)?;
         self.emit(Event::SessionDone(session_id.to_string()));
         Ok(())
@@ -165,20 +159,49 @@ impl Engine {
         let _ = crate::tmux::kill_session(session_id).await;
 
         if let Some(mut session) = self.store.get_session(session_id)? {
-            session.status = crate::types::SessionStatus::Terminated;
+            // Never clobber a terminal status — most importantly, never flip
+            // a `Done` session back to `Terminated`. `Done` is only ever
+            // reached via `handle_merge_detection`, which already notified
+            // the orchestrator; `sweep_retired_sessions`'s notification
+            // dedup relies on `Done` meaning "already told" (see
+            // `lifecycle::poller::sweep_retired_sessions`), so re-marking it
+            // `Terminated` here would make the sweep send a second,
+            // contradictory notice for a PR that was in fact merged.
+            if matches!(
+                session.status,
+                SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted
+            ) {
+                return Ok(());
+            }
+            session.status = SessionStatus::Terminated;
             self.store.upsert_session(&session)?;
             self.emit(Event::SessionUpdated(session));
         }
         Ok(())
     }
 
-    /// Kill the tmux session (best-effort) and mark it Done in the DB.
-    /// Called automatically when a PR is merged. Emits SessionUpdated.
+    /// Kill the tmux session (best-effort), remove its worktree/artifacts,
+    /// and mark it Done in the DB. Called automatically when a PR is
+    /// merged. Emits SessionUpdated. Mirrors `remove_session`'s worktree
+    /// and artifact cleanup so the record isn't deleted here but still
+    /// stops leaking a checked-out worktree and per-session hook files.
     pub async fn cleanup_session(&self, session_id: &str) -> anyhow::Result<()> {
+        self.cleanup_session_in(session_id, &crate::config::AppConfig::sessions_dir()).await
+    }
+
+    /// `cleanup_session`'s implementation, with the sessions dir as a
+    /// parameter so tests can point artifact removal at a tempdir instead
+    /// of the real `AppConfig::sessions_dir()`.
+    async fn cleanup_session_in(
+        &self,
+        session_id:   &str,
+        sessions_dir: &std::path::Path,
+    ) -> anyhow::Result<()> {
         // Best-effort tmux kill — session may already be dead.
         let _ = crate::tmux::kill_session(session_id).await;
 
         if let Some(mut session) = self.store.get_session(session_id)? {
+            remove_worktree_and_artifacts(session_id, session.workspace_path.as_deref(), sessions_dir).await;
             session.status = crate::types::SessionStatus::Done;
             session.terminal_at = Some(crate::lifecycle::poller::now_millis());
             self.store.upsert_session(&session)?;
@@ -186,6 +209,21 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// Remove a session's worktree (if any) and hook artifacts — the shared
+/// teardown tail of `remove_orchestrator`, `remove_session`, and
+/// `cleanup_session`, so none of them leak a checked-out worktree or
+/// per-session hook files.
+async fn remove_worktree_and_artifacts(
+    session_id:     &str,
+    workspace_path: Option<&str>,
+    sessions_dir:   &std::path::Path,
+) {
+    if let Some(wp) = workspace_path {
+        remove_worker_worktree(wp, session_id).await;
+    }
+    crate::hooks::remove_session_artifacts(sessions_dir, session_id);
 }
 
 /// Remove a Ninox-managed git worktree (best-effort, never propagates errors).
@@ -259,6 +297,43 @@ mod tests {
         }
     }
 
+    /// A `Done` session (reached via `cleanup_session`, which already
+    /// notified the orchestrator about the merge) must never be flipped back
+    /// to `Terminated` by a later `terminate_session` call (e.g. the `DELETE
+    /// /sessions/:id` route firing on a stale client, or a race with the
+    /// poller). `sweep_retired_sessions`'s notification dedup relies on
+    /// `Done` meaning "already told" — reopening it as `Terminated` would
+    /// make the sweep send a second, contradictory notification claiming the
+    /// PR was never detected merged.
+    #[tokio::test]
+    async fn terminate_session_does_not_reopen_a_done_session() {
+        let store = Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
+        let session = crate::types::Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: crate::types::SessionStatus::Done,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: Some(1), pr_id: Some(1), workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
+            summary: None,
+            terminal_at: Some(1_000),
+        };
+        store.upsert_session(&session).unwrap();
+        let engine = Engine::new(Arc::clone(&store));
+        let mut rx = engine.subscribe();
+
+        engine.terminate_session("s1").await.unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a no-op terminate_session on a Done session must not emit SessionUpdated"
+        );
+        let after = store.get_session("s1").unwrap().unwrap();
+        assert!(matches!(after.status, crate::types::SessionStatus::Done), "status must stay Done");
+        assert_eq!(after.terminal_at, Some(1_000), "terminal_at must be untouched");
+    }
+
     #[tokio::test]
     async fn cleanup_session_sets_done_status() {
         let store = Arc::new(
@@ -293,6 +368,56 @@ mod tests {
         } else {
             panic!("expected SessionUpdated");
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_session_removes_worktree_and_artifacts() {
+        // Real git repo + real worktree so we exercise the same
+        // `remove_worker_worktree` path `remove_session` uses, not a mock.
+        let repo_dir = tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo_dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "init"]);
+
+        let session_id = "s1";
+        let worktree_path = repo_dir.path().join(".claude/worktrees").join(session_id);
+        run_git(&["worktree", "add", "-q", worktree_path.to_str().unwrap()]);
+        assert!(worktree_path.exists(), "test setup: worktree must exist before cleanup");
+
+        let sessions_dir = tempdir().unwrap();
+        let artifact_path = sessions_dir.path().join(format!("{session_id}.json"));
+        std::fs::write(&artifact_path, "{}").unwrap();
+
+        let store = Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
+        let session = crate::types::Session {
+            id: session_id.into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: crate::types::SessionStatus::PrOpen,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: Some(1), pr_id: Some(1),
+            workspace_path: Some(worktree_path.to_string_lossy().to_string()),
+            pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
+            summary: None,
+            terminal_at: None,
+        };
+        store.upsert_session(&session).unwrap();
+        let engine = Engine::new(Arc::clone(&store));
+
+        engine.cleanup_session_in(session_id, sessions_dir.path()).await.unwrap();
+
+        assert!(!worktree_path.exists(), "cleanup_session must remove the worktree, like remove_session does");
+        assert!(!artifact_path.exists(), "cleanup_session must remove session artifacts, like remove_session does");
+        let after = store.get_session(session_id).unwrap().unwrap();
+        assert!(matches!(after.status, crate::types::SessionStatus::Done));
     }
 
     #[tokio::test]

@@ -54,9 +54,19 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cargo/bin
+            ~/Library/Caches/ort.pyke.io
             target
-          key: ${{ runner.os }}-cargo-bundle-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-bundle-
+          # v2: the cache key must change whenever the cached *paths* change
+          # (not just Cargo.lock) — bumping straight to a new key here forces
+          # this run to do a full rebuild that actually re-executes the
+          # `ort-sys` build script and repopulates `~/Library/Caches/ort.pyke.io`
+          # from scratch, rather than restoring the old `v1` cache (which
+          # never captured that directory) and skipping the build script
+          # because its `target/` fingerprint looks up to date — the actual
+          # bug behind the "library 'clang_rt.osx' not found" / missing
+          # ort.pyke.io search-path link failures.
+          key: ${{ runner.os }}-cargo-bundle-v2-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-bundle-v2-
       - name: Install cargo-bundle
         run: command -v cargo-bundle || cargo install cargo-bundle
       - name: Build Ninox.app
