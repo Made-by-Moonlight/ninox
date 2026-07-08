@@ -876,11 +876,38 @@ impl Poller {
             if !expired {
                 continue;
             }
-            if let Err(e) = self.engine.store.delete_session(&session.id) {
+            // `Done` sessions only ever get there via `handle_merge_detection`
+            // (see `poll_github`), which already sent
+            // `format_worker_done_reaction` to the orchestrator before
+            // transitioning the status — notifying again here would be a
+            // duplicate. `Terminated` sessions (worker process died on its
+            // own via `poll_pids`, or a direct `terminate_session`) have
+            // never been told anything — this is their one and only chance
+            // before the record disappears for good.
+            if matches!(session.status, SessionStatus::Terminated) {
+                self.engine.emit(Event::Notification(Notification {
+                    id:         format!("retired-{}", session.id),
+                    kind:       NotificationKind::WorkerDone,
+                    title:      format!("Worker retired — {}", session.name),
+                    body:       "Session cleaned up without a detected PR merge".to_string(),
+                    session_id: Some(session.id.clone()),
+                    created_at: now,
+                }));
+                if let Some(orch) = session.orchestrator_id.clone() {
+                    let msg = crate::lifecycle::reactions::format_worker_retired_reaction(&session);
+                    if let Err(e) = self.engine.send_to_session(&orch, &msg).await {
+                        tracing::warn!("send worker-retired reaction to orchestrator {orch}: {e}");
+                    }
+                }
+            }
+            // Delegate to `remove_session` rather than deleting the row
+            // directly — it also kills any lingering tmux session and
+            // removes the worktree/artifacts, so a session that never went
+            // through `handle_merge_detection`'s cleanup still gets it here.
+            if let Err(e) = self.engine.remove_session(&session.id).await {
                 tracing::warn!("purge retired session {}: {e}", session.id);
                 continue;
             }
-            self.engine.emit(Event::SessionDone(session.id));
         }
     }
 }
@@ -2429,5 +2456,76 @@ mod tests {
         poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
 
         assert!(store.get_session("still-working").unwrap().is_some());
+    }
+
+    /// A session that reaches `Terminated` without ever going through
+    /// `handle_merge_detection` (e.g. `poll_pids` reaping a dead process, or
+    /// a direct `terminate_session`) must still tell its orchestrator before
+    /// its record disappears for good — this is the gap `sweep_retired_sessions`
+    /// used to have when it purged sessions via `store.delete_session` directly.
+    #[tokio::test]
+    async fn sweep_retired_sessions_notifies_orchestrator_for_never_merge_detected_session() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Terminated; // e.g. poll_pids reaping a dead process
+        s.orchestrator_id = Some("orch1".into());
+        s.terminal_at = Some(0); // maximally stale, past any retention window
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
+
+        assert!(store.get_session("w1").unwrap().is_none(), "session must still be purged");
+
+        let events = drain_events(&mut rx);
+        let retired_notifs = events.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+                && n.id == "retired-w1"
+        )).count();
+        assert_eq!(retired_notifs, 1, "orchestrator must be told its worker was retired");
+    }
+
+    /// A session that already went through `handle_merge_detection` (and so
+    /// already got `format_worker_done_reaction`) must not be notified again
+    /// when the retention sweep later purges it — the merge-detection
+    /// notification is the one and only notice the orchestrator needs.
+    #[tokio::test]
+    async fn sweep_retired_sessions_does_not_double_notify_a_merge_detected_session() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.orchestrator_id = Some("orch1".into());
+        s.pr_number = Some(7);
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        // The merge-detection happy path — this already notifies orch1 and
+        // marks the session Done.
+        assert!(poller.handle_merge_detection(&s, 7, true).await);
+        drain_events(&mut rx); // discard the merge-detection's own notification/events
+
+        // Fast-forward past the retention window and let the sweep purge it.
+        let mut done = store.get_session("w1").unwrap().unwrap();
+        done.terminal_at = Some(0);
+        store.upsert_session(&done).unwrap();
+
+        poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
+
+        assert!(store.get_session("w1").unwrap().is_none(), "session must still be purged");
+
+        let events = drain_events(&mut rx);
+        let retired_notifs = events.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+        )).count();
+        assert_eq!(retired_notifs, 0, "must not re-notify a session already told about its merge");
     }
 }

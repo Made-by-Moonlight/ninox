@@ -172,13 +172,31 @@ impl Engine {
         Ok(())
     }
 
-    /// Kill the tmux session (best-effort) and mark it Done in the DB.
-    /// Called automatically when a PR is merged. Emits SessionUpdated.
+    /// Kill the tmux session (best-effort), remove its worktree/artifacts,
+    /// and mark it Done in the DB. Called automatically when a PR is
+    /// merged. Emits SessionUpdated. Mirrors `remove_session`'s worktree
+    /// and artifact cleanup so the record isn't deleted here but still
+    /// stops leaking a checked-out worktree and per-session hook files.
     pub async fn cleanup_session(&self, session_id: &str) -> anyhow::Result<()> {
+        self.cleanup_session_in(session_id, &crate::config::AppConfig::sessions_dir()).await
+    }
+
+    /// `cleanup_session`'s implementation, with the sessions dir as a
+    /// parameter so tests can point artifact removal at a tempdir instead
+    /// of the real `AppConfig::sessions_dir()`.
+    async fn cleanup_session_in(
+        &self,
+        session_id:   &str,
+        sessions_dir: &std::path::Path,
+    ) -> anyhow::Result<()> {
         // Best-effort tmux kill — session may already be dead.
         let _ = crate::tmux::kill_session(session_id).await;
 
         if let Some(mut session) = self.store.get_session(session_id)? {
+            if let Some(ref wp) = session.workspace_path {
+                remove_worker_worktree(wp, session_id).await;
+            }
+            crate::hooks::remove_session_artifacts(sessions_dir, session_id);
             session.status = crate::types::SessionStatus::Done;
             session.terminal_at = Some(crate::lifecycle::poller::now_millis());
             self.store.upsert_session(&session)?;
@@ -293,6 +311,56 @@ mod tests {
         } else {
             panic!("expected SessionUpdated");
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_session_removes_worktree_and_artifacts() {
+        // Real git repo + real worktree so we exercise the same
+        // `remove_worker_worktree` path `remove_session` uses, not a mock.
+        let repo_dir = tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo_dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "init"]);
+
+        let session_id = "s1";
+        let worktree_path = repo_dir.path().join(".claude/worktrees").join(session_id);
+        run_git(&["worktree", "add", "-q", worktree_path.to_str().unwrap()]);
+        assert!(worktree_path.exists(), "test setup: worktree must exist before cleanup");
+
+        let sessions_dir = tempdir().unwrap();
+        let artifact_path = sessions_dir.path().join(format!("{session_id}.json"));
+        std::fs::write(&artifact_path, "{}").unwrap();
+
+        let store = Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
+        let session = crate::types::Session {
+            id: session_id.into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: crate::types::SessionStatus::PrOpen,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: Some(1), pr_id: Some(1),
+            workspace_path: Some(worktree_path.to_string_lossy().to_string()),
+            pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
+            summary: None,
+            terminal_at: None,
+        };
+        store.upsert_session(&session).unwrap();
+        let engine = Engine::new(Arc::clone(&store));
+
+        engine.cleanup_session_in(session_id, sessions_dir.path()).await.unwrap();
+
+        assert!(!worktree_path.exists(), "cleanup_session must remove the worktree, like remove_session does");
+        assert!(!artifact_path.exists(), "cleanup_session must remove session artifacts, like remove_session does");
+        let after = store.get_session(session_id).unwrap().unwrap();
+        assert!(matches!(after.status, crate::types::SessionStatus::Done));
     }
 
     #[tokio::test]

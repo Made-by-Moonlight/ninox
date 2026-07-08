@@ -85,6 +85,28 @@ pub fn format_worker_done_reaction(worker: &Session, pr_number: u64) -> String {
     )
 }
 
+/// Format a worker-retired reaction for the *orchestrator*: fired by the
+/// retention sweep (`Poller::sweep_retired_sessions`) when a worker session
+/// is purged from the store without ever having gone through
+/// `handle_merge_detection` — e.g. its process exited on its own, or it was
+/// terminated directly, before its PR (if any) was detected merged. Unlike
+/// `format_worker_done_reaction`, this does NOT imply the worker's work
+/// landed — the orchestrator should check the PR's actual state.
+pub fn format_worker_retired_reaction(worker: &Session) -> String {
+    match worker.pr_number {
+        Some(pr) => format!(
+            "[Ninox] Worker `{id}` was cleaned up and its session is gone — \
+             its PR #{pr} was not detected as merged, so check its state.",
+            id = worker.id,
+        ),
+        None => format!(
+            "[Ninox] Worker `{id}` was cleaned up and its session is gone \
+             without ever opening a PR.",
+            id = worker.id,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +183,24 @@ mod tests {
         assert!(msg.contains("s1"), "must name the worker session");
         assert!(msg.contains("#42"), "must name the merged PR");
         assert!(msg.to_lowercase().contains("merged"));
+    }
+
+    #[test]
+    fn worker_retired_reaction_names_worker_and_pr_when_present() {
+        let worker = mock_session(); // id "s1", pr_number Some(7)
+        let msg = format_worker_retired_reaction(&worker);
+        assert!(msg.contains("s1"), "must name the worker session");
+        assert!(msg.contains("#7"), "must name the tracked PR");
+        assert!(!msg.to_lowercase().contains("merged successfully"));
+    }
+
+    #[test]
+    fn worker_retired_reaction_omits_pr_when_none() {
+        let mut worker = mock_session();
+        worker.pr_number = None;
+        let msg = format_worker_retired_reaction(&worker);
+        assert!(msg.contains("s1"));
+        assert!(msg.contains("without ever opening a PR"));
     }
 
     #[test]
