@@ -170,11 +170,18 @@ jobs:
       - name: Build Ninox.app
         run: cargo bundle --release -p ninox --format osx
 
+      - name: Verify bundle
+        run: |
+          set -euo pipefail
+          test -d target/release/bundle/osx/Ninox.app
+          test -x target/release/bundle/osx/Ninox.app/Contents/MacOS/ninox
+          test -f target/release/bundle/osx/Ninox.app/Contents/Resources/Ninox.icns
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" target/release/bundle/osx/Ninox.app/Contents/Info.plist
+
       - name: Zip Ninox.app
         run: |
           set -euo pipefail
           cd target/release/bundle/osx
-          test -d Ninox.app
           ditto -c -k --sequesterRsrc --keepParent Ninox.app Ninox.app.zip
 
       - name: Upload to release
