@@ -37,7 +37,13 @@ pub struct ImportStats {
 
 /// Package every Markdown file under `brain_path` into a gzipped tarball at
 /// `output_path`, preserving relative paths (e.g. `repos/ninox.md`).
+///
+/// Creates `brain_path` if it doesn't exist yet (mirrors `BrainIndex::open`),
+/// so exporting a brain that has never been indexed produces an empty
+/// archive instead of a raw "no such file or directory" error.
 pub fn export(brain_path: &Path, output_path: &Path) -> Result<ExportStats> {
+    fs::create_dir_all(brain_path).with_context(|| format!("create brain dir {brain_path:?}"))?;
+
     let out_file = fs::File::create(output_path)
         .with_context(|| format!("create archive {output_path:?}"))?;
     let mut builder = tar::Builder::new(GzEncoder::new(out_file, Compression::default()));
@@ -71,6 +77,30 @@ pub fn export(brain_path: &Path, output_path: &Path) -> Result<ExportStats> {
     Ok(ExportStats { files })
 }
 
+/// Reject an entry whose path or type could let extraction escape
+/// `target_brain_path` — required because `Entry::unpack`, unlike
+/// `Entry::unpack_in`, does not guard against this itself. An absolute path
+/// or a `..` component could point anywhere on disk once joined onto the
+/// target dir, and a symlink/hard-link entry could redirect a *later*
+/// same-named entry through it.
+fn check_entry_is_safe(rel_path: &Path, entry_type: tar::EntryType) -> Result<()> {
+    if rel_path.is_absolute()
+        || rel_path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("archive entry {rel_path:?} has an unsafe path");
+    }
+    if entry_type.is_symlink() || entry_type.is_hard_link() {
+        bail!("archive entry {rel_path:?} is a symlink/hard link, refusing to extract it");
+    }
+    Ok(())
+}
+
+fn open_archive(archive_path: &Path) -> Result<tar::Archive<GzDecoder<fs::File>>> {
+    let in_file =
+        fs::File::open(archive_path).with_context(|| format!("open archive {archive_path:?}"))?;
+    Ok(tar::Archive::new(GzDecoder::new(in_file)))
+}
+
 /// Extract a `.tar.gz` produced by [`export`] into `target_brain_path`.
 ///
 /// An entry whose relative path already exists under `target_brain_path` is
@@ -79,34 +109,34 @@ pub fn export(brain_path: &Path, output_path: &Path) -> Result<ExportStats> {
 /// notes. Rebuilding the SQLite index afterwards is the caller's
 /// responsibility (mirrors `ninox brain index`).
 ///
-/// Every entry path is required to be relative and free of `..` components,
-/// and every entry must be a regular file or directory — symlink and hard
-/// link entries are refused outright — so a malicious or corrupted archive
-/// can never write outside `target_brain_path` (`Entry::unpack`, unlike
-/// `Entry::unpack_in`, does not guard against this itself).
+/// Runs in two passes: the first validates every entry via
+/// [`check_entry_is_safe`] without writing anything, so an archive
+/// containing even one unsafe entry (absolute path, `..` traversal, symlink,
+/// hard link) is rejected wholesale instead of leaving a half-imported,
+/// unreported brain on disk from the entries that came before it. The
+/// second pass does the actual extraction; a per-entry failure there (e.g.
+/// a `--force` overwrite of a file by a same-named directory) is recorded in
+/// [`ImportStats::failed`] rather than aborting, so one bad entry still
+/// doesn't lose the rest of an otherwise-good import.
 pub fn import(archive_path: &Path, target_brain_path: &Path, force: bool) -> Result<ImportStats> {
     fs::create_dir_all(target_brain_path)
         .with_context(|| format!("create brain dir {target_brain_path:?}"))?;
 
-    let in_file =
-        fs::File::open(archive_path).with_context(|| format!("open archive {archive_path:?}"))?;
-    let mut archive = tar::Archive::new(GzDecoder::new(in_file));
+    let mut validate_archive = open_archive(archive_path)?;
+    for entry in validate_archive.entries().context("read archive entries")? {
+        let entry = entry.context("read archive entry")?;
+        let rel_path = entry.path().context("read entry path")?.to_path_buf();
+        check_entry_is_safe(&rel_path, entry.header().entry_type())?;
+    }
 
+    let mut archive = open_archive(archive_path)?;
     let mut stats = ImportStats::default();
     for entry in archive.entries().context("read archive entries")? {
         let mut entry = entry.context("read archive entry")?;
         let rel_path = entry.path().context("read entry path")?.to_path_buf();
-
-        if rel_path.is_absolute()
-            || rel_path.components().any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            bail!("archive entry {rel_path:?} has an unsafe path");
-        }
-
         let entry_type = entry.header().entry_type();
-        if entry_type.is_symlink() || entry_type.is_hard_link() {
-            bail!("archive entry {rel_path:?} is a symlink/hard link, refusing to extract it");
-        }
+        check_entry_is_safe(&rel_path, entry_type)?;
+
         if entry_type.is_dir() {
             // Directories are implicit in the relative file paths we
             // extract; nothing to do for an explicit directory entry.
@@ -273,21 +303,21 @@ mod tests {
     // these, so they're hand-built with the low-level `tar` API directly.
     // -----------------------------------------------------------------
 
-    fn write_single_entry_archive(
-        archive_path: &Path,
+    type RawBuilder = tar::Builder<GzEncoder<fs::File>>;
+
+    // Appends an entry by writing the name field's raw bytes directly
+    // rather than through `Header::set_path`, which itself refuses absolute
+    // paths and `..` components — bypassing it here simulates a
+    // hand-crafted malicious archive, which the tar *format* doesn't
+    // forbid even though this crate's own writer does.
+    fn append_raw_entry(
+        builder: &mut RawBuilder,
         entry_path: &str,
         entry_type: tar::EntryType,
         content: &[u8],
         link_target: Option<&str>,
     ) {
-        let file = fs::File::create(archive_path).unwrap();
-        let mut builder = tar::Builder::new(GzEncoder::new(file, Compression::default()));
         let mut header = tar::Header::new_gnu();
-        // Write the name field's raw bytes directly rather than through
-        // `Header::set_path`, which itself refuses absolute paths and `..`
-        // components — bypassing it here simulates a hand-crafted malicious
-        // archive, which the tar *format* doesn't forbid even though this
-        // crate's own writer does.
         {
             let name_bytes = entry_path.as_bytes();
             assert!(name_bytes.len() < 100, "test path too long for the name field");
@@ -301,6 +331,18 @@ mod tests {
         }
         header.set_cksum();
         builder.append(&header, content).unwrap();
+    }
+
+    fn write_single_entry_archive(
+        archive_path: &Path,
+        entry_path: &str,
+        entry_type: tar::EntryType,
+        content: &[u8],
+        link_target: Option<&str>,
+    ) {
+        let file = fs::File::create(archive_path).unwrap();
+        let mut builder = tar::Builder::new(GzEncoder::new(file, Compression::default()));
+        append_raw_entry(&mut builder, entry_path, entry_type, content, link_target);
         let enc = builder.into_inner().unwrap();
         enc.finish().unwrap();
     }
@@ -419,5 +461,53 @@ mod tests {
         assert_eq!(stats.failed.len(), 1);
         assert_eq!(stats.failed[0].0, PathBuf::from("repos/a.md"));
         assert!(target_dir.path().join("repos/b.md").exists());
+    }
+
+    #[test]
+    fn import_writes_nothing_when_any_entry_fails_the_safety_check() {
+        let archive_dir = tempdir().unwrap();
+        let archive_path = archive_dir.path().join("mixed.tar.gz");
+        {
+            let file = fs::File::create(&archive_path).unwrap();
+            let mut builder = tar::Builder::new(GzEncoder::new(file, Compression::default()));
+            // A perfectly safe entry ordered *before* the unsafe one, so a
+            // naive per-entry bail would already have written it to disk.
+            append_raw_entry(&mut builder, "repos/a.md", tar::EntryType::Regular, b"safe content", None);
+            append_raw_entry(
+                &mut builder,
+                "/etc/cron.d/pwn",
+                tar::EntryType::Regular,
+                b"malicious",
+                None,
+            );
+            let enc = builder.into_inner().unwrap();
+            enc.finish().unwrap();
+        }
+
+        let target_dir = tempdir().unwrap();
+        let err = import(&archive_path, target_dir.path(), false).unwrap_err();
+        assert!(err.to_string().contains("unsafe path"), "unexpected error: {err}");
+        assert!(
+            !target_dir.path().join("repos/a.md").exists(),
+            "no entry should be written when the archive contains any unsafe entry, even one ordered earlier"
+        );
+    }
+
+    #[test]
+    fn export_creates_brain_dir_if_missing_and_produces_empty_archive() {
+        let parent_dir = tempdir().unwrap();
+        let brain_path = parent_dir.path().join("never-indexed-brain");
+        assert!(!brain_path.exists());
+
+        let archive_dir = tempdir().unwrap();
+        let archive_path = archive_dir.path().join("brain.tar.gz");
+        let stats = export(&brain_path, &archive_path).unwrap();
+
+        assert_eq!(stats.files, 0);
+        assert!(
+            brain_path.exists(),
+            "export should create the brain dir on demand, like BrainIndex::open does"
+        );
+        assert!(archive_path.exists());
     }
 }
