@@ -73,7 +73,11 @@ fn action_button<'a>(label: &'a str, color: Color, message: Option<Message>, s: 
 /// The action row for kinds that carry a follow-up action — `None` for
 /// everything else. `UpdateAvailable` triggers the `cargo install` subprocess
 /// (disabled/relabeled mid-flight via `app.update_in_progress`);
-/// `UpdateInstalled` prompts a restart to pick up the new binary.
+/// `UpdateInstalled` prompts a restart to pick up the new binary;
+/// `UpdateFailed` offers an immediate retry — the periodic background check
+/// (`poller::poll_update_check`) already recorded this version as notified
+/// before the install was attempted, so without this button a failed
+/// install wouldn't get another automatic reminder for the same version.
 fn notification_action<'a>(app: &'a App, kind: &NotificationKind, s: &ColorScheme) -> Option<Element<'a, Message>> {
     match kind {
         NotificationKind::UpdateAvailable => Some(if app.update_in_progress {
@@ -84,6 +88,11 @@ fn notification_action<'a>(app: &'a App, kind: &NotificationKind, s: &ColorSchem
         NotificationKind::UpdateInstalled => Some(action_button(
             "Restart now", kind_color(kind, s), Some(Message::RestartApp), s,
         )),
+        NotificationKind::UpdateFailed => Some(if app.update_in_progress {
+            action_button("Retrying…", s.faint, None, s)
+        } else {
+            action_button("Retry", kind_color(kind, s), Some(Message::ApplyUpdate), s)
+        }),
         _ => None,
     }
 }

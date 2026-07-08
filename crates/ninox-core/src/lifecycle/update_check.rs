@@ -60,7 +60,11 @@ pub fn resolve_registry_source(cargo_home: &Path) -> Option<RegistrySource> {
         .as_str()?;
     let registry = value.get("registries")?.get(registry_name)?;
     let index = registry.get("index")?.as_str()?;
-    let index_url = format!("{}/", index.strip_prefix("sparse+").unwrap_or(index).trim_end_matches('/'));
+    // Only the sparse HTTP protocol is supported — a git-based index (no
+    // `sparse+` prefix) would need a full git checkout to read, which this
+    // module doesn't do. Treat it the same as "nothing configured" rather
+    // than sending a bogus HTTP request to a git URL.
+    let index_url = format!("{}/", index.strip_prefix("sparse+")?.trim_end_matches('/'));
     let credential_provider = registry
         .get("credential-provider")
         .and_then(|v| v.as_str())
@@ -292,6 +296,19 @@ index = "sparse+https://example.com/cargo/synthesia-cargo/"
 
 [source.crates-io]
 replace-with = "synthesia-cargo"
+"#);
+        assert!(resolve_registry_source(dir.path()).is_none());
+    }
+
+    #[test]
+    fn resolve_registry_source_none_for_a_non_sparse_index() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cargo_config(dir.path(), r#"
+[registries.git-registry]
+index = "https://example.com/git-index.git"
+
+[source.crates-io]
+replace-with = "git-registry"
 "#);
         assert!(resolve_registry_source(dir.path()).is_none());
     }

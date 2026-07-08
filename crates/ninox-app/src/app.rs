@@ -65,6 +65,12 @@ pub enum VersionCheckState {
     Checking,
     UpToDate,
     UpdateAvailable(String),
+    /// `ApplyUpdate` finished successfully — set directly by
+    /// `Message::UpdateApplied` (not by a fresh `ensure_version_check`)
+    /// since the running process is still the old binary until restarted,
+    /// so re-checking the registry would just report `UpdateAvailable`
+    /// again for the exact version that was just installed.
+    Installed,
     Failed,
 }
 
@@ -2115,6 +2121,7 @@ impl App {
                     .as_millis() as i64;
                 match result {
                     Ok(()) => {
+                        state.version_check = VersionCheckState::Installed;
                         Self::push_notification(state, Notification {
                             id:         format!("update-installed-{ts}"),
                             kind:       NotificationKind::UpdateInstalled,
@@ -2126,6 +2133,7 @@ impl App {
                     }
                     Err(e) => {
                         tracing::error!("update install failed: {e}");
+                        state.version_check = VersionCheckState::Failed;
                         Self::push_notification(state, Notification {
                             id:         format!("update-failed-{ts}"),
                             kind:       NotificationKind::UpdateFailed,
@@ -2140,8 +2148,13 @@ impl App {
             }
 
             Message::RestartApp => {
-                if let Ok(exe) = std::env::current_exe() {
-                    let _ = std::process::Command::new(exe).spawn();
+                match std::env::current_exe() {
+                    Ok(exe) => {
+                        if let Err(e) = std::process::Command::new(exe).spawn() {
+                            tracing::warn!("restart: failed to spawn new instance: {e}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("restart: couldn't resolve current_exe: {e}"),
                 }
                 iced::exit()
             }
