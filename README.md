@@ -34,6 +34,13 @@ The HTTP server always starts on `127.0.0.1:8080` (or `--port`), exposing the en
 
 Every [tagged release](https://github.com/Made-by-Moonlight/ninox/releases) has a prebuilt `Ninox.app.zip` attached as a release asset — download it, unzip, and drag `Ninox.app` into `/Applications`. No local Rust toolchain needed.
 
+The bundle is ad-hoc code-signed in CI (no paid Apple Developer ID or notarization), which is enough to stop Gatekeeper from calling it "damaged" after a browser download. It's not enough to clear the separate "unidentified developer" warning macOS shows the first time you open an app from outside the App Store — that only goes away with real notarization. The first time you launch `Ninox.app`, expect that prompt; get past it with either:
+
+- Right-click (or Control-click) `Ninox.app` → **Open** → **Open** in the confirmation dialog, or
+- **System Settings** → **Privacy & Security** → scroll to the blocked-app notice → **Open Anyway**
+
+You only need to do this once per download.
+
 To build it yourself instead — to get a proper `Ninox.app` that shows up in the Dock and Launchpad with its own icon (instead of running as a bare binary) — build it with [`cargo-bundle`](https://github.com/burtonageo/cargo-bundle):
 
 ```bash

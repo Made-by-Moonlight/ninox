@@ -67,14 +67,7 @@ jobs:
           # ort.pyke.io search-path link failures.
           key: ${{ runner.os }}-cargo-bundle-v2-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-bundle-v2-
-      - name: Install cargo-bundle
-        run: command -v cargo-bundle || cargo install cargo-bundle
-      - name: Build Ninox.app
-        run: cargo bundle --release -p ninox --format osx
-      - name: Verify bundle
-        run: |
-          set -euo pipefail
-          test -d target/release/bundle/osx/Ninox.app
-          test -x target/release/bundle/osx/Ninox.app/Contents/MacOS/ninox
-          test -f target/release/bundle/osx/Ninox.app/Contents/Resources/Ninox.icns
-          /usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" target/release/bundle/osx/Ninox.app/Contents/Info.plist
+      - name: Build, sign & verify Ninox.app
+        uses: ./.github/actions/build-macos-bundle
+        with:
+          zip: "false"
