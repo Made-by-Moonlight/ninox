@@ -187,16 +187,13 @@ async fn detect_default_branch(workspace: &Path) -> String {
     "main".to_string()
 }
 
-/// The session's diff against the repo's default branch, or `None` when
-/// there's nothing worth harvesting: no diff at all, or a diff touching only
-/// lockfiles.
-pub async fn compute_nontrivial_diff(workspace: &Path) -> Option<String> {
-    let default_branch = detect_default_branch(workspace).await;
-    let range = format!("{default_branch}...HEAD");
+/// Filenames changed by `workspace`'s branch against its default branch, or
+/// `None` on a git error. Shared name-only lookup behind both
+/// [`compute_diff`] and [`compute_nontrivial_diff`].
+async fn changed_files(workspace: &Path, range: &str) -> Option<Vec<String>> {
     let ws = workspace.to_string_lossy();
-
     let names_out = Command::new("git")
-        .args(["-C", &ws, "diff", "--name-only", &range])
+        .args(["-C", &ws, "diff", "--name-only", range])
         .output()
         .await
         .ok()?;
@@ -204,20 +201,16 @@ pub async fn compute_nontrivial_diff(workspace: &Path) -> Option<String> {
         return None;
     }
     let names = String::from_utf8_lossy(&names_out.stdout);
-    let files: Vec<&str> = names.lines().filter(|l| !l.is_empty()).collect();
-    if files.is_empty() {
-        return None;
-    }
-    let all_trivial = files.iter().all(|f| {
-        let base = Path::new(f).file_name().and_then(|n| n.to_str()).unwrap_or(f);
-        TRIVIAL_FILENAMES.contains(&base)
-    });
-    if all_trivial {
-        return None;
-    }
+    Some(names.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+}
 
+/// The full unified diff text for `workspace` against `range`, or `None` on
+/// a git error or an empty diff. Shared plumbing behind both
+/// [`compute_diff`] and [`compute_nontrivial_diff`].
+async fn diff_text(workspace: &Path, range: &str) -> Option<String> {
+    let ws = workspace.to_string_lossy();
     let diff_out = Command::new("git")
-        .args(["-C", &ws, "diff", &range])
+        .args(["-C", &ws, "diff", range])
         .output()
         .await
         .ok()?;
@@ -229,6 +222,39 @@ pub async fn compute_nontrivial_diff(workspace: &Path) -> Option<String> {
         return None;
     }
     Some(diff)
+}
+
+/// The workspace's raw diff against its default branch, or `None` when
+/// there's no diff at all. Unlike [`compute_nontrivial_diff`], this never
+/// filters out lockfile-only changes — a user actively viewing a live
+/// session's diff wants to see everything that changed, not just what's
+/// worth a brain harvest.
+pub async fn compute_diff(workspace: &Path) -> Option<String> {
+    let default_branch = detect_default_branch(workspace).await;
+    let range = format!("{default_branch}...HEAD");
+    diff_text(workspace, &range).await
+}
+
+/// The session's diff against the repo's default branch, or `None` when
+/// there's nothing worth harvesting: no diff at all, or a diff touching only
+/// lockfiles.
+pub async fn compute_nontrivial_diff(workspace: &Path) -> Option<String> {
+    let default_branch = detect_default_branch(workspace).await;
+    let range = format!("{default_branch}...HEAD");
+
+    let files = changed_files(workspace, &range).await?;
+    if files.is_empty() {
+        return None;
+    }
+    let all_trivial = files.iter().all(|f| {
+        let base = Path::new(f).file_name().and_then(|n| n.to_str()).unwrap_or(f);
+        TRIVIAL_FILENAMES.contains(&base)
+    });
+    if all_trivial {
+        return None;
+    }
+
+    diff_text(workspace, &range).await
 }
 
 /// Build the one-shot harvest prompt. Inlines the same brain workflow
@@ -407,6 +433,34 @@ mod tests {
 
         let diff = compute_nontrivial_diff(&repo).await.expect("non-trivial diff");
         assert!(diff.contains("src.rs"));
+    }
+
+    #[tokio::test]
+    async fn compute_diff_returns_none_with_no_changes() {
+        let repo = init_repo();
+        checkout_feature_branch(&repo, "feature-5");
+        assert!(compute_diff(&repo).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn compute_diff_includes_lockfile_only_changes() {
+        let repo = init_repo();
+        checkout_feature_branch(&repo, "feature-6");
+        write_and_commit(&repo, "Cargo.lock", "version = 3\n", "bump lockfile");
+
+        let diff = compute_diff(&repo).await.expect("diff even though lockfile-only");
+        assert!(diff.contains("Cargo.lock"));
+    }
+
+    #[tokio::test]
+    async fn compute_diff_returns_source_changes() {
+        let repo = init_repo();
+        checkout_feature_branch(&repo, "feature-7");
+        write_and_commit(&repo, "src.rs", "fn main() {}\n", "add source file");
+
+        let diff = compute_diff(&repo).await.expect("non-empty diff");
+        assert!(diff.contains("src.rs"));
+        assert!(diff.contains("fn main()"));
     }
 
     #[test]
