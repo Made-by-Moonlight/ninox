@@ -135,6 +135,10 @@ pub struct Comment {
 #[serde(rename_all = "snake_case")]
 pub enum NotificationKind {
     CiFailure, AgentStuck, PrNeedsAttention, MergeConflict, WorkerDone,
+    /// A worker session was purged by the retention sweep without its PR
+    /// ever being detected merged (e.g. its process exited on its own).
+    /// Distinct from `WorkerDone`, which implies the merge succeeded.
+    WorkerRetired,
     /// A worker asked the orchestrator to schedule additional work it
     /// discovered outside its own task (`ninox request-work`).
     WorkRequested,
@@ -196,6 +200,7 @@ mod tests {
         for (kind, wire) in [
             (NotificationKind::WorkRequested,  "\"work_requested\""),
             (NotificationKind::ExtraPr,        "\"extra_pr\""),
+            (NotificationKind::WorkerRetired,  "\"worker_retired\""),
             (NotificationKind::UpdateAvailable, "\"update_available\""),
             (NotificationKind::UpdateInstalled, "\"update_installed\""),
             (NotificationKind::UpdateFailed,    "\"update_failed\""),

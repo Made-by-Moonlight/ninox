@@ -120,10 +120,7 @@ impl Engine {
         let sessions_dir = crate::config::AppConfig::sessions_dir();
         for session in &workers {
             let _ = crate::tmux::kill_session(&session.id).await;
-            if let Some(ref wp) = session.workspace_path {
-                remove_worker_worktree(wp, &session.id).await;
-            }
-            crate::hooks::remove_session_artifacts(&sessions_dir, &session.id);
+            remove_worktree_and_artifacts(&session.id, session.workspace_path.as_deref(), &sessions_dir).await;
         }
         // Also kill the orchestrator's own tmux session (same id as orchestrator).
         let _ = crate::tmux::kill_session(orchestrator_id).await;
@@ -138,14 +135,11 @@ impl Engine {
     /// Kill the tmux session and delete it from the DB entirely.
     pub async fn remove_session(&self, session_id: &str) -> anyhow::Result<()> {
         let _ = crate::tmux::kill_session(session_id).await;
-        if let Ok(Some(session)) = self.store.get_session(session_id) {
-            if let Some(ref wp) = session.workspace_path {
-                remove_worker_worktree(wp, session_id).await;
-            }
-        }
-        crate::hooks::remove_session_artifacts(
-            &crate::config::AppConfig::sessions_dir(), session_id,
-        );
+        let workspace_path = self.store.get_session(session_id).ok().flatten()
+            .and_then(|s| s.workspace_path);
+        remove_worktree_and_artifacts(
+            session_id, workspace_path.as_deref(), &crate::config::AppConfig::sessions_dir(),
+        ).await;
         self.store.delete_session(session_id)?;
         self.emit(Event::SessionDone(session_id.to_string()));
         Ok(())
@@ -165,7 +159,21 @@ impl Engine {
         let _ = crate::tmux::kill_session(session_id).await;
 
         if let Some(mut session) = self.store.get_session(session_id)? {
-            session.status = crate::types::SessionStatus::Terminated;
+            // Never clobber a terminal status — most importantly, never flip
+            // a `Done` session back to `Terminated`. `Done` is only ever
+            // reached via `handle_merge_detection`, which already notified
+            // the orchestrator; `sweep_retired_sessions`'s notification
+            // dedup relies on `Done` meaning "already told" (see
+            // `lifecycle::poller::sweep_retired_sessions`), so re-marking it
+            // `Terminated` here would make the sweep send a second,
+            // contradictory notice for a PR that was in fact merged.
+            if matches!(
+                session.status,
+                SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted
+            ) {
+                return Ok(());
+            }
+            session.status = SessionStatus::Terminated;
             self.store.upsert_session(&session)?;
             self.emit(Event::SessionUpdated(session));
         }
@@ -193,10 +201,7 @@ impl Engine {
         let _ = crate::tmux::kill_session(session_id).await;
 
         if let Some(mut session) = self.store.get_session(session_id)? {
-            if let Some(ref wp) = session.workspace_path {
-                remove_worker_worktree(wp, session_id).await;
-            }
-            crate::hooks::remove_session_artifacts(sessions_dir, session_id);
+            remove_worktree_and_artifacts(session_id, session.workspace_path.as_deref(), sessions_dir).await;
             session.status = crate::types::SessionStatus::Done;
             session.terminal_at = Some(crate::lifecycle::poller::now_millis());
             self.store.upsert_session(&session)?;
@@ -204,6 +209,21 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// Remove a session's worktree (if any) and hook artifacts — the shared
+/// teardown tail of `remove_orchestrator`, `remove_session`, and
+/// `cleanup_session`, so none of them leak a checked-out worktree or
+/// per-session hook files.
+async fn remove_worktree_and_artifacts(
+    session_id:     &str,
+    workspace_path: Option<&str>,
+    sessions_dir:   &std::path::Path,
+) {
+    if let Some(wp) = workspace_path {
+        remove_worker_worktree(wp, session_id).await;
+    }
+    crate::hooks::remove_session_artifacts(sessions_dir, session_id);
 }
 
 /// Remove a Ninox-managed git worktree (best-effort, never propagates errors).
@@ -275,6 +295,43 @@ mod tests {
         } else {
             panic!("expected SessionUpdated");
         }
+    }
+
+    /// A `Done` session (reached via `cleanup_session`, which already
+    /// notified the orchestrator about the merge) must never be flipped back
+    /// to `Terminated` by a later `terminate_session` call (e.g. the `DELETE
+    /// /sessions/:id` route firing on a stale client, or a race with the
+    /// poller). `sweep_retired_sessions`'s notification dedup relies on
+    /// `Done` meaning "already told" — reopening it as `Terminated` would
+    /// make the sweep send a second, contradictory notification claiming the
+    /// PR was never detected merged.
+    #[tokio::test]
+    async fn terminate_session_does_not_reopen_a_done_session() {
+        let store = Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
+        let session = crate::types::Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: crate::types::SessionStatus::Done,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: Some(1), pr_id: Some(1), workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
+            summary: None,
+            terminal_at: Some(1_000),
+        };
+        store.upsert_session(&session).unwrap();
+        let engine = Engine::new(Arc::clone(&store));
+        let mut rx = engine.subscribe();
+
+        engine.terminate_session("s1").await.unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a no-op terminate_session on a Done session must not emit SessionUpdated"
+        );
+        let after = store.get_session("s1").unwrap().unwrap();
+        assert!(matches!(after.status, crate::types::SessionStatus::Done), "status must stay Done");
+        assert_eq!(after.terminal_at, Some(1_000), "terminal_at must be untouched");
     }
 
     #[tokio::test]

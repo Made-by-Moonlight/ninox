@@ -887,7 +887,7 @@ impl Poller {
             if matches!(session.status, SessionStatus::Terminated) {
                 self.engine.emit(Event::Notification(Notification {
                     id:         format!("retired-{}", session.id),
-                    kind:       NotificationKind::WorkerDone,
+                    kind:       NotificationKind::WorkerRetired,
                     title:      format!("Worker retired — {}", session.name),
                     body:       "Session cleaned up without a detected PR merge".to_string(),
                     session_id: Some(session.id.clone()),
@@ -2484,7 +2484,7 @@ mod tests {
 
         let events = drain_events(&mut rx);
         let retired_notifs = events.iter().filter(|e| matches!(
-            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerRetired
                 && n.id == "retired-w1"
         )).count();
         assert_eq!(retired_notifs, 1, "orchestrator must be told its worker was retired");
@@ -2524,7 +2524,7 @@ mod tests {
 
         let events = drain_events(&mut rx);
         let retired_notifs = events.iter().filter(|e| matches!(
-            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerRetired
         )).count();
         assert_eq!(retired_notifs, 0, "must not re-notify a session already told about its merge");
     }
