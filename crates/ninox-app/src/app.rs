@@ -2454,19 +2454,74 @@ impl App {
             base
         }
     }
+}
 
+/// Pull one `Event` off `rx`, merging any `ClientOutput` chunks already
+/// sitting in the channel for the same client generation into it.
+/// `pending` carries a lookahead event across calls: a `try_recv` that
+/// turns out not to match can't be put back on the channel, so it's
+/// stashed here and returned as-is on the following call instead of being
+/// dropped or clobbering the event already in hand.
+///
+/// The PTY reader thread (`AttachedClient::spawn`) emits one `ClientOutput`
+/// per raw `read()`, capped at 8KB — a single full-screen repaint (a tmux
+/// status refresh, a busy TUI redrawing) routinely arrives as many of these
+/// back-to-back. Rendering each as its own frame is what surfaces as a
+/// flickering, "darting" cursor mid-repaint: the view briefly shows the
+/// cursor at each intermediate position the repaint passes through instead
+/// of settling directly on the final one. This only merges chunks that are
+/// already buffered by the time we look — it never waits for more to
+/// arrive, so it adds no latency to genuinely paced output (e.g. a spinner).
+/// Chunks from a different generation are never merged together, matching
+/// the same stale-vs-current-client distinction `ClientOutput`'s handler
+/// already relies on elsewhere.
+async fn next_coalesced_event(
+    rx: &mut broadcast::Receiver<Event>,
+    pending: &mut Option<Event>,
+) -> Option<Event> {
+    let mut event = if let Some(event) = pending.take() {
+        event
+    } else {
+        loop {
+            match rx.recv().await {
+                Ok(event) => break event,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    };
+
+    while let Event::ClientOutput { session_id, generation, bytes } = &event {
+        let (session_id, generation) = (session_id.clone(), *generation);
+        match rx.try_recv() {
+            Ok(Event::ClientOutput { session_id: sid2, generation: gen2, bytes: more })
+                if sid2 == session_id && gen2 == generation =>
+            {
+                let mut merged = bytes.clone();
+                merged.extend(more);
+                event = Event::ClientOutput { session_id, generation, bytes: merged };
+            }
+            Ok(other) => {
+                *pending = Some(other);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+
+    Some(event)
+}
+
+impl App {
     /// Subscription that drives `Message::EngineEvent` from the engine broadcast channel.
     pub fn subscription(state: &Self) -> Subscription<Message> {
         let mut rx: broadcast::Receiver<Event> = state.engine.subscribe();
+        let mut pending: Option<Event> = None;
         let engine_sub = Subscription::run_with_id(
             "engine-events",
             async_stream::stream! {
-                loop {
-                    match rx.recv().await {
-                        Ok(event)  => yield Message::EngineEvent(Box::new(event)),
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed)    => break,
-                    }
+                while let Some(event) = next_coalesced_event(&mut rx, &mut pending).await {
+                    yield Message::EngineEvent(Box::new(event));
                 }
             },
         );
@@ -2852,6 +2907,59 @@ mod tests {
     use super::*;
     use ninox_core::{events::Engine, store::Store};
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn coalesces_buffered_client_output_for_the_same_generation() {
+        // Send three chunks before ever polling — all three are already
+        // sitting in the channel by the time `next_coalesced_event` looks,
+        // so one call must return them merged into a single event rather
+        // than requiring three separate (and three separately rendered)
+        // frames.
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut pending = None;
+        tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"foo".to_vec() }).unwrap();
+        tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"bar".to_vec() }).unwrap();
+        tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"baz".to_vec() }).unwrap();
+
+        match next_coalesced_event(&mut rx, &mut pending).await {
+            Some(Event::ClientOutput { bytes, .. }) => assert_eq!(bytes, b"foobarbaz".to_vec()),
+            other => panic!("expected merged ClientOutput, got {other:?}"),
+        }
+
+        drop(tx);
+        assert!(next_coalesced_event(&mut rx, &mut pending).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn does_not_merge_client_output_across_different_generations() {
+        // A stale client's trailing output must never be glued onto a
+        // fresh client's — same reasoning as the `current != Some(generation)`
+        // guard in the `ClientOutput` handler.
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut pending = None;
+        tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"old".to_vec() }).unwrap();
+        tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 2, bytes: b"new".to_vec() }).unwrap();
+
+        let first = next_coalesced_event(&mut rx, &mut pending).await.unwrap();
+        assert!(matches!(&first, Event::ClientOutput { generation: 1, bytes, .. } if bytes == b"old"));
+
+        let second = next_coalesced_event(&mut rx, &mut pending).await.unwrap();
+        assert!(matches!(&second, Event::ClientOutput { generation: 2, bytes, .. } if bytes == b"new"));
+    }
+
+    #[tokio::test]
+    async fn does_not_merge_client_output_across_different_sessions() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut pending = None;
+        tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"a".to_vec() }).unwrap();
+        tx.send(Event::ClientOutput { session_id: "s2".into(), generation: 1, bytes: b"b".to_vec() }).unwrap();
+
+        let first = next_coalesced_event(&mut rx, &mut pending).await.unwrap();
+        assert!(matches!(&first, Event::ClientOutput { session_id, bytes, .. } if session_id == "s1" && bytes == b"a"));
+
+        let second = next_coalesced_event(&mut rx, &mut pending).await.unwrap();
+        assert!(matches!(&second, Event::ClientOutput { session_id, bytes, .. } if session_id == "s2" && bytes == b"b"));
+    }
 
     fn pr_session(pr_number: Option<u64>, pr_id: Option<i64>, repo: &str) -> Session {
         Session {
