@@ -11,7 +11,7 @@ use ninox_core::{
     config::AppConfig,
     events::Engine,
     github::resolve_token,
-    lifecycle::poller::Poller,
+    lifecycle::{poller::Poller, repo_discovery},
     slugify,
     store::Store,
     tmux,
@@ -19,7 +19,12 @@ use ninox_core::{
     BrainIndex, QueryFilters,
 };
 use clap::{Parser, Subcommand};
-use std::{path::PathBuf, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
@@ -113,6 +118,17 @@ enum BrainAction {
         #[arg(long)]
         force: bool,
     },
+    /// Scan known repo workspaces and write their location, remote, and
+    /// purpose into `repos/`, plus mechanically detectable relationships
+    /// (shared worktrees, shared remote owner) into `relationships/`.
+    /// Re-running updates existing entries in place rather than duplicating
+    /// them.
+    DiscoverRepos {
+        /// Workspace paths to scan. Defaults to every workspace_path
+        /// recorded in the session store (i.e. every repo a worker has ever
+        /// been spawned into) when none are given.
+        paths: Vec<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -158,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
             run_request_work(&description)
         }
         Some(Command::Brain { action }) => {
-            run_brain(action).await
+            run_brain(action, store).await
         }
         Some(Command::Statusline) => {
             run_statusline(db_path);
@@ -203,6 +219,9 @@ async fn run_spawn(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("worker-{ts}"));
     let display_name = name.unwrap_or_else(|| first_words(&prompt, 4));
+    // The fleet card summary: the first line of the raw task prompt, before
+    // the worker-context footer is appended below.
+    let summary = first_line(&prompt, 140);
     let orchestrator_id = orchestrator_id
         .or_else(|| std::env::var("NINOX_ORCHESTRATOR_ID").ok());
 
@@ -262,6 +281,8 @@ async fn run_spawn(
         catalogue_path:  std::env::var("NINOX_BRAIN").ok().filter(|s| !s.is_empty()),
         context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: Some(claude_session_id.clone()),
+        summary,
+        terminal_at: None,
     };
 
     store.upsert_session(&session)?;
@@ -403,7 +424,7 @@ fn run_statusline(db_path: PathBuf) {
     println!("{}", ninox_core::lifecycle::statusline::render_line(&payload));
 }
 
-async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
+async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()> {
     let config = AppConfig::load().unwrap_or_default();
     let brain_path = config.resolved_brain_path();
 
@@ -473,9 +494,220 @@ async fn run_brain(action: BrainAction) -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        BrainAction::DiscoverRepos { paths } => {
+            // Each catalogue group discovered below opens its own
+            // BrainIndex (see run_discover_repos) rather than reusing
+            // `brain` above, since candidates can span multiple catalogues.
+            run_discover_repos(&brain_path, &store, paths)?;
+        }
     }
 
     Ok(())
+}
+
+/// `ninox brain discover-repos` — scan `paths` (or, if empty, every
+/// workspace_path the session store has ever recorded) and write what's
+/// mechanically derivable about each repo into `repos/`, plus any
+/// mechanically detectable relationships into `relationships/`.
+///
+/// Queries the brain for each entry's id before writing (mirroring the
+/// "query first" convention `docs/BRAIN.md` and the harvest prompt in
+/// `lifecycle::brain_harvest` teach) purely to report new-vs-updated counts —
+/// the write itself is idempotent regardless, since each repo's entry id is
+/// deterministic (see `repo_discovery::repo_entry_ids`), so re-running
+/// overwrites the same file rather than creating a duplicate under a
+/// different name.
+///
+/// Candidate workspaces are grouped by the brain catalogue that should
+/// receive their discovery output, and each group is discovered and written
+/// independently. When `paths` are given explicitly on the CLI, they all go
+/// to `default_brain_path` (this invocation's own resolved brain — the
+/// caller picked it on purpose, same as `ninox brain index`/`query`/`show`).
+/// When defaulting to every known session's `workspace_path`, each session's
+/// own recorded `catalogue_path` (its `NINOX_BRAIN` at spawn time — see
+/// `Session::catalogue_path`) takes precedence over `default_brain_path` —
+/// the same rule `Poller::trigger_brain_harvest` follows, and for the same
+/// reason: a worker spawned against a non-default catalogue must have its
+/// facts land in that catalogue, not silently in whichever brain happens to
+/// be default for this CLI invocation.
+fn run_discover_repos(
+    default_brain_path: &std::path::Path,
+    store: &Store,
+    paths: Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    let mut groups: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    if paths.is_empty() {
+        for session in store.list_sessions()? {
+            let Some(workspace) = session.workspace_path else { continue };
+            let catalogue = session
+                .catalogue_path
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_brain_path.to_path_buf());
+            groups.entry(catalogue).or_default().push(PathBuf::from(workspace));
+        }
+    } else {
+        groups.insert(default_brain_path.to_path_buf(), paths);
+    }
+
+    if groups.is_empty() {
+        println!(
+            "no candidate workspaces — pass one or more paths, or spawn a worker first \
+             so the session store has a workspace_path to scan"
+        );
+        return Ok(());
+    }
+
+    for (catalogue_path, candidates) in groups {
+        discover_repos_into_catalogue(&catalogue_path, &candidates)?;
+    }
+    Ok(())
+}
+
+/// Discover repos among `candidates` and write the results into the single
+/// brain catalogue at `catalogue_path`. See [`run_discover_repos`] for how
+/// candidates are grouped by catalogue before reaching here.
+fn discover_repos_into_catalogue(catalogue_path: &std::path::Path, candidates: &[PathBuf]) -> anyhow::Result<()> {
+    let brain = BrainIndex::open(catalogue_path)?;
+    let discovery = repo_discovery::discover(candidates);
+    let ids = repo_discovery::repo_entry_ids(&discovery.repos);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    let mut new_count = 0usize;
+    let mut updated_count = 0usize;
+    for (repo, id) in discovery.repos.iter().zip(&ids) {
+        if brain.get(id)?.is_some() { updated_count += 1 } else { new_count += 1 }
+        write_brain_entry(catalogue_path, id, &repo_discovery::repo_entry_markdown(repo, &today))?;
+    }
+
+    for (repo_index, worktrees) in &discovery.extra_worktrees {
+        let repo = &discovery.repos[*repo_index];
+        let repo_id = &ids[*repo_index];
+        let id = repo_discovery::worktree_relationship_id(repo_id);
+        let markdown = repo_discovery::worktree_relationship_markdown(repo, repo_id, worktrees, &today);
+        write_brain_entry(catalogue_path, &id, &markdown)?;
+    }
+
+    let org_groups = repo_discovery::group_by_owner(&discovery.repos, &ids);
+    for (owner, members) in &org_groups {
+        let id = repo_discovery::shared_org_relationship_id(owner);
+        let markdown = repo_discovery::shared_org_relationship_markdown(owner, members, &today);
+        write_brain_entry(catalogue_path, &id, &markdown)?;
+    }
+
+    let embedder = try_build_embedder();
+    let stats = brain.rebuild(embedder.as_deref())?;
+    println!(
+        "[{}] discovered {} repo(s) ({} new, {} updated), {} worktree relationship(s), \
+         {} shared-org relationship(s) — indexed {} entries",
+        catalogue_path.display(),
+        discovery.repos.len(),
+        new_count,
+        updated_count,
+        discovery.extra_worktrees.len(),
+        org_groups.len(),
+        stats.indexed,
+    );
+    Ok(())
+}
+
+/// Write a brain entry's Markdown content to `brain_path/id`, creating its
+/// parent section directory (e.g. `repos/`) if needed.
+fn write_brain_entry(brain_path: &std::path::Path, id: &str, content: &str) -> anyhow::Result<()> {
+    let path = brain_path.join(id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod discover_repos_tests {
+    use super::run_discover_repos;
+    use ninox_core::{store::Store, types::{Session, SessionStatus}};
+    use std::path::Path;
+
+    fn init_repo(dir: &Path, remote: &str) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["remote", "add", "origin", remote]);
+        run(&["commit", "-q", "--allow-empty", "-m", "init"]);
+    }
+
+    fn session(id: &str, workspace: &Path, catalogue_path: Option<&Path>) -> Session {
+        Session {
+            id: id.to_string(),
+            orchestrator_id: None,
+            name: id.to_string(),
+            repo: String::new(),
+            status: SessionStatus::Working,
+            agent_type: "claude-code".to_string(),
+            cost_usd: 0.0,
+            started_at: 0,
+            pr_number: None,
+            pr_id: None,
+            workspace_path: Some(workspace.to_string_lossy().to_string()),
+            pid: None,
+            model: None,
+            context_tokens: None,
+            catalogue_path: catalogue_path.map(|p| p.to_string_lossy().to_string()),
+            context_used_pct: None,
+            context_total_tokens: None,
+            context_window_size: None,
+            claude_session_id: None,
+            summary: None,
+            terminal_at: None,
+        }
+    }
+
+    /// Mirrors `Poller::trigger_brain_harvest`'s existing rule (see
+    /// `poller.rs`'s `metadata_sync_brain_harvest_prefers_session_catalogue_path_over_default`
+    /// test): a session spawned against a non-default catalogue must have
+    /// its discovered repo facts land in that catalogue, not silently in
+    /// whichever brain happens to be default for this CLI invocation.
+    #[test]
+    fn discover_repos_routes_each_session_to_its_own_catalogue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default_brain = tmp.path().join("default-brain");
+        let other_brain = tmp.path().join("other-brain");
+
+        let repo_default = tmp.path().join("repo-default");
+        let repo_other = tmp.path().join("repo-other");
+        std::fs::create_dir_all(&repo_default).unwrap();
+        std::fs::create_dir_all(&repo_other).unwrap();
+        init_repo(&repo_default, "git@github.com:acme/repo-default.git");
+        init_repo(&repo_other, "git@github.com:acme/repo-other.git");
+
+        let store = Store::open(tmp.path().join("store.db")).unwrap();
+        // No catalogue_path recorded -- must fall back to the default brain.
+        store.upsert_session(&session("s-default", &repo_default, None)).unwrap();
+        // Spawned against a non-default catalogue -- must land there instead.
+        store.upsert_session(&session("s-other", &repo_other, Some(&other_brain))).unwrap();
+
+        run_discover_repos(&default_brain, &store, Vec::new()).unwrap();
+
+        assert!(
+            default_brain.join("repos/repo-default.md").exists(),
+            "session with no catalogue_path must land in the default brain"
+        );
+        assert!(
+            !default_brain.join("repos/repo-other.md").exists(),
+            "must not leak the other session's repo into the default brain"
+        );
+        assert!(
+            other_brain.join("repos/repo-other.md").exists(),
+            "session with a catalogue_path must land in its own brain"
+        );
+        assert!(
+            !other_brain.join("repos/repo-default.md").exists(),
+            "must not leak the default session's repo into the other catalogue"
+        );
+    }
 }
 
 /// Attempt to construct the local embedding model, falling back to `None`
@@ -612,6 +844,19 @@ fn first_words(s: &str, n: usize) -> String {
     s.split_whitespace().take(n).collect::<Vec<_>>().join("-")
 }
 
+/// First non-empty line of `s`, trimmed and clipped to `max_chars` (with a
+/// trailing "…" if truncated) — derives the fleet card summary from a
+/// spawn prompt. `None` if `s` has no non-empty line.
+fn first_line(s: &str, max_chars: usize) -> Option<String> {
+    let line = s.lines().find(|l| !l.trim().is_empty())?.trim();
+    if line.chars().count() <= max_chars {
+        Some(line.to_string())
+    } else {
+        let clipped: String = line.chars().take(max_chars).collect();
+        Some(format!("{clipped}…"))
+    }
+}
+
 fn has_display() -> bool {
     #[cfg(target_os = "macos")]
     { true }
@@ -621,7 +866,30 @@ fn has_display() -> bool {
 
 #[cfg(test)]
 mod worker_env_tests {
-    use super::{worker_context_footer, worker_env_vars};
+    use super::{first_line, worker_context_footer, worker_env_vars};
+
+    #[test]
+    fn first_line_takes_first_non_empty_line_trimmed() {
+        assert_eq!(first_line("  Fix the flaky test  \n\nDetails follow.", 140).as_deref(), Some("Fix the flaky test"));
+    }
+
+    #[test]
+    fn first_line_skips_leading_blank_lines() {
+        assert_eq!(first_line("\n\n  Ship the thing\nmore text", 140).as_deref(), Some("Ship the thing"));
+    }
+
+    #[test]
+    fn first_line_clips_long_text_with_ellipsis() {
+        let long = "a".repeat(200);
+        let clipped = first_line(&long, 140).unwrap();
+        assert_eq!(clipped.chars().count(), 141); // 140 chars + "…"
+        assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
+    fn first_line_is_none_for_blank_prompt() {
+        assert_eq!(first_line("   \n\n  ", 140), None);
+    }
 
     #[test]
     fn worker_footer_scopes_to_one_pr_and_routes_extra_work_to_request_work() {

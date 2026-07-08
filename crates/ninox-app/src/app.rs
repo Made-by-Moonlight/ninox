@@ -118,6 +118,10 @@ pub struct App {
     pub prs:             HashMap<PrId, PR>,
     pub ci_status:       HashMap<PrId, CIStatus>,
     pub review_threads:  HashMap<PrId, Vec<Comment>>,
+    /// On-demand `git diff` text per session's workspace (`ensure_diff`).
+    /// Absent = not fetched yet (render "Loading…"); `Some(None)` = fetched,
+    /// no diff (no workspace recorded, or a clean working tree).
+    pub diffs:           HashMap<SessionId, Option<String>>,
     pub notifications:   VecDeque<Notification>,
     pub sidebar:         SidebarState,
     pub view:            View,
@@ -272,6 +276,10 @@ pub enum Message {
     /// `models_cmd` discovery finished for a harness (`None` = failed —
     /// cached so pickers fall through to known_models without retrying).
     ModelListLoaded { harness: String, models: Option<Vec<String>> },
+    /// An on-demand `git diff` fetch (`ensure_diff`) resolved for a
+    /// session's workspace — `diff: None` means no workspace recorded, or a
+    /// clean diff against the default branch, not an error.
+    DiffFetched { session_id: SessionId, diff: Option<String> },
     Noop,
 }
 
@@ -483,6 +491,7 @@ impl App {
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
+            diffs:          HashMap::new(),
             notifications:  VecDeque::new(),
             sidebar:        SidebarState::default(),
             view:           View::default(),
@@ -600,6 +609,26 @@ impl App {
         Task::future(async move {
             let models = crate::models::run_models_cmd(cmd).await;
             Message::ModelListLoaded { harness: h, models }
+        })
+    }
+
+    /// Kick off an on-demand `git diff` fetch for `session_id`'s workspace.
+    /// Unlike `ensure_models`, this always re-runs rather than caching on
+    /// first success: a live, in-progress session's diff changes as the
+    /// worker commits, so callers re-issue this every time the Diff panel
+    /// is opened or the session poll ticks while it's on screen.
+    fn ensure_diff(state: &mut App, session_id: &str) -> Task<Message> {
+        let Some(workspace) = state.sessions.get(session_id).and_then(|s| s.workspace_path.clone()) else {
+            state.diffs.insert(session_id.to_string(), None);
+            return Task::none();
+        };
+        let sid = session_id.to_string();
+        Task::future(async move {
+            let diff = ninox_core::lifecycle::brain_harvest::compute_diff(
+                std::path::Path::new(&workspace),
+            )
+            .await;
+            Message::DiffFetched { session_id: sid, diff }
         })
     }
 
@@ -742,8 +771,14 @@ impl App {
                 state.terminals.remove(&id);
                 Self::resize_terminals(state);
 
+                let diff_task = if state.worker_panel == DetailPanel::Diff {
+                    Self::ensure_diff(state, &id)
+                } else {
+                    Task::none()
+                };
+
                 let engine = state.engine.clone();
-                Task::future(async move {
+                let attach_task = Task::future(async move {
                     if !ninox_core::tmux::has_session(&id).await {
                         if let Ok(Some(mut s)) = engine.store.get_session(&id) {
                             s.status = ninox_core::types::SessionStatus::Terminated;
@@ -758,7 +793,8 @@ impl App {
                     }
                     let argv = ninox_core::tmux::attach_args(&id).await;
                     Message::ClientAttach { session_id: id, argv }
-                })
+                });
+                Task::batch(vec![diff_task, attach_task])
             }
 
             Message::ClientAttach { session_id, argv } => {
@@ -1129,6 +1165,8 @@ impl App {
                             catalogue_path:  Some(catalogue_path.clone()),
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
+                            summary:         None,
+                            terminal_at:         None,
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1184,6 +1222,7 @@ impl App {
                                     started_at:      ts_i64,
                                     claude_session_id,
                                     failure_status:  ninox_core::SessionStatus::Terminated,
+                                    summary:         None,
                                 },
                             )
                             .await;
@@ -1270,6 +1309,8 @@ impl App {
                             catalogue_path:  Some(catalogue_path.clone()),
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
+                            summary:         None,
+                            terminal_at:         None,
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1314,6 +1355,7 @@ impl App {
                                     started_at:      ts_i64,
                                     claude_session_id,
                                     failure_status:  ninox_core::SessionStatus::Terminated,
+                                    summary:         None,
                                 },
                             )
                             .await;
@@ -1327,10 +1369,13 @@ impl App {
             }
 
             Message::SwitchDetailPanel(new_panel) => {
-                if let View::SessionDetail { panel, .. } = &mut state.view {
+                let session_id = if let View::SessionDetail { session_id, panel } = &mut state.view {
                     *panel = new_panel;
                     state.worker_panel = new_panel;
-                }
+                    Some(session_id.clone())
+                } else {
+                    None
+                };
                 // Entering/leaving Split changes how much width the terminal
                 // canvas actually has, so the grid must be reflowed to match.
                 let resized = Self::resize_terminals(state);
@@ -1339,7 +1384,10 @@ impl App {
                         client.resize(cols, rows);
                     }
                 }
-                Task::none()
+                match (new_panel, session_id) {
+                    (DetailPanel::Diff, Some(sid)) => Self::ensure_diff(state, &sid),
+                    _ => Task::none(),
+                }
             }
 
             Message::RemoveOrchestrator(id) => {
@@ -1355,9 +1403,13 @@ impl App {
                     k != &id && s.orchestrator_id.as_deref() != Some(id.as_str())
                 });
                 state.terminals.remove(&id);
+                state.diffs.remove(&id);
                 // Drop clients for the orchestrator itself and any worker
                 // sessions removed above — only surviving sessions keep theirs.
                 state.clients.retain(|sid, _| state.sessions.contains_key(sid));
+                // Same for diffs: the orchestrator's own removal is handled
+                // above, this catches its removed workers.
+                state.diffs.retain(|sid, _| state.sessions.contains_key(sid));
                 state.sidebar.expanded_orchestrators.remove(&id);
                 let engine = state.engine.clone();
                 Task::future(async move {
@@ -1375,6 +1427,7 @@ impl App {
                 state.sessions.remove(&id);
                 state.terminals.remove(&id);
                 state.clients.remove(&id);
+                state.diffs.remove(&id);
                 let engine = state.engine.clone();
                 Task::future(async move {
                     if let Err(e) = engine.remove_session(&id).await {
@@ -1396,6 +1449,10 @@ impl App {
                 // fight the respawn for the same tmux session name.
                 state.clients.remove(&id);
                 state.terminals.remove(&id);
+                // Re-file respawns the same id onto a fresh workspace/branch
+                // — the cached diff is for the OLD incarnation and would
+                // otherwise flash stale content until the next fetch.
+                state.diffs.remove(&id);
 
                 let ts = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -1405,6 +1462,7 @@ impl App {
                 let name    = session.name.clone();
                 let repo    = session.repo.clone();
                 let orch_id = session.orchestrator_id.clone();
+                let summary = session.summary.clone();
                 Task::future(async move {
                     // Ignore kill errors — a Terminated husk has no tmux
                     // session, and Re-file on one "just spawns". The
@@ -1427,6 +1485,7 @@ impl App {
                             started_at:      ts,
                             claude_session_id,
                             failure_status:  ninox_core::SessionStatus::Terminated,
+                            summary,
                         },
                     )
                     .await;
@@ -1449,6 +1508,10 @@ impl App {
                 };
                 state.clients.remove(&id);
                 state.terminals.remove(&id);
+                // Same id, relaunched — the pane died and may come back onto
+                // a different pty/branch state; drop the cached diff so the
+                // Diff panel refetches instead of showing the pre-resume text.
+                state.diffs.remove(&id);
 
                 let ts = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -1458,6 +1521,7 @@ impl App {
                 let name    = session.name.clone();
                 let repo    = session.repo.clone();
                 let orch_id = session.orchestrator_id.clone();
+                let summary = session.summary.clone();
                 Task::future(async move {
                     let _ = ninox_core::tmux::kill_session(&id).await;
                     let attach = crate::spawn_util::spawn_interactive_session(
@@ -1475,6 +1539,7 @@ impl App {
                             started_at:      ts,
                             claude_session_id,
                             failure_status:  ninox_core::SessionStatus::Interrupted,
+                            summary,
                         },
                     )
                     .await;
@@ -1665,40 +1730,48 @@ impl App {
                 let orch_ids: std::collections::HashSet<&str> =
                     state.orchestrators.iter().map(|o| o.id.as_str()).collect();
 
-                // Remove terminated/done sessions from state and DB — includes
-                // both standalone sessions and workers under orchestrators.
-                let to_clean: Vec<SessionId> = state.sessions.values()
-                    .filter(|s| {
-                        matches!(s.status, SessionStatus::Done | SessionStatus::Terminated)
-                        && !orch_ids.contains(s.id.as_str())
-                    })
-                    .map(|s| s.id.clone())
+                // A completed (Done/Terminated) session lingers on the board
+                // for a configurable grace period after finishing — see
+                // `ninox_core::lifecycle::poller::Poller::sweep_retired_sessions`,
+                // which is the sole place that actually deletes the store
+                // record once that window elapses. This handler must not
+                // race that retention logic by deleting eagerly on status
+                // alone; it only mirrors the store, dropping from `state`
+                // whatever has genuinely vanished from it (already purged by
+                // the sweep, or by a direct user removal).
+                let db_ids: std::collections::HashSet<&str> =
+                    db_sessions.iter().map(|s| s.id.as_str()).collect();
+                let to_clean: Vec<SessionId> = state.sessions.keys()
+                    .filter(|id| !db_ids.contains(id.as_str()) && !orch_ids.contains(id.as_str()))
+                    .cloned()
                     .collect();
                 for id in &to_clean {
                     state.sessions.remove(id);
                     state.terminals.remove(id);
+                    state.diffs.remove(id);
                 }
-                let engine_clean = state.engine.clone();
-                let to_clean_clone = to_clean.clone();
 
-                // Add genuinely new active sessions (spawned by ninox spawn).
-                // PTY streaming is NOT started here — NavigateSession handles that
-                // on demand with the correct window dimensions.
+                // Add genuinely new sessions (spawned by `ninox spawn`, or a
+                // completed session not yet tracked in `state`) — including
+                // Done/Terminated ones, which stay visible until the sweep
+                // above purges their store record. PTY streaming is NOT
+                // started here — NavigateSession handles that on demand with
+                // the correct window dimensions.
                 for session in db_sessions {
-                    if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
-                        continue;
-                    }
                     if !state.sessions.contains_key(&session.id) {
                         state.sessions.insert(session.id.clone(), session);
                     }
                 }
 
-                Task::future(async move {
-                    for id in to_clean_clone {
-                        let _ = engine_clean.store.delete_session(&id);
+                // Refresh the diff for whatever session is on the Diff panel
+                // right now — a live session's diff changes as the worker
+                // commits, so this is the "keeps updating" tick for it.
+                match &state.view {
+                    View::SessionDetail { session_id, panel: DetailPanel::Diff } => {
+                        Self::ensure_diff(state, &session_id.clone())
                     }
-                    Message::Noop
-                })
+                    _ => Task::none(),
+                }
             }
 
             Message::NavigatePrList => {
@@ -2031,6 +2104,11 @@ impl App {
                 Task::none()
             }
 
+            Message::DiffFetched { session_id, diff } => {
+                state.diffs.insert(session_id, diff);
+                Task::none()
+            }
+
             Message::Noop => Task::none(),
         }
     }
@@ -2067,6 +2145,7 @@ impl App {
                 state.terminals.remove(&id);
                 // A done session is definitionally not viewable.
                 state.clients.remove(&id);
+                state.diffs.remove(&id);
                 Task::none()
             }
 
@@ -2105,6 +2184,7 @@ impl App {
                     View::SessionDetail { session_id: sid, .. } if sid == &session_id);
                 state.clients.remove(&session_id);
                 state.terminals.remove(&session_id);
+                state.diffs.remove(&session_id);
                 // One automatic reattach for unexpected deaths (tmux server
                 // restart); repeated failures fall through to the
                 // "Terminal connecting…" placeholder.
@@ -2633,6 +2713,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
         }
     }
 
@@ -2732,6 +2814,7 @@ mod tests {
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
+            diffs:          HashMap::new(),
             notifications:  VecDeque::new(),
             sidebar:        SidebarState::default(),
             view:           View::FleetBoard { scope: None },
@@ -2766,6 +2849,8 @@ mod tests {
             catalogue_path: Some("/brains/b".into()),
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
         }
     }
 
@@ -2831,6 +2916,17 @@ mod tests {
     }
 
     #[test]
+    fn refile_message_drops_the_cached_diff_from_the_prior_incarnation() {
+        let e = test_engine();
+        let mut m = base(e);
+        let s = refile_session("s1");
+        m.sessions.insert("s1".into(), s);
+        m.diffs.insert("s1".into(), Some("stale diff text".into()));
+        let (m, _) = m.update(Message::RefileSession("s1".into()));
+        assert!(!m.diffs.contains_key("s1"), "re-file must not leave the old workspace's diff cached");
+    }
+
+    #[test]
     fn resume_plan_builds_a_resume_command_from_the_stored_id() {
         let cfg = ninox_core::config::AppConfig::default();
         let mut session = refile_session("s1");
@@ -2869,6 +2965,20 @@ mod tests {
         // itself mutates, same as its Re-file twin.
         assert!(!m.terminals.contains_key("s1"));
         assert!(m.sessions.contains_key("s1"));
+    }
+
+    #[test]
+    fn resume_message_drops_the_cached_diff_from_before_the_pane_died() {
+        let e = test_engine();
+        let mut m = base(e);
+        let mut s = refile_session("s1");
+        s.status = SessionStatus::Interrupted;
+        s.claude_session_id = Some("stored-uuid".into());
+        m.sessions.insert("s1".into(), s.clone());
+        m.engine.store.upsert_session(&s).unwrap();
+        m.diffs.insert("s1".into(), Some("stale diff text".into()));
+        let (m, _) = m.update(Message::ResumeSession("s1".into()));
+        assert!(!m.diffs.contains_key("s1"), "resume must not leave the pre-resume diff cached");
     }
 
     #[tokio::test]
@@ -2969,6 +3079,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
         };
         let (updated, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         assert!(updated.sessions.contains_key("s1"));
@@ -3052,6 +3164,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;
@@ -3100,6 +3214,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
         }).unwrap();
         let engine = Engine::new(store);
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
@@ -3123,6 +3239,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = m2;
@@ -3132,8 +3250,15 @@ mod tests {
         assert_eq!(terminated[0].id, "t1");
     }
 
+    /// A Done worker must survive `PollSessions` while its store record is
+    /// still within the retention grace period — the old behavior (instant
+    /// removal on status alone) gave the fleet board no window to show what
+    /// just completed. Only once the record is actually gone from the store
+    /// (here simulated directly, standing in for
+    /// `Poller::sweep_retired_sessions` having purged it) must the board
+    /// drop it.
     #[test]
-    fn poll_sessions_removes_done_worker_from_sidebar() {
+    fn poll_sessions_keeps_done_worker_until_purged_from_store() {
         let e = test_engine();
         let mut m = base(e);
 
@@ -3153,16 +3278,144 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: Some(0),
         };
         let _ = m.engine.store.upsert_session(&worker);
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(worker))));
         m = next;
         assert!(m.sessions.contains_key("w1"), "worker should be present before poll");
 
-        // PollSessions should clean up the done worker
+        // Still present after a poll tick — the record is still in the
+        // store, so the board must not drop it just because it's Done.
         let (next, _) = m.update(Message::PollSessions);
         m = next;
-        assert!(!m.sessions.contains_key("w1"), "done worker must be removed by PollSessions");
+        assert!(
+            m.sessions.contains_key("w1"),
+            "Done worker must survive PollSessions while its retention window hasn't elapsed",
+        );
+
+        // Once the retention sweep has actually purged the record...
+        m.engine.store.delete_session("w1").unwrap();
+        let (next, _) = m.update(Message::PollSessions);
+        m = next;
+        assert!(
+            !m.sessions.contains_key("w1"),
+            "a session purged from the store must disappear from the board on the next poll",
+        );
+    }
+
+    /// An orchestrator's own session (tracked in `state.sessions` alongside
+    /// its workers) must never be dropped from the board by `PollSessions`
+    /// even if it's briefly absent from a given `list_sessions()` read —
+    /// mirrors the retention sweep's own orchestrator exemption.
+    #[test]
+    fn poll_sessions_never_drops_orchestrator_sessions() {
+        let e = test_engine();
+        let mut m = base(e);
+
+        let o = Orchestrator { id: "o1".into(), name: "orch".into(), created_at: 0 };
+        let _ = m.engine.store.upsert_orchestrator(&o);
+        let (next, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorSpawned(o))));
+        m = next;
+
+        // The orchestrator's own session row is untracked in the sessions
+        // table (e.g. not yet written) — PollSessions must not evict it from
+        // `state.sessions` just because `db_sessions` doesn't contain it.
+        m.sessions.insert("o1".into(), Session {
+            id: "o1".into(), orchestrator_id: None, name: "orch".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0,
+            started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None,
+            summary: None,
+            terminal_at: None,
+        });
+
+        let (next, _) = m.update(Message::PollSessions);
+        m = next;
+        assert!(m.sessions.contains_key("o1"), "orchestrator sessions must never be auto-dropped");
+    }
+
+    #[test]
+    fn poll_sessions_drops_the_cached_diff_once_the_session_is_purged_from_the_store() {
+        // Mirrors `poll_sessions_keeps_done_worker_until_purged_from_store`:
+        // PollSessions only evicts `state` for what's genuinely gone from
+        // the store (the retention sweep's job, simulated here via a direct
+        // delete), not on status alone.
+        let e = test_engine();
+        let mut m = base(e);
+        let s = Session {
+            id: "w1".into(), orchestrator_id: None, name: "worker".into(),
+            repo: "r".into(), status: SessionStatus::Done,
+            agent_type: "c".into(), cost_usd: 0.0,
+            started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: Some(0),
+        };
+        let _ = m.engine.store.upsert_session(&s);
+        let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
+        m = next;
+        m.diffs.insert("w1".into(), Some("stale diff text".into()));
+
+        m.engine.store.delete_session("w1").unwrap();
+        let (next, _) = m.update(Message::PollSessions);
+        m = next;
+        assert!(!m.diffs.contains_key("w1"), "a session purged from the store must not leak its cached diff");
+    }
+
+    #[test]
+    fn remove_session_drops_the_cached_diff() {
+        let e = test_engine();
+        let mut m = base(e);
+        let s = refile_session("s1");
+        m.sessions.insert("s1".into(), s);
+        m.diffs.insert("s1".into(), Some("stale diff text".into()));
+        let (m, _) = m.update(Message::RemoveSession("s1".into()));
+        assert!(!m.diffs.contains_key("s1"));
+    }
+
+    #[test]
+    fn remove_orchestrator_drops_cached_diffs_for_it_and_its_workers() {
+        let e = test_engine();
+        let mut m = base(e);
+        let o = Orchestrator { id: "o1".into(), name: "orch".into(), created_at: 0 };
+        let worker = Session {
+            id: "w1".into(), orchestrator_id: Some("o1".into()), name: "worker".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0,
+            started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None,
+        };
+        let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorSpawned(o))));
+        m = m2;
+        let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(worker))));
+        m = m2;
+        m.diffs.insert("o1".into(), Some("stale orch diff".into()));
+        m.diffs.insert("w1".into(), Some("stale worker diff".into()));
+
+        let (m, _) = m.update(Message::RemoveOrchestrator("o1".into()));
+        assert!(!m.diffs.contains_key("o1"));
+        assert!(!m.diffs.contains_key("w1"));
+    }
+
+    #[test]
+    fn session_done_event_drops_the_cached_diff() {
+        let e = test_engine();
+        let mut m = base(e);
+        let s = refile_session("s1");
+        m.sessions.insert("s1".into(), s);
+        m.diffs.insert("s1".into(), Some("stale diff text".into()));
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionDone("s1".into()))));
+        assert!(!m.diffs.contains_key("s1"));
     }
 
     #[test]
@@ -3571,11 +3824,49 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
         let (m3, _) = m2.update(Message::SwitchDetailPanel(DetailPanel::Inspector));
         assert!(matches!(&m3.view, View::SessionDetail { panel: DetailPanel::Inspector, .. }));
+    }
+
+    #[test]
+    fn switching_to_diff_panel_without_a_workspace_marks_no_diff_synchronously() {
+        use crate::components::session_detail::DetailPanel;
+        let e = test_engine();
+        let m = base(e);
+        let s = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 1.23,
+            started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None,
+        };
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
+        let (m2, _) = m.update(Message::NavigateSession("s1".into()));
+        let (m3, _) = m2.update(Message::SwitchDetailPanel(DetailPanel::Diff));
+        assert!(matches!(&m3.view, View::SessionDetail { panel: DetailPanel::Diff, .. }));
+        assert_eq!(m3.diffs.get("s1"), Some(&None));
+    }
+
+    #[test]
+    fn diff_fetched_stores_the_result_by_session_id() {
+        let e = test_engine();
+        let m = base(e);
+        let (m, _) = m.update(Message::DiffFetched {
+            session_id: "s1".into(),
+            diff: Some("diff --git a/x b/x\n+hello\n".into()),
+        });
+        assert_eq!(
+            m.diffs.get("s1"),
+            Some(&Some("diff --git a/x b/x\n+hello\n".to_string())),
+        );
     }
 
     #[test]
@@ -3599,6 +3890,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -3651,6 +3944,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         // NavigateSession defaults to the Split panel, so switch to Terminal
@@ -3698,6 +3993,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -3779,6 +4076,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m, _) = m.update(Message::NavigateSession("s1".into()));
@@ -3831,6 +4130,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -3921,6 +4222,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -4700,6 +5003,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;

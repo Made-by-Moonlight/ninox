@@ -1,5 +1,5 @@
 use crate::{
-    config::AppConfig,
+    config::{AppConfig, SessionRetentionConfig},
     events::{Engine, Event},
     github::{split_repo, CheckRun},
     hooks,
@@ -13,19 +13,39 @@ use crate::{
         CIStatus, Comment, Notification, NotificationKind, PrId, Session, SessionStatus, PR,
     },
 };
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 
 /// Last-seen `(cost_usd, context_used_pct, context_total_tokens)` snapshot per session.
 /// Used by `poll_context_updates` to detect external changes.
 type ContextSnapshot = (f64, Option<f64>, Option<u64>);
 
-/// Unix epoch milliseconds "now" — used to stamp `Notification::created_at`.
-fn now_millis() -> i64 {
+/// Unix epoch milliseconds "now" — used to stamp `Notification::created_at`
+/// and `Session::terminal_at`. `pub(crate)` so `events::cleanup_session` can
+/// stamp the same clock when it marks a session `Done`.
+pub(crate) fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Best-effort extraction of a human-readable message from a
+/// `JoinError::into_panic()` payload — used so a panicking `HarvestRunner`
+/// is diagnosable in logs instead of silently swallowed.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 pub struct Poller {
@@ -39,6 +59,14 @@ pub struct Poller {
     /// Injectable so tests can fake success/failure without spawning a real
     /// process — see `sync_sessions_metadata`'s `trigger_brain_harvest`.
     harvest_runner:   Arc<dyn HarvestRunner>,
+    /// One lock per resolved brain vault path, created on first use. Held
+    /// across a harvest's `HarvestRunner::run` call so two sessions whose
+    /// harvests target the same vault (the common case: both on the global
+    /// default catalogue) never run their `claude -p` — and its `ninox
+    /// brain index` — concurrently against it. Never pruned: the number of
+    /// distinct vault paths in play is bounded by the number of configured
+    /// catalogues, not by session count.
+    vault_locks:      Arc<std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl Poller {
@@ -52,7 +80,25 @@ impl Poller {
             enrichment_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             context_cache:    Arc::new(std::sync::Mutex::new(HashMap::new())),
             harvest_runner,
+            vault_locks:      Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The (created-on-first-use) lock for a given vault path — see
+    /// `vault_locks`.
+    fn vault_lock(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        // Canonicalize so two syntactically different paths to the same
+        // physical vault (trailing slash, symlink) share one lock. Falls
+        // back to the raw path when it doesn't exist yet (e.g. a vault
+        // that hasn't been written to before) — that harvest still gets
+        // its own lock, just not deduplicated against a not-yet-existing
+        // twin, which can't race with anything yet either.
+        let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let mut locks = self.vault_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     pub async fn start(self, token: CancellationToken) {
@@ -68,6 +114,10 @@ impl Poller {
                 _ = pid_interval.tick()    => {
                     self.poll_pids().await;
                     self.poll_context_updates().await;
+                    let retention = AppConfig::load()
+                        .unwrap_or_default()
+                        .session_retention;
+                    self.sweep_retired_sessions(&retention).await;
                 }
                 _ = usage_interval.tick()  => self.poll_usage().await,
                 _ = github_interval.tick() => {
@@ -96,6 +146,7 @@ impl Poller {
             if let Some(pid) = session.pid {
                 if !is_pid_alive(pid) {
                     session.status = SessionStatus::Terminated;
+                    session.terminal_at = Some(now_millis());
                     let _ = self.engine.store.upsert_session(&session);
                     self.engine.emit(Event::SessionUpdated(session));
                 }
@@ -203,24 +254,21 @@ impl Poller {
     /// guaranteed to fire once per session lifetime, so no second dedup
     /// layer is needed here.
     ///
-    /// Diff computation runs on this poll tick (a couple of cheap, local
-    /// `git` calls); only the `claude -p` subprocess itself — which may take
-    /// a while — is handed off via `tokio::spawn` so it can never stall the
-    /// poll loop. Any failure (disabled config, no workspace, trivial diff,
-    /// or the subprocess itself failing) is logged at most and never
-    /// propagates back into `sync_sessions_metadata`.
+    /// Diff computation (a couple of local `git` subprocess calls) AND the
+    /// `claude -p` subprocess itself both run inside a single `tokio::spawn`
+    /// — nothing about harvesting, however slow, may stall this poll tick's
+    /// processing of other sessions. Any failure (disabled config, no
+    /// workspace, trivial diff, or the subprocess itself failing) is logged
+    /// at most and never propagates back into `sync_sessions_metadata`. A
+    /// second, supervising spawn awaits the harvest task purely to log a
+    /// panic that would otherwise be silent.
     async fn trigger_brain_harvest(&self, session: &Session) {
         let config = AppConfig::load().unwrap_or_default();
         if !config.brain_harvest.enabled {
             return;
         }
         let Some(workspace) = session.workspace_path.clone() else { return };
-        let Some(diff) = brain_harvest::compute_nontrivial_diff(std::path::Path::new(&workspace)).await else {
-            tracing::info!("brain harvest skipped for {}: no non-trivial diff", session.id);
-            return;
-        };
-
-        let prompt         = brain_harvest::build_harvest_prompt(&session.id, &diff);
+        let workspace_path: PathBuf = workspace.into();
         // Prefer the session's own catalogue — set from that worker's
         // `NINOX_BRAIN` at spawn time (see `main.rs::run_spawn`,
         // `spawn_util::interactive_env_vars`) — over the global default, so
@@ -229,13 +277,38 @@ impl Poller {
         let brain_path: PathBuf = session.catalogue_path.clone()
             .map(PathBuf::from)
             .unwrap_or_else(|| config.resolved_brain_path());
-        let workspace_path: PathBuf = workspace.into();
-        let runner          = self.harvest_runner.clone();
-        let session_id      = session.id.clone();
+        let runner       = self.harvest_runner.clone();
+        let session_id    = session.id.clone();
+        let panic_session_id = session_id.clone();
+        let vault_lock   = self.vault_lock(&brain_path);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
+            let Some(diff) = brain_harvest::compute_nontrivial_diff(&workspace_path).await else {
+                tracing::info!("brain harvest skipped for {session_id}: no non-trivial diff");
+                return;
+            };
+            let prompt = brain_harvest::build_harvest_prompt(&session_id, &diff);
+
+            // Serialize concurrent harvests that share a vault — two
+            // `claude -p` subprocesses running `ninox brain index` against
+            // the same vault at once can race on the index write.
+            let _guard = vault_lock.lock().await;
             if let Err(e) = runner.run(prompt, workspace_path, brain_path).await {
                 tracing::warn!("brain harvest failed for session {session_id}: {e}");
+            }
+        });
+
+        tokio::spawn(async move {
+            if let Err(join_err) = handle.await {
+                if join_err.is_panic() {
+                    let payload = join_err.into_panic();
+                    tracing::warn!(
+                        "brain harvest task panicked for session {panic_session_id}: {}",
+                        panic_message(payload.as_ref()),
+                    );
+                } else {
+                    tracing::warn!("brain harvest task for session {panic_session_id} was cancelled");
+                }
             }
         });
     }
@@ -346,7 +419,14 @@ impl Poller {
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
 
         for mut session in sessions {
-            if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted) {
+            // Only `Done` is excluded here — a session already has its PR's
+            // merge handled by definition once `Done`. `Terminated` (the
+            // worker's own process exited, typically once its PR is merely
+            // *open*) and `Interrupted` sessions may still have a PR whose
+            // fate hasn't resolved yet, so they must keep being polled or a
+            // later merge becomes permanently invisible (no status update,
+            // no notification) the instant the process dies.
+            if matches!(session.status, SessionStatus::Done) {
                 continue;
             }
             let Some(pr_number) = session.pr_number else { continue };
@@ -427,23 +507,7 @@ impl Poller {
             let pr_id: PrId = pr_number as i64;
 
             // -- Merge detection — handle before CI (no point polling CI on merged PR) --
-            if pr_status.merged && !matches!(session.status, SessionStatus::Done) {
-                self.engine.emit(Event::Notification(Notification {
-                    id:         format!("merged-{}", session.id),
-                    kind:       NotificationKind::WorkerDone,
-                    title:      format!("PR merged — {}", session.name),
-                    body:       format!("#{} merged successfully", pr_number),
-                    session_id: Some(session.id.clone()),
-                    created_at: now_millis(),
-                }));
-                if let Err(e) = self.engine.cleanup_session(&session.id).await {
-                    tracing::warn!("cleanup_session {}: {e}", session.id);
-                }
-                // Remove enrichment state for this session — it's done
-                {
-                    let mut cache = self.enrichment_cache.lock().unwrap();
-                    cache.remove(&session.id);
-                }
+            if self.handle_merge_detection(&session, pr_number, pr_status.merged).await {
                 continue; // skip further enrichment for this session
             }
 
@@ -670,6 +734,95 @@ impl Poller {
             }
         }
     }
+    /// Handle a freshly-fetched PR status's merge state for `session`.
+    /// Returns `true` when the merge was handled this call (the caller
+    /// should skip further CI/review enrichment for the session this tick);
+    /// `false` when there's nothing to do (not merged, or already `Done` —
+    /// reusing the status transition itself as the one-shot dedup guard, so
+    /// a session can never fire this reaction twice).
+    ///
+    /// Extracted from `poll_github` so it's directly unit-testable without a
+    /// live GitHub client — `poll_github` only needs the client to fetch
+    /// `pr_status` in the first place; this handles the resulting state
+    /// unconditionally.
+    async fn handle_merge_detection(
+        &self,
+        session:    &Session,
+        pr_number:  u64,
+        pr_merged:  bool,
+    ) -> bool {
+        if !pr_merged || matches!(session.status, SessionStatus::Done) {
+            return false;
+        }
+        self.engine.emit(Event::Notification(Notification {
+            id:         format!("merged-{}", session.id),
+            kind:       NotificationKind::WorkerDone,
+            title:      format!("PR merged — {}", session.name),
+            body:       format!("#{} merged successfully", pr_number),
+            session_id: Some(session.id.clone()),
+            created_at: now_millis(),
+        }));
+        // Code-level completion guarantee for the orchestrator — independent
+        // of whether the worker's own agent ever reports back before exiting.
+        if let Some(orch) = session.orchestrator_id.clone() {
+            let msg = crate::lifecycle::reactions::format_worker_done_reaction(session, pr_number);
+            if let Err(e) = self.engine.send_to_session(&orch, &msg).await {
+                tracing::warn!("send worker-done reaction to orchestrator {orch}: {e}");
+            }
+        }
+        if let Err(e) = self.engine.cleanup_session(&session.id).await {
+            tracing::warn!("cleanup_session {}: {e}", session.id);
+        }
+        // Remove enrichment state for this session — it's done
+        {
+            let mut cache = self.enrichment_cache.lock().unwrap();
+            cache.remove(&session.id);
+        }
+        true
+    }
+
+    // ── Retention sweep ──────────────────────────────────────────────────────
+
+    /// Purge `Done`/`Terminated` session records whose terminal state was
+    /// reached more than `retention`'s window ago — gives the fleet board a
+    /// grace period to show what just completed instead of the record
+    /// vanishing the instant the poller marks it done (see
+    /// `Session::terminal_at`). Sessions with no `terminal_at` (a terminal
+    /// state reached via a direct user action —
+    /// `Engine::terminate_session`/`Engine::remove_session` — rather than
+    /// this automatic lifecycle path) have no grace period and are purged
+    /// on sight, preserving today's immediate disappearance for those
+    /// actions. Orchestrator sessions are never purged this way.
+    async fn sweep_retired_sessions(&self, retention: &SessionRetentionConfig) {
+        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+        let Ok(orchestrators) = self.engine.store.list_orchestrators() else { return };
+        let orch_ids: std::collections::HashSet<&str> =
+            orchestrators.iter().map(|o| o.id.as_str()).collect();
+
+        let now = now_millis();
+        let retention_ms = retention.retention_millis();
+
+        for session in sessions {
+            if !matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
+                continue;
+            }
+            if orch_ids.contains(session.id.as_str()) {
+                continue;
+            }
+            let expired = match session.terminal_at {
+                Some(t) => now.saturating_sub(t) >= retention_ms,
+                None    => true,
+            };
+            if !expired {
+                continue;
+            }
+            if let Err(e) = self.engine.store.delete_session(&session.id) {
+                tracing::warn!("purge retired session {}: {e}", session.id);
+                continue;
+            }
+            self.engine.emit(Event::SessionDone(session.id));
+        }
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -807,6 +960,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
         }
     }
 
@@ -1756,5 +1911,396 @@ mod tests {
             Some(v) => std::env::set_var("NINOX_CONFIG", v),
             None    => std::env::remove_var("NINOX_CONFIG"),
         }
+    }
+
+    /// Captures every `tracing` event's formatted `message` field so tests
+    /// can assert on log output without a real logging backend.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl CapturedLogs {
+        fn contains(&self, needle: &str) -> bool {
+            self.0.lock().unwrap().iter().any(|m| m.contains(needle))
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.0);
+        }
+    }
+
+    /// A `HarvestRunner` whose returned future panics as soon as it's
+    /// polled — stands in for a bug inside the real harvest subprocess
+    /// plumbing, to prove a panic is logged rather than silently lost.
+    struct PanickingHarvestRunner;
+
+    impl HarvestRunner for PanickingHarvestRunner {
+        fn run(
+            &self,
+            _prompt: String,
+            _workspace: PathBuf,
+            _brain_path: PathBuf,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+            Box::pin(async move { panic!("simulated harvest panic") })
+        }
+    }
+
+    /// A panicking `HarvestRunner` must produce a logged warning — the
+    /// `tokio::spawn` `JoinHandle` is otherwise discarded and a panic would
+    /// be completely silent (see `trigger_brain_harvest`'s supervising
+    /// spawn).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn metadata_sync_logs_a_warning_when_harvest_task_panics() {
+        use crate::{config::ENV_TEST_GUARD, store::Store};
+        use tracing_subscriber::{layer::SubscriberExt, Registry};
+
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("NINOX_CONFIG").ok();
+        std::env::set_var("NINOX_CONFIG", nonexistent_config_path());
+
+        let logs = CapturedLogs::default();
+        let _log_guard = tracing::subscriber::set_default(Registry::default().with(logs.clone()));
+
+        let repo = init_diff_repo("feature-panic", Some(("src.rs", "fn main() {}\n")));
+        let workspace = repo.to_str().unwrap().to_string();
+
+        let sessions_dir = tempfile::tempdir().unwrap();
+        let meta = serde_json::json!({"agentReportedPrNumber": "20"});
+        std::fs::write(sessions_dir.path().join("s1.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", &workspace)).unwrap();
+        let engine = Engine::new(store.clone());
+
+        let poller = Poller::new_with_harvest_runner(engine, Arc::new(PanickingHarvestRunner));
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        // The harvest + its supervising task are detached spawns; poll
+        // until the panic has been caught and logged, bounded so a
+        // regression fails the test instead of hanging.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !logs.contains("brain harvest task panicked") {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for the panic to be logged");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        match prior {
+            Some(v) => std::env::set_var("NINOX_CONFIG", v),
+            None    => std::env::remove_var("NINOX_CONFIG"),
+        }
+    }
+
+    /// Records whether it ever observed two overlapping `run()` calls —
+    /// proves the per-vault lock actually serializes concurrent harvests
+    /// targeting the same brain path, rather than merely happening not to
+    /// race in this particular run.
+    struct OverlapDetectingHarvestRunner {
+        calls:      tokio::sync::mpsc::UnboundedSender<()>,
+        active:     Arc<std::sync::atomic::AtomicUsize>,
+        overlapped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl HarvestRunner for OverlapDetectingHarvestRunner {
+        fn run(
+            &self,
+            _prompt: String,
+            _workspace: PathBuf,
+            _brain_path: PathBuf,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+            let _ = self.calls.send(());
+            let active = self.active.clone();
+            let overlapped = self.overlapped.clone();
+            Box::pin(async move {
+                if active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                    overlapped.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    /// Two sessions whose harvests target the same (default) brain vault —
+    /// neither sets `catalogue_path`, so both resolve to
+    /// `config.resolved_brain_path()` — must never have their
+    /// `HarvestRunner::run` calls (which, in production, both invoke `ninox
+    /// brain index`) overlap.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn concurrent_harvests_to_the_same_vault_do_not_overlap() {
+        use crate::{config::ENV_TEST_GUARD, store::Store};
+
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("NINOX_CONFIG").ok();
+        std::env::set_var("NINOX_CONFIG", nonexistent_config_path());
+
+        let repo1 = init_diff_repo("feature-vault-1", Some(("a.rs", "fn a() {}\n")));
+        let repo2 = init_diff_repo("feature-vault-2", Some(("b.rs", "fn b() {}\n")));
+
+        let sessions_dir = tempfile::tempdir().unwrap();
+        for (id, pr) in [("s1", "30"), ("s2", "31")] {
+            let meta = serde_json::json!({"agentReportedPrNumber": pr});
+            std::fs::write(sessions_dir.path().join(format!("{id}.json")), serde_json::to_string(&meta).unwrap()).unwrap();
+        }
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", repo1.to_str().unwrap())).unwrap();
+        store.upsert_session(&test_session("s2", repo2.to_str().unwrap())).unwrap();
+        let engine = Engine::new(store.clone());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overlapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner = Arc::new(OverlapDetectingHarvestRunner {
+            calls: tx, active: active.clone(), overlapped: overlapped.clone(),
+        });
+        let poller = Poller::new_with_harvest_runner(engine, runner);
+
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("both harvests should be attempted")
+                .expect("channel should not be closed");
+        }
+        // Let the (lock-serialized) second call finish its simulated work
+        // so `overlapped` reflects the full run.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert!(
+            !overlapped.load(std::sync::atomic::Ordering::SeqCst),
+            "concurrent harvests to the same vault must not run HarvestRunner::run concurrently",
+        );
+
+        match prior {
+            Some(v) => std::env::set_var("NINOX_CONFIG", v),
+            None    => std::env::remove_var("NINOX_CONFIG"),
+        }
+    }
+
+    /// Two syntactically different paths to the same physical vault (here:
+    /// a trailing slash) must resolve to the same lock — otherwise two
+    /// harvests using differently-spelled `catalogue_path`s for the same
+    /// vault could still run `ninox brain index` concurrently, silently
+    /// defeating the point of the lock.
+    #[test]
+    fn vault_lock_treats_equivalent_paths_as_the_same_vault() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let engine = Engine::new(store);
+        let poller = Poller::new_with_harvest_runner(engine, Arc::new(ClaudeHarvestRunner));
+
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().to_path_buf();
+        let with_trailing_slash = PathBuf::from(format!("{}/", canonical.display()));
+
+        let lock_a = poller.vault_lock(&canonical);
+        let lock_b = poller.vault_lock(&with_trailing_slash);
+
+        assert!(
+            Arc::ptr_eq(&lock_a, &lock_b),
+            "syntactically different paths to the same physical vault must share one lock",
+        );
+    }
+    /// The confirmed bug: a worker's process typically exits (`Terminated`)
+    /// once its PR is merely *open*, well before that PR merges. Merge
+    /// detection must still run for `Terminated` sessions, not just
+    /// `Working`/`PrOpen` — otherwise the later merge becomes permanently
+    /// invisible the instant the process dies.
+    #[tokio::test]
+    async fn merge_detection_fires_for_terminated_session() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Terminated;
+        s.orchestrator_id = Some("orch1".into());
+        s.pr_number = Some(42);
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        let handled = poller.handle_merge_detection(&s, 42, true).await;
+        assert!(handled, "merge detection must run for a Terminated session");
+
+        let after = store.get_session("w1").unwrap().unwrap();
+        assert!(matches!(after.status, SessionStatus::Done), "merged session transitions to Done");
+        assert!(after.terminal_at.is_some(), "Done via merge detection must stamp terminal_at");
+
+        let events = drain_events(&mut rx);
+        let merged_notifs = events.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+        )).count();
+        assert_eq!(merged_notifs, 1, "exactly one WorkerDone notification for the merge");
+    }
+
+    /// The orchestrator must receive exactly one worker-done reaction per
+    /// merged session — calling merge detection again for an already-`Done`
+    /// session (as the next poll tick would, reading the updated status back
+    /// from the store) must be a no-op, not a duplicate notification.
+    #[tokio::test]
+    async fn merge_detection_does_not_fire_twice_for_the_same_session() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::PrOpen;
+        s.orchestrator_id = Some("orch1".into());
+        s.pr_number = Some(7);
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        let first = poller.handle_merge_detection(&s, 7, true).await;
+        assert!(first, "first tick handles the merge");
+
+        // Simulate the next poll tick re-reading the (now Done) session from
+        // the store before calling merge detection again.
+        let updated = store.get_session("w1").unwrap().unwrap();
+        let second = poller.handle_merge_detection(&updated, 7, true).await;
+        assert!(!second, "an already-Done session must not re-fire merge detection");
+
+        let events = drain_events(&mut rx);
+        let merged_notifs = events.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+        )).count();
+        assert_eq!(merged_notifs, 1, "no duplicate WorkerDone notification across ticks");
+    }
+
+    #[tokio::test]
+    async fn handle_merge_detection_is_noop_when_pr_not_merged() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let s = test_session("w1", "/ws");
+        store.upsert_session(&s).unwrap();
+        let engine = Engine::new(store.clone());
+        let poller = Poller::new(engine);
+
+        let handled = poller.handle_merge_detection(&s, 1, false).await;
+        assert!(!handled);
+        assert!(matches!(store.get_session("w1").unwrap().unwrap().status, SessionStatus::Working));
+    }
+
+    /// A session past the retention window is purged; one still within the
+    /// window survives. Time is injected via `terminal_at` (computed off the
+    /// real clock, offset by the retention window) rather than sleeping, and
+    /// the retention config is passed in directly rather than read from
+    /// `AppConfig::load()` — mirroring `sync_sessions_metadata`'s pattern of
+    /// taking its directory as a parameter so tests can control it exactly.
+    #[tokio::test]
+    async fn sweep_retired_sessions_purges_only_past_the_retention_window() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let retention = SessionRetentionConfig { done_retention_days: 2 };
+        let now = now_millis();
+        let retention_ms = retention.retention_millis();
+
+        let mut expired = test_session("expired", "/ws");
+        expired.status = SessionStatus::Done;
+        expired.terminal_at = Some(now - retention_ms - 1_000);
+        store.upsert_session(&expired).unwrap();
+
+        let mut fresh = test_session("fresh", "/ws");
+        fresh.status = SessionStatus::Done;
+        fresh.terminal_at = Some(now - 1_000);
+        store.upsert_session(&fresh).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.sweep_retired_sessions(&retention).await;
+
+        assert!(store.get_session("expired").unwrap().is_none(), "past-retention session must be purged");
+        assert!(store.get_session("fresh").unwrap().is_some(), "within-retention session must survive");
+
+        let events = drain_events(&mut rx);
+        assert!(events.iter().any(|e| matches!(e, Event::SessionDone(id) if id == "expired")));
+    }
+
+    /// A session terminated via a direct user action
+    /// (`terminate_session`/`remove_session`) never gets `terminal_at`
+    /// stamped — those must stay "immediate", so the sweep purges them on
+    /// sight rather than holding them for the grace period.
+    #[tokio::test]
+    async fn sweep_retired_sessions_purges_sessions_with_no_terminal_at_immediately() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("user-killed", "/ws");
+        s.status = SessionStatus::Terminated;
+        s.terminal_at = None;
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let poller = Poller::new(engine);
+
+        poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
+
+        assert!(store.get_session("user-killed").unwrap().is_none());
+    }
+
+    /// An orchestrator's own session row must never be auto-purged by the
+    /// retention sweep, no matter its status or how stale `terminal_at` is.
+    #[tokio::test]
+    async fn sweep_retired_sessions_never_purges_orchestrator_sessions() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_orchestrator(&crate::types::Orchestrator {
+            id: "orch1".into(), name: "orch".into(), created_at: 0,
+        }).unwrap();
+        let mut s = test_session("orch1", "/ws");
+        s.status = SessionStatus::Done;
+        s.terminal_at = Some(0); // maximally stale
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let poller = Poller::new(engine);
+
+        poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
+
+        assert!(store.get_session("orch1").unwrap().is_some(), "orchestrator sessions are never auto-purged");
+    }
+
+    /// Active (non-terminal) sessions are left alone by the sweep regardless
+    /// of `terminal_at`.
+    #[tokio::test]
+    async fn sweep_retired_sessions_ignores_non_terminal_sessions() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("still-working", "/ws");
+        s.status = SessionStatus::Working;
+        s.terminal_at = None;
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let poller = Poller::new(engine);
+
+        poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
+
+        assert!(store.get_session("still-working").unwrap().is_some());
     }
 }

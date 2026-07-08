@@ -73,6 +73,18 @@ pub fn format_extra_pr_reaction(
     msg
 }
 
+/// Format a worker-done reaction for the *orchestrator*: fired automatically
+/// by the poller when a worker's tracked PR is detected merged. This is a
+/// code-level completion guarantee — unlike the notification/desktop alert,
+/// it doesn't depend on the worker's own agent voluntarily reporting back
+/// (via `ninox send`) before it exits.
+pub fn format_worker_done_reaction(worker: &Session, pr_number: u64) -> String {
+    format!(
+        "[Ninox] Worker `{id}`'s PR #{pr_number} merged.",
+        id = worker.id,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +100,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
+            terminal_at: None,
         }
     }
 
@@ -138,6 +152,15 @@ mod tests {
         assert!(msg.contains("#9") && msg.contains("#11"), "must list every extra PR");
         assert!(msg.contains("https://github.com/org/repo/pull/9"));
         assert!(msg.contains("s1"));
+    }
+
+    #[test]
+    fn worker_done_reaction_names_worker_and_merged_pr() {
+        let worker = mock_session(); // id "s1"
+        let msg = format_worker_done_reaction(&worker, 42);
+        assert!(msg.contains("s1"), "must name the worker session");
+        assert!(msg.contains("#42"), "must name the merged PR");
+        assert!(msg.to_lowercase().contains("merged"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use iced::{
-    widget::{button, column, container, row, text, Space},
+    widget::{button, column, container, row, scrollable, text, Space},
     Alignment, Background, Border, Color, Element, Length, Padding,
 };
 
@@ -192,6 +192,75 @@ pub enum DetailPanel {
     Split,
     Info,
     Inspector,
+    Diff,
+}
+
+/// Diff view — unified `git diff` text for the session's workspace
+/// (`App::ensure_diff`), rendered on the same dark terminal surface as the
+/// Terminal panel so `term_ok`/`term_err` (designed against `term_bg`) read
+/// with enough contrast for add/remove line coloring.
+fn diff_panel<'a>(app: &'a App, session_id: &str, s: &'a ColorScheme) -> Element<'a, Message> {
+    // Iced lays out one widget per line with no virtualization, so an
+    // enormous diff would otherwise stall layout/paint on every frame.
+    const MAX_DIFF_LINES: usize = 4000;
+
+    let body: Element<Message> = match app.diffs.get(session_id) {
+        None => text("Loading diff…").size(13).font(crate::style::MONO).color(s.faint).into(),
+        Some(None) => text("No changes yet").size(13).font(crate::style::MONO).color(s.faint).into(),
+        Some(Some(diff)) => {
+            let all_lines: Vec<&str> = diff.lines().collect();
+            let shown_count = all_lines.len().min(MAX_DIFF_LINES);
+
+            let mut rows: Vec<Element<Message>> =
+                all_lines[..shown_count].iter().map(|line| diff_line(line, s)).collect();
+            if all_lines.len() > MAX_DIFF_LINES {
+                rows.push(
+                    text(format!("… {} more lines truncated", all_lines.len() - MAX_DIFF_LINES))
+                        .size(11)
+                        .font(crate::style::MONO)
+                        .color(s.faint)
+                        .into(),
+                );
+            }
+
+            scrollable(column(rows)).width(Length::Fill).height(Length::Fill).into()
+        }
+    };
+
+    container(body)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(16)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(s.term_bg)),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// One unified-diff line, colored by its leading marker: `+`/`-` content
+/// lines in `term_ok`/`term_err`, `+++`/`---`/`diff --git`/`index` headers
+/// and `@@` hunk markers dimmed out, everything else (context lines) in the
+/// terminal's plain foreground.
+fn diff_line<'a>(line: &str, s: &ColorScheme) -> Element<'a, Message> {
+    let color = if line.starts_with("+++")
+        || line.starts_with("---")
+        || line.starts_with("diff --git")
+        || line.starts_with("index ")
+    {
+        s.faint
+    } else if line.starts_with("@@") {
+        s.accent
+    } else if line.starts_with('+') {
+        s.term_ok
+    } else if line.starts_with('-') {
+        s.term_err
+    } else {
+        s.term_fg
+    };
+    text(line.to_string()).size(12).font(crate::style::MONO).color(color).into()
 }
 
 /// Session detail view — header + panel toggle + terminal canvas.
@@ -390,6 +459,7 @@ pub fn session_detail<'a>(
                     panel_btn(app, "Split", DetailPanel::Split, *panel),
                     panel_btn(app, "Info", DetailPanel::Info, *panel),
                     panel_btn(app, "Inspector", DetailPanel::Inspector, *panel),
+                    panel_btn(app, "Diff", DetailPanel::Diff, *panel),
                 ]
                 .spacing(22)
                 .align_y(Alignment::Center),
@@ -507,6 +577,7 @@ pub fn session_detail<'a>(
         .into(),
         DetailPanel::Info => info_pane,
         DetailPanel::Inspector => inspector_panel(app, session),
+        DetailPanel::Diff => diff_panel(app, session_id, s),
     };
 
     column![header, tabs_block, content]
@@ -533,6 +604,8 @@ mod tests {
             pid: None, model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: claude_session_id.map(String::from),
+            summary: None,
+            terminal_at: None,
         }
     }
 
