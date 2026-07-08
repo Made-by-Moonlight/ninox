@@ -48,6 +48,8 @@ This produces `target/release/bundle/osx/Ninox.app`, which you can open directly
 open target/release/bundle/osx/Ninox.app
 ```
 
+**Synthesia-internal:** the private mirror at [`Synthesia-Technologies/ninox`](https://github.com/Synthesia-Technologies/ninox) publishes a prebuilt `Ninox.app.zip` as a GitHub Release asset for every tagged release, alongside the `ninox`/`ninox-core`/`ninox-server` crates on our internal CodeArtifact registry — see that repo's [Releases page](https://github.com/Synthesia-Technologies/ninox/releases). No need to build the bundle yourself or visit this public repo for either the CLI or the GUI app.
+
 Bundle metadata (name, identifier, icon) lives under `[package.metadata.bundle]` in `crates/ninox-app/Cargo.toml`. The icon source is `crates/ninox-app/assets/icon-1024.png`; the compiled `crates/ninox-app/assets/Ninox.icns` is generated from it with `sips` + `iconutil` (regenerate after changing the source image):
 
 ```bash
