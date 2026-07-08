@@ -116,7 +116,7 @@ concurrency:
 jobs:
   publish:
     name: Publish
-    runs-on: ${{ vars.RUNNER_LABEL && fromJSON(format('["self-hosted","{0}"]', vars.RUNNER_LABEL)) || 'ubuntu-latest' }}
+    runs-on: ${{ fromJSON(vars.RUNNER_LABEL && format('["self-hosted","{0}"]', vars.RUNNER_LABEL) || '["ubuntu-latest"]') }}
     outputs:
       configured: ${{ steps.config.outputs.configured }}
     env:

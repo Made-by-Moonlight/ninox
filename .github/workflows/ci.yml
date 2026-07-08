@@ -24,7 +24,7 @@ jobs:
     # (e.g. "build") on the private Synthesia-Technologies mirror, which
     # has access to the org's self-hosted runner infra that the public
     # repo does not.
-    runs-on: ${{ vars.RUNNER_LABEL && fromJSON(format('["self-hosted","{0}"]', vars.RUNNER_LABEL)) || 'ubuntu-latest' }}
+    runs-on: ${{ fromJSON(vars.RUNNER_LABEL && format('["self-hosted","{0}"]', vars.RUNNER_LABEL) || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install system dependencies
