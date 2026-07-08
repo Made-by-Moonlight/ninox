@@ -202,6 +202,9 @@ async fn run_spawn(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("worker-{ts}"));
     let display_name = name.unwrap_or_else(|| first_words(&prompt, 4));
+    // The fleet card summary: the first line of the raw task prompt, before
+    // the worker-context footer is appended below.
+    let summary = first_line(&prompt, 140);
     let orchestrator_id = orchestrator_id
         .or_else(|| std::env::var("NINOX_ORCHESTRATOR_ID").ok());
 
@@ -261,6 +264,7 @@ async fn run_spawn(
         catalogue_path:  std::env::var("NINOX_BRAIN").ok().filter(|s| !s.is_empty()),
         context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: Some(claude_session_id.clone()),
+        summary,
         terminal_at: None,
     };
 
@@ -783,6 +787,19 @@ fn first_words(s: &str, n: usize) -> String {
     s.split_whitespace().take(n).collect::<Vec<_>>().join("-")
 }
 
+/// First non-empty line of `s`, trimmed and clipped to `max_chars` (with a
+/// trailing "…" if truncated) — derives the fleet card summary from a
+/// spawn prompt. `None` if `s` has no non-empty line.
+fn first_line(s: &str, max_chars: usize) -> Option<String> {
+    let line = s.lines().find(|l| !l.trim().is_empty())?.trim();
+    if line.chars().count() <= max_chars {
+        Some(line.to_string())
+    } else {
+        let clipped: String = line.chars().take(max_chars).collect();
+        Some(format!("{clipped}…"))
+    }
+}
+
 fn has_display() -> bool {
     #[cfg(target_os = "macos")]
     { true }
@@ -792,7 +809,30 @@ fn has_display() -> bool {
 
 #[cfg(test)]
 mod worker_env_tests {
-    use super::{worker_context_footer, worker_env_vars};
+    use super::{first_line, worker_context_footer, worker_env_vars};
+
+    #[test]
+    fn first_line_takes_first_non_empty_line_trimmed() {
+        assert_eq!(first_line("  Fix the flaky test  \n\nDetails follow.", 140).as_deref(), Some("Fix the flaky test"));
+    }
+
+    #[test]
+    fn first_line_skips_leading_blank_lines() {
+        assert_eq!(first_line("\n\n  Ship the thing\nmore text", 140).as_deref(), Some("Ship the thing"));
+    }
+
+    #[test]
+    fn first_line_clips_long_text_with_ellipsis() {
+        let long = "a".repeat(200);
+        let clipped = first_line(&long, 140).unwrap();
+        assert_eq!(clipped.chars().count(), 141); // 140 chars + "…"
+        assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
+    fn first_line_is_none_for_blank_prompt() {
+        assert_eq!(first_line("   \n\n  ", 140), None);
+    }
 
     #[test]
     fn worker_footer_scopes_to_one_pr_and_routes_extra_work_to_request_work() {

@@ -1129,7 +1129,8 @@ impl App {
                             catalogue_path:  Some(catalogue_path.clone()),
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
-                            terminal_at: None,
+                            summary:         None,
+                            terminal_at:         None,
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1185,6 +1186,7 @@ impl App {
                                     started_at:      ts_i64,
                                     claude_session_id,
                                     failure_status:  ninox_core::SessionStatus::Terminated,
+                                    summary:         None,
                                 },
                             )
                             .await;
@@ -1271,7 +1273,8 @@ impl App {
                             catalogue_path:  Some(catalogue_path.clone()),
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
-                            terminal_at: None,
+                            summary:         None,
+                            terminal_at:         None,
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1316,6 +1319,7 @@ impl App {
                                     started_at:      ts_i64,
                                     claude_session_id,
                                     failure_status:  ninox_core::SessionStatus::Terminated,
+                                    summary:         None,
                                 },
                             )
                             .await;
@@ -1407,6 +1411,7 @@ impl App {
                 let name    = session.name.clone();
                 let repo    = session.repo.clone();
                 let orch_id = session.orchestrator_id.clone();
+                let summary = session.summary.clone();
                 Task::future(async move {
                     // Ignore kill errors — a Terminated husk has no tmux
                     // session, and Re-file on one "just spawns". The
@@ -1429,6 +1434,7 @@ impl App {
                             started_at:      ts,
                             claude_session_id,
                             failure_status:  ninox_core::SessionStatus::Terminated,
+                            summary,
                         },
                     )
                     .await;
@@ -1460,6 +1466,7 @@ impl App {
                 let name    = session.name.clone();
                 let repo    = session.repo.clone();
                 let orch_id = session.orchestrator_id.clone();
+                let summary = session.summary.clone();
                 Task::future(async move {
                     let _ = ninox_core::tmux::kill_session(&id).await;
                     let attach = crate::spawn_util::spawn_interactive_session(
@@ -1477,6 +1484,7 @@ impl App {
                             started_at:      ts,
                             claude_session_id,
                             failure_status:  ninox_core::SessionStatus::Interrupted,
+                            summary,
                         },
                     )
                     .await;
@@ -2634,6 +2642,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
             terminal_at: None,
         }
     }
@@ -2768,6 +2777,7 @@ mod tests {
             catalogue_path: Some("/brains/b".into()),
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
             terminal_at: None,
         }
     }
@@ -2972,6 +2982,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
             terminal_at: None,
         };
         let (updated, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3056,6 +3067,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
             terminal_at: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3105,6 +3117,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
             terminal_at: None,
         }).unwrap();
         let engine = Engine::new(store);
@@ -3129,6 +3142,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
             terminal_at: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3167,6 +3181,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
             terminal_at: Some(0),
         };
         let _ = m.engine.store.upsert_session(&worker);
@@ -3219,6 +3234,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
             terminal_at: None,
         });
 
@@ -3633,6 +3649,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
             terminal_at: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3662,7 +3679,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
-                terminal_at: None,
+            summary: None,
+            terminal_at: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -3715,6 +3733,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
             terminal_at: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3763,7 +3782,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
-                terminal_at: None,
+            summary: None,
+            terminal_at: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -3845,6 +3865,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
             terminal_at: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3898,7 +3919,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
-                terminal_at: None,
+            summary: None,
+            terminal_at: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -3989,7 +4011,8 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
-                terminal_at: None,
+            summary: None,
+            terminal_at: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -4769,6 +4792,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
+            summary: None,
             terminal_at: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));

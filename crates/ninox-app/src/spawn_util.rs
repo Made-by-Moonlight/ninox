@@ -45,6 +45,10 @@ pub struct InteractiveSpawnParams {
     /// for Resume (keep it retryable — see the design spec's Error
     /// Handling section).
     pub failure_status:  ninox_core::SessionStatus,
+    /// One-line task summary carried over from the session being
+    /// respawned (Re-file/Resume); `None` for a fresh spawn, which has no
+    /// prior summary to preserve.
+    pub summary:         Option<String>,
 }
 
 /// Launch an interactive agent session inside tmux and start PTY streaming.
@@ -130,7 +134,8 @@ pub async fn spawn_interactive_session(
         catalogue_path:  (!p.catalogue_path.is_empty()).then(|| p.catalogue_path.clone()),
         context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: Some(p.claude_session_id),
-        terminal_at: None,
+        summary:         p.summary,
+        terminal_at:     None,
     };
     let _ = engine.store.upsert_session(&updated);
 
@@ -731,6 +736,7 @@ mod tests {
                 started_at:        0,
                 claude_session_id: "fixed-uuid-for-test".into(),
                 failure_status:    SessionStatus::Terminated,
+                summary:           None,
             },
         )
         .await;
@@ -759,6 +765,7 @@ mod tests {
             catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some("fixed-uuid".into()),
+            summary: None,
             terminal_at: None,
         }).unwrap();
 
@@ -789,6 +796,7 @@ mod tests {
                 started_at:        0,
                 claude_session_id: "fixed-uuid".into(),
                 failure_status:    SessionStatus::Interrupted,
+                summary:           None,
             },
         )
         .await;
@@ -1001,6 +1009,7 @@ mod persistence_probe {
                 started_at:      0,
                 claude_session_id: "probe-fixed-id".into(),
                 failure_status:  ninox_core::SessionStatus::Terminated,
+                summary:           None,
             },
         )
         .await;
@@ -1051,6 +1060,7 @@ mod persistence_probe {
                 started_at:      0,
                 claude_session_id: "probe-fixed-id".into(),
                 failure_status:  ninox_core::SessionStatus::Terminated,
+                summary:           None,
             },
         )
         .await;
