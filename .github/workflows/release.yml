@@ -173,6 +173,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-bundle-
 
       - name: Build, sign & verify Ninox.app
+        id: build
         uses: ./.github/actions/build-macos-bundle
 
       - name: Upload to release
@@ -180,7 +181,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ needs.release.outputs.tag }}" --clobber \
-            target/release/bundle/osx/Ninox.app.zip
+            "${{ steps.build.outputs.zip-path }}"
 
       - name: Publish release
         env:

@@ -65,4 +65,6 @@ runs:
       shell: bash
       run: |
         echo "bundle=target/release/bundle/osx/Ninox.app" >> "$GITHUB_OUTPUT"
-        echo "zip=target/release/bundle/osx/Ninox.app.zip" >> "$GITHUB_OUTPUT"
+        if [ "${{ inputs.zip }}" = "true" ]; then
+          echo "zip=target/release/bundle/osx/Ninox.app.zip" >> "$GITHUB_OUTPUT"
+        fi
