@@ -16,7 +16,15 @@ permissions:
 jobs:
   test:
     name: Clippy + Test
-    runs-on: ubuntu-latest
+    # This file is mirrored byte-for-byte to the public repo (see
+    # publish-codeartifact.yml's header) with no `if: github.repository`
+    # gates, so per-repo runner selection has to come from a repo variable
+    # rather than a hardcoded label: RUNNER_LABEL is unset on the public
+    # repo (falls back to ubuntu-latest) and set to the ARC runner type
+    # (e.g. "build") on the private Synthesia-Technologies mirror, which
+    # has access to the org's self-hosted runner infra that the public
+    # repo does not.
+    runs-on: ${{ vars.RUNNER_LABEL && fromJSON(format('["self-hosted","{0}"]', vars.RUNNER_LABEL)) || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install system dependencies

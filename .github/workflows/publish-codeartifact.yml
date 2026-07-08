@@ -38,6 +38,16 @@ name: Publish to CodeArtifact
 #                                 role ARNs aren't secret; a repo secret of
 #                                 the same name also works if preferred)
 #
+# Optional repo variable, unrelated to the gate above (it only selects
+# which runner picks up the `publish` job, same mirroring rationale as
+# ci.yml's Clippy + Test job):
+#   RUNNER_LABEL                  ARC self-hosted runner type (e.g. "build")
+#                                 to run this job on org-managed
+#                                 infrastructure instead of a GitHub-hosted
+#                                 runner. Unset on the public repo, which
+#                                 has no access to that infrastructure and
+#                                 falls back to ubuntu-latest.
+#
 # One-time setup needed on the private mirror before this can publish
 # anything: a CodeArtifact repository that accepts the "cargo" package
 # format, an IAM role that trusts this repo's GitHub OIDC identity and is
@@ -106,7 +116,7 @@ concurrency:
 jobs:
   publish:
     name: Publish
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL && fromJSON(format('["self-hosted","{0}"]', vars.RUNNER_LABEL)) || 'ubuntu-latest' }}
     outputs:
       configured: ${{ steps.config.outputs.configured }}
     env:
