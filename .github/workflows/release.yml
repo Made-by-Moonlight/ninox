@@ -15,7 +15,10 @@ name: Release
 #      the inter-crate version pins + Cargo.lock, commit
 #      `chore(release): vX.Y.Z` to main, and tag it.
 #   4. Create the GitHub release with notes grouped by commit type.
-#   5. The pushed version bump triggers publish.yml, which pushes the new
+#   5. Build the macOS Ninox.app bundle (same `cargo bundle` invocation as
+#      ci.yml's bundle-macos job) from the tagged commit, zip it, and attach
+#      it to the release as an asset.
+#   6. The pushed version bump triggers publish.yml, which pushes the new
 #      versions to crates.io via Trusted Publishing.
 #
 # The very first run has no v* tag, so the whole history counts — that cut
@@ -45,6 +48,9 @@ jobs:
   release:
     name: Cut release
     runs-on: ubuntu-latest
+    outputs:
+      bump: ${{ steps.decide.outputs.bump }}
+      tag: ${{ steps.bump.outputs.tag }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -84,6 +90,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Bump versions, tag, release
+        id: bump
         if: steps.decide.outputs.bump != 'none'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -133,3 +140,46 @@ jobs:
 
           gh release create "v$next" --title "v$next" \
             --notes-file /tmp/release-notes.md --generate-notes
+
+          echo "tag=v$next" >> "$GITHUB_OUTPUT"
+
+  bundle-macos:
+    name: Build & attach macOS app bundle
+    needs: release
+    if: needs.release.outputs.bump != 'none'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      - name: Cache Rust
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: ${{ runner.os }}-cargo-bundle-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-bundle-
+
+      - name: Install cargo-bundle
+        run: command -v cargo-bundle || cargo install cargo-bundle
+
+      - name: Build Ninox.app
+        run: cargo bundle --release -p ninox --format osx
+
+      - name: Zip Ninox.app
+        run: |
+          set -euo pipefail
+          cd target/release/bundle/osx
+          test -d Ninox.app
+          ditto -c -k --sequesterRsrc --keepParent Ninox.app Ninox.app.zip
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ needs.release.outputs.tag }}" \
+            target/release/bundle/osx/Ninox.app.zip

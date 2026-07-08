@@ -32,7 +32,9 @@ The HTTP server always starts on `127.0.0.1:8080` (or `--port`), exposing the en
 
 ## macOS app bundle
 
-To get a proper `Ninox.app` that shows up in the Dock and Launchpad with its own icon (instead of running as a bare binary), build it with [`cargo-bundle`](https://github.com/burtonageo/cargo-bundle):
+Every [tagged release](https://github.com/Made-by-Moonlight/ninox/releases) has a prebuilt `Ninox.app.zip` attached as a release asset — download it, unzip, and drag `Ninox.app` into `/Applications`. No local Rust toolchain needed.
+
+To build it yourself instead — to get a proper `Ninox.app` that shows up in the Dock and Launchpad with its own icon (instead of running as a bare binary) — build it with [`cargo-bundle`](https://github.com/burtonageo/cargo-bundle):
 
 ```bash
 cargo install cargo-bundle
