@@ -7,6 +7,7 @@ use crate::{
         brain_harvest::{self, ClaudeHarvestRunner, HarvestRunner},
         enrichment::EnrichmentCache,
         probe::is_pid_alive,
+        update_check::{self, CargoRegistryUpdateSource, UpdateSource},
         usage,
     },
     types::{
@@ -67,6 +68,13 @@ pub struct Poller {
     /// distinct vault paths in play is bounded by the number of configured
     /// catalogues, not by session count.
     vault_locks:      Arc<std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Where to look up the latest published ninox version. Injectable so
+    /// tests never hit the network or shell out — see `poll_update_check`.
+    update_source:    Arc<dyn UpdateSource>,
+    /// The newest version a `poll_update_check` run has already notified
+    /// about, so a steady "still on 0.14.0" state re-notifies only once,
+    /// not every tick — same dedup shape as `github_lookup_failed_notified`.
+    last_notified_update: Arc<std::sync::Mutex<Option<semver::Version>>>,
 }
 
 impl Poller {
@@ -81,7 +89,16 @@ impl Poller {
             context_cache:    Arc::new(std::sync::Mutex::new(HashMap::new())),
             harvest_runner,
             vault_locks:      Arc::new(std::sync::Mutex::new(HashMap::new())),
+            update_source:    Arc::new(CargoRegistryUpdateSource),
+            last_notified_update: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Overrides the update-check source — the dependency-injection seam
+    /// `poll_update_check`'s tests use instead of the real registry.
+    pub fn with_update_source(mut self, source: Arc<dyn UpdateSource>) -> Self {
+        self.update_source = source;
+        self
     }
 
     /// The (created-on-first-use) lock for a given vault path — see
@@ -105,9 +122,15 @@ impl Poller {
         let mut pid_interval    = tokio::time::interval(Duration::from_secs(5));
         let mut usage_interval  = tokio::time::interval(Duration::from_secs(10));
         let mut github_interval = tokio::time::interval(Duration::from_secs(30));
+        // Releases only happen on merge-to-main, so this doesn't need to be
+        // frequent — 6h keeps the once-per-startup check (interval's first
+        // tick fires immediately) without hammering the registry or
+        // shelling out to `aws codeartifact get-authorization-token` often.
+        let mut update_interval = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
         // Prevent a missed tick from causing back-to-back polls.
         github_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         usage_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        update_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = token.cancelled()      => break,
@@ -120,6 +143,7 @@ impl Poller {
                     self.sweep_retired_sessions(&retention).await;
                 }
                 _ = usage_interval.tick()  => self.poll_usage().await,
+                _ = update_interval.tick() => self.poll_update_check().await,
                 _ = github_interval.tick() => {
                     // Reconciliation first: a session whose PR the poller
                     // hasn't adopted yet has no `pr_number` for `poll_github`
@@ -128,6 +152,42 @@ impl Poller {
                     self.poll_github().await;
                 }
             }
+        }
+    }
+
+    // ── Update check ─────────────────────────────────────────────────────────
+
+    /// Checks `update_source` for a newer ninox release than the one
+    /// currently running, emitting an `UpdateAvailable` notification the
+    /// first time a given newer version is seen. `ninox-core`'s own
+    /// `CARGO_PKG_VERSION` is used rather than threading the app crate's
+    /// version through: `release.yml` bumps every workspace crate together
+    /// in one commit, and `ninox-app`'s `Cargo.toml` pins an exact-version
+    /// path dependency on `ninox-core`, so the two can never diverge for a
+    /// published build.
+    async fn poll_update_check(&self) {
+        let current_version = env!("CARGO_PKG_VERSION");
+        match update_check::check_for_update(self.update_source.as_ref(), "ninox", current_version).await {
+            Ok(Some(latest)) => {
+                let already_notified = {
+                    let mut last = self.last_notified_update.lock().unwrap_or_else(|e| e.into_inner());
+                    let already = last.as_ref() == Some(&latest);
+                    *last = Some(latest.clone());
+                    already
+                };
+                if !already_notified {
+                    self.engine.emit(Event::Notification(Notification {
+                        id:         format!("update-available-{latest}"),
+                        kind:       NotificationKind::UpdateAvailable,
+                        title:      "Update available".to_string(),
+                        body:       format!("ninox {latest} is available — running {current_version}"),
+                        session_id: None,
+                        created_at: now_millis(),
+                    }));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("update check failed: {e}"),
         }
     }
 
@@ -1628,6 +1688,73 @@ mod tests {
         poller.poll_github().await;
         let events = drain_events(&mut rx);
         assert_eq!(failures(&events), 1, "must notify again after recovering and failing anew");
+    }
+
+    // ── Update check ─────────────────────────────────────────────────────────
+
+    /// Returns whatever version is currently set in `0` — swappable mid-test
+    /// so "a newer version than the one we already notified about" is
+    /// exercisable without a real registry.
+    struct FakeUpdateSource(std::sync::Mutex<Option<semver::Version>>);
+
+    #[async_trait::async_trait]
+    impl UpdateSource for FakeUpdateSource {
+        async fn latest_version(&self, _package: &str) -> anyhow::Result<Option<semver::Version>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+    }
+
+    fn bare_engine() -> Arc<Engine> {
+        use crate::store::Store;
+        let store = Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        Engine::new(store)
+    }
+
+    fn update_events(evs: &[Event]) -> usize {
+        evs.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::UpdateAvailable
+        )).count()
+    }
+
+    #[tokio::test]
+    async fn poll_update_check_notifies_once_then_again_for_a_newer_version() {
+        let engine = bare_engine();
+        let mut rx = engine.subscribe();
+        let source = Arc::new(FakeUpdateSource(std::sync::Mutex::new(Some(semver::Version::new(99, 0, 0)))));
+        let poller = Poller::new(engine).with_update_source(source.clone());
+
+        poller.poll_update_check().await;
+        assert_eq!(update_events(&drain_events(&mut rx)), 1, "first sighting of a newer version must notify");
+
+        poller.poll_update_check().await;
+        assert_eq!(update_events(&drain_events(&mut rx)), 0, "same version again must not re-notify");
+
+        *source.0.lock().unwrap() = Some(semver::Version::new(100, 0, 0));
+        poller.poll_update_check().await;
+        assert_eq!(update_events(&drain_events(&mut rx)), 1, "an even newer version must notify again");
+    }
+
+    #[tokio::test]
+    async fn poll_update_check_no_notification_when_already_current() {
+        let engine = bare_engine();
+        let mut rx = engine.subscribe();
+        let current: semver::Version = env!("CARGO_PKG_VERSION").parse().unwrap();
+        let source = Arc::new(FakeUpdateSource(std::sync::Mutex::new(Some(current))));
+        let poller = Poller::new(engine).with_update_source(source);
+
+        poller.poll_update_check().await;
+        assert_eq!(update_events(&drain_events(&mut rx)), 0);
+    }
+
+    #[tokio::test]
+    async fn poll_update_check_no_notification_when_source_has_nothing() {
+        let engine = bare_engine();
+        let mut rx = engine.subscribe();
+        let source = Arc::new(FakeUpdateSource(std::sync::Mutex::new(None)));
+        let poller = Poller::new(engine).with_update_source(source);
+
+        poller.poll_update_check().await;
+        assert_eq!(update_events(&drain_events(&mut rx)), 0);
     }
 
     // ── Brain harvest ────────────────────────────────────────────────────────

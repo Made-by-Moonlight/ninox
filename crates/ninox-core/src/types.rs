@@ -145,6 +145,15 @@ pub enum NotificationKind {
     /// against every configured remote (not just a transient error) — status
     /// enrichment has silently stalled for this session until it recovers.
     GithubLookupFailed,
+    /// A newer ninox version is published on the registry than the one
+    /// currently running — see `lifecycle::update_check`.
+    UpdateAvailable,
+    /// `cargo install ninox --force --locked` finished successfully; the
+    /// running process is still the old binary until restarted.
+    UpdateInstalled,
+    /// The `cargo install` subprocess triggered by `UpdateAvailable`'s
+    /// "Update now" action exited non-zero.
+    UpdateFailed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,8 +194,11 @@ mod tests {
     #[test]
     fn notification_kind_serde_covers_work_requested_and_extra_pr() {
         for (kind, wire) in [
-            (NotificationKind::WorkRequested, "\"work_requested\""),
-            (NotificationKind::ExtraPr,       "\"extra_pr\""),
+            (NotificationKind::WorkRequested,  "\"work_requested\""),
+            (NotificationKind::ExtraPr,        "\"extra_pr\""),
+            (NotificationKind::UpdateAvailable, "\"update_available\""),
+            (NotificationKind::UpdateInstalled, "\"update_installed\""),
+            (NotificationKind::UpdateFailed,    "\"update_failed\""),
         ] {
             assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
             let parsed: NotificationKind = serde_json::from_str(wire).unwrap();

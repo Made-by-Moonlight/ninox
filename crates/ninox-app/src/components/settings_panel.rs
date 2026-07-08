@@ -44,6 +44,7 @@ pub fn settings_panel(app: &App) -> Element<'_, Message> {
         theme_card(app),
         harnesses_card(app),
         workers_card(app),
+        version_card(app),
     ]
     .spacing(18)
     .width(Length::Fixed(COLUMN_W));
@@ -251,4 +252,75 @@ fn workers_card(app: &App) -> Element<'_, Message> {
         );
     }
     card(app, "Workers", body.into())
+}
+
+/// A small filled pill button for the version card's update action —
+/// mirrors `notification_panel`'s `action_button` but kept local to this
+/// file, matching how each component here owns its own small button styles
+/// (see `harnesses_card`'s toggle, `workers_card`'s picker styling, etc.)
+/// rather than sharing one across files.
+fn pill_button<'a>(label: &'a str, message: Option<Message>, s: &crate::theme::ColorScheme) -> Element<'a, Message> {
+    let text_color = s.card;
+    let fill = s.status_done;
+    button(text(label).size(11).font(crate::style::SANS_BOLD).color(text_color))
+        .on_press_maybe(message)
+        .padding([4, 10])
+        .style(move |_theme, _status| button::Style {
+            background: Some(Background::Color(fill)),
+            border: Border { radius: 3.0.into(), ..Default::default() },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Version card: the running build's own version (also the quickest way to
+/// tell what a user reporting an issue is actually on) plus a fresh
+/// on-demand registry check (`ensure_version_check`, fired on every
+/// `NavigateSettings`) — same `lifecycle::update_check` source the
+/// background poller uses, so "up to date" here means the same thing it
+/// means in the notification panel.
+fn version_card(app: &App) -> Element<'_, Message> {
+    use crate::app::VersionCheckState;
+    let s = &app.scheme;
+
+    let version_line = text(format!("ninox {}", crate::app::NINOX_VERSION))
+        .size(14)
+        .font(SERIF)
+        .color(s.ink);
+
+    let status: Element<Message> = match &app.version_check {
+        VersionCheckState::NotChecked | VersionCheckState::Checking => {
+            text("Checking for updates…").size(11).font(MONO).color(s.faint).into()
+        }
+        VersionCheckState::UpToDate => {
+            text("Up to date").size(11).font(MONO).color(s.status_done).into()
+        }
+        VersionCheckState::Failed => row![
+            text("Update check failed").size(11).font(MONO).color(s.faint),
+            Space::new(10, 0),
+            pill_button("Retry", Some(Message::NavigateSettings), s),
+        ]
+        .align_y(Alignment::Center)
+        .into(),
+        VersionCheckState::Installed => row![
+            text("Update installed").size(11).font(MONO).color(s.status_done),
+            Space::new(10, 0),
+            pill_button("Restart now", Some(Message::RestartApp), s),
+        ]
+        .align_y(Alignment::Center)
+        .into(),
+        VersionCheckState::UpdateAvailable(latest) => row![
+            text(format!("Update available — {latest}")).size(11).font(MONO).color(s.status_done),
+            Space::new(10, 0),
+            pill_button(
+                if app.update_in_progress { "Updating…" } else { "Update now" },
+                (!app.update_in_progress).then_some(Message::ApplyUpdate),
+                s,
+            ),
+        ]
+        .align_y(Alignment::Center)
+        .into(),
+    };
+
+    card(app, "Version", column![version_line, Space::new(0, 8), status].spacing(0).into())
 }

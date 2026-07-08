@@ -20,6 +20,14 @@ use crate::{
 
 const MAX_NOTIFICATIONS: usize = 50;
 
+/// The running binary's own version — shown in Settings and used as the
+/// baseline for `ensure_version_check`. This crate's `CARGO_PKG_VERSION`,
+/// not `ninox-core`'s, since it's specifically "what build is this person
+/// actually running" (the two are guaranteed equal for a published
+/// release — see `poller::poll_update_check`'s doc comment — but this is
+/// the more literally correct source for a user-facing version display).
+pub const NINOX_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // ---------------------------------------------------------------------------
 // View state
 // ---------------------------------------------------------------------------
@@ -44,6 +52,26 @@ pub enum BrainMode {
     #[default]
     Pinboard,
     Catalogue,
+}
+
+/// On-demand registry check triggered when Settings opens (`ensure_version_check`)
+/// — independent of the periodic background check in `ninox_core::lifecycle::poller`,
+/// so opening Settings always shows a fresh answer rather than whatever the
+/// last multi-hour poll happened to see.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum VersionCheckState {
+    #[default]
+    NotChecked,
+    Checking,
+    UpToDate,
+    UpdateAvailable(String),
+    /// `ApplyUpdate` finished successfully — set directly by
+    /// `Message::UpdateApplied` (not by a fresh `ensure_version_check`)
+    /// since the running process is still the old binary until restarted,
+    /// so re-checking the registry would just report `UpdateAvailable`
+    /// again for the exact version that was just installed.
+    Installed,
+    Failed,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -123,6 +151,14 @@ pub struct App {
     /// no diff (no workspace recorded, or a clean working tree).
     pub diffs:           HashMap<SessionId, Option<String>>,
     pub notifications:   VecDeque<Notification>,
+    /// True while an `ApplyUpdate`-triggered `cargo install` subprocess is
+    /// running — disables the "Update now" action so a second click can't
+    /// spawn a duplicate install.
+    pub update_in_progress: bool,
+    /// Result of the on-demand check `ensure_version_check` fires whenever
+    /// Settings opens — drives the version line's "up to date"/"update
+    /// available" state (spec: Settings panel).
+    pub version_check:   VersionCheckState,
     pub sidebar:         SidebarState,
     pub view:            View,
     /// The user's preferred worker panel — global, not per-session: the
@@ -260,6 +296,19 @@ pub enum Message {
     DismissNotification(String),
     DismissAllNotifications,
     NavigateNotification(SessionId),
+    /// "Update now" pressed on an `UpdateAvailable` notification slip —
+    /// kicks off `cargo install ninox --force --locked` as a subprocess.
+    ApplyUpdate,
+    /// The `cargo install` subprocess from `ApplyUpdate` finished.
+    UpdateApplied(Result<(), String>),
+    /// "Restart now" pressed on an `UpdateInstalled` notification slip —
+    /// relaunches the binary and exits this process.
+    RestartApp,
+    /// The on-demand registry check `ensure_version_check` fires when
+    /// Settings opens resolved: `Some(version)` = that version is newer
+    /// than the running one, `None` = already current, `Err` = the check
+    /// itself failed (no registry configured, network error, ...).
+    VersionCheckResult(Result<Option<String>, String>),
     FleetFilterQuery(String),
     ClearFleetFilter,
     ScrollTerminal { session_id: SessionId, delta: i32 },
@@ -493,6 +542,8 @@ impl App {
             review_threads: HashMap::new(),
             diffs:          HashMap::new(),
             notifications:  VecDeque::new(),
+            update_in_progress: false,
+            version_check:  VersionCheckState::NotChecked,
             sidebar:        SidebarState::default(),
             view:           View::default(),
             worker_panel:   Default::default(),
@@ -629,6 +680,22 @@ impl App {
             )
             .await;
             Message::DiffFetched { session_id: sid, diff }
+        })
+    }
+
+    /// Kicks off an on-demand registry check for Settings' version line.
+    /// Always re-runs on every `NavigateSettings` (unlike `ensure_models`'s
+    /// cache-on-first-success) — the whole point is a fresh answer each
+    /// time a user opens Settings to check, not a possibly-hours-stale one.
+    fn ensure_version_check(state: &mut App) -> Task<Message> {
+        state.version_check = VersionCheckState::Checking;
+        Task::future(async move {
+            use ninox_core::lifecycle::update_check::{CargoRegistryUpdateSource, check_for_update};
+            let result = check_for_update(&CargoRegistryUpdateSource, "ninox", NINOX_VERSION)
+                .await
+                .map(|latest| latest.map(|v| v.to_string()))
+                .map_err(|e| e.to_string());
+            Message::VersionCheckResult(result)
         })
     }
 
@@ -1803,7 +1870,9 @@ impl App {
                 state.view = View::Settings;
                 // Kick model discovery for the worker default's harness so
                 // the Workers card's picker has live options when it opens.
-                Self::ensure_models(state, &state.config.worker.harness.clone())
+                let models_task = Self::ensure_models(state, &state.config.worker.harness.clone());
+                let version_task = Self::ensure_version_check(state);
+                Task::batch(vec![models_task, version_task])
             }
 
             Message::SettingsToggleHarness(name) => {
@@ -2031,6 +2100,77 @@ impl App {
                 task
             }
 
+            Message::ApplyUpdate => {
+                if state.update_in_progress {
+                    return Task::none();
+                }
+                state.update_in_progress = true;
+                Task::future(async move {
+                    use ninox_core::lifecycle::update_check::{CargoInstallInstaller, UpdateInstaller};
+                    let result = CargoInstallInstaller.install("ninox").await.map_err(|e| e.to_string());
+                    Message::UpdateApplied(result)
+                })
+            }
+
+            Message::UpdateApplied(result) => {
+                state.update_in_progress = false;
+                state.notifications.retain(|n| n.kind != NotificationKind::UpdateAvailable);
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                match result {
+                    Ok(()) => {
+                        state.version_check = VersionCheckState::Installed;
+                        Self::push_notification(state, Notification {
+                            id:         format!("update-installed-{ts}"),
+                            kind:       NotificationKind::UpdateInstalled,
+                            title:      "Update installed".to_string(),
+                            body:       "Restart ninox to use the new version.".to_string(),
+                            session_id: None,
+                            created_at: ts,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("update install failed: {e}");
+                        state.version_check = VersionCheckState::Failed;
+                        Self::push_notification(state, Notification {
+                            id:         format!("update-failed-{ts}"),
+                            kind:       NotificationKind::UpdateFailed,
+                            title:      "Update failed".to_string(),
+                            body:       e,
+                            session_id: None,
+                            created_at: ts,
+                        });
+                    }
+                }
+                Task::none()
+            }
+
+            Message::RestartApp => {
+                match std::env::current_exe() {
+                    Ok(exe) => {
+                        if let Err(e) = std::process::Command::new(exe).spawn() {
+                            tracing::warn!("restart: failed to spawn new instance: {e}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("restart: couldn't resolve current_exe: {e}"),
+                }
+                iced::exit()
+            }
+
+            Message::VersionCheckResult(result) => {
+                state.version_check = match result {
+                    Ok(Some(latest)) => VersionCheckState::UpdateAvailable(latest),
+                    Ok(None)         => VersionCheckState::UpToDate,
+                    Err(e) => {
+                        tracing::warn!("settings version check failed: {e}");
+                        VersionCheckState::Failed
+                    }
+                };
+                Task::none()
+            }
+
             Message::FleetFilterQuery(q) => {
                 state.fleet_filter.query = q;
                 Task::none()
@@ -2223,20 +2363,29 @@ impl App {
             }
 
             Event::Notification(n) => {
-                let title = n.title.clone();
-                let body = n.body.clone();
-                std::thread::spawn(move || {
-                    let _ = notify_rust::Notification::new()
-                        .summary(&title)
-                        .body(&body)
-                        .show();
-                });
-                state.notifications.push_back(n);
-                if state.notifications.len() > MAX_NOTIFICATIONS {
-                    state.notifications.pop_front();
-                }
+                Self::push_notification(state, n);
                 Task::none()
             }
+        }
+    }
+
+    /// Fires the native macOS notification (via `notify-rust`) and appends
+    /// to the in-app panel, capped at `MAX_NOTIFICATIONS` — shared by
+    /// engine-sourced notifications (`Event::Notification`, e.g. the
+    /// periodic update check) and ones this process constructs directly for
+    /// an on-demand action's outcome (e.g. `UpdateApplied`).
+    fn push_notification(state: &mut Self, n: Notification) {
+        let title = n.title.clone();
+        let body = n.body.clone();
+        std::thread::spawn(move || {
+            let _ = notify_rust::Notification::new()
+                .summary(&title)
+                .body(&body)
+                .show();
+        });
+        state.notifications.push_back(n);
+        if state.notifications.len() > MAX_NOTIFICATIONS {
+            state.notifications.pop_front();
         }
     }
 
@@ -2816,6 +2965,8 @@ mod tests {
             review_threads: HashMap::new(),
             diffs:          HashMap::new(),
             notifications:  VecDeque::new(),
+            update_in_progress: false,
+            version_check:  VersionCheckState::NotChecked,
             sidebar:        SidebarState::default(),
             view:           View::FleetBoard { scope: None },
             worker_panel:   Default::default(),
