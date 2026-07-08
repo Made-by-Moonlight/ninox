@@ -30,6 +30,37 @@ cargo build --release -p ninox
 
 The HTTP server always starts on `127.0.0.1:8080` (or `--port`), exposing the engine's HTTP/WebSocket API.
 
+## macOS app bundle
+
+To get a proper `Ninox.app` that shows up in the Dock and Launchpad with its own icon (instead of running as a bare binary), build it with [`cargo-bundle`](https://github.com/burtonageo/cargo-bundle):
+
+```bash
+cargo install cargo-bundle
+
+# Run from the repo root — bundle asset paths in crates/ninox-app/Cargo.toml
+# are resolved relative to the current working directory, not the crate dir.
+cargo bundle --release -p ninox --format osx
+```
+
+This produces `target/release/bundle/osx/Ninox.app`, which you can open directly or drag into `/Applications`:
+
+```bash
+open target/release/bundle/osx/Ninox.app
+```
+
+Bundle metadata (name, identifier, icon) lives under `[package.metadata.bundle]` in `crates/ninox-app/Cargo.toml`. The icon source is `crates/ninox-app/assets/icon-1024.png`; the compiled `crates/ninox-app/assets/Ninox.icns` is generated from it with `sips` + `iconutil` (regenerate after changing the source image):
+
+```bash
+cd crates/ninox-app/assets
+rm -rf Ninox.iconset && mkdir Ninox.iconset
+for size in 16 32 128 256 512; do
+  sips -z $size $size icon-1024.png --out Ninox.iconset/icon_${size}x${size}.png
+  sips -z $((size*2)) $((size*2)) icon-1024.png --out Ninox.iconset/icon_${size}x${size}@2x.png
+done
+iconutil -c icns Ninox.iconset -o Ninox.icns
+rm -rf Ninox.iconset
+```
+
 ## Configuration
 
 App config is stored at `~/.config/ninox/config.toml`:
