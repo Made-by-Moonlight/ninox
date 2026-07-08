@@ -44,6 +44,7 @@ pub fn settings_panel(app: &App) -> Element<'_, Message> {
         theme_card(app),
         harnesses_card(app),
         workers_card(app),
+        version_card(app),
     ]
     .spacing(18)
     .width(Length::Fixed(COLUMN_W));
@@ -251,4 +252,48 @@ fn workers_card(app: &App) -> Element<'_, Message> {
         );
     }
     card(app, "Workers", body.into())
+}
+
+/// Version card: the running build's own version (also the quickest way to
+/// tell what a user reporting an issue is actually on) plus a fresh
+/// on-demand registry check (`ensure_version_check`, fired on every
+/// `NavigateSettings`) — same `lifecycle::update_check` source the
+/// background poller uses, so "up to date" here means the same thing it
+/// means in the notification panel.
+fn version_card(app: &App) -> Element<'_, Message> {
+    use crate::app::VersionCheckState;
+    let s = &app.scheme;
+
+    let version_line = text(format!("ninox {}", crate::app::NINOX_VERSION))
+        .size(14)
+        .font(SERIF)
+        .color(s.ink);
+
+    let status: Element<Message> = match &app.version_check {
+        VersionCheckState::NotChecked | VersionCheckState::Checking => {
+            text("Checking for updates…").size(11).font(MONO).color(s.faint).into()
+        }
+        VersionCheckState::UpToDate => {
+            text("Up to date").size(11).font(MONO).color(s.status_done).into()
+        }
+        VersionCheckState::Failed => {
+            text("Update check failed").size(11).font(MONO).color(s.faint).into()
+        }
+        VersionCheckState::UpdateAvailable(latest) => row![
+            text(format!("Update available — {latest}")).size(11).font(MONO).color(s.status_done),
+            Space::new(10, 0),
+            button(text("Update now").size(11).font(crate::style::SANS_BOLD).color(s.card))
+                .on_press_maybe((!app.update_in_progress).then_some(Message::ApplyUpdate))
+                .padding([4, 10])
+                .style(move |_theme, _status| button::Style {
+                    background: Some(Background::Color(s.status_done)),
+                    border: Border { radius: 3.0.into(), ..Default::default() },
+                    ..Default::default()
+                }),
+        ]
+        .align_y(Alignment::Center)
+        .into(),
+    };
+
+    card(app, "Version", column![version_line, Space::new(0, 8), status].spacing(0).into())
 }
