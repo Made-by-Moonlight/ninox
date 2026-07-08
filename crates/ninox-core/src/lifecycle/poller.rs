@@ -263,14 +263,21 @@ impl Poller {
                     let url = report.url.clone().unwrap_or_else(|| {
                         format!("https://github.com/{}/pull/{}", session.repo, report.number)
                     });
-                    let _ = self.engine.store.upsert_pr(&PR {
+                    let pr = PR {
                         id:         report.number as i64,
                         number:     report.number,
                         title:      String::new(),
                         url,
                         body:       String::new(),
                         session_id: session.id.clone(),
-                    });
+                    };
+                    let _ = self.engine.store.upsert_pr(&pr);
+                    // Only reachable once per extra PR (the `get_pr` guard
+                    // above stops matching once the row exists) — this must
+                    // stay visible to the UI, not just recorded in the
+                    // store, or an agent-created duplicate PR is invisible
+                    // outside a one-off notification.
+                    self.engine.emit(Event::ExtraPrDetected(pr));
                 }
             }
 
@@ -582,6 +589,18 @@ impl Poller {
                     session_id: session.id.clone(),
                 };
                 let _ = self.engine.store.upsert_pr(&pr);
+                // Persist pr_id on the session itself — not just on the
+                // emitted event. Every other poller (poll_usage,
+                // poll_context_updates, sync_sessions_metadata) reads a
+                // fresh Session from `list_sessions()` and re-emits a full
+                // `SessionUpdated` snapshot on its own read-modify-write
+                // cycle; if pr_id were never written back here, that
+                // snapshot would carry `pr_id: None` and stomp the UI's
+                // in-memory pr_id back to None on the next unrelated tick.
+                if session.pr_id != Some(pr_id) {
+                    session.pr_id = Some(pr_id);
+                    let _ = self.engine.store.upsert_session(&session);
+                }
                 self.engine.emit(Event::PrOpened { session_id: session.id.clone(), pr });
             }
 
@@ -1202,9 +1221,31 @@ mod tests {
         )).collect();
         assert_eq!(extra_notifs.len(), 2, "one ExtraPr notification per extra PR");
 
-        // Second tick: nothing new — no duplicate notifications.
+        // A notification alone is a one-off toast — the UI must also learn
+        // about the extra PR itself so it can stay visible on the Pull
+        // Requests ledger, not just flash a bell icon and vanish.
+        let mut extra_pr_numbers: Vec<u64> = events.iter().filter_map(|e| match e {
+            Event::ExtraPrDetected(pr) => Some(pr.number),
+            _ => None,
+        }).collect();
+        extra_pr_numbers.sort();
+        assert_eq!(
+            extra_pr_numbers, vec![43, 44],
+            "ExtraPrDetected must fire for every extra PR, not just the notification",
+        );
+        let pr_43 = events.iter().find_map(|e| match e {
+            Event::ExtraPrDetected(pr) if pr.number == 43 => Some(pr),
+            _ => None,
+        }).expect("ExtraPrDetected for #43");
+        assert_eq!(pr_43.session_id, "s1", "the ledger entry must point back at the owning session");
+
+        // Second tick: nothing new — no duplicate notifications or re-detections.
         poller.sync_sessions_metadata(sessions_dir.path()).await;
         let events = drain_events(&mut rx);
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::ExtraPrDetected(_))),
+            "an extra PR already recorded in the store must not be re-detected on every tick",
+        );
         assert!(
             !events.iter().any(|e| matches!(e, Event::Notification(_))),
             "extra PRs must not be re-notified on every tick",
@@ -1395,6 +1436,11 @@ mod tests {
         let row = store.get_pr(9).unwrap().unwrap();
         assert_eq!(row.session_id, "other", "the other repo's row must not be stolen");
         assert_eq!(row.url, "https://github.com/org/repo-b/pull/9");
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::ExtraPrDetected(pr) if pr.number == 9)),
+            "must not emit ExtraPrDetected for a row it didn't (and mustn't) write — that \
+             would let s1 clobber the ledger UI's view of another session's PR",
+        );
 
         poller.sync_sessions_metadata(sessions_dir.path()).await;
         let events = drain_events(&mut rx);
@@ -1637,6 +1683,52 @@ mod tests {
         assert!(
             !calls.contains(&("OwnerB".to_string(), "repoB".to_string(), 50)),
             "must never retry the tracked number against another repo's get_pr_status: {calls:?}",
+        );
+    }
+
+    /// The flicker bug: once `poll_github` discovers a PR, `session.pr_id`
+    /// must be persisted to the store — not just carried on the in-memory
+    /// `Event::PrOpened` the UI happens to receive. Every other poller
+    /// (`poll_usage`, `poll_context_updates`, `sync_sessions_metadata`) does
+    /// its own read-modify-write cycle against `list_sessions()` and
+    /// re-emits a full `Event::SessionUpdated` snapshot; if `pr_id` was
+    /// never written back, that snapshot carries `pr_id: None` and stomps
+    /// the UI's in-memory `pr_id` back to `None` on the very next unrelated
+    /// tick (e.g. a cost/token update while the agent is still generating
+    /// text) — which is exactly what made the session detail view's PR card
+    /// flicker between "No PR yet" and the real card.
+    #[tokio::test]
+    async fn poll_github_persists_pr_id_so_later_polls_dont_regress_it() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".to_string(), "repo".to_string(), 50),
+            crate::github::PrStatus {
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "t".into(), number: 50, head_sha: "abc".into(),
+            },
+        );
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.repo = "Owner/repo".into();
+        session.pr_number = Some(50);
+        store.upsert_session(&session).unwrap();
+
+        let engine = github_engine(store.clone(), fake);
+        let poller = Poller::new(engine);
+
+        poller.poll_github().await;
+
+        let updated = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(
+            updated.pr_id, Some(50),
+            "pr_id discovered by poll_github must be persisted to the store, or a later \
+             read-modify-write by any other poller will re-broadcast pr_id: None and flicker the UI",
         );
     }
 

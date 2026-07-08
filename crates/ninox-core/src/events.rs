@@ -21,6 +21,13 @@ pub enum Event {
     ClientClosed   { session_id: SessionId, generation: u64 },
     CiUpdated      { pr_id: PrId, status: CIStatus },
     PrOpened       { session_id: SessionId, pr: PR },
+    /// A PR beyond the session's tracked one (`PrOpened`'s `pr`) was
+    /// detected — most often an agent accidentally opening a second PR.
+    /// Unlike `PrOpened`, this must never change which PR a session tracks;
+    /// it only makes the extra PR visible (e.g. on the Pull Requests
+    /// ledger) so a human notices and can clean it up. `PR::session_id`
+    /// carries the owning session — no separate field needed.
+    ExtraPrDetected(PR),
     ReviewComment  { pr_id: PrId, comment: Comment },
     Notification(Notification),
 }
