@@ -26,6 +26,14 @@ async-stream = "0.3.6"
 arboard = "3"
 ttf-parser = "0.25"
 
+[package.metadata.bundle]
+name = "Ninox"
+identifier = "com.madebymoonlight.ninox"
+icon = ["crates/ninox-app/assets/Ninox.icns"]
+copyright = "Copyright (c) 2026 Made by Moonlight"
+category = "public.app-category.developer-tools"
+short_description = "GPU-accelerated desktop UI for the Ninox orchestrator engine."
+
 [dev-dependencies]
 tempfile = "3.27.0"
 # Used only to drive `iced::Task<Message>` (returned from `App::update`) to

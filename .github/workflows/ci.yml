@@ -41,3 +41,30 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: tmux start-server && cargo test --workspace
+
+  bundle-macos:
+    name: macOS App Bundle
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Cache Rust
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: ${{ runner.os }}-cargo-bundle-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-bundle-
+      - name: Install cargo-bundle
+        run: command -v cargo-bundle || cargo install cargo-bundle
+      - name: Build Ninox.app
+        run: cargo bundle --release -p ninox --format osx
+      - name: Verify bundle
+        run: |
+          set -euo pipefail
+          test -d target/release/bundle/osx/Ninox.app
+          test -x target/release/bundle/osx/Ninox.app/Contents/MacOS/ninox
+          test -f target/release/bundle/osx/Ninox.app/Contents/Resources/Ninox.icns
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" target/release/bundle/osx/Ninox.app/Contents/Info.plist
