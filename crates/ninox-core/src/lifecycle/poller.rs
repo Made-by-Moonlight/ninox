@@ -555,23 +555,35 @@ impl Poller {
             };
             self.clear_github_lookup_failed(&session.id);
 
-            // Self-heal: the PR was found against a different remote (and
-            // possibly a different PR number in that remote's own sequence)
-            // than the one on record — persist it so future ticks go
-            // straight there instead of re-discovering it via fallback
-            // every time.
-            if resolved_repo != session.repo || Some(pr_number) != session.pr_number {
-                tracing::info!(
-                    "session {} repo/PR corrected {}#{:?} -> {resolved_repo}#{pr_number}",
-                    session.id, session.repo, session.pr_number,
-                );
+            let pr_id: PrId = pr_number as i64;
+
+            // Self-heal (repo/pr_number) and pr_id are persisted together,
+            // in one write, before merge detection below — which can
+            // `continue` the loop and move the session to `Done`, a status
+            // this function never revisits (see the guard at the top of the
+            // loop). If pr_id were only set further down (after merge
+            // detection), a PR that turns out to already be merged on the
+            // very tick it's discovered would leave the session stuck with
+            // pr_number set but pr_id permanently None/stale — same
+            // flicker-causing inconsistency as the bug this function is
+            // otherwise fixing, just for a session that never gets polled
+            // again to self-correct.
+            if resolved_repo != session.repo
+                || Some(pr_number) != session.pr_number
+                || session.pr_id != Some(pr_id)
+            {
+                if resolved_repo != session.repo || Some(pr_number) != session.pr_number {
+                    tracing::info!(
+                        "session {} repo/PR corrected {}#{:?} -> {resolved_repo}#{pr_number}",
+                        session.id, session.repo, session.pr_number,
+                    );
+                }
                 session.repo = resolved_repo;
                 session.pr_number = Some(pr_number);
+                session.pr_id = Some(pr_id);
                 let _ = self.engine.store.upsert_session(&session);
             }
             let Some((owner, repo)) = split_repo(&session.repo) else { continue };
-
-            let pr_id: PrId = pr_number as i64;
 
             // -- Merge detection — handle before CI (no point polling CI on merged PR) --
             if self.handle_merge_detection(&session, pr_number, pr_status.merged).await {
@@ -589,18 +601,6 @@ impl Poller {
                     session_id: session.id.clone(),
                 };
                 let _ = self.engine.store.upsert_pr(&pr);
-                // Persist pr_id on the session itself — not just on the
-                // emitted event. Every other poller (poll_usage,
-                // poll_context_updates, sync_sessions_metadata) reads a
-                // fresh Session from `list_sessions()` and re-emits a full
-                // `SessionUpdated` snapshot on its own read-modify-write
-                // cycle; if pr_id were never written back here, that
-                // snapshot would carry `pr_id: None` and stomp the UI's
-                // in-memory pr_id back to None on the next unrelated tick.
-                if session.pr_id != Some(pr_id) {
-                    session.pr_id = Some(pr_id);
-                    let _ = self.engine.store.upsert_session(&session);
-                }
                 self.engine.emit(Event::PrOpened { session_id: session.id.clone(), pr });
             }
 
@@ -1730,6 +1730,65 @@ mod tests {
             "pr_id discovered by poll_github must be persisted to the store, or a later \
              read-modify-write by any other poller will re-broadcast pr_id: None and flicker the UI",
         );
+    }
+
+    /// Guards against a narrower version of the same bug: if the discovered
+    /// PR is *already merged* on the very tick it's found, merge detection
+    /// short-circuits the rest of the loop iteration and moves the session
+    /// to `Done` — a status `poll_github` never revisits (see the guard at
+    /// the top of the loop). `pr_id` must therefore be persisted *before*
+    /// merge detection runs, not alongside the (skipped) PR-upsert block
+    /// further down, or a merged-on-discovery session is stuck with a
+    /// correct `pr_number` but a permanently stale/absent `pr_id` — the
+    /// exact inconsistency this function otherwise fixes, just for a
+    /// session that never gets a second chance to self-correct. Also
+    /// exercises this alongside the dual-remote self-heal path, so
+    /// `repo`/`pr_number`/`pr_id` are all proven to land in the same write.
+    #[tokio::test]
+    async fn poll_github_persists_pr_id_when_the_self_healed_pr_is_already_merged() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[
+            ("origin", "https://github.com/OwnerA/repoA.git"),
+            ("mirror", "https://github.com/OwnerB/repoB.git"),
+        ]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.branch_matches.lock().unwrap().insert(
+            ("OwnerB".to_string(), "repoB".to_string(), "worker-branch".to_string()),
+            crate::github::PrRef { number: 99, url: "https://github.com/OwnerB/repoB/pull/99".into() },
+        );
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("OwnerB".to_string(), "repoB".to_string(), 99),
+            crate::github::PrStatus {
+                merged: true, state: "closed".into(), mergeable: None,
+                title: "t".into(), number: 99, head_sha: "abc".into(),
+            },
+        );
+        // OwnerA/repoA#50 has no entry — get_pr_status errors, simulating a 404,
+        // forcing the branch-match fallback to OwnerB/repoB#99.
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.repo = "OwnerA/repoA".into();
+        session.pr_number = Some(50);
+        store.upsert_session(&session).unwrap();
+
+        let engine = github_engine(store.clone(), fake);
+        let poller = Poller::new(engine);
+
+        poller.poll_github().await;
+
+        let updated = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(updated.repo, "OwnerB/repoB", "self-heal must still land");
+        assert_eq!(updated.pr_number, Some(99), "self-heal must still land");
+        assert_eq!(
+            updated.pr_id, Some(99),
+            "pr_id must be persisted even though the self-healed PR is already merged and \
+             merge detection short-circuits the rest of this loop iteration",
+        );
+        assert!(matches!(updated.status, SessionStatus::Done), "merged PR still transitions to Done");
     }
 
     /// When every configured remote fails, that must be visible — not just
