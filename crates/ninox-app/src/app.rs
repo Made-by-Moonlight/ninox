@@ -2479,7 +2479,7 @@ async fn next_coalesced_event(
     rx: &mut broadcast::Receiver<Event>,
     pending: &mut Option<Event>,
 ) -> Option<Event> {
-    let mut event = if let Some(event) = pending.take() {
+    let event = if let Some(event) = pending.take() {
         event
     } else {
         loop {
@@ -2491,15 +2491,19 @@ async fn next_coalesced_event(
         }
     };
 
-    while let Event::ClientOutput { session_id, generation, bytes } = &event {
-        let (session_id, generation) = (session_id.clone(), *generation);
+    // Extend `bytes` in place rather than re-cloning the merged-so-far
+    // buffer on every iteration — a bursty repaint can queue dozens of
+    // chunks, and cloning each time would copy O(chunks²) bytes instead
+    // of O(total bytes).
+    let Event::ClientOutput { session_id, generation, mut bytes } = event else {
+        return Some(event);
+    };
+    loop {
         match rx.try_recv() {
             Ok(Event::ClientOutput { session_id: sid2, generation: gen2, bytes: more })
                 if sid2 == session_id && gen2 == generation =>
             {
-                let mut merged = bytes.clone();
-                merged.extend(more);
-                event = Event::ClientOutput { session_id, generation, bytes: merged };
+                bytes.extend(more);
             }
             Ok(other) => {
                 *pending = Some(other);
@@ -2509,7 +2513,7 @@ async fn next_coalesced_event(
         }
     }
 
-    Some(event)
+    Some(Event::ClientOutput { session_id, generation, bytes })
 }
 
 impl App {
