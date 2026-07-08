@@ -176,6 +176,7 @@ mod tests {
                 context_total_tokens: None,
                 context_window_size: None,
                 claude_session_id: None,
+                summary: None,
                 terminal_at: None,
             })
             .unwrap();
@@ -235,6 +236,7 @@ mod tests {
                 context_total_tokens: None,
                 context_window_size: None,
                 claude_session_id: None,
+                summary: None,
                 terminal_at: None,
             })
             .unwrap();
