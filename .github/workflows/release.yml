@@ -20,9 +20,10 @@ name: Release
 #      reason, the release is left as a draft instead of going live with a
 #      missing asset. Re-running the bundle-macos job against the existing
 #      tag (or publishing the draft manually) recovers from that state.
-#   5. Build the macOS Ninox.app bundle (same `cargo bundle` invocation as
-#      ci.yml's bundle-macos job) from the tagged commit, zip it, attach it
-#      to the release as an asset, then un-draft the release.
+#   5. Build the macOS Ninox.app bundle from the tagged commit via the
+#      shared .github/actions/build-macos-bundle composite action (build,
+#      ad-hoc code-sign, verify signature, zip), attach it to the release
+#      as an asset, then un-draft the release.
 #   6. The pushed version bump triggers publish.yml, which pushes the new
 #      versions to crates.io via Trusted Publishing.
 #
@@ -171,25 +172,8 @@ jobs:
           key: ${{ runner.os }}-cargo-bundle-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-bundle-
 
-      - name: Install cargo-bundle
-        run: command -v cargo-bundle || cargo install cargo-bundle
-
-      - name: Build Ninox.app
-        run: cargo bundle --release -p ninox --format osx
-
-      - name: Verify bundle
-        run: |
-          set -euo pipefail
-          test -d target/release/bundle/osx/Ninox.app
-          test -x target/release/bundle/osx/Ninox.app/Contents/MacOS/ninox
-          test -f target/release/bundle/osx/Ninox.app/Contents/Resources/Ninox.icns
-          /usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" target/release/bundle/osx/Ninox.app/Contents/Info.plist
-
-      - name: Zip Ninox.app
-        run: |
-          set -euo pipefail
-          cd target/release/bundle/osx
-          ditto -c -k --sequesterRsrc --keepParent Ninox.app Ninox.app.zip
+      - name: Build, sign & verify Ninox.app
+        uses: ./.github/actions/build-macos-bundle
 
       - name: Upload to release
         env:
