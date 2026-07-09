@@ -80,6 +80,46 @@ pub fn with_gate_tooltip<'a>(
         .into()
 }
 
+/// "Removing in Nd/Nh/Nm" for a terminal session sitting in its retention
+/// grace period, or `None` if there's nothing to show (no `terminal_at`,
+/// i.e. the session isn't terminal, or was terminated by direct user
+/// action and has no grace period at all).
+pub fn retention_label(terminal_at: i64, retention_millis: i64, now: i64) -> Option<String> {
+    let remaining_ms = terminal_at + retention_millis - now;
+    Some(if remaining_ms <= 0 {
+        "Removing shortly".to_string()
+    } else {
+        format!("Removing in {}", humanize_duration(remaining_ms))
+    })
+}
+
+/// Exactly one unit, the coarsest that's still >= 1: days, else hours,
+/// else minutes.
+fn humanize_duration(ms: i64) -> String {
+    const MINUTE: i64 = 60_000;
+    const HOUR:   i64 = 60 * MINUTE;
+    const DAY:    i64 = 24 * HOUR;
+    if ms >= DAY {
+        format!("{}d", ms / DAY)
+    } else if ms >= HOUR {
+        format!("{}h", ms / HOUR)
+    } else {
+        format!("{}m", (ms / MINUTE).max(1))
+    }
+}
+
+/// Wall-clock "now" in epoch milliseconds, for the retention countdown.
+/// `ninox_core::lifecycle::poller::now_millis()` exists but is
+/// `pub(crate)` — deliberately scoped to `ninox-core` — so this is a
+/// small private equivalent for this UI display concern rather than
+/// widening that core-internal helper's visibility.
+pub(crate) fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +187,29 @@ mod tests {
             "Review — approved".to_string(),
             "Mergeable — yes".to_string(),
         ]);
+    }
+
+    #[test]
+    fn retention_label_shows_days_when_more_than_a_day_remains() {
+        let label = retention_label(0, 2 * 86_400_000, 86_400_000 /* now = 1 day later */);
+        assert_eq!(label, Some("Removing in 1d".to_string()));
+    }
+
+    #[test]
+    fn retention_label_shows_hours_under_a_day() {
+        let label = retention_label(0, 86_400_000, 68_400_000 /* now = 19h later, 5h left */);
+        assert_eq!(label, Some("Removing in 5h".to_string()));
+    }
+
+    #[test]
+    fn retention_label_shows_minutes_under_an_hour() {
+        let label = retention_label(0, 3_600_000, 3_300_000 /* now = 55m later, 5m left */);
+        assert_eq!(label, Some("Removing in 5m".to_string()));
+    }
+
+    #[test]
+    fn retention_label_past_the_window_says_shortly() {
+        let label = retention_label(0, 3_600_000, 3_700_000 /* now past the window */);
+        assert_eq!(label, Some("Removing shortly".to_string()));
     }
 }
