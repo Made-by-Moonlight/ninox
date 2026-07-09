@@ -125,7 +125,7 @@ mod tests {
                 context_window_size: None,
                 claude_session_id: None,
                 summary: None,
-                terminal_at: None,
+                terminal_at: None, gate_status: None,
             })
             .unwrap();
         let app = sessions_router(engine);
@@ -177,7 +177,7 @@ mod tests {
                 context_window_size: None,
                 claude_session_id: None,
                 summary: None,
-                terminal_at: None,
+                terminal_at: None, gate_status: None,
             })
             .unwrap();
         let response = sessions_router(engine)
@@ -237,7 +237,7 @@ mod tests {
                 context_window_size: None,
                 claude_session_id: None,
                 summary: None,
-                terminal_at: None,
+                terminal_at: None, gate_status: None,
             })
             .unwrap();
         let response = sessions_router(engine)
@@ -276,7 +276,7 @@ mod tests {
                 context_window_size: None,
                 claude_session_id: None,
                 summary: None,
-                terminal_at: None,
+                terminal_at: None, gate_status: None,
             })
             .unwrap();
         let response = sessions_router(engine)

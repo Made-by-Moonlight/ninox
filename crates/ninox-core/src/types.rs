@@ -19,6 +19,29 @@ pub enum SessionStatus {
     Interrupted,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GateCheck {
+    Passing,
+    Failing,
+    Pending,
+    Unknown,
+}
+
+/// Structured snapshot of the three raw signals `derive_session_status`
+/// already collapses into one `SessionStatus` — kept separately so the UI
+/// can explain *which* check is blocking and *since when*, not just the
+/// single derived enum value. Current-state only: no transition history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GateStatus {
+    pub ci:        GateCheck,
+    pub review:    GateCheck,
+    pub mergeable: GateCheck,
+    /// Epoch ms this exact (ci, review, mergeable) combination was first
+    /// observed — reset whenever any of the three values changes.
+    pub since: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id:             SessionId,
@@ -92,6 +115,13 @@ pub struct Session {
     /// period. `#[serde(default)]` for wire/DB back-compat.
     #[serde(default)]
     pub terminal_at: Option<i64>,
+    /// Structured CI/review/mergeable breakdown behind the current
+    /// `status`. `None` until the first GitHub enrichment tick for a
+    /// session with an open PR (`Spawning`/`Working` sessions have no PR
+    /// yet, so no gate to report). `#[serde(default)]` for wire/DB
+    /// back-compat with sessions recorded before this field existed.
+    #[serde(default)]
+    pub gate_status: Option<GateStatus>,
 }
 
 /// Which fields of a `Session` a particular `Event::SessionUpdated` carries
@@ -108,6 +138,7 @@ pub struct SessionFields(u16);
 impl SessionFields {
     pub const NONE:        Self = Self(0);
     pub const STATUS:      Self = Self(1 << 0);
+    pub const GATE:        Self = Self(1 << 1);
     /// `pr_number`, `pr_id`, and `repo` travel together — they're only ever
     /// self-healed/adopted as a unit (see `poller.rs`'s repo/PR self-heal).
     pub const PR_LINK:     Self = Self(1 << 2);
@@ -124,9 +155,6 @@ impl SessionFields {
     /// row is transitioning from an optimistic placeholder to its first real
     /// snapshot and every field is being established for the first time.
     pub const ALL:         Self = Self(0xFFFF);
-    // NOTE: bit `1 << 1` is intentionally left free — Task 2 adds a `GATE`
-    // constant there, alongside the `GateStatus` type and the corresponding
-    // `merge_from` branch, since both need `Session.gate_status` to exist.
 
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -152,8 +180,9 @@ impl Session {
         if fields.contains(SessionFields::STATUS) {
             self.status = incoming.status.clone();
         }
-        // NOTE: a `GATE` branch is added here in Task 2, once
-        // `Session.gate_status` exists.
+        if fields.contains(SessionFields::GATE) {
+            self.gate_status = incoming.gate_status.clone();
+        }
         if fields.contains(SessionFields::PR_LINK) {
             self.pr_number = incoming.pr_number;
             self.pr_id = incoming.pr_id;
@@ -332,7 +361,24 @@ mod tests {
             catalogue_path: None, context_used_pct: Some(1.0),
             context_total_tokens: Some(10), context_window_size: Some(200_000),
             claude_session_id: None, summary: None, terminal_at: None,
+            gate_status: None,
         }
+    }
+
+    #[test]
+    fn merge_from_gate_copies_only_when_flagged() {
+        let mut existing = base_session();
+        let mut incoming = base_session();
+        incoming.gate_status = Some(GateStatus {
+            ci: GateCheck::Failing, review: GateCheck::Passing,
+            mergeable: GateCheck::Unknown, since: 42,
+        });
+
+        existing.merge_from(&incoming, SessionFields::COST); // GATE not flagged
+        assert_eq!(existing.gate_status, None, "unflagged GATE must not be copied");
+
+        existing.merge_from(&incoming, SessionFields::GATE);
+        assert_eq!(existing.gate_status, incoming.gate_status, "flagged GATE must be copied");
     }
 
     #[test]

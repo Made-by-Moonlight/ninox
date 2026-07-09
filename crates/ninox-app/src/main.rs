@@ -282,7 +282,7 @@ async fn run_spawn(
         context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: Some(claude_session_id.clone()),
         summary,
-        terminal_at: None,
+        terminal_at: None, gate_status: None,
     };
 
     store.upsert_session(&session)?;
@@ -661,7 +661,7 @@ mod discover_repos_tests {
             context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         }
     }
 
