@@ -2354,6 +2354,16 @@ impl App {
                 Task::none()
             }
 
+            // Never touches the owning session's tracked pr_number/pr_id —
+            // this is a PR beyond the tracked one (typically an agent
+            // opening a duplicate by mistake); it must surface on the Pull
+            // Requests ledger without displacing what the session actually
+            // tracks.
+            Event::ExtraPrDetected(pr) => {
+                state.prs.insert(pr.id, pr);
+                Task::none()
+            }
+
             Event::ReviewComment { pr_id, comment } => {
                 state.review_threads
                     .entry(pr_id)
@@ -3235,6 +3245,33 @@ mod tests {
         };
         let (updated, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         assert!(updated.sessions.contains_key("s1"));
+    }
+
+    /// An agent that accidentally opens a second PR must not have it
+    /// silently vanish — it needs to land in `state.prs` so the Pull
+    /// Requests ledger can show it — but it must never displace the
+    /// session's actually-tracked PR (`ExtraPrDetected` is deliberately
+    /// distinct from `PrOpened` for exactly this reason).
+    #[test]
+    fn extra_pr_detected_populates_prs_without_touching_tracked_pr() {
+        let e = test_engine();
+        let mut m = base(e);
+        let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(
+            pr_session(Some(42), Some(42), "org/repo"),
+        ))));
+        m = next;
+
+        let extra = ninox_core::types::PR {
+            id: 43, number: 43, title: String::new(),
+            url: "https://github.com/org/repo/pull/43".into(),
+            body: String::new(), session_id: "s1".into(),
+        };
+        let (updated, _) = m.update(Message::EngineEvent(Box::new(Event::ExtraPrDetected(extra))));
+
+        assert!(updated.prs.contains_key(&43), "extra PR must be visible to the ledger");
+        let session = updated.sessions.get("s1").unwrap();
+        assert_eq!(session.pr_number, Some(42), "tracked PR must not change");
+        assert_eq!(session.pr_id, Some(42), "tracked PR must not change");
     }
 
     #[test]
