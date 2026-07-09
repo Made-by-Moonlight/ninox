@@ -11,8 +11,8 @@ use crate::{
         usage,
     },
     types::{
-        CIStatus, Comment, Notification, NotificationKind, PrId, Session, SessionFields,
-        SessionStatus, PR,
+        CIStatus, Comment, GateCheck, GateStatus, Notification, NotificationKind, PrId, Session,
+        SessionFields, SessionStatus, PR,
     },
 };
 use std::{
@@ -710,12 +710,17 @@ impl Poller {
 
             // Update session status in DB (after review threads so has_changes_requested is known)
             let new_status = derive_session_status(&session.status, &pr_status, &ci, has_changes_requested);
+            let new_gate = derive_gate_status(
+                &ci, has_changes_requested, pr_status.mergeable, session.gate_status.as_ref(), now_millis(),
+            );
             let mut updated = session.clone();
             updated.status = new_status;
-            if updated.status != session.status {
+            updated.gate_status = Some(new_gate);
+            if updated.status != session.status || updated.gate_status != session.gate_status {
                 let _ = self.engine.store.upsert_session(&updated);
                 self.engine.emit(Event::SessionUpdated(
-                    updated.clone(), SessionFields::STATUS | SessionFields::PR_LINK,
+                    updated.clone(),
+                    SessionFields::STATUS | SessionFields::PR_LINK | SessionFields::GATE,
                 ));
             }
 
@@ -982,6 +987,35 @@ fn derive_session_status(
     SessionStatus::PrOpen
 }
 
+fn derive_gate_status(
+    ci:                    &CIStatus,
+    has_changes_requested: bool,
+    mergeable:             Option<bool>,
+    previous:              Option<&GateStatus>,
+    now:                   i64,
+) -> GateStatus {
+    let ci_check = if ci.failing > 0 {
+        GateCheck::Failing
+    } else if ci.pending > 0 {
+        GateCheck::Pending
+    } else {
+        GateCheck::Passing
+    };
+    let review_check = if has_changes_requested { GateCheck::Failing } else { GateCheck::Passing };
+    let mergeable_check = match mergeable {
+        Some(true)  => GateCheck::Passing,
+        Some(false) => GateCheck::Failing,
+        None        => GateCheck::Unknown,
+    };
+
+    let unchanged = previous.is_some_and(|p| {
+        p.ci == ci_check && p.review == review_check && p.mergeable == mergeable_check
+    });
+    let since = if unchanged { previous.unwrap().since } else { now };
+
+    GateStatus { ci: ci_check, review: review_check, mergeable: mergeable_check, since }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,6 +1066,56 @@ mod tests {
         let ci = CIStatus { pr_id: 1, total: 3, failing: 0, passing: 3, pending: 0 };
         let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, false);
         assert!(matches!(s, SessionStatus::Mergeable));
+    }
+
+    #[test]
+    fn derive_gate_status_maps_raw_signals() {
+        let ci = CIStatus { pr_id: 1, total: 3, passing: 1, failing: 1, pending: 1 };
+        let gate = derive_gate_status(&ci, true, Some(false), None, 1_000);
+        assert!(matches!(gate.ci, GateCheck::Failing));
+        assert!(matches!(gate.review, GateCheck::Failing));
+        assert!(matches!(gate.mergeable, GateCheck::Failing));
+        assert_eq!(gate.since, 1_000, "first observation stamps `since` to `now`");
+    }
+
+    #[test]
+    fn derive_gate_status_maps_all_passing() {
+        let ci = CIStatus { pr_id: 1, total: 2, passing: 2, failing: 0, pending: 0 };
+        let gate = derive_gate_status(&ci, false, Some(true), None, 1_000);
+        assert!(matches!(gate.ci, GateCheck::Passing));
+        assert!(matches!(gate.review, GateCheck::Passing));
+        assert!(matches!(gate.mergeable, GateCheck::Passing));
+    }
+
+    #[test]
+    fn derive_gate_status_maps_pending_ci_and_unknown_mergeable() {
+        let ci = CIStatus { pr_id: 1, total: 2, passing: 0, failing: 0, pending: 2 };
+        let gate = derive_gate_status(&ci, false, None, None, 1_000);
+        assert!(matches!(gate.ci, GateCheck::Pending));
+        assert!(matches!(gate.mergeable, GateCheck::Unknown));
+    }
+
+    #[test]
+    fn derive_gate_status_carries_since_forward_when_unchanged() {
+        let ci = CIStatus { pr_id: 1, total: 1, passing: 1, failing: 0, pending: 0 };
+        let previous = GateStatus {
+            ci: GateCheck::Passing, review: GateCheck::Passing,
+            mergeable: GateCheck::Passing, since: 500,
+        };
+        let gate = derive_gate_status(&ci, false, Some(true), Some(&previous), 9_999);
+        assert_eq!(gate.since, 500, "unchanged combination keeps the original `since`");
+    }
+
+    #[test]
+    fn derive_gate_status_resets_since_when_combination_changes() {
+        let ci = CIStatus { pr_id: 1, total: 1, passing: 0, failing: 1, pending: 0 };
+        let previous = GateStatus {
+            ci: GateCheck::Passing, review: GateCheck::Passing,
+            mergeable: GateCheck::Passing, since: 500,
+        };
+        let gate = derive_gate_status(&ci, false, Some(true), Some(&previous), 9_999);
+        assert!(matches!(gate.ci, GateCheck::Failing));
+        assert_eq!(gate.since, 9_999, "a changed combination resets `since` to `now`");
     }
 
     #[test]
