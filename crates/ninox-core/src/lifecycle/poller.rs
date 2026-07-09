@@ -710,12 +710,13 @@ impl Poller {
 
             // Update session status in DB (after review threads so has_changes_requested is known)
             let new_status = derive_session_status(&session.status, &pr_status, &ci, has_changes_requested);
-            let new_gate = derive_gate_status(
-                &ci, has_changes_requested, pr_status.mergeable, session.gate_status.as_ref(), now_millis(),
+            let new_gate = compute_new_gate(
+                &session.status, &ci, has_changes_requested, pr_status.mergeable,
+                session.gate_status.as_ref(), now_millis(),
             );
             let mut updated = session.clone();
             updated.status = new_status;
-            updated.gate_status = Some(new_gate);
+            updated.gate_status = new_gate;
             if updated.status != session.status || updated.gate_status != session.gate_status {
                 let _ = self.engine.store.upsert_session(&updated);
                 self.engine.emit(Event::SessionUpdated(
@@ -1016,6 +1017,34 @@ fn derive_gate_status(
     GateStatus { ci: ci_check, review: review_check, mergeable: mergeable_check, since }
 }
 
+/// Wraps `derive_gate_status` with the same terminal guard
+/// `derive_session_status` applies to `SessionStatus`: once a session has
+/// reached a terminal status (`Done`/`Terminated`/`Interrupted`), its
+/// `GateStatus` must never be recomputed — it stays exactly as last
+/// observed. `poll_github` deliberately keeps polling `Terminated` and
+/// `Interrupted` sessions with an unresolved PR (see the comment on its
+/// status guard) purely to catch a late merge; that must not have the side
+/// effect of drifting `gate_status` off live CI/review/mergeable data that
+/// no longer reflects a session anyone is actively working.
+///
+/// `current_status` must be the status *entering* this tick — i.e.
+/// `session.status` before this tick's `derive_session_status` call — not
+/// the freshly derived one, so a session's very last live tick (the one
+/// that flips it to terminal) still gets to compute its final gate.
+fn compute_new_gate(
+    current_status:        &SessionStatus,
+    ci:                    &CIStatus,
+    has_changes_requested: bool,
+    mergeable:             Option<bool>,
+    previous_gate:         Option<&GateStatus>,
+    now:                   i64,
+) -> Option<GateStatus> {
+    if matches!(current_status, SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted) {
+        return previous_gate.cloned();
+    }
+    Some(derive_gate_status(ci, has_changes_requested, mergeable, previous_gate, now))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,6 +1145,46 @@ mod tests {
         let gate = derive_gate_status(&ci, false, Some(true), Some(&previous), 9_999);
         assert!(matches!(gate.ci, GateCheck::Failing));
         assert_eq!(gate.since, 9_999, "a changed combination resets `since` to `now`");
+    }
+
+    /// The bug this guards: a `Terminated`/`Interrupted` session with an
+    /// unresolved PR keeps being polled (see the comment on `poll_github`'s
+    /// status guard) purely to catch a late merge. That must not have the
+    /// side effect of recomputing `gate_status` from live CI/review/mergeable
+    /// data — the gate must stay exactly as last observed, mirroring
+    /// `derive_session_status`'s own terminal guard.
+    #[test]
+    fn compute_new_gate_preserves_terminal_gate_even_when_live_signals_changed() {
+        let previous = GateStatus {
+            ci: GateCheck::Failing, review: GateCheck::Failing,
+            mergeable: GateCheck::Failing, since: 111,
+        };
+        // Live signals now look all-green — if the terminal guard were
+        // missing, `derive_gate_status` would flip the gate to all-Passing
+        // and reset `since` to `now`.
+        let ci = CIStatus { pr_id: 1, total: 3, passing: 3, failing: 0, pending: 0 };
+
+        for status in [SessionStatus::Terminated, SessionStatus::Interrupted, SessionStatus::Done] {
+            let gate = compute_new_gate(&status, &ci, false, Some(true), Some(&previous), 9_999);
+            assert_eq!(
+                gate, Some(previous.clone()),
+                "{status:?} session's gate must be carried forward unchanged, not recomputed",
+            );
+        }
+    }
+
+    #[test]
+    fn compute_new_gate_recomputes_for_non_terminal_status() {
+        let previous = GateStatus {
+            ci: GateCheck::Failing, review: GateCheck::Failing,
+            mergeable: GateCheck::Failing, since: 111,
+        };
+        let ci = CIStatus { pr_id: 1, total: 3, passing: 3, failing: 0, pending: 0 };
+
+        let gate = compute_new_gate(&SessionStatus::PrOpen, &ci, false, Some(true), Some(&previous), 9_999);
+        let gate = gate.expect("non-terminal status must produce a fresh gate");
+        assert!(matches!(gate.ci, GateCheck::Passing), "must reflect the live all-green signals");
+        assert_eq!(gate.since, 9_999, "changed combination resets `since` to `now`");
     }
 
     #[test]
@@ -1851,6 +1920,63 @@ mod tests {
             updated.pr_id, Some(50),
             "pr_id discovered by poll_github must be persisted to the store, or a later \
              read-modify-write by any other poller will re-broadcast pr_id: None and flicker the UI",
+        );
+    }
+
+    /// End-to-end regression for the `compute_new_gate` terminal guard: a
+    /// `Terminated` session with an unresolved PR is still polled by
+    /// `poll_github` (see the comment on its status guard, purely to catch a
+    /// late merge), but its already-set `gate_status` must survive the tick
+    /// unchanged even though the live CI/mergeable signals now disagree with
+    /// it — `derive_session_status` already has its own terminal guard for
+    /// `status`; this proves `gate_status` gets the same treatment.
+    #[tokio::test]
+    async fn poll_github_does_not_recompute_gate_for_terminated_session_with_unresolved_pr() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".to_string(), "repo".to_string(), 50),
+            crate::github::PrStatus {
+                // Not merged — the PR is still unresolved, which is exactly
+                // why `poll_github` doesn't skip a `Terminated` session. All
+                // live signals (mergeable, and CI/review from FakeGithub's
+                // empty checks/threads) are as green as possible, directly
+                // contradicting the stale stored gate below.
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "t".into(), number: 50, head_sha: "abc".into(),
+            },
+        );
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.repo = "Owner/repo".into();
+        session.pr_number = Some(50);
+        session.status = SessionStatus::Terminated;
+        let stale_gate = GateStatus {
+            ci: GateCheck::Failing, review: GateCheck::Failing,
+            mergeable: GateCheck::Failing, since: 111,
+        };
+        session.gate_status = Some(stale_gate.clone());
+        store.upsert_session(&session).unwrap();
+
+        let engine = github_engine(store.clone(), fake);
+        let poller = Poller::new(engine);
+
+        poller.poll_github().await;
+
+        let updated = store.get_session("s1").unwrap().unwrap();
+        assert!(
+            matches!(updated.status, SessionStatus::Terminated),
+            "status must stay Terminated (derive_session_status's own terminal guard)",
+        );
+        assert_eq!(
+            updated.gate_status, Some(stale_gate),
+            "gate_status must be carried forward unchanged for a terminal session, \
+             even though live CI/mergeable data disagrees with it",
         );
     }
 
