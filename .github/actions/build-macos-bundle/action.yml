@@ -1,0 +1,70 @@
+name: Build macOS app bundle
+description: >
+  Build Ninox.app with cargo-bundle, verify its structure, ad-hoc code-sign
+  it, verify the signature, and (optionally) zip it with ditto. Shared by
+  ci.yml, release.yml, and publish-codeartifact.yml so the build/sign
+  sequence can't drift between them.
+
+inputs:
+  zip:
+    description: Whether to zip the signed bundle into Ninox.app.zip with ditto
+    required: false
+    default: "true"
+
+outputs:
+  bundle-path:
+    description: Path to the built, signed Ninox.app bundle
+    value: ${{ steps.paths.outputs.bundle }}
+  zip-path:
+    description: Path to Ninox.app.zip (only produced when the zip input is true)
+    value: ${{ steps.paths.outputs.zip }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install cargo-bundle
+      shell: bash
+      run: command -v cargo-bundle || cargo install cargo-bundle
+
+    - name: Build Ninox.app
+      shell: bash
+      run: cargo bundle --release -p ninox --format osx
+
+    - name: Verify bundle
+      shell: bash
+      run: |
+        set -euo pipefail
+        test -d target/release/bundle/osx/Ninox.app
+        test -x target/release/bundle/osx/Ninox.app/Contents/MacOS/ninox
+        test -f target/release/bundle/osx/Ninox.app/Contents/Resources/Ninox.icns
+        /usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" target/release/bundle/osx/Ninox.app/Contents/Info.plist
+
+    # Ad-hoc signing (identity "-") since there's no paid Apple Developer ID
+    # / notarization available. This clears the "'Ninox' is damaged and
+    # can't be opened" Gatekeeper error that an unsigned bundle downloaded
+    # with the com.apple.quarantine attribute triggers. It does NOT clear
+    # the standard "unidentified developer" first-run prompt — only real
+    # notarization does that — see the README's macOS app bundle section.
+    - name: Ad-hoc sign Ninox.app
+      shell: bash
+      run: codesign --force --deep --sign - target/release/bundle/osx/Ninox.app
+
+    - name: Verify code signature
+      shell: bash
+      run: codesign --verify --deep --strict target/release/bundle/osx/Ninox.app
+
+    - name: Zip Ninox.app
+      if: inputs.zip == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd target/release/bundle/osx
+        ditto -c -k --sequesterRsrc --keepParent Ninox.app Ninox.app.zip
+
+    - id: paths
+      shell: bash
+      run: |
+        echo "bundle=target/release/bundle/osx/Ninox.app" >> "$GITHUB_OUTPUT"
+        if [ "${{ inputs.zip }}" = "true" ]; then
+          echo "zip=target/release/bundle/osx/Ninox.app.zip" >> "$GITHUB_OUTPUT"
+        fi

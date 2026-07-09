@@ -69,6 +69,17 @@ fn pr_row<'a>(app: &'a App, pr: &'a PR) -> Element<'a, Message> {
         ..Default::default()
     };
 
+    // Extra PRs (a duplicate an agent opened beyond the session's tracked
+    // one — see `Event::ExtraPrDetected`) are recorded with no title:
+    // nothing has enriched them via the GitHub API yet. Blank-title cells
+    // read as broken, and this is exactly the row a human most needs to
+    // notice, so it gets a legible placeholder instead of empty space.
+    let (title_text, title_font, title_color): (&str, _, _) = if pr.title.is_empty() {
+        ("(untitled — not yet enriched)", SERIF_ITALIC, s.faint)
+    } else {
+        (pr.title.as_str(), SERIF, s.ink)
+    };
+
     let nav = button(
         row![
             container(
@@ -76,10 +87,10 @@ fn pr_row<'a>(app: &'a App, pr: &'a PR) -> Element<'a, Message> {
             )
             .width(Length::Fixed(70.0)),
             container(
-                text(&pr.title)
+                text(title_text)
                     .size(15)
-                    .font(SERIF)
-                    .color(s.ink)
+                    .font(title_font)
+                    .color(title_color)
                     .wrapping(iced::widget::text::Wrapping::None),
             )
             .width(Length::Fill)

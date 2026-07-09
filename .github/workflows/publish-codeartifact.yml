@@ -72,15 +72,12 @@ name: Publish to CodeArtifact
 # It creates a draft release for the tag if one doesn't already exist
 # (idempotent — a re-run against a tag that already has a release, e.g.
 # after a failed first attempt, reuses it instead of erroring or
-# duplicating), then builds+verifies the macOS bundle the same way as
-# ci.yml's bundle-macos job, zips it, uploads it with --clobber, and only
-# un-drafts the release once that upload succeeds — so a failed build
-# leaves a draft rather than a public release missing its asset. (The
-# public repo doesn't yet attach this bundle to its own releases the same
-# way — see the sibling feat-release-app-bundle branch — but this job's
-# build+verify steps are copied from ci.yml regardless of whether/when
-# that lands, since ci.yml is what already exercises this exact build on
-# every push.)
+# duplicating), then builds, ad-hoc code-signs, verifies, and zips the
+# macOS bundle via the shared .github/actions/build-macos-bundle composite
+# action (the same one ci.yml and release.yml use), uploads it with
+# --clobber, and only un-drafts the release once that upload succeeds — so
+# a failed build leaves a draft rather than a public release missing its
+# asset.
 #
 # It only runs on tag pushes (not the plain `main` push side of this
 # workflow's trigger, which exists solely for crate publishing) and
@@ -379,30 +376,14 @@ jobs:
           key: ${{ runner.os }}-cargo-bundle-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-bundle-
 
-      - name: Install cargo-bundle
-        run: command -v cargo-bundle || cargo install cargo-bundle
-
-      - name: Build Ninox.app
-        run: cargo bundle --release -p ninox --format osx
-
-      - name: Verify bundle
-        run: |
-          set -euo pipefail
-          test -d target/release/bundle/osx/Ninox.app
-          test -x target/release/bundle/osx/Ninox.app/Contents/MacOS/ninox
-          test -f target/release/bundle/osx/Ninox.app/Contents/Resources/Ninox.icns
-          /usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" target/release/bundle/osx/Ninox.app/Contents/Info.plist
-
-      - name: Zip Ninox.app
-        run: |
-          set -euo pipefail
-          cd target/release/bundle/osx
-          ditto -c -k --sequesterRsrc --keepParent Ninox.app Ninox.app.zip
+      - name: Build, sign & verify Ninox.app
+        id: build
+        uses: ./.github/actions/build-macos-bundle
 
       - name: Upload to release
         run: |
           gh release upload "$GITHUB_REF_NAME" --clobber \
-            target/release/bundle/osx/Ninox.app.zip
+            "${{ steps.build.outputs.zip-path }}"
 
       - name: Publish release
         run: gh release edit "$GITHUB_REF_NAME" --draft=false

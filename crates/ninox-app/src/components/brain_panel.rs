@@ -752,11 +752,29 @@ fn reading_pane(app: &App) -> Element<'_, Message> {
                 hline(s.rule_dark, 1.0),
             ];
 
+            // iced's stock markdown widget defaults to a 16px base size with
+            // inline `code` inheriting that same size (it has no size knob of
+            // its own — see `iced_widget::markdown::Span::view`), which reads
+            // oversized next to the reading pane's 14px prose. Match spec
+            // (`docs/design-concepts/03-field-notes.html` `.reading p`/`.reading
+            // code`): 14px body, 12px fenced code, and a paper-toned inline
+            // code chip instead of iced's default white-on-black one.
             let body = container(
                 iced::widget::markdown::view(
                     &app.brain_view.markdown,
-                    iced::widget::markdown::Settings::default(),
-                    iced::widget::markdown::Style::from_palette(app.scheme.iced_theme().palette()),
+                    iced::widget::markdown::Settings {
+                        code_size: 12.0.into(),
+                        ..iced::widget::markdown::Settings::with_text_size(14.0)
+                    },
+                    iced::widget::markdown::Style {
+                        inline_code_highlight: iced::widget::markdown::Highlight {
+                            background: Background::Color(s.paper),
+                            border: Border { color: s.rule, width: 1.0, radius: 2.0.into() },
+                        },
+                        inline_code_padding: iced::Padding { top: 1.0, right: 5.0, bottom: 1.0, left: 5.0 },
+                        inline_code_color: s.ink,
+                        link_color: s.accent,
+                    },
                 )
                 .map(Message::BrainLinkClicked),
             )

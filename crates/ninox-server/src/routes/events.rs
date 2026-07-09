@@ -39,6 +39,9 @@ fn event_to_json(event: &Event) -> Option<String> {
         Event::PrOpened { session_id, pr } => {
             serde_json::json!({"type": "pr_event", "payload": {"session_id": session_id, "pr": pr}})
         }
+        Event::ExtraPrDetected(pr) => {
+            serde_json::json!({"type": "extra_pr_event", "payload": {"session_id": pr.session_id, "pr": pr}})
+        }
         Event::ReviewComment { pr_id, comment } => {
             serde_json::json!({"type": "review_comment", "payload": {"pr_id": pr_id, "comment": comment}})
         }
