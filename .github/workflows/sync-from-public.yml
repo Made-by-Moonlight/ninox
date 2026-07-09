@@ -1,0 +1,90 @@
+name: Sync from public
+
+# Keeps internal/main caught up with the public mirror (Made-by-Moonlight/
+# ninox) without rebasing this repo's overlay commits forward. Overlay
+# commits (CODEOWNERS, this workflow, scripts/promote-to-public.sh) never
+# exist on the public side, so the only safe direction is merging
+# public/main *into* internal/main — never the reverse, and never a
+# rebase. A regular merge doesn't rewrite history, which matters now that
+# internal engineers commit here directly: rebasing the overlay forward
+# would rewrite commits they've already pulled.
+#
+# If internal/main already contains everything from public/main, this is a
+# no-op. Otherwise it pushes a merge commit to a side branch and opens a
+# PR against main — it never merges that PR itself. The repo ruleset set
+# up in MLOPS-2371 requires code-owner review on every PR into main
+# (internal-only; the public mirror shares git history and isn't subject
+# to it), so landing the sync still goes through the same review as any
+# other change here.
+#
+# A merge conflict fails this job outright (no branch is pushed) — that
+# means a commit landed on internal/main that touches the same lines as a
+# public/main change. Resolve it by hand: fetch public/main, merge it into
+# a branch locally, fix the conflict, push, open the PR yourself.
+#
+# Internal-only: added via an overlay commit on internal/main, same as
+# CODEOWNERS, and never cherry-picked to the public repo. The repository
+# check below is belt-and-braces in case this file ever ends up over
+# there by accident.
+
+on:
+  schedule:
+    - cron: '17 6 * * *' # once a day; arbitrary time, just off the hour
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-from-public
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Synthesia-Technologies/ninox'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Fetch public mirror
+        run: git fetch https://github.com/Made-by-Moonlight/ninox.git main
+
+      - name: Check whether a sync is needed
+        id: check
+        run: |
+          if git merge-base --is-ancestor FETCH_HEAD origin/main; then
+            echo "internal/main already has everything from public/main"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge public/main into a sync branch
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          git config user.name "ninox-sync[bot]"
+          git config user.email "ninox-sync@users.noreply.github.com"
+          git checkout -b sync-from-public
+          git merge --no-edit FETCH_HEAD
+
+      - name: Push sync branch
+        if: steps.check.outputs.needed == 'true'
+        run: git push --force-with-lease origin sync-from-public
+
+      - name: Open or update PR
+        if: steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh pr view sync-from-public >/dev/null 2>&1; then
+            echo "PR already open — the push above already updated it."
+          else
+            gh pr create \
+              --title "chore(sync): merge public/main into internal/main" \
+              --body "Automated merge-forward from the public mirror (Made-by-Moonlight/ninox). Opens only when public/main has commits internal/main doesn't already have. Still needs code-owner review per the repo ruleset — this workflow only proposes the sync." \
+              --base main \
+              --head sync-from-public
+          fi
