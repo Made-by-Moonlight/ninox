@@ -10,14 +10,23 @@ set -euo pipefail
 #   scripts/promote-to-public.sh [--force] <commit>...
 #   scripts/promote-to-public.sh [--force] <commit1>..<commit2>
 #
-# A <a>..<b> argument is expanded to the commits in between (oldest
-# first, same order git log would list them); otherwise each commit is
-# cherry-picked in the order given.
+# A <a>..<b> argument is expanded to the commits strictly after <a> up to
+# and including <b> (standard git range semantics — <a> itself is
+# excluded), oldest first; otherwise each commit is cherry-picked in the
+# order given. Merge commits are always rejected (from either form) —
+# `git cherry-pick` can't apply one without an explicit -m mainline
+# choice, and letting the script's own conflict-recovery path swallow
+# that failure previously (see git blame) skipped the safety checks
+# below entirely, which is exactly how the internal-only CODEOWNERS file
+# could have leaked. Cherry-pick a merge commit by hand with -m if you
+# really need its content promoted.
 #
-# Before pushing, this greps the diff being promoted for a short list of
-# internal-only strings (the private remote's host alias, "synthesia",
-# "codeartifact") and refuses to push if any show up — pass --force once
-# you've confirmed a match is a false positive.
+# Before pushing, this refuses (unless --force) to promote any commit
+# whose diff touches a known internal-only path (CODEOWNERS, this
+# script, the sync-from-public workflow) or whose added lines match a
+# short list of internal-only strings (the private remote's host alias,
+# "synthesia", "codeartifact"). Both checks are best-effort, not
+# exhaustive — review the diff yourself before using --force.
 #
 # Assumes remotes named "public" (Made-by-Moonlight/ninox) and "origin"
 # (the internal mirror this script runs from) — override with the
@@ -57,6 +66,14 @@ if [ "${#commits[@]}" -eq 0 ]; then
   exit 1
 fi
 
+for c in "${commits[@]}"; do
+  parent_field_count=$(git rev-list --parents -n1 "$c" | wc -w)
+  if [ "$parent_field_count" -gt 2 ]; then
+    echo "refusing to promote merge commit $c — cherry-pick it by hand with -m if you really need to" >&2
+    exit 1
+  fi
+done
+
 last_commit="${commits[$((${#commits[@]}-1))]}"
 branch="promote/$(date +%Y%m%d)-$(git rev-parse --short "$last_commit")"
 
@@ -65,15 +82,31 @@ git switch -c "$branch" "$PUBLIC_REMOTE/main"
 if ! git cherry-pick "${commits[@]}"; then
   echo "cherry-pick stopped with a conflict on branch '$branch'." >&2
   echo "Resolve it, then: git cherry-pick --continue" >&2
-  echo "Then push and open the PR yourself:" >&2
+  echo "Then re-run the internal-only-content check yourself before pushing:" >&2
+  echo "  git diff --name-only $PUBLIC_REMOTE/main..HEAD" >&2
+  echo "  git diff $PUBLIC_REMOTE/main..HEAD | grep -Ei 'synthesia|codeartifact|github\\.com-synthesia'" >&2
+  echo "Then push and open the PR:" >&2
   echo "  git push $PUBLIC_REMOTE $branch" >&2
   echo "  gh pr create --repo Made-by-Moonlight/ninox --base main --head $branch" >&2
   exit 1
 fi
 
+internal_only_paths='^(CODEOWNERS|\.github/workflows/sync-from-public\.yml|scripts/promote-to-public\.sh)$'
+touched_internal=$(git diff --name-only "$PUBLIC_REMOTE/main..HEAD" | grep -E "$internal_only_paths" || true)
+if [ -n "$touched_internal" ]; then
+  echo "Promoted diff touches internal-only file(s):" >&2
+  echo "$touched_internal" | sed 's/^/  - /' >&2
+  if [ "$force" != true ]; then
+    echo "Refusing to push. Re-run with --force once you've confirmed this is intentional." >&2
+    exit 1
+  fi
+  echo "Continuing anyway (--force)." >&2
+fi
+
 sensitive_pattern='synthesia|codeartifact|github\.com-synthesia'
-if diff_hits=$(git diff "$PUBLIC_REMOTE/main..HEAD" | grep -Eio "$sensitive_pattern" | sort -u) && [ -n "$diff_hits" ]; then
-  echo "Found strings that look internal-only in the promoted diff:" >&2
+added_lines=$(git diff "$PUBLIC_REMOTE/main..HEAD" | grep -E '^\+[^+]')
+if diff_hits=$(printf '%s' "$added_lines" | grep -Eio "$sensitive_pattern" | sort -u) && [ -n "$diff_hits" ]; then
+  echo "Found strings that look internal-only in the promoted diff's added lines:" >&2
   echo "$diff_hits" | sed 's/^/  - /' >&2
   if [ "$force" != true ]; then
     echo "Refusing to push. Re-run with --force once you've confirmed this is a false positive." >&2

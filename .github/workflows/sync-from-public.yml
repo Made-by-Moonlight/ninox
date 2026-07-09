@@ -22,6 +22,24 @@ name: Sync from public
 # public/main change. Resolve it by hand: fetch public/main, merge it into
 # a branch locally, fix the conflict, push, open the PR yourself.
 #
+# The sync-from-public branch is force-pushed on every run (it's fully
+# bot-owned — nothing else should ever push to it) rather than using
+# --force-with-lease, since a lease needs a local remote-tracking ref for
+# the branch and this job only ever fetches main, not sync-from-public;
+# leasing against nothing fails the push on every run after the first.
+#
+# Opening the PR with the default GITHUB_TOKEN means GitHub's anti-
+# recursion rule applies: this PR will NOT automatically trigger other
+# pull_request-scoped workflows (e.g. ci.yml), the same limitation
+# release.yml documents for its own push and works around with a deploy
+# key. If internal main's ruleset ever requires passing status checks
+# (today it's code-owner review only, per MLOPS-2371), set a repo secret
+# named SYNC_PR_TOKEN (a PAT or GitHub App installation token with repo
+# scope) and this workflow will use it instead, so the PR is attributed
+# to a real actor and CI runs normally. Until then, a reviewer can
+# manually re-run checks (push an empty commit, or use the "Update
+# branch" button) if status checks are ever required.
+#
 # Internal-only: added via an overlay commit on internal/main, same as
 # CODEOWNERS, and never cherry-picked to the public repo. The repository
 # check below is belt-and-braces in case this file ever ends up over
@@ -44,10 +62,14 @@ jobs:
   sync:
     if: github.repository == 'Synthesia-Technologies/ninox'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SYNC_TOKEN: ${{ secrets.SYNC_PR_TOKEN || github.token }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
+          token: ${{ env.SYNC_TOKEN }}
 
       - name: Fetch public mirror
         run: git fetch https://github.com/Made-by-Moonlight/ninox.git main
@@ -72,12 +94,12 @@ jobs:
 
       - name: Push sync branch
         if: steps.check.outputs.needed == 'true'
-        run: git push --force-with-lease origin sync-from-public
+        run: git push --force origin sync-from-public
 
       - name: Open or update PR
         if: steps.check.outputs.needed == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ env.SYNC_TOKEN }}
         run: |
           if gh pr view sync-from-public >/dev/null 2>&1; then
             echo "PR already open — the push above already updated it."
