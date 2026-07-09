@@ -281,11 +281,17 @@ fn tree_row<'a>(
     let s = &app.scheme;
     let is_active = matches!(&app.view, View::SessionDetail { session_id, .. } if session_id == id);
     let dot: Element<Message> = match status {
-        Some(st) => status_dot(
-            s.status_color(st),
-            matches!(st, ninox_core::types::SessionStatus::Done
-                        | ninox_core::types::SessionStatus::Terminated),
-        ),
+        Some(st) => {
+            let base = status_dot(
+                s.status_color(st),
+                matches!(st, ninox_core::types::SessionStatus::Done
+                            | ninox_core::types::SessionStatus::Terminated),
+            );
+            match app.sessions.get(id) {
+                Some(session) => crate::components::lifecycle_status::with_gate_tooltip(s, session, base),
+                None => base,
+            }
+        }
         None => Space::new(8, 0).into(),
     };
     let name_font = if bold { SANS_BOLD } else { crate::style::SANS };

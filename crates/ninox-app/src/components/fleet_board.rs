@@ -269,9 +269,12 @@ fn session_card<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> 
     }
     body.push(Space::new(0, 9).into());
     body.push(crate::style::dotted_rule(s.rule_dark));
+    let stamp_with_tooltip = crate::components::lifecycle_status::with_gate_tooltip(
+        s, session, crate::style::stamp(word, st_color),
+    );
     body.push(
         row![
-            crate::style::stamp(word, st_color),
+            stamp_with_tooltip,
             Space::new(Length::Fill, 0),
             text(format!("${:.2}", session.cost_usd))
                 .size(11.5).font(crate::style::MONO_MEDIUM).color(s.ink),

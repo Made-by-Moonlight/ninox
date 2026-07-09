@@ -6,6 +6,7 @@ pub mod fleet_board;
 pub mod folio;
 pub mod info_panel;
 pub mod inspector_panel;
+pub mod lifecycle_status;
 pub mod links;
 pub mod notification_panel;
 pub mod pr_list;
