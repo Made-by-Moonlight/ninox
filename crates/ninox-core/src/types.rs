@@ -94,6 +94,95 @@ pub struct Session {
     pub terminal_at: Option<i64>,
 }
 
+/// Which fields of a `Session` a particular `Event::SessionUpdated` carries
+/// fresh, authoritative values for. Every producer of that event is read
+/// from a DB snapshot taken at the start of its own tick — a snapshot that
+/// can be stale for fields *other* actors are concurrently writing. Flagging
+/// exactly the fields a given tick just persisted, and merging field-by-field
+/// on the receiving end (`Session::merge_from`), means a stale snapshot can
+/// never stomp a fresher value for a field it isn't authoritative for —
+/// closing the class of bug fixed one field at a time in PR #57.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionFields(u16);
+
+impl SessionFields {
+    pub const NONE:        Self = Self(0);
+    pub const STATUS:      Self = Self(1 << 0);
+    /// `pr_number`, `pr_id`, and `repo` travel together — they're only ever
+    /// self-healed/adopted as a unit (see `poller.rs`'s repo/PR self-heal).
+    pub const PR_LINK:     Self = Self(1 << 2);
+    pub const COST:        Self = Self(1 << 3);
+    /// `context_tokens`, `context_used_pct`, `context_total_tokens`,
+    /// `context_window_size` — all sourced from the same usage/statusline
+    /// snapshot, so they travel together too.
+    pub const CONTEXT:     Self = Self(1 << 4);
+    pub const TERMINAL_AT: Self = Self(1 << 5);
+    pub const PID:         Self = Self(1 << 6);
+    pub const WORKSPACE:   Self = Self(1 << 7);
+    pub const MODEL:       Self = Self(1 << 8);
+    /// Full-struct replace — only for the spawn-completion event, where the
+    /// row is transitioning from an optimistic placeholder to its first real
+    /// snapshot and every field is being established for the first time.
+    pub const ALL:         Self = Self(0xFFFF);
+    // NOTE: bit `1 << 1` is intentionally left free — Task 2 adds a `GATE`
+    // constant there, alongside the `GateStatus` type and the corresponding
+    // `merge_from` branch, since both need `Session.gate_status` to exist.
+
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl std::ops::BitOr for SessionFields {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl Session {
+    /// Copy only the fields flagged in `fields` from `incoming` onto `self`.
+    /// See `SessionFields`'s doc comment for why this must never be a
+    /// wholesale replace except when `fields == SessionFields::ALL`.
+    pub fn merge_from(&mut self, incoming: &Session, fields: SessionFields) {
+        if fields == SessionFields::ALL {
+            *self = incoming.clone();
+            return;
+        }
+        if fields.contains(SessionFields::STATUS) {
+            self.status = incoming.status.clone();
+        }
+        // NOTE: a `GATE` branch is added here in Task 2, once
+        // `Session.gate_status` exists.
+        if fields.contains(SessionFields::PR_LINK) {
+            self.pr_number = incoming.pr_number;
+            self.pr_id = incoming.pr_id;
+            self.repo = incoming.repo.clone();
+        }
+        if fields.contains(SessionFields::COST) {
+            self.cost_usd = incoming.cost_usd;
+        }
+        if fields.contains(SessionFields::CONTEXT) {
+            self.context_tokens = incoming.context_tokens;
+            self.context_used_pct = incoming.context_used_pct;
+            self.context_total_tokens = incoming.context_total_tokens;
+            self.context_window_size = incoming.context_window_size;
+        }
+        if fields.contains(SessionFields::TERMINAL_AT) {
+            self.terminal_at = incoming.terminal_at;
+        }
+        if fields.contains(SessionFields::PID) {
+            self.pid = incoming.pid;
+        }
+        if fields.contains(SessionFields::WORKSPACE) {
+            self.workspace_path = incoming.workspace_path.clone();
+        }
+        if fields.contains(SessionFields::MODEL) {
+            self.model = incoming.model.clone();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Orchestrator {
     pub id:         OrchestratorId,
@@ -231,5 +320,75 @@ mod tests {
         assert_eq!(json, "\"interrupted\"");
         let back: SessionStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(back, SessionStatus::Interrupted);
+    }
+
+    fn base_session() -> Session {
+        Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r1".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 1.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: Some("/ws".into()),
+            pid: Some(111), model: Some("m1".into()), context_tokens: Some(10),
+            catalogue_path: None, context_used_pct: Some(1.0),
+            context_total_tokens: Some(10), context_window_size: Some(200_000),
+            claude_session_id: None, summary: None, terminal_at: None,
+        }
+    }
+
+    #[test]
+    fn merge_from_only_copies_flagged_fields() {
+        let mut existing = base_session();
+        let mut incoming = base_session();
+        // Incoming carries a *stale* repo/pr fields (as if read before another
+        // actor's write landed) but a fresh cost_usd.
+        incoming.repo = "stale-repo".into();
+        incoming.cost_usd = 42.0;
+
+        existing.merge_from(&incoming, SessionFields::COST);
+
+        assert_eq!(existing.cost_usd, 42.0, "flagged field must be copied");
+        assert_eq!(existing.repo, "r1", "unflagged field must survive untouched");
+    }
+
+    #[test]
+    fn merge_from_disjoint_updates_do_not_stomp_each_other() {
+        // Simulates two out-of-order Event::SessionUpdated arrivals touching
+        // disjoint fields — this is the regression test PR #57's fix lacked
+        // at the general level.
+        let mut state = base_session();
+
+        let mut a = base_session();
+        a.status = SessionStatus::PrOpen;
+        a.pr_number = Some(7);
+        state.merge_from(&a, SessionFields::STATUS | SessionFields::PR_LINK);
+
+        let mut b = base_session(); // stale snapshot: still pr_number None
+        b.cost_usd = 9.99;
+        state.merge_from(&b, SessionFields::COST);
+
+        assert!(matches!(state.status, SessionStatus::PrOpen), "A's status must survive B's arrival");
+        assert_eq!(state.pr_number, Some(7), "A's pr_number must survive B's arrival");
+        assert_eq!(state.cost_usd, 9.99, "B's cost_usd must still apply");
+    }
+
+    #[test]
+    fn merge_from_all_replaces_the_whole_struct() {
+        let mut existing = base_session();
+        let mut incoming = base_session();
+        incoming.name = "brand-new-name".into();
+        incoming.pid = Some(999);
+
+        existing.merge_from(&incoming, SessionFields::ALL);
+
+        assert_eq!(existing.name, "brand-new-name");
+        assert_eq!(existing.pid, Some(999));
+    }
+
+    #[test]
+    fn session_fields_bitor_combines_flags() {
+        let combined = SessionFields::STATUS | SessionFields::PR_LINK;
+        assert!(combined.contains(SessionFields::STATUS));
+        assert!(combined.contains(SessionFields::PR_LINK));
+        assert!(!combined.contains(SessionFields::COST));
     }
 }
