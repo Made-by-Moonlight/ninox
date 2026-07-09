@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use ninox_core::{events::Engine, pty, tmux, Event, Session, SessionStatus};
+use ninox_core::{events::Engine, pty, tmux, Event, Session, SessionFields, SessionStatus};
 
 /// The per-kind differences between the spawn-modal launch paths
 /// (standalone vs orchestrator). Everything else — env resolution,
@@ -103,7 +103,7 @@ pub async fn spawn_interactive_session(
         if let Ok(Some(mut s)) = engine.store.get_session(&sid) {
             s.status = p.failure_status;
             let _ = engine.store.upsert_session(&s);
-            engine.emit(Event::SessionUpdated(s));
+            engine.emit(Event::SessionUpdated(s, SessionFields::STATUS));
         }
         return None;
     }
@@ -143,7 +143,7 @@ pub async fn spawn_interactive_session(
         tracing::error!("pty setup failed for {sid}: {e}");
     }
 
-    engine.emit(Event::SessionUpdated(updated));
+    engine.emit(Event::SessionUpdated(updated, SessionFields::ALL));
 
     // Hidden tmux client attach argv — mirrors NavigateSession's attach flow.
     Some(tmux::attach_args(&sid).await)
