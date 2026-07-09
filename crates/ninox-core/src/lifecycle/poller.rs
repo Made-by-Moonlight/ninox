@@ -11,7 +11,8 @@ use crate::{
         usage,
     },
     types::{
-        CIStatus, Comment, Notification, NotificationKind, PrId, Session, SessionStatus, PR,
+        CIStatus, Comment, Notification, NotificationKind, PrId, Session, SessionFields,
+        SessionStatus, PR,
     },
 };
 use std::{
@@ -208,7 +209,7 @@ impl Poller {
                     session.status = SessionStatus::Terminated;
                     session.terminal_at = Some(now_millis());
                     let _ = self.engine.store.upsert_session(&session);
-                    self.engine.emit(Event::SessionUpdated(session));
+                    self.engine.emit(Event::SessionUpdated(session, SessionFields::STATUS | SessionFields::TERMINAL_AT));
                 }
             }
         }
@@ -242,7 +243,9 @@ impl Poller {
                     session.pr_number = Some(first.number);
                     session.status    = SessionStatus::PrOpen;
                     let _ = self.engine.store.upsert_session(&session);
-                    self.engine.emit(Event::SessionUpdated(session.clone()));
+                    self.engine.emit(Event::SessionUpdated(
+                        session.clone(), SessionFields::PR_LINK | SessionFields::STATUS,
+                    ));
                     tracing::info!(
                         "session {} PR #{} detected via metadata hook",
                         session.id, first.number
@@ -443,7 +446,9 @@ impl Poller {
                 session.model = snapshot.model;
             }
             let _ = self.engine.store.upsert_session(&session);
-            self.engine.emit(Event::SessionUpdated(session));
+            self.engine.emit(Event::SessionUpdated(
+                session, SessionFields::COST | SessionFields::CONTEXT | SessionFields::MODEL,
+            ));
         }
     }
 
@@ -475,7 +480,9 @@ impl Poller {
             }
         }
         for session in changed {
-            self.engine.emit(Event::SessionUpdated(session));
+            self.engine.emit(Event::SessionUpdated(
+                session, SessionFields::COST | SessionFields::CONTEXT,
+            ));
         }
     }
 
@@ -707,7 +714,9 @@ impl Poller {
             updated.status = new_status;
             if updated.status != session.status {
                 let _ = self.engine.store.upsert_session(&updated);
-                self.engine.emit(Event::SessionUpdated(updated.clone()));
+                self.engine.emit(Event::SessionUpdated(
+                    updated.clone(), SessionFields::STATUS | SessionFields::PR_LINK,
+                ));
             }
 
             if has_new && !review_reaction_already_sent {
@@ -797,7 +806,9 @@ impl Poller {
                         session.repo      = repo_slug.clone();
                         session.status    = SessionStatus::PrOpen;
                         let _ = self.engine.store.upsert_session(&session);
-                        self.engine.emit(Event::SessionUpdated(session.clone()));
+                        self.engine.emit(Event::SessionUpdated(
+                            session.clone(), SessionFields::PR_LINK | SessionFields::STATUS,
+                        ));
                         tracing::info!(
                             "session {} PR #{} detected via reconciliation ({repo_slug}, branch {branch})",
                             session.id, pr_ref.number,
@@ -1147,7 +1158,7 @@ mod tests {
             .await
             .expect("SessionUpdated should be emitted")
             .unwrap();
-        assert!(matches!(evt, Event::SessionUpdated(s) if s.id == "s1" && s.cost_usd > 0.0));
+        assert!(matches!(evt, Event::SessionUpdated(s, _fields) if s.id == "s1" && s.cost_usd > 0.0));
     }
 
     /// The `ninox statusline` subcommand (a separate short-lived process)
@@ -1185,7 +1196,7 @@ mod tests {
         assert_eq!(events.len(), 1, "only the changed session should emit");
         assert!(matches!(
             &events[0],
-            Event::SessionUpdated(s) if s.id == "s1" && s.context_used_pct == Some(42.0) && s.cost_usd == 3.5
+            Event::SessionUpdated(s, _fields) if s.id == "s1" && s.context_used_pct == Some(42.0) && s.cost_usd == 3.5
         ));
 
         // A third tick with no further changes emits nothing.
