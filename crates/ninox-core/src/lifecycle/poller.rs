@@ -594,6 +594,9 @@ impl Poller {
 
             // -- Merge detection — handle before CI (no point polling CI on merged PR) --
             if self.handle_merge_detection(&session, pr_number, pr_status.merged).await {
+                // Skips the gate-computation block below — a merged session's
+                // gate_status is intentionally left frozen at its last
+                // pre-merge value, not recomputed at the merging tick.
                 continue; // skip further enrichment for this session
             }
 

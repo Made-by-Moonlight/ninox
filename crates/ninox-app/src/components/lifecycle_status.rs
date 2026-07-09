@@ -80,10 +80,11 @@ pub fn with_gate_tooltip<'a>(
         .into()
 }
 
-/// "Removing in Nd/Nh/Nm" for a terminal session sitting in its retention
-/// grace period, or `None` if there's nothing to show (no `terminal_at`,
-/// i.e. the session isn't terminal, or was terminated by direct user
-/// action and has no grace period at all).
+/// "Removing in Nd/Nh/Nm" (or "Removing shortly") for a terminal session's
+/// retention countdown, computed from an already-known `terminal_at`.
+/// Always returns `Some` — callers are responsible for only calling this
+/// once a session actually has a `terminal_at` (see `sidebar.rs`/
+/// `fleet_board.rs`, which gate the call behind `Option<i64>` chains).
 pub fn retention_label(terminal_at: i64, retention_millis: i64, now: i64) -> Option<String> {
     let remaining_ms = terminal_at + retention_millis - now;
     Some(if remaining_ms <= 0 {

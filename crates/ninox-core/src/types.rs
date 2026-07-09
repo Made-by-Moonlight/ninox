@@ -172,6 +172,13 @@ impl Session {
     /// Copy only the fields flagged in `fields` from `incoming` onto `self`.
     /// See `SessionFields`'s doc comment for why this must never be a
     /// wholesale replace except when `fields == SessionFields::ALL`.
+    ///
+    /// `name`, `summary`, `catalogue_path`, `claude_session_id`,
+    /// `agent_type`, `started_at`, `orchestrator_id`, and `id` have no flag
+    /// of their own — they're only ever set via the `ALL` path at
+    /// spawn-completion. A new emitter that needs to update one of these
+    /// must use `SessionFields::ALL` or add a new flag for it; reusing an
+    /// existing flag would silently drop the update.
     pub fn merge_from(&mut self, incoming: &Session, fields: SessionFields) {
         if fields == SessionFields::ALL {
             *self = incoming.clone();
