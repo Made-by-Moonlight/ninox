@@ -271,6 +271,15 @@ pub async fn create_session(
     cmd:       &str,
     env:       &[(&str, &str)],
 ) -> Result<()> {
+    // tmux does NOT fail on a nonexistent `-c` dir (verified on 3.6a: exit 0,
+    // pane silently starts in $HOME). For harnesses with cwd-scoped state —
+    // claude-code keys conversations to the directory it starts in — that
+    // fallback breaks `--resume` with "No conversation found with session
+    // ID". Fail loudly here instead.
+    anyhow::ensure!(
+        std::path::Path::new(workspace).is_dir(),
+        "workspace directory does not exist: {workspace}"
+    );
     // Build -e KEY=VALUE pairs
     let mut env_pairs: Vec<String> = Vec::new();
     for (k, v) in env {
@@ -481,6 +490,19 @@ mod tests {
         assert!(is_test_binary(), "the test binary itself must be detected as a test binary");
         assert_eq!(socket(), "ninox-test");
         assert_ne!(socket(), "ninox");
+    }
+
+    #[tokio::test]
+    async fn create_session_fails_when_workspace_dir_is_missing() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        // tmux 3.6a exits 0 for `new-session -c <missing-dir>` and silently
+        // starts the pane in $HOME instead — which made `claude --resume`
+        // fail with "No conversation found with session ID" (conversations
+        // are cwd-scoped). create_session must fail loudly instead.
+        let result = create_session(&id, "/definitely/not/a/real/dir", "sleep 30", &[]).await;
+        assert!(result.is_err(), "missing workspace must be an error, not a silent $HOME fallback");
+        assert!(!has_session(&id).await, "no session may be left behind on failure");
     }
 
     #[tokio::test]
