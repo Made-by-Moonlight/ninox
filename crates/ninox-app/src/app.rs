@@ -1540,7 +1540,7 @@ impl App {
                     // Same workspace-restoration guard as Resume below —
                     // without it a torn-down worktree makes tmux silently
                     // start the fresh agent in $HOME.
-                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id).await {
+                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id, is_orch).await {
                         tracing::warn!("re-file {id}: cannot restore workspace: {e}");
                     }
                     let attach = crate::spawn_util::spawn_interactive_session(
@@ -1605,7 +1605,7 @@ impl App {
                     // rejects a missing workspace, so the spawn fails
                     // visibly into `failure_status` instead of the agent
                     // silently starting in $HOME.
-                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id).await {
+                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id, is_orch).await {
                         tracing::warn!("resume {id}: cannot restore workspace: {e}");
                     }
                     let attach = crate::spawn_util::spawn_interactive_session(

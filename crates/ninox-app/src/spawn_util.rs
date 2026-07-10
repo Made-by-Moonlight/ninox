@@ -253,6 +253,9 @@ pub async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Res
 /// fails with "No conversation found with session ID".
 ///
 /// - Path exists → nothing to do.
+/// - Missing orchestrator workspace (`is_orchestrator`) → plain
+///   `create_dir_all`, mirroring how the orchestrator spawn created it in
+///   the first place — the conversation lookup only needs the path back.
 /// - Missing and shaped like a ninox worktree (`{repo}/.claude/worktrees/
 ///   {session_id}`) → recreate it via [`create_worker_worktree`]. Cleanup
 ///   deletes the branch along with the worktree, and that's fine: a fresh
@@ -262,8 +265,16 @@ pub async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Res
 ///   spawn wrote (git-excluded, so never on the branch either way).
 /// - Missing and anything else → error, so the spawn fails visibly instead
 ///   of the agent silently running in the wrong directory.
-pub async fn ensure_session_workspace(workspace: &str, session_id: &str) -> anyhow::Result<()> {
+pub async fn ensure_session_workspace(
+    workspace:       &str,
+    session_id:      &str,
+    is_orchestrator: bool,
+) -> anyhow::Result<()> {
     if std::path::Path::new(workspace).is_dir() {
+        return Ok(());
+    }
+    if is_orchestrator {
+        std::fs::create_dir_all(workspace)?;
         return Ok(());
     }
     let suffix = format!("/.claude/worktrees/{session_id}");
@@ -325,6 +336,17 @@ pub fn create_worktree_at(
 
     let repo_str = repo_root.to_string_lossy().to_string();
     let target_str = target.to_string_lossy().to_string();
+
+    // A worktree whose directory was deleted manually (`rm -rf`, not `git
+    // worktree remove`) stays REGISTERED in git, and `git worktree add`
+    // then refuses both the -b and existing-branch attempts below with
+    // "missing but already registered worktree". Prune first — it only
+    // clears registrations whose directories are already gone, so it can
+    // never touch a live worktree. Best-effort: if it fails, the add
+    // attempts below surface the real error.
+    let _ = Command::new("git")
+        .args(["-C", &repo_str, "worktree", "prune"])
+        .output();
 
     // Attempt 1: create a fresh branch named after `branch`.
     let out = Command::new("git")
@@ -646,7 +668,7 @@ mod tests {
             .unwrap();
         assert!(!std::path::Path::new(&worktree).exists(), "sanity: worktree removed");
 
-        ensure_session_workspace(&worktree, "ensure-ws-1").await.unwrap();
+        ensure_session_workspace(&worktree, "ensure-ws-1", false).await.unwrap();
 
         assert!(std::path::Path::new(&worktree).is_dir(), "worktree must be recreated at the same path");
         let out = std::process::Command::new("git")
@@ -675,7 +697,7 @@ mod tests {
             .output()
             .unwrap();
 
-        ensure_session_workspace(&worktree, "ensure-ws-2").await.unwrap();
+        ensure_session_workspace(&worktree, "ensure-ws-2", false).await.unwrap();
 
         assert!(std::path::Path::new(&worktree).is_dir(), "worktree must be recreated at the same path");
         let out = std::process::Command::new("git")
@@ -689,9 +711,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_session_workspace_recovers_a_manually_deleted_worktree() {
+        let repo = init_git_repo();
+        let worktree = create_worker_worktree(repo.to_str().unwrap(), "ensure-ws-3").await.unwrap();
+        // A user pruning `.claude/worktrees/` does `rm -rf`, not `git
+        // worktree remove` — git then still has the worktree REGISTERED
+        // ("missing but already registered worktree"), which makes a naive
+        // `git worktree add` fail on both the -b and existing-branch paths.
+        std::fs::remove_dir_all(&worktree).unwrap();
+
+        ensure_session_workspace(&worktree, "ensure-ws-3", false).await.unwrap();
+
+        assert!(std::path::Path::new(&worktree).is_dir(), "worktree must be recreated at the same path");
+        let out = std::process::Command::new("git")
+            .args(["-C", &worktree, "branch", "--show-current"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ensure-ws-3");
+    }
+
+    #[tokio::test]
     async fn ensure_session_workspace_is_a_noop_when_the_dir_exists() {
         let dir = tempdir().unwrap().keep();
-        ensure_session_workspace(dir.to_str().unwrap(), "whatever").await.unwrap();
+        ensure_session_workspace(dir.to_str().unwrap(), "whatever", false).await.unwrap();
         assert!(dir.is_dir());
     }
 
@@ -700,8 +742,22 @@ mod tests {
         // A missing dir that is NOT a ninox worktree ({repo}/.claude/
         // worktrees/{session_id}) can't be safely recreated — error out so
         // the spawn fails visibly instead of claude starting in $HOME.
-        let result = ensure_session_workspace("/definitely/not/a/real/dir", "sess-x").await;
+        let result = ensure_session_workspace("/definitely/not/a/real/dir", "sess-x", false).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn ensure_session_workspace_recreates_a_plain_dir_for_orchestrators() {
+        // Orchestrator workspaces are plain directories (created with
+        // create_dir_all at spawn, not git worktrees). Recreating the bare
+        // path is all claude needs to find the conversation again.
+        let parent = tempdir().unwrap().keep();
+        let ws = parent.join("orch-1");
+        assert!(!ws.exists());
+
+        ensure_session_workspace(ws.to_str().unwrap(), "orch-1", true).await.unwrap();
+
+        assert!(ws.is_dir(), "orchestrator workspace must be recreated as a plain dir");
     }
 
     #[test]
