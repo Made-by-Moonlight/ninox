@@ -241,6 +241,46 @@ pub async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Res
     .context("worktree creation task panicked")?
 }
 
+/// Make sure a session's recorded `workspace_path` exists before a Resume
+/// or Re-file respawn. Worker worktrees are torn down on completion
+/// (`events::remove_worktree_and_artifacts`) and by users pruning
+/// `.claude/worktrees/` — but claude-code keys its conversations to the cwd
+/// *path string* (`~/.claude/projects/<escaped-path>/<uuid>.jsonl`, which
+/// survives the teardown), so recreating the worktree at the exact same
+/// path is what makes `--resume` find the conversation again. tmux itself
+/// is no safety net: `new-session -c <missing-dir>` exits 0 and silently
+/// starts the pane in $HOME (verified on tmux 3.6a), where `--resume` then
+/// fails with "No conversation found with session ID".
+///
+/// - Path exists → nothing to do.
+/// - Missing and shaped like a ninox worktree (`{repo}/.claude/worktrees/
+///   {session_id}`) → recreate it via [`create_worker_worktree`] (checks
+///   out the session's still-existing branch, or a fresh one) and re-seed
+///   the brain skill the original spawn wrote (git-excluded, so it is not
+///   on the branch).
+/// - Missing and anything else → error, so the spawn fails visibly instead
+///   of the agent silently running in the wrong directory.
+pub async fn ensure_session_workspace(workspace: &str, session_id: &str) -> anyhow::Result<()> {
+    if std::path::Path::new(workspace).is_dir() {
+        return Ok(());
+    }
+    let suffix = format!("/.claude/worktrees/{session_id}");
+    let Some(repo_root) = workspace.strip_suffix(&suffix).filter(|r| !r.is_empty()) else {
+        anyhow::bail!(
+            "workspace {workspace} is gone and is not a ninox worker worktree — cannot recreate it"
+        );
+    };
+    anyhow::ensure!(
+        std::path::Path::new(repo_root).is_dir(),
+        "workspace {workspace} is gone and its repo root {repo_root} no longer exists"
+    );
+    create_worker_worktree(repo_root, session_id).await?;
+    if let Err(e) = seed_worker_brain_skill(workspace).await {
+        tracing::warn!("failed to re-seed brain skill for {session_id}: {e}");
+    }
+    Ok(())
+}
+
 /// Walk up from `start` (inclusive) looking for the nearest ancestor
 /// directory containing a `.git` entry — either a real repo's `.git`
 /// directory, or a linked worktree's `.git` gitfile. `start` itself need
@@ -590,6 +630,47 @@ mod tests {
             std::path::Path::new(&second).join(".claude").join("settings.json"),
         ).unwrap();
         assert_eq!(contents, r#"{"userCustom": true}"#);
+    }
+
+    #[tokio::test]
+    async fn ensure_session_workspace_recreates_missing_worker_worktree() {
+        let repo = init_git_repo();
+        let worktree = create_worker_worktree(repo.to_str().unwrap(), "ensure-ws-1").await.unwrap();
+        // Simulate post-merge teardown: the worktree dir is gone, the branch
+        // (and the claude transcript keyed to this path) survive.
+        std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "worktree", "remove", "--force", &worktree])
+            .output()
+            .unwrap();
+        assert!(!std::path::Path::new(&worktree).exists(), "sanity: worktree removed");
+
+        ensure_session_workspace(&worktree, "ensure-ws-1").await.unwrap();
+
+        assert!(std::path::Path::new(&worktree).is_dir(), "worktree must be recreated at the same path");
+        let out = std::process::Command::new("git")
+            .args(["-C", &worktree, "branch", "--show-current"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(), "ensure-ws-1",
+            "the session's original branch must be checked out again",
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_session_workspace_is_a_noop_when_the_dir_exists() {
+        let dir = tempdir().unwrap().keep();
+        ensure_session_workspace(dir.to_str().unwrap(), "whatever").await.unwrap();
+        assert!(dir.is_dir());
+    }
+
+    #[tokio::test]
+    async fn ensure_session_workspace_errors_for_a_missing_non_worktree_path() {
+        // A missing dir that is NOT a ninox worktree ({repo}/.claude/
+        // worktrees/{session_id}) can't be safely recreated — error out so
+        // the spawn fails visibly instead of claude starting in $HOME.
+        let result = ensure_session_workspace("/definitely/not/a/real/dir", "sess-x").await;
+        assert!(result.is_err());
     }
 
     #[test]
