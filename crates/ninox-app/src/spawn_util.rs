@@ -254,10 +254,12 @@ pub async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Res
 ///
 /// - Path exists → nothing to do.
 /// - Missing and shaped like a ninox worktree (`{repo}/.claude/worktrees/
-///   {session_id}`) → recreate it via [`create_worker_worktree`] (checks
-///   out the session's still-existing branch, or a fresh one) and re-seed
-///   the brain skill the original spawn wrote (git-excluded, so it is not
-///   on the branch).
+///   {session_id}`) → recreate it via [`create_worker_worktree`]. Cleanup
+///   deletes the branch along with the worktree, and that's fine: a fresh
+///   branch is cut from the repo's HEAD in that case (the conversation
+///   lookup only needs the *path* back, not the branch), while a surviving
+///   branch is checked out again. Re-seeds the brain skill the original
+///   spawn wrote (git-excluded, so never on the branch either way).
 /// - Missing and anything else → error, so the spawn fails visibly instead
 ///   of the agent silently running in the wrong directory.
 pub async fn ensure_session_workspace(workspace: &str, session_id: &str) -> anyhow::Result<()> {
@@ -654,6 +656,35 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(), "ensure-ws-1",
             "the session's original branch must be checked out again",
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_session_workspace_recreates_worktree_even_when_the_branch_is_gone() {
+        let repo = init_git_repo();
+        let worktree = create_worker_worktree(repo.to_str().unwrap(), "ensure-ws-2").await.unwrap();
+        // Full cleanup teardown: worktree AND branch both removed. Only the
+        // claude transcript (keyed to this path, under ~/.claude/projects/)
+        // survives — respawning to see that context must still work.
+        std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "worktree", "remove", "--force", &worktree])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "branch", "-D", "ensure-ws-2"])
+            .output()
+            .unwrap();
+
+        ensure_session_workspace(&worktree, "ensure-ws-2").await.unwrap();
+
+        assert!(std::path::Path::new(&worktree).is_dir(), "worktree must be recreated at the same path");
+        let out = std::process::Command::new("git")
+            .args(["-C", &worktree, "branch", "--show-current"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(), "ensure-ws-2",
+            "a fresh branch is created from HEAD when the original is gone",
         );
     }
 
