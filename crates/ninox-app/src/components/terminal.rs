@@ -340,6 +340,17 @@ impl<'a> TerminalWidget<'a> {
         let mut hyperlink_storage = Vec::new();
         crate::components::links::link_at(&self.row_link_cells(row, &mut hyperlink_storage), col)
     }
+
+    /// A `CopyToClipboard` message for `sel`'s current selection, or `None`
+    /// if there's no selection or it's blank. Shared by the drag-release
+    /// auto-copy and the explicit Cmd+C / Ctrl+Shift+C shortcut so the two
+    /// paths can't drift apart.
+    fn copy_message(&self, sel: &SelectionState) -> Option<Message> {
+        sel.range()
+            .map(|((sc, sr), (ec, er))| extract_selection(self.state, sc, sr, ec, er))
+            .filter(|s| !s.trim().is_empty())
+            .map(Message::CopyToClipboard)
+    }
 }
 
 impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
@@ -389,6 +400,38 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                         }
                         state.end = Some(cell);
                         self.state.cache.clear();
+                        return (iced::widget::canvas::event::Status::Captured, None);
+                    }
+
+                    // Dragging past the top or bottom edge — the natural
+                    // gesture to extend a selection into scrollback that
+                    // isn't currently on screen. `position_in` returns None
+                    // once the pointer leaves `bounds`, so without this the
+                    // selection simply stops growing and there's no way to
+                    // select anything beyond the visible screen. Extend to
+                    // the edge row and nudge the view a few lines toward
+                    // the pointer; further movement while still past the
+                    // edge keeps extending/scrolling one step per event.
+                    if let Some(pos) = cursor.position() {
+                        let col = ((pos.x - bounds.x) / cell_w) as usize;
+                        let col = col.min(cols.saturating_sub(1));
+                        if pos.y < bounds.y {
+                            state.end = Some((col, 0));
+                            state.moved = true;
+                            self.state.cache.clear();
+                            return (
+                                iced::widget::canvas::event::Status::Captured,
+                                Some(Message::ScrollTerminal { session_id: self.session_id.clone(), delta: 3 }),
+                            );
+                        } else if pos.y > bounds.y + bounds.height {
+                            state.end = Some((col, rows.saturating_sub(1)));
+                            state.moved = true;
+                            self.state.cache.clear();
+                            return (
+                                iced::widget::canvas::event::Status::Captured,
+                                Some(Message::ScrollTerminal { session_id: self.session_id.clone(), delta: -3 }),
+                            );
+                        }
                     }
                     return (iced::widget::canvas::event::Status::Captured, None);
                 }
@@ -425,14 +468,28 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                     return (iced::widget::canvas::event::Status::Captured, None);
                 }
                 // Drag — copy the selection.
-                let text = state.range().map(|((sc, sr), (ec, er))| {
-                    extract_selection(self.state, sc, sr, ec, er)
-                });
-                if let Some(t) = text.filter(|s| !s.trim().is_empty()) {
-                    return (iced::widget::canvas::event::Status::Captured,
-                            Some(Message::CopyToClipboard(t)));
-                }
-                return (iced::widget::canvas::event::Status::Captured, None);
+                return (iced::widget::canvas::event::Status::Captured, self.copy_message(state));
+            }
+
+            // Cmd+C (macOS) or Ctrl+Shift+C (the Linux/Windows terminal
+            // convention, since plain Ctrl+C is reserved for SIGINT) —
+            // intercepted here rather than in the app-level RawKey handler
+            // because the current selection lives in this widget's
+            // canvas-local `SelectionState`, not in app state. Without
+            // this, Cmd+C fell through to `encode_key`, which has no
+            // functional-key mapping for a bare Character key under only
+            // the logo modifier, so it took the plain-text fallback and
+            // typed a literal "c" into the terminal instead of copying —
+            // and did nothing useful even when there was a selection.
+            // Plain Ctrl+C is deliberately left alone: it's the standard
+            // SIGINT byte (0x03). Mirrors the Cmd+V / Ctrl+Shift+V split
+            // already used for paste below.
+            Event::Keyboard(KeyEvent::KeyPressed { key, modifiers, .. })
+                if ((modifiers.logo() && !modifiers.control())
+                    || (modifiers.control() && modifiers.shift()))
+                    && matches!(key, iced::keyboard::Key::Character(c) if c.as_str().eq_ignore_ascii_case("c")) =>
+            {
+                return (iced::widget::canvas::event::Status::Captured, self.copy_message(state));
             }
 
             // Emit RawKey so the handler can apply APP_CURSOR-aware conversion.
@@ -1039,6 +1096,201 @@ mod tests {
         match message {
             Some(Message::OpenUrl(url)) => assert_eq!(url, "http://example.com/path"),
             other => panic!("expected OpenUrl, got {other:?}"),
+        }
+    }
+
+    /// Builds a `KeyPressed` canvas event for `key` under `modifiers` —
+    /// the fields beyond those two don't affect the copy-shortcut match.
+    fn key_pressed(key: iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> iced::widget::canvas::Event {
+        iced::widget::canvas::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: iced::keyboard::key::Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified),
+            location: iced::keyboard::Location::Standard,
+            modifiers,
+            text: None,
+        })
+    }
+
+    #[test]
+    fn cmd_c_copies_the_active_selection_instead_of_typing_c() {
+        use iced::widget::canvas::Program;
+
+        let mut s = TerminalState::new(80, 5, None);
+        s.process(b"hello world");
+        let widget = test_widget(&s);
+        let bounds = Rectangle::new(iced::Point::ORIGIN, Size::new(800.0, 100.0));
+        let mut state = SelectionState {
+            anchor: Some((0, 0)),
+            end: Some((4, 0)),
+            moved: true,
+            ..Default::default()
+        };
+
+        let (status, message) = widget.update(
+            &mut state,
+            key_pressed(iced::keyboard::Key::Character("c".into()), iced::keyboard::Modifiers::LOGO),
+            bounds,
+            iced::mouse::Cursor::Unavailable,
+        );
+        assert_eq!(status, iced::widget::canvas::event::Status::Captured);
+        match message {
+            Some(Message::CopyToClipboard(text)) => assert_eq!(text, "hello"),
+            other => panic!("expected CopyToClipboard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_c_with_no_selection_is_swallowed_not_typed() {
+        use iced::widget::canvas::Program;
+
+        let s = TerminalState::new(80, 5, None);
+        let widget = test_widget(&s);
+        let bounds = Rectangle::new(iced::Point::ORIGIN, Size::new(800.0, 100.0));
+        let mut state = SelectionState::default();
+
+        let (status, message) = widget.update(
+            &mut state,
+            key_pressed(iced::keyboard::Key::Character("c".into()), iced::keyboard::Modifiers::LOGO),
+            bounds,
+            iced::mouse::Cursor::Unavailable,
+        );
+        // Captured (never falls through to RawKey / the PTY) but nothing to copy.
+        assert_eq!(status, iced::widget::canvas::event::Status::Captured);
+        assert!(message.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_is_not_treated_as_copy() {
+        use iced::widget::canvas::Program;
+
+        let mut s = TerminalState::new(80, 5, None);
+        s.process(b"hello world");
+        let widget = test_widget(&s);
+        let bounds = Rectangle::new(iced::Point::ORIGIN, Size::new(800.0, 100.0));
+        let mut state = SelectionState {
+            anchor: Some((0, 0)),
+            end: Some((4, 0)),
+            moved: true,
+            ..Default::default()
+        };
+
+        // Ctrl+C must still reach RawKey (SIGINT), not be swallowed as copy.
+        let (_, message) = widget.update(
+            &mut state,
+            key_pressed(iced::keyboard::Key::Character("c".into()), iced::keyboard::Modifiers::CTRL),
+            bounds,
+            iced::mouse::Cursor::Unavailable,
+        );
+        assert!(matches!(message, Some(Message::RawKey { .. })));
+    }
+
+    #[test]
+    fn ctrl_shift_c_copies_the_active_selection() {
+        use iced::widget::canvas::Program;
+
+        let mut s = TerminalState::new(80, 5, None);
+        s.process(b"hello world");
+        let widget = test_widget(&s);
+        let bounds = Rectangle::new(iced::Point::ORIGIN, Size::new(800.0, 100.0));
+        let mut state = SelectionState {
+            anchor: Some((0, 0)),
+            end: Some((4, 0)),
+            moved: true,
+            ..Default::default()
+        };
+
+        // The Linux/Windows terminal convention (plain Ctrl+C is SIGINT).
+        let (status, message) = widget.update(
+            &mut state,
+            key_pressed(
+                iced::keyboard::Key::Character("c".into()),
+                iced::keyboard::Modifiers::CTRL | iced::keyboard::Modifiers::SHIFT,
+            ),
+            bounds,
+            iced::mouse::Cursor::Unavailable,
+        );
+        assert_eq!(status, iced::widget::canvas::event::Status::Captured);
+        match message {
+            Some(Message::CopyToClipboard(text)) => assert_eq!(text, "hello"),
+            other => panic!("expected CopyToClipboard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dragging_above_the_top_edge_extends_selection_and_scrolls_into_history() {
+        use iced::mouse::Button;
+        use iced::widget::canvas::Program;
+
+        let mut s = TerminalState::new(80, 24, None);
+        s.process(b"line one\r\nline two\r\n");
+        let widget = test_widget(&s);
+        let (cell_w, cell_h) = cell_size(FONT_SIZE);
+        let bounds = Rectangle::new(iced::Point::new(0.0, 100.0), Size::new(80.0 * cell_w, 24.0 * cell_h));
+        let mut state = SelectionState::default();
+
+        let start = iced::Point::new(cell_w * 2.0, bounds.y + cell_h * 2.0);
+        widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::ButtonPressed(Button::Left)),
+            bounds,
+            iced::mouse::Cursor::Available(start),
+        );
+
+        // Drag above the canvas's top edge — outside `bounds`, so
+        // `position_in` returns None for this position.
+        let above = iced::Point::new(cell_w * 3.0, bounds.y - 20.0);
+        let (status, message) = widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::CursorMoved { position: above }),
+            bounds,
+            iced::mouse::Cursor::Available(above),
+        );
+
+        assert_eq!(status, iced::widget::canvas::event::Status::Captured);
+        assert_eq!(state.end, Some((3, 0)), "selection should extend to the top row");
+        assert!(state.moved);
+        match message {
+            Some(Message::ScrollTerminal { delta, .. }) => assert!(delta > 0, "should scroll up into history"),
+            other => panic!("expected ScrollTerminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dragging_below_the_bottom_edge_extends_selection_and_scrolls_toward_live() {
+        use iced::mouse::Button;
+        use iced::widget::canvas::Program;
+
+        let mut s = TerminalState::new(80, 24, None);
+        s.process(b"line one\r\nline two\r\n");
+        let widget = test_widget(&s);
+        let (cell_w, cell_h) = cell_size(FONT_SIZE);
+        let bounds = Rectangle::new(iced::Point::new(0.0, 100.0), Size::new(80.0 * cell_w, 24.0 * cell_h));
+        let mut state = SelectionState::default();
+
+        let start = iced::Point::new(cell_w * 2.0, bounds.y + cell_h * 2.0);
+        widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::ButtonPressed(Button::Left)),
+            bounds,
+            iced::mouse::Cursor::Available(start),
+        );
+
+        // Drag below the canvas's bottom edge — outside `bounds`.
+        let below = iced::Point::new(cell_w * 3.0, bounds.y + bounds.height + 20.0);
+        let (status, message) = widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::CursorMoved { position: below }),
+            bounds,
+            iced::mouse::Cursor::Available(below),
+        );
+
+        assert_eq!(status, iced::widget::canvas::event::Status::Captured);
+        assert_eq!(state.end, Some((3, 23)), "selection should extend to the bottom row");
+        assert!(state.moved);
+        match message {
+            Some(Message::ScrollTerminal { delta, .. }) => assert!(delta < 0, "should scroll down toward live"),
+            other => panic!("expected ScrollTerminal, got {other:?}"),
         }
     }
 }
