@@ -421,7 +421,7 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                             self.state.cache.clear();
                             return (
                                 iced::widget::canvas::event::Status::Captured,
-                                Some(Message::ScrollTerminal { session_id: self.session_id.clone(), delta: 3 }),
+                                Some(Message::ScrollTerminal { session_id: self.session_id.clone(), delta: 3, local: true }),
                             );
                         } else if pos.y > bounds.y + bounds.height {
                             state.end = Some((col, rows.saturating_sub(1)));
@@ -429,7 +429,7 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                             self.state.cache.clear();
                             return (
                                 iced::widget::canvas::event::Status::Captured,
-                                Some(Message::ScrollTerminal { session_id: self.session_id.clone(), delta: -3 }),
+                                Some(Message::ScrollTerminal { session_id: self.session_id.clone(), delta: -3, local: true }),
                             );
                         }
                     }
@@ -512,7 +512,7 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                 if lines != 0 {
                     return (
                         iced::widget::canvas::event::Status::Captured,
-                        Some(Message::ScrollTerminal { session_id: self.session_id.clone(), delta: lines }),
+                        Some(Message::ScrollTerminal { session_id: self.session_id.clone(), delta: lines, local: false }),
                     );
                 }
             }
@@ -1251,7 +1251,10 @@ mod tests {
         assert_eq!(state.end, Some((3, 0)), "selection should extend to the top row");
         assert!(state.moved);
         match message {
-            Some(Message::ScrollTerminal { delta, .. }) => assert!(delta > 0, "should scroll up into history"),
+            Some(Message::ScrollTerminal { delta, local, .. }) => {
+                assert!(delta > 0, "should scroll up into history");
+                assert!(local, "drag auto-scroll must target local scrollback, not the PTY");
+            }
             other => panic!("expected ScrollTerminal, got {other:?}"),
         }
     }
@@ -1289,8 +1292,65 @@ mod tests {
         assert_eq!(state.end, Some((3, 23)), "selection should extend to the bottom row");
         assert!(state.moved);
         match message {
-            Some(Message::ScrollTerminal { delta, .. }) => assert!(delta < 0, "should scroll down toward live"),
+            Some(Message::ScrollTerminal { delta, local, .. }) => {
+                assert!(delta < 0, "should scroll down toward live");
+                assert!(local, "drag auto-scroll must target local scrollback, not the PTY");
+            }
             other => panic!("expected ScrollTerminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drag_autoscroll_stays_local_even_when_pty_mouse_mode_is_on() {
+        use iced::mouse::Button;
+        use iced::widget::canvas::Program;
+
+        let mut s = TerminalState::new(80, 24, None);
+        s.process(b"\x1b[?1000h"); // inner app enables mouse reporting (vim mouse=a, htop, ...)
+        // In this mode a real wheel event WOULD be encoded for the PTY —
+        // exactly the routing drag auto-scroll must bypass.
+        assert!(
+            crate::input::encode_wheel(3, 0, 0, s.term.mode()).is_some(),
+            "precondition: mouse mode routes wheel events to the PTY"
+        );
+        let widget = test_widget(&s);
+        let (cell_w, cell_h) = cell_size(FONT_SIZE);
+        let bounds = Rectangle::new(iced::Point::new(0.0, 100.0), Size::new(80.0 * cell_w, 24.0 * cell_h));
+        let mut state = SelectionState::default();
+
+        let start = iced::Point::new(cell_w * 2.0, bounds.y + cell_h * 2.0);
+        widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::ButtonPressed(Button::Left)),
+            bounds,
+            iced::mouse::Cursor::Available(start),
+        );
+
+        let above = iced::Point::new(cell_w * 3.0, bounds.y - 20.0);
+        let (_, message) = widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::CursorMoved { position: above }),
+            bounds,
+            iced::mouse::Cursor::Available(above),
+        );
+        match message {
+            Some(Message::ScrollTerminal { local: true, .. }) => {}
+            other => panic!("expected a local ScrollTerminal, got {other:?}"),
+        }
+
+        // A real wheel event keeps PTY-aware routing (local: false).
+        let inside = iced::Point::new(cell_w * 3.0, bounds.y + cell_h * 3.0);
+        let (_, message) = widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            }),
+            bounds,
+            iced::mouse::Cursor::Available(inside),
+        );
+        match message {
+            Some(Message::ScrollTerminal { local: false, .. }) => {}
+            other => panic!("expected a PTY-aware ScrollTerminal, got {other:?}"),
         }
     }
 }
