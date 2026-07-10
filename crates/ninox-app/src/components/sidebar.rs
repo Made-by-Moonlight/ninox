@@ -281,13 +281,33 @@ fn tree_row<'a>(
     let s = &app.scheme;
     let is_active = matches!(&app.view, View::SessionDetail { session_id, .. } if session_id == id);
     let dot: Element<Message> = match status {
-        Some(st) => status_dot(
-            s.status_color(st),
-            matches!(st, ninox_core::types::SessionStatus::Done
-                        | ninox_core::types::SessionStatus::Terminated),
-        ),
+        Some(st) => {
+            let base = status_dot(
+                s.status_color(st),
+                matches!(st, ninox_core::types::SessionStatus::Done
+                            | ninox_core::types::SessionStatus::Terminated),
+            );
+            match app.sessions.get(id) {
+                Some(session) => crate::components::lifecycle_status::with_gate_tooltip(s, session, base),
+                None => base,
+            }
+        }
         None => Space::new(8, 0).into(),
     };
+    let retention_badge: Option<Element<Message>> = status
+        .filter(|st| matches!(st, ninox_core::types::SessionStatus::Done | ninox_core::types::SessionStatus::Terminated))
+        .and_then(|_| app.sessions.get(id))
+        .and_then(|session| session.terminal_at)
+        .and_then(|terminal_at| {
+            crate::components::lifecycle_status::retention_label(
+                terminal_at,
+                app.config.session_retention.retention_millis(),
+                crate::components::lifecycle_status::now_millis(),
+            )
+        })
+        .map(|label| {
+            text(label).size(9.5).font(MONO).color(s.faint).into()
+        });
     let name_font = if bold { SANS_BOLD } else { crate::style::SANS };
     let left_pad = if indented { 38.0 } else { 18.0 };
 
@@ -301,37 +321,44 @@ fn tree_row<'a>(
         (is_active || hovered).then_some(Background::Color(s.card))
     };
 
-    let navigate = button(
-        row![
-            container(Space::new(0, 0)).width(3).height(Length::Fixed(20.0)).style(move |_| {
-                container::Style {
-                    background: Some(Background::Color(if is_active { s.accent } else { Color::TRANSPARENT })),
-                    ..Default::default()
-                }
-            }),
-            Space::new(left_pad - 3.0, 0),
-            dot,
-            Space::new(9, 0),
-            // Single-line + clipped: at narrow sidebar widths iced would
-            // otherwise wrap the name onto two lines and letter-stack the
-            // mono slug into a vertical column over the row controls.
-            container(
-                text(name.to_owned())
-                    .size(12.5)
-                    .font(name_font)
-                    .color(if is_active || bold { s.ink } else { s.ink_2 })
-                    .wrapping(iced::widget::text::Wrapping::None),
-            )
-            .width(Length::Fill)
-            .clip(true),
-            Space::new(6, 0),
-            text(right.to_owned())
-                .size(10)
-                .font(MONO)
-                .color(s.faint)
+    let mut nav_row_items: Vec<Element<Message>> = vec![
+        container(Space::new(0, 0)).width(3).height(Length::Fixed(20.0)).style(move |_| {
+            container::Style {
+                background: Some(Background::Color(if is_active { s.accent } else { Color::TRANSPARENT })),
+                ..Default::default()
+            }
+        }).into(),
+        Space::new(left_pad - 3.0, 0).into(),
+        dot,
+        Space::new(9, 0).into(),
+        // Single-line + clipped: at narrow sidebar widths iced would
+        // otherwise wrap the name onto two lines and letter-stack the
+        // mono slug into a vertical column over the row controls.
+        container(
+            text(name.to_owned())
+                .size(12.5)
+                .font(name_font)
+                .color(if is_active || bold { s.ink } else { s.ink_2 })
                 .wrapping(iced::widget::text::Wrapping::None),
-        ]
-        .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .clip(true)
+        .into(),
+        Space::new(6, 0).into(),
+        text(right.to_owned())
+            .size(10)
+            .font(MONO)
+            .color(s.faint)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
+    ];
+    if let Some(badge) = retention_badge {
+        nav_row_items.push(Space::new(6, 0).into());
+        nav_row_items.push(badge);
+    }
+
+    let navigate = button(
+        row(nav_row_items).align_y(Alignment::Center),
     )
     .on_press(Message::NavigateSession(id.to_owned()))
     .style(move |_t, status| button::Style {

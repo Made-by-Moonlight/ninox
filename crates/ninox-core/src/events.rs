@@ -6,7 +6,7 @@ use tokio::sync::{broadcast, Mutex};
 pub enum Event {
     OrchestratorSpawned(Orchestrator),
     OrchestratorRemoved(OrchestratorId),
-    SessionUpdated(Session),
+    SessionUpdated(Session, SessionFields),
     SessionSpawned(Session),
     SessionDone(SessionId),
     TerminalOutput { session_id: SessionId, bytes: Vec<u8> },
@@ -182,7 +182,7 @@ impl Engine {
             }
             session.status = SessionStatus::Terminated;
             self.store.upsert_session(&session)?;
-            self.emit(Event::SessionUpdated(session));
+            self.emit(Event::SessionUpdated(session, SessionFields::STATUS));
         }
         Ok(())
     }
@@ -212,7 +212,7 @@ impl Engine {
             session.status = crate::types::SessionStatus::Done;
             session.terminal_at = Some(crate::lifecycle::poller::now_millis());
             self.store.upsert_session(&session)?;
-            self.emit(Event::SessionUpdated(session));
+            self.emit(Event::SessionUpdated(session, SessionFields::STATUS | SessionFields::TERMINAL_AT));
         }
         Ok(())
     }
@@ -281,7 +281,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(store);
@@ -290,7 +290,7 @@ mod tests {
         engine.terminate_session("s1").await.unwrap();
 
         let evt = rx.recv().await.unwrap();
-        if let Event::SessionUpdated(s) = evt {
+        if let Event::SessionUpdated(s, _fields) = evt {
             assert!(matches!(s.status, crate::types::SessionStatus::Terminated));
             assert_eq!(
                 s.terminal_at, None,
@@ -324,7 +324,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: Some(1_000),
+            terminal_at: Some(1_000), gate_status: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(Arc::clone(&store));
@@ -356,7 +356,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(Arc::clone(&store));
@@ -365,7 +365,7 @@ mod tests {
         engine.cleanup_session("s1").await.unwrap();
 
         let evt = rx.recv().await.unwrap();
-        if let Event::SessionUpdated(s) = evt {
+        if let Event::SessionUpdated(s, _fields) = evt {
             assert!(matches!(s.status, crate::types::SessionStatus::Done));
             assert!(
                 s.terminal_at.is_some(),
@@ -414,7 +414,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(Arc::clone(&store));

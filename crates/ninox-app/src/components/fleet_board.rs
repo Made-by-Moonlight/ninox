@@ -269,16 +269,33 @@ fn session_card<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> 
     }
     body.push(Space::new(0, 9).into());
     body.push(crate::style::dotted_rule(s.rule_dark));
-    body.push(
-        row![
-            crate::style::stamp(word, st_color),
-            Space::new(Length::Fill, 0),
-            text(format!("${:.2}", session.cost_usd))
-                .size(11.5).font(crate::style::MONO_MEDIUM).color(s.ink),
-        ]
-        .align_y(Alignment::Center)
-        .into(),
+    let stamp_with_tooltip = crate::components::lifecycle_status::with_gate_tooltip(
+        s, session, crate::style::stamp(word, st_color),
     );
+    let retention_badge: Option<Element<Message>> = if matches!(
+        session.status, SessionStatus::Done | SessionStatus::Terminated
+    ) {
+        session.terminal_at.and_then(|terminal_at| {
+            crate::components::lifecycle_status::retention_label(
+                terminal_at,
+                app.config.session_retention.retention_millis(),
+                crate::components::lifecycle_status::now_millis(),
+            )
+        }).map(|label| text(label).size(9.5).font(crate::style::MONO).color(s.faint).into())
+    } else {
+        None
+    };
+    let mut bottom_row: Vec<Element<Message>> = vec![
+        stamp_with_tooltip,
+        Space::new(Length::Fill, 0).into(),
+        text(format!("${:.2}", session.cost_usd))
+            .size(11.5).font(crate::style::MONO_MEDIUM).color(s.ink).into(),
+    ];
+    if let Some(badge) = retention_badge {
+        bottom_row.insert(1, badge);
+        bottom_row.insert(2, Space::new(8, 0).into());
+    }
+    body.push(row(bottom_row).align_y(Alignment::Center).into());
 
     button(
         column(body)

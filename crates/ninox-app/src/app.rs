@@ -608,7 +608,7 @@ impl App {
                         &session.claude_session_id, has_resume_args,
                     );
                     let _ = engine.store.upsert_session(&dead);
-                    engine.emit(CoreEvent::SessionUpdated(dead));
+                    engine.emit(CoreEvent::SessionUpdated(dead, SessionFields::STATUS));
                 }
             }
 
@@ -850,7 +850,9 @@ impl App {
                         if let Ok(Some(mut s)) = engine.store.get_session(&id) {
                             s.status = ninox_core::types::SessionStatus::Terminated;
                             let _ = engine.store.upsert_session(&s);
-                            engine.emit(ninox_core::events::Event::SessionUpdated(s));
+                            engine.emit(ninox_core::events::Event::SessionUpdated(
+                                s, ninox_core::types::SessionFields::STATUS,
+                            ));
                         }
                         return Message::Noop;
                     }
@@ -1233,7 +1235,7 @@ impl App {
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
                             summary:         None,
-                            terminal_at:         None,
+                            terminal_at:         None, gate_status: None,
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1377,7 +1379,7 @@ impl App {
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
                             summary:         None,
-                            terminal_at:         None,
+                            terminal_at:         None, gate_status: None,
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -2273,8 +2275,11 @@ impl App {
                 Task::none()
             }
 
-            Event::SessionUpdated(session) => {
-                state.sessions.insert(session.id.clone(), session);
+            Event::SessionUpdated(incoming, fields) => {
+                match state.sessions.get_mut(&incoming.id) {
+                    Some(existing) => existing.merge_from(&incoming, fields),
+                    None => { state.sessions.insert(incoming.id.clone(), incoming); }
+                }
                 Task::none()
             }
 
@@ -2873,7 +2878,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         }
     }
 
@@ -3011,7 +3016,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         }
     }
 
@@ -3241,10 +3246,57 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         let (updated, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         assert!(updated.sessions.contains_key("s1"));
+    }
+
+    /// Two producers racing `SessionUpdated` for the same session must merge
+    /// their flagged fields rather than one wholesale-replacing the other's
+    /// work — a stale rebroadcast (e.g. a poller tick that read the row
+    /// before another actor's write landed) must not stomp fields it isn't
+    /// flagged to own.
+    #[test]
+    fn session_updated_merges_instead_of_replacing() {
+        let e = test_engine();
+        let mut app = base(e);
+        let mut session = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r1".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None,
+        };
+        let (updated, _) = app.update(Message::EngineEvent(Box::new(
+            Event::SessionSpawned(session.clone()),
+        )));
+        app = updated;
+
+        // Actor A: authoritative for PR_LINK + STATUS, from a fresh read.
+        session.status = SessionStatus::PrOpen;
+        session.pr_number = Some(7);
+        let (after_a, _) = app.update(Message::EngineEvent(Box::new(
+            Event::SessionUpdated(session.clone(), SessionFields::STATUS | SessionFields::PR_LINK),
+        )));
+        app = after_a;
+
+        // Actor B: authoritative for COST only, from a *stale* read that
+        // still has pr_number: None — must not stomp A's PR_LINK write.
+        let mut stale = session.clone();
+        stale.pr_number = None;
+        stale.status = SessionStatus::Working;
+        stale.cost_usd = 3.25;
+        let (after_b, _) = app.update(Message::EngineEvent(Box::new(
+            Event::SessionUpdated(stale, SessionFields::COST),
+        )));
+
+        let final_session = after_b.sessions.get("s1").unwrap();
+        assert_eq!(final_session.cost_usd, 3.25, "B's flagged field must apply");
+        assert_eq!(final_session.pr_number, Some(7), "A's pr_number must survive B's stale rebroadcast");
+        assert!(matches!(final_session.status, SessionStatus::PrOpen), "A's status must survive B's stale rebroadcast");
     }
 
     /// An agent that accidentally opens a second PR must not have it
@@ -3353,7 +3405,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;
@@ -3403,7 +3455,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         }).unwrap();
         let engine = Engine::new(store);
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
@@ -3428,7 +3480,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = m2;
@@ -3467,7 +3519,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: Some(0),
+            terminal_at: Some(0), gate_status: None,
         };
         let _ = m.engine.store.upsert_session(&worker);
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(worker))));
@@ -3520,7 +3572,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         });
 
         let (next, _) = m.update(Message::PollSessions);
@@ -3544,7 +3596,7 @@ mod tests {
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
-            claude_session_id: None, summary: None, terminal_at: Some(0),
+            claude_session_id: None, summary: None, terminal_at: Some(0), gate_status: None,
         };
         let _ = m.engine.store.upsert_session(&s);
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3581,7 +3633,7 @@ mod tests {
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
-            claude_session_id: None, summary: None, terminal_at: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorSpawned(o))));
         m = m2;
@@ -4013,7 +4065,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -4034,7 +4086,7 @@ mod tests {
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
-            claude_session_id: None, summary: None, terminal_at: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -4079,7 +4131,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -4133,7 +4185,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         // NavigateSession defaults to the Split panel, so switch to Terminal
@@ -4182,7 +4234,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -4265,7 +4317,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m, _) = m.update(Message::NavigateSession("s1".into()));
@@ -4319,7 +4371,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -4411,7 +4463,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -5192,7 +5244,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;

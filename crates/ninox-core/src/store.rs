@@ -54,6 +54,7 @@ impl Store {
             ("claude_session_id",    "ALTER TABLE sessions ADD COLUMN claude_session_id TEXT"),
             ("summary",              "ALTER TABLE sessions ADD COLUMN summary TEXT"),
             ("terminal_at",          "ALTER TABLE sessions ADD COLUMN terminal_at INTEGER"),
+            ("gate_status",          "ALTER TABLE sessions ADD COLUMN gate_status TEXT"),
         ] {
             if !Self::column_exists(&conn, "sessions", col)? {
                 conn.execute(ddl, [])?;
@@ -73,13 +74,16 @@ impl Store {
 
     pub fn upsert_session(&self, s: &Session) -> Result<()> {
         let status = serde_json::to_string(&s.status)?.replace('"', "");
+        let gate_status = s.gate_status.as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO sessions (id,orchestrator_id,name,repo,status,agent_type,
              cost_usd,started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id,summary,terminal_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
+             claude_session_id,summary,terminal_at,gate_status)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
              ON CONFLICT(id) DO UPDATE SET
              repo=excluded.repo,
              status=excluded.status,cost_usd=excluded.cost_usd,
@@ -93,13 +97,15 @@ impl Store {
              context_window_size=excluded.context_window_size,
              claude_session_id=excluded.claude_session_id,
              summary=excluded.summary,
-             terminal_at=excluded.terminal_at",
+             terminal_at=excluded.terminal_at,
+             gate_status=excluded.gate_status",
             params![
                 s.id, s.orchestrator_id, s.name, s.repo, status, s.agent_type,
                 s.cost_usd, s.started_at, s.pr_number, s.pr_id,
                 s.workspace_path, s.pid, s.model, s.context_tokens,
                 s.catalogue_path, s.context_used_pct, s.context_total_tokens,
-                s.context_window_size, s.claude_session_id, s.summary, s.terminal_at
+                s.context_window_size, s.claude_session_id, s.summary, s.terminal_at,
+                gate_status
             ],
         )?;
         Ok(())
@@ -111,7 +117,7 @@ impl Store {
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id,summary,terminal_at
+             claude_session_id,summary,terminal_at,gate_status
              FROM sessions ORDER BY started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -137,6 +143,7 @@ impl Store {
                 r.get::<_, Option<String>>(18)?,
                 r.get::<_, Option<String>>(19)?,
                 r.get::<_, Option<i64>>(20)?,
+                r.get::<_, Option<String>>(21)?,
             ))
         })?;
         rows.map(|r| {
@@ -144,9 +151,11 @@ impl Store {
                  cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                  model, context_tokens, catalogue_path, context_used_pct,
                  context_total_tokens, context_window_size, claude_session_id,
-                 summary, terminal_at) = r?;
+                 summary, terminal_at, gate_status_str) = r?;
             let status = serde_json::from_str(&format!("\"{status_str}\""))
                 .unwrap_or(SessionStatus::Working);
+            let gate_status = gate_status_str
+                .and_then(|s| serde_json::from_str(&s).ok());
             Ok(Session {
                 id, orchestrator_id, name, repo, status, agent_type,
                 cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
@@ -158,6 +167,7 @@ impl Store {
                 claude_session_id,
                 summary,
                 terminal_at,
+                gate_status,
             })
         })
         .collect()
@@ -169,7 +179,7 @@ impl Store {
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id,summary,terminal_at
+             claude_session_id,summary,terminal_at,gate_status
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], |r| {
@@ -195,6 +205,7 @@ impl Store {
                 r.get::<_, Option<String>>(18)?,
                 r.get::<_, Option<String>>(19)?,
                 r.get::<_, Option<i64>>(20)?,
+                r.get::<_, Option<String>>(21)?,
             ))
         })?;
         match rows.next() {
@@ -204,9 +215,11 @@ impl Store {
                      cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                      model, context_tokens, catalogue_path, context_used_pct,
                      context_total_tokens, context_window_size, claude_session_id,
-                     summary, terminal_at) = r?;
+                     summary, terminal_at, gate_status_str) = r?;
                 let status = serde_json::from_str(&format!("\"{status_str}\""))
                     .unwrap_or(SessionStatus::Working);
+                let gate_status = gate_status_str
+                    .and_then(|s| serde_json::from_str(&s).ok());
                 Ok(Some(Session {
                     id, orchestrator_id, name, repo, status, agent_type,
                     cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
@@ -218,6 +231,7 @@ impl Store {
                     claude_session_id,
                     summary,
                     terminal_at,
+                    gate_status,
                 }))
             }
         }
@@ -362,7 +376,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         store.upsert_session(&session).unwrap();
         let list = store.list_sessions().unwrap();
@@ -382,7 +396,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         store.upsert_session(&s).unwrap();
         s.status = SessionStatus::Done;
@@ -408,7 +422,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         store.upsert_session(&s).unwrap();
         s.repo = "OwnerB/repoB".into();
@@ -429,7 +443,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap();
@@ -450,7 +464,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap().unwrap();
@@ -471,7 +485,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2").unwrap().unwrap();
@@ -492,7 +506,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: Some("Fix flaky CI on the auth suite".into()),
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2b").unwrap().unwrap();
@@ -523,7 +537,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some("b7e0b3a0-0000-4000-8000-000000000001".into()),
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s3").unwrap().unwrap();
@@ -554,7 +568,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: Some(1_720_000_000_000),
+            terminal_at: Some(1_720_000_000_000), gate_status: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s5").unwrap().unwrap();
@@ -588,7 +602,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         store.upsert_session(&s).unwrap();
         s.started_at = 200;
@@ -626,7 +640,7 @@ mod tests {
             context_window_size: Some(200_000),
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap().unwrap();
@@ -649,7 +663,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2").unwrap().unwrap();
@@ -676,11 +690,60 @@ mod tests {
                 model: model.map(String::from), context_tokens: None, catalogue_path: None,
                 context_used_pct: None, context_total_tokens: None, context_window_size: None,
                 claude_session_id: None, summary: None,
-                terminal_at: None,
+                terminal_at: None, gate_status: None,
             }).unwrap();
         }
         let samples = store.cost_samples("claude-code", Some("claude-fable-5")).unwrap();
         assert_eq!(samples.len(), 2);
         assert!((samples.iter().sum::<f64>() - 8.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn upsert_and_fetch_session_round_trips_gate_status() {
+        let store = Store::open(tempdir().unwrap().keep().join("t.db")).unwrap();
+        let mut session = crate::types::Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: crate::types::SessionStatus::PrOpen,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: Some(1), pr_id: Some(1), workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None,
+            gate_status: None,
+        };
+        session.gate_status = Some(crate::types::GateStatus {
+            ci: crate::types::GateCheck::Failing,
+            review: crate::types::GateCheck::Passing,
+            mergeable: crate::types::GateCheck::Unknown,
+            since: 12_345,
+        });
+        store.upsert_session(&session).unwrap();
+
+        let fetched = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(fetched.gate_status, session.gate_status);
+
+        let listed = store.list_sessions().unwrap();
+        assert_eq!(listed[0].gate_status, session.gate_status);
+    }
+
+    #[test]
+    fn legacy_row_without_gate_status_column_defaults_to_none() {
+        // A row written before this migration has no gate_status column
+        // value — column_exists-gated ALTER TABLE means the column is added
+        // but existing rows get SQL NULL, which must deserialize to `None`.
+        let store = Store::open(tempdir().unwrap().keep().join("t.db")).unwrap();
+        let session = crate::types::Session {
+            id: "s2".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: crate::types::SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None,
+            gate_status: None,
+        };
+        store.upsert_session(&session).unwrap();
+        let fetched = store.get_session("s2").unwrap().unwrap();
+        assert_eq!(fetched.gate_status, None);
     }
 }
