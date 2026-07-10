@@ -12,7 +12,15 @@ use ninox_core::types::{GateCheck, Session};
 /// when it's blocked, rather than just repeating "no."
 pub fn gate_lines(session: &Session) -> Vec<String> {
     let Some(gate) = &session.gate_status else {
-        return vec!["No PR opened yet".to_string()];
+        // `pr_number` is set by the metadata hook the moment a PR exists,
+        // but `gate_status` only arrives on the next GitHub enrichment
+        // tick — in that window "No PR opened yet" would contradict the
+        // visible PR-Open status next to this tooltip.
+        return vec![if session.pr_number.is_some() {
+            "Checking PR status…".to_string()
+        } else {
+            "No PR opened yet".to_string()
+        }];
     };
 
     let ci_word = match gate.ci {
@@ -87,7 +95,9 @@ pub fn with_gate_tooltip<'a>(
 /// `fleet_board.rs`, which gate the call behind `Option<i64>` chains).
 pub fn retention_label(terminal_at: i64, retention_millis: i64, now: i64) -> Option<String> {
     let remaining_ms = terminal_at + retention_millis - now;
-    Some(if remaining_ms <= 0 {
+    // The whole sub-minute window reads "shortly" — humanize_duration has
+    // no unit below minutes, so 1s–59s would otherwise round up to "1m".
+    Some(if remaining_ms < 60_000 {
         "Removing shortly".to_string()
     } else {
         format!("Removing in {}", humanize_duration(remaining_ms))
@@ -143,6 +153,14 @@ mod tests {
         let session = session_with(SessionStatus::Working, None);
         let lines = gate_lines(&session);
         assert_eq!(lines, vec!["No PR opened yet".to_string()]);
+    }
+
+    #[test]
+    fn gate_lines_with_pr_but_no_gate_yet_says_checking() {
+        let mut session = session_with(SessionStatus::PrOpen, None);
+        session.pr_number = Some(42);
+        let lines = gate_lines(&session);
+        assert_eq!(lines, vec!["Checking PR status…".to_string()]);
     }
 
     #[test]
@@ -206,6 +224,12 @@ mod tests {
     fn retention_label_shows_minutes_under_an_hour() {
         let label = retention_label(0, 3_600_000, 3_300_000 /* now = 55m later, 5m left */);
         assert_eq!(label, Some("Removing in 5m".to_string()));
+    }
+
+    #[test]
+    fn retention_label_under_a_minute_says_shortly_not_1m() {
+        let label = retention_label(0, 3_600_000, 3_570_000 /* now = 59.5m later, 30s left */);
+        assert_eq!(label, Some("Removing shortly".to_string()));
     }
 
     #[test]
