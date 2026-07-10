@@ -2393,6 +2393,19 @@ impl App {
         let title = n.title.clone();
         let body = n.body.clone();
         std::thread::spawn(move || {
+            // Pin the sending application before the first notification:
+            // notify-rust's macOS backend otherwise resolves the sender
+            // lazily via the AppleScript `get id of application
+            // "use_default"`, and macOS answers an unknown app name with a
+            // blocking "Where is use_default?" application picker.
+            #[cfg(target_os = "macos")]
+            {
+                static PIN_SENDER: std::sync::Once = std::sync::Once::new();
+                PIN_SENDER.call_once(|| {
+                    let exe = std::env::current_exe().unwrap_or_default();
+                    let _ = notify_rust::set_application(notification_sender_bundle_id(&exe));
+                });
+            }
             let _ = notify_rust::Notification::new()
                 .summary(&title)
                 .body(&body)
@@ -2912,6 +2925,20 @@ process.exit(0);
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Bundle identifier notifications are attributed to. Running from inside
+/// Ninox.app, use our own identifier (must match `[package.metadata.bundle]
+/// identifier` in Cargo.toml); from a bare binary, borrow Terminal's — it
+/// always exists, whereas an identifier unknown to Launch Services makes
+/// notifications silently drop.
+#[cfg(target_os = "macos")]
+fn notification_sender_bundle_id(exe: &std::path::Path) -> &'static str {
+    if exe.components().any(|c| c.as_os_str() == "Ninox.app") {
+        "com.madebymoonlight.ninox"
+    } else {
+        "com.apple.Terminal"
+    }
+}
+
 #[cfg(test)]
 impl App {
     pub fn update(self, message: Message) -> (Self, Task<Message>) {
@@ -2992,6 +3019,22 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn notification_sender_is_ninox_when_bundled_else_terminal() {
+        use std::path::Path;
+        assert_eq!(
+            notification_sender_bundle_id(Path::new(
+                "/Applications/Ninox.app/Contents/MacOS/ninox-app"
+            )),
+            "com.madebymoonlight.ninox",
+        );
+        assert_eq!(
+            notification_sender_bundle_id(Path::new("/Users/me/ninox/target/debug/ninox")),
+            "com.apple.Terminal",
+        );
     }
 
     #[test]
