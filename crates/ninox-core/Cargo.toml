@@ -1,6 +1,6 @@
 [package]
 name        = "ninox-core"
-version     = "0.17.1"
+version     = "0.17.2"
 edition     = "2021"
 description = "Engine core for the Ninox native app: session lifecycle, config, and storage."
 license     = "MIT"
