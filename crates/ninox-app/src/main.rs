@@ -101,6 +101,17 @@ enum BrainAction {
         /// Relative path of the entry (e.g. people/alice.md)
         path: String,
     },
+    /// Write a Markdown entry and index it immediately — replaces the
+    /// write-then-`ninox brain index` two-step flow so an entry is
+    /// queryable as soon as it's added, not whenever someone next
+    /// remembers to reindex.
+    Add {
+        /// Relative path of the entry under the brain root (e.g. repos/ninox.md)
+        path: String,
+        /// Markdown content, including frontmatter. Reads stdin if omitted.
+        #[arg(long)]
+        content: Option<String>,
+    },
     /// Package the brain's Markdown source into a portable .tar.gz archive
     /// (excludes the derived .index.db)
     Export {
@@ -457,6 +468,21 @@ async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()>
                 }
             }
         }
+        BrainAction::Add { path, content } => {
+            let content = match content {
+                Some(c) => c,
+                None => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    buf
+                }
+            };
+            let stats = run_brain_add(&brain_path, &path, &content)?;
+            println!(
+                "wrote {path} and indexed {} entries ({} embedded, {} cached)",
+                stats.indexed, stats.embedded, stats.cached
+            );
+        }
         BrainAction::Export { output } => {
             let stats = ninox_core::brain_archive::export(&brain_path, &output)?;
             println!("exported {} entries to {}", stats.files, output.display());
@@ -619,6 +645,18 @@ fn write_brain_entry(brain_path: &std::path::Path, id: &str, content: &str) -> a
     }
     std::fs::write(path, content)?;
     Ok(())
+}
+
+/// Writes `content` to `path` under the brain root and immediately rebuilds
+/// the index — the `BrainAction::Add` handler's logic, pulled into a free
+/// function (same convention as `run_discover_repos`) so it's callable
+/// directly from tests without going through CLI arg parsing or resolving
+/// `AppConfig`'s default brain path.
+fn run_brain_add(brain_path: &std::path::Path, path: &str, content: &str) -> anyhow::Result<ninox_core::brain::RebuildStats> {
+    write_brain_entry(brain_path, path, content)?;
+    let brain = BrainIndex::open(brain_path)?;
+    let embedder = try_build_embedder();
+    brain.rebuild(embedder.as_deref())
 }
 
 #[cfg(test)]
@@ -854,6 +892,37 @@ fn first_line(s: &str, max_chars: usize) -> Option<String> {
     } else {
         let clipped: String = line.chars().take(max_chars).collect();
         Some(format!("{clipped}…"))
+    }
+}
+
+#[cfg(test)]
+mod brain_add_tests {
+    use super::run_brain_add;
+    use ninox_core::BrainIndex;
+
+    #[test]
+    fn add_writes_and_indexes_in_one_call() {
+        let brain_dir = tempfile::tempdir().unwrap();
+        let stats = run_brain_add(
+            brain_dir.path(),
+            "repos/ninox.md",
+            "---\nname: ninox\nmetadata:\n  type: repo\n---\n\nNinox repo notes.",
+        )
+        .unwrap();
+        assert_eq!(stats.indexed, 1);
+
+        // No separate `ninox brain index` step required — the entry is
+        // already queryable against the freshly written index file.
+        let brain = BrainIndex::open(brain_dir.path()).unwrap();
+        let found = brain.get("repos/ninox.md").unwrap();
+        assert!(found.is_some(), "entry should be queryable immediately after add");
+    }
+
+    #[test]
+    fn add_creates_missing_parent_directories() {
+        let brain_dir = tempfile::tempdir().unwrap();
+        run_brain_add(brain_dir.path(), "concepts/new-thing.md", "# new thing").unwrap();
+        assert!(brain_dir.path().join("concepts/new-thing.md").exists());
     }
 }
 
