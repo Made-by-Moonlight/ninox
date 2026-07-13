@@ -116,6 +116,19 @@ pub async fn spawn_interactive_session(
         .and_then(|ss| ss.into_iter().find(|s| s.id == sid))
         .and_then(|s| s.pid);
 
+    // Resume and Re-file respawn an *existing* row — carry forward every
+    // field the spawn isn't authoritative for (PR linkage, gate breakdown,
+    // accumulated cost, context readout) instead of hardcoding it empty,
+    // which wiped all of them from both the store and (via the ALL-flagged
+    // emit below) app memory until the pollers re-derived them. A fresh
+    // spawn's optimistically-inserted row holds exactly these empty values
+    // anyway, so carrying them forward is a no-op there. Read the row here
+    // — after the awaits above, with none between read and write — so the
+    // ALL emit's payload is fresh by construction. `terminal_at` is NOT
+    // carried: the session is back to Working, so the retention countdown
+    // ends.
+    let prior = engine.store.get_session(&sid).ok().flatten();
+    let prior = prior.as_ref();
     let updated = Session {
         id:              sid.clone(),
         orchestrator_id: p.orchestrator_id,
@@ -123,27 +136,29 @@ pub async fn spawn_interactive_session(
         repo:            p.repo,
         status:          SessionStatus::Working,
         agent_type:      p.agent.harness.clone(),
-        cost_usd:        0.0,
+        cost_usd:        prior.map_or(0.0, |s| s.cost_usd),
         started_at:      p.started_at,
-        pr_number:       None,
-        pr_id:           None,
+        pr_number:       prior.and_then(|s| s.pr_number),
+        pr_id:           prior.and_then(|s| s.pr_id),
         workspace_path:  Some(p.workspace),
         pid,
         model:           p.agent.model.clone(),
-        context_tokens:  None,
+        context_tokens:  prior.and_then(|s| s.context_tokens),
         catalogue_path:  (!p.catalogue_path.is_empty()).then(|| p.catalogue_path.clone()),
-        context_used_pct: None, context_total_tokens: None, context_window_size: None,
+        context_used_pct:     prior.and_then(|s| s.context_used_pct),
+        context_total_tokens: prior.and_then(|s| s.context_total_tokens),
+        context_window_size:  prior.and_then(|s| s.context_window_size),
         claude_session_id: Some(p.claude_session_id),
         summary:         p.summary,
-        terminal_at:     None, gate_status: None,
+        terminal_at:     None,
+        gate_status:     prior.and_then(|s| s.gate_status.clone()),
     };
     let _ = engine.store.upsert_session(&updated);
+    engine.emit(Event::SessionUpdated(updated, SessionFields::ALL));
 
     if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &sid).await {
         tracing::error!("pty setup failed for {sid}: {e}");
     }
-
-    engine.emit(Event::SessionUpdated(updated, SessionFields::ALL));
 
     // Hidden tmux client attach argv — mirrors NavigateSession's attach flow.
     Some(tmux::attach_args(&sid).await)
@@ -914,6 +929,73 @@ mod tests {
         assert_eq!(session.claude_session_id.as_deref(), Some("fixed-uuid-for-test"));
 
         ninox_core::tmux::kill_session("spawn-uuid-test").await.ok();
+    }
+
+    /// Resume/Re-file respawn an existing row: the success snapshot must
+    /// carry forward PR linkage, gate breakdown, cost, and context instead
+    /// of resetting them — resetting wiped the gate tooltip, PR link, and
+    /// cost readout (store + app memory, via the ALL-flagged emit) for up
+    /// to a poll cycle on every Resume, or indefinitely with GitHub
+    /// polling unavailable.
+    #[tokio::test]
+    async fn respawn_preserves_pr_gate_cost_and_context() {
+        use ninox_core::{config::AgentConfig, store::Store, types::{GateCheck, GateStatus, Session}, SessionStatus};
+        use tempfile::tempdir;
+
+        let store = std::sync::Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
+        let engine = ninox_core::events::Engine::new(store.clone());
+        let ws = tempdir().unwrap().keep().to_string_lossy().to_string();
+
+        store.upsert_session(&Session {
+            id: "respawn-preserve-test".into(), orchestrator_id: None, name: "n".into(),
+            repo: "Owner/repo".into(), status: SessionStatus::Interrupted, agent_type: "claude-code".into(),
+            cost_usd: 4.2, started_at: 0, pr_number: Some(7), pr_id: Some(7),
+            workspace_path: Some(ws.clone()), pid: None, model: None, context_tokens: Some(999),
+            catalogue_path: None,
+            context_used_pct: Some(41.0), context_total_tokens: Some(82_000), context_window_size: Some(200_000),
+            claude_session_id: Some("old-uuid".into()),
+            summary: Some("carry me".into()),
+            terminal_at: Some(123),
+            gate_status: Some(GateStatus {
+                ci: GateCheck::Failing, review: GateCheck::Pending,
+                mergeable: GateCheck::Failing, since: 5,
+            }),
+        }).unwrap();
+
+        let attach = spawn_interactive_session(
+            engine,
+            InteractiveSpawnParams {
+                session_id:        "respawn-preserve-test".into(),
+                name:              "n".into(),
+                workspace:         ws,
+                repo:              "Owner/repo".into(),
+                orchestrator_id:   None,
+                agent:             AgentConfig::default(),
+                base_cmd:          "sleep 30".into(),
+                catalogue_path:    String::new(),
+                extra_env:         Vec::new(),
+                started_at:        1,
+                claude_session_id: "old-uuid".into(),
+                failure_status:    SessionStatus::Interrupted,
+                summary:           Some("carry me".into()),
+            },
+        )
+        .await;
+        assert!(attach.is_some(), "tmux create must succeed");
+        ninox_core::tmux::kill_session("respawn-preserve-test").await.ok();
+
+        let s = store.get_session("respawn-preserve-test").unwrap().unwrap();
+        assert_eq!(s.pr_number, Some(7), "PR linkage must survive a respawn");
+        assert_eq!(s.pr_id, Some(7));
+        assert_eq!(s.cost_usd, 4.2, "accumulated cost must survive a respawn");
+        assert_eq!(s.context_used_pct, Some(41.0));
+        assert_eq!(s.context_total_tokens, Some(82_000));
+        assert_eq!(s.context_window_size, Some(200_000));
+        assert_eq!(s.context_tokens, Some(999));
+        let gate = s.gate_status.expect("gate breakdown must survive a respawn");
+        assert!(matches!(gate.ci, GateCheck::Failing));
+        assert!(matches!(s.status, SessionStatus::Working), "spawn still owns status");
+        assert_eq!(s.terminal_at, None, "retention countdown ends on respawn");
     }
 
     #[tokio::test]

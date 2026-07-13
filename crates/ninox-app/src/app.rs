@@ -1540,9 +1540,10 @@ impl App {
                 Task::future(async move {
                     // Ignore kill errors — a Terminated husk has no tmux
                     // session, and Re-file on one "just spawns". The
-                    // respawn upserts the record back to Working with cost
-                    // 0; the usage poller re-ingests real spend from the
-                    // workspace transcript.
+                    // respawn upserts the record back to Working, carrying
+                    // forward accumulated cost/context; the usage poller
+                    // keeps re-ingesting absolute spend from the workspace
+                    // transcript either way.
                     let _ = ninox_core::tmux::kill_session(&id).await;
                     // Same workspace-restoration guard as Resume below —
                     // without it a torn-down worktree makes tmux silently

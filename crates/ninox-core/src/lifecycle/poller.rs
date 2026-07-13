@@ -242,9 +242,21 @@ impl Poller {
                 if let Some(first) = meta.pr_reports.first() {
                     session.pr_number = Some(first.number);
                     session.status    = SessionStatus::PrOpen;
-                    let _ = self.engine.store.upsert_session(&session);
+                    // Write through the live row, not the tick-start
+                    // snapshot — `deliver_work_requests` awaited above, and
+                    // the statusline process can land cost/context at any
+                    // moment (see `update_live_session_row`).
+                    let Some(written) = self.update_live_session_row(&session, |row| {
+                        row.pr_number = session.pr_number;
+                        row.status    = session.status.clone();
+                    }) else {
+                        // Deleted mid-tick — nothing below (extra-PR ledger
+                        // rows, notifications, orchestrator messages) should
+                        // run for a session that no longer exists either.
+                        continue;
+                    };
                     self.engine.emit(Event::SessionUpdated(
-                        session.clone(), SessionFields::PR_LINK | SessionFields::STATUS,
+                        written, SessionFields::PR_LINK | SessionFields::STATUS,
                     ));
                     tracing::info!(
                         "session {} PR #{} detected via metadata hook",
@@ -858,14 +870,23 @@ impl Poller {
                         session.pr_number = Some(pr_ref.number);
                         session.repo      = repo_slug.clone();
                         session.status    = SessionStatus::PrOpen;
-                        let _ = self.engine.store.upsert_session(&session);
-                        self.engine.emit(Event::SessionUpdated(
-                            session.clone(), SessionFields::PR_LINK | SessionFields::STATUS,
-                        ));
-                        tracing::info!(
-                            "session {} PR #{} detected via reconciliation ({repo_slug}, branch {branch})",
-                            session.id, pr_ref.number,
-                        );
+                        // Write through the live row, not the tick-start
+                        // snapshot — `find_open_pr_for_branch` is a network
+                        // await, plenty of time for the statusline process to
+                        // land cost/context (see `update_live_session_row`).
+                        if let Some(written) = self.update_live_session_row(&session, |row| {
+                            row.pr_number = session.pr_number;
+                            row.repo      = session.repo.clone();
+                            row.status    = session.status.clone();
+                        }) {
+                            self.engine.emit(Event::SessionUpdated(
+                                written, SessionFields::PR_LINK | SessionFields::STATUS,
+                            ));
+                            tracing::info!(
+                                "session {} PR #{} detected via reconciliation ({repo_slug}, branch {branch})",
+                                session.id, pr_ref.number,
+                            );
+                        }
                         break;
                     }
                     Ok(None) => continue,
@@ -1733,6 +1754,10 @@ mod tests {
         /// store before returning — simulating the session being removed
         /// mid-poll, after the snapshot but before the status/gate write.
         mid_review_delete: std::sync::Mutex<Option<(std::sync::Arc<crate::store::Store>, String)>>,
+        /// Same statusline simulation as `mid_review_upsert`, but fired from
+        /// `find_open_pr_for_branch` — the await inside
+        /// `poll_pr_reconciliation`'s adoption loop.
+        mid_branch_lookup_upsert: std::sync::Mutex<Option<(std::sync::Arc<crate::store::Store>, crate::types::Session)>>,
     }
 
     #[async_trait::async_trait]
@@ -1760,6 +1785,9 @@ mod tests {
             Ok(vec![])
         }
         async fn find_open_pr_for_branch(&self, owner: &str, repo: &str, branch: &str) -> anyhow::Result<Option<crate::github::PrRef>> {
+            if let Some((store, row)) = self.mid_branch_lookup_upsert.lock().unwrap().take() {
+                store.upsert_session(&row).unwrap();
+            }
             Ok(self.branch_matches.lock().unwrap()
                 .get(&(owner.to_string(), repo.to_string(), branch.to_string()))
                 .cloned())
@@ -1817,6 +1845,48 @@ mod tests {
         assert_eq!(session.pr_number, Some(77), "no wrapper metadata was ever written — reconciliation must still find it");
         assert!(matches!(session.status, SessionStatus::PrOpen));
         assert_eq!(session.repo, "Owner/repo");
+    }
+
+    /// The same stale-upsert race `poll_github`'s writes were fixed for:
+    /// reconciliation's adoption write starts from the tick-start snapshot,
+    /// but `find_open_pr_for_branch` is a network await during which the
+    /// statusline process can land cost/context. The adoption must go
+    /// through the live row.
+    #[tokio::test]
+    async fn poll_pr_reconciliation_does_not_revert_mid_poll_statusline_fields() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.branch_matches.lock().unwrap().insert(
+            ("Owner".to_string(), "repo".to_string(), "worker-branch".to_string()),
+            crate::github::PrRef { number: 77, url: "https://github.com/Owner/repo/pull/77".into() },
+        );
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let session = test_session("s1", &workspace);
+        store.upsert_session(&session).unwrap();
+
+        let mut mid_poll = session.clone();
+        mid_poll.cost_usd = 7.25;
+        mid_poll.context_used_pct = Some(55.0);
+        *fake.mid_branch_lookup_upsert.lock().unwrap() = Some((store.clone(), mid_poll));
+
+        let engine = github_engine(store.clone(), fake);
+        let poller = Poller::new(engine);
+
+        poller.poll_pr_reconciliation().await;
+
+        let updated = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(updated.pr_number, Some(77), "the adoption write itself must still land");
+        assert!(matches!(updated.status, SessionStatus::PrOpen));
+        assert_eq!(
+            updated.cost_usd, 7.25,
+            "adoption must not revert cost_usd written mid-poll by the statusline process",
+        );
+        assert_eq!(updated.context_used_pct, Some(55.0), "mid-poll context fields must survive too");
     }
 
     #[tokio::test]
