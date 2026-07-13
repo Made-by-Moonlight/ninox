@@ -1,13 +1,13 @@
 [package]
 name        = "ninox-server"
-version     = "0.17.5"
+version     = "0.17.6"
 edition     = "2021"
 description = "HTTP/WebSocket server exposing the Ninox engine to the native app and web dashboard."
 license     = "MIT"
 repository  = "https://github.com/Made-by-Moonlight/ninox"
 
 [dependencies]
-ninox-core   = { path = "../ninox-core", version = "0.17.5" }
+ninox-core   = { path = "../ninox-core", version = "0.17.6" }
 tokio        = { workspace = true }
 axum         = { workspace = true }
 serde        = { workspace = true }
