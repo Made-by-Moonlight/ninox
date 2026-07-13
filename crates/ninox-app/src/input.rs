@@ -130,6 +130,15 @@ pub fn encode_wheel(lines_up: i32, col: usize, row: usize, mode: &TermMode) -> O
     Some(format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes())
 }
 
+/// Bytes to send the PTY for a `ScrollTerminal` message, or None if the
+/// scroll should act on ninox's own scrollback. A `local` scroll
+/// (drag-select auto-scroll) must never reach the PTY — under a
+/// mouse-mode TUI the wheel bytes would scroll the inner app instead of
+/// extending the selection into local history.
+pub fn scroll_pty_bytes(local: bool, lines_up: i32, mode: &TermMode) -> Option<Vec<u8>> {
+    if local { None } else { encode_wheel(lines_up, 0, 0, mode) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +214,18 @@ mod tests {
         assert_eq!(encode_paste("a\nb", &TermMode::empty()), b"a\nb".to_vec());
         assert_eq!(encode_paste("a\nb", &TermMode::BRACKETED_PASTE),
                    b"\x1b[200~a\nb\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn local_scroll_never_reaches_the_pty_even_in_mouse_mode() {
+        let mouse = TermMode::MOUSE_MODE | TermMode::SGR_MOUSE;
+        // Precondition: a non-local scroll in mouse mode *does* go to the PTY.
+        assert!(scroll_pty_bytes(false, 3, &mouse).is_some());
+        // The drag-autoscroll path opts out regardless of mode.
+        assert_eq!(scroll_pty_bytes(true, 3, &mouse), None);
+        assert_eq!(scroll_pty_bytes(true, -3, &mouse), None);
+        // Without mouse mode, non-local scrolls stay local too.
+        assert_eq!(scroll_pty_bytes(false, 3, &TermMode::empty()), None);
     }
 
     #[test]

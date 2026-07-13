@@ -2207,13 +2207,7 @@ impl App {
             Message::ScrollTerminal { session_id, delta, local } => {
                 if let Some(term) = state.terminals.get_mut(&session_id) {
                     let mode = *term.term.mode();
-                    // A `local` scroll (drag-select auto-scroll) must never
-                    // reach the PTY — under a mouse-mode TUI `encode_wheel`
-                    // would scroll the inner app instead of extending the
-                    // selection into ninox's scrollback.
-                    let pty_bytes =
-                        if local { None } else { crate::input::encode_wheel(delta, 0, 0, &mode) };
-                    if let Some(bytes) = pty_bytes {
+                    if let Some(bytes) = crate::input::scroll_pty_bytes(local, delta, &mode) {
                         if let Some(client) = state.clients.get(&session_id) {
                             for _ in 0..delta.unsigned_abs() { client.write(bytes.clone()); }
                         }
