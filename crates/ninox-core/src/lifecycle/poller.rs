@@ -246,20 +246,23 @@ impl Poller {
                     // snapshot — `deliver_work_requests` awaited above, and
                     // the statusline process can land cost/context at any
                     // moment (see `update_live_session_row`).
-                    let written = self.update_live_session_row(&session, |row| {
+                    let Some(written) = self.update_live_session_row(&session, |row| {
                         row.pr_number = session.pr_number;
                         row.status    = session.status.clone();
-                    });
-                    if written.is_some() {
-                        self.engine.emit(Event::SessionUpdated(
-                            session.clone(), SessionFields::PR_LINK | SessionFields::STATUS,
-                        ));
-                        tracing::info!(
-                            "session {} PR #{} detected via metadata hook",
-                            session.id, first.number
-                        );
-                        self.trigger_brain_harvest(&session).await;
-                    }
+                    }) else {
+                        // Deleted mid-tick — nothing below (extra-PR ledger
+                        // rows, notifications, orchestrator messages) should
+                        // run for a session that no longer exists either.
+                        continue;
+                    };
+                    self.engine.emit(Event::SessionUpdated(
+                        written, SessionFields::PR_LINK | SessionFields::STATUS,
+                    ));
+                    tracing::info!(
+                        "session {} PR #{} detected via metadata hook",
+                        session.id, first.number
+                    );
+                    self.trigger_brain_harvest(&session).await;
                 }
             }
 
@@ -871,14 +874,13 @@ impl Poller {
                         // snapshot — `find_open_pr_for_branch` is a network
                         // await, plenty of time for the statusline process to
                         // land cost/context (see `update_live_session_row`).
-                        let written = self.update_live_session_row(&session, |row| {
+                        if let Some(written) = self.update_live_session_row(&session, |row| {
                             row.pr_number = session.pr_number;
                             row.repo      = session.repo.clone();
                             row.status    = session.status.clone();
-                        });
-                        if written.is_some() {
+                        }) {
                             self.engine.emit(Event::SessionUpdated(
-                                session.clone(), SessionFields::PR_LINK | SessionFields::STATUS,
+                                written, SessionFields::PR_LINK | SessionFields::STATUS,
                             ));
                             tracing::info!(
                                 "session {} PR #{} detected via reconciliation ({repo_slug}, branch {branch})",
