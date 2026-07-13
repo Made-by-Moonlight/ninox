@@ -1,0 +1,114 @@
+name: Sync from public
+
+# Keeps internal/main caught up with the public mirror (Made-by-Moonlight/
+# ninox) without rebasing this repo's overlay commits forward. Overlay
+# commits (CODEOWNERS, this workflow, scripts/promote-to-public.sh) never
+# exist on the public side, so the only safe direction is merging
+# public/main *into* internal/main — never the reverse, and never a
+# rebase. A regular merge doesn't rewrite history, which matters now that
+# internal engineers commit here directly: rebasing the overlay forward
+# would rewrite commits they've already pulled.
+#
+# If internal/main already contains everything from public/main, this is a
+# no-op. Otherwise it pushes a merge commit to a side branch and opens a
+# PR against main — it never merges that PR itself, so a human always
+# looks at what's being merged before it lands. Note that the live "Main"
+# ruleset on this repo only blocks branch deletion and non-fast-forward
+# pushes (MLOPS-2371's plan to also require code-owner review was never
+# applied to it) — so nothing stops main-branch admins from merging or
+# pushing straight past this PR; opening it is about visibility, not an
+# enforced gate.
+#
+# A merge conflict fails this job outright (no branch is pushed) — that
+# means a commit landed on internal/main that touches the same lines as a
+# public/main change. Resolve it by hand: fetch public/main, merge it into
+# a branch locally, fix the conflict, push, open the PR yourself.
+#
+# The sync-from-public branch is force-pushed on every run (it's fully
+# bot-owned — nothing else should ever push to it) rather than using
+# --force-with-lease, since a lease needs a local remote-tracking ref for
+# the branch and this job only ever fetches main, not sync-from-public;
+# leasing against nothing fails the push on every run after the first.
+#
+# Opening the PR with the default GITHUB_TOKEN means GitHub's anti-
+# recursion rule applies: this PR will NOT automatically trigger other
+# pull_request-scoped workflows (e.g. ci.yml), the same limitation
+# release.yml documents for its own push and works around with a deploy
+# key. Doesn't matter today since nothing requires those checks to pass
+# before merging (see above), but if a required-status-checks rule is
+# ever added to the ruleset, set a repo secret named SYNC_PR_TOKEN (a PAT
+# or GitHub App installation token with repo scope) and this workflow
+# will use it instead, so the PR is attributed to a real actor and CI
+# runs normally. Until then, a reviewer can manually re-run checks (push
+# an empty commit, or use the "Update branch" button) if needed.
+#
+# Internal-only: added via an overlay commit on internal/main, same as
+# CODEOWNERS, and never cherry-picked to the public repo. The repository
+# check below is belt-and-braces in case this file ever ends up over
+# there by accident.
+
+on:
+  schedule:
+    - cron: '17 6 * * *' # once a day; arbitrary time, just off the hour
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-from-public
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Synthesia-Technologies/ninox'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SYNC_TOKEN: ${{ secrets.SYNC_PR_TOKEN || github.token }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          token: ${{ env.SYNC_TOKEN }}
+
+      - name: Fetch public mirror
+        run: git fetch https://github.com/Made-by-Moonlight/ninox.git main
+
+      - name: Check whether a sync is needed
+        id: check
+        run: |
+          if git merge-base --is-ancestor FETCH_HEAD origin/main; then
+            echo "internal/main already has everything from public/main"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge public/main into a sync branch
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          git config user.name "ninox-sync[bot]"
+          git config user.email "ninox-sync@users.noreply.github.com"
+          git checkout -b sync-from-public
+          git merge --no-edit FETCH_HEAD
+
+      - name: Push sync branch
+        if: steps.check.outputs.needed == 'true'
+        run: git push --force origin sync-from-public
+
+      - name: Open or update PR
+        if: steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ env.SYNC_TOKEN }}
+        run: |
+          if gh pr view sync-from-public >/dev/null 2>&1; then
+            echo "PR already open — the push above already updated it."
+          else
+            gh pr create \
+              --title "chore(sync): merge public/main into internal/main" \
+              --body "Automated merge-forward from the public mirror (Made-by-Moonlight/ninox). Opens only when public/main has commits internal/main doesn't already have. This workflow only proposes the sync and never merges it itself — take a look before merging (or bypassing, if you're pushing straight to main)." \
+              --base main \
+              --head sync-from-public
+          fi

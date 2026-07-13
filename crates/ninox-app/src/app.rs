@@ -1544,6 +1544,12 @@ impl App {
                     // 0; the usage poller re-ingests real spend from the
                     // workspace transcript.
                     let _ = ninox_core::tmux::kill_session(&id).await;
+                    // Same workspace-restoration guard as Resume below —
+                    // without it a torn-down worktree makes tmux silently
+                    // start the fresh agent in $HOME.
+                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id, is_orch).await {
+                        tracing::warn!("re-file {id}: cannot restore workspace: {e}");
+                    }
                     let attach = crate::spawn_util::spawn_interactive_session(
                         engine,
                         crate::spawn_util::InteractiveSpawnParams {
@@ -1598,6 +1604,17 @@ impl App {
                 let summary = session.summary.clone();
                 Task::future(async move {
                     let _ = ninox_core::tmux::kill_session(&id).await;
+                    // The worktree may have been torn down since the session
+                    // ran (merge cleanup, manual prune). Recreate it at the
+                    // same path — claude-code keys the conversation to that
+                    // path, so this is what makes `--resume` find it. On
+                    // failure, fall through: `tmux::create_session` now
+                    // rejects a missing workspace, so the spawn fails
+                    // visibly into `failure_status` instead of the agent
+                    // silently starting in $HOME.
+                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id, is_orch).await {
+                        tracing::warn!("resume {id}: cannot restore workspace: {e}");
+                    }
                     let attach = crate::spawn_util::spawn_interactive_session(
                         engine,
                         crate::spawn_util::InteractiveSpawnParams {

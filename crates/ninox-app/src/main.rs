@@ -321,7 +321,19 @@ async fn run_spawn(
         ninox_brain_env.as_deref(),
         ninox_config_env.as_deref(),
     );
-    tmux::create_session(&id, &effective_workspace, &cmd, &env_vec).await?;
+    // The session was already upserted as Working above; if tmux refuses
+    // the spawn (e.g. the workspace dir doesn't exist — create_session
+    // rejects that rather than letting the pane silently start in $HOME),
+    // mark it Terminated before bailing. A pid-less Working ghost is
+    // invisible to poll_pids and would linger until the next app restart's
+    // reconciliation.
+    if let Err(e) = tmux::create_session(&id, &effective_workspace, &cmd, &env_vec).await {
+        if let Ok(Some(mut s)) = store.get_session(&id) {
+            s.status = SessionStatus::Terminated;
+            let _ = store.upsert_session(&s);
+        }
+        return Err(e);
+    }
 
     Ok(())
 }
@@ -866,7 +878,37 @@ fn has_display() -> bool {
 
 #[cfg(test)]
 mod worker_env_tests {
-    use super::{first_line, worker_context_footer, worker_env_vars};
+    use super::{first_line, run_spawn, worker_context_footer, worker_env_vars};
+
+    #[tokio::test]
+    async fn run_spawn_marks_the_session_terminated_when_tmux_create_fails() {
+        use std::sync::Arc;
+        // A nonexistent workspace makes worktree creation fail (falls back
+        // to the shared workspace, also missing), and tmux::create_session
+        // now rejects the missing dir. run_spawn upserts the session as
+        // Working BEFORE that point — bailing without a status fix-up
+        // leaves a permanent Working ghost with no pid for poll_pids to
+        // reap (only startup reconciliation would ever catch it).
+        let store = Arc::new(
+            ninox_core::store::Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap(),
+        );
+        let result = run_spawn(
+            store.clone(),
+            ninox_core::config::AppConfig::default(),
+            "do the task".into(),
+            "/definitely/not/a/real/dir".into(),
+            Some("ghost-spawn-test".into()),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "spawn into a missing workspace must fail");
+
+        let session = store.get_session("ghost-spawn-test").unwrap().unwrap();
+        assert!(
+            matches!(session.status, ninox_core::SessionStatus::Terminated),
+            "failed spawn must not leave a Working ghost, got {:?}", session.status,
+        );
+    }
 
     #[test]
     fn first_line_takes_first_non_empty_line_trimmed() {
