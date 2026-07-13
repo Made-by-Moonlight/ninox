@@ -311,7 +311,12 @@ pub enum Message {
     VersionCheckResult(Result<Option<String>, String>),
     FleetFilterQuery(String),
     ClearFleetFilter,
-    ScrollTerminal { session_id: SessionId, delta: i32 },
+    /// Scroll a terminal by `delta` lines (positive = up into history).
+    /// `local: false` (wheel) forwards to the PTY when the inner app has
+    /// mouse mode enabled; `local: true` (drag-select auto-scroll) always
+    /// moves ninox's own scrollback so selections can extend into history
+    /// even under a mouse-mode TUI.
+    ScrollTerminal { session_id: SessionId, delta: i32, local: bool },
     JumpToLatest { session_id: SessionId },
     /// A chunk of tmux pane history came back from `capture-pane` for a
     /// scrolled-back terminal.
@@ -2199,10 +2204,10 @@ impl App {
                 Task::none()
             }
 
-            Message::ScrollTerminal { session_id, delta } => {
+            Message::ScrollTerminal { session_id, delta, local } => {
                 if let Some(term) = state.terminals.get_mut(&session_id) {
                     let mode = *term.term.mode();
-                    if let Some(bytes) = crate::input::encode_wheel(delta, 0, 0, &mode) {
+                    if let Some(bytes) = crate::input::scroll_pty_bytes(local, delta, &mode) {
                         if let Some(client) = state.clients.get(&session_id) {
                             for _ in 0..delta.unsigned_abs() { client.write(bytes.clone()); }
                         }

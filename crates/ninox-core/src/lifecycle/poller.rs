@@ -488,6 +488,31 @@ impl Poller {
 
     // ── GitHub enrichment ────────────────────────────────────────────────────
 
+    /// Read-modify-write against the *live* session row rather than a
+    /// tick-start `list_sessions()` snapshot. The external `ninox
+    /// statusline` process writes cost/context straight into the row from
+    /// its own process during `poll_github`'s GitHub awaits, and
+    /// `upsert_session` is a full-row write — so writing a snapshot back
+    /// would revert those fresher fields. Returns the row as written, or
+    /// `None` (write skipped) when the session was deleted mid-tick:
+    /// resurrecting a deleted row is worse than dropping one update. A
+    /// read *error* falls back to the snapshot instead — a missed
+    /// statusline write loses less than a skipped status update.
+    fn update_live_session_row(
+        &self,
+        snapshot: &crate::types::Session,
+        apply: impl FnOnce(&mut crate::types::Session),
+    ) -> Option<crate::types::Session> {
+        let mut row = match self.engine.store.get_session(&snapshot.id) {
+            Ok(Some(row)) => row,
+            Ok(None)      => return None,
+            Err(_)        => snapshot.clone(),
+        };
+        apply(&mut row);
+        let _ = self.engine.store.upsert_session(&row);
+        Some(row)
+    }
+
     async fn poll_github(&self) {
         let Some(gh) = &self.engine.github else { return };
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
@@ -588,7 +613,21 @@ impl Poller {
                 session.repo = resolved_repo;
                 session.pr_number = Some(pr_number);
                 session.pr_id = Some(pr_id);
-                let _ = self.engine.store.upsert_session(&session);
+                let written = self.update_live_session_row(&session, |row| {
+                    row.repo = session.repo.clone();
+                    row.pr_number = session.pr_number;
+                    row.pr_id = session.pr_id;
+                });
+                if written.is_some() {
+                    // This emit is the *only* channel by which self-healed pr
+                    // fields reach the GUI — the status/gate emit further down
+                    // deliberately flags only STATUS|GATE (it persists nothing
+                    // else). PR_LINK alone restricts the receiving `merge_from`
+                    // to exactly the three fields this write just corrected.
+                    self.engine.emit(Event::SessionUpdated(
+                        session.clone(), SessionFields::PR_LINK,
+                    ));
+                }
             }
             let Some((owner, repo)) = split_repo(&session.repo) else { continue };
 
@@ -717,15 +756,20 @@ impl Poller {
                 &session.status, &ci, has_changes_requested, pr_status.mergeable,
                 session.gate_status.as_ref(), now_millis(),
             );
-            let mut updated = session.clone();
-            updated.status = new_status;
-            updated.gate_status = new_gate;
-            if updated.status != session.status || updated.gate_status != session.gate_status {
-                let _ = self.engine.store.upsert_session(&updated);
-                self.engine.emit(Event::SessionUpdated(
-                    updated.clone(),
-                    SessionFields::STATUS | SessionFields::PR_LINK | SessionFields::GATE,
-                ));
+            if new_status != session.status || new_gate != session.gate_status {
+                // `session` is the tick-start snapshot, several GitHub
+                // awaits old — write through the live row instead (see
+                // `update_live_session_row`), and skip both write and emit
+                // if the session was deleted mid-tick.
+                if let Some(updated) = self.update_live_session_row(&session, |row| {
+                    row.status = new_status;
+                    row.gate_status = new_gate;
+                }) {
+                    self.engine.emit(Event::SessionUpdated(
+                        updated,
+                        SessionFields::STATUS | SessionFields::GATE,
+                    ));
+                }
             }
 
             if has_new && !review_reaction_already_sent {
@@ -1675,12 +1719,29 @@ mod tests {
         branch_matches: std::sync::Mutex<HashMap<(String, String, String), crate::github::PrRef>>,
         /// (owner, repo, pr_number) triples `get_pr_status` was actually called with, in order.
         calls: std::sync::Mutex<Vec<(String, String, u64)>>,
+        /// When set, `get_review_threads` upserts this row into the store
+        /// before returning — simulating the external `ninox statusline`
+        /// process landing a cost/context write mid-poll, after
+        /// `poll_github` took its `list_sessions()` snapshot but before its
+        /// status/gate write.
+        mid_review_upsert: std::sync::Mutex<Option<(std::sync::Arc<crate::store::Store>, crate::types::Session)>>,
+        /// Same as `mid_review_upsert`, but fired from `get_pr_status` —
+        /// i.e. before the *self-heal* write rather than the status/gate
+        /// write, which needs its own mid-poll statusline simulation.
+        mid_pr_status_upsert: std::sync::Mutex<Option<(std::sync::Arc<crate::store::Store>, crate::types::Session)>>,
+        /// When set, `get_review_threads` deletes this session id from the
+        /// store before returning — simulating the session being removed
+        /// mid-poll, after the snapshot but before the status/gate write.
+        mid_review_delete: std::sync::Mutex<Option<(std::sync::Arc<crate::store::Store>, String)>>,
     }
 
     #[async_trait::async_trait]
     impl crate::github::GithubApi for FakeGithub {
         async fn get_pr_status(&self, owner: &str, repo: &str, pr_number: u64) -> anyhow::Result<crate::github::PrStatus> {
             self.calls.lock().unwrap().push((owner.to_string(), repo.to_string(), pr_number));
+            if let Some((store, row)) = self.mid_pr_status_upsert.lock().unwrap().take() {
+                store.upsert_session(&row).unwrap();
+            }
             self.pr_status_ok.lock().unwrap()
                 .get(&(owner.to_string(), repo.to_string(), pr_number))
                 .cloned()
@@ -1690,6 +1751,12 @@ mod tests {
             Ok(vec![])
         }
         async fn get_review_threads(&self, _owner: &str, _repo: &str, _pr_number: u64) -> anyhow::Result<Vec<crate::github::ReviewThread>> {
+            if let Some((store, row)) = self.mid_review_upsert.lock().unwrap().take() {
+                store.upsert_session(&row).unwrap();
+            }
+            if let Some((store, id)) = self.mid_review_delete.lock().unwrap().take() {
+                store.delete_session(&id).unwrap();
+            }
             Ok(vec![])
         }
         async fn find_open_pr_for_branch(&self, owner: &str, repo: &str, branch: &str) -> anyhow::Result<Option<crate::github::PrRef>> {
@@ -2040,6 +2107,264 @@ mod tests {
              merge detection short-circuits the rest of this loop iteration",
         );
         assert!(matches!(updated.status, SessionStatus::Done), "merged PR still transitions to Done");
+    }
+
+    /// The stale-upsert race: `poll_github`'s status/gate write starts from
+    /// the `list_sessions()` snapshot taken at the top of the tick, but the
+    /// external `ninox statusline` process (see `poll_context_updates`)
+    /// writes cost/context straight into the same row during the GitHub
+    /// awaits in between — and `upsert_session` is a full-row last-writer-
+    /// wins write. Persisting the snapshot would silently revert those
+    /// fresher fields; the fix re-reads the live row and sets only
+    /// status/gate on it. The fake's `get_review_threads` (the last await
+    /// before the write) plays the statusline process here.
+    #[tokio::test]
+    async fn poll_github_status_write_does_not_revert_mid_poll_statusline_fields() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".to_string(), "repo".to_string(), 50),
+            crate::github::PrStatus {
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "t".into(), number: 50, head_sha: "abc".into(),
+            },
+        );
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.repo = "Owner/repo".into();
+        session.pr_number = Some(50);
+        session.pr_id = Some(50); // fully consistent — no self-heal write this tick
+        store.upsert_session(&session).unwrap();
+
+        // The statusline write that lands mid-poll: fresher cost/context.
+        let mut mid_poll = session.clone();
+        mid_poll.cost_usd = 7.25;
+        mid_poll.context_used_pct = Some(55.0);
+        mid_poll.context_tokens = Some(123);
+        *fake.mid_review_upsert.lock().unwrap() = Some((store.clone(), mid_poll));
+
+        let engine = github_engine(store.clone(), fake);
+        let poller = Poller::new(engine);
+
+        poller.poll_github().await;
+
+        let updated = store.get_session("s1").unwrap().unwrap();
+        assert!(
+            matches!(updated.status, SessionStatus::Mergeable),
+            "the status write itself must still land (open PR, all-green signals): {:?}",
+            updated.status,
+        );
+        assert!(updated.gate_status.is_some(), "the gate write must still land");
+        assert_eq!(
+            updated.cost_usd, 7.25,
+            "persisting status/gate must not revert cost_usd written mid-poll by the statusline process",
+        );
+        assert_eq!(updated.context_used_pct, Some(55.0), "mid-poll context fields must survive too");
+        assert_eq!(updated.context_tokens, Some(123));
+    }
+
+    /// Same stale-upsert race as above, one write earlier in the tick: the
+    /// *self-heal* write (repo/pr_number/pr_id) also starts from the
+    /// snapshot, and the statusline process can land cost/context during
+    /// the `get_pr_status` awaits that precede it. The fake's
+    /// `get_pr_status` plays the statusline process here.
+    #[tokio::test]
+    async fn poll_github_self_heal_write_does_not_revert_mid_poll_statusline_fields() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".to_string(), "repo".to_string(), 50),
+            crate::github::PrStatus {
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "t".into(), number: 50, head_sha: "abc".into(),
+            },
+        );
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.repo = "Owner/repo".into();
+        session.pr_number = Some(50);
+        session.pr_id = None; // inconsistent — triggers the self-heal write
+        store.upsert_session(&session).unwrap();
+
+        let mut mid_poll = session.clone();
+        mid_poll.cost_usd = 7.25;
+        mid_poll.context_used_pct = Some(55.0);
+        *fake.mid_pr_status_upsert.lock().unwrap() = Some((store.clone(), mid_poll));
+
+        let engine = github_engine(store.clone(), fake);
+        let poller = Poller::new(engine);
+
+        poller.poll_github().await;
+
+        let updated = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(updated.pr_id, Some(50), "the self-heal write itself must still land");
+        assert_eq!(
+            updated.cost_usd, 7.25,
+            "the self-heal write must not revert cost_usd written mid-poll by the statusline process",
+        );
+        assert_eq!(updated.context_used_pct, Some(55.0), "mid-poll context fields must survive too");
+    }
+
+    /// A session deleted between the tick-start snapshot and the
+    /// status/gate write must stay deleted — falling back to the snapshot
+    /// there would resurrect the row.
+    #[tokio::test]
+    async fn poll_github_status_write_does_not_resurrect_a_row_deleted_mid_poll() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".to_string(), "repo".to_string(), 50),
+            crate::github::PrStatus {
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "t".into(), number: 50, head_sha: "abc".into(),
+            },
+        );
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.repo = "Owner/repo".into();
+        session.pr_number = Some(50);
+        session.pr_id = Some(50); // fully consistent — no self-heal write this tick
+        store.upsert_session(&session).unwrap();
+
+        *fake.mid_review_delete.lock().unwrap() = Some((store.clone(), "s1".to_string()));
+
+        let engine = github_engine(store.clone(), fake);
+        let poller = Poller::new(engine);
+
+        poller.poll_github().await;
+
+        assert!(
+            store.get_session("s1").unwrap().is_none(),
+            "a session deleted mid-poll must not be re-inserted by the status/gate write",
+        );
+    }
+
+    /// Per the `SessionFields` contract (see its doc comment), a producer
+    /// must flag exactly the fields it persisted. The status/gate write
+    /// persists only `status` and `gate_status` — flagging PR_LINK too (as
+    /// it once did) would make the receiving `merge_from` copy this tick's
+    /// snapshot of `pr_number`/`pr_id`/`repo` over values a fresher emitter
+    /// may have established since.
+    #[tokio::test]
+    async fn poll_github_status_gate_emit_flags_exactly_status_and_gate() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".to_string(), "repo".to_string(), 50),
+            crate::github::PrStatus {
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "t".into(), number: 50, head_sha: "abc".into(),
+            },
+        );
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.repo = "Owner/repo".into();
+        session.pr_number = Some(50);
+        session.pr_id = Some(50); // fully consistent — nothing to self-heal
+        store.upsert_session(&session).unwrap();
+
+        let engine = github_engine(store.clone(), fake);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github().await;
+
+        let events = drain_events(&mut rx);
+        let fields: Vec<SessionFields> = events.iter().filter_map(|e| match e {
+            Event::SessionUpdated(s, f) if s.id == "s1" => Some(*f),
+            _ => None,
+        }).collect();
+        assert_eq!(
+            fields, vec![SessionFields::STATUS | SessionFields::GATE],
+            "with nothing to self-heal, the tick's only SessionUpdated is the status/gate \
+             write, flagged for exactly the two fields it persisted — no PR_LINK",
+        );
+    }
+
+    /// The self-heal write is the only thing that persists corrected
+    /// `repo`/`pr_number`/`pr_id`, so it must announce them itself — the
+    /// status/gate emit no longer over-flags PR_LINK on its behalf (the
+    /// former, accidental delivery channel). The PR_LINK-only flag restricts
+    /// the receiving `merge_from` to exactly the fields the self-heal wrote.
+    #[tokio::test]
+    async fn poll_github_self_heal_emits_pr_link_flagged_update() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[
+            ("origin", "https://github.com/OwnerA/repoA.git"),
+            ("mirror", "https://github.com/OwnerB/repoB.git"),
+        ]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.branch_matches.lock().unwrap().insert(
+            ("OwnerB".to_string(), "repoB".to_string(), "worker-branch".to_string()),
+            crate::github::PrRef { number: 99, url: "https://github.com/OwnerB/repoB/pull/99".into() },
+        );
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("OwnerB".to_string(), "repoB".to_string(), 99),
+            crate::github::PrStatus {
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "t".into(), number: 99, head_sha: "abc".into(),
+            },
+        );
+        // OwnerA/repoA#50 has no entry — get_pr_status errors, simulating a
+        // 404, forcing the branch-match fallback (and thus the self-heal).
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.repo = "OwnerA/repoA".into();
+        session.pr_number = Some(50);
+        store.upsert_session(&session).unwrap();
+
+        let engine = github_engine(store.clone(), fake);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github().await;
+
+        let events = drain_events(&mut rx);
+        let healed = events.iter().find_map(|e| match e {
+            Event::SessionUpdated(s, f) if *f == SessionFields::PR_LINK => Some(s.clone()),
+            _ => None,
+        }).expect(
+            "self-heal must emit its own PR_LINK-flagged SessionUpdated — it's the only \
+             channel by which the corrected pr fields reach the GUI",
+        );
+        assert_eq!(healed.repo, "OwnerB/repoB");
+        assert_eq!(healed.pr_number, Some(99));
+        assert_eq!(healed.pr_id, Some(99));
+
+        for e in &events {
+            if let Event::SessionUpdated(_, f) = e {
+                if f.contains(SessionFields::STATUS) {
+                    assert!(
+                        !f.contains(SessionFields::PR_LINK),
+                        "the status/gate emit must not over-flag PR_LINK on the self-heal's behalf",
+                    );
+                }
+            }
+        }
     }
 
     /// When every configured remote fails, that must be visible — not just
