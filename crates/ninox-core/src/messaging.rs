@@ -18,10 +18,23 @@ use std::path::{Path, PathBuf};
 ///   which the Stop/UserPromptSubmit hooks installed in the worker's
 ///   worktree settings drain (see
 ///   `ninox_app::spawn_util::ensure_statusline_settings`). Keystrokes are
-///   then only a best-effort idle-wake nudge (`tmux::wake_idle_session`) —
-///   losing that race is not a delivery failure (the inbox file already
-///   durably holds the message and will be drained on the next natural
-///   Stop/UserPromptSubmit); failing to write the inbox file is.
+///   then only a best-effort idle-wake nudge (`tmux::wake_idle_session`).
+///   Failing to WRITE the inbox file is a real delivery failure and
+///   propagates. The nudge is a different story, and the guarantee is
+///   weaker than it may look at first: for a session ACTIVELY working, the
+///   very next Stop (turn end) or UserPromptSubmit drains it regardless of
+///   whether the nudge lands. For a session already IDLE, there is no such
+///   next turn boundary coming on its own — the nudge is the ONLY delivery
+///   trigger, and it is single-shot and best-effort (see
+///   `tmux::wake_idle_session`'s own doc comment for exactly what can make
+///   it not fire). If it doesn't land, the message stays durably pending
+///   but genuinely undelivered until something else makes the session
+///   active again (a human interacting with it, or a later message
+///   triggering another nudge attempt) — this is a known residual gap, not
+///   a "will always eventually drain" guarantee. Given this whole feature
+///   is opt-in and default-off, closing that gap (e.g. a poller loop that
+///   keeps re-nudging a session with pending mail) is left as a follow-up
+///   rather than built into this change.
 /// - `inbox_enabled = true` but the target CANNOT drain a file-based inbox
 ///   (an orchestrator — hooks are only ever installed in worker worktrees;
 ///   a pre-existing worktree whose settings.json predates the toggle being
@@ -81,12 +94,20 @@ fn target_can_drain_inbox(store: &Store, session_id: &str) -> bool {
     inbox_hooks_installed(Path::new(&workspace))
 }
 
-/// Whether `workspace`'s `.claude/settings.json` has a non-empty `Stop`
-/// hooks array — the signal `ensure_statusline_settings` writes exactly
-/// when inbox messaging is enabled, alongside `UserPromptSubmit`. Missing
-/// file, unparsable JSON, or an absent/empty `hooks.Stop` all mean "cannot
-/// drain" rather than erroring — this is a best-effort capability probe,
-/// not a delivery path of its own.
+/// Substring identifying OUR Stop hook's command, as written by
+/// `ensure_statusline_settings` (`"<ninox_bin> inbox drain-stop"`).
+const STOP_HOOK_MARKER: &str = "inbox drain-stop";
+
+/// Whether `workspace`'s `.claude/settings.json` has a `Stop` hook whose
+/// command is specifically ninox's own inbox drain (contains
+/// [`STOP_HOOK_MARKER`]) — NOT merely "some Stop hook exists". A worktree
+/// whose checked-in settings.json happens to carry an unrelated Stop hook
+/// (e.g. a lint-on-stop check) would otherwise pass a bare
+/// presence/non-empty check while nothing there actually drains our
+/// inbox — the exact same silent-loss shape this whole gate exists to
+/// close. Missing file, unparsable JSON, or no matching command all mean
+/// "cannot drain" rather than erroring — this is a best-effort capability
+/// probe, not a delivery path of its own.
 fn inbox_hooks_installed(workspace: &Path) -> bool {
     let settings_path: PathBuf = workspace.join(".claude").join("settings.json");
     let Ok(raw) = std::fs::read_to_string(&settings_path) else {
@@ -95,10 +116,21 @@ fn inbox_hooks_installed(workspace: &Path) -> bool {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return false;
     };
-    json.get("hooks")
-        .and_then(|h| h.get("Stop"))
-        .and_then(|s| s.as_array())
-        .is_some_and(|a| !a.is_empty())
+    let Some(stop_groups) = json.get("hooks").and_then(|h| h.get("Stop")).and_then(|s| s.as_array()) else {
+        return false;
+    };
+    stop_groups.iter().any(|group| {
+        group
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .is_some_and(|hooks| {
+                hooks.iter().any(|hook| {
+                    hook.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.contains(STOP_HOOK_MARKER))
+                })
+            })
+    })
 }
 
 #[cfg(test)]
@@ -168,6 +200,26 @@ mod tests {
         std::fs::write(
             dir.path().join(".claude").join("settings.json"),
             r#"{"hooks": {"Stop": []}}"#,
+        )
+        .unwrap();
+        assert!(!inbox_hooks_installed(dir.path()));
+    }
+
+    #[test]
+    fn inbox_hooks_installed_false_for_a_foreign_stop_hook() {
+        // A worktree whose checked-in settings.json has SOME Stop hook —
+        // just not ours (e.g. a lint-on-stop check) — must not be treated
+        // as drainable: nothing there actually drains our inbox.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(
+            dir.path().join(".claude").join("settings.json"),
+            serde_json::json!({
+                "hooks": {
+                    "Stop": [{"hooks": [{"type": "command", "command": "node .claude/lint-on-stop.cjs"}]}]
+                }
+            })
+            .to_string(),
         )
         .unwrap();
         assert!(!inbox_hooks_installed(dir.path()));

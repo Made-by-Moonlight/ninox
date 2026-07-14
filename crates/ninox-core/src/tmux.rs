@@ -544,11 +544,17 @@ fn nudge_still_alone_at_prompt(pane: &str) -> bool {
 /// Wake an idle session so its Stop/UserPromptSubmit hooks run and drain
 /// the file-based inbox (see `ninox_core::inbox`) sooner than the next
 /// natural turn boundary. Only meaningful when that opt-in inbox is
-/// enabled — the message itself never travels through this keystroke.
+/// enabled — the message itself never travels through this keystroke. For
+/// an idle session this nudge IS the only delivery trigger there is (no
+/// Stop/UserPromptSubmit fires on its own until something wakes it) — see
+/// `crate::messaging::deliver_message`'s doc comment for the resulting
+/// guarantee (best-effort, not "will always eventually drain").
 ///
 /// Skips sending anything unless the pane's input prompt is visibly present
 /// AND empty: a human mid-typing, or no visible prompt at all (alt-screen,
-/// still rendering), must never be clobbered by a nudge.
+/// still rendering), must never be clobbered by a nudge. The one exception
+/// is the prompt holding EXACTLY our own nudge marker and nothing else —
+/// see the stale-nudge paragraph below.
 ///
 /// Deliberately does NOT reuse [`send_keys`] wholesale: that function sends
 /// Enter unconditionally `SEND_SUBMIT_DELAY_MS` after the literal text, with
@@ -559,14 +565,32 @@ fn nudge_still_alone_at_prompt(pane: &str) -> bool {
 /// — nothing else — immediately before pressing Enter; if a human started
 /// typing in that window, Enter is withheld entirely (their in-progress
 /// input is left alone, nudge character included, rather than risking it
-/// being submitted on our behalf). Losing this race is not a delivery
-/// failure — the message is already durably written to the inbox file;
-/// this is only a latency optimization, so no retry loop is needed either.
+/// being submitted on our behalf).
+///
+/// Withholding Enter that way creates its own hazard if left unhandled: the
+/// pane is then left showing just our nudge character, un-submitted. A
+/// later call would see that as "prompt has content" and skip entirely —
+/// forever, since nothing else will ever clear a marker only we would type.
+/// That would permanently wedge delivery to an idle session behind a single
+/// lost race. Closed by treating "prompt holds exactly our nudge marker" as
+/// recognizably OUR OWN leftover from a previous attempt rather than a
+/// human's input: submit it immediately (verified Enter) instead of typing
+/// a fresh one. Losing today's race is still not a delivery failure — the
+/// message is already durably written to the inbox file — so no retry loop
+/// is needed for the fresh-nudge path either.
 pub async fn wake_idle_session(session_id: &str) -> Result<()> {
     let pane = capture_visible_plain(session_id).await;
-    if prompt_line_content(&pane) != Some("") {
-        return Ok(());
+    match prompt_line_content(&pane) {
+        Some("") => {} // proceed to type a fresh nudge below
+        Some(IDLE_WAKE_NUDGE) => {
+            // Our own nudge, left over un-submitted from a previous call —
+            // submit it now rather than treating the box as permanently
+            // occupied.
+            return run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await.map(|_| ());
+        }
+        _ => return Ok(()), // genuinely occupied by something else
     }
+
     run_session_scoped(&["send-keys", "-t", session_id, "-l", IDLE_WAKE_NUDGE]).await?;
     tokio::time::sleep(std::time::Duration::from_millis(SEND_SUBMIT_DELAY_MS)).await;
 
@@ -845,6 +869,43 @@ mod tests {
         // Enter must have been pressed: cat processes the completed line
         // and echoes it back once it receives the newline.
         wait_for_pane_contains(&id, "❯ .").await;
+        kill_session(&id).await.unwrap();
+    }
+
+    /// Regression test for the stall this closes: if a previous
+    /// `wake_idle_session` call typed the nudge but had Enter withheld
+    /// (e.g. it lost the pre-Enter recapture race), the box is left
+    /// showing just the nudge marker, un-submitted. A naive re-application
+    /// of the "prompt must be empty" check would see that as permanently
+    /// occupied and skip forever — wedging every future delivery attempt
+    /// to this idle session behind one lost race. Recognizing "prompt
+    /// holds exactly our own marker" as ours to submit closes that.
+    #[tokio::test]
+    async fn wake_idle_session_submits_its_own_stale_nudge_instead_of_stalling_forever() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        let marker_line = format!("❯ {IDLE_WAKE_NUDGE}");
+        // Simulate a previous attempt that typed the nudge but never
+        // pressed Enter — no Enter here either, so the cursor stays put.
+        run_session_scoped(&["send-keys", "-t", &id, "-l", &marker_line]).await.unwrap();
+        wait_for_pane_contains(&id, &marker_line).await;
+
+        wake_idle_session(&id).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        // Submission must have happened immediately (no fresh nudge typed,
+        // no delay): cat echoes the completed line, so the marker line
+        // now appears twice (once from the still-visible original typing,
+        // once from cat's echo of what it read on Enter).
+        let pane = capture_visible_plain(&id).await;
+        let occurrences = pane.lines().filter(|l| l.trim() == marker_line).count();
+        assert_eq!(
+            occurrences, 2,
+            "a stale nudge left over from a previous attempt must be submitted, \
+             not left stuck (which would wedge every future delivery): {pane}"
+        );
         kill_session(&id).await.unwrap();
     }
 
