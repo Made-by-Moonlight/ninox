@@ -533,6 +533,14 @@ fn message_stuck_at_prompt(pane: &str, text: &str) -> bool {
 /// with real content a human might be mid-typing.
 const IDLE_WAKE_NUDGE: &str = ".";
 
+/// Whether the pane's prompt currently holds ONLY the idle-wake nudge
+/// marker — nothing added, nothing removed. Used both right before sending
+/// Enter and (implicitly, by its absence) to detect that Enter already
+/// submitted cleanly.
+fn nudge_still_alone_at_prompt(pane: &str) -> bool {
+    prompt_line_content(pane) == Some(IDLE_WAKE_NUDGE)
+}
+
 /// Wake an idle session so its Stop/UserPromptSubmit hooks run and drain
 /// the file-based inbox (see `ninox_core::inbox`) sooner than the next
 /// natural turn boundary. Only meaningful when that opt-in inbox is
@@ -540,17 +548,32 @@ const IDLE_WAKE_NUDGE: &str = ".";
 ///
 /// Skips sending anything unless the pane's input prompt is visibly present
 /// AND empty: a human mid-typing, or no visible prompt at all (alt-screen,
-/// still rendering), must never be clobbered by a nudge. When the box is
-/// safely empty, reuses [`send_keys`] verbatim so the nudge gets the exact
-/// same pre-Enter delay and verify/retry-Enter hardening as a real message.
-/// Losing the race here is not a delivery failure — the message is already
-/// durably written to the inbox file; this is only a latency optimization.
+/// still rendering), must never be clobbered by a nudge.
+///
+/// Deliberately does NOT reuse [`send_keys`] wholesale: that function sends
+/// Enter unconditionally `SEND_SUBMIT_DELAY_MS` after the literal text, with
+/// no re-check of what else may have landed at the prompt in that window —
+/// fine for a real message the caller explicitly wants delivered, but not
+/// for a nudge whose entire point is to never touch a human's typing. After
+/// typing the nudge, this re-verifies the prompt still holds ONLY the nudge
+/// — nothing else — immediately before pressing Enter; if a human started
+/// typing in that window, Enter is withheld entirely (their in-progress
+/// input is left alone, nudge character included, rather than risking it
+/// being submitted on our behalf). Losing this race is not a delivery
+/// failure — the message is already durably written to the inbox file;
+/// this is only a latency optimization, so no retry loop is needed either.
 pub async fn wake_idle_session(session_id: &str) -> Result<()> {
     let pane = capture_visible_plain(session_id).await;
-    match prompt_line_content(&pane) {
-        Some("") => send_keys(session_id, IDLE_WAKE_NUDGE).await,
-        _ => Ok(()),
+    if prompt_line_content(&pane) != Some("") {
+        return Ok(());
     }
+    run_session_scoped(&["send-keys", "-t", session_id, "-l", IDLE_WAKE_NUDGE]).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(SEND_SUBMIT_DELAY_MS)).await;
+
+    if !nudge_still_alone_at_prompt(&capture_visible_plain(session_id).await) {
+        return Ok(());
+    }
+    run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await.map(|_| ())
 }
 
 /// Write `bytes` to the session's master PTY via tmux's paste-buffer
@@ -749,6 +772,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn nudge_still_alone_at_prompt_true_when_only_the_nudge_is_present() {
+        let pane = "│ ❯ .                                          │";
+        assert!(nudge_still_alone_at_prompt(pane));
+    }
+
+    /// A human who started typing during the pre-Enter delay must fail
+    /// this check — this is the exact signal `wake_idle_session` uses to
+    /// withhold Enter rather than submit their partial input.
+    #[test]
+    fn nudge_still_alone_at_prompt_false_once_more_text_is_appended() {
+        let pane = "│ ❯ .oops I started typing                    │";
+        assert!(!nudge_still_alone_at_prompt(pane));
+    }
+
+    #[test]
+    fn nudge_still_alone_at_prompt_false_once_the_prompt_is_empty_again() {
+        // Either it already submitted cleanly, or something else cleared
+        // the box — either way it's no longer "just the nudge".
+        let pane = "│ ❯                                            │";
+        assert!(!nudge_still_alone_at_prompt(pane));
+    }
+
+    #[test]
+    fn nudge_still_alone_at_prompt_false_when_no_prompt_is_visible() {
+        assert!(!nudge_still_alone_at_prompt("$ echo hi\nhi\n$"));
+    }
+
     /// A human mid-typing (or any other non-empty prompt content) must
     /// never be clobbered by an idle-wake nudge.
     #[tokio::test]
@@ -782,21 +833,54 @@ mod tests {
         let id = unique_id();
         create_session(&id, "/tmp", "cat", &[]).await.unwrap();
         sleep(Duration::from_millis(300)).await;
-        // Simulate an empty Claude Code input prompt.
+        // Simulate an empty Claude Code input prompt: literal text with NO
+        // Enter, so the cursor stays on this exact line — matching how a
+        // real redrawing TUI box keeps typed characters on the same line
+        // as ❯ rather than advancing to a fresh line the way Enter would.
         run_session_scoped(&["send-keys", "-t", &id, "-l", "❯ "]).await.unwrap();
-        run_session_scoped(&["send-keys", "-t", &id, "Enter"]).await.unwrap();
         wait_for_pane_contains(&id, "❯").await;
 
         wake_idle_session(&id).await.unwrap();
 
-        for _ in 0..50 {
-            if capture_visible_plain(&id).await.lines().any(|l| l.trim() == IDLE_WAKE_NUDGE) {
-                kill_session(&id).await.unwrap();
-                return;
-            }
+        // Enter must have been pressed: cat processes the completed line
+        // and echoes it back once it receives the newline.
+        wait_for_pane_contains(&id, "❯ .").await;
+        kill_session(&id).await.unwrap();
+    }
+
+    /// The core race this hardens against: a human starts typing during the
+    /// nudge's own pre-Enter delay window. Injects extra keystrokes into
+    /// the same line ~100ms after the nudge lands (well inside
+    /// `SEND_SUBMIT_DELAY_MS` = 300ms) and asserts Enter was withheld: the
+    /// accumulated line must still be sitting unsubmitted, not echoed back
+    /// by cat as a completed transcript line (which would happen twice —
+    /// once from the live tty echo of typing, once from cat's own echo of
+    /// what it read — if Enter had wrongly been sent).
+    #[tokio::test]
+    async fn wake_idle_session_withholds_enter_if_typing_starts_during_the_delay() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        run_session_scoped(&["send-keys", "-t", &id, "-l", "❯ "]).await.unwrap();
+        wait_for_pane_contains(&id, "❯").await;
+
+        let id2 = id.clone();
+        let racer = tokio::spawn(async move {
             sleep(Duration::from_millis(100)).await;
-        }
-        panic!("nudge marker {IDLE_WAKE_NUDGE:?} never appeared in the pane");
+            run_session_scoped(&["send-keys", "-t", &id2, "-l", "oops"]).await.unwrap();
+        });
+        wake_idle_session(&id).await.unwrap();
+        racer.await.unwrap();
+        sleep(Duration::from_millis(500)).await; // let any wrongly-sent Enter's effects settle
+
+        let pane = capture_visible_plain(&id).await;
+        let occurrences = pane.lines().filter(|l| l.contains("oops")).count();
+        assert_eq!(
+            occurrences, 1,
+            "the human's typing must never be submitted on our behalf: {pane}"
+        );
+        kill_session(&id).await.unwrap();
     }
 
     /// Happy path against a real pane: text lands and the call succeeds —

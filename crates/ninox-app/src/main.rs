@@ -216,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(AppConfig::sessions_dir);
             ninox_core::messaging::deliver_message(
-                &sessions_dir, &session_id, &message, config.inbox_messaging.enabled,
+                &store, &sessions_dir, &session_id, &message, config.inbox_messaging.enabled,
             )
             .await
         }

@@ -434,19 +434,22 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
         }
     });
     if inbox_enabled {
+        // Claude Code hook `timeout` is in SECONDS, not milliseconds — 5
+        // gives these fast, local-filesystem-only drains a generous margin
+        // without risking an accidental multi-minute hang on a hook error.
         settings["hooks"] = serde_json::json!({
             "Stop": [{
                 "hooks": [{
                     "type": "command",
                     "command": format!("{ninox_bin_quoted} inbox drain-stop"),
-                    "timeout": 5000
+                    "timeout": 5
                 }]
             }],
             "UserPromptSubmit": [{
                 "hooks": [{
                     "type": "command",
                     "command": format!("{ninox_bin_quoted} inbox drain-prompt"),
-                    "timeout": 5000
+                    "timeout": 5
                 }]
             }]
         });

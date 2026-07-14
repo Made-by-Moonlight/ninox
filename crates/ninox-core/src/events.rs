@@ -165,11 +165,18 @@ impl Engine {
     ///   inbox and a best-effort idle-wake nudge is sent; errors only if the
     ///   inbox write itself fails.
     pub async fn send_to_session(&self, session_id: &str, message: &str) -> anyhow::Result<()> {
+        // `AppConfig::load()` is a small synchronous TOML read; called
+        // directly (not via `spawn_blocking`) here matches the existing
+        // convention elsewhere in this codebase (e.g. `main.rs::run_spawn`).
         let inbox_enabled = crate::config::AppConfig::load()
             .map(|c| c.inbox_messaging.enabled)
             .unwrap_or(false);
+        // No `NINOX_DATA_DIR` fallback needed here (unlike the `ninox send`
+        // CLI / `run_request_work`): this runs inside the app's own
+        // process, which never has that env var set — only sessions the
+        // app spawns do.
         crate::messaging::deliver_message(
-            &crate::config::AppConfig::sessions_dir(), session_id, message, inbox_enabled,
+            &self.store, &crate::config::AppConfig::sessions_dir(), session_id, message, inbox_enabled,
         )
         .await
     }

@@ -13,10 +13,11 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-/// `hookSpecificOutput.additionalContext` is capped at ~10k chars by Claude
-/// Code — truncate our joined message text to that so the hook payload is
-/// never silently rejected.
-pub const MAX_ADDITIONAL_CONTEXT_CHARS: usize = 10_000;
+/// Shared cap for both hook payloads: `hookSpecificOutput.additionalContext`
+/// is capped at ~10k chars by Claude Code, and `drain_for_stop`'s `reason`
+/// uses the same budget for consistency (no equivalent published limit for
+/// Stop, but an unbounded `reason` string is exactly the same risk).
+pub const MAX_HOOK_PAYLOAD_CHARS: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct InboxMessage {
@@ -37,9 +38,13 @@ pub fn write_message(dir: &Path, session_id: &str, text: &str) -> Result<InboxMe
         .unwrap_or(0);
     // pid + per-process sequence make the id unique even when two callers
     // (orchestrator send + a poller reaction) write in the same millisecond.
+    // The sequence is zero-padded: `read_pending_messages` breaks a
+    // same-`sent_at` tie with a plain string compare on the id, and
+    // unpadded `...-10` sorts before `...-9` lexicographically — padding
+    // keeps that tiebreak in actual write order.
     let message = InboxMessage {
         id: format!(
-            "msg-{sent_at}-{}-{}",
+            "msg-{sent_at}-{}-{:010}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed),
         ),
@@ -107,19 +112,47 @@ pub fn mark_messages_delivered(dir: &Path, session_id: &str, ids: &[String]) -> 
     }
 }
 
+/// `session_id` is trusted, ninox-controlled input interpolated directly
+/// into a path component — same trust boundary as
+/// `hooks::work_requests_dir`'s `{session_id}.requests`. Every caller here
+/// is fed a session id ninox itself generated (`slugify`) or already has on
+/// record in the store; nothing here parses an id from outside that.
 fn inbox_dir(dir: &Path, session_id: &str) -> PathBuf {
     dir.join(format!("{session_id}.inbox"))
 }
 
-/// Join pending message bodies into one blob, oldest first, separated by a
-/// blank line. Shared by both hook-response builders below.
-fn join_pending(pending: &[InboxMessage]) -> String {
-    pending.iter().map(|m| m.text.as_str()).collect::<Vec<_>>().join("\n\n")
+/// Greedily join `pending` message bodies (oldest first, blank-line
+/// separated) up to `max_chars`, returning the joined text and exactly the
+/// ids of the messages that made it in. A message that alone exceeds
+/// `max_chars` is still included, truncated, rather than left permanently
+/// stuck — but nothing after it is added. Anything left out stays pending
+/// for the next drain, rather than being silently discarded.
+fn drain_batch(pending: Vec<InboxMessage>, max_chars: usize) -> (String, Vec<String>) {
+    let mut joined = String::new();
+    let mut ids = Vec::new();
+    for msg in pending {
+        let mut candidate = joined.clone();
+        if !candidate.is_empty() {
+            candidate.push_str("\n\n");
+        }
+        candidate.push_str(&msg.text);
+        if candidate.chars().count() > max_chars {
+            if ids.is_empty() {
+                joined = candidate.chars().take(max_chars).collect();
+                ids.push(msg.id);
+            }
+            break;
+        }
+        joined = candidate;
+        ids.push(msg.id);
+    }
+    (joined, ids)
 }
 
-/// Build the Stop hook's response for `session_id`, marking whatever is
-/// currently pending as delivered. `None` when nothing is pending — the
-/// caller should let Claude Code stop normally rather than print anything.
+/// Build the Stop hook's response for `session_id`, marking whichever
+/// messages made it into the response as delivered. `None` when nothing is
+/// pending — the caller should let Claude Code stop normally rather than
+/// print anything.
 ///
 /// Repeat Stop invocations in the same turn (Claude Code sets
 /// `stop_hook_active` on the hook's stdin payload when it does) need no
@@ -127,17 +160,22 @@ fn join_pending(pending: &[InboxMessage]) -> String {
 /// moment they're marked delivered, so a second call only ever sees
 /// messages that arrived after the first block — never the same batch
 /// re-blocking forever.
+///
+/// Marking happens before this JSON is ever printed by the CLI wrapper
+/// (`ninox inbox drain-stop`) — a crash or kill between the two would lose
+/// the message despite it being marked delivered here. Delivery is
+/// at-most-once, not "never lossy" in the face of a process crash mid-hook;
+/// the property this DOES guarantee is that a marking-*failure* (the
+/// common case — a concurrent rename losing a race, disk hiccup) never
+/// discards a response whose content is already in hand.
 pub fn drain_for_stop(dir: &Path, session_id: &str) -> Result<Option<serde_json::Value>> {
     let pending = read_pending_messages(dir, session_id)?;
     if pending.is_empty() {
         return Ok(None);
     }
-    let reason = join_pending(&pending);
-    let ids: Vec<String> = pending.into_iter().map(|m| m.id).collect();
-    // Best-effort: a marking failure must never discard a response whose
-    // content is already in hand — that would silently drop a message the
-    // model was about to see. Worst case on failure is the same message
-    // getting redelivered next turn, which is safe (never lossy).
+    let (reason, ids) = drain_batch(pending, MAX_HOOK_PAYLOAD_CHARS);
+    // Best-effort: see the "at-most-once" note above — a marking failure
+    // must never discard a response whose content is already in hand.
     if let Err(e) = mark_messages_delivered(dir, session_id, &ids) {
         tracing::warn!("failed to mark inbox messages delivered for {session_id}: {e}");
     }
@@ -145,19 +183,16 @@ pub fn drain_for_stop(dir: &Path, session_id: &str) -> Result<Option<serde_json:
 }
 
 /// Build the UserPromptSubmit hook's response for `session_id`, marking
-/// whatever is currently pending as delivered. `None` when nothing is
-/// pending — the human's submitted prompt must pass through completely
-/// untouched in that case.
+/// whichever messages made it into the response as delivered. `None` when
+/// nothing is pending — the human's submitted prompt must pass through
+/// completely untouched in that case. Same at-most-once caveat as
+/// `drain_for_stop` regarding a process crash between marking and printing.
 pub fn drain_for_prompt_submit(dir: &Path, session_id: &str) -> Result<Option<serde_json::Value>> {
     let pending = read_pending_messages(dir, session_id)?;
     if pending.is_empty() {
         return Ok(None);
     }
-    let mut context = join_pending(&pending);
-    if context.chars().count() > MAX_ADDITIONAL_CONTEXT_CHARS {
-        context = context.chars().take(MAX_ADDITIONAL_CONTEXT_CHARS).collect();
-    }
-    let ids: Vec<String> = pending.into_iter().map(|m| m.id).collect();
+    let (context, ids) = drain_batch(pending, MAX_HOOK_PAYLOAD_CHARS);
     // Best-effort, same reasoning as drain_for_stop: never drop an
     // already-built response over a marking failure.
     if let Err(e) = mark_messages_delivered(dir, session_id, &ids) {
@@ -269,13 +304,78 @@ mod tests {
     }
 
     #[test]
-    fn drain_for_prompt_submit_truncates_to_the_additional_context_cap() {
+    fn drain_for_prompt_submit_truncates_a_single_oversized_message_and_delivers_it() {
         let dir = tempdir().unwrap();
-        let long = "x".repeat(MAX_ADDITIONAL_CONTEXT_CHARS + 500);
+        let long = "x".repeat(MAX_HOOK_PAYLOAD_CHARS + 500);
         write_message(dir.path(), "sess-1", &long).unwrap();
 
         let response = drain_for_prompt_submit(dir.path(), "sess-1").unwrap().unwrap();
         let context = response["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
-        assert_eq!(context.chars().count(), MAX_ADDITIONAL_CONTEXT_CHARS);
+        assert_eq!(context.chars().count(), MAX_HOOK_PAYLOAD_CHARS);
+        // A message too big to ever fit must still be delivered (truncated)
+        // rather than left stuck pending forever.
+        assert!(read_pending_messages(dir.path(), "sess-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn drain_for_prompt_submit_leaves_overflow_messages_pending_instead_of_discarding_them() {
+        let dir = tempdir().unwrap();
+        let big = "x".repeat(MAX_HOOK_PAYLOAD_CHARS);
+        write_message(dir.path(), "sess-1", &big).unwrap();
+        write_message(dir.path(), "sess-1", "second message").unwrap();
+
+        let response = drain_for_prompt_submit(dir.path(), "sess-1").unwrap().unwrap();
+        let context = response["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert_eq!(context, big, "only the first message should be in this batch");
+
+        let still_pending = read_pending_messages(dir.path(), "sess-1").unwrap();
+        assert_eq!(still_pending.len(), 1, "the overflow message must stay pending, not be lost");
+        assert_eq!(still_pending[0].text, "second message");
+    }
+
+    #[test]
+    fn drain_for_stop_leaves_overflow_messages_pending_instead_of_discarding_them() {
+        let dir = tempdir().unwrap();
+        let big = "x".repeat(MAX_HOOK_PAYLOAD_CHARS);
+        write_message(dir.path(), "sess-1", &big).unwrap();
+        write_message(dir.path(), "sess-1", "second message").unwrap();
+
+        let response = drain_for_stop(dir.path(), "sess-1").unwrap().unwrap();
+        assert_eq!(response["reason"], big);
+
+        let still_pending = read_pending_messages(dir.path(), "sess-1").unwrap();
+        assert_eq!(still_pending.len(), 1, "the overflow message must stay pending, not be lost");
+        assert_eq!(still_pending[0].text, "second message");
+    }
+
+    #[test]
+    fn drain_batch_includes_everything_that_fits() {
+        let pending = vec![
+            InboxMessage { id: "a".into(), text: "first".into(), sent_at: 1 },
+            InboxMessage { id: "b".into(), text: "second".into(), sent_at: 2 },
+        ];
+        let (joined, ids) = drain_batch(pending, 100);
+        assert_eq!(joined, "first\n\nsecond");
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn drain_batch_stops_before_a_message_that_would_overflow() {
+        let pending = vec![
+            InboxMessage { id: "a".into(), text: "12345".into(), sent_at: 1 },
+            InboxMessage { id: "b".into(), text: "67890".into(), sent_at: 2 },
+        ];
+        // "12345" fits; adding "\n\n67890" would exceed the cap.
+        let (joined, ids) = drain_batch(pending, 5);
+        assert_eq!(joined, "12345");
+        assert_eq!(ids, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn drain_batch_truncates_a_single_message_that_alone_exceeds_the_cap() {
+        let pending = vec![InboxMessage { id: "a".into(), text: "1234567890".into(), sent_at: 1 }];
+        let (joined, ids) = drain_batch(pending, 5);
+        assert_eq!(joined, "12345");
+        assert_eq!(ids, vec!["a".to_string()]);
     }
 }
