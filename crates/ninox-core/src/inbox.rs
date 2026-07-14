@@ -134,7 +134,13 @@ pub fn drain_for_stop(dir: &Path, session_id: &str) -> Result<Option<serde_json:
     }
     let reason = join_pending(&pending);
     let ids: Vec<String> = pending.into_iter().map(|m| m.id).collect();
-    mark_messages_delivered(dir, session_id, &ids)?;
+    // Best-effort: a marking failure must never discard a response whose
+    // content is already in hand — that would silently drop a message the
+    // model was about to see. Worst case on failure is the same message
+    // getting redelivered next turn, which is safe (never lossy).
+    if let Err(e) = mark_messages_delivered(dir, session_id, &ids) {
+        tracing::warn!("failed to mark inbox messages delivered for {session_id}: {e}");
+    }
     Ok(Some(serde_json::json!({ "decision": "block", "reason": reason })))
 }
 
@@ -152,7 +158,11 @@ pub fn drain_for_prompt_submit(dir: &Path, session_id: &str) -> Result<Option<se
         context = context.chars().take(MAX_ADDITIONAL_CONTEXT_CHARS).collect();
     }
     let ids: Vec<String> = pending.into_iter().map(|m| m.id).collect();
-    mark_messages_delivered(dir, session_id, &ids)?;
+    // Best-effort, same reasoning as drain_for_stop: never drop an
+    // already-built response over a marking failure.
+    if let Err(e) = mark_messages_delivered(dir, session_id, &ids) {
+        tracing::warn!("failed to mark inbox messages delivered for {session_id}: {e}");
+    }
     Ok(Some(serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
