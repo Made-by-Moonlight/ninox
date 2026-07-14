@@ -154,8 +154,10 @@ impl Engine {
 
     /// Send a text message to the agent running in a session's tmux window.
     /// The message is injected as keyboard input — the agent sees it as typed text.
-    /// Returns Ok(()) if the tmux send succeeded; returns an error if the session
-    /// has no active tmux window or tmux is unavailable.
+    /// Returns Ok(()) once delivery is verified (or gives no signal either way);
+    /// errors if the session has no active tmux window, tmux is unavailable, or
+    /// the message is still sitting unsubmitted at the input prompt after the
+    /// Enter retries (see `tmux::send_keys`).
     pub async fn send_to_session(&self, session_id: &str, message: &str) -> anyhow::Result<()> {
         crate::tmux::send_keys(session_id, message).await
     }

@@ -443,12 +443,18 @@ pub async fn send_keys(session_id: &str, text: &str) -> Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(SEND_SUBMIT_DELAY_MS)).await;
     run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await?;
 
-    for _ in 0..SEND_VERIFY_ATTEMPTS {
+    // Every Enter — the initial one and each retry — gets its own
+    // verification pass, so a submission by the final retry is still
+    // reported as success (a false "stuck" error invites a re-send,
+    // which double-delivers).
+    for attempt in 0..=SEND_VERIFY_ATTEMPTS {
         tokio::time::sleep(std::time::Duration::from_millis(SEND_VERIFY_DELAY_MS)).await;
         if !message_stuck_at_prompt(&capture_visible_plain(session_id).await, text) {
             return Ok(());
         }
-        run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await?;
+        if attempt < SEND_VERIFY_ATTEMPTS {
+            run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await?;
+        }
     }
     anyhow::bail!(
         "message to {session_id} is still unsubmitted at its input prompt \
@@ -486,7 +492,20 @@ fn message_stuck_at_prompt(pane: &str, text: &str) -> bool {
         return true;
     }
     let first_line = text.lines().next().unwrap_or("").trim();
-    !first_line.is_empty() && (content.starts_with(first_line) || first_line.starts_with(content))
+    if first_line.is_empty() {
+        return false;
+    }
+    if content.starts_with(first_line) {
+        return true;
+    }
+    // Truncated stuck message: the box cuts long lines at the pane edge,
+    // so the visible content is a leading fragment of the message. Require
+    // it to be long enough to be distinctive — every reaction starts with
+    // `[Ninox]`, and a human who has typed `[` (or `[Ninox] C`) when this
+    // check runs must not have their unfinished input Enter'd for them. A
+    // genuinely truncated line is pane-width, far above this floor.
+    const MIN_TRUNCATED_MATCH_CHARS: usize = 10;
+    content.chars().count() >= MIN_TRUNCATED_MATCH_CHARS && first_line.starts_with(content)
 }
 
 /// Write `bytes` to the session's master PTY via tmux's paste-buffer
@@ -644,6 +663,22 @@ mod tests {
         assert!(!message_stuck_at_prompt(pane, "echo hi"));
     }
 
+    /// The reverse prefix match (truncated stuck message) must require
+    /// enough characters to be distinctive. Every reaction starts with
+    /// `[Ninox]`, so a human who happens to have typed `[` — or even
+    /// `[Ninox] C` — when the verify pass runs must not have their
+    /// unfinished input submitted by a retry Enter.
+    #[test]
+    fn not_stuck_when_prompt_holds_only_a_short_prefix_of_message() {
+        for typed in ["[", "[Ninox] C"] {
+            let pane = format!("│ ❯ {typed}                                   │");
+            assert!(
+                !message_stuck_at_prompt(&pane, REACTION),
+                "short prompt content {typed:?} must not count as our stuck message",
+            );
+        }
+    }
+
     /// Happy path against a real pane: text lands and the call succeeds —
     /// the verification pass must not false-positive on a ❯-less pane.
     #[tokio::test]
@@ -658,6 +693,20 @@ mod tests {
         kill_session(&id).await.unwrap();
     }
 
+    /// Poll until the session's pane shows `needle` — a fixed sleep races
+    /// the login shell `create_session` wraps commands in (a slow profile
+    /// can delay the command past any fixed delay; cf. the first-start
+    /// config races fixed in PR #12).
+    async fn wait_for_pane_contains(id: &str, needle: &str) {
+        for _ in 0..50 {
+            if capture_visible_plain(id).await.contains(needle) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        panic!("pane {id} never showed {needle:?}");
+    }
+
     /// A message that stays visible at a `❯` prompt after Enter (the
     /// stuck-paste failure mode) must surface as an error after the
     /// retries are exhausted, not silently report success.
@@ -668,9 +717,29 @@ mod tests {
         // `cat > /dev/null` never redraws: the tty echo leaves our text
         // sitting after the printed ❯ forever, exactly like a stuck paste.
         create_session(&id, "/tmp", "printf '\\xe2\\x9d\\xaf '; exec cat > /dev/null", &[]).await.unwrap();
-        sleep(Duration::from_millis(300)).await;
+        wait_for_pane_contains(&id, "❯").await;
         let err = send_keys(&id, "stuck message").await.unwrap_err();
         assert!(err.to_string().contains("unsubmitted"), "err: {err}");
+        kill_session(&id).await.unwrap();
+    }
+
+    /// The final retry Enter must itself be verified: when it is the one
+    /// that submits the message, send_keys reports success — not "still
+    /// unsubmitted" to a caller who might then re-send and double-deliver.
+    #[tokio::test]
+    async fn send_keys_succeeds_when_the_last_retry_enter_submits() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        // Consumes the message line plus every retry Enter, keeping the
+        // text visibly stuck at the ❯ the whole time, then clears the
+        // pane — i.e. the message is only submitted by the LAST retry.
+        create_session(
+            &id, "/tmp",
+            "printf '\\xe2\\x9d\\xaf '; read a; read b; read c; read d; printf '\\x1b[2J\\x1b[H'; exec sleep 30",
+            &[],
+        ).await.unwrap();
+        wait_for_pane_contains(&id, "❯").await;
+        send_keys(&id, "late message").await.unwrap();
         kill_session(&id).await.unwrap();
     }
 
