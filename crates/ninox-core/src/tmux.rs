@@ -415,16 +415,78 @@ pub async fn capture_history(session_id: &str, start: i64, end: i64) -> Vec<u8> 
     .unwrap_or_default()
 }
 
+/// A burst of injected characters makes Claude Code's TUI enter paste
+/// handling; an Enter arriving before that settles is swallowed and the
+/// message sits unsubmitted in the input box. Wait this long before Enter.
+const SEND_SUBMIT_DELAY_MS: u64 = 300;
+/// After Enter, re-check delivery this many times, this far apart,
+/// re-sending Enter whenever the message is still visible at the prompt.
+const SEND_VERIFY_ATTEMPTS: u32 = 3;
+const SEND_VERIFY_DELAY_MS: u64 = 500;
+
 /// Send text to a tmux session as if typed at the keyboard.
 /// The text is followed by Enter so the agent receives and acts on it.
 /// Uses `tmux send-keys -l` (literal mode) to avoid tmux interpreting
 /// special characters like `{`, `}`, arrows.
+///
+/// Delivery is verified: if the message is still sitting unsubmitted at the
+/// pane's `❯` input prompt (the stuck-`[Pasted text #N]` failure mode),
+/// Enter is re-sent up to `SEND_VERIFY_ATTEMPTS` times, and exhausting the
+/// retries is an error so callers know the target never saw the message.
+/// Panes that give no signal (no `❯` prompt, unrelated prompt content) are
+/// treated as delivered — a retry Enter must never fire at a human's
+/// half-typed input.
 pub async fn send_keys(session_id: &str, text: &str) -> Result<()> {
     // Send the message text in literal mode
     run_session_scoped(&["send-keys", "-t", session_id, "-l", text]).await?;
-    // Send Enter to submit
+    // Let the TUI finish paste processing before submitting.
+    tokio::time::sleep(std::time::Duration::from_millis(SEND_SUBMIT_DELAY_MS)).await;
     run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await?;
-    Ok(())
+
+    for _ in 0..SEND_VERIFY_ATTEMPTS {
+        tokio::time::sleep(std::time::Duration::from_millis(SEND_VERIFY_DELAY_MS)).await;
+        if !message_stuck_at_prompt(&capture_visible_plain(session_id).await, text) {
+            return Ok(());
+        }
+        run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await?;
+    }
+    anyhow::bail!(
+        "message to {session_id} is still unsubmitted at its input prompt \
+         after {SEND_VERIFY_ATTEMPTS} Enter retries"
+    )
+}
+
+/// Plain-text capture of the pane's visible contents — no `-e`, so the
+/// output carries no escape sequences and can be string-matched.
+async fn capture_visible_plain(session_id: &str) -> String {
+    run_session_scoped(&["capture-pane", "-p", "-t", session_id])
+        .await
+        .unwrap_or_default()
+}
+
+/// Whether a message we just injected is sitting unsubmitted in the target
+/// pane's input box. Looks at the last line holding the `❯` input prompt:
+/// stuck means it shows a `[Pasted text #N]` attachment marker or the
+/// message text itself (prefix-matched both ways, since the box truncates
+/// long lines). Anything else after the prompt — empty box, a placeholder
+/// hint, a human's half-typed message — is NOT ours to submit, so this
+/// stays false and no retry Enter is ever sent at it.
+fn message_stuck_at_prompt(pane: &str, text: &str) -> bool {
+    const PROMPT: char = '❯';
+    let Some(line) = pane.lines().rev().find(|l| l.contains(PROMPT)) else {
+        return false;
+    };
+    let after = &line[line.rfind(PROMPT).unwrap() + PROMPT.len_utf8()..];
+    // Strip the input box's right border and padding: `  msg   │`.
+    let content = after.trim().trim_end_matches('│').trim();
+    if content.is_empty() {
+        return false;
+    }
+    if content.starts_with("[Pasted text") {
+        return true;
+    }
+    let first_line = text.lines().next().unwrap_or("").trim();
+    !first_line.is_empty() && (content.starts_with(first_line) || first_line.starts_with(content))
 }
 
 /// Write `bytes` to the session's master PTY via tmux's paste-buffer
@@ -510,6 +572,105 @@ mod tests {
         create_session(&id, "/tmp", "sleep 30", &[]).await.unwrap();
         let tty = get_pane_tty(&id).await.unwrap();
         assert!(tty.map(|t| t.starts_with("/dev/")).unwrap_or(false));
+        kill_session(&id).await.unwrap();
+    }
+
+    // ── message_stuck_at_prompt ─────────────────────────────────────────
+    //
+    // Fixtures mirror real Claude Code pane captures: transcript above, a
+    // bordered input box with a `❯` prompt at the bottom.
+
+    const REACTION: &str = "[Ninox] CI is failing on your PR (1/3 checks). Please fix the following:\n  - build\n\nRun the failing checks locally, fix the issues, and push your changes.";
+
+    #[test]
+    fn stuck_when_pasted_text_marker_sits_at_prompt() {
+        let pane = "\
+● Working on the auth refactor now.
+
+╭──────────────────────────────────────────────╮
+│ ❯ [Pasted text #1 +4 lines]                  │
+╰──────────────────────────────────────────────╯
+  ? for shortcuts";
+        assert!(message_stuck_at_prompt(pane, REACTION));
+    }
+
+    #[test]
+    fn stuck_when_message_text_sits_at_prompt() {
+        let pane = "\
+╭──────────────────────────────────────────────────────╮
+│ ❯ [Ninox] Worker `auth-fix`'s PR #12 merged.         │
+╰──────────────────────────────────────────────────────╯";
+        assert!(message_stuck_at_prompt(pane, "[Ninox] Worker `auth-fix`'s PR #12 merged."));
+    }
+
+    /// The input box truncates long lines at the pane edge — a visible
+    /// prefix of the message still counts as stuck.
+    #[test]
+    fn stuck_when_prompt_shows_truncated_prefix_of_message() {
+        let pane = "│ ❯ [Ninox] CI is failing on your PR (1/3 che│";
+        assert!(message_stuck_at_prompt(pane, REACTION));
+    }
+
+    /// A submitted message echoes into the transcript ABOVE an empty input
+    /// box — only the last prompt line may be consulted, or every
+    /// successful send would look stuck.
+    #[test]
+    fn not_stuck_when_prompt_empty_and_message_echoed_in_transcript() {
+        let pane = "\
+❯ [Ninox] Worker `auth-fix`'s PR #12 merged.
+
+● Noted — spawning the follow-up worker.
+
+╭──────────────────────────────────────────────╮
+│ ❯                                            │
+╰──────────────────────────────────────────────╯";
+        assert!(!message_stuck_at_prompt(pane, "[Ninox] Worker `auth-fix`'s PR #12 merged."));
+    }
+
+    /// A human's half-typed message (or a placeholder hint) at the prompt
+    /// must never be treated as ours — a retry Enter here would submit
+    /// their unfinished message.
+    #[test]
+    fn not_stuck_when_prompt_holds_unrelated_text() {
+        let pane = "│ ❯ can you also update the readme while     │";
+        assert!(!message_stuck_at_prompt(pane, REACTION));
+    }
+
+    /// Panes without the Claude input prompt (plain shells, alt-screen
+    /// apps) give no signal — treat as delivered, never retry blindly.
+    #[test]
+    fn not_stuck_when_pane_has_no_prompt_marker() {
+        let pane = "$ echo hi\nhi\n$";
+        assert!(!message_stuck_at_prompt(pane, "echo hi"));
+    }
+
+    /// Happy path against a real pane: text lands and the call succeeds —
+    /// the verification pass must not false-positive on a ❯-less pane.
+    #[tokio::test]
+    async fn send_keys_delivers_to_a_plain_pane() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        send_keys(&id, "hello from ninox").await.unwrap();
+        let pane = capture_visible_plain(&id).await;
+        assert!(pane.contains("hello from ninox"), "pane: {pane}");
+        kill_session(&id).await.unwrap();
+    }
+
+    /// A message that stays visible at a `❯` prompt after Enter (the
+    /// stuck-paste failure mode) must surface as an error after the
+    /// retries are exhausted, not silently report success.
+    #[tokio::test]
+    async fn send_keys_errors_when_message_stays_stuck_at_a_prompt() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        // `cat > /dev/null` never redraws: the tty echo leaves our text
+        // sitting after the printed ❯ forever, exactly like a stuck paste.
+        create_session(&id, "/tmp", "printf '\\xe2\\x9d\\xaf '; exec cat > /dev/null", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        let err = send_keys(&id, "stuck message").await.unwrap_err();
+        assert!(err.to_string().contains("unsubmitted"), "err: {err}");
         kill_session(&id).await.unwrap();
     }
 
