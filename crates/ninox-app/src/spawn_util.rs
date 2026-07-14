@@ -449,8 +449,8 @@ yourself. It may save you the exploration entirely.
 
 Write down anything you discovered that the next session — orchestrator or
 worker — would otherwise have to rediscover: where something lives, why
-it's built the way it is, a gotcha you hit. Create or update a Markdown
-file under the section that fits:
+it's built the way it is, a gotcha you hit. Write it as a Markdown file
+under the section that fits:
 
 ```
 repos/          where repositories live, their purpose, entry points
@@ -463,9 +463,12 @@ relationships/  how repos, services, and teams connect
 errors/         known failure modes and how to resolve them
 ```
 
-Each file needs YAML frontmatter followed by a Markdown body:
+Each entry needs YAML frontmatter followed by a Markdown body. Use
+`ninox brain add <path>` to write it — this indexes the entry immediately,
+so it's queryable right away with no separate reindex step:
 
-```markdown
+```bash
+ninox brain add repos/my-crate.md <<'EOF'
 ---
 type: repo
 name: my-crate
@@ -480,12 +483,7 @@ Entry point: `src/main.rs`
 Build: `cargo build`
 
 Facts, not prose. Link related entries with `[[other-entry]]`.
-```
-
-Then rebuild the index so the write becomes queryable:
-
-```bash
-ninox brain index
+EOF
 ```
 
 ## The Rule
