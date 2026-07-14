@@ -104,6 +104,29 @@ impl Default for BrainHarvestConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Inbox messaging configuration
+// ---------------------------------------------------------------------------
+
+/// Opt-in (default OFF) file-based inbox for orchestrator↔worker messaging.
+///
+/// Off (default): `ninox send` and `Engine::send_to_session` behave exactly
+/// as before — the message is injected directly as verified keyboard input
+/// (`tmux::send_keys`, hardened in PR #69 with a pre-Enter delay and
+/// verify/retry).
+///
+/// On: the message is instead written durably to the target session's
+/// file-based inbox (`ninox_core::inbox`), drained by the Stop/
+/// UserPromptSubmit hooks installed in the worker's worktree settings (see
+/// `ninox_app::spawn_util::ensure_statusline_settings`) — keystrokes are
+/// then only a best-effort idle-wake nudge (`tmux::wake_idle_session`), not
+/// the message itself.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InboxMessagingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Session retention configuration
 // ---------------------------------------------------------------------------
 
@@ -172,6 +195,10 @@ pub struct AppConfig {
     /// `SessionRetentionConfig`.
     #[serde(default)]
     pub session_retention: SessionRetentionConfig,
+    /// File-based inbox toggle for orchestrator↔worker messaging. Opt-in,
+    /// default off — see `InboxMessagingConfig`.
+    #[serde(default)]
+    pub inbox_messaging: InboxMessagingConfig,
     /// Theme file name (resolves to `~/.config/ninox/themes/<name>.toml`) or
     /// an absolute/`~`-relative path. `None` uses `themes/field-notes.toml`
     /// if present, else the built-in Field Notes palettes.
@@ -200,6 +227,7 @@ impl Default for AppConfig {
             session_retention: SessionRetentionConfig::default(),
             theme_file:       None,
             harnesses:        BTreeMap::new(),
+            inbox_messaging:  InboxMessagingConfig::default(),
         }
     }
 }
@@ -464,6 +492,24 @@ mod tests {
         let toml_src = "port = 8080\nfont_size = 13.0\n\n[brain_harvest]\nenabled = false\n";
         let cfg: AppConfig = toml::from_str(toml_src).unwrap();
         assert!(!cfg.brain_harvest.enabled);
+    }
+
+    #[test]
+    fn inbox_messaging_defaults_to_disabled() {
+        assert!(!AppConfig::default().inbox_messaging.enabled);
+    }
+
+    #[test]
+    fn inbox_messaging_missing_table_defaults_to_disabled() {
+        let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert!(!cfg.inbox_messaging.enabled);
+    }
+
+    #[test]
+    fn inbox_messaging_can_be_enabled_via_config() {
+        let toml_src = "port = 8080\nfont_size = 13.0\n\n[inbox_messaging]\nenabled = true\n";
+        let cfg: AppConfig = toml::from_str(toml_src).unwrap();
+        assert!(cfg.inbox_messaging.enabled);
     }
 
     #[test]

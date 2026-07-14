@@ -479,6 +479,19 @@ async fn capture_visible_plain(session_id: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The trimmed content after the pane's last `❯` input-prompt line, with the
+/// input box's right border/padding stripped (`  msg   │` → `msg`). `None`
+/// when no prompt line is visible at all (plain shell, alt-screen app) —
+/// distinct from `Some("")`, an empty-but-present input box. Shared by
+/// [`message_stuck_at_prompt`] and [`wake_idle_session`].
+fn prompt_line_content(pane: &str) -> Option<&str> {
+    const PROMPT: char = '❯';
+    let line = pane.lines().rev().find(|l| l.contains(PROMPT))?;
+    let after = &line[line.rfind(PROMPT).unwrap() + PROMPT.len_utf8()..];
+    // Strip the input box's right border and padding: `  msg   │`.
+    Some(after.trim().trim_end_matches('│').trim())
+}
+
 /// Whether a message we just injected is sitting unsubmitted in the target
 /// pane's input box. Looks at the last line holding the `❯` input prompt:
 /// stuck means it shows a `[Pasted text #N]` attachment marker or the
@@ -487,13 +500,9 @@ async fn capture_visible_plain(session_id: &str) -> String {
 /// hint, a human's half-typed message — is NOT ours to submit, so this
 /// stays false and no retry Enter is ever sent at it.
 fn message_stuck_at_prompt(pane: &str, text: &str) -> bool {
-    const PROMPT: char = '❯';
-    let Some(line) = pane.lines().rev().find(|l| l.contains(PROMPT)) else {
+    let Some(content) = prompt_line_content(pane) else {
         return false;
     };
-    let after = &line[line.rfind(PROMPT).unwrap() + PROMPT.len_utf8()..];
-    // Strip the input box's right border and padding: `  msg   │`.
-    let content = after.trim().trim_end_matches('│').trim();
     if content.is_empty() {
         return false;
     }
@@ -515,6 +524,33 @@ fn message_stuck_at_prompt(pane: &str, text: &str) -> bool {
     // genuinely truncated line is pane-width, far above this floor.
     const MIN_TRUNCATED_MATCH_CHARS: usize = 10;
     content.chars().count() >= MIN_TRUNCATED_MATCH_CHARS && first_line.starts_with(content)
+}
+
+/// Marker text for [`wake_idle_session`]'s idle-wake nudge — never the
+/// actual message, which (when the opt-in file-based inbox is enabled) is
+/// delivered entirely through the Stop/UserPromptSubmit hooks' JSON output,
+/// not the keystroke. Kept short and distinctive so it can never collide
+/// with real content a human might be mid-typing.
+const IDLE_WAKE_NUDGE: &str = ".";
+
+/// Wake an idle session so its Stop/UserPromptSubmit hooks run and drain
+/// the file-based inbox (see `ninox_core::inbox`) sooner than the next
+/// natural turn boundary. Only meaningful when that opt-in inbox is
+/// enabled — the message itself never travels through this keystroke.
+///
+/// Skips sending anything unless the pane's input prompt is visibly present
+/// AND empty: a human mid-typing, or no visible prompt at all (alt-screen,
+/// still rendering), must never be clobbered by a nudge. When the box is
+/// safely empty, reuses [`send_keys`] verbatim so the nudge gets the exact
+/// same pre-Enter delay and verify/retry-Enter hardening as a real message.
+/// Losing the race here is not a delivery failure — the message is already
+/// durably written to the inbox file; this is only a latency optimization.
+pub async fn wake_idle_session(session_id: &str) -> Result<()> {
+    let pane = capture_visible_plain(session_id).await;
+    match prompt_line_content(&pane) {
+        Some("") => send_keys(session_id, IDLE_WAKE_NUDGE).await,
+        _ => Ok(()),
+    }
 }
 
 /// Write `bytes` to the session's master PTY via tmux's paste-buffer
@@ -699,6 +735,68 @@ mod tests {
                 "short prompt content {typed:?} must not count as our stuck message",
             );
         }
+    }
+
+    // ── prompt_line_content / wake_idle_session ─────────────────────────
+
+    #[test]
+    fn prompt_line_content_distinguishes_missing_from_empty_prompt() {
+        assert_eq!(prompt_line_content("$ echo hi\nhi\n$"), None);
+        assert_eq!(prompt_line_content("│ ❯                                            │"), Some(""));
+        assert_eq!(
+            prompt_line_content("│ ❯ hello there                                │"),
+            Some("hello there"),
+        );
+    }
+
+    /// A human mid-typing (or any other non-empty prompt content) must
+    /// never be clobbered by an idle-wake nudge.
+    #[tokio::test]
+    async fn wake_idle_session_skips_when_prompt_has_content() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        // Simulate a non-empty prompt directly (bypassing send_keys's own
+        // verify loop — this test only exercises wake_idle_session's
+        // pre-check).
+        run_session_scoped(&["send-keys", "-t", &id, "-l", "❯ half-typed message"]).await.unwrap();
+        run_session_scoped(&["send-keys", "-t", &id, "Enter"]).await.unwrap();
+        wait_for_pane_contains(&id, "half-typed message").await;
+
+        wake_idle_session(&id).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        let pane = capture_visible_plain(&id).await;
+        assert!(
+            !pane.lines().any(|l| l.trim() == IDLE_WAKE_NUDGE),
+            "must never nudge over a non-empty prompt: {pane}"
+        );
+        kill_session(&id).await.unwrap();
+    }
+
+    /// A visibly empty prompt is exactly when the nudge must fire.
+    #[tokio::test]
+    async fn wake_idle_session_sends_nudge_when_prompt_is_empty() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        // Simulate an empty Claude Code input prompt.
+        run_session_scoped(&["send-keys", "-t", &id, "-l", "❯ "]).await.unwrap();
+        run_session_scoped(&["send-keys", "-t", &id, "Enter"]).await.unwrap();
+        wait_for_pane_contains(&id, "❯").await;
+
+        wake_idle_session(&id).await.unwrap();
+
+        for _ in 0..50 {
+            if capture_visible_plain(&id).await.lines().any(|l| l.trim() == IDLE_WAKE_NUDGE) {
+                kill_session(&id).await.unwrap();
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        panic!("nudge marker {IDLE_WAKE_NUDGE:?} never appeared in the pane");
     }
 
     /// Happy path against a real pane: text lands and the call succeeds —

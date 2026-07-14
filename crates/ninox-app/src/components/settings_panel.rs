@@ -44,6 +44,7 @@ pub fn settings_panel(app: &App) -> Element<'_, Message> {
         theme_card(app),
         harnesses_card(app),
         workers_card(app),
+        messaging_card(app),
         version_card(app),
     ]
     .spacing(18)
@@ -252,6 +253,54 @@ fn workers_card(app: &App) -> Element<'_, Message> {
         );
     }
     card(app, "Workers", body.into())
+}
+
+/// Messaging card: the opt-in file-based inbox toggle
+/// (`[inbox_messaging].enabled`, default off — see
+/// `ninox_core::config::InboxMessagingConfig`). Off is the pre-existing
+/// behavior (direct verified keystroke injection); on drains messages
+/// through Stop/UserPromptSubmit hooks installed in worker worktrees,
+/// keeping keystrokes only as an idle-wake nudge. Same ink-fill toggle
+/// styling as `harnesses_card`'s per-harness switch.
+fn messaging_card(app: &App) -> Element<'_, Message> {
+    let s = &app.scheme;
+    let enabled = app.config.inbox_messaging.enabled;
+
+    let toggle = button(Space::new(0, 0))
+        .on_press(Message::SettingsToggleInboxMessaging)
+        .width(Length::Fixed(30.0))
+        .height(Length::Fixed(16.0))
+        .padding(0)
+        .style(move |_t, status| button::Style {
+            background: enabled.then_some(Background::Color(s.ink)),
+            text_color: s.ink,
+            border: Border {
+                color: if matches!(status, button::Status::Hovered) { s.accent } else { s.ink },
+                width: 1.5,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        });
+
+    let label = text("File-based inbox").size(14).font(SERIF)
+        .color(if enabled { s.ink } else { s.ink_2 });
+    let state_label = text(if enabled { "on" } else { "off" }).size(10).font(MONO).color(s.faint);
+
+    card(app, "Messaging", column![
+        row![toggle, Space::new(12, 0), label, Space::new(Length::Fill, 0), state_label]
+            .align_y(Alignment::Center),
+        Space::new(0, 10),
+        text(
+            "Off: orchestrator↔worker messages are injected as verified keystrokes (default). \
+             On: messages are delivered through Stop/UserPromptSubmit hooks in new worker \
+             worktrees, with keystrokes only used to wake an idle session."
+        )
+        .size(10)
+        .font(MONO)
+        .color(s.faint),
+    ]
+    .spacing(0)
+    .into())
 }
 
 /// A small filled pill button for the version card's update action —
