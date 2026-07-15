@@ -79,6 +79,27 @@ enum Command {
     /// session at this workspace. Invoked by Claude Code's own `statusLine`
     /// hook (see `.claude/settings.json`), not intended for direct use.
     Statusline,
+    /// File-based inbox drain hooks (installed in a worker's worktree
+    /// settings only when `[inbox_messaging].enabled = true` — see
+    /// `ninox_core::inbox`). Invoked by Claude Code's own Stop/
+    /// UserPromptSubmit hooks, not intended for direct use.
+    Inbox {
+        #[command(subcommand)]
+        action: InboxAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum InboxAction {
+    /// Stop hook entry point: drains pending inbox messages into a
+    /// `{"decision":"block","reason":...}` response so Claude Code
+    /// continues instead of actually stopping. Prints nothing when nothing
+    /// is pending, letting Claude Code stop normally.
+    DrainStop,
+    /// UserPromptSubmit hook entry point: drains pending inbox messages
+    /// into `hookSpecificOutput.additionalContext`, never touching the
+    /// submitted prompt itself.
+    DrainPrompt,
 }
 
 #[derive(Subcommand)]
@@ -146,13 +167,22 @@ enum BrainAction {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+    let command = args.command;
 
     // Fires on every assistant turn (event-driven) or every `refreshInterval`
     // seconds for every session Ninox spawns — must stay fast and never
     // trigger the tmux-config/wrapper-hook/self-shim setup below, none of
     // which this subcommand needs.
-    if matches!(args.command, Some(Command::Statusline)) {
+    if matches!(command, Some(Command::Statusline)) {
         run_statusline(args.db.unwrap_or_else(default_db_path));
+        return Ok(());
+    }
+
+    // Fires on every Stop/UserPromptSubmit turn of every worker with inbox
+    // messaging enabled — same "stay fast, skip the heavy setup" reasoning
+    // as Statusline above; this subcommand needs none of it either.
+    if let Some(Command::Inbox { action }) = command {
+        run_inbox(action);
         return Ok(());
     }
 
@@ -173,13 +203,22 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let store = Arc::new(Store::open(&db_path)?);
 
-    match args.command {
+    match command {
         Some(Command::Spawn { prompt, workspace, name, orchestrator_id }) => {
             let config = AppConfig::load().unwrap_or_default();
             run_spawn(store, config, prompt, workspace, name, orchestrator_id).await
         }
         Some(Command::Send { session_id, message }) => {
-            ninox_core::tmux::send_keys(&session_id, &message).await
+            let config = AppConfig::load().unwrap_or_default();
+            let sessions_dir = std::env::var("NINOX_DATA_DIR")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(AppConfig::sessions_dir);
+            ninox_core::messaging::deliver_message(
+                &store, &sessions_dir, &session_id, &message, config.inbox_messaging.enabled,
+            )
+            .await
         }
         Some(Command::RequestWork { description }) => {
             run_request_work(&description)
@@ -189,6 +228,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Statusline) => {
             run_statusline(db_path);
+            Ok(())
+        }
+        Some(Command::Inbox { action }) => {
+            run_inbox(action);
             Ok(())
         }
         None => run_tui(store, args.port, args.headless).await,
@@ -238,7 +281,7 @@ async fn run_spawn(
 
     // Create an isolated git worktree so workers don't share a branch.
     // Falls back to the shared workspace if the repo check fails (e.g. not git).
-    let effective_workspace = match create_worker_worktree(&workspace, &id).await {
+    let effective_workspace = match create_worker_worktree(&workspace, &id, config.inbox_messaging.enabled).await {
         Ok(path) => path,
         Err(e) => {
             tracing::warn!("worktree creation failed for {id}, using shared workspace: {e}");
@@ -426,6 +469,44 @@ fn run_request_work(description: &str) -> anyhow::Result<()> {
         request.id,
     );
     Ok(())
+}
+
+/// Handler for `ninox inbox drain-stop`/`drain-prompt` — the Stop/
+/// UserPromptSubmit hooks installed in a worker's worktree settings when
+/// inbox messaging is enabled (`ensure_statusline_settings`). Never returns
+/// an error and never panics: a broken inbox must never wedge the human's
+/// Claude Code session shut, so any failure here degrades to printing
+/// nothing (Stop proceeds normally / the prompt passes through untouched),
+/// with the actual error logged to stderr for debugging.
+fn run_inbox(action: InboxAction) {
+    use std::io::Read;
+    // Required by the Claude Code hook contract even though neither drain
+    // action needs any of its fields: pending-message dedup via mark-
+    // delivered already makes repeat Stop invocations (`stop_hook_active`)
+    // self-limiting — a second call only ever sees messages that arrived
+    // after the first block, never a stale batch re-blocking forever.
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+
+    let Some(session_id) = std::env::var("NINOX_SESSION").ok().filter(|s| !s.is_empty()) else {
+        eprintln!("ninox inbox: NINOX_SESSION not set — nothing to drain");
+        return;
+    };
+    let sessions_dir = std::env::var("NINOX_DATA_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(AppConfig::sessions_dir);
+
+    let response = match action {
+        InboxAction::DrainStop   => ninox_core::inbox::drain_for_stop(&sessions_dir, &session_id),
+        InboxAction::DrainPrompt => ninox_core::inbox::drain_for_prompt_submit(&sessions_dir, &session_id),
+    };
+    match response {
+        Ok(Some(json)) => println!("{json}"),
+        Ok(None) => {}
+        Err(e) => eprintln!("ninox inbox: {e}"),
+    }
 }
 
 /// Handler for `ninox statusline`. Never returns an error and never

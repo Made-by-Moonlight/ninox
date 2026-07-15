@@ -152,14 +152,33 @@ impl Engine {
         Ok(())
     }
 
-    /// Send a text message to the agent running in a session's tmux window.
-    /// The message is injected as keyboard input — the agent sees it as typed text.
-    /// Returns Ok(()) once delivery is verified (or gives no signal either way);
-    /// errors if the session has no active tmux window, tmux is unavailable, or
-    /// the message is still sitting unsubmitted at the input prompt after the
-    /// Enter retries (see `tmux::send_keys`).
+    /// Send a text message to a session (used by poller reactions).
+    ///
+    /// Gated by `AppConfig.inbox_messaging.enabled` (opt-in, default off —
+    /// see `crate::messaging::deliver_message`):
+    /// - off: unchanged — the message is injected as keyboard input, verified
+    ///   via `tmux::send_keys` (delivery-verified + Enter-retried, PR #69).
+    ///   Errors if the session has no active tmux window, tmux is
+    ///   unavailable, or the message is still sitting unsubmitted at the
+    ///   input prompt after the Enter retries.
+    /// - on: the message is written durably to the session's file-based
+    ///   inbox and a best-effort idle-wake nudge is sent; errors only if the
+    ///   inbox write itself fails.
     pub async fn send_to_session(&self, session_id: &str, message: &str) -> anyhow::Result<()> {
-        crate::tmux::send_keys(session_id, message).await
+        // `AppConfig::load()` is a small synchronous TOML read; called
+        // directly (not via `spawn_blocking`) here matches the existing
+        // convention elsewhere in this codebase (e.g. `main.rs::run_spawn`).
+        let inbox_enabled = crate::config::AppConfig::load()
+            .map(|c| c.inbox_messaging.enabled)
+            .unwrap_or(false);
+        // No `NINOX_DATA_DIR` fallback needed here (unlike the `ninox send`
+        // CLI / `run_request_work`): this runs inside the app's own
+        // process, which never has that env var set — only sessions the
+        // app spawns do.
+        crate::messaging::deliver_message(
+            &self.store, &crate::config::AppConfig::sessions_dir(), session_id, message, inbox_enabled,
+        )
+        .await
     }
 
     /// Kill the tmux session, mark it Terminated in the DB, and emit SessionUpdated.

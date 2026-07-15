@@ -479,6 +479,19 @@ async fn capture_visible_plain(session_id: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The trimmed content after the pane's last `❯` input-prompt line, with the
+/// input box's right border/padding stripped (`  msg   │` → `msg`). `None`
+/// when no prompt line is visible at all (plain shell, alt-screen app) —
+/// distinct from `Some("")`, an empty-but-present input box. Shared by
+/// [`message_stuck_at_prompt`] and [`wake_idle_session`].
+fn prompt_line_content(pane: &str) -> Option<&str> {
+    const PROMPT: char = '❯';
+    let line = pane.lines().rev().find(|l| l.contains(PROMPT))?;
+    let after = &line[line.rfind(PROMPT).unwrap() + PROMPT.len_utf8()..];
+    // Strip the input box's right border and padding: `  msg   │`.
+    Some(after.trim().trim_end_matches('│').trim())
+}
+
 /// Whether a message we just injected is sitting unsubmitted in the target
 /// pane's input box. Looks at the last line holding the `❯` input prompt:
 /// stuck means it shows a `[Pasted text #N]` attachment marker or the
@@ -487,13 +500,9 @@ async fn capture_visible_plain(session_id: &str) -> String {
 /// hint, a human's half-typed message — is NOT ours to submit, so this
 /// stays false and no retry Enter is ever sent at it.
 fn message_stuck_at_prompt(pane: &str, text: &str) -> bool {
-    const PROMPT: char = '❯';
-    let Some(line) = pane.lines().rev().find(|l| l.contains(PROMPT)) else {
+    let Some(content) = prompt_line_content(pane) else {
         return false;
     };
-    let after = &line[line.rfind(PROMPT).unwrap() + PROMPT.len_utf8()..];
-    // Strip the input box's right border and padding: `  msg   │`.
-    let content = after.trim().trim_end_matches('│').trim();
     if content.is_empty() {
         return false;
     }
@@ -515,6 +524,80 @@ fn message_stuck_at_prompt(pane: &str, text: &str) -> bool {
     // genuinely truncated line is pane-width, far above this floor.
     const MIN_TRUNCATED_MATCH_CHARS: usize = 10;
     content.chars().count() >= MIN_TRUNCATED_MATCH_CHARS && first_line.starts_with(content)
+}
+
+/// Marker text for [`wake_idle_session`]'s idle-wake nudge — never the
+/// actual message, which (when the opt-in file-based inbox is enabled) is
+/// delivered entirely through the Stop/UserPromptSubmit hooks' JSON output,
+/// not the keystroke. Kept short and distinctive so it can never collide
+/// with real content a human might be mid-typing.
+const IDLE_WAKE_NUDGE: &str = ".";
+
+/// Whether the pane's prompt currently holds ONLY the idle-wake nudge
+/// marker — nothing added, nothing removed. Used both right before sending
+/// Enter and (implicitly, by its absence) to detect that Enter already
+/// submitted cleanly.
+fn nudge_still_alone_at_prompt(pane: &str) -> bool {
+    prompt_line_content(pane) == Some(IDLE_WAKE_NUDGE)
+}
+
+/// Wake an idle session so its Stop/UserPromptSubmit hooks run and drain
+/// the file-based inbox (see `ninox_core::inbox`) sooner than the next
+/// natural turn boundary. Only meaningful when that opt-in inbox is
+/// enabled — the message itself never travels through this keystroke. For
+/// an idle session this nudge IS the only delivery trigger there is (no
+/// Stop/UserPromptSubmit fires on its own until something wakes it) — see
+/// `crate::messaging::deliver_message`'s doc comment for the resulting
+/// guarantee (best-effort, not "will always eventually drain").
+///
+/// Skips sending anything unless the pane's input prompt is visibly present
+/// AND empty: a human mid-typing, or no visible prompt at all (alt-screen,
+/// still rendering), must never be clobbered by a nudge. The one exception
+/// is the prompt holding EXACTLY our own nudge marker and nothing else —
+/// see the stale-nudge paragraph below.
+///
+/// Deliberately does NOT reuse [`send_keys`] wholesale: that function sends
+/// Enter unconditionally `SEND_SUBMIT_DELAY_MS` after the literal text, with
+/// no re-check of what else may have landed at the prompt in that window —
+/// fine for a real message the caller explicitly wants delivered, but not
+/// for a nudge whose entire point is to never touch a human's typing. After
+/// typing the nudge, this re-verifies the prompt still holds ONLY the nudge
+/// — nothing else — immediately before pressing Enter; if a human started
+/// typing in that window, Enter is withheld entirely (their in-progress
+/// input is left alone, nudge character included, rather than risking it
+/// being submitted on our behalf).
+///
+/// Withholding Enter that way creates its own hazard if left unhandled: the
+/// pane is then left showing just our nudge character, un-submitted. A
+/// later call would see that as "prompt has content" and skip entirely —
+/// forever, since nothing else will ever clear a marker only we would type.
+/// That would permanently wedge delivery to an idle session behind a single
+/// lost race. Closed by treating "prompt holds exactly our nudge marker" as
+/// recognizably OUR OWN leftover from a previous attempt rather than a
+/// human's input: submit it immediately (verified Enter) instead of typing
+/// a fresh one. Losing today's race is still not a delivery failure — the
+/// message is already durably written to the inbox file — so no retry loop
+/// is needed for the fresh-nudge path either.
+pub async fn wake_idle_session(session_id: &str) -> Result<()> {
+    let pane = capture_visible_plain(session_id).await;
+    match prompt_line_content(&pane) {
+        Some("") => {} // proceed to type a fresh nudge below
+        Some(IDLE_WAKE_NUDGE) => {
+            // Our own nudge, left over un-submitted from a previous call —
+            // submit it now rather than treating the box as permanently
+            // occupied.
+            return run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await.map(|_| ());
+        }
+        _ => return Ok(()), // genuinely occupied by something else
+    }
+
+    run_session_scoped(&["send-keys", "-t", session_id, "-l", IDLE_WAKE_NUDGE]).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(SEND_SUBMIT_DELAY_MS)).await;
+
+    if !nudge_still_alone_at_prompt(&capture_visible_plain(session_id).await) {
+        return Ok(());
+    }
+    run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await.map(|_| ())
 }
 
 /// Write `bytes` to the session's master PTY via tmux's paste-buffer
@@ -699,6 +782,166 @@ mod tests {
                 "short prompt content {typed:?} must not count as our stuck message",
             );
         }
+    }
+
+    // ── prompt_line_content / wake_idle_session ─────────────────────────
+
+    #[test]
+    fn prompt_line_content_distinguishes_missing_from_empty_prompt() {
+        assert_eq!(prompt_line_content("$ echo hi\nhi\n$"), None);
+        assert_eq!(prompt_line_content("│ ❯                                            │"), Some(""));
+        assert_eq!(
+            prompt_line_content("│ ❯ hello there                                │"),
+            Some("hello there"),
+        );
+    }
+
+    #[test]
+    fn nudge_still_alone_at_prompt_true_when_only_the_nudge_is_present() {
+        let pane = "│ ❯ .                                          │";
+        assert!(nudge_still_alone_at_prompt(pane));
+    }
+
+    /// A human who started typing during the pre-Enter delay must fail
+    /// this check — this is the exact signal `wake_idle_session` uses to
+    /// withhold Enter rather than submit their partial input.
+    #[test]
+    fn nudge_still_alone_at_prompt_false_once_more_text_is_appended() {
+        let pane = "│ ❯ .oops I started typing                    │";
+        assert!(!nudge_still_alone_at_prompt(pane));
+    }
+
+    #[test]
+    fn nudge_still_alone_at_prompt_false_once_the_prompt_is_empty_again() {
+        // Either it already submitted cleanly, or something else cleared
+        // the box — either way it's no longer "just the nudge".
+        let pane = "│ ❯                                            │";
+        assert!(!nudge_still_alone_at_prompt(pane));
+    }
+
+    #[test]
+    fn nudge_still_alone_at_prompt_false_when_no_prompt_is_visible() {
+        assert!(!nudge_still_alone_at_prompt("$ echo hi\nhi\n$"));
+    }
+
+    /// A human mid-typing (or any other non-empty prompt content) must
+    /// never be clobbered by an idle-wake nudge.
+    #[tokio::test]
+    async fn wake_idle_session_skips_when_prompt_has_content() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        // Simulate a non-empty prompt directly (bypassing send_keys's own
+        // verify loop — this test only exercises wake_idle_session's
+        // pre-check).
+        run_session_scoped(&["send-keys", "-t", &id, "-l", "❯ half-typed message"]).await.unwrap();
+        run_session_scoped(&["send-keys", "-t", &id, "Enter"]).await.unwrap();
+        wait_for_pane_contains(&id, "half-typed message").await;
+
+        wake_idle_session(&id).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        let pane = capture_visible_plain(&id).await;
+        assert!(
+            !pane.lines().any(|l| l.trim() == IDLE_WAKE_NUDGE),
+            "must never nudge over a non-empty prompt: {pane}"
+        );
+        kill_session(&id).await.unwrap();
+    }
+
+    /// A visibly empty prompt is exactly when the nudge must fire.
+    #[tokio::test]
+    async fn wake_idle_session_sends_nudge_when_prompt_is_empty() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        // Simulate an empty Claude Code input prompt: literal text with NO
+        // Enter, so the cursor stays on this exact line — matching how a
+        // real redrawing TUI box keeps typed characters on the same line
+        // as ❯ rather than advancing to a fresh line the way Enter would.
+        run_session_scoped(&["send-keys", "-t", &id, "-l", "❯ "]).await.unwrap();
+        wait_for_pane_contains(&id, "❯").await;
+
+        wake_idle_session(&id).await.unwrap();
+
+        // Enter must have been pressed: cat processes the completed line
+        // and echoes it back once it receives the newline.
+        wait_for_pane_contains(&id, "❯ .").await;
+        kill_session(&id).await.unwrap();
+    }
+
+    /// Regression test for the stall this closes: if a previous
+    /// `wake_idle_session` call typed the nudge but had Enter withheld
+    /// (e.g. it lost the pre-Enter recapture race), the box is left
+    /// showing just the nudge marker, un-submitted. A naive re-application
+    /// of the "prompt must be empty" check would see that as permanently
+    /// occupied and skip forever — wedging every future delivery attempt
+    /// to this idle session behind one lost race. Recognizing "prompt
+    /// holds exactly our own marker" as ours to submit closes that.
+    #[tokio::test]
+    async fn wake_idle_session_submits_its_own_stale_nudge_instead_of_stalling_forever() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        let marker_line = format!("❯ {IDLE_WAKE_NUDGE}");
+        // Simulate a previous attempt that typed the nudge but never
+        // pressed Enter — no Enter here either, so the cursor stays put.
+        run_session_scoped(&["send-keys", "-t", &id, "-l", &marker_line]).await.unwrap();
+        wait_for_pane_contains(&id, &marker_line).await;
+
+        wake_idle_session(&id).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        // Submission must have happened immediately (no fresh nudge typed,
+        // no delay): cat echoes the completed line, so the marker line
+        // now appears twice (once from the still-visible original typing,
+        // once from cat's echo of what it read on Enter).
+        let pane = capture_visible_plain(&id).await;
+        let occurrences = pane.lines().filter(|l| l.trim() == marker_line).count();
+        assert_eq!(
+            occurrences, 2,
+            "a stale nudge left over from a previous attempt must be submitted, \
+             not left stuck (which would wedge every future delivery): {pane}"
+        );
+        kill_session(&id).await.unwrap();
+    }
+
+    /// The core race this hardens against: a human starts typing during the
+    /// nudge's own pre-Enter delay window. Injects extra keystrokes into
+    /// the same line ~100ms after the nudge lands (well inside
+    /// `SEND_SUBMIT_DELAY_MS` = 300ms) and asserts Enter was withheld: the
+    /// accumulated line must still be sitting unsubmitted, not echoed back
+    /// by cat as a completed transcript line (which would happen twice —
+    /// once from the live tty echo of typing, once from cat's own echo of
+    /// what it read — if Enter had wrongly been sent).
+    #[tokio::test]
+    async fn wake_idle_session_withholds_enter_if_typing_starts_during_the_delay() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        run_session_scoped(&["send-keys", "-t", &id, "-l", "❯ "]).await.unwrap();
+        wait_for_pane_contains(&id, "❯").await;
+
+        let id2 = id.clone();
+        let racer = tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            run_session_scoped(&["send-keys", "-t", &id2, "-l", "oops"]).await.unwrap();
+        });
+        wake_idle_session(&id).await.unwrap();
+        racer.await.unwrap();
+        sleep(Duration::from_millis(500)).await; // let any wrongly-sent Enter's effects settle
+
+        let pane = capture_visible_plain(&id).await;
+        let occurrences = pane.lines().filter(|l| l.contains("oops")).count();
+        assert_eq!(
+            occurrences, 1,
+            "the human's typing must never be submitted on our behalf: {pane}"
+        );
+        kill_session(&id).await.unwrap();
     }
 
     /// Happy path against a real pane: text lands and the call succeeds —

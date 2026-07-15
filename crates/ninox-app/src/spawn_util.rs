@@ -240,7 +240,15 @@ pub fn repo_from_workspace(workspace: &str) -> Option<String> {
 /// tree checkout, not the cheap metadata query `repo_from_workspace` does —
 /// running it directly on the calling task would tie up a runtime worker
 /// thread for that whole checkout.
-pub async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Result<String> {
+///
+/// `inbox_enabled` is the caller's `AppConfig.inbox_messaging.enabled` —
+/// threaded through explicitly (rather than read here via
+/// `AppConfig::load()`) so callers control it and tests can exercise both
+/// states without touching the real user config file. See
+/// `ensure_statusline_settings`.
+pub async fn create_worker_worktree(
+    repo: &str, session_id: &str, inbox_enabled: bool,
+) -> anyhow::Result<String> {
     use anyhow::Context as _;
 
     let repo = repo.to_string();
@@ -250,7 +258,7 @@ pub async fn create_worker_worktree(repo: &str, session_id: &str) -> anyhow::Res
             .join(".claude")
             .join("worktrees")
             .join(&session_id);
-        create_worktree_at(std::path::Path::new(&repo), &worktree_path, &session_id)
+        create_worktree_at(std::path::Path::new(&repo), &worktree_path, &session_id, inbox_enabled)
     })
     .await
     .context("worktree creation task panicked")?
@@ -284,6 +292,7 @@ pub async fn ensure_session_workspace(
     workspace:       &str,
     session_id:      &str,
     is_orchestrator: bool,
+    inbox_enabled:   bool,
 ) -> anyhow::Result<()> {
     if std::path::Path::new(workspace).is_dir() {
         return Ok(());
@@ -302,7 +311,7 @@ pub async fn ensure_session_workspace(
         std::path::Path::new(repo_root).is_dir(),
         "workspace {workspace} is gone and its repo root {repo_root} no longer exists"
     );
-    create_worker_worktree(repo_root, session_id).await?;
+    create_worker_worktree(repo_root, session_id, inbox_enabled).await?;
     if let Err(e) = seed_worker_brain_skill(workspace).await {
         tracing::warn!("failed to re-seed brain skill for {session_id}: {e}");
     }
@@ -345,6 +354,7 @@ pub fn create_worktree_at(
     repo_root: &std::path::Path,
     target: &std::path::Path,
     branch: &str,
+    inbox_enabled: bool,
 ) -> anyhow::Result<String> {
     use anyhow::Context as _;
     use std::process::Command;
@@ -370,7 +380,7 @@ pub fn create_worktree_at(
         .context("git worktree add")?;
 
     if out.status.success() {
-        ensure_statusline_settings(target);
+        ensure_statusline_settings(target, inbox_enabled);
         return Ok(target_str);
     }
 
@@ -382,7 +392,7 @@ pub fn create_worktree_at(
             .output()
             .context("git worktree add (existing branch)")?;
         if out2.status.success() {
-            ensure_statusline_settings(target);
+            ensure_statusline_settings(target, inbox_enabled);
             return Ok(target_str);
         }
         anyhow::bail!("{}", String::from_utf8_lossy(&out2.stderr).trim());
@@ -391,12 +401,19 @@ pub fn create_worktree_at(
     anyhow::bail!("{}", stderr.trim());
 }
 
-/// Write a minimal `.claude/settings.json` (`statusLine` only) into a
-/// freshly created worker worktree, unless one already exists (e.g.
-/// checked into the branch). Best-effort: any failure here must never fail
-/// worktree creation itself, so errors are swallowed rather than
-/// propagated.
-fn ensure_statusline_settings(worktree_path: &std::path::Path) {
+/// Write a minimal `.claude/settings.json` (`statusLine`, plus the inbox
+/// drain hooks when opt-in messaging is enabled) into a freshly created
+/// worker worktree, unless one already exists (e.g. checked into the
+/// branch). Best-effort: any failure here must never fail worktree
+/// creation itself, so errors are swallowed rather than propagated.
+///
+/// `inbox_enabled` gates the `Stop`/`UserPromptSubmit` hooks that drain the
+/// file-based inbox (`ninox_core::inbox`) — off (the default), this
+/// produces byte-for-byte the same settings as before that feature existed.
+/// On, it installs hooks that run `ninox inbox drain-stop`/`drain-prompt`,
+/// which the harness invokes with `NINOX_SESSION`/`NINOX_DATA_DIR` already
+/// set (see `interactive_env_vars`/`worker_env_vars`).
+fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bool) {
     let claude_dir = worktree_path.join(".claude");
     let settings_path = claude_dir.join("settings.json");
     if settings_path.exists() {
@@ -409,13 +426,34 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path) {
     // unquoted path here would be split into two argv tokens by the shell
     // that ultimately runs this command and never resolve to the binary.
     let ninox_bin_quoted = format!("'{}'", ninox_bin.replace('\'', "'\\''"));
-    let settings = serde_json::json!({
+    let mut settings = serde_json::json!({
         "statusLine": {
             "type": "command",
             "command": format!("{ninox_bin_quoted} statusline"),
             "refreshInterval": 20
         }
     });
+    if inbox_enabled {
+        // Claude Code hook `timeout` is in SECONDS, not milliseconds — 5
+        // gives these fast, local-filesystem-only drains a generous margin
+        // without risking an accidental multi-minute hang on a hook error.
+        settings["hooks"] = serde_json::json!({
+            "Stop": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{ninox_bin_quoted} inbox drain-stop"),
+                    "timeout": 5
+                }]
+            }],
+            "UserPromptSubmit": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{ninox_bin_quoted} inbox drain-prompt"),
+                    "timeout": 5
+                }]
+            }]
+        });
+    }
     if std::fs::create_dir_all(&claude_dir).is_ok() {
         if let Ok(body) = serde_json::to_string_pretty(&settings) {
             let _ = std::fs::write(&settings_path, body);
@@ -606,7 +644,7 @@ mod tests {
     #[tokio::test]
     async fn create_worker_worktree_writes_statusline_settings() {
         let repo = init_git_repo();
-        let worktree = create_worker_worktree(repo.to_str().unwrap(), "test-session-1").await.unwrap();
+        let worktree = create_worker_worktree(repo.to_str().unwrap(), "test-session-1", false).await.unwrap();
 
         let settings_path = std::path::Path::new(&worktree).join(".claude").join("settings.json");
         let settings: serde_json::Value = serde_json::from_str(
@@ -623,6 +661,27 @@ mod tests {
             .unwrap();
         assert!(bin_path.ends_with("/ninox"), "expected a path to the ninox binary, got: {bin_path}");
         assert!(command.ends_with("statusline"));
+        // Off by default: no hooks table at all — byte-for-byte what this
+        // worktree's settings looked like before inbox messaging existed.
+        assert!(settings.get("hooks").is_none(), "hooks must be absent when inbox messaging is disabled");
+    }
+
+    #[tokio::test]
+    async fn create_worker_worktree_installs_inbox_hooks_when_enabled() {
+        let repo = init_git_repo();
+        let worktree = create_worker_worktree(repo.to_str().unwrap(), "test-session-inbox", true).await.unwrap();
+
+        let settings_path = std::path::Path::new(&worktree).join(".claude").join("settings.json");
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&settings_path).unwrap(),
+        ).unwrap();
+        // statusLine must still be there, untouched.
+        assert_eq!(settings["statusLine"]["type"], "command");
+
+        let stop_cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(stop_cmd.ends_with("inbox drain-stop"), "unexpected Stop hook command: {stop_cmd}");
+        let prompt_cmd = settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(prompt_cmd.ends_with("inbox drain-prompt"), "unexpected UserPromptSubmit hook command: {prompt_cmd}");
     }
 
     #[tokio::test]
@@ -645,7 +704,7 @@ mod tests {
         // docstring describes: "unless one already exists (e.g. checked
         // into the branch)".
         let repo = init_git_repo();
-        let first = create_worker_worktree(repo.to_str().unwrap(), "test-session-2").await.unwrap();
+        let first = create_worker_worktree(repo.to_str().unwrap(), "test-session-2", false).await.unwrap();
         let settings_path = std::path::Path::new(&first).join(".claude").join("settings.json");
         std::fs::write(&settings_path, r#"{"userCustom": true}"#).unwrap();
         std::process::Command::new("git")
@@ -662,7 +721,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let second = create_worker_worktree(repo.to_str().unwrap(), "test-session-2").await.unwrap();
+        let second = create_worker_worktree(repo.to_str().unwrap(), "test-session-2", false).await.unwrap();
         let contents = std::fs::read_to_string(
             std::path::Path::new(&second).join(".claude").join("settings.json"),
         ).unwrap();
@@ -672,7 +731,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_session_workspace_recreates_missing_worker_worktree() {
         let repo = init_git_repo();
-        let worktree = create_worker_worktree(repo.to_str().unwrap(), "ensure-ws-1").await.unwrap();
+        let worktree = create_worker_worktree(repo.to_str().unwrap(), "ensure-ws-1", false).await.unwrap();
         // Simulate post-merge teardown: the worktree dir is gone, the branch
         // (and the claude transcript keyed to this path) survive.
         std::process::Command::new("git")
@@ -681,7 +740,7 @@ mod tests {
             .unwrap();
         assert!(!std::path::Path::new(&worktree).exists(), "sanity: worktree removed");
 
-        ensure_session_workspace(&worktree, "ensure-ws-1", false).await.unwrap();
+        ensure_session_workspace(&worktree, "ensure-ws-1", false, false).await.unwrap();
 
         assert!(std::path::Path::new(&worktree).is_dir(), "worktree must be recreated at the same path");
         let out = std::process::Command::new("git")
@@ -697,7 +756,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_session_workspace_recreates_worktree_even_when_the_branch_is_gone() {
         let repo = init_git_repo();
-        let worktree = create_worker_worktree(repo.to_str().unwrap(), "ensure-ws-2").await.unwrap();
+        let worktree = create_worker_worktree(repo.to_str().unwrap(), "ensure-ws-2", false).await.unwrap();
         // Full cleanup teardown: worktree AND branch both removed. Only the
         // claude transcript (keyed to this path, under ~/.claude/projects/)
         // survives — respawning to see that context must still work.
@@ -710,7 +769,7 @@ mod tests {
             .output()
             .unwrap();
 
-        ensure_session_workspace(&worktree, "ensure-ws-2", false).await.unwrap();
+        ensure_session_workspace(&worktree, "ensure-ws-2", false, false).await.unwrap();
 
         assert!(std::path::Path::new(&worktree).is_dir(), "worktree must be recreated at the same path");
         let out = std::process::Command::new("git")
@@ -726,14 +785,14 @@ mod tests {
     #[tokio::test]
     async fn ensure_session_workspace_recovers_a_manually_deleted_worktree() {
         let repo = init_git_repo();
-        let worktree = create_worker_worktree(repo.to_str().unwrap(), "ensure-ws-3").await.unwrap();
+        let worktree = create_worker_worktree(repo.to_str().unwrap(), "ensure-ws-3", false).await.unwrap();
         // A user pruning `.claude/worktrees/` does `rm -rf`, not `git
         // worktree remove` — git then still has the worktree REGISTERED
         // ("missing but already registered worktree"), which makes a naive
         // `git worktree add` fail on both the -b and existing-branch paths.
         std::fs::remove_dir_all(&worktree).unwrap();
 
-        ensure_session_workspace(&worktree, "ensure-ws-3", false).await.unwrap();
+        ensure_session_workspace(&worktree, "ensure-ws-3", false, false).await.unwrap();
 
         assert!(std::path::Path::new(&worktree).is_dir(), "worktree must be recreated at the same path");
         let out = std::process::Command::new("git")
@@ -746,7 +805,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_session_workspace_is_a_noop_when_the_dir_exists() {
         let dir = tempdir().unwrap().keep();
-        ensure_session_workspace(dir.to_str().unwrap(), "whatever", false).await.unwrap();
+        ensure_session_workspace(dir.to_str().unwrap(), "whatever", false, false).await.unwrap();
         assert!(dir.is_dir());
     }
 
@@ -755,7 +814,7 @@ mod tests {
         // A missing dir that is NOT a ninox worktree ({repo}/.claude/
         // worktrees/{session_id}) can't be safely recreated — error out so
         // the spawn fails visibly instead of claude starting in $HOME.
-        let result = ensure_session_workspace("/definitely/not/a/real/dir", "sess-x", false).await;
+        let result = ensure_session_workspace("/definitely/not/a/real/dir", "sess-x", false, false).await;
         assert!(result.is_err());
     }
 
@@ -768,7 +827,7 @@ mod tests {
         let ws = parent.join("orch-1");
         assert!(!ws.exists());
 
-        ensure_session_workspace(ws.to_str().unwrap(), "orch-1", true).await.unwrap();
+        ensure_session_workspace(ws.to_str().unwrap(), "orch-1", true, false).await.unwrap();
 
         assert!(ws.is_dir(), "orchestrator workspace must be recreated as a plain dir");
     }
@@ -792,7 +851,7 @@ mod tests {
     fn find_repo_root_recognizes_a_linked_worktrees_gitfile() {
         let repo = init_git_repo();
         let worktree = repo.join("wt1");
-        create_worktree_at(&repo, &worktree, "wt1-branch").unwrap();
+        create_worktree_at(&repo, &worktree, "wt1-branch", false).unwrap();
         assert!(
             worktree.join(".git").is_file(),
             "sanity: a linked worktree's .git is a gitfile, not a directory"
@@ -806,10 +865,10 @@ mod tests {
     fn create_worktree_at_fails_when_branch_is_checked_out_in_another_worktree() {
         let repo = init_git_repo();
         let first = repo.join("first");
-        create_worktree_at(&repo, &first, "dup-branch").unwrap();
+        create_worktree_at(&repo, &first, "dup-branch", false).unwrap();
 
         let second = repo.join("second");
-        let result = create_worktree_at(&repo, &second, "dup-branch");
+        let result = create_worktree_at(&repo, &second, "dup-branch", false);
 
         assert!(
             result.is_err(),
@@ -823,7 +882,7 @@ mod tests {
         let repo = init_git_repo();
         let target = repo.join(".claude").join("worktrees").join("feat-new-thing");
 
-        let created = create_worktree_at(&repo, &target, "feat-new-thing").unwrap();
+        let created = create_worktree_at(&repo, &target, "feat-new-thing", false).unwrap();
 
         assert_eq!(created, target.to_string_lossy());
         assert!(target.join(".git").exists());
@@ -842,14 +901,14 @@ mod tests {
         let repo = init_git_repo();
         let target = repo.join(".claude").join("worktrees").join("feat-existing");
 
-        let first = create_worktree_at(&repo, &target, "feat-existing").unwrap();
+        let first = create_worktree_at(&repo, &target, "feat-existing", false).unwrap();
         std::process::Command::new("git")
             .args(["-C", &repo.to_string_lossy(), "worktree", "remove", "--force", &first])
             .output()
             .unwrap();
         assert!(!target.exists(), "sanity: worktree dir removed but branch remains");
 
-        let second = create_worktree_at(&repo, &target, "feat-existing").unwrap();
+        let second = create_worktree_at(&repo, &target, "feat-existing", false).unwrap();
 
         assert_eq!(second, target.to_string_lossy());
         let out = std::process::Command::new("git")

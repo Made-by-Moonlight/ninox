@@ -282,6 +282,9 @@ pub enum Message {
     SettingsWorkerModel(String),
     SettingsWorkerCustomModel(String),
     SettingsWorkerCustomCommit,
+    /// Flip the opt-in file-based inbox toggle (`[inbox_messaging].enabled`,
+    /// default off — see `ninox_core::config::InboxMessagingConfig`).
+    SettingsToggleInboxMessaging,
     BrainSelectEntry(String),
     /// The pinboard canvas's hovered node changed (including to/from `None`)
     /// — emitted only on change, never on every mouse move.
@@ -1158,7 +1161,9 @@ impl App {
                                         .and_then(|n| n.to_str())
                                         .unwrap_or(&workspace)
                                         .to_string();
-                                    match crate::spawn_util::create_worktree_at(&root, &ws_path, &branch) {
+                                    match crate::spawn_util::create_worktree_at(
+                                        &root, &ws_path, &branch, state.config.inbox_messaging.enabled,
+                                    ) {
                                         Ok(created) => workspace = created,
                                         Err(e) => {
                                             if let Some(f) = &mut state.spawn_modal {
@@ -1254,13 +1259,14 @@ impl App {
                         let engine = state.engine.clone();
                         let nm     = name;
                         let ts_i64 = ts as i64;
+                        let inbox_enabled = state.config.inbox_messaging.enabled;
 
                         Task::future(async move {
                             // Isolate the session on its own branch/worktree when
                             // the workspace is a git repo; otherwise work in the
                             // directory itself (same fallback as run_spawn).
                             let effective_ws =
-                                match crate::spawn_util::create_worker_worktree(&workspace, &sid).await {
+                                match crate::spawn_util::create_worker_worktree(&workspace, &sid, inbox_enabled).await {
                                     Ok(path) => path,
                                     Err(e) => {
                                         tracing::warn!(
@@ -1537,6 +1543,7 @@ impl App {
                 let repo    = session.repo.clone();
                 let orch_id = session.orchestrator_id.clone();
                 let summary = session.summary.clone();
+                let inbox_enabled = state.config.inbox_messaging.enabled;
                 Task::future(async move {
                     // Ignore kill errors — a Terminated husk has no tmux
                     // session, and Re-file on one "just spawns". The
@@ -1548,7 +1555,7 @@ impl App {
                     // Same workspace-restoration guard as Resume below —
                     // without it a torn-down worktree makes tmux silently
                     // start the fresh agent in $HOME.
-                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id, is_orch).await {
+                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id, is_orch, inbox_enabled).await {
                         tracing::warn!("re-file {id}: cannot restore workspace: {e}");
                     }
                     let attach = crate::spawn_util::spawn_interactive_session(
@@ -1603,6 +1610,7 @@ impl App {
                 let repo    = session.repo.clone();
                 let orch_id = session.orchestrator_id.clone();
                 let summary = session.summary.clone();
+                let inbox_enabled = state.config.inbox_messaging.enabled;
                 Task::future(async move {
                     let _ = ninox_core::tmux::kill_session(&id).await;
                     // The worktree may have been torn down since the session
@@ -1613,7 +1621,7 @@ impl App {
                     // rejects a missing workspace, so the spawn fails
                     // visibly into `failure_status` instead of the agent
                     // silently starting in $HOME.
-                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id, is_orch).await {
+                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id, is_orch, inbox_enabled).await {
                         tracing::warn!("resume {id}: cannot restore workspace: {e}");
                     }
                     let attach = crate::spawn_util::spawn_interactive_session(
@@ -1961,6 +1969,14 @@ impl App {
                     if let Err(e) = state.config.save() {
                         tracing::warn!("failed to save worker model: {e}");
                     }
+                }
+                Task::none()
+            }
+
+            Message::SettingsToggleInboxMessaging => {
+                state.config.inbox_messaging.enabled = !state.config.inbox_messaging.enabled;
+                if let Err(e) = state.config.save() {
+                    tracing::warn!("failed to save config after toggling inbox messaging: {e}");
                 }
                 Task::none()
             }
@@ -5230,7 +5246,7 @@ mod tests {
         // Pre-create the branch (and worktree), then remove just the
         // worktree registration so the path is missing again but the
         // branch survives — exercising the "already exists" fallback.
-        crate::spawn_util::create_worktree_at(&repo, &missing, "feat-existing").unwrap();
+        crate::spawn_util::create_worktree_at(&repo, &missing, "feat-existing", false).unwrap();
         std::process::Command::new("git")
             .args(["-C", &repo.to_string_lossy(), "worktree", "remove", "--force", &missing_str])
             .output()
@@ -5271,7 +5287,7 @@ mod tests {
         // same repo, so `create_worktree_at`'s fallback (checkout without
         // `-b`) fails too — a real git error create_worktree_at can surface.
         let repo = init_git_repo();
-        crate::spawn_util::create_worktree_at(&repo, &repo.join("first"), "dup-branch").unwrap();
+        crate::spawn_util::create_worktree_at(&repo, &repo.join("first"), "dup-branch", false).unwrap();
         let missing = repo.join(".claude").join("worktrees").join("dup-branch");
         let missing_str = missing.to_string_lossy().to_string();
 
