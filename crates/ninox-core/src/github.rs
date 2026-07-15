@@ -3,6 +3,8 @@ use async_trait::async_trait;
 use reqwest::{header, Client};
 use serde::Deserialize;
 
+use crate::types::Comment;
+
 // ---------------------------------------------------------------------------
 // Public data types
 // ---------------------------------------------------------------------------
@@ -34,12 +36,13 @@ pub struct CheckRun {
 
 #[derive(Debug, Clone)]
 pub struct ReviewThread {
-    pub id:     i64,
-    pub author: String,
-    pub body:   String,
-    pub path:   Option<String>,
-    pub line:   Option<u32>,
-    pub state:  String,  // "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED"
+    pub id:         i64,
+    pub author:     String,
+    pub body:       String,
+    pub path:       Option<String>,
+    pub line:       Option<u32>,
+    pub state:      String,  // "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED"
+    pub created_at: i64,     // unix millis
 }
 
 // ---------------------------------------------------------------------------
@@ -75,19 +78,30 @@ struct GhCheckRun {
 
 #[derive(Deserialize)]
 struct GhReview {
-    id:   i64,
-    user: GhUser,
-    body: String,
-    state: String,
+    id:         i64,
+    user:       GhUser,
+    body:       String,
+    state:      String,
+    #[serde(default)]
+    submitted_at: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct GhReviewComment {
-    id:   i64,
-    user: GhUser,
-    body: String,
-    path: Option<String>,
-    line: Option<u32>,
+    id:         i64,
+    user:       GhUser,
+    body:       String,
+    path:       Option<String>,
+    line:       Option<u32>,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+struct GhIssueComment {
+    id:         i64,
+    user:       GhUser,
+    body:       String,
+    created_at: String,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +126,12 @@ pub trait GithubApi: Send + Sync {
     async fn get_pr_status(&self, owner: &str, repo: &str, pr_number: u64) -> Result<PrStatus>;
     async fn get_ci_checks(&self, owner: &str, repo: &str, head_sha: &str) -> Result<Vec<CheckRun>>;
     async fn get_review_threads(&self, owner: &str, repo: &str, pr_number: u64) -> Result<Vec<ReviewThread>>;
+    /// The PR's main conversation-tab comments (`GET
+    /// /repos/{owner}/{repo}/issues/{pr_number}/comments`) — distinct from
+    /// `get_review_threads`, which only covers review submissions and inline
+    /// diff comments. Mapped directly into `Comment` (`path`/`line` are
+    /// always `None` — issue comments aren't anchored to a diff position).
+    async fn get_issue_comments(&self, owner: &str, repo: &str, pr_number: u64) -> Result<Vec<Comment>>;
     /// Find an open PR whose head branch is `branch`, independent of any
     /// metadata the `gh` wrapper hook may or may not have recorded — the
     /// active fallback for PRs created outside the wrapped `gh pr create`.
@@ -241,26 +261,58 @@ impl GithubApi for GitHubClient {
             .await?;
 
         let mut threads: Vec<ReviewThread> = reviews.into_iter().map(|r| ReviewThread {
-            id:     r.id,
-            author: r.user.login,
-            body:   r.body,
-            path:   None,
-            line:   None,
-            state:  r.state,
+            id:         r.id,
+            author:     r.user.login,
+            body:       r.body,
+            path:       None,
+            line:       None,
+            state:      r.state,
+            created_at: r.submitted_at.as_deref().map(parse_github_timestamp).unwrap_or(0),
         }).collect();
 
         for c in comments {
             threads.push(ReviewThread {
-                id:     c.id,
-                author: c.user.login,
-                body:   c.body,
-                path:   c.path,
-                line:   c.line,
-                state:  "COMMENTED".to_string(),
+                id:         c.id,
+                author:     c.user.login,
+                body:       c.body,
+                path:       c.path,
+                line:       c.line,
+                state:      "COMMENTED".to_string(),
+                created_at: parse_github_timestamp(&c.created_at),
             });
         }
 
         Ok(threads)
+    }
+
+    async fn get_issue_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<Comment>> {
+        let url = format!(
+            "https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments?per_page=100"
+        );
+        let comments: Vec<GhIssueComment> = self
+            .http
+            .get(&url)
+            .header(header::AUTHORIZATION, self.auth())
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        Ok(comments.into_iter().map(|c| Comment {
+            id:         c.id,
+            pr_id:      pr_number as i64,
+            author:     c.user.login,
+            body:       c.body,
+            path:       None,
+            line:       None,
+            created_at: parse_github_timestamp(&c.created_at),
+        }).collect())
     }
 
     async fn find_open_pr_for_branch(
@@ -379,6 +431,41 @@ pub fn current_branch(workspace: &str) -> Option<String> {
     Some(branch)
 }
 
+/// Days since the Unix epoch for a proleptic-Gregorian civil date — Howard
+/// Hinnant's `days_from_civil`, used by `parse_github_timestamp` since no
+/// date/time crate is a workspace dependency.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 }; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// Parse a GitHub API timestamp (`"2024-01-02T03:04:05Z"`, always UTC) into
+/// Unix epoch milliseconds. Returns `0` for anything unparseable rather than
+/// failing the whole fetch over one bad timestamp.
+fn parse_github_timestamp(s: &str) -> i64 {
+    let b = s.as_bytes();
+    if b.len() < 19 {
+        return 0;
+    }
+    let (Ok(year), Ok(month), Ok(day), Ok(hour), Ok(min), Ok(sec)) = (
+        s[0..4].parse::<i64>(),
+        s[5..7].parse::<i64>(),
+        s[8..10].parse::<i64>(),
+        s[11..13].parse::<i64>(),
+        s[14..16].parse::<i64>(),
+        s[17..19].parse::<i64>(),
+    ) else {
+        return 0;
+    };
+    let days = days_from_civil(year, month, day);
+    (days * 86_400 + hour * 3_600 + min * 60 + sec) * 1000
+}
+
 /// Resolve GitHub token: config value → GITHUB_TOKEN env → `gh auth token`.
 pub fn resolve_token(config_token: Option<String>) -> Option<String> {
     config_token
@@ -455,6 +542,22 @@ mod tests {
     fn resolve_token_prefers_config_over_env() {
         let token = resolve_token(Some("config-token".to_string()));
         assert_eq!(token, Some("config-token".to_string()));
+    }
+
+    #[test]
+    fn parse_github_timestamp_matches_known_unix_millis() {
+        // 2024-01-02T03:04:05Z, cross-checked against `date -u -d ... +%s`.
+        assert_eq!(parse_github_timestamp("2024-01-02T03:04:05Z"), 1_704_164_645_000);
+    }
+
+    #[test]
+    fn parse_github_timestamp_handles_epoch() {
+        assert_eq!(parse_github_timestamp("1970-01-01T00:00:00Z"), 0);
+    }
+
+    #[test]
+    fn parse_github_timestamp_returns_zero_for_garbage() {
+        assert_eq!(parse_github_timestamp("not-a-timestamp"), 0);
     }
 
     fn init_repo(dir: &std::path::Path) {
