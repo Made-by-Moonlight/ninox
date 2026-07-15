@@ -68,6 +68,8 @@ fn can_resume(session: &Session, is_orchestrator: bool, config: &AppConfig) -> b
 //       + content row (max child):    `identity` column is tallest:
 //         name text size 28 (28*1.3 = 36.4) + 4.0 spacing
 //         + subline text size 10 (10*1.3 = 13.0)          = 53.4
+//         (subline omitted when empty — header runs ~17px shorter;
+//         a safe over-estimate, same direction as tabs_block below)
 //     header total:                                          81.4
 //   - `tabs_block` container:         padding top 10 / bottom 0 -> 10.0
 //       + content column:  panel_btn is a button(...) whose own
@@ -329,9 +331,11 @@ pub fn session_detail<'a>(
 
     let identity = column![
         text(&session.name).size(28).font(crate::style::SERIF_MEDIUM).color(s.ink),
-        text(subline).size(10).font(crate::style::MONO).color(s.faint),
     ]
-    .spacing(4);
+    .spacing(4)
+    .push_maybe((!subline.is_empty()).then(|| {
+        text(subline).size(10).font(crate::style::MONO).color(s.faint)
+    }));
 
     let is_orchestrator = app.orchestrators.iter().any(|o| o.id == session_id);
 
