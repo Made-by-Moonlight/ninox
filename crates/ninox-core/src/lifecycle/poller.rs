@@ -716,10 +716,14 @@ impl Poller {
                 }
             }
 
-            // -- Review threads (throttled via seen_comment_ids) --
+            // -- Review threads + issue comments (throttled via seen_comment_ids) --
             let threads = match gh.get_review_threads(&owner, &repo, pr_number).await {
                 Ok(t)  => t,
                 Err(e) => { tracing::warn!("github review threads: {e}"); vec![] }
+            };
+            let issue_comments = match gh.get_issue_comments(&owner, &repo, pr_number).await {
+                Ok(c)  => c,
+                Err(e) => { tracing::warn!("github issue comments: {e}"); vec![] }
             };
 
             let has_changes_requested = threads.iter().any(|t| t.state == "CHANGES_REQUESTED");
@@ -730,25 +734,49 @@ impl Poller {
                 let mut has_new = false;
                 let mut new_comments: Vec<Comment> = Vec::new();
 
+                // Persist + emit every displayable comment — CHANGES_REQUESTED
+                // and plain COMMENTED reviews (which also covers inline diff
+                // comments, tagged COMMENTED by `get_review_threads`) — so the
+                // Info panel's Marginalia feed shows the whole conversation.
+                // `has_new`/`new_comments` stay CHANGES_REQUESTED-only: they
+                // drive the reaction/notification path below, which must not
+                // widen just because the display feed did. Reviews with an
+                // empty body (a bare "Comment" submission whose only content
+                // is inline comments, already captured separately) are
+                // skipped so the feed doesn't show blank entries.
                 for thread in &threads {
-                    if thread.state == "CHANGES_REQUESTED"
-                        && !state.seen_comment_ids.contains(&thread.id)
+                    if !matches!(thread.state.as_str(), "CHANGES_REQUESTED" | "COMMENTED")
+                        || thread.body.trim().is_empty()
+                        || state.seen_comment_ids.contains(&thread.id)
                     {
-                        state.seen_comment_ids.insert(thread.id);
+                        continue;
+                    }
+                    state.seen_comment_ids.insert(thread.id);
+                    let comment = Comment {
+                        id:         thread.id,
+                        pr_id,
+                        author:     thread.author.clone(),
+                        body:       thread.body.clone(),
+                        path:       thread.path.clone(),
+                        line:       thread.line,
+                        created_at: thread.created_at,
+                    };
+                    let _ = self.engine.store.upsert_comment(&comment);
+                    self.engine.emit(Event::ReviewComment { pr_id, comment: comment.clone() });
+                    if thread.state == "CHANGES_REQUESTED" {
                         has_new = true;
-                        let comment = Comment {
-                            id:         thread.id,
-                            pr_id,
-                            author:     thread.author.clone(),
-                            body:       thread.body.clone(),
-                            path:       thread.path.clone(),
-                            line:       thread.line,
-                            created_at: 0,
-                        };
-                        let _ = self.engine.store.upsert_comment(&comment);
-                        self.engine.emit(Event::ReviewComment { pr_id, comment: comment.clone() });
                         new_comments.push(comment);
                     }
+                }
+
+                for issue_comment in &issue_comments {
+                    if state.seen_comment_ids.contains(&issue_comment.id) {
+                        continue;
+                    }
+                    state.seen_comment_ids.insert(issue_comment.id);
+                    let comment = Comment { pr_id, ..issue_comment.clone() };
+                    let _ = self.engine.store.upsert_comment(&comment);
+                    self.engine.emit(Event::ReviewComment { pr_id, comment });
                 }
 
                 let already_sent = state.review_reaction_sent;
@@ -1758,6 +1786,11 @@ mod tests {
         /// `find_open_pr_for_branch` — the await inside
         /// `poll_pr_reconciliation`'s adoption loop.
         mid_branch_lookup_upsert: std::sync::Mutex<Option<(std::sync::Arc<crate::store::Store>, crate::types::Session)>>,
+        /// Review threads (reviews + inline diff comments) `get_review_threads`
+        /// returns — empty by default, same as before comment tests existed.
+        review_threads: std::sync::Mutex<Vec<crate::github::ReviewThread>>,
+        /// Issue-level conversation comments `get_issue_comments` returns.
+        issue_comments: std::sync::Mutex<Vec<crate::types::Comment>>,
     }
 
     #[async_trait::async_trait]
@@ -1782,7 +1815,10 @@ mod tests {
             if let Some((store, id)) = self.mid_review_delete.lock().unwrap().take() {
                 store.delete_session(&id).unwrap();
             }
-            Ok(vec![])
+            Ok(self.review_threads.lock().unwrap().clone())
+        }
+        async fn get_issue_comments(&self, _owner: &str, _repo: &str, _pr_number: u64) -> anyhow::Result<Vec<crate::types::Comment>> {
+            Ok(self.issue_comments.lock().unwrap().clone())
         }
         async fn find_open_pr_for_branch(&self, owner: &str, repo: &str, branch: &str) -> anyhow::Result<Option<crate::github::PrRef>> {
             if let Some((store, row)) = self.mid_branch_lookup_upsert.lock().unwrap().take() {
@@ -2485,6 +2521,213 @@ mod tests {
         poller.poll_github().await;
         let events = drain_events(&mut rx);
         assert_eq!(failures(&events), 1, "must notify again after recovering and failing anew");
+    }
+
+    // ── Comment capture (MLOPS-2455) ─────────────────────────────────────────
+    //
+    // `get_review_threads`'s only prior consumer was the CHANGES_REQUESTED
+    // reaction/notification path, so a plain "Comment" review, an inline
+    // diff comment, and the PR's main conversation-tab comments never
+    // reached the store or the UI. These tests cover the widened capture
+    // that persists/emits all three for display while leaving the
+    // CHANGES_REQUESTED-only reaction gating untouched.
+
+    fn open_pr_session(id: &str, workspace: &str, pr_number: u64) -> Session {
+        let mut s = test_session(id, workspace);
+        s.repo = "Owner/repo".into();
+        s.pr_number = Some(pr_number);
+        s
+    }
+
+    fn open_pr_fake(pr_number: u64) -> std::sync::Arc<FakeGithub> {
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".to_string(), "repo".to_string(), pr_number),
+            crate::github::PrStatus {
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "t".into(), number: pr_number, head_sha: "abc".into(),
+            },
+        );
+        fake
+    }
+
+    fn comment_events(evs: &[Event]) -> Vec<Comment> {
+        evs.iter().filter_map(|e| match e {
+            Event::ReviewComment { comment, .. } => Some(comment.clone()),
+            _ => None,
+        }).collect()
+    }
+
+    /// A plain "Comment" review (state COMMENTED, no diff position) is
+    /// dropped entirely before this change — only CHANGES_REQUESTED reviews
+    /// were converted into `Comment`s.
+    #[tokio::test]
+    async fn poll_github_captures_commented_review() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = open_pr_fake(50);
+        fake.review_threads.lock().unwrap().push(crate::github::ReviewThread {
+            id: 501, author: "carol".into(), body: "Looks fine overall".into(),
+            path: None, line: None, state: "COMMENTED".into(), created_at: 1_000,
+        });
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", &workspace, 50)).unwrap();
+
+        let engine = github_engine(store.clone(), fake);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+        poller.poll_github().await;
+
+        let persisted = store.list_comments().unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].id, 501);
+        assert_eq!(persisted[0].body, "Looks fine overall");
+        assert_eq!(persisted[0].created_at, 1_000, "created_at must come from the GitHub payload, not be hard-coded 0");
+
+        let emitted = comment_events(&drain_events(&mut rx));
+        assert_eq!(emitted.len(), 1, "must emit Event::ReviewComment for display even though it's not CHANGES_REQUESTED");
+        assert_eq!(emitted[0].id, 501);
+    }
+
+    /// An inline diff comment — `get_review_threads` tags these COMMENTED
+    /// too (see `github.rs`) — must be captured with its `path`/`line`.
+    #[tokio::test]
+    async fn poll_github_captures_inline_review_comment() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = open_pr_fake(50);
+        fake.review_threads.lock().unwrap().push(crate::github::ReviewThread {
+            id: 502, author: "dave".into(), body: "nit: rename this".into(),
+            path: Some("src/main.rs".into()), line: Some(42),
+            state: "COMMENTED".into(), created_at: 2_000,
+        });
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", &workspace, 50)).unwrap();
+
+        let engine = github_engine(store.clone(), fake);
+        let poller = Poller::new(engine);
+        poller.poll_github().await;
+
+        let persisted = store.list_comments().unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].path.as_deref(), Some("src/main.rs"));
+        assert_eq!(persisted[0].line, Some(42));
+    }
+
+    /// Issue-level conversation comments (`GET .../issues/{n}/comments`) are
+    /// a separate GitHub endpoint from review threads entirely — before this
+    /// change nothing ever called it.
+    #[tokio::test]
+    async fn poll_github_captures_issue_comment() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = open_pr_fake(50);
+        fake.issue_comments.lock().unwrap().push(Comment {
+            id: 900, pr_id: 0, author: "erin".into(), body: "Great work, merging soon".into(),
+            path: None, line: None, created_at: 3_000,
+        });
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", &workspace, 50)).unwrap();
+
+        let engine = github_engine(store.clone(), fake);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+        poller.poll_github().await;
+
+        let persisted = store.list_comments().unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].id, 900);
+        assert_eq!(persisted[0].pr_id, 50, "pr_id must be stamped from the resolved PR, not left at the fake's placeholder value");
+
+        let emitted = comment_events(&drain_events(&mut rx));
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].author, "erin");
+    }
+
+    /// Two ticks of the *same* poller (same `enrichment_cache`) must not
+    /// persist or re-emit a comment already seen — `seen_comment_ids` skips
+    /// it entirely on the second tick.
+    #[tokio::test]
+    async fn poll_github_does_not_duplicate_comments_across_repeated_polls() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = open_pr_fake(50);
+        fake.review_threads.lock().unwrap().push(crate::github::ReviewThread {
+            id: 501, author: "carol".into(), body: "Looks fine overall".into(),
+            path: None, line: None, state: "COMMENTED".into(), created_at: 1_000,
+        });
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", &workspace, 50)).unwrap();
+
+        let engine = github_engine(store.clone(), fake);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github().await;
+        assert_eq!(comment_events(&drain_events(&mut rx)).len(), 1);
+
+        poller.poll_github().await;
+        assert_eq!(
+            comment_events(&drain_events(&mut rx)).len(), 0,
+            "the second tick's in-memory seen_comment_ids must skip an already-captured comment",
+        );
+        assert_eq!(store.list_comments().unwrap().len(), 1);
+    }
+
+    /// A restart resets `enrichment_cache` (and so `seen_comment_ids`) to
+    /// empty — the next poll after restart will see the same comment as
+    /// "new" again from GitHub's point of view. `upsert_comment`'s INSERT OR
+    /// REPLACE (keyed by GitHub's comment id) must absorb that re-fetch
+    /// without duplicating the row, so `App::new`'s `list_comments`
+    /// hydration never shows a comment twice.
+    #[tokio::test]
+    async fn poll_github_restart_rehydrates_without_duplicating_comments() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = open_pr_fake(50);
+        fake.review_threads.lock().unwrap().push(crate::github::ReviewThread {
+            id: 501, author: "carol".into(), body: "Looks fine overall".into(),
+            path: None, line: None, state: "COMMENTED".into(), created_at: 1_000,
+        });
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", &workspace, 50)).unwrap();
+
+        {
+            let engine = github_engine(store.clone(), fake.clone());
+            let poller = Poller::new(engine);
+            poller.poll_github().await;
+        }
+        assert_eq!(store.list_comments().unwrap().len(), 1);
+
+        // Fresh `Poller`/`Engine` — a fresh `enrichment_cache`, simulating a
+        // process restart against the same on-disk store.
+        let engine = github_engine(store.clone(), fake);
+        let poller = Poller::new(engine);
+        poller.poll_github().await;
+
+        let persisted = store.list_comments().unwrap();
+        assert_eq!(persisted.len(), 1, "restart must not duplicate an already-persisted comment");
+        assert_eq!(persisted[0].id, 501);
     }
 
     // ── Update check ─────────────────────────────────────────────────────────

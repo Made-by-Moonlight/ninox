@@ -335,6 +335,29 @@ impl Store {
         Ok(())
     }
 
+    /// All persisted review/issue comments, ordered by `created_at` — used to
+    /// hydrate `App`'s in-memory comment feed on startup so a restart doesn't
+    /// lose comments a previous run already fetched.
+    pub fn list_comments(&self) -> Result<Vec<Comment>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, pr_id, author, body, path, line, created_at
+             FROM review_comments ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Comment {
+                id:         r.get(0)?,
+                pr_id:      r.get(1)?,
+                author:     r.get(2)?,
+                body:       r.get(3)?,
+                path:       r.get(4)?,
+                line:       r.get(5)?,
+                created_at: r.get(6)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     pub fn list_orchestrators(&self) -> Result<Vec<Orchestrator>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -624,6 +647,34 @@ mod tests {
         assert_eq!(found.number, 9);
         assert_eq!(found.session_id, "s1");
         assert_eq!(found.url, pr.url);
+    }
+
+    /// `list_comments` is what hydrates `App::review_threads` on restart —
+    /// it must come back ordered by `created_at` so the UI feed doesn't need
+    /// to re-sort, and `upsert_comment`'s INSERT OR REPLACE must not produce
+    /// duplicate rows for a comment seen twice.
+    #[test]
+    fn list_comments_orders_by_created_at_and_upsert_dedupes() {
+        let store = test_store();
+        let later = Comment {
+            id: 2, pr_id: 1, author: "bob".into(), body: "second".into(),
+            path: None, line: None, created_at: 2_000,
+        };
+        let earlier = Comment {
+            id: 1, pr_id: 1, author: "alice".into(), body: "first".into(),
+            path: Some("src/lib.rs".into()), line: Some(10), created_at: 1_000,
+        };
+        store.upsert_comment(&later).unwrap();
+        store.upsert_comment(&earlier).unwrap();
+
+        let comments = store.list_comments().unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].id, 1, "earlier created_at sorts first");
+        assert_eq!(comments[1].id, 2);
+
+        // Re-upserting the same id (e.g. a repeated poll) must replace, not duplicate.
+        store.upsert_comment(&earlier).unwrap();
+        assert_eq!(store.list_comments().unwrap().len(), 2);
     }
 
     #[test]

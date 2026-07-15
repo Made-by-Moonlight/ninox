@@ -517,6 +517,15 @@ impl App {
             .map(|s| (s.id.clone(), s))
             .collect();
 
+        // Comments already fetched by a previous run — grouped by PR so a
+        // restart doesn't blank out the Marginalia feed until the next poll.
+        // `list_comments` already orders by `created_at`, so each group's
+        // insertion order is already the display order.
+        let mut review_threads: HashMap<PrId, Vec<Comment>> = HashMap::new();
+        for comment in engine.store.list_comments().unwrap_or_default() {
+            review_threads.entry(comment.pr_id).or_default().push(comment);
+        }
+
         let config = AppConfig::load().unwrap_or_default();
 
         // First run: seed a complete, editable default theme file so users
@@ -547,7 +556,7 @@ impl App {
             active_catalogue: 0,
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
-            review_threads: HashMap::new(),
+            review_threads,
             diffs:          HashMap::new(),
             notifications:  VecDeque::new(),
             update_in_progress: false,
@@ -2409,10 +2418,15 @@ impl App {
             }
 
             Event::ReviewComment { pr_id, comment } => {
-                state.review_threads
-                    .entry(pr_id)
-                    .or_default()
-                    .push(comment);
+                let thread = state.review_threads.entry(pr_id).or_default();
+                // The poller re-emits on every poll that still sees a comment
+                // in its GitHub response (only *new* ids are skipped there);
+                // guard here too so a repeated emit doesn't duplicate the
+                // in-memory feed the way it would upsert-replace the DB row.
+                if !thread.iter().any(|c| c.id == comment.id) {
+                    thread.push(comment);
+                    thread.sort_by_key(|c| c.created_at);
+                }
                 Task::none()
             }
 
