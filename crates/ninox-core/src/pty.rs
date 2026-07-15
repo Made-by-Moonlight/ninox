@@ -125,8 +125,8 @@ pub async fn start_streaming(
     tokio::spawn(async move {
         let mut counter = 0u64;
         while let Some(bytes) = input_rx.recv().await {
-            let buf = format!("ath-in-{}-{counter}", &tmux_id_input);
-            let tmp = format!("/tmp/ath-in-{}-{counter}.tmp", &tmux_id_input);
+            let buf = format!("ath-in-{}-{counter}", tmux_id_input);
+            let tmp = format!("/tmp/ath-in-{}-{counter}.tmp", tmux_id_input);
             counter += 1;
 
             let _ = tmux::paste_buffer(&tmux_id_input, &buf, &tmp, &bytes).await;
