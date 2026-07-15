@@ -740,15 +740,19 @@ impl Poller {
                 // Info panel's Marginalia feed shows the whole conversation.
                 // `has_new`/`new_comments` stay CHANGES_REQUESTED-only: they
                 // drive the reaction/notification path below, which must not
-                // widen just because the display feed did. Reviews with an
-                // empty body (a bare "Comment" submission whose only content
-                // is inline comments, already captured separately) are
-                // skipped so the feed doesn't show blank entries.
+                // widen just because the display feed did. A bare
+                // empty-body "Comment" review (whose only content is inline
+                // comments, already captured separately) is skipped so the
+                // feed doesn't show blank entries — but never for
+                // CHANGES_REQUESTED, which must keep being captured (and
+                // reacted to) exactly as before regardless of body content.
                 for thread in &threads {
-                    if !matches!(thread.state.as_str(), "CHANGES_REQUESTED" | "COMMENTED")
-                        || thread.body.trim().is_empty()
-                        || state.seen_comment_ids.contains(&thread.id)
-                    {
+                    let is_changes_requested = thread.state == "CHANGES_REQUESTED";
+                    let is_displayable = is_changes_requested || thread.state == "COMMENTED";
+                    if !is_displayable || state.seen_comment_ids.contains(&thread.id) {
+                        continue;
+                    }
+                    if !is_changes_requested && thread.body.trim().is_empty() {
                         continue;
                     }
                     state.seen_comment_ids.insert(thread.id);
@@ -763,7 +767,7 @@ impl Poller {
                     };
                     let _ = self.engine.store.upsert_comment(&comment);
                     self.engine.emit(Event::ReviewComment { pr_id, comment: comment.clone() });
-                    if thread.state == "CHANGES_REQUESTED" {
+                    if is_changes_requested {
                         has_new = true;
                         new_comments.push(comment);
                     }
@@ -2591,6 +2595,46 @@ mod tests {
         let emitted = comment_events(&drain_events(&mut rx));
         assert_eq!(emitted.len(), 1, "must emit Event::ReviewComment for display even though it's not CHANGES_REQUESTED");
         assert_eq!(emitted[0].id, 501);
+    }
+
+    /// The empty-body filter added for the widened COMMENTED capture must
+    /// not narrow the pre-existing CHANGES_REQUESTED path: a "Request
+    /// changes" review with no top-level summary (only inline comments)
+    /// still has an empty `body`, and must still be captured and still
+    /// drive the reaction/notification path exactly as before this change.
+    #[tokio::test]
+    async fn poll_github_captures_changes_requested_review_with_empty_body() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = open_pr_fake(50);
+        fake.review_threads.lock().unwrap().push(crate::github::ReviewThread {
+            id: 503, author: "frank".into(), body: String::new(),
+            path: None, line: None, state: "CHANGES_REQUESTED".into(), created_at: 4_000,
+        });
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", &workspace, 50)).unwrap();
+
+        let engine = github_engine(store.clone(), fake);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+        poller.poll_github().await;
+
+        let persisted = store.list_comments().unwrap();
+        assert_eq!(persisted.len(), 1, "an empty-body CHANGES_REQUESTED review must still be captured");
+        assert_eq!(persisted[0].id, 503);
+
+        let events = drain_events(&mut rx);
+        assert_eq!(comment_events(&events).len(), 1);
+        assert!(
+            events.iter().any(|e| matches!(
+                e, Event::Notification(n) if n.kind == crate::types::NotificationKind::PrNeedsAttention
+            )),
+            "an empty-body CHANGES_REQUESTED review must still trigger the reaction/notification path",
+        );
     }
 
     /// An inline diff comment — `get_review_threads` tags these COMMENTED
