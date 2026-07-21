@@ -217,7 +217,7 @@ fn category_color_procedural_fallback_differs_across_distinct_unknown_categories
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p ninox-app category_color -- --test-threads=1`
+Run: `cargo test -p ninox category_color -- --test-threads=1`
 
 Expected: 2 FAIL, 2 PASS trivially (both sides of `assert_eq!`/`assert_ne!` currently resolve to `s.faint` since the fallback isn't implemented yet):
 - FAIL `category_color_falls_back_to_a_procedural_color_for_unrecognized_types` (currently returns `s.faint`, equal to `s.faint`)
@@ -309,13 +309,13 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Color {
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p ninox-app category_color -- --test-threads=1`
+Run: `cargo test -p ninox category_color -- --test-threads=1`
 
 Expected: PASS (all 4 tests).
 
 - [ ] **Step 6: Run the full `ninox-app` suite to check for regressions**
 
-Run: `cargo test -p ninox-app`
+Run: `cargo test -p ninox`
 
 Expected: PASS, no regressions.
 
@@ -406,7 +406,7 @@ fn force_layout_handles_empty_and_singleton_input_without_panicking() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p ninox-app force_layout -- --test-threads=1`
+Run: `cargo test -p ninox force_layout -- --test-threads=1`
 
 Expected: FAIL to compile with `cannot find function 'force_layout' in this scope` (it doesn't exist yet).
 
@@ -502,13 +502,13 @@ pub(crate) fn force_layout(
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p ninox-app force_layout -- --test-threads=1`
+Run: `cargo test -p ninox force_layout -- --test-threads=1`
 
 Expected: PASS (4 tests). If `force_layout_pulls_linked_nodes_closer_than_an_unlinked_outlier` fails, the fix is tuning `k`'s scale factor (`0.9`) or `FORCE_LAYOUT_ITERATIONS` — not the overall algorithm shape, which is the standard Fruchterman-Reingold formulation.
 
 - [ ] **Step 5: Run the full `ninox-app` suite to check for regressions**
 
-Run: `cargo test -p ninox-app`
+Run: `cargo test -p ninox`
 
 Expected: PASS, no regressions (this task adds a new unused-until-Task-4 function — expect a `dead_code` warning, not a test failure, from `cargo test`; `cargo build` will show the same warning).
 
@@ -606,7 +606,7 @@ fn switching_catalogue_clears_and_repopulates_pinboard_layout() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p ninox-app navigate_brain_populates_pinboard_layout -- --test-threads=1`
+Run: `cargo test -p ninox navigate_brain_populates_pinboard_layout -- --test-threads=1`
 
 Expected: FAIL to compile with `no field 'layout' on type 'BrainViewState'` (it doesn't exist yet).
 
@@ -789,13 +789,13 @@ to:
 
 - [ ] **Step 8: Run tests to verify they pass**
 
-Run: `cargo test -p ninox-app navigate_brain_populates_pinboard_layout switching_catalogue_clears_and_repopulates_pinboard_layout -- --test-threads=1`
+Run: `cargo test -p ninox navigate_brain_populates_pinboard_layout switching_catalogue_clears_and_repopulates_pinboard_layout -- --test-threads=1`
 
 Expected: PASS (both tests).
 
 - [ ] **Step 9: Run the full `ninox-app` suite to check for regressions**
 
-Run: `cargo test -p ninox-app`
+Run: `cargo test -p ninox`
 
 Expected: PASS, including the existing `navigate_brain_populates_pinboard_edges_from_the_index` and `switching_catalogue_clears_and_repopulates_pinboard_edges` tests (unaffected — `edges` behavior is unchanged, only augmented).
 
@@ -871,7 +871,7 @@ with:
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p ninox-app selecting_entry_opens_its_drawer_without_changing_mode -- --test-threads=1`
+Run: `cargo test -p ninox selecting_entry_opens_its_drawer_without_changing_mode -- --test-threads=1`
 
 Expected: FAIL — `assertion 'left == right' failed`, left: `Catalogue`, right: `Pinboard` (today's code still force-switches mode).
 
@@ -912,7 +912,7 @@ to:
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `cargo test -p ninox-app selecting_entry_opens_its_drawer_without_changing_mode -- --test-threads=1`
+Run: `cargo test -p ninox selecting_entry_opens_its_drawer_without_changing_mode -- --test-threads=1`
 
 Expected: PASS.
 
@@ -969,7 +969,7 @@ to:
 
 - [ ] **Step 6: Run the full `ninox-app` suite to check for regressions**
 
-Run: `cargo test -p ninox-app`
+Run: `cargo test -p ninox`
 
 Expected: PASS.
 
@@ -1099,7 +1099,7 @@ fn pinboard_body(app: &App) -> Element<'_, Message> {
 
 - [ ] **Step 2: Build and run the full `ninox-app` suite**
 
-Run: `cargo build -p ninox-app && cargo test -p ninox-app`
+Run: `cargo build -p ninox && cargo test -p ninox`
 
 Expected: builds cleanly (no unused-import warnings — `shadow_alpha`, `hard_shadow`, `Background`, `Border`, `column`, `scrollable` all stay in use elsewhere in this file, e.g. `hover_preview_slip` and `drawers_rail` itself); all tests PASS.
 
