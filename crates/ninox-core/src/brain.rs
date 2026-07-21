@@ -596,6 +596,26 @@ struct FileRecord {
     links: Vec<String>,
 }
 
+/// Collapse known singular/plural category aliases (e.g. a file whose
+/// frontmatter declares `type: error` under the `errors/` directory) to
+/// this app's canonical plural taxonomy names, so the same underlying
+/// category never fragments into two differently-named entries. This is a
+/// fixed alias table, not a fuzzy matcher — an unrecognized type passes
+/// through (lowercased) untouched rather than being silently reassigned.
+fn normalize_entry_type(raw: &str) -> String {
+    let lower = raw.trim().to_lowercase();
+    match lower.as_str() {
+        "repo" => "repos".to_string(),
+        "symbol" => "symbols".to_string(),
+        "concept" => "concepts".to_string(),
+        "pattern" => "patterns".to_string(),
+        "decision" => "decisions".to_string(),
+        "relationship" => "relationships".to_string(),
+        "error" => "errors".to_string(),
+        _ => lower,
+    }
+}
+
 /// Read and parse a single candidate file into a [`FileRecord`]. Pure
 /// function of its inputs (aside from the filesystem read), safe to call
 /// from any thread in the rebuild worker pool.
@@ -619,13 +639,15 @@ fn process_file(brain_path: &Path, path: &Path) -> Option<FileRecord> {
         .and_then(|n| n.to_str())
         .map(str::to_string);
 
-    let entry_type = parsed
-        .frontmatter
-        .get("type")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or(parent_type)
-        .unwrap_or_else(|| "note".to_string());
+    let entry_type = normalize_entry_type(
+        &parsed
+            .frontmatter
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or(parent_type)
+            .unwrap_or_else(|| "note".to_string()),
+    );
 
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
     let name = parsed
@@ -1129,6 +1151,65 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry_type, "people");
+    }
+
+    #[test]
+    fn normalize_entry_type_maps_known_singular_aliases_to_canonical_plural() {
+        for (raw, expected) in [
+            ("repo", "repos"),
+            ("symbol", "symbols"),
+            ("concept", "concepts"),
+            ("pattern", "patterns"),
+            ("decision", "decisions"),
+            ("relationship", "relationships"),
+            ("error", "errors"),
+        ] {
+            assert_eq!(normalize_entry_type(raw), expected);
+        }
+    }
+
+    #[test]
+    fn normalize_entry_type_is_case_insensitive() {
+        assert_eq!(normalize_entry_type("Error"), "errors");
+        assert_eq!(normalize_entry_type("DECISION"), "decisions");
+    }
+
+    #[test]
+    fn normalize_entry_type_passes_through_unrecognized_types() {
+        assert_eq!(normalize_entry_type("people"), "people");
+        assert_eq!(normalize_entry_type("Architecture"), "architecture");
+    }
+
+    #[test]
+    fn rebuild_normalizes_singular_frontmatter_type_to_canonical_plural() {
+        let (brain, dir) = make_brain();
+        let errors_dir = dir.path().join("errors");
+        fs::create_dir_all(&errors_dir).unwrap();
+        fs::write(
+            errors_dir.join("timeout.md"),
+            "---\nname: Timeout\ntype: error\n---\nConnection timed out.",
+        )
+        .unwrap();
+
+        brain.rebuild(None).unwrap();
+
+        let plural = brain
+            .query("", None, QueryFilters { entry_type: Some("errors".into()), tag: None })
+            .unwrap();
+        assert_eq!(
+            plural.len(),
+            1,
+            "singular frontmatter type must normalize to the plural canonical category"
+        );
+        assert_eq!(plural[0].name, "Timeout");
+
+        let singular = brain
+            .query("", None, QueryFilters { entry_type: Some("error".into()), tag: None })
+            .unwrap();
+        assert!(
+            singular.is_empty(),
+            "the un-normalized singular type must no longer exist as a separate category"
+        );
     }
 
     #[test]
