@@ -32,8 +32,38 @@ pub fn category_color(s: &ColorScheme, ty: &str) -> Color {
         "decisions"     => s.cat_decision,
         "relationships" => s.cat_relationship,
         "errors"        => s.cat_error,
-        _               => s.faint,
+        _               => procedural_category_color(s, ty),
     }
+}
+
+/// Deterministic HSL-hue fallback for any category outside the 8
+/// hand-picked taxonomy colors above — used instead of a flat grey so an
+/// unrecognized or novel category type still reads as its own distinct
+/// color. The same `ty` string always yields the same hue (via `hash01`,
+/// reused from the pinboard's deterministic-layout seed), and saturation/
+/// lightness are fixed per theme to stay legible against `paper`/`ink`.
+fn procedural_category_color(s: &ColorScheme, ty: &str) -> Color {
+    let hue = crate::components::brain_pinboard::hash01(ty, 29) * 360.0;
+    let (sat, light) = if s.dark { (0.45, 0.62) } else { (0.45, 0.40) };
+    hsl_to_rgb(hue, sat, light)
+}
+
+/// Standard HSL→RGB conversion (`h` in degrees `[0, 360)`, `s`/`l` in
+/// `[0, 1]`), returning an opaque `iced::Color`.
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Color {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h_prime = h / 60.0;
+    let x = c * (1.0 - (h_prime.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match h_prime as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    Color::from_rgb(r1 + m, g1 + m, b1 + m)
 }
 
 /// Parse the raw text between `[[` and `]]`, handling Obsidian's optional
@@ -930,6 +960,32 @@ mod tests {
         ];
         let cats = categories(&all);
         assert_eq!(cats, vec![("symbols".to_string(), 2), ("errors".to_string(), 1)]);
+    }
+
+    #[test]
+    fn category_color_known_taxonomy_types_are_unaffected_by_the_fallback() {
+        let s = crate::theme::dark();
+        assert_eq!(category_color(&s, "errors"), s.cat_error);
+        assert_eq!(category_color(&s, "repos"), s.status_pr_open);
+    }
+
+    #[test]
+    fn category_color_falls_back_to_a_procedural_color_for_unrecognized_types() {
+        let s = crate::theme::dark();
+        let color = category_color(&s, "totally-new-category");
+        assert_ne!(color, s.faint, "must not wash out to flat grey");
+    }
+
+    #[test]
+    fn category_color_procedural_fallback_is_deterministic() {
+        let s = crate::theme::dark();
+        assert_eq!(category_color(&s, "widgets"), category_color(&s, "widgets"));
+    }
+
+    #[test]
+    fn category_color_procedural_fallback_differs_across_distinct_unknown_categories() {
+        let s = crate::theme::dark();
+        assert_ne!(category_color(&s, "widgets"), category_color(&s, "gadgets"));
     }
 
     #[test]

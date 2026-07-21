@@ -28,7 +28,7 @@ struct Node {
 /// No RNG/clock involved: the same entry id (+ salt) always yields the same
 /// value, so the same set of brain entries always lays out identically
 /// across frames, window resizes, and app restarts.
-fn hash01(s: &str, salt: u64) -> f32 {
+pub(crate) fn hash01(s: &str, salt: u64) -> f32 {
     let mut h: u64 = 1469598103934665603 ^ salt;
     for b in s.bytes() {
         h ^= b as u64;
