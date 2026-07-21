@@ -319,6 +319,25 @@ impl<'a> canvas::Program<Message> for Pinboard<'a> {
                     Stroke::default().with_color(Color { a: 1.0, ..s.ink }).with_width(1.4),
                 );
             }
+            // Persistent selection ring: dashed +6px accent — distinct from
+            // both the solid +4px search-hit ring and the solid +3px hover
+            // ring above, so all three states stay visually distinguishable
+            // even when they overlap (e.g. hovering the selected node).
+            // Unlike hover (transient, cursor-driven `state.hovered`),
+            // selection comes from `self.app.brain_view.selected`, set by a
+            // canvas click OR a sidebar drawer click, and persists until a
+            // different entry is selected.
+            if self.app.brain_view.selected.as_deref() == Some(n.id.as_str()) {
+                frame.stroke(
+                    &Path::circle(Point::new(n.x, n.y), n.r + 6.0),
+                    Stroke {
+                        style: canvas::Style::Solid(s.accent),
+                        width: 1.4,
+                        line_dash: canvas::LineDash { segments: &[3.0, 3.0], offset: 0 },
+                        ..Stroke::default()
+                    },
+                );
+            }
         }
 
         vec![frame.into_geometry()]

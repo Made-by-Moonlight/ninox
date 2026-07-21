@@ -2110,7 +2110,6 @@ impl App {
                         &crate::components::brain_panel::preprocess_wikilinks(&e.body),
                     ).collect();
                     state.brain_view.open_drawers.insert(e.entry_type.clone());
-                    state.brain_view.mode = BrainMode::Catalogue;
                 }
                 state.brain_view.selected = Some(id);
                 Self::refresh_selection_graph(state);
@@ -4150,7 +4149,7 @@ mod tests {
     }
 
     #[test]
-    fn selecting_entry_opens_catalogue_and_drawer() {
+    fn selecting_entry_opens_its_drawer_without_changing_mode() {
         let brain_dir = tempdir().unwrap().keep();
         std::fs::create_dir_all(brain_dir.join("symbols")).unwrap();
         std::fs::write(brain_dir.join("symbols").join("x.md"), "---\nname: X\n---\nbody").unwrap();
@@ -4162,7 +4161,11 @@ mod tests {
         let (app, _) = app.update(Message::NavigateBrain);
         let (app, _) = app.update(Message::BrainSetMode(BrainMode::Pinboard));
         let (app, _) = app.update(Message::BrainSelectEntry("symbols/x.md".into()));
-        assert_eq!(app.brain_view.mode, BrainMode::Catalogue);
+        assert_eq!(
+            app.brain_view.mode,
+            BrainMode::Pinboard,
+            "selecting a specimen must not bounce the user out of pinboard mode"
+        );
         assert!(app.brain_view.open_drawers.contains("symbols"));
         assert_eq!(app.brain_view.selected.as_deref(), Some("symbols/x.md"));
     }
