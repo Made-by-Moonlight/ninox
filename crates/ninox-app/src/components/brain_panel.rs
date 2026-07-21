@@ -472,66 +472,31 @@ fn hover_preview_slip<'a>(s: &'a ColorScheme, entry: &'a BrainEntry) -> Element<
         .into()
 }
 
-/// Pinboard placeholder: taxonomy rail (volume plate + category counts)
-/// beside an empty heavy frame — the specimen-board canvas lands in Task 13.
 fn pinboard_body(app: &App) -> Element<'_, Message> {
     let s = &app.scheme;
-    let (card_a, _, _) = shadow_alpha(s);
-
-    let cat_rows: Vec<Element<Message>> = categories(&app.brain_view.entries)
-        .into_iter()
-        .map(|(ty, n)| {
-            let color = category_color(s, &ty);
-            container(
-                row![
-                    text("●").size(9).color(color),
-                    Space::new(10, 0),
-                    text(ty).size(12).color(s.ink_2),
-                    Space::new(Length::Fill, 0),
-                    text(n.to_string()).size(9.5).font(MONO).color(s.faint),
-                ]
-                .align_y(Alignment::Center),
-            )
-            .padding([3, 16])
-            .width(Length::Fill)
-            .into()
-        })
-        .collect();
-
-    let rail = container(column![
-        volume_plate(app),
-        container(text("brain/ — taxonomy").size(14).font(SERIF_ITALIC).color(s.faint))
-            .padding([10, 16]),
-        scrollable(column(cat_rows)).height(Length::Fill),
-    ])
-    .width(Length::Fixed(215.0))
-    .height(Length::Fill)
-    .style(move |_theme| container::Style {
-        background: Some(Background::Color(s.card)),
-        border: Border { color: s.rule_dark, width: 1.0, radius: 2.0.into() },
-        shadow: hard_shadow(s, 2.0, 3.0, card_a),
-        ..Default::default()
-    });
 
     let board_frame = container(super::brain_pinboard::pinboard_canvas(app))
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| crate::style::heavy_frame(s));
 
-    // Hovered id may no longer exist (a reindex/catalogue switch can drop or
-    // rename entries out from under a stale hover) — resolve defensively and
+    // Preview slip shows whichever is active: a live hover takes precedence
+    // over a persisted selection (e.g. from a drawer click), so moving the
+    // mouse over a different node always reflects what's under the cursor;
+    // otherwise the selected entry's slip stays up as the "highlight in
+    // place" feedback for a drawer-driven selection. Either id may no
+    // longer exist (a reindex/catalogue switch can drop or rename entries
+    // out from under a stale hover/selection) — resolve defensively and
     // simply skip the slip rather than panicking or showing stale content.
-    let hovered_entry = app
-        .brain_view
-        .hovered
-        .as_deref()
-        .and_then(|id| app.brain_view.entries.iter().find(|e| e.id == id));
-    let board: Element<Message> = match hovered_entry {
+    let display_id = app.brain_view.hovered.clone().or_else(|| app.brain_view.selected.clone());
+    let display_entry =
+        display_id.as_deref().and_then(|id| app.brain_view.entries.iter().find(|e| e.id == id));
+    let board: Element<Message> = match display_entry {
         Some(e) => iced::widget::stack![board_frame, hover_preview_slip(s, e)].into(),
         None => board_frame.into(),
     };
 
-    row![rail, board]
+    row![drawers_rail(app), board]
         .spacing(16)
         .width(Length::Fill)
         .height(Length::Fill)
