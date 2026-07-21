@@ -148,6 +148,90 @@ pub(crate) fn resolve_edges(entries: &[BrainEntry], links: &[(String, String)]) 
     edges
 }
 
+/// Relaxation steps `force_layout` runs — fixed rather than convergence-
+/// threshold-based, so the result is a pure, deterministic function of
+/// `entries`/`edges` alone (no wall-clock or RNG dependency anywhere in
+/// this function beyond the deterministic `hash01`-seeded start
+/// positions).
+const FORCE_LAYOUT_ITERATIONS: u32 = 400;
+
+/// Fruchterman-Reingold force-directed layout: nodes repel each other,
+/// linked nodes attract along `edges`, and per-iteration displacement is
+/// capped by a linearly-cooling "temperature" so the system settles
+/// instead of oscillating. Run once per data change (see
+/// `App::refresh_brain_graph`) and cached — NOT recomputed per canvas
+/// draw, unlike the rest of this module's per-frame re-derivation.
+///
+/// Initial positions come from the existing `hash01` (same salts the old
+/// pure-scatter placement used), so re-running on unchanged
+/// `entries`/`edges` reproduces bit-identical output. Returns each entry's
+/// normalized `(x, y)` in `[0.05, 0.95]` on both axes (the same margin the
+/// old hash-based placement used), keyed by entry id.
+pub(crate) fn force_layout(
+    entries: &[BrainEntry],
+    edges: &[(usize, usize)],
+) -> HashMap<String, (f32, f32)> {
+    let n = entries.len();
+    if n == 0 {
+        return HashMap::new();
+    }
+
+    let mut x: Vec<f32> = entries.iter().map(|e| 0.05 + 0.90 * hash01(&e.id, 7)).collect();
+    let mut y: Vec<f32> = entries.iter().map(|e| 0.05 + 0.90 * hash01(&e.id, 13)).collect();
+
+    // Ideal spacing scales down as node count grows, so density stays
+    // roughly constant regardless of how many specimens are in the graph.
+    let k = 0.9 / (n as f32).sqrt();
+    let mut temperature = 0.1f32;
+    let cooling = temperature / FORCE_LAYOUT_ITERATIONS as f32;
+
+    for _ in 0..FORCE_LAYOUT_ITERATIONS {
+        let mut dx = vec![0.0f32; n];
+        let mut dy = vec![0.0f32; n];
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let ddx = x[i] - x[j];
+                let ddy = y[i] - y[j];
+                let d = (ddx * ddx + ddy * ddy).sqrt().max(1e-3);
+                let f = (k * k) / d;
+                let (ux, uy) = (ddx / d, ddy / d);
+                dx[i] += ux * f;
+                dy[i] += uy * f;
+                dx[j] -= ux * f;
+                dy[j] -= uy * f;
+            }
+        }
+
+        for &(a, b) in edges {
+            let ddx = x[b] - x[a];
+            let ddy = y[b] - y[a];
+            let d = (ddx * ddx + ddy * ddy).sqrt().max(1e-3);
+            let f = (d * d) / k;
+            let (ux, uy) = (ddx / d, ddy / d);
+            dx[a] += ux * f;
+            dy[a] += uy * f;
+            dx[b] -= ux * f;
+            dy[b] -= uy * f;
+        }
+
+        for i in 0..n {
+            let mag = (dx[i] * dx[i] + dy[i] * dy[i]).sqrt().max(1e-6);
+            let capped = mag.min(temperature);
+            x[i] = (x[i] + (dx[i] / mag) * capped).clamp(0.05, 0.95);
+            y[i] = (y[i] + (dy[i] / mag) * capped).clamp(0.05, 0.95);
+        }
+
+        temperature = (temperature - cooling).max(0.0);
+    }
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.id.clone(), (x[i], y[i])))
+        .collect()
+}
+
 /// Specimen dot radius: a 3px floor, growing with wikilink count, clamped to
 /// a 9px ceiling so heavily-linked notes don't overwhelm the board.
 fn node_radius(link_count: f32) -> f32 {
@@ -386,5 +470,65 @@ mod tests {
         let entries = vec![entry("a.md")];
         let links = vec![("a.md".to_string(), "a.md".to_string())];
         assert!(resolve_edges(&entries, &links).is_empty());
+    }
+
+    #[test]
+    fn force_layout_is_deterministic() {
+        let entries = vec![entry("a.md"), entry("b.md"), entry("c.md")];
+        let edges = vec![(0, 1)];
+        let first = force_layout(&entries, &edges);
+        let second = force_layout(&entries, &edges);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn force_layout_keeps_positions_within_the_canvas_margin() {
+        let entries: Vec<BrainEntry> = (0..12).map(|i| entry(&format!("n{i}.md"))).collect();
+        let edges: Vec<(usize, usize)> = (0..11).map(|i| (i, i + 1)).collect();
+        let positions = force_layout(&entries, &edges);
+        for (x, y) in positions.values() {
+            assert!((0.05..=0.95).contains(x), "x {x} out of bounds");
+            assert!((0.05..=0.95).contains(y), "y {y} out of bounds");
+        }
+    }
+
+    #[test]
+    fn force_layout_pulls_linked_nodes_closer_than_an_unlinked_outlier() {
+        // A tightly-linked triangle (a-b, b-c, a-c) plus one entirely unlinked
+        // outlier — the triangle's own pairwise distances should end up
+        // smaller than any distance from the outlier to the triangle.
+        let entries = vec![entry("a.md"), entry("b.md"), entry("c.md"), entry("outlier.md")];
+        let edges = vec![(0, 1), (1, 2), (0, 2)];
+        let positions = force_layout(&entries, &edges);
+
+        let dist = |a: &str, b: &str| {
+            let (ax, ay) = positions[a];
+            let (bx, by) = positions[b];
+            ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt()
+        };
+
+        let max_triangle_dist =
+            dist("a.md", "b.md").max(dist("b.md", "c.md")).max(dist("a.md", "c.md"));
+        let min_outlier_dist = dist("a.md", "outlier.md")
+            .min(dist("b.md", "outlier.md"))
+            .min(dist("c.md", "outlier.md"));
+
+        assert!(
+            max_triangle_dist < min_outlier_dist,
+            "triangle pairwise distances ({max_triangle_dist}) should be smaller than any \
+             distance to the unlinked outlier ({min_outlier_dist})"
+        );
+    }
+
+    #[test]
+    fn force_layout_handles_empty_and_singleton_input_without_panicking() {
+        assert!(force_layout(&[], &[]).is_empty());
+
+        let one = vec![entry("solo.md")];
+        let positions = force_layout(&one, &[]);
+        assert_eq!(positions.len(), 1);
+        let (x, y) = positions["solo.md"];
+        assert!((0.05..=0.95).contains(&x));
+        assert!((0.05..=0.95).contains(&y));
     }
 }
