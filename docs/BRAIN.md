@@ -43,6 +43,46 @@ The full resolution order is:
 
 Each orchestrator uses exactly one brain. Brains are never merged — when a project specifies its own brain, it is fully isolated from the global one. This preserves clean boundaries between accounts, clients, and projects where knowledge should not cross over.
 
+## Remote brains
+
+A brain can be shared by a team. The canonical copy lives in S3 (or any
+S3-compatible store — R2, MinIO); every machine keeps a full local mirror,
+so queries stay local-speed. A brain directory is remote-backed when it
+contains a `.sync.toml` (written by `ninox brain remote set`, or
+materialized automatically from a `[[brain.catalogues]]` entry with a
+`remote` field). Auth uses the standard AWS credential chain.
+
+    [[brain.catalogues]]
+    name = "team"
+    path = "~/.config/ninox/brains/team"
+    remote = "s3://team-brains/main"
+    # endpoint = "https://<account>.r2.cloudflarestorage.com"
+    # region = "eu-west-1"
+    # cache_ttl_secs = 0   # 0 = freshness-check every lookup
+
+How it stays in sync:
+
+- **Lookups** (`query`, `show`, and the server's brain routes) first make
+  one conditional GET of the remote's `manifest.json`. Unchanged manifest
+  = one cheap 304 and zero downloads. Changed = only the changed entries
+  are pulled, and only ones you haven't edited locally — a read never
+  clobbers unpushed work. Raise `cache_ttl_secs` to trade freshness for
+  latency. If the remote is unreachable, the local mirror answers with a
+  warning — a query is never blocked by S3.
+- **Writes** ride the habit you already have: `ninox brain index` pulls,
+  resolves, pushes, then rebuilds. `ninox brain sync` does the same
+  without a rebuild being the goal.
+- **Conflicts** (two people edited the same entry since they last agreed)
+  never lose knowledge: the remote version takes the entry's path and
+  your version is kept — and shared — as `<entry>.conflict-<user>-<ts>.md`
+  until someone merges the two and deletes it.
+
+`.index.db`, `.sync.toml`, and `.sync-state.json` never leave the
+machine; each mirror rebuilds its own index. Entry objects in the bucket
+are immutable (`entries/<path>@<hash>`); `manifest.json` alone decides
+what's current, and concurrent pushes are serialized by compare-and-swap
+on it. Full design: `docs/superpowers/specs/2026-07-22-remote-brain-design.md`.
+
 ## CLI
 
 ```
@@ -50,6 +90,10 @@ ninox brain index                    rebuild the index from the brain files
 ninox brain query <text>             full-text search; add --type or --tag to filter
 ninox brain show <path>              print a single entry
 ninox brain discover-repos [paths]   scan repos and write repos/ + relationships/ entries
+ninox brain sync                     pull + push all changes to the brain's remote
+ninox brain remote set <url>         attach an S3-compatible remote (--endpoint, --region, --ttl)
+ninox brain remote status            remote URL, last sync, pending pushes, live conflicts
+ninox brain remote unset             detach; the local copy stays a normal brain
 ```
 
 `discover-repos` mechanically populates `repos/` and `relationships/` instead
