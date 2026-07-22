@@ -117,7 +117,14 @@ impl BrainSync {
     }
 
     /// Download one immutable entry object and move it into place with a
-    /// temp-file + rename so a crash never leaves a half-written entry.
+    /// temp-file + rename so a crash never leaves a half-written entry. The
+    /// temp file name is unique per call (pid + nanosecond timestamp), not a
+    /// single fixed `.sync-tmp` path per entry — two same-machine processes
+    /// syncing the same brain dir concurrently (e.g. a CLI `index` and a
+    /// server-side freshen) must not interleave writes to the same temp path
+    /// and corrupt the entry (and then push the corruption). Same directory
+    /// as `dest` so the final rename stays atomic; a non-`.md` extension so
+    /// `scan_local` ignores any strays left behind by a crash.
     async fn download_entry(&self, rel: &str, sha256: &str) -> Result<()> {
         let key = entry_key(rel, sha256);
         let GetResponse::Found { bytes, .. } = self.store.get(&key, None).await? else {
@@ -127,7 +134,11 @@ impl BrainSync {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = dest.with_extension("md.sync-tmp");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let tmp = dest.with_extension(format!("sync-tmp-{}-{}", std::process::id(), nanos));
         fs::write(&tmp, &bytes)?;
         fs::rename(&tmp, &dest)?;
         Ok(())
@@ -445,6 +456,27 @@ mod tests {
         let sync = BrainSync::new(dir.path().to_path_buf(), cfg(0), store);
         assert!(sync.pull_if_stale().await.is_err());
         assert_eq!(fs::read_to_string(dir.path().join("local.md")).unwrap(), "# mine");
+    }
+
+    #[tokio::test]
+    async fn pull_if_stale_rejects_path_traversal_manifest_entry_without_writing_outside_brain_dir() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(InMemoryRemoteStore::default());
+        // Hand-built manifest JSON: a manifest containing even one unsafe
+        // entry must be rejected wholesale (nothing applied), same as the
+        // unknown-format case above.
+        let raw = br#"{"format": 1, "generation": 1, "entries": {"../evil.md": {"sha256": "abc", "size": 1, "updated_by": "attacker", "updated_at": "2026-07-22T00:00:00Z"}}}"#;
+        store.put(MANIFEST_KEY, raw.to_vec()).await.unwrap();
+        let sync = BrainSync::new(dir.path().to_path_buf(), cfg(0), store);
+
+        let err = sync.pull_if_stale().await.unwrap_err().to_string();
+        assert!(err.contains("unsafe path"), "{err}");
+
+        // Nothing was written outside the brain dir, or inside it.
+        let escaped = dir.path().parent().unwrap().join("evil.md");
+        assert!(!escaped.exists());
+        assert!(!dir.path().join("evil.md").exists());
+        assert!(fs::read_dir(dir.path()).map(|mut r| r.next().is_none()).unwrap_or(true));
     }
 
     #[tokio::test]

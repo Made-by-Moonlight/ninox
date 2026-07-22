@@ -41,6 +41,16 @@ impl Manifest {
 
     /// Parse manifest bytes, refusing unknown format versions loudly so an
     /// old ninox never mangles a newer team's remote.
+    ///
+    /// Also validates every entry's rel path via [`check_rel_path_is_safe`]
+    /// before returning — the remote bucket is shared-write, so `manifest.json`
+    /// is attacker-controlled in the threat model. Rejecting unsafe paths here,
+    /// at the one place every manifest is parsed, means every caller downstream
+    /// (`download_entry`, `delete_local`, the conflict-rename path) can join a
+    /// validated rel path onto `brain_path` without a path-traversal check of
+    /// its own. A manifest with even one unsafe entry is rejected wholesale —
+    /// nothing from it is ever applied — mirroring the two-pass validate-then-
+    /// extract precedent in `brain_archive::import`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let m: Manifest = serde_json::from_slice(bytes).context("parse manifest.json")?;
         if m.format != MANIFEST_FORMAT {
@@ -48,6 +58,9 @@ impl Manifest {
                 "remote brain manifest format {} is not supported by this ninox (wanted {MANIFEST_FORMAT}) — upgrade ninox",
                 m.format
             );
+        }
+        for rel in m.entries.keys() {
+            check_rel_path_is_safe(rel)?;
         }
         Ok(m)
     }
@@ -89,6 +102,30 @@ impl SyncState {
         fs::write(brain_path.join(SYNC_STATE), serde_json::to_vec_pretty(self)?)?;
         Ok(())
     }
+}
+
+/// Reject a manifest entry path that could escape the brain directory when
+/// joined onto it — mirrors `brain_archive::check_entry_is_safe`: no
+/// absolute paths, no `..` components, no prefix/root components, non-empty.
+/// The remote bucket is shared-write, so `rel` here is attacker-controlled;
+/// this is the one gate every rel path from a parsed manifest passes through
+/// (see `Manifest::from_bytes`).
+fn check_rel_path_is_safe(rel: &str) -> Result<()> {
+    let p = Path::new(rel);
+    if rel.is_empty()
+        || p.is_absolute()
+        || p.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        bail!("remote manifest entry {rel:?} has an unsafe path, refusing to sync");
+    }
+    Ok(())
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -203,6 +240,31 @@ mod tests {
     fn manifest_rejects_unknown_format() {
         let bytes = br#"{"format": 99, "generation": 1, "entries": {}}"#;
         assert!(Manifest::from_bytes(bytes).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_parent_dir_traversal_entry() {
+        let bytes = br#"{"format": 1, "generation": 1, "entries": {"../../../../home/victim/.zshrc": {"sha256": "abc", "size": 1, "updated_by": "x", "updated_at": "2026-07-22T00:00:00Z"}}}"#;
+        let err = Manifest::from_bytes(bytes).unwrap_err().to_string();
+        assert!(err.contains("unsafe path"), "{err}");
+    }
+
+    #[test]
+    fn manifest_rejects_absolute_path_entry() {
+        let bytes = br#"{"format": 1, "generation": 1, "entries": {"/tmp/x.md": {"sha256": "abc", "size": 1, "updated_by": "x", "updated_at": "2026-07-22T00:00:00Z"}}}"#;
+        let err = Manifest::from_bytes(bytes).unwrap_err().to_string();
+        assert!(err.contains("unsafe path"), "{err}");
+    }
+
+    #[test]
+    fn manifest_accepts_normal_nested_path_entry() {
+        let mut m = Manifest::empty();
+        m.entries.insert(
+            "repos/a.md".into(),
+            ManifestEntry { sha256: "abc".into(), size: 3, updated_by: "ethan".into(), updated_at: "2026-07-22T10:00:00Z".into() },
+        );
+        let loaded = Manifest::from_bytes(&m.to_bytes().unwrap()).unwrap();
+        assert!(loaded.entries.contains_key("repos/a.md"));
     }
 
     #[test]
