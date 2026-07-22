@@ -29,5 +29,16 @@ flate2      = "1"
 semver      = "1"
 sha2        = "0.10"
 time        = { version = "0.3", features = ["formatting"] }
+# Pinned to aws-config 1.6.3 (see Cargo.lock) rather than the latest 1.x wave:
+# newer releases (1.9+) bump transitive aws-smithy-* MSRV to rustc 1.94.1, which
+# is newer than the toolchain this workspace builds with (1.94.0). Unpin once the
+# toolchain is >= 1.94.1.
+#
+# Feature note: aws-sdk-s3's "rustls" feature name is a legacy alias that pulls in
+# aws-smithy-runtime's `tls-rustls` feature, which still drags in the unmaintained
+# hyper 0.14 / rustls 0.21 / h2 0.3 client-hyper connector for backwards
+# compatibility. We instead select `default-https-client`, the modern
+# hyper 1.x / rustls 0.23 (aws-lc-rs) transport, so real S3 traffic (including
+# SigV4-signed requests) rides the same TLS stack as the rest of the workspace.
 aws-config  = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls", "sso"] }
-aws-sdk-s3  = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
+aws-sdk-s3  = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
