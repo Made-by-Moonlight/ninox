@@ -1066,6 +1066,10 @@ impl App {
                 state.config.brain.catalogues.push(ninox_core::config::CatalogueRef {
                     name: name.clone(),
                     path: path.clone(),
+                    remote: None,
+                    endpoint: None,
+                    region: None,
+                    cache_ttl_secs: None,
                 });
                 if let Err(e) = state.config.save() {
                     tracing::warn!("failed to save config after adding catalogue '{name}': {e}");
@@ -1112,6 +1116,10 @@ impl App {
                     .unwrap_or_else(|| ninox_core::config::CatalogueRef {
                         name: "default".to_string(),
                         path: state.config.resolved_brain_path(),
+                        remote: None,
+                        endpoint: None,
+                        region: None,
+                        cache_ttl_secs: None,
                     });
                 let catalogue_path = catalogue.path.to_string_lossy().to_string();
 
@@ -2968,6 +2976,10 @@ mod tests {
             catalogues:      vec![ninox_core::config::CatalogueRef {
                 name: "default".to_string(),
                 path: std::path::PathBuf::new(),
+                remote: None,
+                endpoint: None,
+                region: None,
+                cache_ttl_secs: None,
             }],
             active_catalogue: 0,
             prs:            HashMap::new(),
@@ -3760,8 +3772,8 @@ mod tests {
         let e = test_engine();
         let mut app = base_with_brain(e, brain_a);
         app.catalogues = vec![
-            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone() },
-            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone() },
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
         ];
         let (app, _) = app.update(Message::NavigateBrain);
         let (app, _) = app.update(Message::BrainSelectEntry("symbols/a.md".into()));
@@ -3952,8 +3964,8 @@ mod tests {
         let e = test_engine();
         let mut app = base_with_brain(e, brain_a);
         app.catalogues = vec![
-            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone() },
-            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone() },
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
         ];
         let (app, _) = app.update(Message::NavigateBrain);
         assert_eq!(
