@@ -124,6 +124,14 @@ impl BrainSync {
     /// Full sync (spec §3): pull, resolve conflicts into conflict copies,
     /// push, all under a bounded manifest compare-and-swap loop. Used by
     /// `ninox brain index` and `ninox brain sync`.
+    ///
+    /// Guarantee on failure (CAS attempts exhausted): **no data loss**, not
+    /// "no disk change". A failed attempt may already have pulled remote
+    /// entries or rewritten a conflicting file into a conflict copy before
+    /// its manifest CAS lost; that content is preserved on disk (nothing is
+    /// silently dropped), but the working tree can differ from how it
+    /// looked when `sync()` was called. Callers that need the tree
+    /// untouched on error must snapshot/restore themselves.
     pub async fn sync(&self) -> Result<SyncReport> {
         let mut report = SyncReport { checked: true, ..Default::default() };
         const MAX_ATTEMPTS: u64 = 5;
@@ -486,5 +494,111 @@ mod tests {
         assert!(err.contains("ninox brain sync"), "error should tell the user how to retry: {err}");
         // Local file untouched by the failed push.
         assert_eq!(fs::read_to_string(dir.path().join("a.md")).unwrap(), "# A");
+    }
+
+    /// A store whose manifest CAS fails `PreconditionFailed` for the first
+    /// `fail_count` calls — as if a teammate wins the race a couple of
+    /// times — then delegates to the real in-memory store. `get`/`put`
+    /// always delegate. Used to exercise a *successful* retry, unlike
+    /// `AlwaysLosesCas` above which only covers permanent exhaustion.
+    struct LosesCasNTimes {
+        inner: InMemoryRemoteStore,
+        fail_count: u64,
+        calls: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteStore for LosesCasNTimes {
+        async fn get(&self, key: &str, inm: Option<&str>) -> anyhow::Result<GetResponse> {
+            self.inner.get(key, inm).await
+        }
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<String> {
+            self.inner.put(key, bytes).await
+        }
+        async fn put_if_match(&self, key: &str, bytes: Vec<u8>, expected_etag: Option<&str>) -> anyhow::Result<PutOutcome> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.fail_count {
+                return Ok(PutOutcome::PreconditionFailed);
+            }
+            self.inner.put_if_match(key, bytes, expected_etag).await
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_recovers_after_bounded_cas_losses_lose_then_win() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("repos")).unwrap();
+        fs::write(dir.path().join("repos/mine.md"), "# Mine").unwrap();
+        let store = Arc::new(LosesCasNTimes {
+            inner: InMemoryRemoteStore::default(),
+            fail_count: 2,
+            calls: std::sync::atomic::AtomicU64::new(0),
+        });
+        let sync = BrainSync::new(dir.path().to_path_buf(), cfg(0), store.clone());
+
+        let report = sync.sync().await.unwrap();
+        assert_eq!(report.pushed, 1);
+        assert_eq!(report.pulled, 0);
+        assert!(report.conflicts.is_empty());
+
+        // The entry really landed remotely: a fresh second client pulls it.
+        let dir2 = tempdir().unwrap();
+        let sync2 = BrainSync::new(dir2.path().to_path_buf(), cfg(0), store.clone());
+        let report2 = sync2.pull_if_stale().await.unwrap();
+        assert_eq!(report2.pulled, 1);
+        assert_eq!(fs::read_to_string(dir2.path().join("repos/mine.md")).unwrap(), "# Mine");
+
+        // No duplicate copies from the retries: exactly the one .md file,
+        // no conflict copies.
+        let scan = crate::brain_sync::manifest::scan_local(dir.path()).unwrap();
+        assert_eq!(scan.len(), 1, "{scan:?}");
+        assert!(!scan.keys().any(|k| k.contains(".conflict-")), "{scan:?}");
+
+        // Idempotence across the retries didn't double-count: a second sync
+        // reports nothing new.
+        let report3 = sync.sync().await.unwrap();
+        assert_eq!(report3.pushed, 0);
+        assert_eq!(report3.pulled, 0);
+        assert!(report3.conflicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_recovers_after_lost_cas_during_conflict_resolution_without_duplicating_the_copy() {
+        let inner = InMemoryRemoteStore::default();
+        seed_remote(&inner, 1, &[("note.md", "# v1")]).await;
+        let store = Arc::new(LosesCasNTimes { inner, fail_count: 1, calls: std::sync::atomic::AtomicU64::new(0) });
+
+        let dir = tempdir().unwrap();
+        let sync = BrainSync::new(dir.path().to_path_buf(), cfg(0), store.clone());
+        sync.pull_if_stale().await.unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join("note.md")).unwrap(), "# v1");
+
+        // Local edit diverges from base...
+        fs::write(dir.path().join("note.md"), "# local edit").unwrap();
+        // ...while the remote independently moves to a different v2.
+        seed_remote(&store.inner, 2, &[("note.md", "# v2 from teammate")]).await;
+
+        // sync() must resolve the conflict (remote wins canonically, local
+        // edit preserved as a conflict copy and pushed) while surviving
+        // exactly one lost manifest CAS along the way.
+        let report = sync.sync().await.unwrap();
+        assert_eq!(report.conflicts.len(), 1, "{:?}", report.conflicts);
+        let copy_rel = report.conflicts[0].clone();
+
+        assert_eq!(fs::read_to_string(dir.path().join("note.md")).unwrap(), "# v2 from teammate");
+        assert_eq!(fs::read_to_string(dir.path().join(&copy_rel)).unwrap(), "# local edit");
+
+        // Exactly one conflict copy on disk — the retried attempt must not
+        // have created a duplicate.
+        let scan = crate::brain_sync::manifest::scan_local(dir.path()).unwrap();
+        let conflict_files: Vec<_> = scan.keys().filter(|k| k.contains(".conflict-")).collect();
+        assert_eq!(conflict_files.len(), 1, "{scan:?}");
+
+        // The conflict copy was actually pushed: a fresh client pulls it.
+        let dir2 = tempdir().unwrap();
+        let sync2 = BrainSync::new(dir2.path().to_path_buf(), cfg(0), store);
+        sync2.pull_if_stale().await.unwrap();
+        assert_eq!(fs::read_to_string(dir2.path().join("note.md")).unwrap(), "# v2 from teammate");
+        assert_eq!(fs::read_to_string(dir2.path().join(&copy_rel)).unwrap(), "# local edit");
     }
 }
