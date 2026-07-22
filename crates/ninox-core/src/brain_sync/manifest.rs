@@ -81,7 +81,7 @@ impl SyncState {
             return Ok(SyncState::default());
         }
         let text = fs::read_to_string(&p).with_context(|| format!("read {p:?}"))?;
-        Ok(serde_json::from_str(&text).with_context(|| format!("parse {p:?}"))?)
+        serde_json::from_str(&text).with_context(|| format!("parse {p:?}"))
     }
 
     pub fn save(&self, brain_path: &Path) -> Result<()> {

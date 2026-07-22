@@ -409,6 +409,11 @@ Then rebuild the index so the write becomes queryable:
 ninox brain index
 ```
 
+If this brain is remote-backed (team-shared), `ninox brain index` also
+pushes your new entries to the team and pulls theirs — nothing extra to
+do. If it reports a conflict copy (`*.conflict-*.md`), merge it into the
+canonical entry and delete the copy when you're confident.
+
 ## The Rule
 
 **Query before touching unfamiliar code. Write down what you found before
