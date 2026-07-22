@@ -11,8 +11,9 @@ pub use config::{ensure_sync_toml, SyncToml, SYNC_TOML};
 pub use diff::{plan_sync, SyncPlan};
 pub use manifest::{Manifest, ManifestEntry, SyncState, MANIFEST_KEY, SYNC_STATE};
 pub use store::{GetResponse, InMemoryRemoteStore, PutOutcome, RemoteStore};
+pub use manifest::rfc3339;
 
-use crate::brain_sync::manifest::{conflict_copy_rel, current_user, entry_key, now_unix, rfc3339, scan_local, sha256_hex};
+use crate::brain_sync::manifest::{conflict_copy_rel, current_user, entry_key, now_unix, scan_local, sha256_hex};
 use anyhow::{bail, Result};
 use std::{fs, path::PathBuf, sync::Arc};
 
@@ -233,6 +234,42 @@ impl BrainSync {
         }
         bail!("brain push failed after {MAX_ATTEMPTS} attempts — the remote is being updated concurrently; retry with `ninox brain sync`")
     }
+}
+
+/// Offline snapshot for `ninox brain remote status` — deliberately makes
+/// no network calls so status always answers instantly.
+#[derive(Debug)]
+pub struct RemoteStatus {
+    pub remote: String,
+    pub cache_ttl_secs: u64,
+    pub generation: u64,
+    pub last_check_unix: u64,
+    pub pending_pushes: Vec<String>,
+    pub conflict_files: Vec<String>,
+}
+
+pub fn remote_status(brain_path: &std::path::Path) -> Result<Option<RemoteStatus>> {
+    let Some(cfg) = SyncToml::load(brain_path)? else {
+        return Ok(None);
+    };
+    let state = SyncState::load(brain_path)?;
+    let local = scan_local(brain_path)?;
+    let pending_pushes: Vec<String> = local
+        .iter()
+        .filter(|(rel, hash)| state.base.get(*rel) != Some(hash))
+        .map(|(rel, _)| rel.clone())
+        .chain(state.base.keys().filter(|rel| !local.contains_key(*rel)).cloned())
+        .collect();
+    let conflict_files: Vec<String> =
+        local.keys().filter(|rel| rel.contains(".conflict-")).cloned().collect();
+    Ok(Some(RemoteStatus {
+        remote: cfg.remote,
+        cache_ttl_secs: cfg.cache_ttl_secs,
+        generation: state.generation,
+        last_check_unix: state.last_check_unix,
+        pending_pushes,
+        conflict_files,
+    }))
 }
 
 /// The front door for every read entry point (CLI query/show, server
@@ -698,5 +735,30 @@ mod tests {
         let brain = open_synced(dir.path(), None).await.unwrap();
         brain.rebuild(None).unwrap();
         assert!(brain.get("a.md").unwrap().is_some());
+    }
+
+    #[test]
+    fn remote_status_none_for_local_brain() {
+        let dir = tempdir().unwrap();
+        assert!(remote_status(dir.path()).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_status_reports_pending_and_conflicts() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(InMemoryRemoteStore::default());
+        seed_remote(&store, 1, &[("a.md", "# A")]).await;
+        cfg(0).save(dir.path()).unwrap();
+        let sync = BrainSync::new(dir.path().to_path_buf(), cfg(0), store);
+        sync.pull_if_stale().await.unwrap();
+
+        fs::write(dir.path().join("a.md"), "# A locally edited").unwrap();
+        fs::write(dir.path().join("b.conflict-ethan-20260722-100000.md"), "# leftover").unwrap();
+
+        let status = remote_status(dir.path()).unwrap().unwrap();
+        assert_eq!(status.remote, "s3://bucket/prefix");
+        assert_eq!(status.generation, 1);
+        assert!(status.pending_pushes.contains(&"a.md".to_string()));
+        assert_eq!(status.conflict_files, vec!["b.conflict-ethan-20260722-100000.md"]);
     }
 }

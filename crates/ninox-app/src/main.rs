@@ -132,6 +132,32 @@ enum BrainAction {
         /// been spawned into) when none are given.
         paths: Vec<PathBuf>,
     },
+    /// Manage this brain's remote backing store
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteAction {
+    /// Attach an S3-compatible remote and run an initial sync
+    Set {
+        /// Remote URL, e.g. s3://team-brains/main
+        url: String,
+        /// Custom endpoint for S3-compatible stores (R2, MinIO)
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long)]
+        region: Option<String>,
+        /// Freshness-check cache TTL in seconds (0 = check every lookup)
+        #[arg(long, default_value_t = 0)]
+        ttl: u64,
+    },
+    /// Show remote, last sync, pending pushes, and live conflicts (offline)
+    Status,
+    /// Detach from the remote; the local copy stays a normal brain
+    Unset,
 }
 
 #[tokio::main]
@@ -527,6 +553,59 @@ async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()>
             // `brain` above, since candidates can span multiple catalogues.
             run_discover_repos(&brain_path, &store, paths)?;
         }
+        BrainAction::Remote { action } => match action {
+            RemoteAction::Set { url, endpoint, region, ttl } => {
+                let cfg = ninox_core::brain_sync::SyncToml {
+                    remote: url,
+                    endpoint,
+                    region,
+                    cache_ttl_secs: ttl,
+                };
+                cfg.save(&brain_path)?;
+                println!("remote set to {} for {}", cfg.remote, brain_path.display());
+                match ninox_core::brain_sync::BrainSync::for_brain(&brain_path).await? {
+                    Some(sync) => {
+                        let report = sync.sync().await?;
+                        print_sync_report(&report);
+                        let brain = BrainIndex::open(&brain_path)?;
+                        let embedder = try_build_embedder();
+                        brain.rebuild(embedder.as_deref())?;
+                    }
+                    None => unreachable!(".sync.toml was just written"),
+                }
+            }
+            RemoteAction::Status => match ninox_core::brain_sync::remote_status(&brain_path)? {
+                None => {
+                    println!("no remote configured for {}", brain_path.display());
+                }
+                Some(s) => {
+                    println!("remote:          {}", s.remote);
+                    println!("cache ttl:       {}s", s.cache_ttl_secs);
+                    println!("last generation: {}", s.generation);
+                    println!(
+                        "last check:      {}",
+                        if s.last_check_unix == 0 { "never".to_string() } else { ninox_core::brain_sync::rfc3339(s.last_check_unix) }
+                    );
+                    println!("pending pushes:  {}", s.pending_pushes.len());
+                    for rel in &s.pending_pushes {
+                        println!("  {rel}");
+                    }
+                    println!("live conflicts:  {}", s.conflict_files.len());
+                    for rel in &s.conflict_files {
+                        println!("  {rel}");
+                    }
+                }
+            },
+            RemoteAction::Unset => {
+                let removed_cfg = std::fs::remove_file(brain_path.join(ninox_core::brain_sync::SYNC_TOML)).is_ok();
+                let _ = std::fs::remove_file(brain_path.join(ninox_core::brain_sync::SYNC_STATE));
+                if removed_cfg {
+                    println!("remote detached; {} is a plain local brain again", brain_path.display());
+                } else {
+                    println!("no remote was configured for {}", brain_path.display());
+                }
+            }
+        },
     }
 
     Ok(())
