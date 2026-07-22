@@ -1,5 +1,5 @@
 use iced::{
-    widget::{button, column, container, pick_list, row, scrollable, text, text_input, Space},
+    widget::{button, column, container, mouse_area, pick_list, row, scrollable, text, text_input, Space},
     Alignment, Background, Border, Color, Element, Length,
 };
 
@@ -616,16 +616,21 @@ fn drawer<'a>(
 /// One entry in an open drawer. Selected = accent 3px left bar + `card` bg
 /// + `MONO_MEDIUM`; hovered = `paper_2` bg (visibly distinct from the
 ///   transparent resting state) — an old regression collapsed hover to a
-///   no-op, so this must render differently in all three states.
+///   no-op, so this must render differently in all three states. Also
+///   dispatches `BrainHoverEntry` on mouse-enter/exit so the pinboard
+///   canvas's hover ring/preview slip react to a drawer hover the same way
+///   they react to hovering the node directly — a no-op in Catalogue mode,
+///   which doesn't read `hovered`.
 fn dentry_row<'a>(app: &'a App, entry: &BrainEntry) -> Element<'a, Message> {
     let s = &app.scheme;
     let is_selected = app.brain_view.selected.as_deref() == Some(entry.id.as_str());
     let id = entry.id.clone();
+    let hover_id = entry.id.clone();
     let name = entry.name.clone();
     let updated: String = entry.updated.as_deref().unwrap_or("").chars().take(10).collect();
     let bar_color = if is_selected { s.accent } else { Color::TRANSPARENT };
 
-    button(
+    let row = button(
         row![
             vline(bar_color, 3.0),
             container(
@@ -658,8 +663,12 @@ fn dentry_row<'a>(app: &'a App, entry: &BrainEntry) -> Element<'a, Message> {
             border: Border::default(),
             ..Default::default()
         }
-    })
-    .into()
+    });
+
+    mouse_area(row)
+        .on_enter(Message::BrainHoverEntry(Some(hover_id)))
+        .on_exit(Message::BrainHoverEntry(None))
+        .into()
 }
 
 /// One `dt`/`dd` row of the reading pane's frontmatter description list.
