@@ -64,6 +64,11 @@ impl Default for AgentConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BrainConfig {
     pub path: Option<PathBuf>,
+    /// Remote backing for the default brain: `s3://bucket/prefix`.
+    pub remote: Option<String>,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub cache_ttl_secs: Option<u64>,
     /// Additional named knowledge bases selectable when spawning an
     /// orchestrator. The implicit "default" catalogue (this config's
     /// `resolved_brain_path()`) is always offered first by
@@ -78,6 +83,13 @@ pub struct BrainConfig {
 pub struct CatalogueRef {
     pub name: String,
     pub path: PathBuf,
+    /// Optional remote backing: `s3://bucket/prefix`. On first open the
+    /// local dir is materialized with a `.sync.toml` built from these
+    /// fields (see `brain_sync::config::ensure_sync_toml`).
+    pub remote: Option<String>,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub cache_ttl_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +285,10 @@ impl AppConfig {
         let mut options = vec![CatalogueRef {
             name: "default".to_string(),
             path: self.resolved_brain_path(),
+            remote: self.brain.remote.clone(),
+            endpoint: self.brain.endpoint.clone(),
+            region: self.brain.region.clone(),
+            cache_ttl_secs: self.brain.cache_ttl_secs,
         }];
         options.extend(
             self.brain
@@ -282,6 +298,29 @@ impl AppConfig {
                 .cloned(),
         );
         options
+    }
+
+    /// The remote-sync settings configured for `brain_path`, if any: the
+    /// default brain's `[brain]` remote fields when `brain_path` is the
+    /// resolved default, else a `[[brain.catalogues]]` entry whose `path`
+    /// matches exactly. Returns the `.sync.toml` payload to materialize.
+    pub fn remote_config_for(&self, brain_path: &std::path::Path) -> Option<crate::brain_sync::SyncToml> {
+        let build = |remote: &Option<String>, endpoint: &Option<String>, region: &Option<String>, ttl: &Option<u64>| {
+            remote.as_ref().map(|r| crate::brain_sync::SyncToml {
+                remote: r.clone(),
+                endpoint: endpoint.clone(),
+                region: region.clone(),
+                cache_ttl_secs: ttl.unwrap_or(0),
+            })
+        };
+        if self.brain.remote.is_some() && brain_path == self.resolved_brain_path() {
+            return build(&self.brain.remote, &self.brain.endpoint, &self.brain.region, &self.brain.cache_ttl_secs);
+        }
+        self.brain
+            .catalogues
+            .iter()
+            .find(|c| c.path == brain_path)
+            .and_then(|c| build(&c.remote, &c.endpoint, &c.region, &c.cache_ttl_secs))
     }
 
     pub fn resolved_orchestrator_root(&self) -> PathBuf {
@@ -516,13 +555,64 @@ mod tests {
     fn catalogue_options_appends_configured_catalogues_and_skips_duplicate_default() {
         let mut cfg = AppConfig::default();
         cfg.brain.catalogues = vec![
-            CatalogueRef { name: "docs".to_string(), path: PathBuf::from("/tmp/docs-brain") },
-            CatalogueRef { name: "default".to_string(), path: PathBuf::from("/tmp/should-be-skipped") },
+            CatalogueRef { name: "docs".to_string(), path: PathBuf::from("/tmp/docs-brain"), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+            CatalogueRef { name: "default".to_string(), path: PathBuf::from("/tmp/should-be-skipped"), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
         ];
         let options = cfg.catalogue_options();
         assert_eq!(options.len(), 2);
         assert_eq!(options[0].name, "default");
         assert_eq!(options[1].name, "docs");
         assert_eq!(options[1].path, PathBuf::from("/tmp/docs-brain"));
+    }
+
+    #[test]
+    fn remote_config_for_matches_catalogue_by_path() {
+        let mut cfg = AppConfig::default();
+        cfg.brain.catalogues = vec![CatalogueRef {
+            name: "team".into(),
+            path: PathBuf::from("/tmp/team-brain"),
+            remote: Some("s3://team-brains/main".into()),
+            endpoint: None,
+            region: Some("eu-west-1".into()),
+            cache_ttl_secs: Some(60),
+        }];
+        let sync = cfg.remote_config_for(std::path::Path::new("/tmp/team-brain")).unwrap();
+        assert_eq!(sync.remote, "s3://team-brains/main");
+        assert_eq!(sync.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(sync.cache_ttl_secs, 60);
+        assert!(cfg.remote_config_for(std::path::Path::new("/tmp/other")).is_none());
+    }
+
+    #[test]
+    fn remote_config_for_matches_default_brain() {
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = AppConfig::default();
+        cfg.brain.remote = Some("s3://team-brains/default".into());
+        let path = cfg.resolved_brain_path();
+        let sync = cfg.remote_config_for(&path).unwrap();
+        assert_eq!(sync.remote, "s3://team-brains/default");
+        assert_eq!(sync.cache_ttl_secs, 0);
+    }
+
+    #[test]
+    fn catalogue_without_remote_yields_none() {
+        let mut cfg = AppConfig::default();
+        cfg.brain.catalogues = vec![CatalogueRef {
+            name: "local".into(),
+            path: PathBuf::from("/tmp/local-brain"),
+            remote: None,
+            endpoint: None,
+            region: None,
+            cache_ttl_secs: None,
+        }];
+        assert!(cfg.remote_config_for(std::path::Path::new("/tmp/local-brain")).is_none());
+    }
+
+    #[test]
+    fn catalogue_ref_remote_fields_default_to_none_in_toml() {
+        let toml_src = "port = 8080\nfont_size = 13.0\n\n[[brain.catalogues]]\nname = \"docs\"\npath = \"/tmp/docs\"\n";
+        let cfg: AppConfig = toml::from_str(toml_src).unwrap();
+        assert!(cfg.brain.catalogues[0].remote.is_none());
+        assert!(cfg.brain.catalogues[0].cache_ttl_secs.is_none());
     }
 }

@@ -98,6 +98,11 @@ impl BrainIndex {
         Ok(Self { conn: Mutex::new(conn), brain_path })
     }
 
+    /// The brain directory this index was opened on.
+    pub fn path(&self) -> &Path {
+        &self.brain_path
+    }
+
     /// Walk the brain directory, parse markdown files, and repopulate the
     /// index, then embed any new or changed entries (skipped entirely if
     /// `embedder` is `None`, or if embedding a given entry fails — indexing
@@ -701,17 +706,23 @@ fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<BrainEntry> {
     })
 }
 
-/// Ensure `.index.db` is in the brain directory's `.gitignore`.
+/// Ensure the brain's derived/local-only files are in its `.gitignore`:
+/// the SQLite index plus the remote-sync marker and state files (see
+/// `brain_sync`), none of which should ever be committed or synced.
 fn ensure_gitignore(brain_path: &Path) -> Result<()> {
     let gi = brain_path.join(".gitignore");
-    let entry = ".index.db\n";
-    if gi.exists() {
-        let content = fs::read_to_string(&gi)?;
-        if !content.contains(".index.db") {
-            fs::write(&gi, format!("{content}{entry}"))?;
+    let wanted = [".index.db", ".sync.toml", ".sync-state.json"];
+    let mut content = if gi.exists() { fs::read_to_string(&gi)? } else { String::new() };
+    let mut changed = !gi.exists();
+    for entry in wanted {
+        if !content.lines().any(|l| l.trim() == entry) {
+            content.push_str(entry);
+            content.push('\n');
+            changed = true;
         }
-    } else {
-        fs::write(&gi, entry)?;
+    }
+    if changed {
+        fs::write(&gi, content)?;
     }
     Ok(())
 }
@@ -992,6 +1003,15 @@ mod tests {
         assert!(gi.exists());
         let content = fs::read_to_string(&gi).unwrap();
         assert!(content.contains(".index.db"));
+    }
+
+    #[test]
+    fn gitignore_covers_sync_files() {
+        let (_brain, dir) = make_brain();
+        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains(".index.db"));
+        assert!(content.contains(".sync.toml"));
+        assert!(content.contains(".sync-state.json"));
     }
 
     #[test]

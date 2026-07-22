@@ -1,5 +1,6 @@
 pub mod brain;
 pub mod brain_archive;
+pub mod brain_sync;
 pub mod client;
 pub mod config;
 pub mod embeddings;
