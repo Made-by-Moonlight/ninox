@@ -4,6 +4,7 @@
 pub mod config;
 pub mod diff;
 pub mod manifest;
+pub mod s3;
 pub mod store;
 
 pub use config::{SyncToml, SYNC_TOML};
@@ -48,6 +49,16 @@ pub struct BrainSync {
 impl BrainSync {
     pub fn new(brain_path: PathBuf, cfg: SyncToml, store: Arc<dyn RemoteStore>) -> Self {
         Self { brain_path, cfg, store }
+    }
+
+    /// Build the sync engine for a brain directory, or `None` when the
+    /// directory has no `.sync.toml` (a plain local brain).
+    pub async fn for_brain(brain_path: &std::path::Path) -> Result<Option<BrainSync>> {
+        let Some(cfg) = SyncToml::load(brain_path)? else {
+            return Ok(None);
+        };
+        let store = s3::S3RemoteStore::from_config(&cfg).await?;
+        Ok(Some(BrainSync::new(brain_path.to_path_buf(), cfg, Arc::new(store))))
     }
 
     /// The lookup-path check (spec §3 "pull_if_stale"): one conditional GET
@@ -233,6 +244,21 @@ mod tests {
 
     fn cfg(ttl: u64) -> SyncToml {
         SyncToml { remote: "s3://bucket/prefix".into(), endpoint: None, region: None, cache_ttl_secs: ttl }
+    }
+
+    #[tokio::test]
+    async fn for_brain_returns_none_without_sync_toml() {
+        let dir = tempdir().unwrap();
+        assert!(BrainSync::for_brain(dir.path()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn for_brain_rejects_non_s3_remote() {
+        let dir = tempdir().unwrap();
+        SyncToml { remote: "ftp://nope".into(), endpoint: None, region: None, cache_ttl_secs: 0 }
+            .save(dir.path())
+            .unwrap();
+        assert!(BrainSync::for_brain(dir.path()).await.is_err());
     }
 
     /// Seed the fake remote with a manifest holding `entries` (rel, body).
