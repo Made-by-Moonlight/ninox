@@ -98,6 +98,11 @@ impl BrainIndex {
         Ok(Self { conn: Mutex::new(conn), brain_path })
     }
 
+    /// The brain directory this index was opened on.
+    pub fn path(&self) -> &Path {
+        &self.brain_path
+    }
+
     /// Walk the brain directory, parse markdown files, and repopulate the
     /// index, then embed any new or changed entries (skipped entirely if
     /// `embedder` is `None`, or if embedding a given entry fails — indexing
