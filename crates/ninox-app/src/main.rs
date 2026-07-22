@@ -85,8 +85,8 @@ enum Command {
 enum BrainAction {
     /// Rebuild the knowledge index
     Index,
-    /// Pull and push all changes to the brain's remote (no-op for a brain
-    /// without a remote — see `ninox brain remote set`)
+    /// Pull and push all changes to the brain's remote (requires a
+    /// configured remote — see `ninox brain remote set`)
     Sync,
     /// Search entries by full-text
     Query {

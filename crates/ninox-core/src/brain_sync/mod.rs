@@ -246,18 +246,25 @@ pub async fn open_synced(
     let brain = crate::BrainIndex::open(brain_path)?;
     match BrainSync::for_brain(brain_path).await {
         Ok(None) => {}
-        Ok(Some(sync)) => match sync.pull_if_stale().await {
-            Ok(report) if report.changed_local() => {
-                if let Err(e) = brain.rebuild(embedder) {
-                    tracing::warn!("brain: index rebuild after pull failed: {e}");
-                }
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!("brain: remote check failed, serving local copy: {e}"),
-        },
+        Ok(Some(sync)) => freshen_from(&brain, &sync, embedder).await,
         Err(e) => tracing::warn!("brain: remote unavailable, serving local copy: {e}"),
     }
     Ok(brain)
+}
+
+/// Freshen an opened brain from its sync engine, degrading to the local
+/// copy with a warning on any remote failure. Split from `open_synced` so
+/// the pull-failure degrade path is testable with an injected store.
+async fn freshen_from(brain: &crate::BrainIndex, sync: &BrainSync, embedder: Option<&dyn crate::embeddings::Embedder>) {
+    match sync.pull_if_stale().await {
+        Ok(report) if report.changed_local() => {
+            if let Err(e) = brain.rebuild(embedder) {
+                tracing::warn!("brain: index rebuild after pull failed: {e}");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("brain: remote check failed, serving local copy: {e}"),
+    }
 }
 
 #[cfg(test)]
@@ -661,6 +668,22 @@ mod tests {
         brain.rebuild(None).unwrap();
         assert!(brain.get("a.md").unwrap().is_some());
         assert!(!dir.path().join(crate::brain_sync::manifest::SYNC_STATE).exists(), "no sync state for local brains");
+    }
+
+    #[tokio::test]
+    async fn freshen_from_survives_failing_remote_store() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "---\nname: A\n---\nLocal fact.").unwrap();
+        let brain = crate::BrainIndex::open(dir.path()).unwrap();
+        brain.rebuild(None).unwrap();
+
+        let store = Arc::new(InMemoryRemoteStore::default());
+        store.fail_all.store(true, std::sync::atomic::Ordering::SeqCst);
+        let sync = BrainSync::new(dir.path().to_path_buf(), cfg(0), store);
+
+        // Must not panic or error — the local brain keeps serving.
+        freshen_from(&brain, &sync, None).await;
+        assert!(brain.get("a.md").unwrap().is_some());
     }
 
     #[tokio::test]
