@@ -140,10 +140,12 @@ alongside `resolve_edges`:
     (O(n²), ~11k pairs at 150 nodes — negligible for a one-shot compute).
   - **Spring attraction**: along each edge in `edges`, pulling toward a
     fixed ideal distance.
-  - **Centering**: a weak pull toward `(0.5, 0.5)` so the whole graph
-    doesn't drift outside the canvas.
-  - **Damping**: velocity decays each iteration so the system settles
-    instead of oscillating indefinitely.
+  - **Temperature-capped displacement**: standard Fruchterman-Reingold —
+    each iteration's per-node displacement is capped by a linearly-cooling
+    "temperature" (starting at a fixed value, reaching ~0 by the final
+    iteration) so the system settles instead of oscillating indefinitely.
+    Combined with the hard `[0.05, 0.95]` clamp below, this keeps the graph
+    on-canvas without a separate centering force.
 - **Output**: final positions clamped into `[0.05, 0.95]` on both axes
   (same margin the current hash-based placement uses) and returned keyed
   by entry id.
@@ -215,9 +217,9 @@ of `hovered`:
 
 - `force_layout` on an empty `entries` slice returns an empty map — no
   special-casing needed, the loops simply don't run.
-- A single node with no edges settles at the centering force's target
-  (`0.5, 0.5`) after damping — no divide-by-zero (repulsion/spring terms
-  only apply between pairs, of which there are none).
+- A single node with no edges stays at its `hash01`-seeded starting
+  position (no repulsion/spring terms apply without another node or an
+  edge) — no divide-by-zero.
 - `Pinboard::nodes()`'s fallback to hash-based position for a `layout`
   cache miss (described above) is the same defensive pattern
   `resolve_edges` already uses for a link endpoint absent from `entries` —

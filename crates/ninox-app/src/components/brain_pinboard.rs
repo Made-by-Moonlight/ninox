@@ -1,7 +1,11 @@
 //! Brain pinboard specimen board — a canvas of wikilink-connected nodes
-//! (spec §IV "Pinboard"). Positions are re-derived from the canvas bounds on
-//! every draw (deterministic, hash-based) rather than stored in `State`, so
-//! resizing the window can never leave stale/clipped node positions behind.
+//! (spec §IV "Pinboard"). Node positions come from the cached force-directed
+//! `layout` on `BrainViewState` (recomputed once per data change by
+//! `App::refresh_brain_graph`, never per draw), falling back to a
+//! deterministic hash-based scatter for any id missing from that cache. The
+//! canvas itself stays stateless — normalized positions are scaled to the
+//! current `bounds` on every draw, so resizing the window can never leave
+//! stale/clipped node positions behind.
 
 use std::collections::HashMap;
 
@@ -39,8 +43,8 @@ pub(crate) fn hash01(s: &str, salt: u64) -> f32 {
 
 /// The pinboard canvas program. Borrows `App` for the duration of a single
 /// `view()` call; its only mutable state is [`PinboardState`]'s hover
-/// selection (node positions are still re-derived from bounds every frame,
-/// never cached).
+/// selection — node positions themselves come from the cached `layout` (see
+/// module docs), scaled to the current bounds on every draw.
 pub struct Pinboard<'a> {
     pub app: &'a App,
 }
@@ -100,8 +104,8 @@ impl<'a> Pinboard<'a> {
 /// The pinboard canvas `Program`'s interaction state: which node (if any)
 /// the cursor is currently hovering. Mutated in `update()` and read back in
 /// `draw()` (to render the hover ring) and `mouse_interaction()` (to switch
-/// to a pointer cursor) — node positions themselves stay re-derived from
-/// bounds every frame (see module docs), only the hover *selection* persists.
+/// to a pointer cursor) — node positions themselves come from the cached
+/// `layout` (see module docs), only the hover *selection* lives here.
 #[derive(Default)]
 pub struct PinboardState {
     hovered: Option<String>,
