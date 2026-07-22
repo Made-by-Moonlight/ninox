@@ -11,7 +11,7 @@ pub use diff::{plan_sync, SyncPlan};
 pub use manifest::{Manifest, ManifestEntry, SyncState, MANIFEST_KEY, SYNC_STATE};
 pub use store::{GetResponse, InMemoryRemoteStore, PutOutcome, RemoteStore};
 
-use crate::brain_sync::manifest::{entry_key, now_unix, scan_local};
+use crate::brain_sync::manifest::{conflict_copy_rel, current_user, entry_key, now_unix, rfc3339, scan_local, sha256_hex};
 use anyhow::{bail, Result};
 use std::{fs, path::PathBuf, sync::Arc};
 
@@ -119,6 +119,100 @@ impl BrainSync {
         fs::write(&tmp, &bytes)?;
         fs::rename(&tmp, &dest)?;
         Ok(())
+    }
+
+    /// Full sync (spec §3): pull, resolve conflicts into conflict copies,
+    /// push, all under a bounded manifest compare-and-swap loop. Used by
+    /// `ninox brain index` and `ninox brain sync`.
+    pub async fn sync(&self) -> Result<SyncReport> {
+        let mut report = SyncReport { checked: true, ..Default::default() };
+        const MAX_ATTEMPTS: u64 = 5;
+        for attempt in 0..MAX_ATTEMPTS {
+            let (mut manifest, etag) = match self.store.get(MANIFEST_KEY, None).await? {
+                GetResponse::Found { bytes, etag } => (Manifest::from_bytes(&bytes)?, Some(etag)),
+                GetResponse::NotFound => (Manifest::empty(), None),
+                GetResponse::NotModified => unreachable!("no If-None-Match sent"),
+            };
+            let mut state = SyncState::load(&self.brain_path)?;
+            let local = scan_local(&self.brain_path)?;
+            let plan = plan_sync(&state.base, &local, &manifest.hashes());
+            let now = now_unix();
+
+            // Pull side: safe pulls, remote-wins resurrections, deletions.
+            for rel in plan.pulls.iter().chain(plan.resurrect_pulls.iter()) {
+                self.download_entry(rel, &manifest.entries[rel].sha256).await?;
+                report.pulled += 1;
+            }
+            for rel in &plan.delete_local {
+                let _ = fs::remove_file(self.brain_path.join(rel));
+                report.deleted_local += 1;
+            }
+
+            // Conflicts: remote wins the canonical path; the local version
+            // is preserved as a conflict copy and pushed like a new entry.
+            let mut pushes = plan.pushes.clone();
+            for rel in &plan.conflicts {
+                let copy_rel = conflict_copy_rel(rel, &current_user(), now);
+                let src = self.brain_path.join(rel);
+                let copy_abs = self.brain_path.join(&copy_rel);
+                if let Some(parent) = copy_abs.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(&src, &copy_abs)?;
+                self.download_entry(rel, &manifest.entries[rel].sha256).await?;
+                tracing::warn!("brain sync: conflict on {rel}, local version kept as {copy_rel}");
+                pushes.push(copy_rel.clone());
+                report.conflicts.push(copy_rel);
+            }
+
+            if pushes.is_empty() && plan.delete_remote.is_empty() {
+                // Nothing to write remotely — record the agreement and stop.
+                state.base = manifest.hashes();
+                state.manifest_etag = etag;
+                state.generation = manifest.generation;
+                state.last_check_unix = now;
+                state.save(&self.brain_path)?;
+                return Ok(report);
+            }
+
+            // Push side: immutable entry objects first, then the manifest CAS.
+            let user = current_user();
+            for rel in &pushes {
+                let bytes = fs::read(self.brain_path.join(rel))?;
+                let sha = sha256_hex(&bytes);
+                let size = bytes.len() as u64;
+                self.store.put(&entry_key(rel, &sha), bytes).await?;
+                manifest.entries.insert(
+                    rel.clone(),
+                    ManifestEntry { sha256: sha, size, updated_by: user.clone(), updated_at: rfc3339(now) },
+                );
+            }
+            for rel in &plan.delete_remote {
+                manifest.entries.remove(rel);
+            }
+            manifest.generation += 1;
+
+            match self.store.put_if_match(MANIFEST_KEY, manifest.to_bytes()?, etag.as_deref()).await? {
+                PutOutcome::Ok { etag: new_etag } => {
+                    report.pushed += pushes.len();
+                    report.deleted_remote += plan.delete_remote.len();
+                    state.base = manifest.hashes();
+                    state.manifest_etag = Some(new_etag);
+                    state.generation = manifest.generation;
+                    state.last_check_unix = now;
+                    state.save(&self.brain_path)?;
+                    return Ok(report);
+                }
+                PutOutcome::PreconditionFailed => {
+                    // Someone pushed between our read and our write. The
+                    // objects we uploaded are unreferenced (immutable keys),
+                    // so retrying from a fresh manifest is always safe.
+                    tracing::warn!("brain sync: lost manifest CAS (attempt {}), retrying", attempt + 1);
+                    tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt + 1))).await;
+                }
+            }
+        }
+        bail!("brain push failed after {MAX_ATTEMPTS} attempts — the remote is being updated concurrently; retry with `ninox brain sync`")
     }
 }
 
@@ -248,5 +342,149 @@ mod tests {
         let sync = BrainSync::new(dir.path().to_path_buf(), cfg(0), store);
         assert!(sync.pull_if_stale().await.is_err());
         assert_eq!(fs::read_to_string(dir.path().join("local.md")).unwrap(), "# mine");
+    }
+
+    #[tokio::test]
+    async fn sync_pushes_new_local_entries() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("repos")).unwrap();
+        fs::write(dir.path().join("repos/mine.md"), "# Mine").unwrap();
+        let store = Arc::new(InMemoryRemoteStore::default());
+        let sync = BrainSync::new(dir.path().to_path_buf(), cfg(0), store.clone());
+
+        let report = sync.sync().await.unwrap();
+        assert_eq!(report.pushed, 1);
+
+        // A second, fresh client pulls what we pushed.
+        let dir2 = tempdir().unwrap();
+        let sync2 = BrainSync::new(dir2.path().to_path_buf(), cfg(0), store);
+        let report2 = sync2.pull_if_stale().await.unwrap();
+        assert_eq!(report2.pulled, 1);
+        assert_eq!(fs::read_to_string(dir2.path().join("repos/mine.md")).unwrap(), "# Mine");
+    }
+
+    #[tokio::test]
+    async fn sync_is_idempotent_when_nothing_changed() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# A").unwrap();
+        let store = Arc::new(InMemoryRemoteStore::default());
+        let sync = BrainSync::new(dir.path().to_path_buf(), cfg(0), store);
+        sync.sync().await.unwrap();
+        let report = sync.sync().await.unwrap();
+        assert_eq!(report.pushed, 0);
+        assert_eq!(report.pulled, 0);
+        assert!(report.conflicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_pushes_local_deletions() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# A").unwrap();
+        let store = Arc::new(InMemoryRemoteStore::default());
+        let sync = BrainSync::new(dir.path().to_path_buf(), cfg(0), store.clone());
+        sync.sync().await.unwrap();
+
+        fs::remove_file(dir.path().join("a.md")).unwrap();
+        let report = sync.sync().await.unwrap();
+        assert_eq!(report.deleted_remote, 1);
+
+        // A fresh client sees an empty brain.
+        let dir2 = tempdir().unwrap();
+        let sync2 = BrainSync::new(dir2.path().to_path_buf(), cfg(0), store);
+        sync2.pull_if_stale().await.unwrap();
+        assert!(crate::brain_sync::manifest::scan_local(dir2.path()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_conflicting_edits_produce_a_conflict_copy_both_sides_see() {
+        let store = Arc::new(InMemoryRemoteStore::default());
+
+        // Alice publishes v1; Bob pulls it.
+        let alice = tempdir().unwrap();
+        fs::write(alice.path().join("note.md"), "# v1").unwrap();
+        let alice_sync = BrainSync::new(alice.path().to_path_buf(), cfg(0), store.clone());
+        alice_sync.sync().await.unwrap();
+        let bob = tempdir().unwrap();
+        let bob_sync = BrainSync::new(bob.path().to_path_buf(), cfg(0), store.clone());
+        bob_sync.pull_if_stale().await.unwrap();
+
+        // Both edit the same entry, Alice pushes first.
+        fs::write(alice.path().join("note.md"), "# alice edit").unwrap();
+        fs::write(bob.path().join("note.md"), "# bob edit").unwrap();
+        alice_sync.sync().await.unwrap();
+        let report = bob_sync.sync().await.unwrap();
+
+        // Bob: canonical = Alice's version, conflict copy = Bob's, pushed.
+        assert_eq!(report.conflicts.len(), 1);
+        let copy_rel = &report.conflicts[0];
+        assert!(copy_rel.contains(".conflict-"), "{copy_rel}");
+        assert_eq!(fs::read_to_string(bob.path().join("note.md")).unwrap(), "# alice edit");
+        assert_eq!(fs::read_to_string(bob.path().join(copy_rel)).unwrap(), "# bob edit");
+
+        // Alice pulls and sees the conflict copy too.
+        let a_report = alice_sync.pull_if_stale().await.unwrap();
+        assert_eq!(a_report.pulled, 1);
+        assert_eq!(fs::read_to_string(alice.path().join(copy_rel)).unwrap(), "# bob edit");
+    }
+
+    #[tokio::test]
+    async fn concurrent_pushes_from_two_clients_converge() {
+        // Alice and Bob push independent new entries with stale local
+        // state; nothing may be lost. (sync() re-reads the manifest at the
+        // top of every attempt, so an in-process interleaved CAS loss can't
+        // be forced with the fake — the retry path itself is exercised by
+        // sync_gives_up_after_bounded_cas_attempts below.)
+        let store = Arc::new(InMemoryRemoteStore::default());
+        let alice = tempdir().unwrap();
+        fs::write(alice.path().join("a.md"), "# a1").unwrap();
+        let alice_sync = BrainSync::new(alice.path().to_path_buf(), cfg(0), store.clone());
+        alice_sync.sync().await.unwrap();
+
+        let bob = tempdir().unwrap();
+        let bob_sync = BrainSync::new(bob.path().to_path_buf(), cfg(0), store.clone());
+        bob_sync.pull_if_stale().await.unwrap();
+
+        // Alice pushes a new entry; Bob's cached ETag is now stale when he
+        // pushes his own. Both must land.
+        fs::write(alice.path().join("b.md"), "# b1").unwrap();
+        alice_sync.sync().await.unwrap();
+        fs::write(bob.path().join("c.md"), "# c1").unwrap();
+        bob_sync.sync().await.unwrap();
+
+        let fresh = tempdir().unwrap();
+        let fresh_sync = BrainSync::new(fresh.path().to_path_buf(), cfg(0), store);
+        fresh_sync.pull_if_stale().await.unwrap();
+        let scan = crate::brain_sync::manifest::scan_local(fresh.path()).unwrap();
+        assert!(scan.contains_key("a.md") && scan.contains_key("b.md") && scan.contains_key("c.md"));
+    }
+
+    #[tokio::test]
+    async fn sync_gives_up_after_bounded_cas_attempts() {
+        use crate::brain_sync::store::{GetResponse, PutOutcome, RemoteStore};
+        use async_trait::async_trait;
+
+        /// A store whose manifest CAS always loses — as if a very busy
+        /// teammate wins every race.
+        struct AlwaysLosesCas(InMemoryRemoteStore);
+        #[async_trait]
+        impl RemoteStore for AlwaysLosesCas {
+            async fn get(&self, key: &str, inm: Option<&str>) -> anyhow::Result<GetResponse> {
+                self.0.get(key, inm).await
+            }
+            async fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<String> {
+                self.0.put(key, bytes).await
+            }
+            async fn put_if_match(&self, _k: &str, _b: Vec<u8>, _e: Option<&str>) -> anyhow::Result<PutOutcome> {
+                Ok(PutOutcome::PreconditionFailed)
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# A").unwrap();
+        let sync = BrainSync::new(dir.path().to_path_buf(), cfg(0), Arc::new(AlwaysLosesCas(InMemoryRemoteStore::default())));
+        let err = sync.sync().await.unwrap_err().to_string();
+        assert!(err.contains("ninox brain sync"), "error should tell the user how to retry: {err}");
+        // Local file untouched by the failed push.
+        assert_eq!(fs::read_to_string(dir.path().join("a.md")).unwrap(), "# A");
     }
 }
