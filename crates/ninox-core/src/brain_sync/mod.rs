@@ -7,7 +7,7 @@ pub mod manifest;
 pub mod s3;
 pub mod store;
 
-pub use config::{SyncToml, SYNC_TOML};
+pub use config::{ensure_sync_toml, SyncToml, SYNC_TOML};
 pub use diff::{plan_sync, SyncPlan};
 pub use manifest::{Manifest, ManifestEntry, SyncState, MANIFEST_KEY, SYNC_STATE};
 pub use store::{GetResponse, InMemoryRemoteStore, PutOutcome, RemoteStore};
@@ -233,6 +233,31 @@ impl BrainSync {
         }
         bail!("brain push failed after {MAX_ATTEMPTS} attempts — the remote is being updated concurrently; retry with `ninox brain sync`")
     }
+}
+
+/// The front door for every read entry point (CLI query/show, server
+/// routes): open the brain, and if it's remote-backed, freshen it first
+/// with a read-safe `pull_if_stale`. Any remote failure degrades to the
+/// local copy with a warning — a lookup is never blocked by S3 (spec §4).
+pub async fn open_synced(
+    brain_path: &std::path::Path,
+    embedder: Option<&dyn crate::embeddings::Embedder>,
+) -> Result<crate::BrainIndex> {
+    let brain = crate::BrainIndex::open(brain_path)?;
+    match BrainSync::for_brain(brain_path).await {
+        Ok(None) => {}
+        Ok(Some(sync)) => match sync.pull_if_stale().await {
+            Ok(report) if report.changed_local() => {
+                if let Err(e) = brain.rebuild(embedder) {
+                    tracing::warn!("brain: index rebuild after pull failed: {e}");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("brain: remote check failed, serving local copy: {e}"),
+        },
+        Err(e) => tracing::warn!("brain: remote unavailable, serving local copy: {e}"),
+    }
+    Ok(brain)
 }
 
 #[cfg(test)]
@@ -626,5 +651,29 @@ mod tests {
         sync2.pull_if_stale().await.unwrap();
         assert_eq!(fs::read_to_string(dir2.path().join("note.md")).unwrap(), "# v2 from teammate");
         assert_eq!(fs::read_to_string(dir2.path().join(&copy_rel)).unwrap(), "# local edit");
+    }
+
+    #[tokio::test]
+    async fn open_synced_without_sync_toml_is_plain_local_open() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# A").unwrap();
+        let brain = open_synced(dir.path(), None).await.unwrap();
+        brain.rebuild(None).unwrap();
+        assert!(brain.get("a.md").unwrap().is_some());
+        assert!(!dir.path().join(crate::brain_sync::manifest::SYNC_STATE).exists(), "no sync state for local brains");
+    }
+
+    #[tokio::test]
+    async fn open_synced_survives_unreachable_remote() {
+        // .sync.toml points at a remote that can't be reached / built —
+        // open_synced must still return a working local BrainIndex.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# A").unwrap();
+        SyncToml { remote: "ftp://invalid".into(), endpoint: None, region: None, cache_ttl_secs: 0 }
+            .save(dir.path())
+            .unwrap();
+        let brain = open_synced(dir.path(), None).await.unwrap();
+        brain.rebuild(None).unwrap();
+        assert!(brain.get("a.md").unwrap().is_some());
     }
 }

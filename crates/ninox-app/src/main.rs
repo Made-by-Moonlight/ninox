@@ -85,6 +85,9 @@ enum Command {
 enum BrainAction {
     /// Rebuild the knowledge index
     Index,
+    /// Pull and push all changes to the brain's remote (no-op for a brain
+    /// without a remote — see `ninox brain remote set`)
+    Sync,
     /// Search entries by full-text
     Query {
         /// Search text
@@ -427,9 +430,15 @@ fn run_statusline(db_path: PathBuf) {
 async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()> {
     let config = AppConfig::load().unwrap_or_default();
     let brain_path = config.resolved_brain_path();
+    // First open of a config-declared remote catalogue materializes its
+    // .sync.toml (a local-fs write only; the sync itself is lazy).
+    if let Err(e) = ninox_core::brain_sync::ensure_sync_toml(&config, &brain_path) {
+        tracing::warn!("brain: failed to materialize .sync.toml: {e}");
+    }
 
     match action {
         BrainAction::Index => {
+            run_remote_sync_if_configured(&brain_path).await;
             let brain = BrainIndex::open(&brain_path)?;
             let embedder = try_build_embedder();
             let stats = brain.rebuild(embedder.as_deref())?;
@@ -438,9 +447,27 @@ async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()>
                 stats.indexed, stats.embedded, stats.cached
             );
         }
+        BrainAction::Sync => {
+            match ninox_core::brain_sync::BrainSync::for_brain(&brain_path).await {
+                Ok(None) => {
+                    eprintln!("this brain has no remote — configure one with `ninox brain remote set s3://bucket/prefix`");
+                    std::process::exit(1);
+                }
+                Ok(Some(sync)) => {
+                    let report = sync.sync().await?;
+                    print_sync_report(&report);
+                    if report.changed_local() {
+                        let brain = BrainIndex::open(&brain_path)?;
+                        let embedder = try_build_embedder();
+                        brain.rebuild(embedder.as_deref())?;
+                    }
+                }
+                Err(e) => anyhow::bail!("brain remote unavailable: {e}"),
+            }
+        }
         BrainAction::Query { text, entry_type, tag } => {
-            let brain = BrainIndex::open(&brain_path)?;
             let embedder = if text.trim().is_empty() { None } else { try_build_embedder() };
+            let brain = ninox_core::brain_sync::open_synced(&brain_path, embedder.as_deref()).await?;
             let filters = QueryFilters { entry_type, tag };
             let entries = brain.query(&text, embedder.as_deref(), filters)?;
             for entry in &entries {
@@ -448,7 +475,7 @@ async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()>
             }
         }
         BrainAction::Show { path } => {
-            let brain = BrainIndex::open(&brain_path)?;
+            let brain = ninox_core::brain_sync::open_synced(&brain_path, None).await?;
             match brain.get(&path)? {
                 Some(entry) => println!("{}", serde_json::to_string_pretty(&entry)?),
                 None => {
@@ -503,6 +530,36 @@ async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()>
     }
 
     Ok(())
+}
+
+/// `ninox brain index` on a remote-backed brain: full sync BEFORE the
+/// rebuild so pulled entries land in the index (spec: pull → resolve →
+/// push → rebuild). Failures degrade to local-only indexing — the index
+/// step must keep working offline.
+async fn run_remote_sync_if_configured(brain_path: &std::path::Path) {
+    match ninox_core::brain_sync::BrainSync::for_brain(brain_path).await {
+        Ok(None) => {}
+        Ok(Some(sync)) => match sync.sync().await {
+            Ok(report) => print_sync_report(&report),
+            Err(e) => eprintln!("brain sync failed (continuing with local index): {e}"),
+        },
+        Err(e) => eprintln!("brain remote unavailable (continuing local-only): {e}"),
+    }
+}
+
+fn print_sync_report(report: &ninox_core::brain_sync::SyncReport) {
+    println!(
+        "synced with remote: pulled {}, pushed {}, deleted {} local / {} remote, {} conflict{}",
+        report.pulled,
+        report.pushed,
+        report.deleted_local,
+        report.deleted_remote,
+        report.conflicts.len(),
+        if report.conflicts.len() == 1 { "" } else { "s" },
+    );
+    for rel in &report.conflicts {
+        eprintln!("  conflict copy kept: {rel}");
+    }
 }
 
 /// `ninox brain discover-repos` — scan `paths` (or, if empty, every

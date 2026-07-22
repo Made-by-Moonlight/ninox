@@ -51,6 +51,27 @@ impl SyncToml {
     }
 }
 
+/// Materialize `.sync.toml` for a brain whose remote is declared in the
+/// app config (spec §1 "first open of a catalogue with a remote"). An
+/// existing `.sync.toml` always wins; a mismatch only logs a warning.
+pub fn ensure_sync_toml(config: &crate::AppConfig, brain_path: &Path) -> Result<()> {
+    let Some(candidate) = config.remote_config_for(brain_path) else {
+        return Ok(());
+    };
+    match SyncToml::load(brain_path)? {
+        Some(existing) => {
+            if existing != candidate {
+                tracing::warn!(
+                    "brain {}: .sync.toml differs from the config's remote settings; the directory's .sync.toml wins",
+                    brain_path.display()
+                );
+            }
+        }
+        None => candidate.save(brain_path)?,
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +117,50 @@ mod tests {
         assert_eq!(no_prefix.bucket_and_prefix().unwrap(), ("bucket-only".into(), "".into()));
         let bad = SyncToml { remote: "https://not-s3".into(), ..sample() };
         assert!(bad.bucket_and_prefix().is_err());
+    }
+
+    #[test]
+    fn ensure_sync_toml_materializes_from_catalogue_config() {
+        let dir = tempdir().unwrap();
+        let brain_path = dir.path().join("team-brain");
+        let mut cfg = crate::AppConfig::default();
+        cfg.brain.catalogues = vec![crate::config::CatalogueRef {
+            name: "team".into(),
+            path: brain_path.clone(),
+            remote: Some("s3://team-brains/main".into()),
+            endpoint: None,
+            region: None,
+            cache_ttl_secs: Some(30),
+        }];
+        ensure_sync_toml(&cfg, &brain_path).unwrap();
+        let loaded = SyncToml::load(&brain_path).unwrap().unwrap();
+        assert_eq!(loaded.remote, "s3://team-brains/main");
+        assert_eq!(loaded.cache_ttl_secs, 30);
+    }
+
+    #[test]
+    fn ensure_sync_toml_never_overwrites_existing_marker() {
+        let dir = tempdir().unwrap();
+        let existing = SyncToml { remote: "s3://original/x".into(), endpoint: None, region: None, cache_ttl_secs: 0 };
+        existing.save(dir.path()).unwrap();
+        let mut cfg = crate::AppConfig::default();
+        cfg.brain.catalogues = vec![crate::config::CatalogueRef {
+            name: "team".into(),
+            path: dir.path().to_path_buf(),
+            remote: Some("s3://different/y".into()),
+            endpoint: None,
+            region: None,
+            cache_ttl_secs: None,
+        }];
+        ensure_sync_toml(&cfg, dir.path()).unwrap();
+        assert_eq!(SyncToml::load(dir.path()).unwrap().unwrap(), existing, "the directory's .sync.toml wins");
+    }
+
+    #[test]
+    fn ensure_sync_toml_is_a_noop_without_remote_config() {
+        let dir = tempdir().unwrap();
+        let cfg = crate::AppConfig::default();
+        ensure_sync_toml(&cfg, dir.path()).unwrap();
+        assert!(SyncToml::load(dir.path()).unwrap().is_none());
     }
 }
