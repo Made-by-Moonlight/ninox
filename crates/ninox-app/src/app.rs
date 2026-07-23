@@ -295,6 +295,16 @@ pub enum Message {
     BrainToggleDrawer(String),
     BrainLinkClicked(iced::widget::markdown::Url),
     BrainSwitchCatalogue(usize),
+    /// The background remote freshen kicked off by `BrainSwitchCatalogue`
+    /// resolved: `open_synced` pulled (or confirmed fresh) the catalogue at
+    /// `path` and reopened its index. Dropped if the user has switched away
+    /// from `path` while the pull was in flight.
+    BrainFreshened { path: std::path::PathBuf, brain: Arc<BrainIndex> },
+    /// The async remote-sync + rebuild kicked off by `BrainReindex`
+    /// finished for the catalogue at `path`. `Ok(n)` = entries indexed;
+    /// `Err` = the local rebuild itself failed (remote failures degrade
+    /// inside the task and still arrive here as `Ok`).
+    BrainReindexed { path: std::path::PathBuf, result: Result<usize, String> },
     ToggleNotifications,
     DismissNotification(String),
     DismissAllNotifications,
@@ -773,9 +783,10 @@ impl App {
 
     /// Re-derive pinboard edges (node-index pairs into `brain_view.entries`)
     /// from the index's resolved link graph. Called once per data change —
-    /// `NavigateBrain`'s initial load, `BrainReindex`, and
-    /// `BrainSwitchCatalogue` — never per canvas draw. A DB error is
-    /// tolerated: warn and leave the pinboard edge-less rather than panic.
+    /// `NavigateBrain`'s initial load and every `reload_brain_entries`
+    /// (reindex, catalogue switch, background freshen) — never per canvas
+    /// draw. A DB error is tolerated: warn and leave the pinboard edge-less
+    /// rather than panic.
     fn refresh_brain_edges(state: &mut Self) {
         match state.brain.links_all() {
             Ok(links) => {
@@ -813,6 +824,41 @@ impl App {
                 tracing::warn!("brain related({id}): {e}");
                 state.brain_view.related = Vec::new();
             }
+        }
+    }
+
+    /// Reload `brain_view.entries` from `state.brain` and re-derive
+    /// everything downstream of the entry set: pinboard edges, ghost-
+    /// selection cleanup, and the selection graph. Shared by
+    /// `BrainSwitchCatalogue` (fresh local open), `BrainReindexed` (async
+    /// rebuild landed), and `BrainFreshened` (background pull landed) so
+    /// all three agree on what "the entry set changed" means.
+    fn reload_brain_entries(state: &mut Self) {
+        // `None`: the GUI brain panel is keyword-only for now — wiring it to the
+        // same embedder the server constructs at startup is a natural follow-up,
+        // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
+        match state.brain.query("", None, QueryFilters::default()) {
+            Ok(entries) => {
+                state.brain_view.entries = entries;
+                Self::refresh_brain_edges(state);
+                // The selected entry may have been renamed or deleted by
+                // whatever changed the entry set — if it no longer resolves,
+                // clear the pane instead of showing a ghost selection.
+                let ghost = state
+                    .brain_view
+                    .selected
+                    .as_ref()
+                    .is_some_and(|id| !state.brain_view.entries.iter().any(|e| &e.id == id));
+                if ghost {
+                    state.brain_view.selected = None;
+                    state.brain_view.markdown = Vec::new();
+                    state.brain_view.backlinks = Vec::new();
+                    state.brain_view.related = Vec::new();
+                }
+                Self::refresh_selection_graph(state);
+                state.brain_view.loaded = true;
+            }
+            Err(e) => tracing::error!("brain entries reload: {e}"),
         }
     }
 
@@ -2022,39 +2068,57 @@ impl App {
             }
 
             Message::BrainReindex => {
-                // `None`: the GUI brain panel is keyword-only for now — wiring it to the
-                // same embedder the server constructs at startup is a natural follow-up,
-                // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
-                match state.brain.rebuild(None) {
-                    Ok(stats) => {
-                        tracing::info!("brain reindexed: {} entries", stats.indexed);
-                        // `None`: the GUI brain panel is keyword-only for now — wiring it to the
-                        // same embedder the server constructs at startup is a natural follow-up,
-                        // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
-                        match state.brain.query("", None, QueryFilters::default()) {
-                            Ok(entries) => {
-                                state.brain_view.entries = entries;
-                                Self::refresh_brain_edges(state);
-                                // The selected entry may have been renamed or
-                                // deleted by whatever triggered the reindex —
-                                // if it no longer resolves, clear the pane
-                                // instead of showing a ghost selection.
-                                let ghost = state
-                                    .brain_view
-                                    .selected
-                                    .as_ref()
-                                    .is_some_and(|id| !state.brain_view.entries.iter().any(|e| &e.id == id));
-                                if ghost {
-                                    state.brain_view.selected = None;
-                                    state.brain_view.markdown = Vec::new();
-                                    state.brain_view.backlinks = Vec::new();
-                                    state.brain_view.related = Vec::new();
-                                }
-                                Self::refresh_selection_graph(state);
+                // Freshen from the remote BEFORE rebuilding, matching the
+                // CLI's `ninox brain index` (sync → rebuild) and the server's
+                // POST /index — previously this button rebuilt local-only, so
+                // teammates' pushes stayed invisible to the GUI. Runs as a
+                // Task so the network wait never blocks the UI thread;
+                // completion (and the entry reload) lands via
+                // `BrainReindexed`. A brain with no remote skips straight to
+                // the rebuild, behaving exactly as before.
+                let brain = state.brain.clone();
+                let config = state.config.clone();
+                let path = state.brain.path().to_path_buf();
+                Task::future(async move {
+                    // First open of a config-declared remote catalogue
+                    // materializes its .sync.toml (a local-fs write only) —
+                    // the CLI does this in run_brain; without it a freshly
+                    // cloned catalogue never learns its remote.
+                    if let Err(e) = ninox_core::brain_sync::ensure_sync_toml(&config, &path) {
+                        tracing::warn!("brain: failed to materialize .sync.toml: {e}");
+                    }
+                    // Full sync (pull → resolve → push), not just
+                    // pull_if_stale: reindex is the GUI's explicit "get in
+                    // sync" gesture, same contract as the CLI Index action.
+                    // Any remote failure degrades to local-only reindexing.
+                    match ninox_core::brain_sync::BrainSync::for_brain(&path).await {
+                        Ok(None) => {}
+                        Ok(Some(sync)) => {
+                            if let Err(e) = sync.sync().await {
+                                tracing::warn!("brain sync failed (continuing with local reindex): {e}");
                             }
-                            Err(e) => tracing::error!("brain query after reindex: {e}"),
                         }
-                        state.brain_view.loaded = true;
+                        Err(e) => tracing::warn!("brain remote unavailable (continuing local-only): {e}"),
+                    }
+                    // `None`: the GUI brain panel is keyword-only for now — wiring it to the
+                    // same embedder the server constructs at startup is a natural follow-up,
+                    // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
+                    let result = brain.rebuild(None).map(|s| s.indexed).map_err(|e| e.to_string());
+                    Message::BrainReindexed { path, result }
+                })
+            }
+
+            Message::BrainReindexed { path, result } => {
+                // Race guard: the user may have switched catalogues while the
+                // sync + rebuild ran — the rebuilt index belongs to the old
+                // catalogue, so leave the current view alone.
+                if state.brain.path() != path.as_path() {
+                    return Task::none();
+                }
+                match result {
+                    Ok(indexed) => {
+                        tracing::info!("brain reindexed: {indexed} entries");
+                        Self::reload_brain_entries(state);
                     }
                     Err(e) => tracing::error!("brain rebuild: {e}"),
                 }
@@ -2112,20 +2176,54 @@ impl App {
                             state.brain_view.related.clear();
                             state.brain_view.edges.clear();
                             state.brain_view.loaded = false;
-                            // `None`: the GUI brain panel is keyword-only for now — wiring it to the
-                            // same embedder the server constructs at startup is a natural follow-up,
-                            // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
-                            match state.brain.query("", None, QueryFilters::default()) {
-                                Ok(entries) => {
-                                    state.brain_view.entries = entries;
-                                    state.brain_view.loaded = true;
-                                    Self::refresh_brain_edges(state);
+                            Self::reload_brain_entries(state);
+                            // The local open above keeps the switch instant;
+                            // a remote-backed catalogue then freshens in the
+                            // background (read-safe pull_if_stale + rebuild,
+                            // the same front door as the CLI's query/show)
+                            // and lands via `BrainFreshened` — previously the
+                            // GUI never pulled on switch at all, so
+                            // teammates' pushes stayed invisible until a
+                            // CLI/server touch on the same directory.
+                            let config = state.config.clone();
+                            let path = cat.path.clone();
+                            return Task::future(async move {
+                                // First open of a config-declared remote
+                                // catalogue materializes its .sync.toml — the
+                                // CLI does this in run_brain; without it a
+                                // fresh clone never learns its remote.
+                                if let Err(e) = ninox_core::brain_sync::ensure_sync_toml(&config, &path) {
+                                    tracing::warn!("brain: failed to materialize .sync.toml: {e}");
                                 }
-                                Err(e) => tracing::error!("brain query after catalogue switch: {e}"),
-                            }
+                                match ninox_core::brain_sync::open_synced(&path, None).await {
+                                    Ok(brain) => Message::BrainFreshened { path, brain: Arc::new(brain) },
+                                    // A hard Err from open_synced means the
+                                    // LOCAL open failed (remote failures
+                                    // degrade inside it) — the synchronous
+                                    // open above already surfaced that same
+                                    // failure, so drop this one quietly.
+                                    Err(e) => {
+                                        tracing::warn!("brain freshen after catalogue switch: {e}");
+                                        Message::Noop
+                                    }
+                                }
+                            });
                         }
                         Err(e) => tracing::warn!("open catalogue '{}': {e}", cat.name),
                     }
+                }
+                Task::none()
+            }
+
+            Message::BrainFreshened { path, brain } => {
+                // Race guard: the pull ran in the background, so apply the
+                // fresh index only if the user is still on this catalogue.
+                // Comparing against the ACTIVE brain's path (swapped on every
+                // switch) means A→B→A while A's pull was in flight still
+                // matches — and that fresh A index is exactly what we want.
+                if state.brain.path() == path.as_path() {
+                    state.brain = brain;
+                    Self::reload_brain_entries(state);
                 }
                 Task::none()
             }
@@ -3954,8 +4052,21 @@ mod tests {
         assert_eq!(m2.brain_view.filter, "rust");
     }
 
-    #[test]
-    fn brain_reindex_reloads_entries_from_disk() {
+    /// Drive a `Task::future` to its single output `Message` — the async
+    /// handlers (reindex, catalogue freshen) deliver their results through
+    /// a follow-up message rather than mutating state directly.
+    async fn output_of(task: Task<Message>) -> Message {
+        use futures::StreamExt;
+        let mut stream = iced_runtime::task::into_stream(task)
+            .expect("expected a real Task, not Task::none()");
+        match stream.next().await {
+            Some(iced_runtime::Action::Output(msg)) => msg,
+            _ => panic!("Task must yield exactly one Action::Output"),
+        }
+    }
+
+    #[tokio::test]
+    async fn brain_reindex_reloads_entries_from_disk() {
         let brain_dir = tempdir().unwrap().keep();
         let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
 
@@ -3968,9 +4079,33 @@ mod tests {
         std::fs::create_dir_all(brain_dir.join("repos")).unwrap();
         std::fs::write(brain_dir.join("repos").join("ninox.md"), "Ninox repo notes.").unwrap();
 
-        let (m3, _) = m2.update(Message::BrainReindex);
+        // Reindex runs sync + rebuild in a Task (no remote here, so the sync
+        // step is a no-op) and reloads entries when `BrainReindexed` lands.
+        let (m3, task) = m2.update(Message::BrainReindex);
+        let done = output_of(task).await;
+        assert!(
+            matches!(&done, Message::BrainReindexed { result: Ok(1), .. }),
+            "expected BrainReindexed with 1 indexed entry, got {done:?}"
+        );
+        let (m3, _) = m3.update(done);
         assert_eq!(m3.brain_view.entries.len(), 1);
         assert_eq!(m3.brain_view.entries[0].id, "repos/ninox.md");
+    }
+
+    #[test]
+    fn stale_brain_reindexed_for_a_switched_away_catalogue_is_ignored() {
+        // The rebuild belongs to whatever brain was active when BrainReindex
+        // fired; if the user switched catalogues while it ran, its completion
+        // must not reload the (unrelated) current catalogue's view.
+        let e = test_engine();
+        let m = base(e);
+        let other = tempdir().unwrap().keep();
+        let (m2, _) = m.update(Message::BrainReindexed { path: other, result: Ok(5) });
+        assert!(
+            !m2.brain_view.loaded,
+            "a completion for a no-longer-active catalogue must be dropped, not applied"
+        );
+        assert!(m2.brain_view.entries.is_empty());
     }
 
     #[test]
@@ -4051,6 +4186,84 @@ mod tests {
         assert_eq!(app.brain_view.entries[0].id, "concepts/b.md");
     }
 
+    #[tokio::test]
+    async fn switching_catalogue_freshens_in_the_background() {
+        // The switch itself is synchronous (instant UI on the local copy),
+        // but it must ALSO return a Task that re-opens the catalogue through
+        // `open_synced` — the pull-before-read front door the CLI and server
+        // already use. Without a remote configured, open_synced degrades to
+        // a plain local open, so the whole flow is exercisable offline.
+        let dir_a = tempdir().unwrap().keep();
+        let dir_b = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_b.join("concepts")).unwrap();
+        std::fs::write(dir_b.join("concepts").join("b.md"), "b body").unwrap();
+        BrainIndex::open(&dir_b).unwrap().rebuild(None).unwrap();
+
+        let e = test_engine();
+        let mut app = base_with_brain(e, Arc::new(BrainIndex::open(&dir_a).unwrap()));
+        app.catalogues = vec![
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+        ];
+
+        let (app, task) = app.update(Message::BrainSwitchCatalogue(1));
+        let freshened = output_of(task).await;
+        assert!(
+            matches!(&freshened, Message::BrainFreshened { path, .. } if path == &dir_b),
+            "switch must kick off a background freshen for the target catalogue, got {freshened:?}"
+        );
+        let (app, _) = app.update(freshened);
+        assert_eq!(app.active_catalogue, 1);
+        assert!(app.brain_view.loaded);
+        assert_eq!(app.brain_view.entries.len(), 1);
+        assert_eq!(app.brain_view.entries[0].id, "concepts/b.md");
+    }
+
+    #[test]
+    fn brain_freshened_for_the_active_catalogue_swaps_the_index_and_reloads() {
+        let dir = tempdir().unwrap().keep();
+        let e = test_engine();
+        let mut app = base_with_brain(e, Arc::new(BrainIndex::open(&dir).unwrap()));
+        app.catalogues[0].path = dir.clone();
+        let (app, _) = app.update(Message::NavigateBrain);
+        assert!(app.brain_view.entries.is_empty());
+
+        // The background pull landed new entries and rebuilt the index —
+        // simulate its delivery with a fresh index over the same directory.
+        std::fs::create_dir_all(dir.join("repos")).unwrap();
+        std::fs::write(dir.join("repos").join("pulled.md"), "pulled from remote").unwrap();
+        let fresh = Arc::new(BrainIndex::open(&dir).unwrap());
+        fresh.rebuild(None).unwrap();
+
+        let (app, _) = app.update(Message::BrainFreshened { path: dir, brain: fresh.clone() });
+        assert!(Arc::ptr_eq(&app.brain, &fresh), "the freshened index must replace the active one");
+        assert_eq!(app.brain_view.entries.len(), 1);
+        assert_eq!(app.brain_view.entries[0].id, "repos/pulled.md");
+    }
+
+    #[test]
+    fn stale_brain_freshened_for_a_switched_away_catalogue_is_ignored() {
+        // The user switched again while the pull was in flight — the late
+        // result belongs to a catalogue that's no longer on screen and must
+        // not clobber the one that is.
+        let dir_a = tempdir().unwrap().keep();
+        let dir_b = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_b.join("concepts")).unwrap();
+        std::fs::write(dir_b.join("concepts").join("b.md"), "b body").unwrap();
+        let stale = Arc::new(BrainIndex::open(&dir_b).unwrap());
+        stale.rebuild(None).unwrap();
+
+        let e = test_engine();
+        let active = Arc::new(BrainIndex::open(&dir_a).unwrap());
+        let mut app = base_with_brain(e, active.clone());
+        app.catalogues[0].path = dir_a.clone();
+        let (app, _) = app.update(Message::NavigateBrain);
+
+        let (app, _) = app.update(Message::BrainFreshened { path: dir_b, brain: stale });
+        assert!(Arc::ptr_eq(&app.brain, &active), "a stale freshen must not replace the active index");
+        assert!(app.brain_view.entries.is_empty(), "dir_b's entries must not leak into dir_a's view");
+    }
+
     #[test]
     fn navigate_brain_populates_pinboard_edges_from_the_index() {
         let brain_dir = tempdir().unwrap().keep();
@@ -4113,8 +4326,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reindex_refreshes_backlinks_and_related_for_the_selected_entry() {
+    #[tokio::test]
+    async fn reindex_refreshes_backlinks_and_related_for_the_selected_entry() {
         // BrainReindex used to refetch entries + edges but leave the reading
         // pane's backlinks/related as stale snapshots from selection time --
         // if the on-disk citation graph changed underneath the selection,
@@ -4151,7 +4364,8 @@ mod tests {
         // reindex rather than the stale selection-time snapshot.
         std::fs::remove_file(brain_dir.join("people").join("bob.md")).unwrap();
 
-        let (m4, _) = m3.update(Message::BrainReindex);
+        let (m4, task) = m3.update(Message::BrainReindex);
+        let (m4, _) = m4.update(output_of(task).await);
         assert_eq!(m4.brain_view.selected.as_deref(), Some("people/alice.md"));
         assert!(
             m4.brain_view.backlinks.is_empty(),
@@ -4165,8 +4379,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reindex_clears_selection_if_the_selected_entry_disappears() {
+    #[tokio::test]
+    async fn reindex_clears_selection_if_the_selected_entry_disappears() {
         // If the selected entry's file is deleted (or renamed) before a
         // reindex, `selected` must be cleared so the reading pane falls back
         // to its empty state instead of showing a ghost entry with stale
@@ -4196,7 +4410,8 @@ mod tests {
 
         std::fs::remove_file(brain_dir.join("people").join("alice.md")).unwrap();
 
-        let (m4, _) = m3.update(Message::BrainReindex);
+        let (m4, task) = m3.update(Message::BrainReindex);
+        let (m4, _) = m4.update(output_of(task).await);
         assert_eq!(
             m4.brain_view.selected, None,
             "selection must be cleared once the selected entry no longer resolves"
