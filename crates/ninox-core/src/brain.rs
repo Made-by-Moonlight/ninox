@@ -52,6 +52,15 @@ pub struct BrainIndex {
     brain_path: PathBuf,
 }
 
+// Manual impl because the GUI's `Message` enum derives `Debug` and carries
+// an `Arc<BrainIndex>` (background freshen results); the SQLite connection
+// has no useful debug form, so show only the identifying path.
+impl std::fmt::Debug for BrainIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrainIndex").field("brain_path", &self.brain_path).finish_non_exhaustive()
+    }
+}
+
 impl BrainIndex {
     pub fn open(brain_path: impl AsRef<Path>) -> Result<Self> {
         let brain_path = brain_path.as_ref().to_path_buf();
