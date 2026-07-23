@@ -2123,6 +2123,9 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
     iced::application("Ninox", app::App::iced_update, app::App::iced_view)
         .subscription(app::App::subscription)
         .theme(app::App::theme)
+        // Native global zoom (Cmd/Ctrl +/-/0) — scales the whole UI rather
+        // than resizing individual widgets. Driven by `App::zoom`.
+        .scale_factor(|state| state.zoom)
         .window(window_settings)
         .font(SYMBOLS_NERD_FONT_MONO)
         .font(FONT_NEWSREADER)

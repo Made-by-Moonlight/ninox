@@ -275,11 +275,19 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Default UI zoom factor (`AppConfig::zoom`) — 1.0 is unscaled. Used by
+/// serde when the field is absent from an older config file.
+fn default_zoom() -> f64 { 1.0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub port:      u16,
     pub font_size: f32,
+    /// Global UI zoom factor applied via Iced's native `scale_factor`,
+    /// driven by the Cmd/Ctrl +/-/0 shortcuts. Persisted so the zoom
+    /// level survives app restarts. Clamped to `[0.5, 3.0]` in the app.
+    #[serde(default = "default_zoom")]
+    pub zoom:      f64,
     #[serde(default)]
     pub theme:     ThemeVariant,
     /// Override for the orchestrator root directory.
@@ -346,6 +354,7 @@ impl Default for AppConfig {
         Self {
             port:             8080,
             font_size:        13.0,
+            zoom:             default_zoom(),
             theme:            ThemeVariant::Dark,
             orchestrator_root: None,
             worktree_root:    None,

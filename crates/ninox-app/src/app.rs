@@ -285,6 +285,12 @@ impl Default for View {
 // App model
 // ---------------------------------------------------------------------------
 
+/// UI zoom bounds and step for the Cmd/Ctrl +/-/0 shortcuts. `zoom` feeds
+/// Iced's native `scale_factor` (see `main.rs`), so it scales the whole UI.
+const ZOOM_MIN:  f64 = 0.5;
+const ZOOM_MAX:  f64 = 3.0;
+const ZOOM_STEP: f64 = 0.1;
+
 pub struct App {
     pub engine:             Arc<Engine>,
     pub config:             AppConfig,
@@ -361,6 +367,10 @@ pub struct App {
     pub drag:            Option<DragTarget>,
     pub fleet_filter:    FleetFilter,
     pub last_fleet_scope: Option<OrchestratorId>,
+    /// Global UI zoom factor fed to Iced's native `scale_factor`. Driven by
+    /// the Cmd/Ctrl +/-/0 shortcuts, clamped to `[ZOOM_MIN, ZOOM_MAX]`, and
+    /// mirrored into `config.zoom` so it persists across restarts.
+    pub zoom:            f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,7 +1021,7 @@ impl App {
             review_threads.entry(comment.pr_id).or_default().push(comment);
         }
 
-        let config = AppConfig::load().unwrap_or_default();
+        let mut config = AppConfig::load().unwrap_or_default();
 
         // First run: seed a complete, editable default theme file so users
         // have a working example to customize rather than a blank slate.
@@ -1023,6 +1033,13 @@ impl App {
         let themes = Themes::load(config.theme_file.as_deref());
         let scheme = themes.scheme(config.theme);
         let active_variant = config.theme;
+        // Restore the persisted zoom, guarding against a hand-edited config
+        // with an out-of-range value. Write the clamped value back into
+        // `config` so a later `config.save()` (e.g. a theme change) persists
+        // the normalized zoom rather than the stale out-of-range one — keeping
+        // disk and runtime in sync.
+        let zoom = config.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        config.zoom = zoom;
         let catalogues = config.catalogue_options();
         let settings = crate::components::settings_panel::SettingsState::from_config(&config);
 
@@ -1070,6 +1087,7 @@ impl App {
             drag:            None,
             fleet_filter:    FleetFilter::default(),
             last_fleet_scope: None,
+            zoom,
         };
         Self::resize_terminals(&mut app);
 
@@ -2888,6 +2906,37 @@ impl App {
                         }
                     }
                     return Task::none();
+                }
+
+                // UI zoom: Cmd (macOS) / Ctrl (elsewhere) with +/-/0, like
+                // macOS Terminal.app. `modifiers.command()` is logo on macOS
+                // and control on other platforms. Intercepted BEFORE the
+                // terminal encode path below so the terminal panel does not
+                // swallow these keys. '+' and '=' both zoom in (on most
+                // layouts '+' is Shift+'='); '-' zooms out; '0' resets. The
+                // level is mirrored into config and persisted across restarts.
+                if modifiers.command() {
+                    if let iced::keyboard::Key::Character(c) = &key {
+                        let new_zoom = match c.as_str() {
+                            "+" | "=" => Some((state.zoom + ZOOM_STEP).min(ZOOM_MAX)),
+                            "-" | "_" => Some((state.zoom - ZOOM_STEP).max(ZOOM_MIN)),
+                            "0"       => Some(1.0),
+                            _         => None,
+                        };
+                        if let Some(z) = new_zoom {
+                            // Snap to the nearest 0.1 to keep repeated steps
+                            // free of binary-float drift (1.0 → 1.1 → 1.2 …).
+                            let z = (z * 10.0).round() / 10.0;
+                            if (z - state.zoom).abs() > f64::EPSILON {
+                                state.zoom = z;
+                                state.config.zoom = z;
+                                if let Err(e) = state.config.save() {
+                                    tracing::error!("failed to save zoom config: {e}");
+                                }
+                            }
+                            return Task::none();
+                        }
+                    }
                 }
 
                 if let View::SessionDetail {
@@ -5066,6 +5115,7 @@ mod tests {
             drag:            None,
             fleet_filter:    FleetFilter::default(),
             last_fleet_scope: None,
+            zoom:            1.0,
         }
     }
 
@@ -6923,6 +6973,107 @@ mod tests {
         assert!(matches!(m.view, View::Brain));
         let m = press(m, "1");
         assert!(matches!(m.view, View::FleetBoard { .. }));
+    }
+
+    /// The zoom modifier: Cmd (⌘, `LOGO`) on macOS, Ctrl elsewhere — the
+    /// combination `Modifiers::command()` reports as pressed.
+    fn zoom_mods() -> iced::keyboard::Modifiers {
+        #[cfg(target_os = "macos")]
+        { iced::keyboard::Modifiers::LOGO }
+        #[cfg(not(target_os = "macos"))]
+        { iced::keyboard::Modifiers::CTRL }
+    }
+
+    /// Press `ch` with the platform zoom modifier held.
+    fn press_cmd(app: App, ch: &str) -> App {
+        let (next, _) = app.update(Message::RawKey {
+            key:       iced::keyboard::Key::Character(ch.into()),
+            modifiers: zoom_mods(),
+            text:      Some(ch.to_string()),
+        });
+        next
+    }
+
+    fn approx(a: f64, b: f64) -> bool { (a - b).abs() < 1e-9 }
+
+    #[test]
+    fn cmd_zoom_steps_and_persists() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("zoom_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            assert!(approx(m.zoom, 1.0));
+            // '+' zooms in by one step.
+            let m = press_cmd(m, "+");
+            assert!(approx(m.zoom, 1.1), "got {}", m.zoom);
+            // '=' also zooms in (on many layouts '+' is Shift+'=').
+            let m = press_cmd(m, "=");
+            assert!(approx(m.zoom, 1.2), "got {}", m.zoom);
+            // Mirrored into config and persisted to disk.
+            assert!(approx(m.config.zoom, 1.2));
+            let loaded = ninox_core::config::AppConfig::load().unwrap();
+            assert!(approx(loaded.zoom, 1.2), "persisted {}", loaded.zoom);
+            // '-' zooms out; '0' resets.
+            let m = press_cmd(m, "-");
+            assert!(approx(m.zoom, 1.1), "got {}", m.zoom);
+            let m = press_cmd(m, "0");
+            assert!(approx(m.zoom, 1.0), "got {}", m.zoom);
+            assert!(approx(ninox_core::config::AppConfig::load().unwrap().zoom, 1.0));
+        });
+    }
+
+    #[test]
+    fn cmd_zoom_clamps_to_range() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("zoom_clamp_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let mut m = base(test_engine());
+            for _ in 0..40 { m = press_cmd(m, "-"); }
+            assert!(approx(m.zoom, ZOOM_MIN), "min clamp got {}", m.zoom);
+            for _ in 0..60 { m = press_cmd(m, "+"); }
+            assert!(approx(m.zoom, ZOOM_MAX), "max clamp got {}", m.zoom);
+        });
+    }
+
+    #[test]
+    fn zoom_keys_survive_focused_terminal() {
+        // With a terminal/split panel focused the terminal normally
+        // swallows keystrokes; zoom must be intercepted first.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("zoom_terminal_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let mut m = base(test_engine());
+            m.view = View::SessionDetail {
+                session_id: "s1".into(),
+                panel: crate::components::session_detail::DetailPanel::Terminal,
+            };
+            let m = press_cmd(m, "+");
+            assert!(approx(m.zoom, 1.1), "terminal swallowed zoom key: {}", m.zoom);
+        });
+    }
+
+    #[test]
+    fn out_of_range_config_zoom_normalized_on_load() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("zoom_load_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            // Persist a config with an out-of-range zoom, as a hand-edit would.
+            let cfg = ninox_core::config::AppConfig { zoom: 99.0, ..Default::default() };
+            cfg.save().unwrap();
+
+            let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
+            let (app, _task) = App::new(
+                test_engine(),
+                std::path::PathBuf::from("/tmp"),
+                ninox_core::config::AgentConfig::default(),
+                brain,
+            );
+            // Both the runtime value AND the in-memory config are clamped, so
+            // a later config.save() (e.g. a theme change) cannot re-persist
+            // the invalid value — disk and runtime stay in sync.
+            assert!(approx(app.zoom, ZOOM_MAX), "runtime zoom {}", app.zoom);
+            assert!(approx(app.config.zoom, ZOOM_MAX), "config zoom {}", app.config.zoom);
+        });
     }
 
     /// Serializes tests that mutate process-global env vars (`NINOX_CONFIG`)
