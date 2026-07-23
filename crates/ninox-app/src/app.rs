@@ -804,9 +804,12 @@ impl App {
 
     /// Refetches `backlinks`/`related` for `brain_view.selected` from the
     /// index. No-ops when nothing is selected. Shared by `BrainSelectEntry`
-    /// (fresh selection) and `BrainReindex` (index may have changed under a
-    /// still-selected entry) — markdown handling stays with the select path
-    /// since reindex never changes which entry is selected, only its graph.
+    /// (fresh selection) and the entry-set reload path (index may have
+    /// changed under a still-selected entry). The reading pane's markdown
+    /// is NOT handled here: the select path parses it from the clicked
+    /// entry, and `reload_brain_entries` re-parses it from the re-read
+    /// entry set — since a background pull can change a selected entry's
+    /// body, not just its graph.
     fn refresh_selection_graph(state: &mut Self) {
         let Some(id) = state.brain_view.selected.clone() else {
             return;
@@ -854,6 +857,17 @@ impl App {
                     state.brain_view.markdown = Vec::new();
                     state.brain_view.backlinks = Vec::new();
                     state.brain_view.related = Vec::new();
+                } else if let Some(id) = state.brain_view.selected.clone() {
+                    // The entry set was just re-read, and whatever changed
+                    // it (background pull, reindex) may have changed the
+                    // selected entry's BODY too — re-render the reading
+                    // pane from the fresh copy instead of keeping the
+                    // parse from selection time.
+                    if let Some(e) = state.brain_view.entries.iter().find(|e| e.id == id) {
+                        state.brain_view.markdown = iced::widget::markdown::parse(
+                            &crate::components::brain_panel::preprocess_wikilinks(&e.body),
+                        ).collect();
+                    }
                 }
                 Self::refresh_selection_graph(state);
                 state.brain_view.loaded = true;
@@ -4363,6 +4377,48 @@ mod tests {
             m3.brain_view.related.iter().any(|e| e.id == "people/alice.md"),
             "alice directly links to bob, so alice should rank in bob's related list: {:?}",
             m3.brain_view.related.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_rerenders_the_reading_pane_for_the_selected_entry() {
+        // The reading pane parsed markdown at selection time and kept it
+        // through entry-set reloads — fine when only the graph could change
+        // underneath a selection, wrong once background pulls can change
+        // the selected entry's body itself.
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("concepts")).unwrap();
+        std::fs::write(
+            brain_dir.join("concepts").join("a.md"),
+            "---\nname: a\n---\none paragraph",
+        )
+        .unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild(None).unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m2, _) = m.update(Message::NavigateBrain);
+        let (m3, _) = m2.update(Message::BrainSelectEntry("concepts/a.md".into()));
+        let blocks_before = m3.brain_view.markdown.len();
+        assert!(blocks_before > 0, "sanity: selection rendered something");
+
+        // The entry's body changes on disk (e.g. a teammate's pull landing)
+        // while it stays selected.
+        std::fs::write(
+            brain_dir.join("concepts").join("a.md"),
+            "---\nname: a\n---\nfirst paragraph\n\nsecond paragraph\n\nthird paragraph",
+        )
+        .unwrap();
+
+        let (m4, task) = m3.update(Message::BrainReindex);
+        let (m4, _) = m4.update(output_of(task).await);
+        assert_eq!(m4.brain_view.selected.as_deref(), Some("concepts/a.md"));
+        assert!(
+            m4.brain_view.markdown.len() > blocks_before,
+            "the reading pane must re-render from the re-read body ({} blocks) instead of \
+             keeping the selection-time parse ({} blocks)",
+            m4.brain_view.markdown.len(), blocks_before,
         );
     }
 
