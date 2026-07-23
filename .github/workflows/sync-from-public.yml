@@ -24,6 +24,15 @@ name: Sync from public
 # public/main change. Resolve it by hand: fetch public/main, merge it into
 # a branch locally, fix the conflict, push, open the PR yourself.
 #
+# The overlay files themselves are internal-authoritative: after the
+# merge, this job restores them from pre-merge internal/main before
+# pushing. Without that, a public-side change to them can propagate
+# silently — concretely, they once leaked to the public repo via a squash
+# merge and were deleted there (Made-by-Moonlight/ninox#76); the first
+# sync whose merge base contains that leak would otherwise resolve the
+# public deletion as a clean removal of the overlay from internal/main,
+# taking this very workflow's schedule down with it.
+#
 # The sync-from-public branch is force-pushed on every run (it's fully
 # bot-owned — nothing else should ever push to it) rather than using
 # --force-with-lease, since a lease needs a local remote-tracking ref for
@@ -93,6 +102,15 @@ jobs:
           git config user.email "ninox-sync@users.noreply.github.com"
           git checkout -b sync-from-public
           git merge --no-edit FETCH_HEAD
+          # Overlay files are internal-authoritative — a public-side change
+          # to them must never propagate through this merge (see the header
+          # comment). ORIG_HEAD is internal/main as it was before the
+          # merge; on a normal sync (public didn't touch them) the restore
+          # is a no-op and the merge commit is left untouched.
+          git checkout ORIG_HEAD -- CODEOWNERS .github/workflows/sync-from-public.yml scripts/promote-to-public.sh
+          if ! git diff --cached --quiet; then
+            git commit --amend --no-edit
+          fi
 
       - name: Push sync branch
         if: steps.check.outputs.needed == 'true'
@@ -103,7 +121,13 @@ jobs:
         env:
           GH_TOKEN: ${{ env.SYNC_TOKEN }}
         run: |
-          if gh pr view sync-from-public >/dev/null 2>&1; then
+          # `gh pr list --head` rather than `gh pr view <branch>`: the
+          # latter exits non-zero here even while the sync PR is open
+          # (observed on every workflow_dispatch run since #4 existed),
+          # which sent the run down the create path to die on "a pull
+          # request ... already exists" — a red run for a successful sync.
+          open_prs=$(gh pr list --head sync-from-public --state open --json number --jq length)
+          if [ "$open_prs" != "0" ]; then
             echo "PR already open — the push above already updated it."
           else
             gh pr create \
