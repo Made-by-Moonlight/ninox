@@ -1,7 +1,11 @@
 //! Brain pinboard specimen board — a canvas of wikilink-connected nodes
-//! (spec §IV "Pinboard"). Positions are re-derived from the canvas bounds on
-//! every draw (deterministic, hash-based) rather than stored in `State`, so
-//! resizing the window can never leave stale/clipped node positions behind.
+//! (spec §IV "Pinboard"). Node positions come from the cached force-directed
+//! `layout` on `BrainViewState` (recomputed once per data change by
+//! `App::refresh_brain_graph`, never per draw), falling back to a
+//! deterministic hash-based scatter for any id missing from that cache. The
+//! canvas itself stays stateless — normalized positions are scaled to the
+//! current `bounds` on every draw, so resizing the window can never leave
+//! stale/clipped node positions behind.
 
 use std::collections::HashMap;
 
@@ -28,7 +32,7 @@ struct Node {
 /// No RNG/clock involved: the same entry id (+ salt) always yields the same
 /// value, so the same set of brain entries always lays out identically
 /// across frames, window resizes, and app restarts.
-fn hash01(s: &str, salt: u64) -> f32 {
+pub(crate) fn hash01(s: &str, salt: u64) -> f32 {
     let mut h: u64 = 1469598103934665603 ^ salt;
     for b in s.bytes() {
         h ^= b as u64;
@@ -39,8 +43,8 @@ fn hash01(s: &str, salt: u64) -> f32 {
 
 /// The pinboard canvas program. Borrows `App` for the duration of a single
 /// `view()` call; its only mutable state is [`PinboardState`]'s hover
-/// selection (node positions are still re-derived from bounds every frame,
-/// never cached).
+/// selection — node positions themselves come from the cached `layout` (see
+/// module docs), scaled to the current bounds on every draw.
 pub struct Pinboard<'a> {
     pub app: &'a App,
 }
@@ -48,7 +52,7 @@ pub struct Pinboard<'a> {
 impl<'a> Pinboard<'a> {
     /// Lay out one [`Node`] per brain entry within `bounds`, sized by node
     /// degree (in `self.app.brain_view.edges`, resolved once per data change
-    /// — see `App::refresh_brain_edges` — never re-derived here) and flagged
+    /// — see `App::refresh_brain_graph` — never re-derived here) and flagged
     /// `hit` when the entry matches the active search filter.
     fn nodes(&self, bounds: Rectangle) -> Vec<Node> {
         let s = &self.app.scheme;
@@ -69,14 +73,29 @@ impl<'a> Pinboard<'a> {
             .entries
             .iter()
             .enumerate()
-            .map(|(i, e)| Node {
-                x: bounds.width * (0.05 + 0.90 * hash01(&e.id, 7)),
-                y: bounds.height * (0.06 + 0.88 * hash01(&e.id, 13)),
-                r: node_radius(degree.get(i).copied().unwrap_or(0) as f32),
-                color: category_color(s, &e.entry_type),
-                hit: !q.is_empty()
-                    && (e.name.to_lowercase().contains(&q) || e.id.to_lowercase().contains(&q)),
-                id: e.id.clone(),
+            .map(|(i, e)| {
+                // `layout` is the cached force-directed position, recomputed
+                // once per data change by `App::refresh_brain_graph` — a
+                // cache miss (e.g. a reindex race) falls back to the old
+                // hash-based scatter position rather than hiding the node.
+                let (nx, ny) = self
+                    .app
+                    .brain_view
+                    .layout
+                    .get(&e.id)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        (0.05 + 0.90 * hash01(&e.id, 7), 0.06 + 0.88 * hash01(&e.id, 13))
+                    });
+                Node {
+                    x: bounds.width * nx,
+                    y: bounds.height * ny,
+                    r: node_radius(degree.get(i).copied().unwrap_or(0) as f32),
+                    color: category_color(s, &e.entry_type),
+                    hit: !q.is_empty()
+                        && (e.name.to_lowercase().contains(&q) || e.id.to_lowercase().contains(&q)),
+                    id: e.id.clone(),
+                }
             })
             .collect()
     }
@@ -85,8 +104,8 @@ impl<'a> Pinboard<'a> {
 /// The pinboard canvas `Program`'s interaction state: which node (if any)
 /// the cursor is currently hovering. Mutated in `update()` and read back in
 /// `draw()` (to render the hover ring) and `mouse_interaction()` (to switch
-/// to a pointer cursor) — node positions themselves stay re-derived from
-/// bounds every frame (see module docs), only the hover *selection* persists.
+/// to a pointer cursor) — node positions themselves come from the cached
+/// `layout` (see module docs), only the hover *selection* lives here.
 #[derive(Default)]
 pub struct PinboardState {
     hovered: Option<String>,
@@ -122,7 +141,7 @@ fn edge_key(a: usize, b: usize) -> (usize, usize) {
 /// Resolve `BrainIndex::links_all()`'s `(from_id, to_id)` string pairs into
 /// deduplicated, undirected node-index pairs against `entries`'s current
 /// order — the form the pinboard canvas draws from. Called once per data
-/// change (`App::refresh_brain_edges`, on `NavigateBrain` / `BrainReindex` /
+/// change (`App::refresh_brain_graph`, on `NavigateBrain` / `BrainReindex` /
 /// `BrainSwitchCatalogue`), never per draw.
 ///
 /// A link endpoint that isn't in `entries` (index/entries drift, or a link
@@ -146,6 +165,90 @@ pub(crate) fn resolve_edges(entries: &[BrainEntry], links: &[(String, String)]) 
         }
     }
     edges
+}
+
+/// Relaxation steps `force_layout` runs — fixed rather than convergence-
+/// threshold-based, so the result is a pure, deterministic function of
+/// `entries`/`edges` alone (no wall-clock or RNG dependency anywhere in
+/// this function beyond the deterministic `hash01`-seeded start
+/// positions).
+const FORCE_LAYOUT_ITERATIONS: u32 = 400;
+
+/// Fruchterman-Reingold force-directed layout: nodes repel each other,
+/// linked nodes attract along `edges`, and per-iteration displacement is
+/// capped by a linearly-cooling "temperature" so the system settles
+/// instead of oscillating. Run once per data change (see
+/// `App::refresh_brain_graph`) and cached — NOT recomputed per canvas
+/// draw, unlike the rest of this module's per-frame re-derivation.
+///
+/// Initial positions come from the existing `hash01` (same salts the old
+/// pure-scatter placement used), so re-running on unchanged
+/// `entries`/`edges` reproduces bit-identical output. Returns each entry's
+/// normalized `(x, y)` in `[0.05, 0.95]` on both axes (the same margin the
+/// old hash-based placement used), keyed by entry id.
+pub(crate) fn force_layout(
+    entries: &[BrainEntry],
+    edges: &[(usize, usize)],
+) -> HashMap<String, (f32, f32)> {
+    let n = entries.len();
+    if n == 0 {
+        return HashMap::new();
+    }
+
+    let mut x: Vec<f32> = entries.iter().map(|e| 0.05 + 0.90 * hash01(&e.id, 7)).collect();
+    let mut y: Vec<f32> = entries.iter().map(|e| 0.05 + 0.90 * hash01(&e.id, 13)).collect();
+
+    // Ideal spacing scales down as node count grows, so density stays
+    // roughly constant regardless of how many specimens are in the graph.
+    let k = 0.9 / (n as f32).sqrt();
+    let mut temperature = 0.1f32;
+    let cooling = temperature / FORCE_LAYOUT_ITERATIONS as f32;
+
+    for _ in 0..FORCE_LAYOUT_ITERATIONS {
+        let mut dx = vec![0.0f32; n];
+        let mut dy = vec![0.0f32; n];
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let ddx = x[i] - x[j];
+                let ddy = y[i] - y[j];
+                let d = (ddx * ddx + ddy * ddy).sqrt().max(1e-3);
+                let f = (k * k) / d;
+                let (ux, uy) = (ddx / d, ddy / d);
+                dx[i] += ux * f;
+                dy[i] += uy * f;
+                dx[j] -= ux * f;
+                dy[j] -= uy * f;
+            }
+        }
+
+        for &(a, b) in edges {
+            let ddx = x[b] - x[a];
+            let ddy = y[b] - y[a];
+            let d = (ddx * ddx + ddy * ddy).sqrt().max(1e-3);
+            let f = (d * d) / k;
+            let (ux, uy) = (ddx / d, ddy / d);
+            dx[a] += ux * f;
+            dy[a] += uy * f;
+            dx[b] -= ux * f;
+            dy[b] -= uy * f;
+        }
+
+        for i in 0..n {
+            let mag = (dx[i] * dx[i] + dy[i] * dy[i]).sqrt().max(1e-6);
+            let capped = mag.min(temperature);
+            x[i] = (x[i] + (dx[i] / mag) * capped).clamp(0.05, 0.95);
+            y[i] = (y[i] + (dy[i] / mag) * capped).clamp(0.05, 0.95);
+        }
+
+        temperature = (temperature - cooling).max(0.0);
+    }
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.id.clone(), (x[i], y[i])))
+        .collect()
 }
 
 /// Specimen dot radius: a 3px floor, growing with wikilink count, clamped to
@@ -174,7 +277,7 @@ impl<'a> canvas::Program<Message> for Pinboard<'a> {
 
         // Dashed link threads: faint ink by default, lit accent when either
         // endpoint matches the active search. Edges are precomputed
-        // node-index pairs (`App::refresh_brain_edges` /
+        // node-index pairs (`App::refresh_brain_graph` /
         // `resolve_edges`) — already deduped by undirected pair, so a
         // mutual link (A -> B and B -> A) is stroked once, not twice.
         let ink_edge = Color { a: 0.18, ..s.ink };
@@ -218,6 +321,25 @@ impl<'a> canvas::Program<Message> for Pinboard<'a> {
                 frame.stroke(
                     &Path::circle(Point::new(n.x, n.y), n.r + 3.0),
                     Stroke::default().with_color(Color { a: 1.0, ..s.ink }).with_width(1.4),
+                );
+            }
+            // Persistent selection ring: dashed +6px accent — distinct from
+            // both the solid +4px search-hit ring and the solid +3px hover
+            // ring above, so all three states stay visually distinguishable
+            // even when they overlap (e.g. hovering the selected node).
+            // Unlike hover (transient, cursor-driven `state.hovered`),
+            // selection comes from `self.app.brain_view.selected`, set by a
+            // canvas click OR a sidebar drawer click, and persists until a
+            // different entry is selected.
+            if self.app.brain_view.selected.as_deref() == Some(n.id.as_str()) {
+                frame.stroke(
+                    &Path::circle(Point::new(n.x, n.y), n.r + 6.0),
+                    Stroke {
+                        style: canvas::Style::Solid(s.accent),
+                        width: 1.4,
+                        line_dash: canvas::LineDash { segments: &[3.0, 3.0], offset: 0 },
+                        ..Stroke::default()
+                    },
                 );
             }
         }
@@ -386,5 +508,65 @@ mod tests {
         let entries = vec![entry("a.md")];
         let links = vec![("a.md".to_string(), "a.md".to_string())];
         assert!(resolve_edges(&entries, &links).is_empty());
+    }
+
+    #[test]
+    fn force_layout_is_deterministic() {
+        let entries = vec![entry("a.md"), entry("b.md"), entry("c.md")];
+        let edges = vec![(0, 1)];
+        let first = force_layout(&entries, &edges);
+        let second = force_layout(&entries, &edges);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn force_layout_keeps_positions_within_the_canvas_margin() {
+        let entries: Vec<BrainEntry> = (0..12).map(|i| entry(&format!("n{i}.md"))).collect();
+        let edges: Vec<(usize, usize)> = (0..11).map(|i| (i, i + 1)).collect();
+        let positions = force_layout(&entries, &edges);
+        for (x, y) in positions.values() {
+            assert!((0.05..=0.95).contains(x), "x {x} out of bounds");
+            assert!((0.05..=0.95).contains(y), "y {y} out of bounds");
+        }
+    }
+
+    #[test]
+    fn force_layout_pulls_linked_nodes_closer_than_an_unlinked_outlier() {
+        // A tightly-linked triangle (a-b, b-c, a-c) plus one entirely unlinked
+        // outlier — the triangle's own pairwise distances should end up
+        // smaller than any distance from the outlier to the triangle.
+        let entries = vec![entry("a.md"), entry("b.md"), entry("c.md"), entry("outlier.md")];
+        let edges = vec![(0, 1), (1, 2), (0, 2)];
+        let positions = force_layout(&entries, &edges);
+
+        let dist = |a: &str, b: &str| {
+            let (ax, ay) = positions[a];
+            let (bx, by) = positions[b];
+            ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt()
+        };
+
+        let max_triangle_dist =
+            dist("a.md", "b.md").max(dist("b.md", "c.md")).max(dist("a.md", "c.md"));
+        let min_outlier_dist = dist("a.md", "outlier.md")
+            .min(dist("b.md", "outlier.md"))
+            .min(dist("c.md", "outlier.md"));
+
+        assert!(
+            max_triangle_dist < min_outlier_dist,
+            "triangle pairwise distances ({max_triangle_dist}) should be smaller than any \
+             distance to the unlinked outlier ({min_outlier_dist})"
+        );
+    }
+
+    #[test]
+    fn force_layout_handles_empty_and_singleton_input_without_panicking() {
+        assert!(force_layout(&[], &[]).is_empty());
+
+        let one = vec![entry("solo.md")];
+        let positions = force_layout(&one, &[]);
+        assert_eq!(positions.len(), 1);
+        let (x, y) = positions["solo.md"];
+        assert!((0.05..=0.95).contains(&x));
+        assert!((0.05..=0.95).contains(&y));
     }
 }

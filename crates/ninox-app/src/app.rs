@@ -101,10 +101,17 @@ pub struct BrainViewState {
     pub related: Vec<BrainEntry>,
     /// Pinboard edges as undirected, deduplicated node-index pairs into
     /// `entries`, resolved from `BrainIndex::links_all()` once per data
-    /// change (`NavigateBrain` / `BrainReindex` / `BrainSwitchCatalogue`) —
-    /// see `App::refresh_brain_edges` and `brain_pinboard::resolve_edges`.
+    /// change (`NavigateBrain` / `reload_brain_entries`) — see
+    /// `App::refresh_brain_graph` and `brain_pinboard::resolve_edges`.
     /// Never re-derived per canvas draw.
     pub edges: Vec<(usize, usize)>,
+    /// Force-directed pinboard layout: each entry id's normalized `(x, y)`
+    /// position in `[0.05, 0.95]`, computed once per data change by
+    /// `brain_pinboard::force_layout` alongside `edges` (same triggers,
+    /// same `App::refresh_brain_graph`) — never recomputed per canvas
+    /// draw. `Pinboard::nodes()` falls back to the old hash-based position
+    /// for any id missing here (e.g. a reindex race).
+    pub layout: HashMap<String, (f32, f32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -782,17 +789,22 @@ impl App {
     }
 
     /// Re-derive pinboard edges (node-index pairs into `brain_view.entries`)
-    /// from the index's resolved link graph. Called once per data change —
-    /// `NavigateBrain`'s initial load and every `reload_brain_entries`
-    /// (reindex, catalogue switch, background freshen) — never per canvas
-    /// draw. A DB error is tolerated: warn and leave the pinboard edge-less
-    /// rather than panic.
-    fn refresh_brain_edges(state: &mut Self) {
+    /// and the force-directed layout built from them. Called once per data
+    /// change — `NavigateBrain`'s initial load and every
+    /// `reload_brain_entries` (reindex, catalogue switch, background
+    /// freshen) — never per canvas draw. A DB error is tolerated: warn and
+    /// leave the pinboard edge-less (and layout unchanged) rather than
+    /// panic.
+    fn refresh_brain_graph(state: &mut Self) {
         match state.brain.links_all() {
             Ok(links) => {
                 state.brain_view.edges = crate::components::brain_pinboard::resolve_edges(
                     &state.brain_view.entries,
                     &links,
+                );
+                state.brain_view.layout = crate::components::brain_pinboard::force_layout(
+                    &state.brain_view.entries,
+                    &state.brain_view.edges,
                 );
             }
             Err(e) => {
@@ -843,7 +855,7 @@ impl App {
         match state.brain.query("", None, QueryFilters::default()) {
             Ok(entries) => {
                 state.brain_view.entries = entries;
-                Self::refresh_brain_edges(state);
+                Self::refresh_brain_graph(state);
                 // The selected entry may have been renamed or deleted by
                 // whatever changed the entry set — if it no longer resolves,
                 // clear the pane instead of showing a ghost selection.
@@ -1995,7 +2007,7 @@ impl App {
                         Ok(entries) => {
                             state.brain_view.entries = entries;
                             state.brain_view.loaded = true;
-                            Self::refresh_brain_edges(state);
+                            Self::refresh_brain_graph(state);
                         }
                         Err(e) => tracing::error!("brain query: {e}"),
                     }
@@ -2098,7 +2110,6 @@ impl App {
                         &crate::components::brain_panel::preprocess_wikilinks(&e.body),
                     ).collect();
                     state.brain_view.open_drawers.insert(e.entry_type.clone());
-                    state.brain_view.mode = BrainMode::Catalogue;
                 }
                 state.brain_view.selected = Some(id);
                 Self::refresh_selection_graph(state);
@@ -2223,6 +2234,7 @@ impl App {
                             state.brain_view.backlinks.clear();
                             state.brain_view.related.clear();
                             state.brain_view.edges.clear();
+                            state.brain_view.layout.clear();
                             state.brain_view.loaded = false;
                             Self::reload_brain_entries(state);
                             // The local open above keeps the switch instant;
@@ -4137,7 +4149,7 @@ mod tests {
     }
 
     #[test]
-    fn selecting_entry_opens_catalogue_and_drawer() {
+    fn selecting_entry_opens_its_drawer_without_changing_mode() {
         let brain_dir = tempdir().unwrap().keep();
         std::fs::create_dir_all(brain_dir.join("symbols")).unwrap();
         std::fs::write(brain_dir.join("symbols").join("x.md"), "---\nname: X\n---\nbody").unwrap();
@@ -4149,7 +4161,11 @@ mod tests {
         let (app, _) = app.update(Message::NavigateBrain);
         let (app, _) = app.update(Message::BrainSetMode(BrainMode::Pinboard));
         let (app, _) = app.update(Message::BrainSelectEntry("symbols/x.md".into()));
-        assert_eq!(app.brain_view.mode, BrainMode::Catalogue);
+        assert_eq!(
+            app.brain_view.mode,
+            BrainMode::Pinboard,
+            "selecting a specimen must not bounce the user out of pinboard mode"
+        );
         assert!(app.brain_view.open_drawers.contains("symbols"));
         assert_eq!(app.brain_view.selected.as_deref(), Some("symbols/x.md"));
     }
@@ -4352,6 +4368,36 @@ mod tests {
     }
 
     #[test]
+    fn navigate_brain_populates_pinboard_layout_from_the_index() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("people")).unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("alice.md"),
+            "---\nname: Alice\n---\nManages [[bob]].",
+        )
+        .unwrap();
+        std::fs::write(
+            brain_dir.join("people").join("bob.md"),
+            "---\nname: Bob\n---\nReports to [[alice]].",
+        )
+        .unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild(None).unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        assert!(m.brain_view.layout.is_empty());
+
+        let (m2, _) = m.update(Message::NavigateBrain);
+        assert_eq!(m2.brain_view.layout.len(), 2);
+        for entry in &m2.brain_view.entries {
+            let (x, y) = m2.brain_view.layout[&entry.id];
+            assert!((0.05..=0.95).contains(&x));
+            assert!((0.05..=0.95).contains(&y));
+        }
+    }
+
+    #[test]
     fn selecting_entry_populates_backlinks_and_related_from_the_index() {
         let brain_dir = tempdir().unwrap().keep();
         std::fs::create_dir_all(brain_dir.join("people")).unwrap();
@@ -4550,6 +4596,39 @@ mod tests {
             app.brain_view.edges.is_empty(),
             "catalogue B has no links -- edges must be cleared, not left over from A"
         );
+    }
+
+    #[test]
+    fn switching_catalogue_clears_and_repopulates_pinboard_layout() {
+        let dir_a = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_a.join("people")).unwrap();
+        std::fs::write(dir_a.join("people").join("alice.md"), "Sees [[bob]].").unwrap();
+        std::fs::write(dir_a.join("people").join("bob.md"), "Sees [[alice]].").unwrap();
+
+        let dir_b = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_b.join("people")).unwrap();
+        std::fs::write(dir_b.join("people").join("carol.md"), "No links here.").unwrap();
+
+        let brain_a = Arc::new(BrainIndex::open(&dir_a).unwrap());
+        brain_a.rebuild(None).unwrap();
+        BrainIndex::open(&dir_b).unwrap().rebuild(None).unwrap();
+
+        let e = test_engine();
+        let mut app = base_with_brain(e, brain_a);
+        app.catalogues = vec![
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+        ];
+        let (app, _) = app.update(Message::NavigateBrain);
+        assert_eq!(app.brain_view.layout.len(), 2);
+
+        let (app, _) = app.update(Message::BrainSwitchCatalogue(1));
+        assert_eq!(
+            app.brain_view.layout.len(),
+            1,
+            "catalogue B has one entry -- layout must be repopulated for it, not left over from A"
+        );
+        assert!(app.brain_view.layout.contains_key("people/carol.md"));
     }
 
     #[test]
