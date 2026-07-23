@@ -70,7 +70,14 @@ impl BrainIndex {
         let conn = Connection::open(&db_path)
             .with_context(|| format!("open brain db {db_path:?}"))?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
+            // busy_timeout: the GUI's background freshen/reindex, the
+            // in-process server's per-read freshen, and CLI invocations can
+            // rebuild through *separate connections* to this DB; without a
+            // timeout the losing writer fails SQLITE_BUSY instantly instead
+            // of waiting out the other's transaction (same setting as
+            // store.rs).
+            "PRAGMA busy_timeout=5000;
+             PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS entries (
                  id      TEXT PRIMARY KEY,
                  type    TEXT NOT NULL,
