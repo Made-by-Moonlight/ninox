@@ -79,12 +79,36 @@ enum Command {
     /// session at this workspace. Invoked by Claude Code's own `statusLine`
     /// hook (see `.claude/settings.json`), not intended for direct use.
     Statusline,
+    /// File-based inbox drain hooks (installed in a worker's worktree
+    /// settings only when `[inbox_messaging].enabled = true` — see
+    /// `ninox_core::inbox`). Invoked by Claude Code's own Stop/
+    /// UserPromptSubmit hooks, not intended for direct use.
+    Inbox {
+        #[command(subcommand)]
+        action: InboxAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum InboxAction {
+    /// Stop hook entry point: drains pending inbox messages into a
+    /// `{"decision":"block","reason":...}` response so Claude Code
+    /// continues instead of actually stopping. Prints nothing when nothing
+    /// is pending, letting Claude Code stop normally.
+    DrainStop,
+    /// UserPromptSubmit hook entry point: drains pending inbox messages
+    /// into `hookSpecificOutput.additionalContext`, never touching the
+    /// submitted prompt itself.
+    DrainPrompt,
 }
 
 #[derive(Subcommand)]
 enum BrainAction {
     /// Rebuild the knowledge index
     Index,
+    /// Pull and push all changes to the brain's remote (requires a
+    /// configured remote — see `ninox brain remote set`)
+    Sync,
     /// Search entries by full-text
     Query {
         /// Search text
@@ -100,6 +124,17 @@ enum BrainAction {
     Show {
         /// Relative path of the entry (e.g. people/alice.md)
         path: String,
+    },
+    /// Write a Markdown entry and index it immediately — replaces the
+    /// write-then-`ninox brain index` two-step flow so an entry is
+    /// queryable as soon as it's added, not whenever someone next
+    /// remembers to reindex.
+    Add {
+        /// Relative path of the entry under the brain root (e.g. repos/ninox.md)
+        path: String,
+        /// Markdown content, including frontmatter. Reads stdin if omitted.
+        #[arg(long)]
+        content: Option<String>,
     },
     /// Package the brain's Markdown source into a portable .tar.gz archive
     /// (excludes the derived .index.db)
@@ -129,19 +164,54 @@ enum BrainAction {
         /// been spawned into) when none are given.
         paths: Vec<PathBuf>,
     },
+    /// Manage this brain's remote backing store
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteAction {
+    /// Attach an S3-compatible remote and run an initial sync
+    Set {
+        /// Remote URL, e.g. s3://team-brains/main
+        url: String,
+        /// Custom endpoint for S3-compatible stores (R2, MinIO)
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long)]
+        region: Option<String>,
+        /// Freshness-check cache TTL in seconds (0 = check every lookup)
+        #[arg(long, default_value_t = 0)]
+        ttl: u64,
+    },
+    /// Show remote, last sync, pending pushes, and live conflicts (offline)
+    Status,
+    /// Detach from the remote; the local copy stays a normal brain
+    Unset,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+    let command = args.command;
 
     // Fires on every assistant turn (event-driven) or every `refreshInterval`
     // seconds for every session Ninox spawns — must stay fast and never
     // trigger the tmux-config/wrapper-hook/self-shim setup below, none of
     // which this subcommand needs.
-    if matches!(args.command, Some(Command::Statusline)) {
+    if matches!(command, Some(Command::Statusline)) {
         run_statusline(args.db.unwrap_or_else(default_db_path));
+        return Ok(());
+    }
+
+    // Fires on every Stop/UserPromptSubmit turn of every worker with inbox
+    // messaging enabled — same "stay fast, skip the heavy setup" reasoning
+    // as Statusline above; this subcommand needs none of it either.
+    if let Some(Command::Inbox { action }) = command {
+        run_inbox(action);
         return Ok(());
     }
 
@@ -162,13 +232,22 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let store = Arc::new(Store::open(&db_path)?);
 
-    match args.command {
+    match command {
         Some(Command::Spawn { prompt, workspace, name, orchestrator_id }) => {
             let config = AppConfig::load().unwrap_or_default();
             run_spawn(store, config, prompt, workspace, name, orchestrator_id).await
         }
         Some(Command::Send { session_id, message }) => {
-            ninox_core::tmux::send_keys(&session_id, &message).await
+            let config = AppConfig::load().unwrap_or_default();
+            let sessions_dir = std::env::var("NINOX_DATA_DIR")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(AppConfig::sessions_dir);
+            ninox_core::messaging::deliver_message(
+                &store, &sessions_dir, &session_id, &message, config.inbox_messaging.enabled,
+            )
+            .await
         }
         Some(Command::RequestWork { description }) => {
             run_request_work(&description)
@@ -178,6 +257,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Statusline) => {
             run_statusline(db_path);
+            Ok(())
+        }
+        Some(Command::Inbox { action }) => {
+            run_inbox(action);
             Ok(())
         }
         None => run_tui(store, args.port, args.headless).await,
@@ -227,7 +310,7 @@ async fn run_spawn(
 
     // Create an isolated git worktree so workers don't share a branch.
     // Falls back to the shared workspace if the repo check fails (e.g. not git).
-    let effective_workspace = match create_worker_worktree(&workspace, &id).await {
+    let effective_workspace = match create_worker_worktree(&workspace, &id, config.inbox_messaging.enabled).await {
         Ok(path) => path,
         Err(e) => {
             tracing::warn!("worktree creation failed for {id}, using shared workspace: {e}");
@@ -282,7 +365,7 @@ async fn run_spawn(
         context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: Some(claude_session_id.clone()),
         summary,
-        terminal_at: None,
+        terminal_at: None, gate_status: None,
     };
 
     store.upsert_session(&session)?;
@@ -321,7 +404,19 @@ async fn run_spawn(
         ninox_brain_env.as_deref(),
         ninox_config_env.as_deref(),
     );
-    tmux::create_session(&id, &effective_workspace, &cmd, &env_vec).await?;
+    // The session was already upserted as Working above; if tmux refuses
+    // the spawn (e.g. the workspace dir doesn't exist — create_session
+    // rejects that rather than letting the pane silently start in $HOME),
+    // mark it Terminated before bailing. A pid-less Working ghost is
+    // invisible to poll_pids and would linger until the next app restart's
+    // reconciliation.
+    if let Err(e) = tmux::create_session(&id, &effective_workspace, &cmd, &env_vec).await {
+        if let Ok(Some(mut s)) = store.get_session(&id) {
+            s.status = SessionStatus::Terminated;
+            let _ = store.upsert_session(&s);
+        }
+        return Err(e);
+    }
 
     Ok(())
 }
@@ -405,6 +500,44 @@ fn run_request_work(description: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Handler for `ninox inbox drain-stop`/`drain-prompt` — the Stop/
+/// UserPromptSubmit hooks installed in a worker's worktree settings when
+/// inbox messaging is enabled (`ensure_statusline_settings`). Never returns
+/// an error and never panics: a broken inbox must never wedge the human's
+/// Claude Code session shut, so any failure here degrades to printing
+/// nothing (Stop proceeds normally / the prompt passes through untouched),
+/// with the actual error logged to stderr for debugging.
+fn run_inbox(action: InboxAction) {
+    use std::io::Read;
+    // Required by the Claude Code hook contract even though neither drain
+    // action needs any of its fields: pending-message dedup via mark-
+    // delivered already makes repeat Stop invocations (`stop_hook_active`)
+    // self-limiting — a second call only ever sees messages that arrived
+    // after the first block, never a stale batch re-blocking forever.
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+
+    let Some(session_id) = std::env::var("NINOX_SESSION").ok().filter(|s| !s.is_empty()) else {
+        eprintln!("ninox inbox: NINOX_SESSION not set — nothing to drain");
+        return;
+    };
+    let sessions_dir = std::env::var("NINOX_DATA_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(AppConfig::sessions_dir);
+
+    let response = match action {
+        InboxAction::DrainStop   => ninox_core::inbox::drain_for_stop(&sessions_dir, &session_id),
+        InboxAction::DrainPrompt => ninox_core::inbox::drain_for_prompt_submit(&sessions_dir, &session_id),
+    };
+    match response {
+        Ok(Some(json)) => println!("{json}"),
+        Ok(None) => {}
+        Err(e) => eprintln!("ninox inbox: {e}"),
+    }
+}
+
 /// Handler for `ninox statusline`. Never returns an error and never
 /// panics: any failure (bad JSON, no store, no matching session) degrades
 /// to printing the minimal fallback line so Claude Code's statusline row
@@ -427,9 +560,15 @@ fn run_statusline(db_path: PathBuf) {
 async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()> {
     let config = AppConfig::load().unwrap_or_default();
     let brain_path = config.resolved_brain_path();
+    // First open of a config-declared remote catalogue materializes its
+    // .sync.toml (a local-fs write only; the sync itself is lazy).
+    if let Err(e) = ninox_core::brain_sync::ensure_sync_toml(&config, &brain_path) {
+        tracing::warn!("brain: failed to materialize .sync.toml: {e}");
+    }
 
     match action {
         BrainAction::Index => {
+            run_remote_sync_if_configured(&brain_path).await;
             let brain = BrainIndex::open(&brain_path)?;
             let embedder = try_build_embedder();
             let stats = brain.rebuild(embedder.as_deref())?;
@@ -438,9 +577,27 @@ async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()>
                 stats.indexed, stats.embedded, stats.cached
             );
         }
+        BrainAction::Sync => {
+            match ninox_core::brain_sync::BrainSync::for_brain(&brain_path).await {
+                Ok(None) => {
+                    eprintln!("this brain has no remote — configure one with `ninox brain remote set s3://bucket/prefix`");
+                    std::process::exit(1);
+                }
+                Ok(Some(sync)) => {
+                    let report = sync.sync().await?;
+                    print_sync_report(&report);
+                    if report.changed_local() {
+                        let brain = BrainIndex::open(&brain_path)?;
+                        let embedder = try_build_embedder();
+                        brain.rebuild(embedder.as_deref())?;
+                    }
+                }
+                Err(e) => anyhow::bail!("brain remote unavailable: {e}"),
+            }
+        }
         BrainAction::Query { text, entry_type, tag } => {
-            let brain = BrainIndex::open(&brain_path)?;
             let embedder = if text.trim().is_empty() { None } else { try_build_embedder() };
+            let brain = ninox_core::brain_sync::open_synced(&brain_path, embedder.as_deref()).await?;
             let filters = QueryFilters { entry_type, tag };
             let entries = brain.query(&text, embedder.as_deref(), filters)?;
             for entry in &entries {
@@ -448,7 +605,7 @@ async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()>
             }
         }
         BrainAction::Show { path } => {
-            let brain = BrainIndex::open(&brain_path)?;
+            let brain = ninox_core::brain_sync::open_synced(&brain_path, None).await?;
             match brain.get(&path)? {
                 Some(entry) => println!("{}", serde_json::to_string_pretty(&entry)?),
                 None => {
@@ -456,6 +613,21 @@ async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()>
                     std::process::exit(1);
                 }
             }
+        }
+        BrainAction::Add { path, content } => {
+            let content = match content {
+                Some(c) => c,
+                None => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    buf
+                }
+            };
+            let stats = run_brain_add(&brain_path, &path, &content)?;
+            println!(
+                "wrote {path} and indexed {} entries ({} embedded, {} cached)",
+                stats.indexed, stats.embedded, stats.cached
+            );
         }
         BrainAction::Export { output } => {
             let stats = ninox_core::brain_archive::export(&brain_path, &output)?;
@@ -500,9 +672,92 @@ async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()>
             // `brain` above, since candidates can span multiple catalogues.
             run_discover_repos(&brain_path, &store, paths)?;
         }
+        BrainAction::Remote { action } => match action {
+            RemoteAction::Set { url, endpoint, region, ttl } => {
+                let cfg = ninox_core::brain_sync::SyncToml {
+                    remote: url,
+                    endpoint,
+                    region,
+                    cache_ttl_secs: ttl,
+                };
+                cfg.save(&brain_path)?;
+                println!("remote set to {} for {}", cfg.remote, brain_path.display());
+                match ninox_core::brain_sync::BrainSync::for_brain(&brain_path).await? {
+                    Some(sync) => {
+                        let report = sync.sync().await?;
+                        print_sync_report(&report);
+                        let brain = BrainIndex::open(&brain_path)?;
+                        let embedder = try_build_embedder();
+                        brain.rebuild(embedder.as_deref())?;
+                    }
+                    None => unreachable!(".sync.toml was just written"),
+                }
+            }
+            RemoteAction::Status => match ninox_core::brain_sync::remote_status(&brain_path)? {
+                None => {
+                    println!("no remote configured for {}", brain_path.display());
+                }
+                Some(s) => {
+                    println!("remote:          {}", s.remote);
+                    println!("cache ttl:       {}s", s.cache_ttl_secs);
+                    println!("last generation: {}", s.generation);
+                    println!(
+                        "last check:      {}",
+                        if s.last_check_unix == 0 { "never".to_string() } else { ninox_core::brain_sync::rfc3339(s.last_check_unix) }
+                    );
+                    println!("pending pushes:  {}", s.pending_pushes.len());
+                    for rel in &s.pending_pushes {
+                        println!("  {rel}");
+                    }
+                    println!("live conflicts:  {}", s.conflict_files.len());
+                    for rel in &s.conflict_files {
+                        println!("  {rel}");
+                    }
+                }
+            },
+            RemoteAction::Unset => {
+                let removed_cfg = std::fs::remove_file(brain_path.join(ninox_core::brain_sync::SYNC_TOML)).is_ok();
+                let _ = std::fs::remove_file(brain_path.join(ninox_core::brain_sync::SYNC_STATE));
+                if removed_cfg {
+                    println!("remote detached; {} is a plain local brain again", brain_path.display());
+                } else {
+                    println!("no remote was configured for {}", brain_path.display());
+                }
+            }
+        },
     }
 
     Ok(())
+}
+
+/// `ninox brain index` on a remote-backed brain: full sync BEFORE the
+/// rebuild so pulled entries land in the index (spec: pull → resolve →
+/// push → rebuild). Failures degrade to local-only indexing — the index
+/// step must keep working offline.
+async fn run_remote_sync_if_configured(brain_path: &std::path::Path) {
+    match ninox_core::brain_sync::BrainSync::for_brain(brain_path).await {
+        Ok(None) => {}
+        Ok(Some(sync)) => match sync.sync().await {
+            Ok(report) => print_sync_report(&report),
+            Err(e) => eprintln!("brain sync failed (continuing with local index): {e}"),
+        },
+        Err(e) => eprintln!("brain remote unavailable (continuing local-only): {e}"),
+    }
+}
+
+fn print_sync_report(report: &ninox_core::brain_sync::SyncReport) {
+    println!(
+        "synced with remote: pulled {}, pushed {}, deleted {} local / {} remote, {} conflict{}",
+        report.pulled,
+        report.pushed,
+        report.deleted_local,
+        report.deleted_remote,
+        report.conflicts.len(),
+        if report.conflicts.len() == 1 { "" } else { "s" },
+    );
+    for rel in &report.conflicts {
+        eprintln!("  conflict copy kept: {rel}");
+    }
 }
 
 /// `ninox brain discover-repos` — scan `paths` (or, if empty, every
@@ -621,6 +876,18 @@ fn write_brain_entry(brain_path: &std::path::Path, id: &str, content: &str) -> a
     Ok(())
 }
 
+/// Writes `content` to `path` under the brain root and immediately rebuilds
+/// the index — the `BrainAction::Add` handler's logic, pulled into a free
+/// function (same convention as `run_discover_repos`) so it's callable
+/// directly from tests without going through CLI arg parsing or resolving
+/// `AppConfig`'s default brain path.
+fn run_brain_add(brain_path: &std::path::Path, path: &str, content: &str) -> anyhow::Result<ninox_core::brain::RebuildStats> {
+    write_brain_entry(brain_path, path, content)?;
+    let brain = BrainIndex::open(brain_path)?;
+    let embedder = try_build_embedder();
+    brain.rebuild(embedder.as_deref())
+}
+
 #[cfg(test)]
 mod discover_repos_tests {
     use super::run_discover_repos;
@@ -661,7 +928,7 @@ mod discover_repos_tests {
             context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         }
     }
 
@@ -860,6 +1127,37 @@ fn first_line(s: &str, max_chars: usize) -> Option<String> {
     }
 }
 
+#[cfg(test)]
+mod brain_add_tests {
+    use super::run_brain_add;
+    use ninox_core::BrainIndex;
+
+    #[test]
+    fn add_writes_and_indexes_in_one_call() {
+        let brain_dir = tempfile::tempdir().unwrap();
+        let stats = run_brain_add(
+            brain_dir.path(),
+            "repos/ninox.md",
+            "---\nname: ninox\nmetadata:\n  type: repo\n---\n\nNinox repo notes.",
+        )
+        .unwrap();
+        assert_eq!(stats.indexed, 1);
+
+        // No separate `ninox brain index` step required — the entry is
+        // already queryable against the freshly written index file.
+        let brain = BrainIndex::open(brain_dir.path()).unwrap();
+        let found = brain.get("repos/ninox.md").unwrap();
+        assert!(found.is_some(), "entry should be queryable immediately after add");
+    }
+
+    #[test]
+    fn add_creates_missing_parent_directories() {
+        let brain_dir = tempfile::tempdir().unwrap();
+        run_brain_add(brain_dir.path(), "concepts/new-thing.md", "# new thing").unwrap();
+        assert!(brain_dir.path().join("concepts/new-thing.md").exists());
+    }
+}
+
 fn has_display() -> bool {
     #[cfg(target_os = "macos")]
     { true }
@@ -869,7 +1167,37 @@ fn has_display() -> bool {
 
 #[cfg(test)]
 mod worker_env_tests {
-    use super::{first_line, worker_context_footer, worker_env_vars};
+    use super::{first_line, run_spawn, worker_context_footer, worker_env_vars};
+
+    #[tokio::test]
+    async fn run_spawn_marks_the_session_terminated_when_tmux_create_fails() {
+        use std::sync::Arc;
+        // A nonexistent workspace makes worktree creation fail (falls back
+        // to the shared workspace, also missing), and tmux::create_session
+        // now rejects the missing dir. run_spawn upserts the session as
+        // Working BEFORE that point — bailing without a status fix-up
+        // leaves a permanent Working ghost with no pid for poll_pids to
+        // reap (only startup reconciliation would ever catch it).
+        let store = Arc::new(
+            ninox_core::store::Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap(),
+        );
+        let result = run_spawn(
+            store.clone(),
+            ninox_core::config::AppConfig::default(),
+            "do the task".into(),
+            "/definitely/not/a/real/dir".into(),
+            Some("ghost-spawn-test".into()),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "spawn into a missing workspace must fail");
+
+        let session = store.get_session("ghost-spawn-test").unwrap().unwrap();
+        assert!(
+            matches!(session.status, ninox_core::SessionStatus::Terminated),
+            "failed spawn must not leave a Working ghost, got {:?}", session.status,
+        );
+    }
 
     #[test]
     fn first_line_takes_first_non_empty_line_trimmed() {

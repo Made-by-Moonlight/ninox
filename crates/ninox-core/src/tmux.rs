@@ -271,6 +271,15 @@ pub async fn create_session(
     cmd:       &str,
     env:       &[(&str, &str)],
 ) -> Result<()> {
+    // tmux does NOT fail on a nonexistent `-c` dir (verified on 3.6a: exit 0,
+    // pane silently starts in $HOME). For harnesses with cwd-scoped state —
+    // claude-code keys conversations to the directory it starts in — that
+    // fallback breaks `--resume` with "No conversation found with session
+    // ID". Fail loudly here instead.
+    anyhow::ensure!(
+        std::path::Path::new(workspace).is_dir(),
+        "workspace directory does not exist: {workspace}"
+    );
     // Build -e KEY=VALUE pairs
     let mut env_pairs: Vec<String> = Vec::new();
     for (k, v) in env {
@@ -415,16 +424,180 @@ pub async fn capture_history(session_id: &str, start: i64, end: i64) -> Vec<u8> 
     .unwrap_or_default()
 }
 
+/// A burst of injected characters makes Claude Code's TUI enter paste
+/// handling; an Enter arriving before that settles is swallowed and the
+/// message sits unsubmitted in the input box. Wait this long before Enter.
+const SEND_SUBMIT_DELAY_MS: u64 = 300;
+/// After Enter, re-check delivery this many times, this far apart,
+/// re-sending Enter whenever the message is still visible at the prompt.
+const SEND_VERIFY_ATTEMPTS: u32 = 3;
+const SEND_VERIFY_DELAY_MS: u64 = 500;
+
 /// Send text to a tmux session as if typed at the keyboard.
 /// The text is followed by Enter so the agent receives and acts on it.
 /// Uses `tmux send-keys -l` (literal mode) to avoid tmux interpreting
 /// special characters like `{`, `}`, arrows.
+///
+/// Delivery is verified: if the message is still sitting unsubmitted at the
+/// pane's `❯` input prompt (the stuck-`[Pasted text #N]` failure mode),
+/// Enter is re-sent up to `SEND_VERIFY_ATTEMPTS` times, and exhausting the
+/// retries is an error so callers know the target never saw the message.
+/// Panes that give no signal (no `❯` prompt, unrelated prompt content) are
+/// treated as delivered — a retry Enter must never fire at a human's
+/// half-typed input.
 pub async fn send_keys(session_id: &str, text: &str) -> Result<()> {
     // Send the message text in literal mode
     run_session_scoped(&["send-keys", "-t", session_id, "-l", text]).await?;
-    // Send Enter to submit
+    // Let the TUI finish paste processing before submitting.
+    tokio::time::sleep(std::time::Duration::from_millis(SEND_SUBMIT_DELAY_MS)).await;
     run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await?;
-    Ok(())
+
+    // Every Enter — the initial one and each retry — gets its own
+    // verification pass, so a submission by the final retry is still
+    // reported as success (a false "stuck" error invites a re-send,
+    // which double-delivers).
+    for attempt in 0..=SEND_VERIFY_ATTEMPTS {
+        tokio::time::sleep(std::time::Duration::from_millis(SEND_VERIFY_DELAY_MS)).await;
+        if !message_stuck_at_prompt(&capture_visible_plain(session_id).await, text) {
+            return Ok(());
+        }
+        if attempt < SEND_VERIFY_ATTEMPTS {
+            run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await?;
+        }
+    }
+    anyhow::bail!(
+        "message to {session_id} is still unsubmitted at its input prompt \
+         after {SEND_VERIFY_ATTEMPTS} Enter retries"
+    )
+}
+
+/// Plain-text capture of the pane's visible contents — no `-e`, so the
+/// output carries no escape sequences and can be string-matched.
+async fn capture_visible_plain(session_id: &str) -> String {
+    run_session_scoped(&["capture-pane", "-p", "-t", session_id])
+        .await
+        .unwrap_or_default()
+}
+
+/// The trimmed content after the pane's last `❯` input-prompt line, with the
+/// input box's right border/padding stripped (`  msg   │` → `msg`). `None`
+/// when no prompt line is visible at all (plain shell, alt-screen app) —
+/// distinct from `Some("")`, an empty-but-present input box. Shared by
+/// [`message_stuck_at_prompt`] and [`wake_idle_session`].
+fn prompt_line_content(pane: &str) -> Option<&str> {
+    const PROMPT: char = '❯';
+    let line = pane.lines().rev().find(|l| l.contains(PROMPT))?;
+    let after = &line[line.rfind(PROMPT).unwrap() + PROMPT.len_utf8()..];
+    // Strip the input box's right border and padding: `  msg   │`.
+    Some(after.trim().trim_end_matches('│').trim())
+}
+
+/// Whether a message we just injected is sitting unsubmitted in the target
+/// pane's input box. Looks at the last line holding the `❯` input prompt:
+/// stuck means it shows a `[Pasted text #N]` attachment marker or the
+/// message text itself (prefix-matched both ways, since the box truncates
+/// long lines). Anything else after the prompt — empty box, a placeholder
+/// hint, a human's half-typed message — is NOT ours to submit, so this
+/// stays false and no retry Enter is ever sent at it.
+fn message_stuck_at_prompt(pane: &str, text: &str) -> bool {
+    let Some(content) = prompt_line_content(pane) else {
+        return false;
+    };
+    if content.is_empty() {
+        return false;
+    }
+    if content.starts_with("[Pasted text") {
+        return true;
+    }
+    let first_line = text.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        return false;
+    }
+    if content.starts_with(first_line) {
+        return true;
+    }
+    // Truncated stuck message: the box cuts long lines at the pane edge,
+    // so the visible content is a leading fragment of the message. Require
+    // it to be long enough to be distinctive — every reaction starts with
+    // `[Ninox]`, and a human who has typed `[` (or `[Ninox] C`) when this
+    // check runs must not have their unfinished input Enter'd for them. A
+    // genuinely truncated line is pane-width, far above this floor.
+    const MIN_TRUNCATED_MATCH_CHARS: usize = 10;
+    content.chars().count() >= MIN_TRUNCATED_MATCH_CHARS && first_line.starts_with(content)
+}
+
+/// Marker text for [`wake_idle_session`]'s idle-wake nudge — never the
+/// actual message, which (when the opt-in file-based inbox is enabled) is
+/// delivered entirely through the Stop/UserPromptSubmit hooks' JSON output,
+/// not the keystroke. Kept short and distinctive so it can never collide
+/// with real content a human might be mid-typing.
+const IDLE_WAKE_NUDGE: &str = ".";
+
+/// Whether the pane's prompt currently holds ONLY the idle-wake nudge
+/// marker — nothing added, nothing removed. Used both right before sending
+/// Enter and (implicitly, by its absence) to detect that Enter already
+/// submitted cleanly.
+fn nudge_still_alone_at_prompt(pane: &str) -> bool {
+    prompt_line_content(pane) == Some(IDLE_WAKE_NUDGE)
+}
+
+/// Wake an idle session so its Stop/UserPromptSubmit hooks run and drain
+/// the file-based inbox (see `ninox_core::inbox`) sooner than the next
+/// natural turn boundary. Only meaningful when that opt-in inbox is
+/// enabled — the message itself never travels through this keystroke. For
+/// an idle session this nudge IS the only delivery trigger there is (no
+/// Stop/UserPromptSubmit fires on its own until something wakes it) — see
+/// `crate::messaging::deliver_message`'s doc comment for the resulting
+/// guarantee (best-effort, not "will always eventually drain").
+///
+/// Skips sending anything unless the pane's input prompt is visibly present
+/// AND empty: a human mid-typing, or no visible prompt at all (alt-screen,
+/// still rendering), must never be clobbered by a nudge. The one exception
+/// is the prompt holding EXACTLY our own nudge marker and nothing else —
+/// see the stale-nudge paragraph below.
+///
+/// Deliberately does NOT reuse [`send_keys`] wholesale: that function sends
+/// Enter unconditionally `SEND_SUBMIT_DELAY_MS` after the literal text, with
+/// no re-check of what else may have landed at the prompt in that window —
+/// fine for a real message the caller explicitly wants delivered, but not
+/// for a nudge whose entire point is to never touch a human's typing. After
+/// typing the nudge, this re-verifies the prompt still holds ONLY the nudge
+/// — nothing else — immediately before pressing Enter; if a human started
+/// typing in that window, Enter is withheld entirely (their in-progress
+/// input is left alone, nudge character included, rather than risking it
+/// being submitted on our behalf).
+///
+/// Withholding Enter that way creates its own hazard if left unhandled: the
+/// pane is then left showing just our nudge character, un-submitted. A
+/// later call would see that as "prompt has content" and skip entirely —
+/// forever, since nothing else will ever clear a marker only we would type.
+/// That would permanently wedge delivery to an idle session behind a single
+/// lost race. Closed by treating "prompt holds exactly our nudge marker" as
+/// recognizably OUR OWN leftover from a previous attempt rather than a
+/// human's input: submit it immediately (verified Enter) instead of typing
+/// a fresh one. Losing today's race is still not a delivery failure — the
+/// message is already durably written to the inbox file — so no retry loop
+/// is needed for the fresh-nudge path either.
+pub async fn wake_idle_session(session_id: &str) -> Result<()> {
+    let pane = capture_visible_plain(session_id).await;
+    match prompt_line_content(&pane) {
+        Some("") => {} // proceed to type a fresh nudge below
+        Some(IDLE_WAKE_NUDGE) => {
+            // Our own nudge, left over un-submitted from a previous call —
+            // submit it now rather than treating the box as permanently
+            // occupied.
+            return run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await.map(|_| ());
+        }
+        _ => return Ok(()), // genuinely occupied by something else
+    }
+
+    run_session_scoped(&["send-keys", "-t", session_id, "-l", IDLE_WAKE_NUDGE]).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(SEND_SUBMIT_DELAY_MS)).await;
+
+    if !nudge_still_alone_at_prompt(&capture_visible_plain(session_id).await) {
+        return Ok(());
+    }
+    run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await.map(|_| ())
 }
 
 /// Write `bytes` to the session's master PTY via tmux's paste-buffer
@@ -484,6 +657,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_session_fails_when_workspace_dir_is_missing() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        // tmux 3.6a exits 0 for `new-session -c <missing-dir>` and silently
+        // starts the pane in $HOME instead — which made `claude --resume`
+        // fail with "No conversation found with session ID" (conversations
+        // are cwd-scoped). create_session must fail loudly instead.
+        let result = create_session(&id, "/definitely/not/a/real/dir", "sleep 30", &[]).await;
+        assert!(result.is_err(), "missing workspace must be an error, not a silent $HOME fallback");
+        assert!(!has_session(&id).await, "no session may be left behind on failure");
+    }
+
+    #[tokio::test]
     async fn create_and_has_and_kill() {
         if !tmux_available() { return; }
         let id = unique_id();
@@ -510,6 +696,315 @@ mod tests {
         create_session(&id, "/tmp", "sleep 30", &[]).await.unwrap();
         let tty = get_pane_tty(&id).await.unwrap();
         assert!(tty.map(|t| t.starts_with("/dev/")).unwrap_or(false));
+        kill_session(&id).await.unwrap();
+    }
+
+    // ── message_stuck_at_prompt ─────────────────────────────────────────
+    //
+    // Fixtures mirror real Claude Code pane captures: transcript above, a
+    // bordered input box with a `❯` prompt at the bottom.
+
+    const REACTION: &str = "[Ninox] CI is failing on your PR (1/3 checks). Please fix the following:\n  - build\n\nRun the failing checks locally, fix the issues, and push your changes.";
+
+    #[test]
+    fn stuck_when_pasted_text_marker_sits_at_prompt() {
+        let pane = "\
+● Working on the auth refactor now.
+
+╭──────────────────────────────────────────────╮
+│ ❯ [Pasted text #1 +4 lines]                  │
+╰──────────────────────────────────────────────╯
+  ? for shortcuts";
+        assert!(message_stuck_at_prompt(pane, REACTION));
+    }
+
+    #[test]
+    fn stuck_when_message_text_sits_at_prompt() {
+        let pane = "\
+╭──────────────────────────────────────────────────────╮
+│ ❯ [Ninox] Worker `auth-fix`'s PR #12 merged.         │
+╰──────────────────────────────────────────────────────╯";
+        assert!(message_stuck_at_prompt(pane, "[Ninox] Worker `auth-fix`'s PR #12 merged."));
+    }
+
+    /// The input box truncates long lines at the pane edge — a visible
+    /// prefix of the message still counts as stuck.
+    #[test]
+    fn stuck_when_prompt_shows_truncated_prefix_of_message() {
+        let pane = "│ ❯ [Ninox] CI is failing on your PR (1/3 che│";
+        assert!(message_stuck_at_prompt(pane, REACTION));
+    }
+
+    /// A submitted message echoes into the transcript ABOVE an empty input
+    /// box — only the last prompt line may be consulted, or every
+    /// successful send would look stuck.
+    #[test]
+    fn not_stuck_when_prompt_empty_and_message_echoed_in_transcript() {
+        let pane = "\
+❯ [Ninox] Worker `auth-fix`'s PR #12 merged.
+
+● Noted — spawning the follow-up worker.
+
+╭──────────────────────────────────────────────╮
+│ ❯                                            │
+╰──────────────────────────────────────────────╯";
+        assert!(!message_stuck_at_prompt(pane, "[Ninox] Worker `auth-fix`'s PR #12 merged."));
+    }
+
+    /// A human's half-typed message (or a placeholder hint) at the prompt
+    /// must never be treated as ours — a retry Enter here would submit
+    /// their unfinished message.
+    #[test]
+    fn not_stuck_when_prompt_holds_unrelated_text() {
+        let pane = "│ ❯ can you also update the readme while     │";
+        assert!(!message_stuck_at_prompt(pane, REACTION));
+    }
+
+    /// Panes without the Claude input prompt (plain shells, alt-screen
+    /// apps) give no signal — treat as delivered, never retry blindly.
+    #[test]
+    fn not_stuck_when_pane_has_no_prompt_marker() {
+        let pane = "$ echo hi\nhi\n$";
+        assert!(!message_stuck_at_prompt(pane, "echo hi"));
+    }
+
+    /// The reverse prefix match (truncated stuck message) must require
+    /// enough characters to be distinctive. Every reaction starts with
+    /// `[Ninox]`, so a human who happens to have typed `[` — or even
+    /// `[Ninox] C` — when the verify pass runs must not have their
+    /// unfinished input submitted by a retry Enter.
+    #[test]
+    fn not_stuck_when_prompt_holds_only_a_short_prefix_of_message() {
+        for typed in ["[", "[Ninox] C"] {
+            let pane = format!("│ ❯ {typed}                                   │");
+            assert!(
+                !message_stuck_at_prompt(&pane, REACTION),
+                "short prompt content {typed:?} must not count as our stuck message",
+            );
+        }
+    }
+
+    // ── prompt_line_content / wake_idle_session ─────────────────────────
+
+    #[test]
+    fn prompt_line_content_distinguishes_missing_from_empty_prompt() {
+        assert_eq!(prompt_line_content("$ echo hi\nhi\n$"), None);
+        assert_eq!(prompt_line_content("│ ❯                                            │"), Some(""));
+        assert_eq!(
+            prompt_line_content("│ ❯ hello there                                │"),
+            Some("hello there"),
+        );
+    }
+
+    #[test]
+    fn nudge_still_alone_at_prompt_true_when_only_the_nudge_is_present() {
+        let pane = "│ ❯ .                                          │";
+        assert!(nudge_still_alone_at_prompt(pane));
+    }
+
+    /// A human who started typing during the pre-Enter delay must fail
+    /// this check — this is the exact signal `wake_idle_session` uses to
+    /// withhold Enter rather than submit their partial input.
+    #[test]
+    fn nudge_still_alone_at_prompt_false_once_more_text_is_appended() {
+        let pane = "│ ❯ .oops I started typing                    │";
+        assert!(!nudge_still_alone_at_prompt(pane));
+    }
+
+    #[test]
+    fn nudge_still_alone_at_prompt_false_once_the_prompt_is_empty_again() {
+        // Either it already submitted cleanly, or something else cleared
+        // the box — either way it's no longer "just the nudge".
+        let pane = "│ ❯                                            │";
+        assert!(!nudge_still_alone_at_prompt(pane));
+    }
+
+    #[test]
+    fn nudge_still_alone_at_prompt_false_when_no_prompt_is_visible() {
+        assert!(!nudge_still_alone_at_prompt("$ echo hi\nhi\n$"));
+    }
+
+    /// A human mid-typing (or any other non-empty prompt content) must
+    /// never be clobbered by an idle-wake nudge.
+    #[tokio::test]
+    async fn wake_idle_session_skips_when_prompt_has_content() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        // Simulate a non-empty prompt directly (bypassing send_keys's own
+        // verify loop — this test only exercises wake_idle_session's
+        // pre-check).
+        run_session_scoped(&["send-keys", "-t", &id, "-l", "❯ half-typed message"]).await.unwrap();
+        run_session_scoped(&["send-keys", "-t", &id, "Enter"]).await.unwrap();
+        wait_for_pane_contains(&id, "half-typed message").await;
+
+        wake_idle_session(&id).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        let pane = capture_visible_plain(&id).await;
+        assert!(
+            !pane.lines().any(|l| l.trim() == IDLE_WAKE_NUDGE),
+            "must never nudge over a non-empty prompt: {pane}"
+        );
+        kill_session(&id).await.unwrap();
+    }
+
+    /// A visibly empty prompt is exactly when the nudge must fire.
+    #[tokio::test]
+    async fn wake_idle_session_sends_nudge_when_prompt_is_empty() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        // Simulate an empty Claude Code input prompt: literal text with NO
+        // Enter, so the cursor stays on this exact line — matching how a
+        // real redrawing TUI box keeps typed characters on the same line
+        // as ❯ rather than advancing to a fresh line the way Enter would.
+        run_session_scoped(&["send-keys", "-t", &id, "-l", "❯ "]).await.unwrap();
+        wait_for_pane_contains(&id, "❯").await;
+
+        wake_idle_session(&id).await.unwrap();
+
+        // Enter must have been pressed: cat processes the completed line
+        // and echoes it back once it receives the newline.
+        wait_for_pane_contains(&id, "❯ .").await;
+        kill_session(&id).await.unwrap();
+    }
+
+    /// Regression test for the stall this closes: if a previous
+    /// `wake_idle_session` call typed the nudge but had Enter withheld
+    /// (e.g. it lost the pre-Enter recapture race), the box is left
+    /// showing just the nudge marker, un-submitted. A naive re-application
+    /// of the "prompt must be empty" check would see that as permanently
+    /// occupied and skip forever — wedging every future delivery attempt
+    /// to this idle session behind one lost race. Recognizing "prompt
+    /// holds exactly our own marker" as ours to submit closes that.
+    #[tokio::test]
+    async fn wake_idle_session_submits_its_own_stale_nudge_instead_of_stalling_forever() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        let marker_line = format!("❯ {IDLE_WAKE_NUDGE}");
+        // Simulate a previous attempt that typed the nudge but never
+        // pressed Enter — no Enter here either, so the cursor stays put.
+        run_session_scoped(&["send-keys", "-t", &id, "-l", &marker_line]).await.unwrap();
+        wait_for_pane_contains(&id, &marker_line).await;
+
+        wake_idle_session(&id).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        // Submission must have happened immediately (no fresh nudge typed,
+        // no delay): cat echoes the completed line, so the marker line
+        // now appears twice (once from the still-visible original typing,
+        // once from cat's echo of what it read on Enter).
+        let pane = capture_visible_plain(&id).await;
+        let occurrences = pane.lines().filter(|l| l.trim() == marker_line).count();
+        assert_eq!(
+            occurrences, 2,
+            "a stale nudge left over from a previous attempt must be submitted, \
+             not left stuck (which would wedge every future delivery): {pane}"
+        );
+        kill_session(&id).await.unwrap();
+    }
+
+    /// The core race this hardens against: a human starts typing during the
+    /// nudge's own pre-Enter delay window. Injects extra keystrokes into
+    /// the same line ~100ms after the nudge lands (well inside
+    /// `SEND_SUBMIT_DELAY_MS` = 300ms) and asserts Enter was withheld: the
+    /// accumulated line must still be sitting unsubmitted, not echoed back
+    /// by cat as a completed transcript line (which would happen twice —
+    /// once from the live tty echo of typing, once from cat's own echo of
+    /// what it read — if Enter had wrongly been sent).
+    #[tokio::test]
+    async fn wake_idle_session_withholds_enter_if_typing_starts_during_the_delay() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        run_session_scoped(&["send-keys", "-t", &id, "-l", "❯ "]).await.unwrap();
+        wait_for_pane_contains(&id, "❯").await;
+
+        let id2 = id.clone();
+        let racer = tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            run_session_scoped(&["send-keys", "-t", &id2, "-l", "oops"]).await.unwrap();
+        });
+        wake_idle_session(&id).await.unwrap();
+        racer.await.unwrap();
+        sleep(Duration::from_millis(500)).await; // let any wrongly-sent Enter's effects settle
+
+        let pane = capture_visible_plain(&id).await;
+        let occurrences = pane.lines().filter(|l| l.contains("oops")).count();
+        assert_eq!(
+            occurrences, 1,
+            "the human's typing must never be submitted on our behalf: {pane}"
+        );
+        kill_session(&id).await.unwrap();
+    }
+
+    /// Happy path against a real pane: text lands and the call succeeds —
+    /// the verification pass must not false-positive on a ❯-less pane.
+    #[tokio::test]
+    async fn send_keys_delivers_to_a_plain_pane() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        send_keys(&id, "hello from ninox").await.unwrap();
+        let pane = capture_visible_plain(&id).await;
+        assert!(pane.contains("hello from ninox"), "pane: {pane}");
+        kill_session(&id).await.unwrap();
+    }
+
+    /// Poll until the session's pane shows `needle` — a fixed sleep races
+    /// the login shell `create_session` wraps commands in (a slow profile
+    /// can delay the command past any fixed delay; cf. the first-start
+    /// config races fixed in PR #12).
+    async fn wait_for_pane_contains(id: &str, needle: &str) {
+        for _ in 0..50 {
+            if capture_visible_plain(id).await.contains(needle) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        panic!("pane {id} never showed {needle:?}");
+    }
+
+    /// A message that stays visible at a `❯` prompt after Enter (the
+    /// stuck-paste failure mode) must surface as an error after the
+    /// retries are exhausted, not silently report success.
+    #[tokio::test]
+    async fn send_keys_errors_when_message_stays_stuck_at_a_prompt() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        // `cat > /dev/null` never redraws: the tty echo leaves our text
+        // sitting after the printed ❯ forever, exactly like a stuck paste.
+        create_session(&id, "/tmp", "printf '\\xe2\\x9d\\xaf '; exec cat > /dev/null", &[]).await.unwrap();
+        wait_for_pane_contains(&id, "❯").await;
+        let err = send_keys(&id, "stuck message").await.unwrap_err();
+        assert!(err.to_string().contains("unsubmitted"), "err: {err}");
+        kill_session(&id).await.unwrap();
+    }
+
+    /// The final retry Enter must itself be verified: when it is the one
+    /// that submits the message, send_keys reports success — not "still
+    /// unsubmitted" to a caller who might then re-send and double-deliver.
+    #[tokio::test]
+    async fn send_keys_succeeds_when_the_last_retry_enter_submits() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        // Consumes the message line plus every retry Enter, keeping the
+        // text visibly stuck at the ❯ the whole time, then clears the
+        // pane — i.e. the message is only submitted by the LAST retry.
+        create_session(
+            &id, "/tmp",
+            "printf '\\xe2\\x9d\\xaf '; read a; read b; read c; read d; printf '\\x1b[2J\\x1b[H'; exec sleep 30",
+            &[],
+        ).await.unwrap();
+        wait_for_pane_contains(&id, "❯").await;
+        send_keys(&id, "late message").await.unwrap();
         kill_session(&id).await.unwrap();
     }
 

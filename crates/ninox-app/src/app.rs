@@ -292,6 +292,9 @@ pub enum Message {
     SettingsWorkerModel(String),
     SettingsWorkerCustomModel(String),
     SettingsWorkerCustomCommit,
+    /// Flip the opt-in file-based inbox toggle (`[inbox_messaging].enabled`,
+    /// default off — see `ninox_core::config::InboxMessagingConfig`).
+    SettingsToggleInboxMessaging,
     BrainSelectEntry(String),
     /// The pinboard canvas's hovered node changed (including to/from `None`)
     /// — emitted only on change, never on every mouse move.
@@ -302,6 +305,16 @@ pub enum Message {
     BrainToggleDrawer(String),
     BrainLinkClicked(iced::widget::markdown::Url),
     BrainSwitchCatalogue(usize),
+    /// The background remote freshen kicked off by `BrainSwitchCatalogue`
+    /// resolved: `open_synced` pulled (or confirmed fresh) the catalogue at
+    /// `path` and reopened its index. Dropped if the user has switched away
+    /// from `path` while the pull was in flight.
+    BrainFreshened { path: std::path::PathBuf, brain: Arc<BrainIndex> },
+    /// The async remote-sync + rebuild kicked off by `BrainReindex`
+    /// finished for the catalogue at `path`. `Ok(n)` = entries indexed;
+    /// `Err` = the local rebuild itself failed (remote failures degrade
+    /// inside the task and still arrive here as `Ok`).
+    BrainReindexed { path: std::path::PathBuf, result: Result<usize, String> },
     ToggleNotifications,
     DismissNotification(String),
     DismissAllNotifications,
@@ -321,7 +334,12 @@ pub enum Message {
     VersionCheckResult(Result<Option<String>, String>),
     FleetFilterQuery(String),
     ClearFleetFilter,
-    ScrollTerminal { session_id: SessionId, delta: i32 },
+    /// Scroll a terminal by `delta` lines (positive = up into history).
+    /// `local: false` (wheel) forwards to the PTY when the inner app has
+    /// mouse mode enabled; `local: true` (drag-select auto-scroll) always
+    /// moves ninox's own scrollback so selections can extend into history
+    /// even under a mouse-mode TUI.
+    ScrollTerminal { session_id: SessionId, delta: i32, local: bool },
     JumpToLatest { session_id: SessionId },
     /// A chunk of tmux pane history came back from `capture-pane` for a
     /// scrolled-back terminal.
@@ -519,6 +537,17 @@ impl App {
             .map(|s| (s.id.clone(), s))
             .collect();
 
+        // Comments already fetched by a previous run — grouped by PR so a
+        // restart doesn't blank out the Marginalia feed until the next poll.
+        // `list_comments` already orders by `created_at`, so each group's
+        // insertion order is already the display order.
+        let mut review_threads: HashMap<PrId, Vec<Comment>> = HashMap::new();
+        for comment in engine.store.list_comments().unwrap_or_default() {
+            review_threads.entry(comment.pr_id).or_default().push(comment);
+        }
+
+        // `mut`: the zoom clamp below writes the sanitized value back so
+        // disk and runtime stay in sync.
         let mut config = AppConfig::load().unwrap_or_default();
 
         // First run: seed a complete, editable default theme file so users
@@ -556,7 +585,7 @@ impl App {
             active_catalogue: 0,
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
-            review_threads: HashMap::new(),
+            review_threads,
             diffs:          HashMap::new(),
             notifications:  VecDeque::new(),
             update_in_progress: false,
@@ -626,7 +655,7 @@ impl App {
                         &session.claude_session_id, has_resume_args,
                     );
                     let _ = engine.store.upsert_session(&dead);
-                    engine.emit(CoreEvent::SessionUpdated(dead));
+                    engine.emit(CoreEvent::SessionUpdated(dead, SessionFields::STATUS));
                 }
             }
 
@@ -774,9 +803,10 @@ impl App {
 
     /// Re-derive pinboard edges (node-index pairs into `brain_view.entries`)
     /// from the index's resolved link graph. Called once per data change —
-    /// `NavigateBrain`'s initial load, `BrainReindex`, and
-    /// `BrainSwitchCatalogue` — never per canvas draw. A DB error is
-    /// tolerated: warn and leave the pinboard edge-less rather than panic.
+    /// `NavigateBrain`'s initial load and every `reload_brain_entries`
+    /// (reindex, catalogue switch, background freshen) — never per canvas
+    /// draw. A DB error is tolerated: warn and leave the pinboard edge-less
+    /// rather than panic.
     fn refresh_brain_edges(state: &mut Self) {
         match state.brain.links_all() {
             Ok(links) => {
@@ -794,9 +824,12 @@ impl App {
 
     /// Refetches `backlinks`/`related` for `brain_view.selected` from the
     /// index. No-ops when nothing is selected. Shared by `BrainSelectEntry`
-    /// (fresh selection) and `BrainReindex` (index may have changed under a
-    /// still-selected entry) — markdown handling stays with the select path
-    /// since reindex never changes which entry is selected, only its graph.
+    /// (fresh selection) and the entry-set reload path (index may have
+    /// changed under a still-selected entry). The reading pane's markdown
+    /// is NOT handled here: the select path parses it from the clicked
+    /// entry, and `reload_brain_entries` re-parses it from the re-read
+    /// entry set — since a background pull can change a selected entry's
+    /// body, not just its graph.
     fn refresh_selection_graph(state: &mut Self) {
         let Some(id) = state.brain_view.selected.clone() else {
             return;
@@ -815,6 +848,80 @@ impl App {
                 state.brain_view.related = Vec::new();
             }
         }
+    }
+
+    /// Reload `brain_view.entries` from `state.brain` and re-derive
+    /// everything downstream of the entry set: pinboard edges, ghost-
+    /// selection cleanup, and the selection graph. Shared by
+    /// `BrainSwitchCatalogue` (fresh local open), `BrainReindexed` (async
+    /// rebuild landed), and `BrainFreshened` (background pull landed) so
+    /// all three agree on what "the entry set changed" means.
+    fn reload_brain_entries(state: &mut Self) {
+        // `None`: the GUI brain panel is keyword-only for now — wiring it to the
+        // same embedder the server constructs at startup is a natural follow-up,
+        // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
+        match state.brain.query("", None, QueryFilters::default()) {
+            Ok(entries) => {
+                state.brain_view.entries = entries;
+                Self::refresh_brain_edges(state);
+                // The selected entry may have been renamed or deleted by
+                // whatever changed the entry set — if it no longer resolves,
+                // clear the pane instead of showing a ghost selection.
+                let ghost = state
+                    .brain_view
+                    .selected
+                    .as_ref()
+                    .is_some_and(|id| !state.brain_view.entries.iter().any(|e| &e.id == id));
+                if ghost {
+                    state.brain_view.selected = None;
+                    state.brain_view.markdown = Vec::new();
+                    state.brain_view.backlinks = Vec::new();
+                    state.brain_view.related = Vec::new();
+                } else if let Some(id) = state.brain_view.selected.clone() {
+                    // The entry set was just re-read, and whatever changed
+                    // it (background pull, reindex) may have changed the
+                    // selected entry's BODY too — re-render the reading
+                    // pane from the fresh copy instead of keeping the
+                    // parse from selection time.
+                    if let Some(e) = state.brain_view.entries.iter().find(|e| e.id == id) {
+                        state.brain_view.markdown = iced::widget::markdown::parse(
+                            &crate::components::brain_panel::preprocess_wikilinks(&e.body),
+                        ).collect();
+                    }
+                }
+                Self::refresh_selection_graph(state);
+                state.brain_view.loaded = true;
+            }
+            Err(e) => tracing::error!("brain entries reload: {e}"),
+        }
+    }
+
+    /// Background freshen for a (possibly remote-backed) catalogue — the
+    /// pull-before-read front door the CLI (`open_synced`) and server
+    /// (`freshen`) already use, delivered via `BrainFreshened`. Cheap to
+    /// fire repeatedly: `pull_if_stale` is TTL-gated, and a catalogue with
+    /// no remote degrades to a plain local open. Shared by catalogue
+    /// switch and opening the Brain view.
+    fn freshen_brain_task(config: AppConfig, path: std::path::PathBuf) -> Task<Message> {
+        Task::future(async move {
+            // First open of a config-declared remote catalogue materializes
+            // its .sync.toml — the CLI does this in run_brain; without it a
+            // fresh clone never learns its remote.
+            if let Err(e) = ninox_core::brain_sync::ensure_sync_toml(&config, &path) {
+                tracing::warn!("brain: failed to materialize .sync.toml: {e}");
+            }
+            match ninox_core::brain_sync::open_synced(&path, None).await {
+                Ok(brain) => Message::BrainFreshened { path, brain: Arc::new(brain) },
+                // A hard Err from open_synced means the LOCAL open failed
+                // (remote failures degrade inside it) — a catalogue that
+                // can't open locally has already surfaced its error on the
+                // synchronous path, so drop this one quietly.
+                Err(e) => {
+                    tracing::warn!("brain freshen: {e}");
+                    Message::Noop
+                }
+            }
+        })
     }
 
     /// Shared mutation logic.
@@ -868,7 +975,9 @@ impl App {
                         if let Ok(Some(mut s)) = engine.store.get_session(&id) {
                             s.status = ninox_core::types::SessionStatus::Terminated;
                             let _ = engine.store.upsert_session(&s);
-                            engine.emit(ninox_core::events::Event::SessionUpdated(s));
+                            engine.emit(ninox_core::events::Event::SessionUpdated(
+                                s, ninox_core::types::SessionFields::STATUS,
+                            ));
                         }
                         return Message::Noop;
                     }
@@ -1084,6 +1193,10 @@ impl App {
                 state.config.brain.catalogues.push(ninox_core::config::CatalogueRef {
                     name: name.clone(),
                     path: path.clone(),
+                    remote: None,
+                    endpoint: None,
+                    region: None,
+                    cache_ttl_secs: None,
                 });
                 if let Err(e) = state.config.save() {
                     tracing::warn!("failed to save config after adding catalogue '{name}': {e}");
@@ -1130,6 +1243,10 @@ impl App {
                     .unwrap_or_else(|| ninox_core::config::CatalogueRef {
                         name: "default".to_string(),
                         path: state.config.resolved_brain_path(),
+                        remote: None,
+                        endpoint: None,
+                        region: None,
+                        cache_ttl_secs: None,
                     });
                 let catalogue_path = catalogue.path.to_string_lossy().to_string();
 
@@ -1169,7 +1286,9 @@ impl App {
                                         .and_then(|n| n.to_str())
                                         .unwrap_or(&workspace)
                                         .to_string();
-                                    match crate::spawn_util::create_worktree_at(&root, &ws_path, &branch) {
+                                    match crate::spawn_util::create_worktree_at(
+                                        &root, &ws_path, &branch, state.config.inbox_messaging.enabled,
+                                    ) {
                                         Ok(created) => workspace = created,
                                         Err(e) => {
                                             if let Some(f) = &mut state.spawn_modal {
@@ -1251,7 +1370,7 @@ impl App {
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
                             summary:         None,
-                            terminal_at:         None,
+                            terminal_at:         None, gate_status: None,
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1265,13 +1384,14 @@ impl App {
                         let engine = state.engine.clone();
                         let nm     = name;
                         let ts_i64 = ts as i64;
+                        let inbox_enabled = state.config.inbox_messaging.enabled;
 
                         Task::future(async move {
                             // Isolate the session on its own branch/worktree when
                             // the workspace is a git repo; otherwise work in the
                             // directory itself (same fallback as run_spawn).
                             let effective_ws =
-                                match crate::spawn_util::create_worker_worktree(&workspace, &sid).await {
+                                match crate::spawn_util::create_worker_worktree(&workspace, &sid, inbox_enabled).await {
                                     Ok(path) => path,
                                     Err(e) => {
                                         tracing::warn!(
@@ -1395,7 +1515,7 @@ impl App {
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
                             summary:         None,
-                            terminal_at:         None,
+                            terminal_at:         None, gate_status: None,
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -1548,13 +1668,21 @@ impl App {
                 let repo    = session.repo.clone();
                 let orch_id = session.orchestrator_id.clone();
                 let summary = session.summary.clone();
+                let inbox_enabled = state.config.inbox_messaging.enabled;
                 Task::future(async move {
                     // Ignore kill errors — a Terminated husk has no tmux
                     // session, and Re-file on one "just spawns". The
-                    // respawn upserts the record back to Working with cost
-                    // 0; the usage poller re-ingests real spend from the
-                    // workspace transcript.
+                    // respawn upserts the record back to Working, carrying
+                    // forward accumulated cost/context; the usage poller
+                    // keeps re-ingesting absolute spend from the workspace
+                    // transcript either way.
                     let _ = ninox_core::tmux::kill_session(&id).await;
+                    // Same workspace-restoration guard as Resume below —
+                    // without it a torn-down worktree makes tmux silently
+                    // start the fresh agent in $HOME.
+                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id, is_orch, inbox_enabled).await {
+                        tracing::warn!("re-file {id}: cannot restore workspace: {e}");
+                    }
                     let attach = crate::spawn_util::spawn_interactive_session(
                         engine,
                         crate::spawn_util::InteractiveSpawnParams {
@@ -1607,8 +1735,20 @@ impl App {
                 let repo    = session.repo.clone();
                 let orch_id = session.orchestrator_id.clone();
                 let summary = session.summary.clone();
+                let inbox_enabled = state.config.inbox_messaging.enabled;
                 Task::future(async move {
                     let _ = ninox_core::tmux::kill_session(&id).await;
+                    // The worktree may have been torn down since the session
+                    // ran (merge cleanup, manual prune). Recreate it at the
+                    // same path — claude-code keys the conversation to that
+                    // path, so this is what makes `--resume` find it. On
+                    // failure, fall through: `tmux::create_session` now
+                    // rejects a missing workspace, so the spawn fails
+                    // visibly into `failure_status` instead of the agent
+                    // silently starting in $HOME.
+                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id, is_orch, inbox_enabled).await {
+                        tracing::warn!("resume {id}: cannot restore workspace: {e}");
+                    }
                     let attach = crate::spawn_util::spawn_interactive_session(
                         engine,
                         crate::spawn_util::InteractiveSpawnParams {
@@ -1912,7 +2052,13 @@ impl App {
                     }
                 }
                 state.view = View::Brain;
-                Task::none()
+                // Opening the view freshens the ACTIVE catalogue in the
+                // background — switch and reindex got this in the remote-
+                // brains follow-up, but the default catalogue (never
+                // switched to) otherwise only freshens when something hits
+                // the in-process server, so its first Brain visit showed
+                // the local snapshot.
+                Self::freshen_brain_task(state.config.clone(), state.brain.path().to_path_buf())
             }
 
             Message::NavigateSettings => {
@@ -1989,6 +2135,14 @@ impl App {
                 Task::none()
             }
 
+            Message::SettingsToggleInboxMessaging => {
+                state.config.inbox_messaging.enabled = !state.config.inbox_messaging.enabled;
+                if let Err(e) = state.config.save() {
+                    tracing::warn!("failed to save config after toggling inbox messaging: {e}");
+                }
+                Task::none()
+            }
+
             Message::BrainSelectEntry(id) => {
                 if let Some(e) = state.brain_view.entries.iter().find(|e| e.id == id) {
                     state.brain_view.markdown = iced::widget::markdown::parse(
@@ -2013,39 +2167,57 @@ impl App {
             }
 
             Message::BrainReindex => {
-                // `None`: the GUI brain panel is keyword-only for now — wiring it to the
-                // same embedder the server constructs at startup is a natural follow-up,
-                // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
-                match state.brain.rebuild(None) {
-                    Ok(stats) => {
-                        tracing::info!("brain reindexed: {} entries", stats.indexed);
-                        // `None`: the GUI brain panel is keyword-only for now — wiring it to the
-                        // same embedder the server constructs at startup is a natural follow-up,
-                        // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
-                        match state.brain.query("", None, QueryFilters::default()) {
-                            Ok(entries) => {
-                                state.brain_view.entries = entries;
-                                Self::refresh_brain_edges(state);
-                                // The selected entry may have been renamed or
-                                // deleted by whatever triggered the reindex —
-                                // if it no longer resolves, clear the pane
-                                // instead of showing a ghost selection.
-                                let ghost = state
-                                    .brain_view
-                                    .selected
-                                    .as_ref()
-                                    .is_some_and(|id| !state.brain_view.entries.iter().any(|e| &e.id == id));
-                                if ghost {
-                                    state.brain_view.selected = None;
-                                    state.brain_view.markdown = Vec::new();
-                                    state.brain_view.backlinks = Vec::new();
-                                    state.brain_view.related = Vec::new();
-                                }
-                                Self::refresh_selection_graph(state);
+                // Freshen from the remote BEFORE rebuilding, matching the
+                // CLI's `ninox brain index` (sync → rebuild) and the server's
+                // POST /index — previously this button rebuilt local-only, so
+                // teammates' pushes stayed invisible to the GUI. Runs as a
+                // Task so the network wait never blocks the UI thread;
+                // completion (and the entry reload) lands via
+                // `BrainReindexed`. A brain with no remote skips straight to
+                // the rebuild, behaving exactly as before.
+                let brain = state.brain.clone();
+                let config = state.config.clone();
+                let path = state.brain.path().to_path_buf();
+                Task::future(async move {
+                    // First open of a config-declared remote catalogue
+                    // materializes its .sync.toml (a local-fs write only) —
+                    // the CLI does this in run_brain; without it a freshly
+                    // cloned catalogue never learns its remote.
+                    if let Err(e) = ninox_core::brain_sync::ensure_sync_toml(&config, &path) {
+                        tracing::warn!("brain: failed to materialize .sync.toml: {e}");
+                    }
+                    // Full sync (pull → resolve → push), not just
+                    // pull_if_stale: reindex is the GUI's explicit "get in
+                    // sync" gesture, same contract as the CLI Index action.
+                    // Any remote failure degrades to local-only reindexing.
+                    match ninox_core::brain_sync::BrainSync::for_brain(&path).await {
+                        Ok(None) => {}
+                        Ok(Some(sync)) => {
+                            if let Err(e) = sync.sync().await {
+                                tracing::warn!("brain sync failed (continuing with local reindex): {e}");
                             }
-                            Err(e) => tracing::error!("brain query after reindex: {e}"),
                         }
-                        state.brain_view.loaded = true;
+                        Err(e) => tracing::warn!("brain remote unavailable (continuing local-only): {e}"),
+                    }
+                    // `None`: the GUI brain panel is keyword-only for now — wiring it to the
+                    // same embedder the server constructs at startup is a natural follow-up,
+                    // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
+                    let result = brain.rebuild(None).map(|s| s.indexed).map_err(|e| e.to_string());
+                    Message::BrainReindexed { path, result }
+                })
+            }
+
+            Message::BrainReindexed { path, result } => {
+                // Race guard: the user may have switched catalogues while the
+                // sync + rebuild ran — the rebuilt index belongs to the old
+                // catalogue, so leave the current view alone.
+                if state.brain.path() != path.as_path() {
+                    return Task::none();
+                }
+                match result {
+                    Ok(indexed) => {
+                        tracing::info!("brain reindexed: {indexed} entries");
+                        Self::reload_brain_entries(state);
                     }
                     Err(e) => tracing::error!("brain rebuild: {e}"),
                 }
@@ -2103,20 +2275,34 @@ impl App {
                             state.brain_view.related.clear();
                             state.brain_view.edges.clear();
                             state.brain_view.loaded = false;
-                            // `None`: the GUI brain panel is keyword-only for now — wiring it to the
-                            // same embedder the server constructs at startup is a natural follow-up,
-                            // deliberately out of scope for the CLI/HTTP-focused semantic search spec.
-                            match state.brain.query("", None, QueryFilters::default()) {
-                                Ok(entries) => {
-                                    state.brain_view.entries = entries;
-                                    state.brain_view.loaded = true;
-                                    Self::refresh_brain_edges(state);
-                                }
-                                Err(e) => tracing::error!("brain query after catalogue switch: {e}"),
-                            }
+                            Self::reload_brain_entries(state);
+                            // The local open above keeps the switch instant;
+                            // a remote-backed catalogue then freshens in the
+                            // background (read-safe pull_if_stale + rebuild,
+                            // the same front door as the CLI's query/show)
+                            // and lands via `BrainFreshened` — previously the
+                            // GUI never pulled on switch at all, so
+                            // teammates' pushes stayed invisible until a
+                            // CLI/server touch on the same directory.
+                            return Self::freshen_brain_task(
+                                state.config.clone(), cat.path.clone(),
+                            );
                         }
                         Err(e) => tracing::warn!("open catalogue '{}': {e}", cat.name),
                     }
+                }
+                Task::none()
+            }
+
+            Message::BrainFreshened { path, brain } => {
+                // Race guard: the pull ran in the background, so apply the
+                // fresh index only if the user is still on this catalogue.
+                // Comparing against the ACTIVE brain's path (swapped on every
+                // switch) means A→B→A while A's pull was in flight still
+                // matches — and that fresh A index is exactly what we want.
+                if state.brain.path() == path.as_path() {
+                    state.brain = brain;
+                    Self::reload_brain_entries(state);
                 }
                 Task::none()
             }
@@ -2229,10 +2415,10 @@ impl App {
                 Task::none()
             }
 
-            Message::ScrollTerminal { session_id, delta } => {
+            Message::ScrollTerminal { session_id, delta, local } => {
                 if let Some(term) = state.terminals.get_mut(&session_id) {
                     let mode = *term.term.mode();
-                    if let Some(bytes) = crate::input::encode_wheel(delta, 0, 0, &mode) {
+                    if let Some(bytes) = crate::input::scroll_pty_bytes(local, delta, &mode) {
                         if let Some(client) = state.clients.get(&session_id) {
                             for _ in 0..delta.unsigned_abs() { client.write(bytes.clone()); }
                         }
@@ -2322,8 +2508,11 @@ impl App {
                 Task::none()
             }
 
-            Event::SessionUpdated(session) => {
-                state.sessions.insert(session.id.clone(), session);
+            Event::SessionUpdated(incoming, fields) => {
+                match state.sessions.get_mut(&incoming.id) {
+                    Some(existing) => existing.merge_from(&incoming, fields),
+                    None => { state.sessions.insert(incoming.id.clone(), incoming); }
+                }
                 Task::none()
             }
 
@@ -2414,10 +2603,15 @@ impl App {
             }
 
             Event::ReviewComment { pr_id, comment } => {
-                state.review_threads
-                    .entry(pr_id)
-                    .or_default()
-                    .push(comment);
+                let thread = state.review_threads.entry(pr_id).or_default();
+                // The poller re-emits on every poll that still sees a comment
+                // in its GitHub response (only *new* ids are skipped there);
+                // guard here too so a repeated emit doesn't duplicate the
+                // in-memory feed the way it would upsert-replace the DB row.
+                if !thread.iter().any(|c| c.id == comment.id) {
+                    thread.push(comment);
+                    thread.sort_by_key(|c| c.created_at);
+                }
                 Task::none()
             }
 
@@ -2437,6 +2631,19 @@ impl App {
         let title = n.title.clone();
         let body = n.body.clone();
         std::thread::spawn(move || {
+            // Pin the sending application before the first notification:
+            // notify-rust's macOS backend otherwise resolves the sender
+            // lazily via the AppleScript `get id of application
+            // "use_default"`, and macOS answers an unknown app name with a
+            // blocking "Where is use_default?" application picker.
+            #[cfg(target_os = "macos")]
+            {
+                static PIN_SENDER: std::sync::Once = std::sync::Once::new();
+                PIN_SENDER.call_once(|| {
+                    let exe = std::env::current_exe().unwrap_or_default();
+                    let _ = notify_rust::set_application(notification_sender_bundle_id(&exe));
+                });
+            }
             let _ = notify_rust::Notification::new()
                 .summary(&title)
                 .body(&body)
@@ -2513,19 +2720,78 @@ impl App {
             base
         }
     }
+}
 
+/// Pull one `Event` off `rx`, merging any `ClientOutput` chunks already
+/// sitting in the channel for the same client generation into it.
+/// `pending` carries a lookahead event across calls: a `try_recv` that
+/// turns out not to match can't be put back on the channel, so it's
+/// stashed here and returned as-is on the following call instead of being
+/// dropped or clobbering the event already in hand.
+///
+/// The PTY reader thread (`AttachedClient::spawn`) emits one `ClientOutput`
+/// per raw `read()`, capped at 8KB — a single full-screen repaint (a tmux
+/// status refresh, a busy TUI redrawing) routinely arrives as many of these
+/// back-to-back. Rendering each as its own frame is what surfaces as a
+/// flickering, "darting" cursor mid-repaint: the view briefly shows the
+/// cursor at each intermediate position the repaint passes through instead
+/// of settling directly on the final one. This only merges chunks that are
+/// already buffered by the time we look — it never waits for more to
+/// arrive, so it adds no latency to genuinely paced output (e.g. a spinner).
+/// Chunks from a different generation are never merged together, matching
+/// the same stale-vs-current-client distinction `ClientOutput`'s handler
+/// already relies on elsewhere.
+async fn next_coalesced_event(
+    rx: &mut broadcast::Receiver<Event>,
+    pending: &mut Option<Event>,
+) -> Option<Event> {
+    let event = if let Some(event) = pending.take() {
+        event
+    } else {
+        loop {
+            match rx.recv().await {
+                Ok(event) => break event,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    };
+
+    // Extend `bytes` in place rather than re-cloning the merged-so-far
+    // buffer on every iteration — a bursty repaint can queue dozens of
+    // chunks, and cloning each time would copy O(chunks²) bytes instead
+    // of O(total bytes).
+    let Event::ClientOutput { session_id, generation, mut bytes } = event else {
+        return Some(event);
+    };
+    loop {
+        match rx.try_recv() {
+            Ok(Event::ClientOutput { session_id: sid2, generation: gen2, bytes: more })
+                if sid2 == session_id && gen2 == generation =>
+            {
+                bytes.extend(more);
+            }
+            Ok(other) => {
+                *pending = Some(other);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+
+    Some(Event::ClientOutput { session_id, generation, bytes })
+}
+
+impl App {
     /// Subscription that drives `Message::EngineEvent` from the engine broadcast channel.
     pub fn subscription(state: &Self) -> Subscription<Message> {
         let mut rx: broadcast::Receiver<Event> = state.engine.subscribe();
+        let mut pending: Option<Event> = None;
         let engine_sub = Subscription::run_with_id(
             "engine-events",
             async_stream::stream! {
-                loop {
-                    match rx.recv().await {
-                        Ok(event)  => yield Message::EngineEvent(Box::new(event)),
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed)    => break,
-                    }
+                while let Some(event) = next_coalesced_event(&mut rx, &mut pending).await {
+                    yield Message::EngineEvent(Box::new(event));
                 }
             },
         );
@@ -2897,6 +3163,20 @@ process.exit(0);
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Bundle identifier notifications are attributed to. Running from inside
+/// Ninox.app, use our own identifier (must match `[package.metadata.bundle]
+/// identifier` in Cargo.toml); from a bare binary, borrow Terminal's — it
+/// always exists, whereas an identifier unknown to Launch Services makes
+/// notifications silently drop.
+#[cfg(target_os = "macos")]
+fn notification_sender_bundle_id(exe: &std::path::Path) -> &'static str {
+    if exe.components().any(|c| c.as_os_str() == "Ninox.app") {
+        "com.madebymoonlight.ninox"
+    } else {
+        "com.apple.Terminal"
+    }
+}
+
 #[cfg(test)]
 impl App {
     pub fn update(self, message: Message) -> (Self, Task<Message>) {
@@ -2912,6 +3192,59 @@ mod tests {
     use ninox_core::{events::Engine, store::Store};
     use tempfile::tempdir;
 
+    #[tokio::test]
+    async fn coalesces_buffered_client_output_for_the_same_generation() {
+        // Send three chunks before ever polling — all three are already
+        // sitting in the channel by the time `next_coalesced_event` looks,
+        // so one call must return them merged into a single event rather
+        // than requiring three separate (and three separately rendered)
+        // frames.
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut pending = None;
+        tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"foo".to_vec() }).unwrap();
+        tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"bar".to_vec() }).unwrap();
+        tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"baz".to_vec() }).unwrap();
+
+        match next_coalesced_event(&mut rx, &mut pending).await {
+            Some(Event::ClientOutput { bytes, .. }) => assert_eq!(bytes, b"foobarbaz".to_vec()),
+            other => panic!("expected merged ClientOutput, got {other:?}"),
+        }
+
+        drop(tx);
+        assert!(next_coalesced_event(&mut rx, &mut pending).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn does_not_merge_client_output_across_different_generations() {
+        // A stale client's trailing output must never be glued onto a
+        // fresh client's — same reasoning as the `current != Some(generation)`
+        // guard in the `ClientOutput` handler.
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut pending = None;
+        tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"old".to_vec() }).unwrap();
+        tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 2, bytes: b"new".to_vec() }).unwrap();
+
+        let first = next_coalesced_event(&mut rx, &mut pending).await.unwrap();
+        assert!(matches!(&first, Event::ClientOutput { generation: 1, bytes, .. } if bytes == b"old"));
+
+        let second = next_coalesced_event(&mut rx, &mut pending).await.unwrap();
+        assert!(matches!(&second, Event::ClientOutput { generation: 2, bytes, .. } if bytes == b"new"));
+    }
+
+    #[tokio::test]
+    async fn does_not_merge_client_output_across_different_sessions() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut pending = None;
+        tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"a".to_vec() }).unwrap();
+        tx.send(Event::ClientOutput { session_id: "s2".into(), generation: 1, bytes: b"b".to_vec() }).unwrap();
+
+        let first = next_coalesced_event(&mut rx, &mut pending).await.unwrap();
+        assert!(matches!(&first, Event::ClientOutput { session_id, bytes, .. } if session_id == "s1" && bytes == b"a"));
+
+        let second = next_coalesced_event(&mut rx, &mut pending).await.unwrap();
+        assert!(matches!(&second, Event::ClientOutput { session_id, bytes, .. } if session_id == "s2" && bytes == b"b"));
+    }
+
     fn pr_session(pr_number: Option<u64>, pr_id: Option<i64>, repo: &str) -> Session {
         Session {
             id: "s1".into(), orchestrator_id: None, name: "w".into(),
@@ -2922,8 +3255,24 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn notification_sender_is_ninox_when_bundled_else_terminal() {
+        use std::path::Path;
+        assert_eq!(
+            notification_sender_bundle_id(Path::new(
+                "/Applications/Ninox.app/Contents/MacOS/ninox-app"
+            )),
+            "com.madebymoonlight.ninox",
+        );
+        assert_eq!(
+            notification_sender_bundle_id(Path::new("/Users/me/ninox/target/debug/ninox")),
+            "com.apple.Terminal",
+        );
     }
 
     #[test]
@@ -3017,6 +3366,10 @@ mod tests {
             catalogues:      vec![ninox_core::config::CatalogueRef {
                 name: "default".to_string(),
                 path: std::path::PathBuf::new(),
+                remote: None,
+                endpoint: None,
+                region: None,
+                cache_ttl_secs: None,
             }],
             active_catalogue: 0,
             prs:            HashMap::new(),
@@ -3061,7 +3414,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         }
     }
 
@@ -3291,10 +3644,57 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         let (updated, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         assert!(updated.sessions.contains_key("s1"));
+    }
+
+    /// Two producers racing `SessionUpdated` for the same session must merge
+    /// their flagged fields rather than one wholesale-replacing the other's
+    /// work — a stale rebroadcast (e.g. a poller tick that read the row
+    /// before another actor's write landed) must not stomp fields it isn't
+    /// flagged to own.
+    #[test]
+    fn session_updated_merges_instead_of_replacing() {
+        let e = test_engine();
+        let mut app = base(e);
+        let mut session = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r1".into(), status: SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None,
+        };
+        let (updated, _) = app.update(Message::EngineEvent(Box::new(
+            Event::SessionSpawned(session.clone()),
+        )));
+        app = updated;
+
+        // Actor A: authoritative for PR_LINK + STATUS, from a fresh read.
+        session.status = SessionStatus::PrOpen;
+        session.pr_number = Some(7);
+        let (after_a, _) = app.update(Message::EngineEvent(Box::new(
+            Event::SessionUpdated(session.clone(), SessionFields::STATUS | SessionFields::PR_LINK),
+        )));
+        app = after_a;
+
+        // Actor B: authoritative for COST only, from a *stale* read that
+        // still has pr_number: None — must not stomp A's PR_LINK write.
+        let mut stale = session.clone();
+        stale.pr_number = None;
+        stale.status = SessionStatus::Working;
+        stale.cost_usd = 3.25;
+        let (after_b, _) = app.update(Message::EngineEvent(Box::new(
+            Event::SessionUpdated(stale, SessionFields::COST),
+        )));
+
+        let final_session = after_b.sessions.get("s1").unwrap();
+        assert_eq!(final_session.cost_usd, 3.25, "B's flagged field must apply");
+        assert_eq!(final_session.pr_number, Some(7), "A's pr_number must survive B's stale rebroadcast");
+        assert!(matches!(final_session.status, SessionStatus::PrOpen), "A's status must survive B's stale rebroadcast");
     }
 
     /// An agent that accidentally opens a second PR must not have it
@@ -3403,7 +3803,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;
@@ -3453,7 +3853,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         }).unwrap();
         let engine = Engine::new(store);
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
@@ -3478,7 +3878,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = m2;
@@ -3517,7 +3917,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: Some(0),
+            terminal_at: Some(0), gate_status: None,
         };
         let _ = m.engine.store.upsert_session(&worker);
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(worker))));
@@ -3570,7 +3970,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         });
 
         let (next, _) = m.update(Message::PollSessions);
@@ -3594,7 +3994,7 @@ mod tests {
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
-            claude_session_id: None, summary: None, terminal_at: Some(0),
+            claude_session_id: None, summary: None, terminal_at: Some(0), gate_status: None,
         };
         let _ = m.engine.store.upsert_session(&s);
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -3631,7 +4031,7 @@ mod tests {
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
-            claude_session_id: None, summary: None, terminal_at: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorSpawned(o))));
         m = m2;
@@ -3732,8 +4132,21 @@ mod tests {
         assert_eq!(m2.brain_view.filter, "rust");
     }
 
-    #[test]
-    fn brain_reindex_reloads_entries_from_disk() {
+    /// Drive a `Task::future` to its single output `Message` — the async
+    /// handlers (reindex, catalogue freshen) deliver their results through
+    /// a follow-up message rather than mutating state directly.
+    async fn output_of(task: Task<Message>) -> Message {
+        use futures::StreamExt;
+        let mut stream = iced_runtime::task::into_stream(task)
+            .expect("expected a real Task, not Task::none()");
+        match stream.next().await {
+            Some(iced_runtime::Action::Output(msg)) => msg,
+            _ => panic!("Task must yield exactly one Action::Output"),
+        }
+    }
+
+    #[tokio::test]
+    async fn brain_reindex_reloads_entries_from_disk() {
         let brain_dir = tempdir().unwrap().keep();
         let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
 
@@ -3746,9 +4159,33 @@ mod tests {
         std::fs::create_dir_all(brain_dir.join("repos")).unwrap();
         std::fs::write(brain_dir.join("repos").join("ninox.md"), "Ninox repo notes.").unwrap();
 
-        let (m3, _) = m2.update(Message::BrainReindex);
+        // Reindex runs sync + rebuild in a Task (no remote here, so the sync
+        // step is a no-op) and reloads entries when `BrainReindexed` lands.
+        let (m3, task) = m2.update(Message::BrainReindex);
+        let done = output_of(task).await;
+        assert!(
+            matches!(&done, Message::BrainReindexed { result: Ok(1), .. }),
+            "expected BrainReindexed with 1 indexed entry, got {done:?}"
+        );
+        let (m3, _) = m3.update(done);
         assert_eq!(m3.brain_view.entries.len(), 1);
         assert_eq!(m3.brain_view.entries[0].id, "repos/ninox.md");
+    }
+
+    #[test]
+    fn stale_brain_reindexed_for_a_switched_away_catalogue_is_ignored() {
+        // The rebuild belongs to whatever brain was active when BrainReindex
+        // fired; if the user switched catalogues while it ran, its completion
+        // must not reload the (unrelated) current catalogue's view.
+        let e = test_engine();
+        let m = base(e);
+        let other = tempdir().unwrap().keep();
+        let (m2, _) = m.update(Message::BrainReindexed { path: other, result: Ok(5) });
+        assert!(
+            !m2.brain_view.loaded,
+            "a completion for a no-longer-active catalogue must be dropped, not applied"
+        );
+        assert!(m2.brain_view.entries.is_empty());
     }
 
     #[test]
@@ -3810,8 +4247,8 @@ mod tests {
         let e = test_engine();
         let mut app = base_with_brain(e, brain_a);
         app.catalogues = vec![
-            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone() },
-            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone() },
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
         ];
         let (app, _) = app.update(Message::NavigateBrain);
         let (app, _) = app.update(Message::BrainSelectEntry("symbols/a.md".into()));
@@ -3827,6 +4264,110 @@ mod tests {
         assert!(app.brain_view.open_drawers.is_empty());
         assert_eq!(app.brain_view.entries.len(), 1);
         assert_eq!(app.brain_view.entries[0].id, "concepts/b.md");
+    }
+
+    #[tokio::test]
+    async fn opening_the_brain_view_freshens_the_active_catalogue() {
+        // Switch and reindex freshen, but the DEFAULT catalogue is never
+        // switched to — without a freshen on NavigateBrain its first visit
+        // shows whatever local snapshot the last CLI/server touch left.
+        let dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir.join("concepts")).unwrap();
+        std::fs::write(dir.join("concepts").join("a.md"), "a body").unwrap();
+        BrainIndex::open(&dir).unwrap().rebuild(None).unwrap();
+
+        let e = test_engine();
+        let app = base_with_brain(e, Arc::new(BrainIndex::open(&dir).unwrap()));
+
+        let (app, task) = app.update(Message::NavigateBrain);
+        assert!(matches!(app.view, View::Brain));
+        let freshened = output_of(task).await;
+        assert!(
+            matches!(&freshened, Message::BrainFreshened { path, .. } if path == &dir),
+            "opening the Brain view must kick off a background freshen for the active catalogue, got {freshened:?}"
+        );
+        let (app, _) = app.update(freshened);
+        assert!(app.brain_view.loaded);
+        assert_eq!(app.brain_view.entries.len(), 1);
+        assert_eq!(app.brain_view.entries[0].id, "concepts/a.md");
+    }
+
+    #[tokio::test]
+    async fn switching_catalogue_freshens_in_the_background() {
+        // The switch itself is synchronous (instant UI on the local copy),
+        // but it must ALSO return a Task that re-opens the catalogue through
+        // `open_synced` — the pull-before-read front door the CLI and server
+        // already use. Without a remote configured, open_synced degrades to
+        // a plain local open, so the whole flow is exercisable offline.
+        let dir_a = tempdir().unwrap().keep();
+        let dir_b = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_b.join("concepts")).unwrap();
+        std::fs::write(dir_b.join("concepts").join("b.md"), "b body").unwrap();
+        BrainIndex::open(&dir_b).unwrap().rebuild(None).unwrap();
+
+        let e = test_engine();
+        let mut app = base_with_brain(e, Arc::new(BrainIndex::open(&dir_a).unwrap()));
+        app.catalogues = vec![
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+        ];
+
+        let (app, task) = app.update(Message::BrainSwitchCatalogue(1));
+        let freshened = output_of(task).await;
+        assert!(
+            matches!(&freshened, Message::BrainFreshened { path, .. } if path == &dir_b),
+            "switch must kick off a background freshen for the target catalogue, got {freshened:?}"
+        );
+        let (app, _) = app.update(freshened);
+        assert_eq!(app.active_catalogue, 1);
+        assert!(app.brain_view.loaded);
+        assert_eq!(app.brain_view.entries.len(), 1);
+        assert_eq!(app.brain_view.entries[0].id, "concepts/b.md");
+    }
+
+    #[test]
+    fn brain_freshened_for_the_active_catalogue_swaps_the_index_and_reloads() {
+        let dir = tempdir().unwrap().keep();
+        let e = test_engine();
+        let mut app = base_with_brain(e, Arc::new(BrainIndex::open(&dir).unwrap()));
+        app.catalogues[0].path = dir.clone();
+        let (app, _) = app.update(Message::NavigateBrain);
+        assert!(app.brain_view.entries.is_empty());
+
+        // The background pull landed new entries and rebuilt the index —
+        // simulate its delivery with a fresh index over the same directory.
+        std::fs::create_dir_all(dir.join("repos")).unwrap();
+        std::fs::write(dir.join("repos").join("pulled.md"), "pulled from remote").unwrap();
+        let fresh = Arc::new(BrainIndex::open(&dir).unwrap());
+        fresh.rebuild(None).unwrap();
+
+        let (app, _) = app.update(Message::BrainFreshened { path: dir, brain: fresh.clone() });
+        assert!(Arc::ptr_eq(&app.brain, &fresh), "the freshened index must replace the active one");
+        assert_eq!(app.brain_view.entries.len(), 1);
+        assert_eq!(app.brain_view.entries[0].id, "repos/pulled.md");
+    }
+
+    #[test]
+    fn stale_brain_freshened_for_a_switched_away_catalogue_is_ignored() {
+        // The user switched again while the pull was in flight — the late
+        // result belongs to a catalogue that's no longer on screen and must
+        // not clobber the one that is.
+        let dir_a = tempdir().unwrap().keep();
+        let dir_b = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_b.join("concepts")).unwrap();
+        std::fs::write(dir_b.join("concepts").join("b.md"), "b body").unwrap();
+        let stale = Arc::new(BrainIndex::open(&dir_b).unwrap());
+        stale.rebuild(None).unwrap();
+
+        let e = test_engine();
+        let active = Arc::new(BrainIndex::open(&dir_a).unwrap());
+        let mut app = base_with_brain(e, active.clone());
+        app.catalogues[0].path = dir_a.clone();
+        let (app, _) = app.update(Message::NavigateBrain);
+
+        let (app, _) = app.update(Message::BrainFreshened { path: dir_b, brain: stale });
+        assert!(Arc::ptr_eq(&app.brain, &active), "a stale freshen must not replace the active index");
+        assert!(app.brain_view.entries.is_empty(), "dir_b's entries must not leak into dir_a's view");
     }
 
     #[test]
@@ -3891,8 +4432,50 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reindex_refreshes_backlinks_and_related_for_the_selected_entry() {
+    #[tokio::test]
+    async fn reindex_rerenders_the_reading_pane_for_the_selected_entry() {
+        // The reading pane parsed markdown at selection time and kept it
+        // through entry-set reloads — fine when only the graph could change
+        // underneath a selection, wrong once background pulls can change
+        // the selected entry's body itself.
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("concepts")).unwrap();
+        std::fs::write(
+            brain_dir.join("concepts").join("a.md"),
+            "---\nname: a\n---\none paragraph",
+        )
+        .unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild(None).unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m2, _) = m.update(Message::NavigateBrain);
+        let (m3, _) = m2.update(Message::BrainSelectEntry("concepts/a.md".into()));
+        let blocks_before = m3.brain_view.markdown.len();
+        assert!(blocks_before > 0, "sanity: selection rendered something");
+
+        // The entry's body changes on disk (e.g. a teammate's pull landing)
+        // while it stays selected.
+        std::fs::write(
+            brain_dir.join("concepts").join("a.md"),
+            "---\nname: a\n---\nfirst paragraph\n\nsecond paragraph\n\nthird paragraph",
+        )
+        .unwrap();
+
+        let (m4, task) = m3.update(Message::BrainReindex);
+        let (m4, _) = m4.update(output_of(task).await);
+        assert_eq!(m4.brain_view.selected.as_deref(), Some("concepts/a.md"));
+        assert!(
+            m4.brain_view.markdown.len() > blocks_before,
+            "the reading pane must re-render from the re-read body ({} blocks) instead of \
+             keeping the selection-time parse ({} blocks)",
+            m4.brain_view.markdown.len(), blocks_before,
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_refreshes_backlinks_and_related_for_the_selected_entry() {
         // BrainReindex used to refetch entries + edges but leave the reading
         // pane's backlinks/related as stale snapshots from selection time --
         // if the on-disk citation graph changed underneath the selection,
@@ -3929,7 +4512,8 @@ mod tests {
         // reindex rather than the stale selection-time snapshot.
         std::fs::remove_file(brain_dir.join("people").join("bob.md")).unwrap();
 
-        let (m4, _) = m3.update(Message::BrainReindex);
+        let (m4, task) = m3.update(Message::BrainReindex);
+        let (m4, _) = m4.update(output_of(task).await);
         assert_eq!(m4.brain_view.selected.as_deref(), Some("people/alice.md"));
         assert!(
             m4.brain_view.backlinks.is_empty(),
@@ -3943,8 +4527,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reindex_clears_selection_if_the_selected_entry_disappears() {
+    #[tokio::test]
+    async fn reindex_clears_selection_if_the_selected_entry_disappears() {
         // If the selected entry's file is deleted (or renamed) before a
         // reindex, `selected` must be cleared so the reading pane falls back
         // to its empty state instead of showing a ghost entry with stale
@@ -3974,7 +4558,8 @@ mod tests {
 
         std::fs::remove_file(brain_dir.join("people").join("alice.md")).unwrap();
 
-        let (m4, _) = m3.update(Message::BrainReindex);
+        let (m4, task) = m3.update(Message::BrainReindex);
+        let (m4, _) = m4.update(output_of(task).await);
         assert_eq!(
             m4.brain_view.selected, None,
             "selection must be cleared once the selected entry no longer resolves"
@@ -4002,8 +4587,8 @@ mod tests {
         let e = test_engine();
         let mut app = base_with_brain(e, brain_a);
         app.catalogues = vec![
-            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone() },
-            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone() },
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
         ];
         let (app, _) = app.update(Message::NavigateBrain);
         assert_eq!(
@@ -4063,7 +4648,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -4084,7 +4669,7 @@ mod tests {
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
-            claude_session_id: None, summary: None, terminal_at: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -4129,7 +4714,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -4183,7 +4768,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         // NavigateSession defaults to the Split panel, so switch to Terminal
@@ -4232,7 +4817,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -4315,7 +4900,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m, _) = m.update(Message::NavigateSession("s1".into()));
@@ -4369,7 +4954,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -4461,7 +5046,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -5151,7 +5736,7 @@ mod tests {
         // Pre-create the branch (and worktree), then remove just the
         // worktree registration so the path is missing again but the
         // branch survives — exercising the "already exists" fallback.
-        crate::spawn_util::create_worktree_at(&repo, &missing, "feat-existing").unwrap();
+        crate::spawn_util::create_worktree_at(&repo, &missing, "feat-existing", false).unwrap();
         std::process::Command::new("git")
             .args(["-C", &repo.to_string_lossy(), "worktree", "remove", "--force", &missing_str])
             .output()
@@ -5192,7 +5777,7 @@ mod tests {
         // same repo, so `create_worktree_at`'s fallback (checkout without
         // `-b`) fails too — a real git error create_worktree_at can surface.
         let repo = init_git_repo();
-        crate::spawn_util::create_worktree_at(&repo, &repo.join("first"), "dup-branch").unwrap();
+        crate::spawn_util::create_worktree_at(&repo, &repo.join("first"), "dup-branch", false).unwrap();
         let missing = repo.join(".claude").join("worktrees").join("dup-branch");
         let missing_str = missing.to_string_lossy().to_string();
 
@@ -5343,7 +5928,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None,
+            terminal_at: None, gate_status: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;

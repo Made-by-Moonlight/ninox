@@ -97,7 +97,12 @@ fn pr_row<'a>(app: &'a App, pr: &'a PR) -> Element<'a, Message> {
             .clip(true),
             container(
                 row![
-                    status_dot(session_color),
+                    match session {
+                        Some(se) => crate::components::lifecycle_status::with_gate_tooltip(
+                            s, se, status_dot(session_color),
+                        ),
+                        None => status_dot(session_color),
+                    },
                     Space::new(7, 0),
                     text(session_name).size(11.5).font(SANS).color(s.ink_2),
                 ]

@@ -28,7 +28,7 @@ fn event_to_json(event: &Event) -> Option<String> {
     let v = match event {
         Event::OrchestratorSpawned(o) => serde_json::json!({"type": "orchestrator_spawned", "payload": o}),
         Event::OrchestratorRemoved(id) => serde_json::json!({"type": "orchestrator_removed", "payload": {"id": id}}),
-        Event::SessionUpdated(s) => serde_json::json!({"type": "session_updated", "payload": s}),
+        Event::SessionUpdated(s, _fields) => serde_json::json!({"type": "session_updated", "payload": s}),
         Event::SessionSpawned(s) => serde_json::json!({"type": "worker_spawned", "payload": s}),
         Event::SessionDone(id) => {
             serde_json::json!({"type": "worker_done", "payload": {"session_id": id}})

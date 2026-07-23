@@ -52,6 +52,15 @@ pub struct BrainIndex {
     brain_path: PathBuf,
 }
 
+// Manual impl because the GUI's `Message` enum derives `Debug` and carries
+// an `Arc<BrainIndex>` (background freshen results); the SQLite connection
+// has no useful debug form, so show only the identifying path.
+impl std::fmt::Debug for BrainIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrainIndex").field("brain_path", &self.brain_path).finish_non_exhaustive()
+    }
+}
+
 impl BrainIndex {
     pub fn open(brain_path: impl AsRef<Path>) -> Result<Self> {
         let brain_path = brain_path.as_ref().to_path_buf();
@@ -61,7 +70,14 @@ impl BrainIndex {
         let conn = Connection::open(&db_path)
             .with_context(|| format!("open brain db {db_path:?}"))?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
+            // busy_timeout: the GUI's background freshen/reindex, the
+            // in-process server's per-read freshen, and CLI invocations can
+            // rebuild through *separate connections* to this DB; without a
+            // timeout the losing writer fails SQLITE_BUSY instantly instead
+            // of waiting out the other's transaction (same setting as
+            // store.rs).
+            "PRAGMA busy_timeout=5000;
+             PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS entries (
                  id      TEXT PRIMARY KEY,
                  type    TEXT NOT NULL,
@@ -96,6 +112,11 @@ impl BrainIndex {
         )?;
         ensure_gitignore(&brain_path)?;
         Ok(Self { conn: Mutex::new(conn), brain_path })
+    }
+
+    /// The brain directory this index was opened on.
+    pub fn path(&self) -> &Path {
+        &self.brain_path
     }
 
     /// Walk the brain directory, parse markdown files, and repopulate the
@@ -701,17 +722,23 @@ fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<BrainEntry> {
     })
 }
 
-/// Ensure `.index.db` is in the brain directory's `.gitignore`.
+/// Ensure the brain's derived/local-only files are in its `.gitignore`:
+/// the SQLite index plus the remote-sync marker and state files (see
+/// `brain_sync`), none of which should ever be committed or synced.
 fn ensure_gitignore(brain_path: &Path) -> Result<()> {
     let gi = brain_path.join(".gitignore");
-    let entry = ".index.db\n";
-    if gi.exists() {
-        let content = fs::read_to_string(&gi)?;
-        if !content.contains(".index.db") {
-            fs::write(&gi, format!("{content}{entry}"))?;
+    let wanted = [".index.db", ".sync.toml", ".sync-state.json"];
+    let mut content = if gi.exists() { fs::read_to_string(&gi)? } else { String::new() };
+    let mut changed = !gi.exists();
+    for entry in wanted {
+        if !content.lines().any(|l| l.trim() == entry) {
+            content.push_str(entry);
+            content.push('\n');
+            changed = true;
         }
-    } else {
-        fs::write(&gi, entry)?;
+    }
+    if changed {
+        fs::write(&gi, content)?;
     }
     Ok(())
 }
@@ -992,6 +1019,15 @@ mod tests {
         assert!(gi.exists());
         let content = fs::read_to_string(&gi).unwrap();
         assert!(content.contains(".index.db"));
+    }
+
+    #[test]
+    fn gitignore_covers_sync_files() {
+        let (_brain, dir) = make_brain();
+        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains(".index.db"));
+        assert!(content.contains(".sync.toml"));
+        assert!(content.contains(".sync-state.json"));
     }
 
     #[test]

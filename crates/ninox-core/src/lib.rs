@@ -1,5 +1,6 @@
 pub mod brain;
 pub mod brain_archive;
+pub mod brain_sync;
 pub mod client;
 pub mod config;
 pub mod embeddings;
@@ -7,7 +8,9 @@ pub mod events;
 pub mod github;
 pub mod harness;
 pub mod hooks;
+pub mod inbox;
 pub mod lifecycle;
+pub mod messaging;
 pub mod plugin;
 pub mod pty;
 pub mod store;
