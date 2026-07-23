@@ -25,6 +25,11 @@ const CLIENT_OUTPUT_EVENTS_PER_SCHEDULER_TURN: usize = 32;
 // tmux uses the same bound for an inner DEC 2026 frame that never closes.
 const TERMINAL_OUTPUT_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Width (logical px) of the slim reveal rail shown in place of the sidebar
+/// when it is collapsed. Kept in sync between the view (`sidebar_reveal_rail`)
+/// and the terminal-size budget (`resize_terminals`).
+const SIDEBAR_REVEAL_RAIL_W: f32 = 22.0;
+
 /// The running binary's own version — shown in Settings and used as the
 /// baseline for `ensure_version_check`. This crate's `CARGO_PKG_VERSION`,
 /// not `ninox-core`'s, since it's specifically "what build is this person
@@ -363,6 +368,10 @@ pub struct App {
     pub window_width:    f32,
     pub window_height:   f32,
     pub sidebar_width:   f32,
+    /// When true the left sidebar (and its drag handle) is collapsed; the
+    /// main content expands and a slim reveal rail is shown in its place.
+    /// `sidebar_width` is preserved so un-hiding restores the prior size.
+    pub sidebar_hidden:  bool,
     pub info_width:      f32,
     pub drag:            Option<DragTarget>,
     pub fleet_filter:    FleetFilter,
@@ -492,6 +501,8 @@ pub enum Message {
     /// inside the task and still arrive here as `Ok`).
     BrainReindexed { path: std::path::PathBuf, result: Result<usize, String> },
     ToggleNotifications,
+    /// Collapse/expand the left sidebar (header control + Cmd/Ctrl+B).
+    ToggleSidebar,
     DismissNotification(String),
     DismissAllNotifications,
     NavigateNotification(SessionId),
@@ -1042,6 +1053,15 @@ impl App {
         config.zoom = zoom;
         let catalogues = config.catalogue_options();
         let settings = crate::components::settings_panel::SettingsState::from_config(&config);
+        // Restore persisted sidebar geometry; clamp width to the same range
+        // the live drag enforces so a hand-edited config can't wedge layout.
+        // Write the clamped value straight back into `config` so a later
+        // `config.save()` persists the same width the UI renders, rather than
+        // the raw out-of-range value (disk and runtime stay in sync).
+        // `sidebar_hidden` is a bool — no normalization needed.
+        config.sidebar_width = config.sidebar_width.clamp(150.0, 400.0);
+        let sidebar_width_init = config.sidebar_width;
+        let sidebar_hidden_init = config.sidebar_hidden;
 
         let mut app = Self {
             engine:             engine.clone(),
@@ -1082,7 +1102,10 @@ impl App {
             terminal_rows:  50,
             window_width:   1024.0,
             window_height:  768.0,
-            sidebar_width:  220.0,
+            // Restore the persisted sidebar width, clamped to the live drag
+            // range so a stale/edited config can't wedge the layout.
+            sidebar_width:  sidebar_width_init,
+            sidebar_hidden: sidebar_hidden_init,
             info_width:     300.0,
             drag:            None,
             fleet_filter:    FleetFilter::default(),
@@ -1197,7 +1220,13 @@ impl App {
         let (cell_w, cell_h) = crate::components::terminal::cell_size(
             crate::components::terminal::FONT_SIZE,
         );
-        let sidebar_w = state.sidebar_width + 5.0; // +5 for drag handle
+        // When hidden, the sidebar+divider collapse to the slim reveal rail;
+        // otherwise it's the sidebar width plus the 5px drag handle.
+        let sidebar_w = if state.sidebar_hidden {
+            SIDEBAR_REVEAL_RAIL_W
+        } else {
+            state.sidebar_width + 5.0 // +5 for drag handle
+        };
         let info_w    = state.info_width + 5.0; // +5 for drag handle
 
         // Background sizing: what any session shows once Split (the default
@@ -2884,6 +2913,18 @@ impl App {
                     return Task::none();
                 }
 
+                // Cmd/Ctrl+B toggles the sidebar from any view (IDE
+                // convention). `command()` maps to Cmd on macOS / Ctrl
+                // elsewhere, so it never shadows tmux's Ctrl-b prefix inside
+                // a terminal pane. Handled before the terminal-capture path
+                // below so it works while a session terminal is focused.
+                if modifiers.command()
+                    && matches!(&key, iced::keyboard::Key::Character(c)
+                        if c.as_str().eq_ignore_ascii_case("b"))
+                {
+                    return App::apply(state, Message::ToggleSidebar);
+                }
+
                 let terminal_capturing = matches!(
                     &state.view,
                     View::SessionDetail { panel, .. }
@@ -3010,6 +3051,24 @@ impl App {
                 Task::none()
             }
 
+            Message::ToggleSidebar => {
+                state.sidebar_hidden = !state.sidebar_hidden;
+                state.config.sidebar_hidden = state.sidebar_hidden;
+                // Mirrors the SwitchTheme config-save pattern above.
+                if let Err(e) = state.config.save() {
+                    tracing::error!("failed to save sidebar state: {e}");
+                }
+                // Content width changed, so reflow terminals and sync the
+                // backing tmux panes (same as a completed resize drag).
+                let resized = Self::resize_terminals(state);
+                for (sid, cols, rows) in resized {
+                    if let Some(client) = state.clients.get(&sid) {
+                        client.resize(cols, rows);
+                    }
+                }
+                Task::none()
+            }
+
             Message::MouseMoved(position) => {
                 match state.drag {
                     Some(DragTarget::Sidebar) => {
@@ -3030,13 +3089,22 @@ impl App {
             }
 
             Message::MouseReleased => {
-                let was_dragging = state.drag.is_some();
-                state.drag = None;
-                if was_dragging {
+                let target = state.drag.take();
+                if let Some(target) = target {
                     let resized = Self::resize_terminals(state);
                     for (sid, cols, rows) in resized {
                         if let Some(client) = state.clients.get(&sid) {
                             client.resize(cols, rows);
+                        }
+                    }
+                    // Persist the new sidebar width once the drag commits
+                    // (not on every MouseMoved frame). Mirrors the
+                    // SwitchTheme config-save pattern. InfoPanel width is
+                    // session-local and intentionally not persisted.
+                    if matches!(target, DragTarget::Sidebar) {
+                        state.config.sidebar_width = state.sidebar_width;
+                        if let Err(e) = state.config.save() {
+                            tracing::error!("failed to save sidebar width: {e}");
                         }
                     }
                 }
@@ -3868,7 +3936,8 @@ impl App {
         }
     }
 
-    /// A 5px drag handle strip between resizable panels.
+    /// A 5px drag handle strip between resizable panels. Shows a
+    /// horizontal-resize cursor on hover so the divider reads as draggable.
     pub fn drag_handle<'a>(target: DragTarget, border: iced::Color) -> Element<'a, Message> {
         use iced::widget::{container, mouse_area, Space};
         use iced::{Background, Length};
@@ -3880,7 +3949,49 @@ impl App {
                     ..Default::default()
                 }),
         )
+        .interaction(iced::mouse::Interaction::ResizingHorizontally)
         .on_press(Message::StartDrag(target))
+        .into()
+    }
+
+    /// Slim clickable rail shown at the far left when the sidebar is hidden;
+    /// clicking it (or Cmd/Ctrl+B) reveals the sidebar again. Its width is
+    /// accounted for in `resize_terminals` via `SIDEBAR_REVEAL_RAIL_W`.
+    fn sidebar_reveal_rail<'a>(scheme: &crate::theme::ColorScheme) -> Element<'a, Message> {
+        use iced::widget::{button, container, text};
+        use iced::{Background, Border, Length, Padding};
+        let (paper_2, ink_2, card, faint) =
+            (scheme.paper_2, scheme.ink_2, scheme.card, scheme.faint);
+        // Mirror the open sidebar masthead's top padding so the reveal button
+        // clears the macOS traffic lights (the window is titlebar-transparent,
+        // so content runs under the title bar) and lines up vertically with
+        // the open state's collapse control. Keep in sync with
+        // `components::sidebar::masthead_padding`.
+        #[cfg(target_os = "macos")]
+        let top_inset = 40.0;
+        #[cfg(not(target_os = "macos"))]
+        let top_inset = 20.0;
+        container(
+            button(text("»").size(13).color(ink_2))
+                .on_press(Message::ToggleSidebar)
+                .padding([2, 4])
+                .style(move |_t, status| button::Style {
+                    background: Some(Background::Color(
+                        if matches!(status, button::Status::Hovered) { card } else { paper_2 },
+                    )),
+                    text_color: ink_2,
+                    border: Border::default(),
+                    ..Default::default()
+                }),
+        )
+        .padding(Padding { top: top_inset, right: 0.0, bottom: 0.0, left: 0.0 })
+        .width(Length::Fixed(SIDEBAR_REVEAL_RAIL_W))
+        .height(Length::Fill)
+        .style(move |_t| container::Style {
+            background: Some(Background::Color(paper_2)),
+            border: Border { color: faint, width: 1.0, radius: 0.0.into() },
+            ..Default::default()
+        })
         .into()
     }
 
@@ -3908,13 +4019,21 @@ impl App {
             View::Settings => settings_panel(state),
         };
 
-        let base: Element<Message> = container(
+        // Hidden: main content expands to (near) full width behind a slim
+        // reveal rail. Shown: sidebar + draggable divider + content.
+        let chrome = if state.sidebar_hidden {
+            row![
+                App::sidebar_reveal_rail(&state.scheme),
+                main,
+            ]
+        } else {
             row![
                 sidebar(state),
                 App::drag_handle(DragTarget::Sidebar, state.scheme.rule_dark),
                 main,
-            ].height(Length::Fill),
-        )
+            ]
+        };
+        let base: Element<Message> = container(chrome.height(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {
@@ -5111,6 +5230,7 @@ mod tests {
             window_width:   0.0,
             window_height:  0.0,
             sidebar_width:  0.0,
+            sidebar_hidden: false,
             info_width:     0.0,
             drag:            None,
             fleet_filter:    FleetFilter::default(),
@@ -7120,6 +7240,110 @@ mod tests {
             assert_ne!(m.active_variant, before);
             let m = press(m, "t");
             assert_eq!(m.active_variant, before);
+        });
+    }
+
+    #[test]
+    fn toggle_sidebar_flips_and_persists_hidden_state() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("toggle_sidebar_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            assert!(!m.sidebar_hidden);
+            let (m, _) = m.update(Message::ToggleSidebar);
+            assert!(m.sidebar_hidden);
+            // Persisted: a fresh load sees the hidden state too.
+            assert!(ninox_core::config::AppConfig::load().unwrap().sidebar_hidden);
+            let (m, _) = m.update(Message::ToggleSidebar);
+            assert!(!m.sidebar_hidden);
+            assert!(!ninox_core::config::AppConfig::load().unwrap().sidebar_hidden);
+        });
+    }
+
+    #[test]
+    fn cmd_b_toggles_sidebar() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("cmd_b_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            let (m, _) = m.update(Message::RawKey {
+                key:       iced::keyboard::Key::Character("b".into()),
+                modifiers: iced::keyboard::Modifiers::COMMAND,
+                text:      Some("b".to_string()),
+            });
+            assert!(m.sidebar_hidden, "Cmd/Ctrl+B should collapse the sidebar");
+        });
+    }
+
+    #[test]
+    fn sidebar_width_persists_on_drag_release() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("sidebar_width_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let mut m = base(test_engine());
+            // Simulate an in-flight sidebar drag that settled at 305px.
+            m.drag = Some(DragTarget::Sidebar);
+            m.sidebar_width = 305.0;
+            let (_m, _) = m.update(Message::MouseReleased);
+            let loaded = ninox_core::config::AppConfig::load().unwrap();
+            assert_eq!(loaded.sidebar_width, 305.0);
+        });
+    }
+
+    #[test]
+    fn startup_restores_persisted_sidebar_geometry_clamped() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("restore_sidebar_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            // An over-range width must clamp into the 150–400 drag band; the
+            // hidden flag round-trips verbatim.
+            let cfg = ninox_core::config::AppConfig {
+                sidebar_width: 999.0,
+                sidebar_hidden: true,
+                ..ninox_core::config::AppConfig::default()
+            };
+            cfg.save().unwrap();
+
+            let store = Arc::new(Store::open(dir.path().join("t.db")).unwrap());
+            let engine = Engine::new(store);
+            let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
+            let (app, _task) = App::new(
+                engine,
+                std::path::PathBuf::from("/tmp"),
+                ninox_core::config::AgentConfig::default(),
+                brain,
+            );
+            assert_eq!(app.sidebar_width, 400.0);
+            assert!(app.sidebar_hidden);
+            // The in-memory config that a later `config.save()` writes back
+            // must hold the clamped width too — not the raw out-of-range
+            // 999.0 — so disk never drifts from what the UI renders.
+            assert_eq!(app.config.sidebar_width, 400.0);
+        });
+    }
+
+    #[test]
+    fn startup_clamps_below_range_width() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("restore_sidebar_low_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let cfg = ninox_core::config::AppConfig {
+                sidebar_width: 10.0,
+                ..ninox_core::config::AppConfig::default()
+            };
+            cfg.save().unwrap();
+
+            let store = Arc::new(Store::open(dir.path().join("t.db")).unwrap());
+            let engine = Engine::new(store);
+            let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
+            let (app, _task) = App::new(
+                engine,
+                std::path::PathBuf::from("/tmp"),
+                ninox_core::config::AgentConfig::default(),
+                brain,
+            );
+            assert_eq!(app.sidebar_width, 150.0);
+            assert_eq!(app.config.sidebar_width, 150.0);
         });
     }
 

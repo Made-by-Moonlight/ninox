@@ -341,12 +341,28 @@ pub struct AppConfig {
     /// if present, else the built-in Field Notes palettes.
     #[serde(default)]
     pub theme_file: Option<String>,
+    /// Width in logical pixels of the left sidebar. Persisted when a resize
+    /// drag commits (see `app::App::update`'s `MouseReleased` arm) and
+    /// clamped to the 150–400 drag range on load. Default 220.
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
+    /// Whether the left sidebar is collapsed/hidden. Toggled by the sidebar
+    /// header control and Cmd/Ctrl+B; the last-used width is retained in
+    /// `sidebar_width` so showing it again restores the prior size.
+    #[serde(default)]
+    pub sidebar_hidden: bool,
     /// Agent-harness registry overrides/extensions (`[harnesses.<name>]`).
     /// Builtin specs for claude-code/codex/opencode/aider/freebuff apply
     /// when a name is absent here. See `crate::harness`. Kept last so TOML
     /// serialization emits this table-of-tables after every scalar field.
     #[serde(default)]
     pub harnesses: BTreeMap<String, HarnessSpec>,
+}
+
+/// Default left-sidebar width in logical pixels. Matches the historical
+/// hard-coded startup width and sits inside the 150–400 drag range.
+fn default_sidebar_width() -> f32 {
+    220.0
 }
 
 impl Default for AppConfig {
@@ -368,6 +384,8 @@ impl Default for AppConfig {
             brain_harvest:    BrainHarvestConfig::default(),
             session_retention: SessionRetentionConfig::default(),
             theme_file:       None,
+            sidebar_width:    default_sidebar_width(),
+            sidebar_hidden:   false,
             harnesses:        BTreeMap::new(),
             inbox_messaging:  InboxMessagingConfig::default(),
             rust_cache:       RustCacheConfig::default(),
@@ -722,6 +740,25 @@ mod tests {
     #[test]
     fn default_theme_is_dark() {
         assert_eq!(AppConfig::default().theme, ThemeVariant::Dark);
+    }
+
+    #[test]
+    fn sidebar_geometry_round_trips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = AppConfig { sidebar_width: 275.0, sidebar_hidden: true, ..AppConfig::default() };
+        fs::write(&path, toml::to_string(&cfg).unwrap()).unwrap();
+        let loaded: AppConfig = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(loaded.sidebar_width, 275.0);
+        assert!(loaded.sidebar_hidden);
+    }
+
+    #[test]
+    fn missing_sidebar_fields_default() {
+        // Configs written before these fields existed must still load.
+        let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert_eq!(cfg.sidebar_width, default_sidebar_width());
+        assert!(!cfg.sidebar_hidden);
     }
 
     #[test]
