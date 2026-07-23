@@ -48,7 +48,7 @@ pub struct Pinboard<'a> {
 impl<'a> Pinboard<'a> {
     /// Lay out one [`Node`] per brain entry within `bounds`, sized by node
     /// degree (in `self.app.brain_view.edges`, resolved once per data change
-    /// — see `App::refresh_brain_edges` — never re-derived here) and flagged
+    /// — see `App::refresh_brain_graph` — never re-derived here) and flagged
     /// `hit` when the entry matches the active search filter.
     fn nodes(&self, bounds: Rectangle) -> Vec<Node> {
         let s = &self.app.scheme;
@@ -69,14 +69,29 @@ impl<'a> Pinboard<'a> {
             .entries
             .iter()
             .enumerate()
-            .map(|(i, e)| Node {
-                x: bounds.width * (0.05 + 0.90 * hash01(&e.id, 7)),
-                y: bounds.height * (0.06 + 0.88 * hash01(&e.id, 13)),
-                r: node_radius(degree.get(i).copied().unwrap_or(0) as f32),
-                color: category_color(s, &e.entry_type),
-                hit: !q.is_empty()
-                    && (e.name.to_lowercase().contains(&q) || e.id.to_lowercase().contains(&q)),
-                id: e.id.clone(),
+            .map(|(i, e)| {
+                // `layout` is the cached force-directed position, recomputed
+                // once per data change by `App::refresh_brain_graph` — a
+                // cache miss (e.g. a reindex race) falls back to the old
+                // hash-based scatter position rather than hiding the node.
+                let (nx, ny) = self
+                    .app
+                    .brain_view
+                    .layout
+                    .get(&e.id)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        (0.05 + 0.90 * hash01(&e.id, 7), 0.06 + 0.88 * hash01(&e.id, 13))
+                    });
+                Node {
+                    x: bounds.width * nx,
+                    y: bounds.height * ny,
+                    r: node_radius(degree.get(i).copied().unwrap_or(0) as f32),
+                    color: category_color(s, &e.entry_type),
+                    hit: !q.is_empty()
+                        && (e.name.to_lowercase().contains(&q) || e.id.to_lowercase().contains(&q)),
+                    id: e.id.clone(),
+                }
             })
             .collect()
     }
@@ -122,7 +137,7 @@ fn edge_key(a: usize, b: usize) -> (usize, usize) {
 /// Resolve `BrainIndex::links_all()`'s `(from_id, to_id)` string pairs into
 /// deduplicated, undirected node-index pairs against `entries`'s current
 /// order — the form the pinboard canvas draws from. Called once per data
-/// change (`App::refresh_brain_edges`, on `NavigateBrain` / `BrainReindex` /
+/// change (`App::refresh_brain_graph`, on `NavigateBrain` / `BrainReindex` /
 /// `BrainSwitchCatalogue`), never per draw.
 ///
 /// A link endpoint that isn't in `entries` (index/entries drift, or a link
@@ -258,7 +273,7 @@ impl<'a> canvas::Program<Message> for Pinboard<'a> {
 
         // Dashed link threads: faint ink by default, lit accent when either
         // endpoint matches the active search. Edges are precomputed
-        // node-index pairs (`App::refresh_brain_edges` /
+        // node-index pairs (`App::refresh_brain_graph` /
         // `resolve_edges`) — already deduped by undirected pair, so a
         // mutual link (A -> B and B -> A) is stroked once, not twice.
         let ink_edge = Color { a: 0.18, ..s.ink };
