@@ -1,0 +1,33 @@
+name: Guard internal-only paths
+
+# This public repo must never contain the private mirror's overlay files.
+# A PR branch accidentally cut from the private mirror instead of this
+# repo's main carries them along — fail fast at PR time instead of after
+# a squash merge, which is exactly how they slipped in once before
+# (see the PR that removed them).
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Refuse private-mirror overlay files
+        run: |
+          found=""
+          for f in CODEOWNERS .github/workflows/sync-from-public.yml scripts/promote-to-public.sh; do
+            if [ -e "$f" ]; then
+              found="$found  - $f"$'\n'
+            fi
+          done
+          if [ -n "$found" ]; then
+            echo "Private-mirror overlay file(s) present on this branch:" >&2
+            printf '%s' "$found" >&2
+            echo "These files belong to the private mirror only — this branch was probably cut from the wrong base." >&2
+            exit 1
+          fi
