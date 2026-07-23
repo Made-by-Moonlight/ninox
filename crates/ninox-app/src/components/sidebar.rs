@@ -86,6 +86,20 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     #[cfg(not(target_os = "macos"))]
     let masthead_padding = Padding { top: 20.0, right: 18.0, bottom: 14.0, left: 18.0 };
 
+    // Collapse control: hides the sidebar (also bound to Cmd/Ctrl+B). When
+    // hidden the whole sidebar is replaced by a slim reveal rail (see
+    // `App::sidebar_reveal_rail`), so this control only ever shows "«".
+    let collapse_btn = button(text("«").size(14).color(s.ink_2))
+        .on_press(Message::ToggleSidebar)
+        .padding([2, 6])
+        .style(move |_t, status| button::Style {
+            background: matches!(status, button::Status::Hovered)
+                .then_some(Background::Color(s.card)),
+            text_color: s.ink_2,
+            border: Border::default(),
+            ..Default::default()
+        });
+
     // ── 1. Masthead ──────────────────────────────────────────────────────────
     let masthead = container(
         column![
@@ -93,6 +107,8 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
                 text("Nin").size(27).font(SERIF_MEDIUM).color(s.ink),
                 text("ox").size(27).font(SERIF_ITALIC).color(s.ink),
                 text(" ⬡").size(20).font(crate::style::GLYPH).color(s.ink),
+                Space::new(Length::Fill, 0),
+                collapse_btn,
             ]
             .align_y(Alignment::End),
             Space::new(0, 6),
@@ -375,20 +391,34 @@ fn tree_row<'a>(
     if let Some((toggle_id, is_open)) = chevron_toggle {
         row_items.push(Space::new(4, 0).into());
         row_items.push(
-            button(text(if is_open { "▾" } else { "▸" }).size(9).color(s.faint))
+            // Chunky filled triangles (▶/▼, not the small ▸/▾ which read tiny
+            // inside their em box) at size 15 — visibly larger/heavier than
+            // the ~12.5 row name and the size-12 × so the expander is obvious
+            // at a glance. Legible secondary tone, accent on hover; the text
+            // inherits the button's `text_color` (no explicit `.color()`) so
+            // hover can recolor it. Row is `align_y(Center)`, so the taller
+            // glyph stays vertically centered; padding keeps the hit-target.
+            button(text(if is_open { "▼" } else { "▶" }).size(15))
                 .on_press(Message::SelectOrchestrator(toggle_id))
-                .style(move |_t, status| button::Style {
-                    background: row_bg(matches!(status, button::Status::Hovered)),
-                    border: Border::default(),
-                    ..Default::default()
+                .style(move |_t, status| {
+                    let hovered = matches!(status, button::Status::Hovered);
+                    button::Style {
+                        background: row_bg(hovered),
+                        text_color: if hovered { s.accent } else { s.ink_2 },
+                        border: Border::default(),
+                        ..Default::default()
+                    }
                 })
-                .padding([2, 4])
+                .padding([2, 5])
                 .into(),
         );
     }
     if let Some(remove_msg) = remove {
         row_items.push(
-            button(text("×").size(12).color(s.faint))
+            // `×` (U+00D7) at size 15 to balance with the size-15 chevron —
+            // the old size-12 close read undersized next to the chunky
+            // expander. Keeps the existing faint color + row-bg hover.
+            button(text("×").size(15).color(s.faint))
                 .on_press(remove_msg)
                 .style(move |_t, status| button::Style {
                     background: row_bg(matches!(status, button::Status::Hovered)),
