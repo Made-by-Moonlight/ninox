@@ -862,6 +862,34 @@ impl App {
         }
     }
 
+    /// Background freshen for a (possibly remote-backed) catalogue — the
+    /// pull-before-read front door the CLI (`open_synced`) and server
+    /// (`freshen`) already use, delivered via `BrainFreshened`. Cheap to
+    /// fire repeatedly: `pull_if_stale` is TTL-gated, and a catalogue with
+    /// no remote degrades to a plain local open. Shared by catalogue
+    /// switch and opening the Brain view.
+    fn freshen_brain_task(config: AppConfig, path: std::path::PathBuf) -> Task<Message> {
+        Task::future(async move {
+            // First open of a config-declared remote catalogue materializes
+            // its .sync.toml — the CLI does this in run_brain; without it a
+            // fresh clone never learns its remote.
+            if let Err(e) = ninox_core::brain_sync::ensure_sync_toml(&config, &path) {
+                tracing::warn!("brain: failed to materialize .sync.toml: {e}");
+            }
+            match ninox_core::brain_sync::open_synced(&path, None).await {
+                Ok(brain) => Message::BrainFreshened { path, brain: Arc::new(brain) },
+                // A hard Err from open_synced means the LOCAL open failed
+                // (remote failures degrade inside it) — a catalogue that
+                // can't open locally has already surfaced its error on the
+                // synchronous path, so drop this one quietly.
+                Err(e) => {
+                    tracing::warn!("brain freshen: {e}");
+                    Message::Noop
+                }
+            }
+        })
+    }
+
     /// Shared mutation logic.
     fn apply(state: &mut Self, message: Message) -> Task<Message> {
         match message {
@@ -1959,7 +1987,13 @@ impl App {
                     }
                 }
                 state.view = View::Brain;
-                Task::none()
+                // Opening the view freshens the ACTIVE catalogue in the
+                // background — switch and reindex got this in the remote-
+                // brains follow-up, but the default catalogue (never
+                // switched to) otherwise only freshens when something hits
+                // the in-process server, so its first Brain visit showed
+                // the local snapshot.
+                Self::freshen_brain_task(state.config.clone(), state.brain.path().to_path_buf())
             }
 
             Message::NavigateSettings => {
@@ -2185,29 +2219,9 @@ impl App {
                             // GUI never pulled on switch at all, so
                             // teammates' pushes stayed invisible until a
                             // CLI/server touch on the same directory.
-                            let config = state.config.clone();
-                            let path = cat.path.clone();
-                            return Task::future(async move {
-                                // First open of a config-declared remote
-                                // catalogue materializes its .sync.toml — the
-                                // CLI does this in run_brain; without it a
-                                // fresh clone never learns its remote.
-                                if let Err(e) = ninox_core::brain_sync::ensure_sync_toml(&config, &path) {
-                                    tracing::warn!("brain: failed to materialize .sync.toml: {e}");
-                                }
-                                match ninox_core::brain_sync::open_synced(&path, None).await {
-                                    Ok(brain) => Message::BrainFreshened { path, brain: Arc::new(brain) },
-                                    // A hard Err from open_synced means the
-                                    // LOCAL open failed (remote failures
-                                    // degrade inside it) — the synchronous
-                                    // open above already surfaced that same
-                                    // failure, so drop this one quietly.
-                                    Err(e) => {
-                                        tracing::warn!("brain freshen after catalogue switch: {e}");
-                                        Message::Noop
-                                    }
-                                }
-                            });
+                            return Self::freshen_brain_task(
+                                state.config.clone(), cat.path.clone(),
+                            );
                         }
                         Err(e) => tracing::warn!("open catalogue '{}': {e}", cat.name),
                     }
@@ -4184,6 +4198,32 @@ mod tests {
         assert!(app.brain_view.open_drawers.is_empty());
         assert_eq!(app.brain_view.entries.len(), 1);
         assert_eq!(app.brain_view.entries[0].id, "concepts/b.md");
+    }
+
+    #[tokio::test]
+    async fn opening_the_brain_view_freshens_the_active_catalogue() {
+        // Switch and reindex freshen, but the DEFAULT catalogue is never
+        // switched to — without a freshen on NavigateBrain its first visit
+        // shows whatever local snapshot the last CLI/server touch left.
+        let dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir.join("concepts")).unwrap();
+        std::fs::write(dir.join("concepts").join("a.md"), "a body").unwrap();
+        BrainIndex::open(&dir).unwrap().rebuild(None).unwrap();
+
+        let e = test_engine();
+        let app = base_with_brain(e, Arc::new(BrainIndex::open(&dir).unwrap()));
+
+        let (app, task) = app.update(Message::NavigateBrain);
+        assert!(matches!(app.view, View::Brain));
+        let freshened = output_of(task).await;
+        assert!(
+            matches!(&freshened, Message::BrainFreshened { path, .. } if path == &dir),
+            "opening the Brain view must kick off a background freshen for the active catalogue, got {freshened:?}"
+        );
+        let (app, _) = app.update(freshened);
+        assert!(app.brain_view.loaded);
+        assert_eq!(app.brain_view.entries.len(), 1);
+        assert_eq!(app.brain_view.entries[0].id, "concepts/a.md");
     }
 
     #[tokio::test]
