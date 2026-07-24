@@ -33,6 +33,12 @@ pub struct CatalogueForm {
     /// Human-readable refusal reason from the last confirm attempt, if any.
     /// Cleared whenever the user edits any field. Rendered above the footer.
     pub error: Option<String>,
+    /// True after the local catalogue is filed and its initial remote
+    /// attach-and-sync `Task::future` is in flight (only reachable when
+    /// `remote_url` was non-blank) — keeps the modal open with Cancel/File
+    /// disabled so a sync failure lands back in this same form via
+    /// `RemoteSyncDone` instead of being dropped once the modal closes.
+    pub syncing: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -41,7 +47,7 @@ pub struct CatalogueForm {
 
 pub fn catalogue_modal<'a>(state: &'a App, form: &'a CatalogueForm) -> Element<'a, Message> {
     let s = &state.scheme;
-    let can_submit = !form.name.trim().is_empty() && !form.path.trim().is_empty();
+    let can_submit = !form.syncing && !form.name.trim().is_empty() && !form.path.trim().is_empty();
 
     // ── Header: journal-entry title strip — mirrors spawn_modal's header
     // structure exactly (paper_2 container, same padding, serif + serif
@@ -136,7 +142,7 @@ pub fn catalogue_modal<'a>(state: &'a App, form: &'a CatalogueForm) -> Element<'
     // ── Footer: ghost Cancel + accent primary File ⬡ (mirrors spawn_modal's
     // Cancel/Spawn button pair) ───────────────────────────────────────────
     let cancel_button = button(text("Cancel").size(11).font(SANS_BOLD).color(s.ink_2))
-        .on_press(Message::CatalogueFormCancel)
+        .on_press_maybe((!form.syncing).then_some(Message::CatalogueFormCancel))
         .padding([9, 18])
         .style(move |_theme, status| button::Style {
             background: None,
@@ -150,9 +156,10 @@ pub fn catalogue_modal<'a>(state: &'a App, form: &'a CatalogueForm) -> Element<'
         });
 
     let file_label_color = if can_submit { s.card } else { s.faint };
+    let file_label = if form.syncing { "SYNCING… " } else { "FILE " };
     let file_button = button(
         row![
-            text("FILE ").size(12).font(SANS_BOLD).color(file_label_color),
+            text(file_label).size(12).font(SANS_BOLD).color(file_label_color),
             text("⬡").size(12).font(style::GLYPH).color(file_label_color),
         ]
         .align_y(Alignment::Center),

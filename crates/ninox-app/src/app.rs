@@ -1261,7 +1261,12 @@ impl App {
             }
 
             Message::CatalogueFormCancel => {
-                state.catalogue_modal = None;
+                // Ignored mid-attach-sync — the File button is unpressable
+                // while `syncing` too (see `catalogue_modal`), but this is
+                // also reachable via Esc, so guard here.
+                if !state.catalogue_modal.as_ref().is_some_and(|f| f.syncing) {
+                    state.catalogue_modal = None;
+                }
                 Task::none()
             }
 
@@ -1364,18 +1369,33 @@ impl App {
                     .position(|c| c.path == path)
                     .unwrap_or_else(|| state.catalogues.len().saturating_sub(1));
 
-                state.catalogue_modal = None;
                 // Reuse BrainSwitchCatalogue's handler logic to open the
-                // index for real and refresh the view.
+                // index for real and refresh the view — its state mutations
+                // (state.brain, active_catalogue, view resets) all happen
+                // synchronously before it returns a task.
                 let switch_task = App::apply(state, Message::BrainSwitchCatalogue(idx));
                 match remote_cfg {
                     // Fresh directory (nothing to push): a full sync here is
                     // exactly the "initial sync" spec §1 describes for
-                    // onboarding onto an existing bucket, and reports its
-                    // outcome (never silently swallowed) via the same
-                    // `RemoteSyncDone` path `RemoteFormConfirm` uses below.
-                    Some(cfg) => Task::batch([switch_task, Self::attach_remote_task(path, cfg)]),
-                    None => switch_task,
+                    // onboarding onto an existing bucket. `switch_task`'s own
+                    // background freshen (a read-only pull_if_stale) would
+                    // otherwise race this full push+pull sync against the
+                    // same `.sync.toml`/index — dropped in favor of
+                    // `attach_remote_task` alone, which supersedes it. The
+                    // modal stays open (`syncing = true`) so a failure here
+                    // is never silently swallowed the way it would be if the
+                    // modal had already closed: `RemoteSyncDone` reports the
+                    // outcome back into this same form.
+                    Some(cfg) => {
+                        if let Some(f) = &mut state.catalogue_modal {
+                            f.syncing = true;
+                        }
+                        Self::attach_remote_task(path, cfg)
+                    }
+                    None => {
+                        state.catalogue_modal = None;
+                        switch_task
+                    }
                 }
             }
 
@@ -1465,11 +1485,23 @@ impl App {
             // brain — no network call, so this is synchronous.
             Message::RemoteDetach => {
                 let path = state.brain.path().to_path_buf();
-                let _ = std::fs::remove_file(path.join(ninox_core::brain_sync::SYNC_TOML));
-                let _ = std::fs::remove_file(path.join(ninox_core::brain_sync::SYNC_STATE));
-                state.remote_status = None;
-                state.remote_last_sync = None;
-                state.remote_modal = None;
+                let sync_toml = path.join(ninox_core::brain_sync::SYNC_TOML);
+                // Only report "detached" once the marker file is actually
+                // gone — an `Err` here (permissions, a locked file) must not
+                // claim success while `.sync.toml` (and thus the remote)
+                // stays live on disk. A `NotFound` isn't a failure: already
+                // detached, or never attached — nothing left to remove.
+                let removed = std::fs::remove_file(&sync_toml);
+                if removed.is_ok() || !sync_toml.exists() {
+                    let _ = std::fs::remove_file(path.join(ninox_core::brain_sync::SYNC_STATE));
+                    state.remote_status = None;
+                    state.remote_last_sync = None;
+                    state.remote_modal = None;
+                } else if let Err(e) = removed {
+                    if let Some(f) = &mut state.remote_modal {
+                        f.error = Some(format!("couldn't detach: {e}"));
+                    }
+                }
                 Task::none()
             }
 
@@ -1484,6 +1516,13 @@ impl App {
                         tracing::info!("brain remote sync: {}", summary.describe());
                         state.remote_last_sync = Some(summary);
                         if let Some(f) = &mut state.remote_modal { f.syncing = false; }
+                        // Creation-time attach (`CatalogueFormConfirm`) kept
+                        // the add-catalogue modal open with `syncing = true`
+                        // instead of closing it — a success here is its cue
+                        // to close, same as the plain-local path always did.
+                        if state.catalogue_modal.as_ref().is_some_and(|f| f.syncing) {
+                            state.catalogue_modal = None;
+                        }
                         // Reopen the index fresh: `attach_remote_task`/
                         // `resync_remote_task` may have rebuilt it out from
                         // under the currently-held `Arc<BrainIndex>`.
@@ -1500,12 +1539,20 @@ impl App {
                     }
                     Err(e) => {
                         tracing::warn!("brain remote sync failed: {e}");
-                        // `None`: failed during catalogue creation, whose
-                        // modal is already closed by the time this lands —
-                        // nothing else to show it in; already logged above.
+                        // Surface the failure everywhere it could plausibly
+                        // be waiting for one: the standalone remote modal
+                        // (`RemoteFormConfirm`/`RemoteSyncNow`) and/or the
+                        // add-catalogue modal kept open mid-attach
+                        // (`CatalogueFormConfirm`) — never silently dropped.
                         if let Some(f) = &mut state.remote_modal {
                             f.syncing = false;
-                            f.error = Some(e);
+                            f.error = Some(e.clone());
+                        }
+                        if let Some(f) = &mut state.catalogue_modal {
+                            if f.syncing {
+                                f.syncing = false;
+                                f.error = Some(e);
+                            }
                         }
                     }
                 }
@@ -2096,9 +2143,12 @@ impl App {
                 }
 
                 // Esc closes the add-catalogue modal (Brain view's volume
-                // plate `+`) at the same precedence level.
+                // plate `+`) at the same precedence level. Never dismisses
+                // mid-attach-sync (see `CatalogueFormCancel`'s guard).
                 if state.catalogue_modal.is_some() {
-                    if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)) {
+                    if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape))
+                        && !state.catalogue_modal.as_ref().is_some_and(|f| f.syncing)
+                    {
                         state.catalogue_modal = None;
                     }
                     return Task::none();
@@ -5794,7 +5844,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_with_remote_url_populates_catalogue_ref_remote_fields() {
+    fn confirm_with_remote_url_populates_catalogue_ref_and_dispatches_the_attach_task() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("catalogue_remote_config.toml");
         let catalogue_dir = dir.path().join("ninox-team-brain");
@@ -5807,14 +5857,60 @@ mod tests {
             let (m, _) = m.update(Message::CatalogueFormRemoteUrl("s3://team-brains/main".into()));
             let (m, _) = m.update(Message::CatalogueFormRemoteRegion("eu-west-1".into()));
             let (m, _) = m.update(Message::CatalogueFormRemoteTtl("60".into()));
-            let (m, _) = m.update(Message::CatalogueFormConfirm);
+            let (m, task) = m.update(Message::CatalogueFormConfirm);
 
-            assert!(m.catalogue_modal.is_none(), "local half of creation succeeds and closes the modal");
+            // The modal stays open, marked syncing, rather than closing
+            // immediately — a subsequent attach failure (see
+            // `confirm_with_remote_url_surfaces_attach_failure_in_the_still_open_modal`)
+            // must land somewhere, not be silently dropped.
+            let form = m.catalogue_modal.as_ref().expect("modal stays open while the initial sync runs");
+            assert!(form.syncing);
+            assert!(
+                iced_runtime::task::into_stream(task).is_some(),
+                "a remote URL must actually dispatch the attach-and-sync task, not just update config"
+            );
+
             let cat = m.config.brain.catalogues.iter().find(|c| c.name == "team").expect("catalogue saved");
             assert_eq!(cat.remote.as_deref(), Some("s3://team-brains/main"));
             assert_eq!(cat.region.as_deref(), Some("eu-west-1"));
             assert_eq!(cat.cache_ttl_secs, Some(60));
             assert!(cat.endpoint.is_none());
+        });
+    }
+
+    #[test]
+    fn confirm_with_remote_url_surfaces_attach_failure_in_the_still_open_modal() {
+        // The catalogue itself is real and already saved to config/disk by
+        // the time an async attach failure lands — only the remote half
+        // failed, so the failure must surface in the still-open modal
+        // instead of being dropped once a naive implementation closed it
+        // immediately on the (successful) local half.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("catalogue_remote_fail_config.toml");
+        let catalogue_dir = dir.path().join("ninox-team-brain-2");
+
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            let (m, _) = m.update(Message::CatalogueModalOpen);
+            let (m, _) = m.update(Message::CatalogueFormName("team2".into()));
+            let (m, _) = m.update(Message::CatalogueFormPath(catalogue_dir.to_string_lossy().to_string()));
+            let (m, _) = m.update(Message::CatalogueFormRemoteUrl("s3://team-brains/main".into()));
+            let (m, _) = m.update(Message::CatalogueFormConfirm);
+            assert!(m.catalogue_modal.as_ref().unwrap().syncing);
+
+            let path = m.brain.path().to_path_buf();
+            let (m, _) = m.update(Message::RemoteSyncDone {
+                path,
+                outcome: Err("remote unavailable: connection refused".into()),
+            });
+
+            let form = m.catalogue_modal.as_ref().expect("modal stays open to show the failure, not silently closed");
+            assert!(!form.syncing);
+            assert!(form.error.as_deref().unwrap().contains("connection refused"));
+            assert!(
+                m.config.brain.catalogues.iter().any(|c| c.name == "team2"),
+                "the local catalogue itself is unaffected by the remote attach failing"
+            );
         });
     }
 
@@ -5917,14 +6013,18 @@ mod tests {
     }
 
     #[test]
-    fn remote_form_confirm_with_valid_input_marks_the_form_syncing() {
+    fn remote_form_confirm_with_valid_input_marks_the_form_syncing_and_dispatches_the_attach_task() {
         let m = base(test_engine());
         let (m, _) = m.update(Message::RemoteModalOpen);
         let (m, _) = m.update(Message::RemoteFormUrl("s3://bucket/prefix".into()));
-        let (m, _) = m.update(Message::RemoteFormConfirm);
+        let (m, task) = m.update(Message::RemoteFormConfirm);
         let form = m.remote_modal.as_ref().expect("modal stays open while syncing");
         assert!(form.syncing);
         assert!(form.error.is_none());
+        assert!(
+            iced_runtime::task::into_stream(task).is_some(),
+            "confirming must actually dispatch the attach-and-sync task"
+        );
     }
 
     #[test]
@@ -5935,6 +6035,31 @@ mod tests {
         assert!(
             iced_runtime::task::into_stream(task).is_none(),
             "RemoteSyncNow with no remote configured must not spawn a task"
+        );
+    }
+
+    #[test]
+    fn remote_sync_now_dispatches_a_task_when_a_remote_is_configured() {
+        let brain_dir = tempdir().unwrap().keep();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        ninox_core::brain_sync::SyncToml {
+            remote: "s3://bucket/prefix".into(),
+            endpoint: None,
+            region: None,
+            cache_ttl_secs: 0,
+        }
+        .save(&brain_dir)
+        .unwrap();
+
+        let m = base_with_brain(test_engine(), brain);
+        let (mut m, _) = m.update(Message::RemoteModalOpen);
+        m.remote_status = ninox_core::brain_sync::remote_status(&brain_dir).unwrap();
+
+        let (m, task) = m.update(Message::RemoteSyncNow);
+        assert!(m.remote_modal.as_ref().unwrap().syncing);
+        assert!(
+            iced_runtime::task::into_stream(task).is_some(),
+            "a configured remote must actually dispatch the re-sync task"
         );
     }
 
