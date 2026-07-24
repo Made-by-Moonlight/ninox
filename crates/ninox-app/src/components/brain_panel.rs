@@ -336,6 +336,44 @@ fn folio(app: &App) -> Element<'_, Message> {
     )
 }
 
+/// Remote-backing affordance beside the volume plate: an inert-until-hover
+/// "⛓ attach remote" ghost for a plain local catalogue, or a compact status
+/// chip ("⛓ remote · 2 pending · 1 conflict") once one is attached — either
+/// way, clicking opens `remote_modal` (spec's `ninox brain remote status`
+/// surfaced live rather than requiring a terminal).
+fn remote_badge(app: &App) -> Element<'_, Message> {
+    let s = &app.scheme;
+    let label = match &app.remote_status {
+        None => "⛓ attach remote".to_string(),
+        Some(status) => {
+            let mut parts = vec![format!("⛓ {}", status.remote)];
+            if !status.pending_pushes.is_empty() {
+                parts.push(format!("{} pending", status.pending_pushes.len()));
+            }
+            if !status.conflict_files.is_empty() {
+                parts.push(format!("{} conflict{}", status.conflict_files.len(), if status.conflict_files.len() == 1 { "" } else { "s" }));
+            }
+            parts.join(" · ")
+        }
+    };
+    let has_conflicts = app.remote_status.as_ref().is_some_and(|r| !r.conflict_files.is_empty());
+    let idle_color = if app.remote_status.is_some() { s.ink_2 } else { s.faint };
+
+    button(text(label).size(9.5).font(MONO))
+        .on_press(Message::RemoteModalOpen)
+        .padding([2, 8])
+        .style(move |_theme, status| {
+            let hovered = status == button::Status::Hovered;
+            button::Style {
+                background: None,
+                text_color: if has_conflicts { s.accent } else if hovered { s.ink } else { idle_color },
+                border: Border { color: if hovered { s.rule_dark } else { Color::TRANSPARENT }, width: 1.0, radius: 2.0.into() },
+                ..Default::default()
+            }
+        })
+        .into()
+}
+
 /// Volume plate — which catalogue is open. Lives at the head of the
 /// rail/drawers, never the folio (mockup `.volplate`): a paper-2 strip with a
 /// CATALOGUE micro-label, mono `⌂ name`, faint ▾, and a 1px rule-dark bottom
@@ -404,6 +442,8 @@ fn volume_plate(app: &App) -> Element<'_, Message> {
                 micro_label("Catalogue", s.faint).size(8.5),
                 Space::new(Length::Fill, 0),
                 switcher,
+                Space::new(10, 0),
+                remote_badge(app),
                 Space::new(10, 0),
                 add_button,
             ]

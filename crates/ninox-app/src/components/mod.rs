@@ -10,6 +10,7 @@ pub mod lifecycle_status;
 pub mod links;
 pub mod notification_panel;
 pub mod pr_list;
+pub mod remote_modal;
 pub mod scrollback;
 pub mod session_detail;
 pub mod settings_panel;
