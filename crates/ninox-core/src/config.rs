@@ -23,6 +23,34 @@ pub enum ThemeVariant {
 }
 
 // ---------------------------------------------------------------------------
+// Editor
+// ---------------------------------------------------------------------------
+
+/// Which external editor the "Open in editor" action launches on a worker's
+/// workspace directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorChoice {
+    #[default]
+    VsCode,
+    Cursor,
+}
+
+impl std::fmt::Display for EditorChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EditorChoice::VsCode => "VS Code",
+            EditorChoice::Cursor => "Cursor",
+        })
+    }
+}
+
+impl EditorChoice {
+    /// All variants, in display order — for the settings dropdown.
+    pub const ALL: [EditorChoice; 2] = [EditorChoice::VsCode, EditorChoice::Cursor];
+}
+
+// ---------------------------------------------------------------------------
 // Agent configuration
 // ---------------------------------------------------------------------------
 
@@ -290,6 +318,10 @@ pub struct AppConfig {
     pub zoom:      f64,
     #[serde(default)]
     pub theme:     ThemeVariant,
+    /// External editor launched by the "Open in editor" action on a worker's
+    /// workspace directory. Default: VS Code.
+    #[serde(default)]
+    pub editor:    EditorChoice,
     /// Override for the orchestrator root directory.
     /// Defaults to `~/.config/ninox/orchestrator`.
     #[serde(default)]
@@ -372,6 +404,7 @@ impl Default for AppConfig {
             font_size:        13.0,
             zoom:             default_zoom(),
             theme:            ThemeVariant::Dark,
+            editor:           EditorChoice::default(),
             orchestrator_root: None,
             worktree_root:    None,
             repositories_root: None,

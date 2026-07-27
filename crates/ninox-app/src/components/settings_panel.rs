@@ -3,7 +3,7 @@
 //! the footer); harness registry toggles and the worker default follow in
 //! their own cards.
 
-use ninox_core::config::{AppConfig, ThemeVariant};
+use ninox_core::config::{AppConfig, EditorChoice, ThemeVariant};
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
     Alignment, Background, Border, Element, Length,
@@ -250,6 +250,16 @@ fn workers_card(app: &App) -> Element<'_, Message> {
         .padding([6, 10])
         .style(crate::style::pick_style(s));
 
+    let editor_pick = pick_list(
+        EditorChoice::ALL.as_slice(),
+        Some(app.config.editor),
+        Message::SettingsEditor,
+    )
+    .font(MONO)
+    .text_size(12)
+    .padding([6, 10])
+    .style(crate::style::pick_style(s));
+
     let mut body = column![
         row![
             column![micro_label("Harness", s.faint), Space::new(0, 6), harness_pick].spacing(0),
@@ -257,6 +267,8 @@ fn workers_card(app: &App) -> Element<'_, Message> {
             column![micro_label("Model", s.faint), Space::new(0, 6), model_pick].spacing(0),
         ]
         .align_y(Alignment::Start),
+        Space::new(0, 14),
+        column![micro_label("Editor", s.faint), Space::new(0, 6), editor_pick].spacing(0),
     ]
     .spacing(0);
     if let Some(v) = &app.settings.worker_custom {

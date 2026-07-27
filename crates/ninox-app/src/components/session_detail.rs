@@ -457,6 +457,29 @@ pub fn session_detail<'a>(
                 )
             })
     };
+    let open_in_editor_btn: Element<Message> = {
+        let workspace = session.workspace_path.clone();
+        let can_open = workspace.is_some();
+        let label_color = if can_open { s.accent } else { s.faint };
+        button(crate::style::micro_label("Open in editor", label_color).size(10.0))
+            .on_press_maybe(workspace.map(Message::OpenInEditor))
+            .padding([6, 16])
+            .style(move |_theme, status| {
+                let hovered = can_open && matches!(status, button::Status::Hovered);
+                button::Style {
+                    background: hovered.then_some(Background::Color(s.accent)),
+                    text_color: if hovered { s.card } else { label_color },
+                    border: Border {
+                        color: if can_open { s.accent } else { s.rule_dark },
+                        width: 1.5,
+                        radius: 2.0.into(),
+                    },
+                    shadow: crate::style::hard_shadow(s, 2.0, 2.0, crate::style::shadow_alpha(s).0),
+                }
+            })
+            .into()
+    };
+
     let resume_btn: Element<Message> =
         if can_resume(
             session,
@@ -514,6 +537,8 @@ pub fn session_detail<'a>(
             text(cost).size(13).font(crate::style::MONO).color(s.ink_2),
             Space::new(14, 0),
             refile_btn,
+            Space::new(10, 0),
+            open_in_editor_btn,
             Space::new(10, 0),
             resume_btn,
             Space::new(10, 0),

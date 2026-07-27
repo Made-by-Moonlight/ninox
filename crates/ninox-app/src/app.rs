@@ -1,7 +1,7 @@
 use std::{collections::{HashMap, VecDeque}, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use ninox_core::{
-    config::{AppConfig, ThemeVariant},
+    config::{AppConfig, EditorChoice, ThemeVariant},
     events::{Engine, Event},
     slugify,
     types::*,
@@ -469,6 +469,8 @@ pub enum Message {
     SettingsToggleHarness(String),
     /// Workers card — the `[worker]` default `ninox spawn` launches.
     SettingsWorkerHarness(String),
+    /// External editor for the "Open in editor" action (`AppConfig::editor`).
+    SettingsEditor(EditorChoice),
     SettingsWorkerModel(String),
     SettingsWorkerCustomModel(String),
     SettingsWorkerCustomCommit,
@@ -541,6 +543,9 @@ pub enum Message {
         truncated: bool,
     },
     OpenUrl(String),
+    /// Open a worker's workspace directory in the configured editor
+    /// (`AppConfig::editor`). Fire-and-forget, like `OpenUrl`.
+    OpenInEditor(String),
     /// `models_cmd` discovery finished for a harness (`None` = failed —
     /// cached so pickers fall through to known_models without retrying).
     ModelListLoaded { harness: String, models: Option<Vec<String>> },
@@ -3251,6 +3256,14 @@ impl App {
                 task
             }
 
+            Message::SettingsEditor(editor) => {
+                state.config.editor = editor;
+                if let Err(e) = state.config.save() {
+                    tracing::warn!("failed to save editor choice: {e}");
+                }
+                Task::none()
+            }
+
             Message::SettingsWorkerModel(v) => {
                 if v == crate::models::CUSTOM_SENTINEL {
                     state.settings.worker_custom =
@@ -3709,6 +3722,16 @@ impl App {
 
             Message::OpenUrl(url) => {
                 let _ = std::process::Command::new(open_url_program()).arg(&url).spawn();
+                Task::none()
+            }
+
+            Message::OpenInEditor(path) => {
+                // Fire-and-forget, exactly like OpenUrl: no error surfacing.
+                // If the configured editor isn't on PATH this silently
+                // no-ops, which is the accepted product behaviour.
+                let _ = std::process::Command::new(editor_program(state.config.editor))
+                    .arg(&path)
+                    .spawn();
                 Task::none()
             }
 
@@ -4289,6 +4312,16 @@ fn open_url_program() -> &'static str {
     { "open" }
     #[cfg(not(target_os = "macos"))]
     { "xdg-open" }
+}
+
+/// The CLI binary that opens a directory in the configured editor. Both
+/// VS Code (`code`) and Cursor (`cursor`) ship a `PATH` launcher that opens
+/// the given path.
+fn editor_program(choice: EditorChoice) -> &'static str {
+    match choice {
+        EditorChoice::VsCode => "code",
+        EditorChoice::Cursor => "cursor",
+    }
 }
 
 /// Best browser URL for a session's tracked PR: the recorded PR's own URL
@@ -5171,6 +5204,14 @@ mod tests {
         assert_eq!(open_url_program(), "open");
         #[cfg(target_os = "linux")]
         assert_eq!(open_url_program(), "xdg-open");
+    }
+
+    /// The "Open in editor" action must map each `EditorChoice` to the
+    /// matching PATH launcher.
+    #[test]
+    fn editor_program_maps_each_choice() {
+        assert_eq!(editor_program(EditorChoice::VsCode), "code");
+        assert_eq!(editor_program(EditorChoice::Cursor), "cursor");
     }
 
     fn test_engine() -> Arc<Engine> {
