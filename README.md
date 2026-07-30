@@ -12,9 +12,9 @@ Running one coding agent in a terminal is fine. Running five of them across thre
 - **Everything on one board** — a fleet board shows every session at a glance; click through to a live embedded terminal for any of them. Sessions run on a private tmux server, so they keep working when you close the app and are still there when you come back.
 - **Isolated by default** — sessions in a git repo get their own worktree, so parallel agents never trample each other's changes.
 - **A shared brain** — a plain-Markdown knowledge base that agents query before exploring unfamiliar code and write to before finishing. Knowledge discovered in one session stops being rediscovered in the next. It's just files — commit it, diff it, or point Ninox at an existing Obsidian vault. See [docs/BRAIN.md](docs/BRAIN.md).
-- **The boring-but-vital extras** — PR tracking for session branches, per-session cost and context usage, and desktop notifications when a session needs you.
+- **The boring-but-vital extras** — PR tracking for session branches, per-session cost estimates and context usage, and desktop notifications when a session needs you.
 
-Ninox is built in Rust with [Iced](https://github.com/iced-rs/iced): a GPU-accelerated native UI with its own embedded engine and SQLite store — no Electron, no bundled browser. [Claude Code](https://claude.com/claude-code) is the first-class harness; codex, opencode, and aider can be enabled via config.
+Ninox is built in Rust with [Iced](https://github.com/iced-rs/iced): a GPU-accelerated native UI with its own embedded engine and SQLite store — no Electron, no bundled browser. [Claude Code](https://claude.com/claude-code) is the first-class harness; codex, opencode, aider, and custom harnesses can be enabled via config. Note that worker sessions run unattended with permission prompts bypassed (`--dangerously-skip-permissions` for Claude Code) — spawn fleets in repositories you trust.
 
 ## Why use it?
 
@@ -49,7 +49,7 @@ cargo build --release -p ninox
 ./target/release/ninox --headless
 
 # Custom port and database path
-./target/release/ninox --port 9090 --db ~/.local/share/ninox/ninox.db
+./target/release/ninox --port 9090 --db ./ninox.db
 ```
 
 The HTTP server always starts on `127.0.0.1:8080` (or `--port`), exposing the engine's HTTP/WebSocket API — so everything the UI does is also scriptable.
@@ -96,12 +96,14 @@ rm -rf Ninox.iconset
 
 ## Configuration
 
-App config is stored at `~/.config/ninox/config.toml`:
+App config lives in the platform config directory — `~/Library/Application Support/ninox/config.toml` on macOS, `~/.config/ninox/config.toml` on Linux (override with `NINOX_CONFIG`):
 
 ```toml
 port = 8080
 font_size = 13.0
 ```
+
+PR tracking needs a GitHub token: set `github_token` in the config file or export `GITHUB_TOKEN`. Without it, PR status simply won't populate.
 
 ## Development
 
