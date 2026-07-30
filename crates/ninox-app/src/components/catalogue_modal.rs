@@ -22,9 +22,23 @@ use crate::{
 pub struct CatalogueForm {
     pub name: String,
     pub path: String,
+    /// `s3://bucket/prefix` — leave blank for a plain local catalogue.
+    /// Non-blank: `CatalogueFormConfirm` files the catalogue AND runs an
+    /// initial full sync (spec §1 "onboarding a teammate is pasting one
+    /// config block"), same core path as `RemoteFormConfirm`.
+    pub remote_url: String,
+    pub remote_endpoint: String,
+    pub remote_region: String,
+    pub remote_ttl: String,
     /// Human-readable refusal reason from the last confirm attempt, if any.
     /// Cleared whenever the user edits any field. Rendered above the footer.
     pub error: Option<String>,
+    /// True after the local catalogue is filed and its initial remote
+    /// attach-and-sync `Task::future` is in flight (only reachable when
+    /// `remote_url` was non-blank) — keeps the modal open with Cancel/File
+    /// disabled so a sync failure lands back in this same form via
+    /// `RemoteSyncDone` instead of being dropped once the modal closes.
+    pub syncing: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -33,7 +47,7 @@ pub struct CatalogueForm {
 
 pub fn catalogue_modal<'a>(state: &'a App, form: &'a CatalogueForm) -> Element<'a, Message> {
     let s = &state.scheme;
-    let can_submit = !form.name.trim().is_empty() && !form.path.trim().is_empty();
+    let can_submit = !form.syncing && !form.name.trim().is_empty() && !form.path.trim().is_empty();
 
     // ── Header: journal-entry title strip — mirrors spawn_modal's header
     // structure exactly (paper_2 container, same padding, serif + serif
@@ -82,10 +96,53 @@ pub fn catalogue_modal<'a>(state: &'a App, form: &'a CatalogueForm) -> Element<'
     ]
     .spacing(4);
 
+    // ── Remote (optional): a brand-new catalogue can be born already
+    // S3-backed — the same fields `remote_modal` collects to attach a
+    // remote to an existing catalogue. Blank remote URL = plain local
+    // catalogue, unchanged from before this field existed. ──────────────────
+    let remote_url_field = column![
+        micro_label("Remote (optional) — s3://bucket/prefix", s.ink_2),
+        Space::new(0, 6),
+        text_input("s3://bucket/prefix", &form.remote_url)
+            .on_input(Message::CatalogueFormRemoteUrl)
+            .on_submit_maybe(can_submit.then_some(Message::CatalogueFormConfirm))
+            .font(MONO)
+            .size(13)
+            .padding([6, 2])
+            .style(style::underlined_input_style(s)),
+        hline(s.rule_dark, 1.5),
+    ]
+    .spacing(4);
+
+    let remote_detail_field = |label: &'static str, placeholder: &'static str, value: &'a String, on_input: fn(String) -> Message| {
+        column![
+            micro_label(label, s.ink_2),
+            Space::new(0, 6),
+            text_input(placeholder, value)
+                .on_input(on_input)
+                .on_submit_maybe(can_submit.then_some(Message::CatalogueFormConfirm))
+                .font(MONO)
+                .size(12)
+                .padding([6, 2])
+                .style(style::underlined_input_style(s)),
+            hline(s.rule_dark, 1.5),
+        ]
+        .spacing(4)
+        .width(Length::FillPortion(1))
+    };
+
+    let remote_details_row = row![
+        remote_detail_field("Endpoint", "optional (R2/MinIO)", &form.remote_endpoint, Message::CatalogueFormRemoteEndpoint),
+        Space::new(14, 0),
+        remote_detail_field("Region", "optional", &form.remote_region, Message::CatalogueFormRemoteRegion),
+        Space::new(14, 0),
+        remote_detail_field("Cache TTL (secs)", "0", &form.remote_ttl, Message::CatalogueFormRemoteTtl),
+    ];
+
     // ── Footer: ghost Cancel + accent primary File ⬡ (mirrors spawn_modal's
     // Cancel/Spawn button pair) ───────────────────────────────────────────
     let cancel_button = button(text("Cancel").size(11).font(SANS_BOLD).color(s.ink_2))
-        .on_press(Message::CatalogueFormCancel)
+        .on_press_maybe((!form.syncing).then_some(Message::CatalogueFormCancel))
         .padding([9, 18])
         .style(move |_theme, status| button::Style {
             background: None,
@@ -99,9 +156,10 @@ pub fn catalogue_modal<'a>(state: &'a App, form: &'a CatalogueForm) -> Element<'
         });
 
     let file_label_color = if can_submit { s.card } else { s.faint };
+    let file_label = if form.syncing { "SYNCING… " } else { "FILE " };
     let file_button = button(
         row![
-            text("FILE ").size(12).font(SANS_BOLD).color(file_label_color),
+            text(file_label).size(12).font(SANS_BOLD).color(file_label_color),
             text("⬡").size(12).font(style::GLYPH).color(file_label_color),
         ]
         .align_y(Alignment::Center),
@@ -135,7 +193,7 @@ pub fn catalogue_modal<'a>(state: &'a App, form: &'a CatalogueForm) -> Element<'
         .into()
     });
 
-    let mut body = column![name_field, Space::new(0, 18), path_field]
+    let mut body = column![name_field, Space::new(0, 18), path_field, Space::new(0, 18), remote_url_field, Space::new(0, 14), remote_details_row]
         .padding([20, 24])
         .spacing(0);
     if let Some(err) = error_line {
@@ -144,7 +202,7 @@ pub fn catalogue_modal<'a>(state: &'a App, form: &'a CatalogueForm) -> Element<'
     body = body.push(Space::new(0, 22)).push(footer);
 
     let modal = container(column![header, hline(s.ink, 2.0), body])
-        .width(Length::Fixed(420.0))
+        .width(Length::Fixed(460.0))
         .style(move |_theme| {
             let mut frame = style::heavy_frame(s);
             let (_, _, modal_a) = shadow_alpha(s);

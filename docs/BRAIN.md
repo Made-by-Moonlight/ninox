@@ -83,6 +83,14 @@ are immutable (`entries/<path>@<hash>`); `manifest.json` alone decides
 what's current, and concurrent pushes are serialized by compare-and-swap
 on it. Full design: `docs/superpowers/specs/2026-07-22-remote-brain-design.md`.
 
+The GUI's Brain view offers the same surface without a terminal: the "File
+a new catalogue" form (the `+` beside the volume plate) takes an optional
+remote block to create a catalogue that's remote-backed from the start,
+and the remote badge beside the volume plate opens a modal to attach a
+remote to an already-local catalogue (writing `.sync.toml` and running the
+initial sync) or, once attached, to see status (remote, last sync, pending
+pushes, live conflicts), trigger a manual sync, or detach.
+
 ## CLI
 
 ```
