@@ -1,10 +1,34 @@
 # Ninox
 
-Ninox is a native desktop agent orchestrator — built in Rust with [Iced](https://github.com/iced-rs/iced). It embeds its own orchestrator engine directly and runs a GPU-accelerated UI: no Electron, no bundled browser. Running Ninox starts the engine with its own SQLite store and an HTTP/WebSocket API server.
+A native desktop cockpit for running fleets of coding agents.
+
+![Ninox demo](docs/assets/ninox.gif)
+
+## What is Ninox?
+
+Running one coding agent in a terminal is fine. Running five of them across three repos is a wall of terminal tabs with no overview, no shared memory, and no record of what any of them cost. Ninox is a desktop app that turns that mess into a fleet you can actually supervise:
+
+- **Orchestrators and workers** — spawn an orchestrator with a goal and it breaks the work down, spawning worker sessions to execute in parallel. Workers that discover extra work hand it back to the orchestrator (`ninox request-work`) rather than going off-script. Standalone sessions are there for when you just want one agent in one repo.
+- **Everything on one board** — a fleet board shows every session at a glance; click through to a live embedded terminal for any of them. Sessions run on a private tmux server, so they keep working when you close the app and are still there when you come back.
+- **Isolated by default** — sessions in a git repo get their own worktree, so parallel agents never trample each other's changes.
+- **A shared brain** — a plain-Markdown knowledge base that agents query before exploring unfamiliar code and write to before finishing. Knowledge discovered in one session stops being rediscovered in the next. It's just files — commit it, diff it, or point Ninox at an existing Obsidian vault. See [docs/BRAIN.md](docs/BRAIN.md).
+- **The boring-but-vital extras** — PR tracking for session branches, per-session cost and context usage, and desktop notifications when a session needs you.
+
+Ninox is built in Rust with [Iced](https://github.com/iced-rs/iced): a GPU-accelerated native UI with its own embedded engine and SQLite store — no Electron, no bundled browser. [Claude Code](https://claude.com/claude-code) is the first-class harness; codex, opencode, and aider can be enabled via config.
+
+## Why use it?
+
+Use Ninox when you've outgrown a single agent in a single terminal:
+
+- You want several agents working in parallel without babysitting each one.
+- You want sessions that survive app restarts (and laptops going to sleep).
+- You want your agents to accumulate knowledge about your codebases instead of starting cold every session.
+- You want one place to see what's running, what it's doing, and what it has cost.
 
 ## Prerequisites
 
 - Rust toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+- tmux 3.2+ (3.5+ recommended for full extended-keyboard support)
 - macOS or Linux (Windows not yet supported)
 
 ## Install
@@ -28,7 +52,7 @@ cargo build --release -p ninox
 ./target/release/ninox --port 9090 --db ~/.local/share/ninox/ninox.db
 ```
 
-The HTTP server always starts on `127.0.0.1:8080` (or `--port`), exposing the engine's HTTP/WebSocket API.
+The HTTP server always starts on `127.0.0.1:8080` (or `--port`), exposing the engine's HTTP/WebSocket API — so everything the UI does is also scriptable.
 
 ## macOS app bundle
 
@@ -92,7 +116,7 @@ cargo run -p ninox -- --headless  # Run headless (engine + HTTP only)
 
 | Crate | Purpose |
 |---|---|
-| `ninox-core` | Engine: session lifecycle, config, storage |
+| `ninox-core` | Engine: session lifecycle, brain, config, storage |
 | `ninox-server` | HTTP/WebSocket server exposing the engine |
 | `ninox` | Native Iced UI + binary entry point |
 
