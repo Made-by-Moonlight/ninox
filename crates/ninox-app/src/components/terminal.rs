@@ -1,6 +1,6 @@
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::Term;
+use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, Rgb};
 use iced::widget::canvas::{Cache, Frame, Geometry, Path};
 use iced::{Color as IcedColor, Rectangle, Size, Theme};
@@ -549,9 +549,9 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
         let term_bg = self.terminal_bg;
         let term_fg = self.terminal_fg;
         let cursor_color = self.cursor_color;
-        // Shape + blink from DECSCUSR. Blink is deliberately not animated —
-        // see the module-level note on steady cursor rendering.
-        let cursor_shape = term.cursor_style().shape;
+        // Shape from DECSCUSR, visibility from DECTCEM. Blink is deliberately
+        // not animated — see the module-level note on steady cursor rendering.
+        let cursor_shape = effective_cursor_shape(term);
 
         let geometry = self.state.cache.draw(renderer, bounds.size(), |frame: &mut Frame| {
             // Background fill.
@@ -630,6 +630,19 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
         } else {
             iced::mouse::Interaction::default()
         }
+    }
+}
+
+/// Cursor shape the draw path should render. `Term::cursor_style()` only
+/// reflects DECSCUSR (block/beam/underline) — it never reports the cursor
+/// hidden via DECTCEM (CSI ?25l), which TUIs use to hide the cursor while
+/// repainting. Mirror alacritty's own `renderable_content()`: SHOW_CURSOR
+/// unset → `Hidden` (a no-op in `draw_cell`).
+fn effective_cursor_shape(term: &Term<EventProxy>) -> CursorShape {
+    if term.mode().contains(TermMode::SHOW_CURSOR) {
+        term.cursor_style().shape
+    } else {
+        CursorShape::Hidden
     }
 }
 
@@ -867,6 +880,24 @@ mod tests {
     fn process_ansi_no_panic() {
         let mut s = TerminalState::new(80, 24, None);
         s.process(b"\x1b[31mred\x1b[0m");
+    }
+
+    #[test]
+    fn dectcem_hide_yields_hidden_cursor_shape() {
+        // TUIs (e.g. Claude Code) hide the cursor with CSI ?25l during
+        // repaints; drawing it anyway paints a ghost cursor at whatever
+        // transient position a frame catches.
+        let mut s = TerminalState::new(80, 24, None);
+        s.process(b"\x1b[?25l");
+        assert_eq!(effective_cursor_shape(&s.term), CursorShape::Hidden);
+    }
+
+    #[test]
+    fn dectcem_show_restores_cursor_shape() {
+        let mut s = TerminalState::new(80, 24, None);
+        s.process(b"\x1b[?25l");
+        s.process(b"\x1b[?25h");
+        assert_ne!(effective_cursor_shape(&s.term), CursorShape::Hidden);
     }
 
     #[test]
