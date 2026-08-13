@@ -42,7 +42,9 @@ pub fn parse_capture(bytes: &[u8], cols: u16) -> Vec<StyledLine> {
     // capture-pane emits bare \n; the emulator needs \r\n to reset columns.
     let mut feed = Vec::with_capacity(bytes.len() + n_lines);
     for &b in bytes {
-        if b == b'\n' { feed.push(b'\r'); }
+        if b == b'\n' {
+            feed.push(b'\r');
+        }
         feed.push(b);
     }
     state.process(&feed);
@@ -80,6 +82,9 @@ pub struct Scrollback {
     pub lines: VecDeque<StyledLine>,
     /// How many lines above the live screen the view is scrolled. 0 = live.
     pub offset: usize,
+    /// User-requested offset, which may temporarily exceed `lines.len()`
+    /// while an older-history fetch is in flight.
+    requested_offset: usize,
     /// Most negative tmux history index fetched so far (0 = nothing yet).
     pub fetched_to: i64,
     /// All available history has been fetched.
@@ -92,19 +97,27 @@ impl Scrollback {
     /// n=0 → the line directly above the live screen.
     pub fn line_above(&self, n: usize) -> Option<&StyledLine> {
         let len = self.lines.len();
-        if n < len { self.lines.get(len - 1 - n) } else { None }
+        if n < len {
+            self.lines.get(len - 1 - n)
+        } else {
+            None
+        }
     }
 
     /// Scroll up by `delta`; clamps to cached lines. Returns true when the
     /// caller should fetch an older chunk (cache edge hit, more exists).
     pub fn scroll_up(&mut self, delta: usize) -> bool {
-        let want = self.offset + delta;
-        self.offset = want.min(self.lines.len());
-        want > self.lines.len() && !self.top_reached && !self.fetch_pending
+        self.requested_offset = self.requested_offset.saturating_add(delta);
+        if self.top_reached {
+            self.requested_offset = self.requested_offset.min(self.lines.len());
+        }
+        self.offset = self.requested_offset.min(self.lines.len());
+        self.requested_offset > self.lines.len() && !self.top_reached && !self.fetch_pending
     }
 
     pub fn scroll_down(&mut self, delta: usize) {
-        self.offset = self.offset.saturating_sub(delta);
+        self.requested_offset = self.requested_offset.saturating_sub(delta);
+        self.offset = self.requested_offset.min(self.lines.len());
     }
 
     /// Prepend an older chunk fetched from tmux.
@@ -115,6 +128,10 @@ impl Scrollback {
         self.fetched_to = fetched_to;
         self.top_reached = top_reached;
         self.fetch_pending = false;
+        if self.top_reached {
+            self.requested_offset = self.requested_offset.min(self.lines.len());
+        }
+        self.offset = self.requested_offset.min(self.lines.len());
     }
 }
 
@@ -167,15 +184,26 @@ mod tests {
         assert_eq!(sb.offset, 0, "offset must not exceed cached lines");
 
         sb.absorb(vec![vec![]; 100], -100, false);
+        assert_eq!(sb.offset, 3, "initial intent applies when history arrives");
         assert!(!sb.scroll_up(50), "within cache: no fetch needed");
-        assert_eq!(sb.offset, 50);
+        assert_eq!(sb.offset, 53);
         assert!(sb.scroll_up(60), "beyond cache: fetch needed");
         assert_eq!(sb.offset, 100, "clamped to cached lines");
 
         sb.scroll_down(30);
-        assert_eq!(sb.offset, 70);
+        assert_eq!(sb.offset, 83);
         sb.scroll_down(1000);
         assert_eq!(sb.offset, 0);
+    }
+
+    #[test]
+    fn scrolling_back_down_while_fetching_reduces_pending_intent() {
+        let mut sb = Scrollback::default();
+        assert!(sb.scroll_up(20));
+        sb.fetch_pending = true;
+        sb.scroll_down(15);
+        sb.absorb(vec![vec![]; 100], -100, false);
+        assert_eq!(sb.offset, 5);
     }
 
     #[test]
@@ -189,13 +217,19 @@ mod tests {
     #[test]
     fn line_above_indexes_newest_first() {
         let mut sb = Scrollback::default();
-        let mk = |ch: char| vec![StyledCell {
+        let mk = |ch: char| {
+            vec![StyledCell {
             c: ch,
-            fg: alacritty_terminal::vte::ansi::Color::Named(alacritty_terminal::vte::ansi::NamedColor::Foreground),
-            bg: alacritty_terminal::vte::ansi::Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background),
+                fg: alacritty_terminal::vte::ansi::Color::Named(
+                    alacritty_terminal::vte::ansi::NamedColor::Foreground,
+                ),
+                bg: alacritty_terminal::vte::ansi::Color::Named(
+                    alacritty_terminal::vte::ansi::NamedColor::Background,
+                ),
             flags: alacritty_terminal::term::cell::Flags::empty(),
             hyperlink: None,
-        }];
+            }]
+        };
         // Oldest-first storage: a then b; b is directly above the screen.
         sb.absorb(vec![mk('a'), mk('b')], -2, true);
         assert_eq!(sb.line_above(0).unwrap()[0].c, 'b');
