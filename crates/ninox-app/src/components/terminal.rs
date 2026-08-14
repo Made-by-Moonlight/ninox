@@ -33,37 +33,62 @@ fn term_font_has_glyph(character: char) -> bool {
     .is_some()
 }
 
-fn font_and_shaping_for_cell(
-    character: char,
-    flags: Flags,
-) -> (iced::Font, iced::widget::text::Shaping) {
+fn is_nerd_codepoint(character: char) -> bool {
     let codepoint = character as u32;
-    if (0xE000..=0xF8FF).contains(&codepoint)
+    (0xE000..=0xF8FF).contains(&codepoint)
         || (0xF0000..=0xFFFFD).contains(&codepoint)
         || (0x100000..=0x10FFFD).contains(&codepoint)
-    {
-        return (NERD_FONT, iced::widget::text::Shaping::Basic);
-    }
+}
 
-    let font = iced::Font {
-        weight: if flags.intersects(Flags::BOLD) {
-            iced::font::Weight::Bold
-        } else {
-            iced::font::Weight::Normal
-        },
-        style: if flags.contains(Flags::ITALIC) {
-            iced::font::Style::Italic
-        } else {
-            iced::font::Style::Normal
-        },
-        ..TERM_FONT
-    };
-    let shaping = if term_font_has_glyph(character) {
-        iced::widget::text::Shaping::Basic
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlyphRendering {
+    Basic,
+    Contextual,
+    Fallback,
+}
+
+fn glyph_rendering(character: char) -> GlyphRendering {
+    if character.is_ascii() || is_nerd_codepoint(character) {
+        GlyphRendering::Basic
+    } else if term_font_has_glyph(character) {
+        GlyphRendering::Contextual
     } else {
-        iced::widget::text::Shaping::Advanced
-    };
-    (font, shaping)
+        GlyphRendering::Fallback
+    }
+}
+
+fn font_for_cell(character: char, flags: Flags) -> iced::Font {
+    if is_nerd_codepoint(character) {
+        NERD_FONT
+    } else {
+        iced::Font {
+            weight: if flags.intersects(Flags::BOLD) {
+                iced::font::Weight::Bold
+            } else {
+                iced::font::Weight::Normal
+            },
+            style: if flags.contains(Flags::ITALIC) {
+                iced::font::Style::Italic
+            } else {
+                iced::font::Style::Normal
+            },
+            ..TERM_FONT
+        }
+    }
+}
+
+fn draw_contextual_glyph(
+    frame: &mut Frame,
+    character: char,
+    mut text: iced::widget::canvas::Text,
+) {
+    // Advanced shaping is reliable when the requested font is already
+    // established by an adjacent bundled glyph. U+200B is covered by
+    // JetBrains Mono but has no advance, so it anchors font selection without
+    // painting or shifting the terminal cell.
+    text.content = format!("\u{200b}{character}");
+    text.shaping = iced::widget::text::Shaping::Advanced;
+    frame.fill_text(text);
 }
 
 /// The single source of truth for the terminal's font size — every layout
@@ -920,8 +945,9 @@ fn draw_cell(
     if c != ' ' && c != '\0' {
         let glyph_fg = if block_cursor { term_bg } else { fg };
 
-        let (font, shaping) = font_and_shaping_for_cell(c, flags);
-        frame.fill_text(iced::widget::canvas::Text {
+        let font = font_for_cell(c, flags);
+        let rendering = glyph_rendering(c);
+        let mut text = iced::widget::canvas::Text {
             content: c.to_string(),
             position: iced::Point::new(x, y),
             color: glyph_fg,
@@ -930,11 +956,16 @@ fn draw_cell(
             horizontal_alignment: iced::alignment::Horizontal::Left,
             vertical_alignment: iced::alignment::Vertical::Top,
             line_height: iced::widget::text::LineHeight::Relative(cell_h / font_size),
-            // Keep bundled glyphs deterministic; use system fallback only
-            // when JetBrains Mono genuinely lacks the codepoint (e.g. Braille
-            // spinner frames).
-            shaping,
-        });
+            shaping: iced::widget::text::Shaping::Basic,
+        };
+        if rendering == GlyphRendering::Contextual {
+            draw_contextual_glyph(frame, c, text);
+        } else {
+            if rendering == GlyphRendering::Fallback {
+                text.shaping = iced::widget::text::Shaping::Advanced;
+            }
+            frame.fill_text(text);
+        }
     }
 
     // Decoration strokes — drawn in the resolved (post-transform) fg color.
@@ -1138,20 +1169,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_braille_spinner_glyphs_use_fallback_without_affecting_punctuation() {
-        for character in ['\'', '’', '“', '”', '→'] {
-            assert!(term_font_has_glyph(character));
-            assert_eq!(
-                font_and_shaping_for_cell(character, Flags::empty()).1,
-                iced::widget::text::Shaping::Basic
-            );
+    fn unicode_punctuation_uses_context_without_changing_fallback_policy() {
+        assert!(term_font_has_glyph('\u{200b}'));
+        assert_eq!(glyph_rendering('\''), GlyphRendering::Basic);
+        assert_eq!(glyph_rendering('\u{e0b0}'), GlyphRendering::Basic);
+        for character in ['’', '“', '”', '→'] {
+            assert_eq!(glyph_rendering(character), GlyphRendering::Contextual);
         }
         for character in ['⠰', '⠳'] {
-            assert!(!term_font_has_glyph(character));
-            assert_eq!(
-                font_and_shaping_for_cell(character, Flags::empty()).1,
-                iced::widget::text::Shaping::Advanced
-            );
+            assert_eq!(glyph_rendering(character), GlyphRendering::Fallback);
         }
 
         let mut state = TerminalState::new(20, 1, None);
