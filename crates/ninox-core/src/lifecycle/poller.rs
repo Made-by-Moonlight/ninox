@@ -1049,11 +1049,36 @@ impl Poller {
         let mut terminal_prs: Vec<(String, u64)> = Vec::new();
         for w in watches {
             let key = PrKey { repo: w.repo.clone(), number: w.pr_number };
-            let Some(snap) = result.prs.get(&key) else { continue };
             let cache_key = format!(
                 "watch:{}#{}:{}",
                 w.repo, w.pr_number, w.opener_session_id.as_deref().unwrap_or(""),
             );
+            let Some(snap) = result.prs.get(&key) else {
+                // The PR vanished from the batch result (deleted/renamed repo,
+                // access revoked, etc.) without an explicit batch error — the
+                // watch has no terminal signal to act on, so it stays
+                // registered forever unless the user runs `ninox close --pr`.
+                // Warn once per run of consecutive misses via the same
+                // dedup flag `notify_github_lookup_failed` uses, but log only
+                // — no notification event (that stays session-scoped).
+                let mut cache = self.enrichment_cache.lock().unwrap();
+                let state = cache.entry(cache_key.clone()).or_default();
+                if !state.github_lookup_failed_notified {
+                    tracing::warn!(
+                        "watch {}#{}: PR absent from batch result (deleted/renamed repo?); \
+                         watch stays until `ninox close --pr`",
+                        w.repo, w.pr_number,
+                    );
+                    state.github_lookup_failed_notified = true;
+                }
+                continue;
+            };
+            {
+                let mut cache = self.enrichment_cache.lock().unwrap();
+                if let Some(state) = cache.get_mut(&cache_key) {
+                    state.github_lookup_failed_notified = false;
+                }
+            }
 
             if snap.status.merged || snap.closed {
                 self.engine.emit(Event::Notification(Notification {
@@ -4233,6 +4258,44 @@ mod tests {
         assert_eq!(done.len(), 1, "exactly one terminal notification — the watch's, not a session merge");
         assert!(done[0].title.contains("o/r#7"), "it must be about the watched PR, got {:?}", done[0].title);
         assert!(store.list_pr_watches().unwrap().is_empty());
+    }
+
+    /// A watch whose PR key never shows up in the batch result (deleted or
+    /// renamed repo, access revoked, etc.) has no terminal signal to act
+    /// on — it must stay registered forever (only `ninox close --pr` may
+    /// drop it) and must never emit a `Notification` event. The dedup log
+    /// warning is a controller-ruled log-only path with no assertable
+    /// event, so this only asserts on the registry and the event stream.
+    #[tokio::test]
+    async fn watch_missing_from_batch_result_stays_registered_and_silent() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("sess-a", "/ws")).unwrap();
+        store.upsert_pr_watch(&watch_by("o/r", 7, "sess-a")).unwrap();
+
+        // Batch result never contains a "o/r"#7 entry — the PR is absent.
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+
+        let engine = batch_engine(store.clone(), batch);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched().await;
+        poller.poll_github_batched().await;
+
+        assert!(
+            notifs(&drain_events(&mut rx), NotificationKind::WorkerDone).is_empty(),
+            "a missing batch entry is not a terminal signal — no WorkerDone",
+        );
+        assert!(
+            notifs(&drain_events(&mut rx), NotificationKind::GithubLookupFailed).is_empty(),
+            "the miss is log-only — no notification event, deduped or otherwise",
+        );
+        assert_eq!(
+            store.list_pr_watches().unwrap().len(), 1,
+            "the watch must stay registered across repeated misses until `ninox close --pr`",
+        );
     }
 
     // ── Update check ─────────────────────────────────────────────────────────
