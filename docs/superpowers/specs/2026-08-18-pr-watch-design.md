@@ -107,8 +107,9 @@ Branch→PR reconciliation folds into the same query via
 Targets are chunked at ~50 PRs per query.
 
 Quirk: `mergeable` returns `UNKNOWN` while GitHub computes it lazily —
-keep the last known value and re-read next tick rather than flapping
-`GateCheck::Mergeable`.
+map it to `None`, exactly what the legacy REST path receives (`null`
+while computing), so `GateCheck::Mergeable` behaves identically on both
+paths and self-corrects on the next tick.
 
 Auth: the existing `resolve_token()` chain; POST to
 `api.github.com/graphql`.
