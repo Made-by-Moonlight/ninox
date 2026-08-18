@@ -469,7 +469,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// Parse a GitHub API timestamp (`"2024-01-02T03:04:05Z"`, always UTC) into
 /// Unix epoch milliseconds. Returns `0` for anything unparseable rather than
 /// failing the whole fetch over one bad timestamp.
-fn parse_github_timestamp(s: &str) -> i64 {
+pub(crate) fn parse_github_timestamp(s: &str) -> i64 {
     let b = s.as_bytes();
     if b.len() < 19 {
         return 0;

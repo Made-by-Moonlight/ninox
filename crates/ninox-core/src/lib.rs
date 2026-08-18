@@ -6,6 +6,7 @@ pub mod config;
 pub mod embeddings;
 pub mod events;
 pub mod github;
+pub mod github_graphql;
 pub mod harness;
 pub mod hooks;
 pub mod inbox;
