@@ -369,6 +369,28 @@ pub fn split_repo(s: &str) -> Option<(String, String)> {
     Some((owner, repo))
 }
 
+/// Parse a GitHub PR URL (`https://github.com/{owner}/{repo}/pull/{n}`,
+/// tolerating `www.`, a trailing slash, and PR sub-pages like `/files`)
+/// into `("owner/repo", n)`. Returns `None` for anything else — including
+/// non-GitHub hosts and issue URLs — so `ninox open --pr` can refuse
+/// unwatchable input loudly instead of registering a dud row.
+pub fn parse_pr_url(url: &str) -> Option<(String, u64)> {
+    let rest = url
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| url.trim().strip_prefix("http://"))?;
+    let rest = rest.strip_prefix("www.").unwrap_or(rest);
+    let rest = rest.strip_prefix("github.com/")?;
+    let mut parts = rest.split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    if parts.next()? != "pull" {
+        return None;
+    }
+    let number: u64 = parts.next()?.parse().ok()?;
+    Some((format!("{owner}/{repo}"), number))
+}
+
 /// Every configured git remote's GitHub repo slug (`owner/repo`) for
 /// `workspace`, `origin` first (the common case, tried with no extra
 /// requests) then any other remote in `git remote` order. Repos here
@@ -536,6 +558,28 @@ mod tests {
         let (owner, repo) = split_repo("https://github.com/Made-by-Moonlight/Athene.git").unwrap();
         assert_eq!(owner, "Made-by-Moonlight");
         assert_eq!(repo, "Athene");
+    }
+
+    #[test]
+    fn parse_pr_url_extracts_slug_and_number() {
+        assert_eq!(
+            parse_pr_url("https://github.com/Synthesia-Technologies/ninox/pull/42"),
+            Some(("Synthesia-Technologies/ninox".to_string(), 42))
+        );
+    }
+
+    #[test]
+    fn parse_pr_url_tolerates_trailing_slash_www_and_subpaths() {
+        assert_eq!(parse_pr_url("https://www.github.com/o/r/pull/7/"), Some(("o/r".to_string(), 7)));
+        assert_eq!(parse_pr_url("https://github.com/o/r/pull/7/files"), Some(("o/r".to_string(), 7)));
+    }
+
+    #[test]
+    fn parse_pr_url_rejects_non_pr_urls() {
+        assert_eq!(parse_pr_url("https://github.com/o/r"), None);
+        assert_eq!(parse_pr_url("https://github.com/o/r/issues/7"), None);
+        assert_eq!(parse_pr_url("https://gitlab.com/o/r/pull/7"), None);
+        assert_eq!(parse_pr_url("https://github.com/o/r/pull/not-a-number"), None);
     }
 
     #[test]
