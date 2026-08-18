@@ -77,6 +77,13 @@ pub struct Poller {
     /// about, so a steady "still on 0.14.0" state re-notifies only once,
     /// not every tick — same dedup shape as `github_lookup_failed_notified`.
     last_notified_update: Arc<std::sync::Mutex<Option<semver::Version>>>,
+    /// Unix millis until which `poll_github_batched` must skip its tick
+    /// entirely (0 = no pause). Set by `note_rate_limit` (GraphQL budget
+    /// running low) or `note_batch_error` (GitHub answered 403/429). A
+    /// paused tick returns before `GithubBatchApi::fetch_batch` is even
+    /// called — a skipped tick, never a blocked task — so it costs nothing
+    /// beyond the interval's own tick.
+    rate_limit_pause_until: Arc<std::sync::Mutex<i64>>,
 }
 
 impl Poller {
@@ -93,6 +100,7 @@ impl Poller {
             vault_locks:      Arc::new(std::sync::Mutex::new(HashMap::new())),
             update_source:    Arc::new(CargoRegistryUpdateSource),
             last_notified_update: Arc::new(std::sync::Mutex::new(None)),
+            rate_limit_pause_until: Arc::new(std::sync::Mutex::new(0)),
         }
     }
 
@@ -101,6 +109,15 @@ impl Poller {
     pub fn with_update_source(mut self, source: Arc<dyn UpdateSource>) -> Self {
         self.update_source = source;
         self
+    }
+
+    /// Test seam: force `rate_limit_pause_until` directly, so pause-expiry
+    /// behavior (a past pause not skipping a tick) can be exercised without
+    /// waiting on a real clock or driving it through `note_rate_limit`/
+    /// `note_batch_error`.
+    #[cfg(test)]
+    fn set_pause_until(&self, t: i64) {
+        *self.rate_limit_pause_until.lock().unwrap_or_else(|e| e.into_inner()) = t;
     }
 
     /// The (created-on-first-use) lock for a given vault path — see
@@ -804,6 +821,13 @@ impl Poller {
     /// legacy path; anyone actually hitting it can flip `[pr_watch] enabled`
     /// off to get it back.
     async fn poll_github_batched(&self) {
+        // A skipped tick, never a blocked task: checked before anything
+        // else, including `self.engine.github_batch`'s own presence check,
+        // so a pause set by `note_rate_limit`/`note_batch_error` costs
+        // nothing beyond this one lock+compare every interval tick.
+        if now_millis() < *self.rate_limit_pause_until.lock().unwrap_or_else(|e| e.into_inner()) {
+            return;
+        }
         let Some(batch) = &self.engine.github_batch else { return };
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
         let watches = self.engine.store.list_pr_watches().unwrap_or_default();
@@ -955,16 +979,48 @@ impl Poller {
     }
 
     /// A whole batched fetch failed — every target this tick is unobserved.
-    /// Backoff/rate-limit accounting is filled in by a later task; for now
-    /// the failure is logged so it isn't silent.
+    /// `RateLimitedError` (403/429 from GitHub's GraphQL endpoint) pauses
+    /// `poll_github_batched` for its `Retry-After` hint, or a fixed 120s
+    /// when GitHub sent none; any other error (a transient network blip,
+    /// say) is logged only — polling must not stall over something that
+    /// will very likely have cleared up by the next tick. `{e:#}` logs the
+    /// full `anyhow` cause chain, not just the top-level message, so a
+    /// sustained outage (which otherwise notifies nobody — watches/sessions
+    /// simply go quiet) is still diagnosable from logs alone.
     fn note_batch_error(&self, e: &anyhow::Error) {
-        tracing::warn!("github batch fetch: {e}");
+        if let Some(rl) = e.downcast_ref::<crate::github_graphql::RateLimitedError>() {
+            let pause_until = match rl.retry_after_secs {
+                Some(secs) => now_millis() + secs as i64 * 1000,
+                None       => now_millis() + 120_000,
+            };
+            *self.rate_limit_pause_until.lock().unwrap_or_else(|e| e.into_inner()) = pause_until;
+            tracing::warn!("github batch fetch rate limited, pausing until {pause_until}: {e:#}");
+        } else {
+            tracing::warn!("github batch fetch failed (no pause; retrying next tick): {e:#}");
+        }
     }
 
-    /// Record the GraphQL rate-limit budget reported by the last fetch —
-    /// filled in by a later task (adaptive interval + budget notification).
-    fn note_rate_limit(&self, _rate_limit: &crate::github_graphql::RateLimitInfo) {
-        // filled in by a later task
+    /// Record the GraphQL rate-limit budget reported by the last fetch. Once
+    /// the remaining budget drops below a small floor, pause
+    /// `poll_github_batched` until GitHub's own reset time rather than
+    /// grinding the remaining quota to zero. Warns only when newly pausing
+    /// (not on every low-budget tick): once paused, `poll_github_batched`'s
+    /// own pause check stops this from being called again until the pause
+    /// has actually elapsed, so re-warning here would only fire for a pause
+    /// that's already expired — i.e. genuinely new.
+    fn note_rate_limit(&self, rate_limit: &crate::github_graphql::RateLimitInfo) {
+        if rate_limit.remaining >= 100 || rate_limit.reset_at <= now_millis() {
+            return;
+        }
+        let mut pause = self.rate_limit_pause_until.lock().unwrap_or_else(|e| e.into_inner());
+        let already_paused = *pause > now_millis();
+        *pause = rate_limit.reset_at;
+        if !already_paused {
+            tracing::warn!(
+                "github rate limit low ({} remaining, cost {}) — pausing batched polling until {}",
+                rate_limit.remaining, rate_limit.cost, rate_limit.reset_at,
+            );
+        }
     }
 
     /// Fan the batched snapshots out to the registry's PR watches: merge/close
@@ -3469,6 +3525,12 @@ mod tests {
         /// later calls see an empty `BatchResult`, which is exactly the
         /// "alias missing" shape the lookup-failure dedup test needs.
         result: std::sync::Mutex<crate::github_graphql::BatchResult>,
+        /// Queued front-first, ahead of `result` above: a test that wants a
+        /// specific `fetch_batch` call to fail (e.g. with a
+        /// `RateLimitedError`) pushes one here. Once drained, calls fall
+        /// back to the `result`/`mem::take` behavior as before — most tests
+        /// never touch this and see no change.
+        queued_errors: std::sync::Mutex<std::collections::VecDeque<anyhow::Error>>,
         /// Every `(pr_keys, branch_keys)` pair the poller asked for, in order.
         calls:  std::sync::Mutex<Vec<(Vec<crate::github_graphql::PrKey>, Vec<crate::github_graphql::BranchKey>)>>,
     }
@@ -3481,6 +3543,9 @@ mod tests {
             branches: &[crate::github_graphql::BranchKey],
         ) -> anyhow::Result<crate::github_graphql::BatchResult> {
             self.calls.lock().unwrap().push((prs.to_vec(), branches.to_vec()));
+            if let Some(err) = self.queued_errors.lock().unwrap().pop_front() {
+                return Err(err);
+            }
             Ok(std::mem::take(&mut *self.result.lock().unwrap()))
         }
     }
@@ -3815,6 +3880,119 @@ mod tests {
             e, Event::Notification(n) if n.kind == crate::types::NotificationKind::GithubLookupFailed
         )).count();
         assert_eq!(failures, 1, "a missing alias must notify once, not once per tick");
+    }
+
+    // ── Rate-limit floor and Retry-After backoff (`note_rate_limit` /
+    //    `note_batch_error` / the pause check atop `poll_github_batched`) ────
+
+    /// A low-but-nonzero remaining budget must pause the *next* tick before
+    /// it even calls `fetch_batch` — a skipped tick, not a blocked one.
+    #[tokio::test]
+    async fn low_rate_limit_remaining_pauses_next_tick() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        {
+            let mut result = batch.result.lock().unwrap();
+            result.prs.insert(pr_key("Owner/repo", 50), open_snapshot(50));
+            result.rate_limit = crate::github_graphql::RateLimitInfo {
+                cost: 1, remaining: 50, reset_at: now_millis() + 60_000,
+            };
+        }
+
+        let engine = batch_engine(store.clone(), batch.clone());
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched().await;
+        poller.poll_github_batched().await;
+
+        assert_eq!(
+            batch.calls.lock().unwrap().len(), 1,
+            "a low remaining budget must pause the second tick before it fetches",
+        );
+    }
+
+    /// A healthy remaining budget must never pause — both ticks fetch.
+    #[tokio::test]
+    async fn healthy_rate_limit_does_not_pause() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        {
+            let mut result = batch.result.lock().unwrap();
+            result.prs.insert(pr_key("Owner/repo", 50), open_snapshot(50));
+            result.rate_limit = crate::github_graphql::RateLimitInfo {
+                cost: 1, remaining: 4000, reset_at: now_millis() + 60_000,
+            };
+        }
+
+        let engine = batch_engine(store.clone(), batch.clone());
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched().await;
+        poller.poll_github_batched().await;
+
+        assert_eq!(
+            batch.calls.lock().unwrap().len(), 2,
+            "a healthy remaining budget must never pause polling",
+        );
+    }
+
+    /// A `RateLimitedError` with a `Retry-After` hint pauses for exactly
+    /// that long — the next tick must be skipped, not merely retried.
+    #[tokio::test]
+    async fn rate_limited_error_with_retry_after_pauses() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        batch.queued_errors.lock().unwrap().push_back(
+            anyhow::Error::new(crate::github_graphql::RateLimitedError { retry_after_secs: Some(3600) })
+        );
+        batch.result.lock().unwrap().prs.insert(pr_key("Owner/repo", 50), open_snapshot(50));
+
+        let engine = batch_engine(store.clone(), batch.clone());
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched().await; // errors — pauses for 3600s
+        poller.poll_github_batched().await; // must be skipped
+
+        assert_eq!(
+            batch.calls.lock().unwrap().len(), 1,
+            "a Retry-After-bearing rate limit error must pause the next tick",
+        );
+    }
+
+    /// A pause timestamp already in the past must not skip a tick — the
+    /// pause check compares against "now", not merely "is it set".
+    #[tokio::test]
+    async fn past_pause_does_not_skip_tick() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        batch.result.lock().unwrap().prs.insert(pr_key("Owner/repo", 50), open_snapshot(50));
+
+        let engine = batch_engine(store.clone(), batch.clone());
+        let poller = Poller::new(engine);
+        poller.set_pause_until(now_millis() - 1_000);
+
+        poller.poll_github_batched().await;
+
+        assert_eq!(
+            batch.calls.lock().unwrap().len(), 1,
+            "a pause timestamp already in the past must not skip the tick",
+        );
     }
 
     // ── Registry watch delivery (`deliver_watch_updates`) ────────────────────
