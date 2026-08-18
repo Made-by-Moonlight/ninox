@@ -811,9 +811,19 @@ impl Poller {
         // -- Collect targets --------------------------------------------------
         // Session PRs: same skip rule as poll_github — only Done is excluded.
         let mut pr_keys: Vec<PrKey> = Vec::new();
+        // Insertion-ordered, deduped: `candidate_repos` sorts `origin` first,
+        // and the adoption loop below walks this Vec (not the result HashMap)
+        // so a session with several remotes deterministically adopts from the
+        // *first* one that has a PR — matching `poll_pr_reconciliation`'s
+        // origin-first, break-on-first-match behavior. Dedup is done with a
+        // seen-set while building rather than `sort`+`dedup`, which would
+        // destroy that origin-first ordering.
         let mut branch_keys: Vec<BranchKey> = Vec::new();
-        // (session.id, branch) per branch key repo, to adopt discovered PRs.
-        let mut branch_owners: HashMap<BranchKey, String> = HashMap::new();
+        let mut seen_branch_keys: std::collections::HashSet<BranchKey> = std::collections::HashSet::new();
+        // Every session awaiting adoption on a given (repo, branch). Several
+        // sessions can share one workspace (and so one key) — all of them must
+        // adopt, exactly as the legacy per-session reconciliation loop does.
+        let mut branch_owners: HashMap<BranchKey, Vec<String>> = HashMap::new();
 
         for session in &sessions {
             if matches!(session.status, SessionStatus::Done) {
@@ -832,8 +842,10 @@ impl Poller {
                         if let Some(branch) = crate::github::current_branch(ws) {
                             for repo_slug in crate::github::candidate_repos(ws) {
                                 let key = BranchKey { repo: repo_slug, branch: branch.clone() };
-                                branch_owners.insert(key.clone(), session.id.clone());
-                                branch_keys.push(key);
+                                branch_owners.entry(key.clone()).or_default().push(session.id.clone());
+                                if seen_branch_keys.insert(key.clone()) {
+                                    branch_keys.push(key);
+                                }
                             }
                         }
                     }
@@ -861,25 +873,37 @@ impl Poller {
         self.note_rate_limit(&result.rate_limit);
 
         // -- Branch adoption (replaces poll_pr_reconciliation) ----------------
-        for (key, pr_ref) in &result.branch_prs {
-            let Some(pr_ref) = pr_ref else { continue };
-            let Some(session_id) = branch_owners.get(key) else { continue };
-            let Ok(Some(mut session)) = self.engine.store.get_session(session_id) else { continue };
-            if session.pr_number.is_some() {
-                continue; // adopted via an earlier key this tick
-            }
-            session.pr_number = Some(pr_ref.number);
-            session.repo      = key.repo.clone();
-            session.status    = SessionStatus::PrOpen;
-            if let Some(written) = self.update_live_session_row(&session, |row| {
-                row.pr_number = session.pr_number;
-                row.repo      = session.repo.clone();
-                row.status    = session.status.clone();
-            }) {
-                self.engine.emit(Event::SessionUpdated(
-                    written,
-                    SessionFields::PR_LINK | SessionFields::STATUS,
-                ));
+        // Driven by `branch_keys` (insertion-ordered, origin-first) rather
+        // than `result.branch_prs` (a HashMap with arbitrary iteration order),
+        // so which remote a multi-remote session adopts from is deterministic.
+        for key in &branch_keys {
+            let Some(Some(pr_ref)) = result.branch_prs.get(key) else { continue };
+            let Some(owner_ids) = branch_owners.get(key) else { continue };
+            for session_id in owner_ids {
+                let Ok(Some(mut session)) = self.engine.store.get_session(session_id) else { continue };
+                if session.pr_number.is_some() {
+                    // Already adopted — either via an earlier (higher-priority)
+                    // key this tick, which is what makes the first matching
+                    // remote win, or before this tick entirely.
+                    continue;
+                }
+                session.pr_number = Some(pr_ref.number);
+                session.repo      = key.repo.clone();
+                session.status    = SessionStatus::PrOpen;
+                if let Some(written) = self.update_live_session_row(&session, |row| {
+                    row.pr_number = session.pr_number;
+                    row.repo      = session.repo.clone();
+                    row.status    = session.status.clone();
+                }) {
+                    self.engine.emit(Event::SessionUpdated(
+                        written,
+                        SessionFields::PR_LINK | SessionFields::STATUS,
+                    ));
+                    tracing::info!(
+                        "session {} PR #{} detected via reconciliation ({}, branch {})",
+                        session.id, pr_ref.number, key.repo, key.branch,
+                    );
+                }
             }
         }
 
@@ -3541,6 +3565,11 @@ mod tests {
         poller.poll_github_batched().await;
 
         let calls = batch.calls.lock().unwrap().clone();
+        // The branch-key Vec is built straight from `candidate_repos`, which
+        // sorts `origin` first — and the adoption loop walks that Vec rather
+        // than the result HashMap, so a multi-remote session deterministically
+        // adopts from the first (origin) remote that has a PR, exactly as
+        // `poll_pr_reconciliation`'s break-on-first-match loop does.
         assert_eq!(calls[0].1, vec![branch_key], "a PR-less session must contribute its branch key");
 
         let after = store.get_session("s1").unwrap().unwrap();
@@ -3558,6 +3587,65 @@ mod tests {
                     && fields.contains(SessionFields::STATUS)
             )),
             "adoption must broadcast the PR link and status to the UI",
+        );
+    }
+
+    /// Several sessions can share one workspace (an orchestrator and its
+    /// worker on the same worktree, a re-attached session, a split follow-up).
+    /// They collapse to a single branch key — one alias in the query — but the
+    /// adoption must still fan back out to *every* owner, exactly as the
+    /// legacy per-session reconciliation loop does. A last-writer-wins owner
+    /// map would leave all but one of them permanently un-adopted.
+    #[tokio::test]
+    async fn batched_poll_adopts_branch_pr_for_every_session_sharing_a_workspace() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", &workspace)).unwrap();
+        store.upsert_session(&test_session("s2", &workspace)).unwrap();
+
+        let branch_key = crate::github_graphql::BranchKey {
+            repo: "Owner/repo".into(), branch: "worker-branch".into(),
+        };
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        batch.result.lock().unwrap().branch_prs.insert(
+            branch_key.clone(),
+            Some(crate::github::PrRef { number: 9, url: "https://github.com/Owner/repo/pull/9".into() }),
+        );
+
+        let engine = batch_engine(store.clone(), batch.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched().await;
+
+        assert_eq!(
+            batch.calls.lock().unwrap()[0].1, vec![branch_key],
+            "two sessions on one workspace must still cost exactly one branch alias",
+        );
+
+        for id in ["s1", "s2"] {
+            let after = store.get_session(id).unwrap().unwrap();
+            assert_eq!(after.pr_number, Some(9), "{id} must adopt the branch's PR too");
+            assert_eq!(after.repo, "Owner/repo", "{id} must record the repo the PR was found in");
+            assert!(matches!(after.status, SessionStatus::PrOpen), "{id} must move to PrOpen");
+        }
+
+        let events = drain_events(&mut rx);
+        let adopted: std::collections::HashSet<String> = events.iter().filter_map(|e| match e {
+            Event::SessionUpdated(s, fields)
+                if s.pr_number == Some(9)
+                    && fields.contains(SessionFields::PR_LINK)
+                    && fields.contains(SessionFields::STATUS) => Some(s.id.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(
+            adopted,
+            ["s1".to_string(), "s2".to_string()].into_iter().collect::<std::collections::HashSet<_>>(),
+            "both sessions' adoptions must reach the UI",
         );
     }
 
