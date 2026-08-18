@@ -116,6 +116,27 @@ enum Command {
         #[command(subcommand)]
         action: WorkersAction,
     },
+    /// Register a PR for consolidated watching ([pr_watch] must be enabled).
+    /// The current session ($NINOX_SESSION) becomes the watch's opener and
+    /// receives merge/CI/review notifications for it.
+    Open {
+        /// GitHub PR URL, e.g. https://github.com/owner/repo/pull/42
+        #[arg(long)]
+        pr: String,
+    },
+    /// Remove this session's watch on a PR (other sessions' watches on the
+    /// same PR are unaffected).
+    Close {
+        /// GitHub PR URL previously passed to `ninox open --pr`
+        #[arg(long)]
+        pr: String,
+    },
+    /// List watched resources
+    List {
+        /// List active PR watches
+        #[arg(long)]
+        prs: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -300,6 +321,39 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(run_workers_cli(action, db_path).await);
     }
 
+    // Fires on every `ninox open --pr` / `ninox close --pr` / `ninox list
+    // --prs` invocation — agents call these directly (via NINOX_BIN) on
+    // every PR they open or finish with, so this must stay fast and skip
+    // the tmux-config/wrapper-hook/self-shim setup below the same way
+    // Statusline/Inbox do above; it needs only `Store::open`. `matches!`
+    // (rather than `if let ... = command`) is used as the guard because the
+    // three variants carry different fields — binding them here would move
+    // `command` on a branch that falls through to the `match command` below
+    // instead of returning, which the borrow checker rejects. `..` patterns
+    // bind nothing, so the guard itself never moves `command`; the actual
+    // move happens via `command.unwrap()` a few lines down, on a path that
+    // unconditionally returns.
+    if matches!(
+        command,
+        Some(Command::Open { .. } | Command::Close { .. } | Command::List { .. })
+    ) {
+        let db_path = args.db.unwrap_or_else(default_db_path);
+        std::fs::create_dir_all(db_path.parent().unwrap())?;
+        let store = Store::open(&db_path)?;
+        let enabled = AppConfig::load().unwrap_or_default().pr_watch.enabled;
+        let opener = std::env::var("NINOX_SESSION").ok().filter(|s| !s.is_empty());
+        let action = match command.unwrap() {
+            Command::Open { pr }  => PrWatchCliAction::Open { pr },
+            Command::Close { pr } => PrWatchCliAction::Close { pr },
+            Command::List { prs } => {
+                anyhow::ensure!(prs, "nothing to list — pass --prs");
+                PrWatchCliAction::List
+            }
+            _ => unreachable!(),
+        };
+        println!("{}", run_pr_watch(&store, enabled, action, opener)?);
+        return Ok(());
+    }
 
     if let Err(e) = tmux::write_server_config() {
         eprintln!("failed to write tmux config: {e}");
@@ -361,6 +415,12 @@ async fn main() -> anyhow::Result<()> {
         // across the early `return`.
         Some(Command::Workers { .. }) => {
             unreachable!("Workers short-circuits and returns earlier in main()")
+        }
+        // Open/Close/List always short-circuit-return above before reaching
+        // this match; unreachable in practice, but the compiler can't see
+        // that across the early `return`.
+        Some(Command::Open { .. } | Command::Close { .. } | Command::List { .. }) => {
+            unreachable!("Open/Close/List short-circuit and return earlier in main()")
         }
         None => run_tui(store, args.port, args.headless).await,
     }
@@ -1578,6 +1638,79 @@ fn run_inbox(action: InboxAction) {
     }
 }
 
+/// The parsed form of `Command::Open`/`Command::Close`/`Command::List{prs}`
+/// consumed by [`run_pr_watch`] — kept separate from `Command` so the core
+/// logic is testable without going through clap's arg parsing.
+enum PrWatchCliAction {
+    Open { pr: String },
+    Close { pr: String },
+    List,
+}
+
+/// Core logic for `ninox open --pr` / `ninox close --pr` / `ninox list
+/// --prs`, pulled into a free function (same convention as `run_brain_add`/
+/// `run_discover_repos`) so tests can drive it directly against a scratch
+/// `Store` without spawning the binary. Returns the message to print.
+fn run_pr_watch(
+    store: &ninox_core::store::Store,
+    config_enabled: bool,
+    action: PrWatchCliAction,
+    opener: Option<String>,
+) -> anyhow::Result<String> {
+    use ninox_core::{github::parse_pr_url, types::PrWatch};
+    match action {
+        PrWatchCliAction::Open { pr } => {
+            let (repo, number) = parse_pr_url(&pr)
+                .ok_or_else(|| anyhow::anyhow!("not a GitHub PR URL: {pr}"))?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            store.upsert_pr_watch(&PrWatch {
+                repo: repo.clone(),
+                pr_number: number,
+                pr_url: pr,
+                opener_session_id: opener,
+                created_at: now,
+            })?;
+            let mut msg = format!("watching {repo}#{number}");
+            if !config_enabled {
+                msg.push_str(
+                    " — note: pr_watch is disabled ([pr_watch].enabled = false), \
+                     the watch is recorded but inactive until it is enabled",
+                );
+            }
+            Ok(msg)
+        }
+        PrWatchCliAction::Close { pr } => {
+            let (repo, number) = parse_pr_url(&pr)
+                .ok_or_else(|| anyhow::anyhow!("not a GitHub PR URL: {pr}"))?;
+            let removed = store.delete_pr_watch(&repo, number, opener.as_deref())?;
+            Ok(if removed > 0 {
+                format!("closed watch on {repo}#{number}")
+            } else {
+                format!("no watch on {repo}#{number} for this session")
+            })
+        }
+        PrWatchCliAction::List => {
+            let watches = store.list_pr_watches()?;
+            if watches.is_empty() {
+                return Ok("no active PR watches".to_string());
+            }
+            Ok(watches
+                .iter()
+                .map(|w| format!(
+                    "{}#{}  opener={}  {}",
+                    w.repo, w.pr_number,
+                    w.opener_session_id.as_deref().unwrap_or("(unowned)"),
+                    w.pr_url,
+                ))
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+    }
+}
+
 /// Handler for `ninox statusline`. Never returns an error and never
 /// panics: any failure (bad JSON, no store, no matching session) degrades
 /// to printing the minimal fallback line so Claude Code's statusline row
@@ -2792,5 +2925,94 @@ mod release_cli_tests {
         // A plain shell has no NINOX_SESSION to look up.
         assert!(caller_is_orchestrator(None, &[], Some("orchestrator")));
         assert!(!caller_is_orchestrator(None, &[], None));
+    }
+}
+
+#[cfg(test)]
+mod pr_watch_cli_tests {
+    use super::*;
+    use ninox_core::store::Store;
+
+    fn tmp_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn open_registers_watch_with_opener() {
+        let (_d, store) = tmp_store();
+        let msg = run_pr_watch(
+            &store, true,
+            PrWatchCliAction::Open { pr: "https://github.com/o/r/pull/7".into() },
+            Some("sess-a".into()),
+        ).unwrap();
+        let watches = store.list_pr_watches().unwrap();
+        assert_eq!(watches.len(), 1);
+        assert_eq!(watches[0].repo, "o/r");
+        assert_eq!(watches[0].pr_number, 7);
+        assert_eq!(watches[0].opener_session_id.as_deref(), Some("sess-a"));
+        assert!(msg.contains("watching o/r#7"));
+    }
+
+    #[test]
+    fn open_with_toggle_off_still_records_but_warns() {
+        let (_d, store) = tmp_store();
+        let msg = run_pr_watch(
+            &store, false,
+            PrWatchCliAction::Open { pr: "https://github.com/o/r/pull/7".into() },
+            None,
+        ).unwrap();
+        assert_eq!(store.list_pr_watches().unwrap().len(), 1);
+        assert!(msg.contains("pr_watch is disabled"));
+    }
+
+    #[test]
+    fn open_rejects_non_pr_url() {
+        let (_d, store) = tmp_store();
+        let err = run_pr_watch(
+            &store, true,
+            PrWatchCliAction::Open { pr: "https://github.com/o/r/issues/7".into() },
+            None,
+        ).unwrap_err();
+        assert!(err.to_string().contains("not a GitHub PR URL"));
+        assert!(store.list_pr_watches().unwrap().is_empty());
+    }
+
+    #[test]
+    fn close_removes_only_callers_watch() {
+        let (_d, store) = tmp_store();
+        for opener in [Some("sess-a".to_string()), Some("sess-b".to_string())] {
+            run_pr_watch(&store, true,
+                PrWatchCliAction::Open { pr: "https://github.com/o/r/pull/7".into() },
+                opener).unwrap();
+        }
+        let msg = run_pr_watch(&store, true,
+            PrWatchCliAction::Close { pr: "https://github.com/o/r/pull/7".into() },
+            Some("sess-a".into())).unwrap();
+        assert!(msg.contains("closed"));
+        let left = store.list_pr_watches().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].opener_session_id.as_deref(), Some("sess-b"));
+    }
+
+    #[test]
+    fn close_without_matching_watch_reports_nothing_to_close() {
+        let (_d, store) = tmp_store();
+        let msg = run_pr_watch(&store, true,
+            PrWatchCliAction::Close { pr: "https://github.com/o/r/pull/7".into() },
+            Some("sess-a".into())).unwrap();
+        assert!(msg.contains("no watch"));
+    }
+
+    #[test]
+    fn list_prints_watches() {
+        let (_d, store) = tmp_store();
+        run_pr_watch(&store, true,
+            PrWatchCliAction::Open { pr: "https://github.com/o/r/pull/7".into() },
+            Some("sess-a".into())).unwrap();
+        let msg = run_pr_watch(&store, true, PrWatchCliAction::List, None).unwrap();
+        assert!(msg.contains("o/r#7"));
+        assert!(msg.contains("sess-a"));
     }
 }
