@@ -2557,6 +2557,7 @@ impl App {
                 let inbox_enabled = state.config.inbox_messaging.enabled;
                 let repositories_root = state.config.resolved_repositories_root();
                 let worktree_root = state.config.resolved_worktree_root();
+                let pr_watch_enabled = state.config.pr_watch.enabled;
                 Task::future(async move {
                     let current_worker = if is_orch {
                         None
@@ -2706,6 +2707,7 @@ impl App {
                         &id,
                         is_orch,
                         inbox_enabled,
+                        pr_watch_enabled,
                     ).await {
                         tracing::warn!("re-file {id}: cannot restore workspace: {e}");
                         emit_checkout_unavailable(&engine, &id, &name, &e);
@@ -2889,6 +2891,7 @@ impl App {
                 let orch_id = session.orchestrator_id.clone();
                 let summary = session.summary.clone();
                 let inbox_enabled = state.config.inbox_messaging.enabled;
+                let pr_watch_enabled = state.config.pr_watch.enabled;
                 Task::future(async move {
                     let mut runtime_claim = runtime_claim;
                     if let Err(error) = ninox_core::tmux::kill_session(&id).await {
@@ -2909,6 +2912,7 @@ impl App {
                         &id,
                         is_orch,
                         inbox_enabled,
+                        pr_watch_enabled,
                     ).await {
                         tracing::warn!("resume {id}: cannot restore workspace: {e}");
                         emit_checkout_unavailable(&engine, &id, &name, &e);

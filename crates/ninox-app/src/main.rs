@@ -9,6 +9,7 @@ mod theme;
 use anyhow::Context as _;
 use spawn_util::{
     acquire_worker_checkout_for_incarnation, repo_from_workspace, seed_worker_brain_skill,
+    seed_worker_watch_pr_skill,
 };
 use ninox_core::{
     config::AppConfig,
@@ -895,6 +896,15 @@ async fn run_spawn(
 
     if let Err(e) = seed_worker_brain_skill(&effective_workspace).await {
         tracing::warn!("failed to seed brain skill for {id}: {e}");
+    }
+    // Durable, on-disk counterpart to the `worker_context_footer` PR-watch
+    // line below: the footer is lost after context compaction, but a
+    // seeded SKILL.md survives for the life of the worktree. Gated the
+    // same way the footer line is — only when [pr_watch] is enabled.
+    if config.pr_watch.enabled {
+        if let Err(e) = seed_worker_watch_pr_skill(&effective_workspace).await {
+            tracing::warn!("failed to seed watch-pr skill for {id}: {e}");
+        }
     }
 
     // Derive the GitHub repo slug from the workspace's git remote so that
