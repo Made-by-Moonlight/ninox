@@ -172,6 +172,24 @@ pub struct InboxMessagingConfig {
 }
 
 // ---------------------------------------------------------------------------
+// PR watch configuration
+// ---------------------------------------------------------------------------
+
+/// Opt-in (default OFF) consolidated PR watching.
+///
+/// Off (default): the poller's per-session REST polling
+/// (`poll_github` + `poll_pr_reconciliation`) runs exactly as before.
+///
+/// On: one batched GraphQL query per tick covers every watched PR —
+/// session-attached PRs plus explicit `ninox open --pr` registry entries
+/// (see `store::PrWatch`) — via `github_graphql::GithubBatchApi`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrWatchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Session retention configuration
 // ---------------------------------------------------------------------------
 
@@ -368,6 +386,10 @@ pub struct AppConfig {
     /// Bounded worker-only shared sccache and release-pruning policy.
     #[serde(default)]
     pub rust_cache: RustCacheConfig,
+    /// Consolidated batched-GraphQL PR watching. Opt-in, default off — see
+    /// `PrWatchConfig`.
+    #[serde(default)]
+    pub pr_watch: PrWatchConfig,
     /// Theme file name (resolves to `~/.config/ninox/themes/<name>.toml`) or
     /// an absolute/`~`-relative path. `None` uses `themes/field-notes.toml`
     /// if present, else the built-in Field Notes palettes.
@@ -422,6 +444,7 @@ impl Default for AppConfig {
             harnesses:        BTreeMap::new(),
             inbox_messaging:  InboxMessagingConfig::default(),
             rust_cache:       RustCacheConfig::default(),
+            pr_watch:         PrWatchConfig::default(),
         }
     }
 }
@@ -1079,6 +1102,24 @@ mod tests {
         let toml_src = "port = 8080\nfont_size = 13.0\n\n[inbox_messaging]\nenabled = true\n";
         let cfg: AppConfig = toml::from_str(toml_src).unwrap();
         assert!(cfg.inbox_messaging.enabled);
+    }
+
+    #[test]
+    fn pr_watch_defaults_to_disabled() {
+        assert!(!AppConfig::default().pr_watch.enabled);
+    }
+
+    #[test]
+    fn pr_watch_missing_table_defaults_to_disabled() {
+        let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert!(!cfg.pr_watch.enabled);
+    }
+
+    #[test]
+    fn pr_watch_can_be_enabled_via_config() {
+        let toml_src = "port = 8080\nfont_size = 13.0\n\n[pr_watch]\nenabled = true\n";
+        let cfg: AppConfig = toml::from_str(toml_src).unwrap();
+        assert!(cfg.pr_watch.enabled);
     }
 
     #[test]
