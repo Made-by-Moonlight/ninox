@@ -482,6 +482,9 @@ pub enum Message {
     SettingsRustCacheDir(String),
     SettingsRustCacheSize(String),
     SettingsToggleRustCachePrune,
+    /// Flip the opt-in consolidated PR-watching toggle (`[pr_watch].enabled`,
+    /// default off — see `ninox_core::config::PrWatchConfig`).
+    SettingsTogglePrWatch,
     BrainSelectEntry(String),
     /// The pinboard canvas's hovered node changed (including to/from `None`)
     /// — emitted only on change, never on every mouse move.
@@ -3479,6 +3482,14 @@ impl App {
                 Task::none()
             }
 
+            Message::SettingsTogglePrWatch => {
+                state.config.pr_watch.enabled = !state.config.pr_watch.enabled;
+                if let Err(e) = state.config.save() {
+                    tracing::warn!("failed to save config after toggling PR watch: {e}");
+                }
+                Task::none()
+            }
+
             Message::BrainSelectEntry(id) => {
                 if let Some(e) = state.brain_view.entries.iter().find(|e| e.id == id) {
                     state.brain_view.markdown = iced::widget::markdown::parse(
@@ -4456,23 +4467,26 @@ pub async fn setup_orchestrator_root(
 
     let claude_dir        = root.join(".claude");
     let claude_skills_dir = claude_dir.join("skills");
-    let spawn_skill_dir   = claude_skills_dir.join("spawn-worker");
-    let reap_skill_dir    = claude_skills_dir.join("reap-workers");
-    let orch_skill_dir    = claude_skills_dir.join("spawn-orchestrator");
-    let config_skill_dir  = claude_skills_dir.join("set-agent-config");
-    let brain_skill_dir   = claude_skills_dir.join("brain");
+    let spawn_skill_dir     = claude_skills_dir.join("spawn-worker");
+    let reap_skill_dir      = claude_skills_dir.join("reap-workers");
+    let orch_skill_dir      = claude_skills_dir.join("spawn-orchestrator");
+    let config_skill_dir    = claude_skills_dir.join("set-agent-config");
+    let brain_skill_dir     = claude_skills_dir.join("brain");
+    let watch_pr_skill_dir  = claude_skills_dir.join("watch-pr");
     fs::create_dir_all(&claude_dir).await?;
     fs::create_dir_all(&spawn_skill_dir).await?;
     fs::create_dir_all(&reap_skill_dir).await?;
     fs::create_dir_all(&orch_skill_dir).await?;
     fs::create_dir_all(&config_skill_dir).await?;
     fs::create_dir_all(&brain_skill_dir).await?;
+    fs::create_dir_all(&watch_pr_skill_dir).await?;
 
-    let spawn_skill_path  = spawn_skill_dir.join("SKILL.md");
-    let reap_skill_path   = reap_skill_dir.join("SKILL.md");
-    let orch_skill_path   = orch_skill_dir.join("SKILL.md");
-    let config_skill_path = config_skill_dir.join("SKILL.md");
-    let brain_skill_path  = brain_skill_dir.join("SKILL.md");
+    let spawn_skill_path    = spawn_skill_dir.join("SKILL.md");
+    let reap_skill_path     = reap_skill_dir.join("SKILL.md");
+    let orch_skill_path     = orch_skill_dir.join("SKILL.md");
+    let config_skill_path   = config_skill_dir.join("SKILL.md");
+    let brain_skill_path    = brain_skill_dir.join("SKILL.md");
+    let watch_pr_skill_path = watch_pr_skill_dir.join("SKILL.md");
 
     // AGENTS.md is canonical; CLAUDE.md symlinks to it.
     let agents_md_path = root.join("AGENTS.md");
@@ -4593,6 +4607,8 @@ Reap the ones you are done with:
 ```
 
 See the `reap-workers` skill for the full contract.
+
+Workers can register extra PR watches — see the `watch-pr` skill.
 
 ## The Rule
 
@@ -4877,6 +4893,32 @@ better than no brain at all.
         ninox_bin = ninox_bin,
     );
     fs::write(&brain_skill_path, brain_skill_content).await?;
+
+    // watch-pr skill — always overwritten.
+    let watch_pr_skill_content = r#"---
+name: watch-pr
+description: Register a GitHub PR for consolidated watching so you get pinged on merge, CI failures, and review activity instead of polling gh yourself.
+---
+
+# Watching a PR
+
+NEVER poll GitHub for PR/CI state in a loop (`gh pr checks --watch`,
+`gh run watch`, repeated `gh pr view`) — it burns the shared API rate
+limit. Register a watch instead:
+
+    ninox open --pr <pr-url>
+
+Ninox's poller then delivers merge, CI-failure, and changes-requested
+notifications straight into your session. When you stop caring:
+
+    ninox close --pr <pr-url>
+
+Watches auto-close when the PR merges or closes. `ninox list --prs`
+shows active watches. Workers' own PRs are watched automatically — this
+is for *additional* PRs (a dependency PR, a teammate's PR, a PR you
+opened outside ninox).
+"#;
+    fs::write(&watch_pr_skill_path, watch_pr_skill_content).await?;
 
     // subagent-blocker hook — always overwritten.
     let blocker = r#"#!/usr/bin/env node
@@ -8533,6 +8575,30 @@ mod tests {
 
         let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
         assert!(agents_md.contains(&skill_path.display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_seeds_watch_pr_skill() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+
+        let skill = std::fs::read_to_string(
+            root.join(".claude").join("skills").join("watch-pr").join("SKILL.md"),
+        ).unwrap();
+        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
+        assert!(skill.contains("name: watch-pr"));
+        assert!(skill.contains("description:"));
+        assert!(skill.contains("ninox open --pr"));
+        assert!(skill.contains("ninox close --pr"));
+        assert!(skill.contains("ninox list --prs"));
+
+        let spawn_skill = std::fs::read_to_string(
+            root.join(".claude").join("skills").join("spawn-worker").join("SKILL.md"),
+        ).unwrap();
+        assert!(
+            spawn_skill.contains("see the `watch-pr` skill"),
+            "spawn-worker skill must cross-link the watch-pr skill"
+        );
     }
 
     #[tokio::test]

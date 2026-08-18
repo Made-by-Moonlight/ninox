@@ -934,7 +934,7 @@ async fn run_spawn(
         }
     };
     if !orch_id_env.is_empty() {
-        effective_prompt.push_str(&worker_context_footer(&id, &orch_id_env, delivery));
+        effective_prompt.push_str(&worker_context_footer(&id, &orch_id_env, delivery, config.pr_watch.enabled));
     }
 
     let claude_session_id = ninox_core::harness::new_claude_session_id();
@@ -1213,9 +1213,12 @@ fn worker_context_footer(
     id: &str,
     orch_id: &str,
     delivery: WorkerDelivery,
+    pr_watch_enabled: bool,
 ) -> String {
     match delivery {
-        WorkerDelivery::Pr if !orch_id.is_empty() => pr_worker_context_footer(id, orch_id),
+        WorkerDelivery::Pr if !orch_id.is_empty() => {
+            pr_worker_context_footer(id, orch_id, pr_watch_enabled)
+        }
         WorkerDelivery::Pr => format!(
             "\n\n---\n\
              Ninox session `{id}`\n\n\
@@ -1275,9 +1278,11 @@ fn worker_context_footer(
 
 /// The context footer appended to every worker's task prompt: its own
 /// session id, its orchestrator's id, the channels back to the orchestrator,
-/// and the one-worker-one-PR scope rule.
-fn pr_worker_context_footer(id: &str, orch_id: &str) -> String {
-    format!(
+/// and the one-worker-one-PR scope rule. When `pr_watch_enabled` (mirrors
+/// `AppConfig.pr_watch.enabled`), also tells the worker to register PR
+/// watches instead of polling `gh` directly.
+fn pr_worker_context_footer(id: &str, orch_id: &str, pr_watch_enabled: bool) -> String {
+    let mut footer = format!(
         "\n\n---\n\
          Ninox session `{id}` · orchestrator `{orch_id}`\n\n\
          **Goal:** complete the task and open a pull request.\n\n\
@@ -1297,7 +1302,15 @@ fn pr_worker_context_footer(id: &str, orch_id: &str) -> String {
          ninox complete \"<root cause/design, commit, PR URL, and validation>\"\n\
          ```\n\
          Use `ninox send` for blockers or progress, not successful completion.",
-    )
+    );
+    if pr_watch_enabled {
+        footer.push_str(
+            "\n\nInstead of polling gh for PR/CI status, register watches: \
+             `ninox open --pr <url>` (notifications are delivered to you), \
+             `ninox close --pr <url>` when done.",
+        );
+    }
+    footer
 }
 
 /// The tmux env for a spawned worker: always the session id + data dir, plus
@@ -2920,7 +2933,7 @@ mod worker_env_tests {
 
     #[test]
     fn worker_footer_scopes_to_one_pr_and_routes_extra_work_to_request_work() {
-        let footer = worker_context_footer("w1", "orch1", WorkerDelivery::Pr);
+        let footer = worker_context_footer("w1", "orch1", WorkerDelivery::Pr, false);
         assert!(footer.contains("`w1`"), "must name the worker's own session");
         assert!(footer.contains("ninox send orch1"), "must keep the message-back channel");
         assert!(
@@ -2941,26 +2954,31 @@ mod worker_env_tests {
     #[test]
     fn pr_delivery_wrapper_is_byte_identical_to_upstream_footer() {
         assert_eq!(
-            worker_context_footer("w1", "orch1", WorkerDelivery::Pr),
-            pr_worker_context_footer("w1", "orch1"),
+            worker_context_footer("w1", "orch1", WorkerDelivery::Pr, false),
+            pr_worker_context_footer("w1", "orch1", false),
         );
     }
 
     #[test]
     fn direct_worker_contract_has_no_pr_delivery_workflow() {
-        let footer = worker_context_footer("w1", "orch1", WorkerDelivery::Direct);
+        let footer = worker_context_footer("w1", "orch1", WorkerDelivery::Direct, false);
         assert!(footer.contains("validated artifacts or direct changes"));
         assert!(footer.contains("blocked") && footer.contains("complete"));
         assert!(footer.contains("ninox complete"));
         assert!(!footer.contains("complete the task and open a pull request"));
         assert!(!footer.contains("one worker, one task, one pull request"));
+    }
+
+    #[test]
+    fn worker_footer_omits_pr_watch_instruction_when_disabled() {
+        let footer = worker_context_footer("w1", "orch1", WorkerDelivery::Pr, false);
         assert!(!footer.contains("ninox open --pr"));
         assert!(!footer.contains("ninox close --pr"));
     }
 
     #[test]
     fn direct_worker_without_orchestrator_still_gets_no_git_delivery_contract() {
-        let footer = worker_context_footer("w1", "", WorkerDelivery::Direct);
+        let footer = worker_context_footer("w1", "", WorkerDelivery::Direct, false);
 
         assert!(footer.contains("Do not create branches"));
         assert!(footer.contains("do not push"));
@@ -3046,6 +3064,15 @@ mod worker_env_tests {
         assert!(prompt.contains("write artifacts or direct changes"));
         assert!(!prompt.contains("Git command"));
         assert!(!prompt.contains("repository read"));
+    }
+
+    #[test]
+    fn worker_footer_appends_pr_watch_instruction_when_enabled() {
+        let footer = worker_context_footer("w1", "orch1", WorkerDelivery::Pr, true);
+        assert!(
+            footer.contains("ninox open --pr") && footer.contains("ninox close --pr"),
+            "must instruct the worker to register/close PR watches instead of polling gh"
+        );
     }
 
     #[test]

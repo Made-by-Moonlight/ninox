@@ -413,6 +413,29 @@ fn messaging_card(app: &App) -> Element<'_, Message> {
         .color(if enabled { s.ink } else { s.ink_2 });
     let state_label = text(if enabled { "on" } else { "off" }).size(10).font(MONO).color(s.faint);
 
+    let pr_watch_enabled = app.config.pr_watch.enabled;
+
+    let pr_watch_toggle = button(Space::new(0, 0))
+        .on_press(Message::SettingsTogglePrWatch)
+        .width(Length::Fixed(30.0))
+        .height(Length::Fixed(16.0))
+        .padding(0)
+        .style(move |_t, status| button::Style {
+            background: pr_watch_enabled.then_some(Background::Color(s.ink)),
+            text_color: s.ink,
+            border: Border {
+                color: if matches!(status, button::Status::Hovered) { s.accent } else { s.ink },
+                width: 1.5,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        });
+
+    let pr_watch_label = text("Consolidated PR watching (batched GraphQL)").size(14).font(SERIF)
+        .color(if pr_watch_enabled { s.ink } else { s.ink_2 });
+    let pr_watch_state_label =
+        text(if pr_watch_enabled { "on" } else { "off" }).size(10).font(MONO).color(s.faint);
+
     card(app, "Messaging", column![
         row![toggle, Space::new(12, 0), label, Space::new(Length::Fill, 0), state_label]
             .align_y(Alignment::Center),
@@ -421,6 +444,24 @@ fn messaging_card(app: &App) -> Element<'_, Message> {
             "Off: orchestrator↔worker messages are injected as verified keystrokes (default). \
              On: messages are delivered through Stop/UserPromptSubmit hooks in new worker \
              worktrees, with keystrokes only used to wake an idle session."
+        )
+        .size(10)
+        .font(MONO)
+        .color(s.faint),
+        Space::new(0, 14),
+        row![
+            pr_watch_toggle,
+            Space::new(12, 0),
+            pr_watch_label,
+            Space::new(Length::Fill, 0),
+            pr_watch_state_label,
+        ]
+        .align_y(Alignment::Center),
+        Space::new(0, 10),
+        text(
+            "Off: PR/CI state is polled per session via REST, as before. On: one batched \
+             GraphQL query per tick covers every watched PR, including extra PRs registered \
+             with `ninox open --pr`."
         )
         .size(10)
         .font(MONO)
