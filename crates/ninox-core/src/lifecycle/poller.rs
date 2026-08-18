@@ -967,14 +967,154 @@ impl Poller {
         // filled in by a later task
     }
 
-    /// Fan the batched snapshots out to the registry's PR watches (status
-    /// deltas, auto-close on merge/close) — filled in by a later task.
+    /// Fan the batched snapshots out to the registry's PR watches: merge/close
+    /// (terminal, and auto-closing), newly-failing CI and new
+    /// CHANGES_REQUESTED review activity.
+    ///
+    /// Watches are *notification-only*. They deliver a `Notification` (feed +
+    /// desktop) and a tmux reaction to the opener session, and nothing else —
+    /// no session status/gate change, no `cleanup_session`, and none of the
+    /// session-owned store rows (`upsert_pr`/`upsert_ci_status`/
+    /// `upsert_comment`). Lifecycle transitions stay exclusive to
+    /// session-attached PRs, which is why this deliberately doesn't route
+    /// through `ingest_ci`/`scan_reviews` despite the transition logic
+    /// looking alike: those write the session's rows and fire the session's
+    /// notifications, neither of which a watch is allowed to touch.
+    ///
+    /// Dedup rides on the same `enrichment_cache` under a synthetic key
+    /// (`watch:{repo}#{number}:{opener}`), so a watch on a PR that is *also*
+    /// some session's tracked PR keeps its own independent transition state
+    /// instead of stealing/clobbering the session's.
     async fn deliver_watch_updates(
         &self,
-        _watches: &[crate::types::PrWatch],
-        _result: &crate::github_graphql::BatchResult,
+        watches: &[crate::types::PrWatch],
+        result: &crate::github_graphql::BatchResult,
     ) {
-        // filled in by a later task
+        let mut terminal_prs: Vec<(String, u64)> = Vec::new();
+        for w in watches {
+            let key = PrKey { repo: w.repo.clone(), number: w.pr_number };
+            let Some(snap) = result.prs.get(&key) else { continue };
+            let cache_key = format!(
+                "watch:{}#{}:{}",
+                w.repo, w.pr_number, w.opener_session_id.as_deref().unwrap_or(""),
+            );
+
+            if snap.status.merged || snap.closed {
+                self.engine.emit(Event::Notification(Notification {
+                    id:         format!("watch-done-{cache_key}"),
+                    kind:       NotificationKind::WorkerDone,
+                    title:      format!(
+                        "Watched PR {} — {}#{}",
+                        if snap.status.merged { "merged" } else { "closed" },
+                        w.repo, w.pr_number,
+                    ),
+                    body:       w.pr_url.clone(),
+                    session_id: w.opener_session_id.clone(),
+                    created_at: now_millis(),
+                }));
+                if let Some(opener) = &w.opener_session_id {
+                    let msg = crate::lifecycle::reactions::format_watched_pr_terminal(
+                        &w.repo, w.pr_number, snap.status.merged,
+                    );
+                    if let Err(e) = self.engine.send_to_session(opener, &msg).await {
+                        tracing::warn!("send watched-pr terminal reaction to {opener}: {e}");
+                    }
+                }
+                self.enrichment_cache.lock().unwrap().remove(&cache_key);
+                terminal_prs.push((w.repo.clone(), w.pr_number));
+                continue;
+            }
+
+            // CI transition — the same newly-failing logic as `ingest_ci`,
+            // against the watch's own cache entry.
+            let ci = summarize_checks(w.pr_number as PrId, &snap.checks);
+            let (newly_failing, ci_already_sent) = {
+                let mut cache = self.enrichment_cache.lock().unwrap();
+                let state = cache.entry(cache_key.clone()).or_default();
+                let newly_failing = state.prev_failing.is_none_or(|p| p == 0) && ci.failing > 0;
+                state.prev_failing = Some(ci.failing);
+                let already = state.ci_reaction_sent;
+                if newly_failing && !already {
+                    state.ci_reaction_sent = true;
+                }
+                if ci.failing == 0 {
+                    state.ci_reaction_sent = false;
+                }
+                (newly_failing, already)
+            };
+            if newly_failing && !ci_already_sent {
+                self.engine.emit(Event::Notification(Notification {
+                    id:         format!("watch-ci-{cache_key}"),
+                    kind:       NotificationKind::CiFailure,
+                    title:      format!("Watched PR CI failing — {}#{}", w.repo, w.pr_number),
+                    body:       format!("{}/{} checks failing", ci.failing, ci.total),
+                    session_id: w.opener_session_id.clone(),
+                    created_at: now_millis(),
+                }));
+                if let Some(opener) = &w.opener_session_id {
+                    let failing_names: Vec<String> = snap.checks.iter()
+                        .filter(|c| c.conclusion.as_deref() == Some("failure")
+                                 || c.conclusion.as_deref() == Some("timed_out"))
+                        .map(|c| c.name.clone())
+                        .collect();
+                    let msg = crate::lifecycle::reactions::format_watched_pr_ci(
+                        &w.repo, w.pr_number, &ci, &failing_names,
+                    );
+                    if let Err(e) = self.engine.send_to_session(opener, &msg).await {
+                        tracing::warn!("send watched-pr ci reaction to {opener}: {e}");
+                    }
+                }
+            }
+
+            // New CHANGES_REQUESTED review activity — `seen_comment_ids` dedup
+            // on the watch's own cache entry (store writes for comments are
+            // the session path's job; watches only notify).
+            let new_comments: Vec<Comment> = {
+                let mut cache = self.enrichment_cache.lock().unwrap();
+                let state = cache.entry(cache_key.clone()).or_default();
+                snap.threads.iter()
+                    .filter(|t| t.state == "CHANGES_REQUESTED")
+                    .filter(|t| state.seen_comment_ids.insert(t.id))
+                    .map(|t| Comment {
+                        id:         t.id,
+                        pr_id:      w.pr_number as PrId,
+                        author:     t.author.clone(),
+                        body:       t.body.clone(),
+                        path:       t.path.clone(),
+                        line:       t.line,
+                        created_at: t.created_at,
+                    })
+                    .collect()
+            };
+            if !new_comments.is_empty() {
+                self.engine.emit(Event::Notification(Notification {
+                    id:         format!("watch-review-{cache_key}"),
+                    kind:       NotificationKind::PrNeedsAttention,
+                    title:      format!("Watched PR review — {}#{}", w.repo, w.pr_number),
+                    body:       "Changes requested".to_string(),
+                    session_id: w.opener_session_id.clone(),
+                    created_at: now_millis(),
+                }));
+                if let Some(opener) = &w.opener_session_id {
+                    let msg = crate::lifecycle::reactions::format_watched_pr_review(
+                        &w.repo, w.pr_number, &new_comments,
+                    );
+                    if let Err(e) = self.engine.send_to_session(opener, &msg).await {
+                        tracing::warn!("send watched-pr review reaction to {opener}: {e}");
+                    }
+                }
+            }
+        }
+
+        // Auto-close: every watch on a PR that reached a terminal state goes,
+        // whoever opened it — deduped so N openers cost one DELETE.
+        terminal_prs.sort();
+        terminal_prs.dedup();
+        for (repo, number) in terminal_prs {
+            if let Err(e) = self.engine.store.delete_pr_watches_for_pr(&repo, number) {
+                tracing::warn!("auto-close watches for {repo}#{number}: {e}");
+            }
+        }
     }
 
     /// The CI block: summarize → upsert → `CiUpdated` emit → newly-failing
@@ -3675,6 +3815,246 @@ mod tests {
             e, Event::Notification(n) if n.kind == crate::types::NotificationKind::GithubLookupFailed
         )).count();
         assert_eq!(failures, 1, "a missing alias must notify once, not once per tick");
+    }
+
+    // ── Registry watch delivery (`deliver_watch_updates`) ────────────────────
+    //
+    // Watches are notification-only: they deliver to the *opener* session (and
+    // to the UI's notification feed) but never move any session's status/gate
+    // and never write the session-owned PR/CI/comment rows. Auto-close drops
+    // every watch on a PR once it reaches a terminal state.
+
+    fn watch_by(repo: &str, pr_number: u64, opener: &str) -> crate::types::PrWatch {
+        crate::types::PrWatch {
+            opener_session_id: Some(opener.into()),
+            ..watch(repo, pr_number)
+        }
+    }
+
+    fn merged_snapshot(number: u64) -> crate::github_graphql::PrSnapshot {
+        let mut snap = open_snapshot(number);
+        snap.status.merged = true;
+        snap.status.state  = "closed".into();
+        snap.closed        = true;
+        snap
+    }
+
+    fn notifs(events: &[Event], kind: NotificationKind) -> Vec<Notification> {
+        events.iter().filter_map(|e| match e {
+            Event::Notification(n) if n.kind == kind => Some(n.clone()),
+            _ => None,
+        }).collect()
+    }
+
+    #[tokio::test]
+    async fn watch_on_merged_pr_notifies_opener_and_auto_closes() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        // The opener exists but tracks no PR of its own — anything that
+        // happens to it here could only have come from the watch path.
+        store.upsert_session(&test_session("sess-a", "/ws")).unwrap();
+        store.upsert_pr_watch(&watch_by("o/r", 7, "sess-a")).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        batch.result.lock().unwrap().prs.insert(pr_key("o/r", 7), merged_snapshot(7));
+
+        let engine = batch_engine(store.clone(), batch);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched().await;
+
+        let done = notifs(&drain_events(&mut rx), NotificationKind::WorkerDone);
+        assert_eq!(done.len(), 1, "a merged watched PR must notify exactly once");
+        assert_eq!(done[0].session_id.as_deref(), Some("sess-a"), "the notification belongs to the opener");
+        assert!(done[0].title.contains("merged"), "title must say merged, got {:?}", done[0].title);
+        assert!(done[0].title.contains("o/r#7"), "title must name the watched PR, got {:?}", done[0].title);
+        assert_eq!(done[0].body, "https://github.com/o/r/pull/7", "body carries the watch's URL");
+
+        assert!(
+            store.list_pr_watches().unwrap().is_empty(),
+            "a merged PR must auto-close its watches",
+        );
+        assert!(
+            store.get_pr(7).unwrap().is_none(),
+            "the watch path must not write session-owned PR rows",
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_on_closed_unmerged_pr_also_auto_closes() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("sess-a", "/ws")).unwrap();
+        store.upsert_pr_watch(&watch_by("o/r", 7, "sess-a")).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        {
+            let mut snap = open_snapshot(7);
+            snap.closed       = true;
+            snap.status.state = "closed".into(); // merged stays false
+            batch.result.lock().unwrap().prs.insert(pr_key("o/r", 7), snap);
+        }
+
+        let engine = batch_engine(store.clone(), batch);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched().await;
+
+        let done = notifs(&drain_events(&mut rx), NotificationKind::WorkerDone);
+        assert_eq!(done.len(), 1, "a closed watched PR is terminal too");
+        assert!(done[0].title.contains("closed"), "title must say closed, got {:?}", done[0].title);
+        assert!(!done[0].title.contains("merged"), "an unmerged close must not claim a merge");
+        assert!(store.list_pr_watches().unwrap().is_empty(), "closing must auto-close the watch");
+    }
+
+    #[tokio::test]
+    async fn watch_ci_failure_notifies_once_until_recovery() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("sess-a", "/ws")).unwrap();
+        store.upsert_pr_watch(&watch_by("o/r", 7, "sess-a")).unwrap();
+
+        // A CHANGES_REQUESTED review rides along on every snapshot: it must
+        // notify exactly once across all four ticks (`seen_comment_ids`
+        // dedup on the watch's own cache entry), and never persist a
+        // comment row — those belong to the session path.
+        let snapshot = |conclusion: &str| {
+            let mut snap = open_snapshot(7);
+            snap.checks = vec![CheckRun {
+                name: "test".into(), status: "completed".into(), conclusion: Some(conclusion.into()),
+            }];
+            snap.threads = vec![crate::github::ReviewThread {
+                id: 701, author: "alice".into(), body: "please fix".into(),
+                path: Some("src/lib.rs".into()), line: Some(3),
+                state: "CHANGES_REQUESTED".into(), created_at: 5_000,
+            }];
+            snap
+        };
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        let engine = batch_engine(store.clone(), batch.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        let tick = |conclusion: &str| {
+            batch.result.lock().unwrap().prs.insert(pr_key("o/r", 7), snapshot(conclusion));
+        };
+
+        tick("failure");
+        poller.poll_github_batched().await;
+        let first = drain_events(&mut rx);
+        let ci = notifs(&first, NotificationKind::CiFailure);
+        assert_eq!(ci.len(), 1, "the first failing tick must notify the opener");
+        assert_eq!(ci[0].session_id.as_deref(), Some("sess-a"));
+        assert!(ci[0].title.contains("o/r#7"), "title must name the watched PR, got {:?}", ci[0].title);
+        assert_eq!(ci[0].body, "1/1 checks failing");
+        assert_eq!(
+            notifs(&first, NotificationKind::PrNeedsAttention).len(), 1,
+            "the new CHANGES_REQUESTED review must notify the opener once",
+        );
+
+        tick("failure");
+        poller.poll_github_batched().await;
+        let second = drain_events(&mut rx);
+        assert!(
+            notifs(&second, NotificationKind::CiFailure).is_empty(),
+            "a still-failing PR must not re-notify",
+        );
+        assert!(
+            notifs(&second, NotificationKind::PrNeedsAttention).is_empty(),
+            "an already-seen review comment must not re-notify",
+        );
+
+        tick("success");
+        poller.poll_github_batched().await;
+        assert!(
+            notifs(&drain_events(&mut rx), NotificationKind::CiFailure).is_empty(),
+            "a green tick must not notify",
+        );
+
+        tick("failure");
+        poller.poll_github_batched().await;
+        assert_eq!(
+            notifs(&drain_events(&mut rx), NotificationKind::CiFailure).len(), 1,
+            "failing again after recovery is a fresh transition and must notify",
+        );
+
+        assert!(
+            store.list_comments().unwrap().is_empty(),
+            "the watch path must not write session-owned comment rows",
+        );
+        assert_eq!(
+            store.list_pr_watches().unwrap().len(), 1,
+            "a non-terminal PR keeps its watch registered",
+        );
+    }
+
+    #[tokio::test]
+    async fn unowned_watch_emits_events_but_no_session_delivery() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_pr_watch(&watch("o/r", 7)).unwrap(); // opener: None
+        assert_eq!(store.list_pr_watches().unwrap().len(), 1);
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        batch.result.lock().unwrap().prs.insert(pr_key("o/r", 7), merged_snapshot(7));
+
+        let engine = batch_engine(store.clone(), batch);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched().await;
+
+        let done = notifs(&drain_events(&mut rx), NotificationKind::WorkerDone);
+        assert_eq!(done.len(), 1, "an unowned watch still reaches the notification feed");
+        assert_eq!(done[0].session_id, None, "an unowned watch has no session to attribute to");
+        assert!(store.list_pr_watches().unwrap().is_empty(), "auto-close applies to unowned watches too");
+    }
+
+    #[tokio::test]
+    async fn watch_never_mutates_any_session_status() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        // sess-a's OWN PR is Owner/repo#50 and is wide open; the PR it
+        // *watches* (o/r#7) is merged. Lifecycle transitions belong to the
+        // session-attached PR only, so sess-a must land where its own open PR
+        // puts it (Mergeable) — never Done, never cleaned up.
+        store.upsert_session(&open_pr_session("sess-a", "/ws", 50)).unwrap();
+        store.upsert_pr_watch(&watch_by("o/r", 7, "sess-a")).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        {
+            let mut result = batch.result.lock().unwrap();
+            result.prs.insert(pr_key("Owner/repo", 50), open_snapshot(50));
+            result.prs.insert(pr_key("o/r", 7), merged_snapshot(7));
+        }
+
+        let engine = batch_engine(store.clone(), batch);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched().await;
+
+        let after = store.get_session("sess-a").unwrap()
+            .expect("a watch reaching a terminal PR must never clean up the opener session");
+        assert!(
+            matches!(after.status, SessionStatus::Mergeable),
+            "the opener's status must follow its OWN open PR, not the watched merge; got {:?}", after.status,
+        );
+        assert!(after.terminal_at.is_none(), "no watch may stamp a session terminal");
+
+        // The watch's own terminal notification still fires, attributed to the opener.
+        let done = notifs(&drain_events(&mut rx), NotificationKind::WorkerDone);
+        assert_eq!(done.len(), 1, "exactly one terminal notification — the watch's, not a session merge");
+        assert!(done[0].title.contains("o/r#7"), "it must be about the watched PR, got {:?}", done[0].title);
+        assert!(store.list_pr_watches().unwrap().is_empty());
     }
 
     // ── Update check ─────────────────────────────────────────────────────────
