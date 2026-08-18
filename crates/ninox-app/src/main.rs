@@ -408,6 +408,10 @@ async fn main() -> anyhow::Result<()> {
     // line in every worker footer and the orchestrator AGENTS.md points
     // here), so it must stay as cheap as Statusline/Inbox/Open above: it
     // reads the config and nothing else — no store, no tmux, no wrappers.
+    //
+    // Unlike Open/Close/List above, this arm *can* bind its fields directly:
+    // all three are `bool` (Copy), so the pattern copies them out instead of
+    // moving `command`, and the arm returns unconditionally anyway.
     if let Some(Command::Capabilities { worker, orchestrator, json }) = command {
         let filter = match (worker, orchestrator) {
             (true, false) => Some(Audience::Worker),
@@ -1349,8 +1353,11 @@ fn pr_worker_context_footer(id: &str, orch_id: &str, pr_watch_enabled: bool) -> 
              `ninox close --pr <url>` when done.",
         );
     }
+    // `--worker`: unfiltered output would also list the orchestrator-only
+    // skills, including spawn-worker telling the reader to delegate work
+    // instead of doing it — exactly the wrong instruction for a worker.
     footer.push_str(
-        "\n\nRun `ninox capabilities` to list what ninox can currently do.",
+        "\n\nRun `ninox capabilities --worker` to list what ninox can currently do.",
     );
     footer
 }
@@ -1889,7 +1896,7 @@ async fn run_spawn_orchestrator(
     // blocker, which every orchestrator session inherits. Normally seeded at
     // app startup, but a spawn must not depend on the app having run first.
     let root = config.resolved_orchestrator_root();
-    if let Err(e) = app::setup_orchestrator_root(&root, &ninox_bin, &config_path).await {
+    if let Err(e) = app::setup_orchestrator_root(&root, &config, &ninox_bin, &config_path).await {
         tracing::warn!("orchestrator root setup failed: {e}");
     }
     let ws = root.join(&id);
@@ -2687,7 +2694,9 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "ninox".to_string());
 
-    if let Err(e) = app::setup_orchestrator_root(&orchestrator_root, &ninox_bin, &config_path).await {
+    if let Err(e) =
+        app::setup_orchestrator_root(&orchestrator_root, &config, &ninox_bin, &config_path).await
+    {
         tracing::warn!("orchestrator root setup failed: {e}");
     }
 
@@ -3166,14 +3175,16 @@ mod worker_env_tests {
 
     /// The capability-discovery bootstrap line is ungated — a worker must
     /// always be told how to find out what ninox can do for it, regardless
-    /// of which individual capabilities happen to be enabled.
+    /// of which individual capabilities happen to be enabled. It must be
+    /// audience-scoped: an unfiltered listing would show the worker
+    /// orchestrator-only skills like spawn-worker.
     #[test]
-    fn worker_footer_always_points_at_the_capabilities_command() {
+    fn worker_footer_always_points_at_the_worker_scoped_capabilities_command() {
         for pr_watch in [false, true] {
             let footer = worker_context_footer("w1", "orch1", WorkerDelivery::Pr, pr_watch);
             assert!(
-                footer.contains("ninox capabilities"),
-                "capabilities bootstrap line must be present with pr_watch={pr_watch}"
+                footer.contains("ninox capabilities --worker"),
+                "worker-scoped capabilities bootstrap line must be present with pr_watch={pr_watch}"
             );
         }
     }

@@ -5,10 +5,10 @@
 //! [`REGISTRY`], and every surface that needs to know about capabilities
 //! loops that slice rather than restating the list:
 //!
-//! - `ninox_app::app::setup_orchestrator_root` seeds each orchestrator
-//!   entry's [`Capability::orchestrator_md`] as
+//! - `ninox_app::app::setup_orchestrator_root` seeds each *enabled*
+//!   orchestrator entry's [`Capability::orchestrator_md`] as
 //!   `<root>/.claude/skills/<name>/SKILL.md` and builds AGENTS.md's
-//!   "Available Skills" bullets from the same loop.
+//!   "Available Skills" bullets from the same (gated) set.
 //! - `ninox_app::spawn_util::seed_worker_skills` seeds each *enabled*
 //!   worker entry's [`Capability::worker_md`] into a worker's worktree.
 //! - `ninox capabilities` prints the registry with each entry's live

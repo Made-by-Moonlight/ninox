@@ -4448,23 +4448,64 @@ pub fn pr_url_for_session(
     Some(format!("https://github.com/{}/pull/{number}", session.repo))
 }
 
+/// Writes one `<skills_dir>/<name>/SKILL.md` per entry in `caps` whose
+/// [`Capability::enabled`] gate is satisfied by `config`, with the seed-time
+/// placeholders substituted, and returns the entries actually seeded (in the
+/// order given) so callers can advertise exactly what landed on disk.
+///
+/// Split out of [`setup_orchestrator_root`] so the gating loop can be tested
+/// against a caller-supplied capability slice — the real `REGISTRY` is a
+/// `const`, so a deliberately-disabled entry can't be injected into it.
+///
+/// Files are always overwritten: an upgraded ninox re-seeds the current
+/// wording over whatever the previous version wrote. Note that a
+/// now-disabled capability's *stale* file is left in place rather than
+/// deleted — removing files from a directory the user may have added their
+/// own skills to is not this function's call to make.
+async fn seed_orchestrator_skills<'a>(
+    skills_dir: &std::path::Path,
+    config: &AppConfig,
+    caps: &[&'a ninox_core::capabilities::Capability],
+    ninox_bin: &str,
+    config_path: &str,
+) -> anyhow::Result<Vec<&'a ninox_core::capabilities::Capability>> {
+    use ninox_core::capabilities;
+    use tokio::fs;
+
+    let mut seeded = Vec::new();
+    for cap in caps {
+        let Some(md) = cap.orchestrator_md else { continue };
+        if !(cap.enabled)(config) {
+            continue;
+        }
+        let dir = skills_dir.join(cap.name);
+        fs::create_dir_all(&dir).await?;
+        fs::write(dir.join("SKILL.md"), capabilities::render(md, ninox_bin, config_path)).await?;
+        seeded.push(*cap);
+    }
+    Ok(seeded)
+}
+
 /// Seeds `~/.config/ninox/orchestrator/` (or the configured root) with the
 /// files that orchestrator sessions need: AGENTS.md (canonical, CLAUDE.md
-/// symlinks to it), one SKILL.md per orchestrator-facing capability in
-/// `ninox_core::capabilities::REGISTRY`, and the subagent-blocker PreToolUse
-/// hook.
+/// symlinks to it), one SKILL.md per *enabled* orchestrator-facing capability
+/// in `ninox_core::capabilities::REGISTRY`, and the subagent-blocker
+/// PreToolUse hook.
 ///
 /// Both the seeded skills and AGENTS.md's "Available Skills" list are driven
-/// by that registry, so adding a capability needs no edit here. Skill bodies
-/// go through `capabilities::render` to substitute the seed-time
-/// placeholders (`{{NINOX_BIN}}`, `{{CONFIG_PATH}}`) — see the
-/// `ninox_core::capabilities` module docs.
+/// by that registry, so adding a capability needs no edit here — and both are
+/// filtered by each capability's `enabled` gate against `config`, evaluated
+/// once per call (every orchestrator entry is currently ungated, so this
+/// changes nothing today). Skill bodies go through `capabilities::render` to
+/// substitute the seed-time placeholders (`{{NINOX_BIN}}`, `{{CONFIG_PATH}}`)
+/// — see the `ninox_core::capabilities` module docs.
 ///
 /// AGENTS.md and settings.json are skipped if already present (user-editable).
 /// Generated skills are refreshed while untouched; user-modified skills and
 /// unrelated files are preserved. The blocker is always overwritten.
 pub async fn setup_orchestrator_root(
     root: &std::path::Path,
+    config: &AppConfig,
     ninox_bin: &str,
     config_path: &str,
 ) -> anyhow::Result<()> {
@@ -4484,20 +4525,15 @@ pub async fn setup_orchestrator_root(
 
     let skill_path = |name: &str| claude_skills_dir.join(name).join("SKILL.md");
 
-    // Skill files — always overwritten, so an upgraded ninox re-seeds the
-    // current wording over whatever the previous version wrote.
-    for cap in capabilities::for_audience(Audience::Orchestrator) {
-        let Some(md) = cap.orchestrator_md else { continue };
-        let dir = claude_skills_dir.join(cap.name);
-        fs::create_dir_all(&dir).await?;
-        fs::write(dir.join("SKILL.md"), capabilities::render(md, ninox_bin, config_path)).await?;
-    }
+    let caps: Vec<_> = capabilities::for_audience(Audience::Orchestrator).collect();
+    let seeded =
+        seed_orchestrator_skills(&claude_skills_dir, config, &caps, ninox_bin, config_path).await?;
 
     // AGENTS.md is canonical; CLAUDE.md symlinks to it.
     let agents_md_path = root.join("AGENTS.md");
     if !agents_md_path.exists() {
         let mut skills = String::new();
-        for cap in capabilities::for_audience(Audience::Orchestrator) {
+        for cap in &seeded {
             let Some(md) = cap.orchestrator_md else { continue };
             skills.push_str(&format!(
                 "- `{}` — {}\n",
@@ -4505,6 +4541,13 @@ pub async fn setup_orchestrator_root(
                 capabilities::description(md).unwrap_or(""),
             ));
         }
+        // The preamble points at whichever entry owns the spawn-worker
+        // capability rather than a hand-typed directory name, so a rename in
+        // the registry can't silently leave a dangling path here.
+        let spawn_skill = seeded
+            .iter()
+            .find(|c| c.name == "spawn-worker")
+            .expect("registry must declare an orchestrator spawn-worker capability");
         let body = format!(
             "# Ninox Orchestrator\n\n\
              Before doing anything else, read and follow: `{spawn_skill}`\n\n\
@@ -4512,8 +4555,8 @@ pub async fn setup_orchestrator_root(
              - `{reap_skill}` — cleaning up workers you are done with\n\
              - `{orch_skill}` — spawning another orchestrator (only on the user's request)\n\
              {skills}\n\
-             Run `{ninox_bin} capabilities` to list what ninox can currently do.\n",
-            spawn_skill = skill_path("spawn-worker").display(),
+             Run `{ninox_bin} capabilities --orchestrator` to list what ninox can currently do.\n",
+            spawn_skill = skill_path(spawn_skill.name).display(),
             reap_skill  = reap_skill_path.display(),
             orch_skill  = orch_skill_path.display(),
             skills      = skills,
@@ -8228,7 +8271,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_skill_teaches_work_request_handling() {
         let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
 
         let skill = std::fs::read_to_string(
             root.join(".claude").join("skills").join("spawn-worker").join("SKILL.md"),
@@ -8257,7 +8300,7 @@ mod tests {
     #[tokio::test]
     async fn setup_orchestrator_root_seeds_reap_skill() {
         let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
 
         let skill_path = root.join(".claude").join("skills").join("reap-workers").join("SKILL.md");
         let skill = std::fs::read_to_string(&skill_path).unwrap();
@@ -8287,7 +8330,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_skill_points_at_reaping() {
         let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
 
         let skill = std::fs::read_to_string(
             root.join(".claude").join("skills").join("spawn-worker").join("SKILL.md"),
@@ -8298,7 +8341,7 @@ mod tests {
     #[tokio::test]
     async fn setup_orchestrator_root_seeds_spawn_orchestrator_skill() {
         let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
 
         let skill_path = root.join(".claude").join("skills").join("spawn-orchestrator").join("SKILL.md");
         let skill = std::fs::read_to_string(&skill_path).unwrap();
@@ -8327,7 +8370,7 @@ mod tests {
     #[tokio::test]
     async fn setup_orchestrator_root_seeds_watch_pr_skill() {
         let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
 
         let skill_path = root.join(".claude").join("skills").join("watch-pr").join("SKILL.md");
         let skill = std::fs::read_to_string(&skill_path).unwrap();
@@ -8356,7 +8399,7 @@ mod tests {
     #[tokio::test]
     async fn set_agent_config_skill_has_frontmatter() {
         let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
 
         let skill = std::fs::read_to_string(
             root.join(".claude").join("skills").join("set-agent-config").join("SKILL.md"),
@@ -8369,7 +8412,7 @@ mod tests {
     #[tokio::test]
     async fn setup_orchestrator_root_seeds_brain_skill() {
         let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
 
         let skill_path = root.join(".claude").join("skills").join("brain").join("SKILL.md");
         let skill = std::fs::read_to_string(&skill_path).unwrap();
@@ -8395,7 +8438,7 @@ mod tests {
     async fn setup_orchestrator_root_seeds_every_registry_orchestrator_skill() {
         use ninox_core::capabilities::{self, Audience};
         let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, "/path/to/ninox", "/cfg.toml").await.unwrap();
+        setup_orchestrator_root(&root, &AppConfig::default(), "/path/to/ninox", "/cfg.toml").await.unwrap();
 
         let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
         for cap in capabilities::for_audience(Audience::Orchestrator) {
@@ -8421,10 +8464,52 @@ mod tests {
                 cap.name,
             );
         }
+        // Audience-scoped: an unfiltered listing would show the orchestrator
+        // the worker-only variants of skills it shares (e.g. watch-pr).
         assert!(
-            agents_md.contains("/path/to/ninox capabilities"),
-            "AGENTS.md must point at the capabilities command"
+            agents_md.contains("/path/to/ninox capabilities --orchestrator"),
+            "AGENTS.md must point at the orchestrator-scoped capabilities command"
         );
+    }
+
+    /// The `enabled` gate is honored on the orchestrator side too, not just
+    /// the worker side. `REGISTRY` is a `const` whose entries are all
+    /// ungated today, so this drives the extracted seeding loop with a
+    /// locally-built capability slice instead.
+    #[tokio::test]
+    async fn seed_orchestrator_skills_skips_gated_off_capabilities() {
+        use ninox_core::capabilities::{Audience, Capability};
+
+        let on = Capability {
+            name: "always-on",
+            audience: Audience::Orchestrator,
+            orchestrator_md: Some("---\nname: always-on\ndescription: On.\n---\n\nbody\n"),
+            worker_md: None,
+            enabled: |_| true,
+        };
+        let off = Capability {
+            name: "gated-off",
+            audience: Audience::Orchestrator,
+            orchestrator_md: Some("---\nname: gated-off\ndescription: Off.\n---\n\nbody\n"),
+            worker_md: None,
+            enabled: |_| false,
+        };
+
+        let dir = tempdir().unwrap().keep();
+        let seeded = seed_orchestrator_skills(
+            &dir, &AppConfig::default(), &[&on, &off], "ninox", "/cfg.toml",
+        )
+        .await
+        .unwrap();
+
+        assert!(dir.join("always-on").join("SKILL.md").exists(), "enabled entry must be seeded");
+        assert!(
+            !dir.join("gated-off").join("SKILL.md").exists(),
+            "a capability whose gate is off must not be seeded"
+        );
+        // The returned set is what AGENTS.md advertises — a disabled
+        // capability must not be listed there either.
+        assert_eq!(seeded.iter().map(|c| c.name).collect::<Vec<_>>(), vec!["always-on"]);
     }
 
     /// The skills are always re-seeded, so a stale copy from an older ninox
@@ -8433,13 +8518,13 @@ mod tests {
     #[tokio::test]
     async fn setup_orchestrator_root_overwrites_stale_skills_but_not_agents_md() {
         let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
 
         let skill = root.join(".claude").join("skills").join("brain").join("SKILL.md");
         std::fs::write(&skill, "stale\n").unwrap();
         std::fs::write(root.join("AGENTS.md"), "hand-edited\n").unwrap();
 
-        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
 
         assert_ne!(std::fs::read_to_string(&skill).unwrap(), "stale\n");
         assert_eq!(std::fs::read_to_string(root.join("AGENTS.md")).unwrap(), "hand-edited\n");
@@ -8448,7 +8533,7 @@ mod tests {
     #[tokio::test]
     async fn setup_orchestrator_root_configures_statusline() {
         let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, "/path/to/ninox", "/cfg.toml").await.unwrap();
+        setup_orchestrator_root(&root, &AppConfig::default(), "/path/to/ninox", "/cfg.toml").await.unwrap();
 
         let settings: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(root.join(".claude").join("settings.json")).unwrap(),
@@ -8467,7 +8552,7 @@ mod tests {
         std::fs::create_dir_all(&claude_dir).unwrap();
         std::fs::write(claude_dir.join("settings.json"), r#"{"userCustom": true}"#).unwrap();
 
-        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
 
         let contents = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
         assert_eq!(contents, r#"{"userCustom": true}"#, "pre-existing settings.json must be left byte-for-byte alone");
