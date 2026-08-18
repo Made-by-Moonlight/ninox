@@ -97,6 +97,8 @@ pub struct Engine {
     stream_cancel: Mutex<HashMap<SessionId, tokio::sync::oneshot::Sender<()>>>,
     /// Optional GitHub API client. None when no token is configured.
     pub github: Option<Arc<dyn GithubApi>>,
+    /// Optional GitHub batch GraphQL client. None when no token is configured.
+    pub github_batch: Option<Arc<dyn crate::github_graphql::GithubBatchApi>>,
 }
 
 impl Engine {
@@ -108,11 +110,14 @@ impl Engine {
             pty_writers:   Mutex::new(HashMap::new()),
             stream_cancel: Mutex::new(HashMap::new()),
             github:        None,
+            github_batch:  None,
         })
     }
 
     pub fn new_with_github(store: Arc<Store>, token: String) -> Arc<Self> {
         let (tx, _) = broadcast::channel(256);
+        let github_batch = crate::github_graphql::GraphQlClient::new(token.clone()).ok()
+            .map(|c| Arc::new(c) as Arc<dyn crate::github_graphql::GithubBatchApi>);
         let github = GitHubClient::new(token).ok()
             .map(|c| Arc::new(c) as Arc<dyn GithubApi>);
         Arc::new(Self {
@@ -121,6 +126,7 @@ impl Engine {
             pty_writers:   Mutex::new(HashMap::new()),
             stream_cancel: Mutex::new(HashMap::new()),
             github,
+            github_batch,
         })
     }
 
@@ -135,6 +141,26 @@ impl Engine {
             pty_writers:   Mutex::new(HashMap::new()),
             stream_cancel: Mutex::new(HashMap::new()),
             github:        Some(github),
+            github_batch:  None,
+        })
+    }
+
+    /// Construct an `Engine` with caller-supplied `GithubApi` and
+    /// `GithubBatchApi` — the dependency-injection seam tests use to drive
+    /// the GitHub-enrichment poller against fakes instead of the real network.
+    pub fn new_with_github_apis(
+        store: Arc<Store>,
+        github: Arc<dyn GithubApi>,
+        batch: Arc<dyn crate::github_graphql::GithubBatchApi>,
+    ) -> Arc<Self> {
+        let (tx, _) = broadcast::channel(256);
+        Arc::new(Self {
+            store,
+            tx,
+            pty_writers:   Mutex::new(HashMap::new()),
+            stream_cancel: Mutex::new(HashMap::new()),
+            github:        Some(github),
+            github_batch:  Some(batch),
         })
     }
 
