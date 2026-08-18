@@ -2,6 +2,7 @@ use crate::{
     config::{AppConfig, SessionRetentionConfig},
     events::{Engine, Event},
     github::{split_repo, CheckRun},
+    github_graphql::{BranchKey, PrKey},
     hooks,
     lifecycle::{
         brain_harvest::{self, ClaudeHarvestRunner, HarvestRunner},
@@ -147,11 +148,15 @@ impl Poller {
                 _ = usage_interval.tick()  => self.poll_usage().await,
                 _ = update_interval.tick() => self.poll_update_check().await,
                 _ = github_interval.tick() => {
-                    // Reconciliation first: a session whose PR the poller
-                    // hasn't adopted yet has no `pr_number` for `poll_github`
-                    // to enrich, so it must run before (not instead of) it.
-                    self.poll_pr_reconciliation().await;
-                    self.poll_github().await;
+                    if AppConfig::load().unwrap_or_default().pr_watch.enabled {
+                        self.poll_github_batched().await;
+                    } else {
+                        // Reconciliation first: a session whose PR the poller
+                        // hasn't adopted yet has no `pr_number` for `poll_github`
+                        // to enrich, so it must run before (not instead of) it.
+                        self.poll_pr_reconciliation().await;
+                        self.poll_github().await;
+                    }
                 }
             }
         }
@@ -775,6 +780,177 @@ impl Poller {
 
             self.emit_review_reaction(&session, has_new, review_reaction_already_sent, &new_comments).await;
         }
+    }
+
+    // ── Batched GitHub enrichment (behind `[pr_watch] enabled`) ─────────────
+
+    /// One tick of the batched path: collect every PR the app cares about
+    /// (session PRs + registry watches) plus every branch still awaiting PR
+    /// adoption, fetch them all in a single `GithubBatchApi::fetch_batch`
+    /// call, then run the *same* enrichment helpers `poll_github` uses over
+    /// the returned snapshots. It replaces both `poll_pr_reconciliation` and
+    /// `poll_github` for the tick — `start()` calls one or the other, never
+    /// both, so the legacy REST path stays byte-for-byte what it was when the
+    /// toggle is off.
+    ///
+    /// Deliberate simplification vs the legacy path, called out because it is
+    /// a behavior change and not an oversight: the legacy cross-repo 404
+    /// fallback (`poll_github` re-matching the session's *branch* against
+    /// every other configured remote when the recorded repo 404s, then
+    /// self-healing `session.repo`/`pr_number`) is NOT replicated here. A
+    /// session whose recorded `(repo, number)` alias comes back missing gets
+    /// the existing deduped `GithubLookupFailed` notification instead. That
+    /// fallback exists for repo/PR-number drift, which self-heals on the
+    /// legacy path; anyone actually hitting it can flip `[pr_watch] enabled`
+    /// off to get it back.
+    async fn poll_github_batched(&self) {
+        let Some(batch) = &self.engine.github_batch else { return };
+        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+        let watches = self.engine.store.list_pr_watches().unwrap_or_default();
+
+        // -- Collect targets --------------------------------------------------
+        // Session PRs: same skip rule as poll_github — only Done is excluded.
+        let mut pr_keys: Vec<PrKey> = Vec::new();
+        let mut branch_keys: Vec<BranchKey> = Vec::new();
+        // (session.id, branch) per branch key repo, to adopt discovered PRs.
+        let mut branch_owners: HashMap<BranchKey, String> = HashMap::new();
+
+        for session in &sessions {
+            if matches!(session.status, SessionStatus::Done) {
+                continue;
+            }
+            match session.pr_number {
+                Some(n) if !session.repo.is_empty() => {
+                    pr_keys.push(PrKey { repo: session.repo.clone(), number: n });
+                }
+                None if !matches!(
+                    session.status,
+                    SessionStatus::Terminated | SessionStatus::Interrupted
+                ) => {
+                    // poll_pr_reconciliation equivalent, batched.
+                    if let Some(ws) = &session.workspace_path {
+                        if let Some(branch) = crate::github::current_branch(ws) {
+                            for repo_slug in crate::github::candidate_repos(ws) {
+                                let key = BranchKey { repo: repo_slug, branch: branch.clone() };
+                                branch_owners.insert(key.clone(), session.id.clone());
+                                branch_keys.push(key);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for w in &watches {
+            pr_keys.push(PrKey { repo: w.repo.clone(), number: w.pr_number });
+        }
+        pr_keys.sort_by(|a, b| (&a.repo, a.number).cmp(&(&b.repo, b.number)));
+        pr_keys.dedup();
+        if pr_keys.is_empty() && branch_keys.is_empty() {
+            return;
+        }
+
+        // -- One batched fetch ------------------------------------------------
+        let result = match batch.fetch_batch(&pr_keys, &branch_keys).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.note_batch_error(&e);
+                return;
+            }
+        };
+        self.note_rate_limit(&result.rate_limit);
+
+        // -- Branch adoption (replaces poll_pr_reconciliation) ----------------
+        for (key, pr_ref) in &result.branch_prs {
+            let Some(pr_ref) = pr_ref else { continue };
+            let Some(session_id) = branch_owners.get(key) else { continue };
+            let Ok(Some(mut session)) = self.engine.store.get_session(session_id) else { continue };
+            if session.pr_number.is_some() {
+                continue; // adopted via an earlier key this tick
+            }
+            session.pr_number = Some(pr_ref.number);
+            session.repo      = key.repo.clone();
+            session.status    = SessionStatus::PrOpen;
+            if let Some(written) = self.update_live_session_row(&session, |row| {
+                row.pr_number = session.pr_number;
+                row.repo      = session.repo.clone();
+                row.status    = session.status.clone();
+            }) {
+                self.engine.emit(Event::SessionUpdated(
+                    written,
+                    SessionFields::PR_LINK | SessionFields::STATUS,
+                ));
+            }
+        }
+
+        // -- Session enrichment (replaces poll_github's per-session fetches) --
+        for mut session in sessions {
+            if matches!(session.status, SessionStatus::Done) {
+                continue;
+            }
+            let Some(pr_number) = session.pr_number else { continue };
+            if session.repo.is_empty() {
+                continue;
+            }
+            let key = PrKey { repo: session.repo.clone(), number: pr_number };
+            let Some(snap) = result.prs.get(&key) else {
+                self.notify_github_lookup_failed(&session);
+                continue;
+            };
+            self.clear_github_lookup_failed(&session.id);
+            let pr_id: PrId = pr_number as i64;
+            if session.pr_id != Some(pr_id) {
+                session.pr_id = Some(pr_id);
+                if self.update_live_session_row(&session, |row| row.pr_id = Some(pr_id)).is_some() {
+                    self.engine.emit(Event::SessionUpdated(session.clone(), SessionFields::PR_LINK));
+                }
+            }
+            if self.handle_merge_detection(&session, pr_number, snap.status.merged).await {
+                continue;
+            }
+            let Some((owner, repo)) = split_repo(&session.repo) else { continue };
+            let pr = PR {
+                id:         pr_id,
+                number:     pr_number,
+                title:      snap.status.title.clone(),
+                url:        format!("https://github.com/{owner}/{repo}/pull/{pr_number}"),
+                body:       String::new(),
+                session_id: session.id.clone(),
+            };
+            let _ = self.engine.store.upsert_pr(&pr);
+            self.engine.emit(Event::PrOpened { session_id: session.id.clone(), pr });
+
+            let ci = self.ingest_ci(&session, pr_id, &snap.checks).await;
+            let (has_new, already_sent, new_comments, has_changes_requested) =
+                self.scan_reviews(&session.id, pr_id, &snap.threads, &snap.issue_comments);
+            self.apply_status_and_gate(&session, &snap.status, &ci, has_changes_requested);
+            self.emit_review_reaction(&session, has_new, already_sent, &new_comments).await;
+        }
+
+        self.deliver_watch_updates(&watches, &result).await;
+    }
+
+    /// A whole batched fetch failed — every target this tick is unobserved.
+    /// Backoff/rate-limit accounting is filled in by a later task; for now
+    /// the failure is logged so it isn't silent.
+    fn note_batch_error(&self, e: &anyhow::Error) {
+        tracing::warn!("github batch fetch: {e}");
+    }
+
+    /// Record the GraphQL rate-limit budget reported by the last fetch —
+    /// filled in by a later task (adaptive interval + budget notification).
+    fn note_rate_limit(&self, _rate_limit: &crate::github_graphql::RateLimitInfo) {
+        // filled in by a later task
+    }
+
+    /// Fan the batched snapshots out to the registry's PR watches (status
+    /// deltas, auto-close on merge/close) — filled in by a later task.
+    async fn deliver_watch_updates(
+        &self,
+        _watches: &[crate::types::PrWatch],
+        _result: &crate::github_graphql::BatchResult,
+    ) {
+        // filled in by a later task
     }
 
     /// The CI block: summarize → upsert → `CiUpdated` emit → newly-failing
@@ -3113,6 +3289,304 @@ mod tests {
         let persisted = store.list_comments().unwrap();
         assert_eq!(persisted.len(), 1, "restart must not duplicate an already-persisted comment");
         assert_eq!(persisted[0].id, 501);
+    }
+
+    // ── Batched GraphQL path (`poll_github_batched`) ─────────────────────────
+    //
+    // The batched path collapses `poll_pr_reconciliation` + `poll_github`'s
+    // per-session REST fan-out into one `fetch_batch` call. These tests drive
+    // it through a `GithubBatchApi` fake, so the collection/dedup rules, the
+    // branch-adoption half and the enrichment half are all exercised without
+    // any network access.
+
+    #[derive(Default)]
+    struct FakeBatchApi {
+        /// Handed out (by `std::mem::take`) on the *first* `fetch_batch` call;
+        /// later calls see an empty `BatchResult`, which is exactly the
+        /// "alias missing" shape the lookup-failure dedup test needs.
+        result: std::sync::Mutex<crate::github_graphql::BatchResult>,
+        /// Every `(pr_keys, branch_keys)` pair the poller asked for, in order.
+        calls:  std::sync::Mutex<Vec<(Vec<crate::github_graphql::PrKey>, Vec<crate::github_graphql::BranchKey>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::github_graphql::GithubBatchApi for FakeBatchApi {
+        async fn fetch_batch(
+            &self,
+            prs: &[crate::github_graphql::PrKey],
+            branches: &[crate::github_graphql::BranchKey],
+        ) -> anyhow::Result<crate::github_graphql::BatchResult> {
+            self.calls.lock().unwrap().push((prs.to_vec(), branches.to_vec()));
+            Ok(std::mem::take(&mut *self.result.lock().unwrap()))
+        }
+    }
+
+    /// An `Engine` wired to a batch fake (plus an inert REST fake, so the
+    /// legacy path would 404 rather than silently satisfying an assertion the
+    /// batched path is supposed to satisfy).
+    fn batch_engine(
+        store: std::sync::Arc<crate::store::Store>,
+        batch: std::sync::Arc<FakeBatchApi>,
+    ) -> std::sync::Arc<Engine> {
+        Engine::new_with_github_apis(
+            store,
+            std::sync::Arc::new(FakeGithub::default()) as std::sync::Arc<dyn crate::github::GithubApi>,
+            batch as std::sync::Arc<dyn crate::github_graphql::GithubBatchApi>,
+        )
+    }
+
+    fn pr_key(repo: &str, number: u64) -> crate::github_graphql::PrKey {
+        crate::github_graphql::PrKey { repo: repo.into(), number }
+    }
+
+    fn open_snapshot(number: u64) -> crate::github_graphql::PrSnapshot {
+        crate::github_graphql::PrSnapshot {
+            status: crate::github::PrStatus {
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "t".into(), number, head_sha: "abc".into(),
+            },
+            closed:         false,
+            checks:         vec![],
+            threads:        vec![],
+            issue_comments: vec![],
+        }
+    }
+
+    fn watch(repo: &str, pr_number: u64) -> crate::types::PrWatch {
+        crate::types::PrWatch {
+            repo:              repo.into(),
+            pr_number,
+            pr_url:            format!("https://github.com/{repo}/pull/{pr_number}"),
+            opener_session_id: None,
+            created_at:        0,
+        }
+    }
+
+    /// The whole point of batching: N sessions (and any registry watches)
+    /// pointing at the same PR must cost exactly one alias in the query, not
+    /// one per row.
+    #[tokio::test]
+    async fn batched_poll_dedupes_session_and_watch_targets() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        for id in ["s1", "s2"] {
+            let mut s = test_session(id, "/ws");
+            s.status    = SessionStatus::PrOpen;
+            s.repo      = "o/r".into();
+            s.pr_number = Some(7);
+            store.upsert_session(&s).unwrap();
+        }
+        // A registry watch on the very same PR — must collapse into the same key.
+        store.upsert_pr_watch(&watch("o/r", 7)).unwrap();
+        // A second, distinct PR proves dedup isn't just "keep one key".
+        store.upsert_pr_watch(&watch("o/r", 9)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        let engine = batch_engine(store.clone(), batch.clone());
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched().await;
+
+        let calls = batch.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "one tick must issue exactly one batched fetch");
+        assert_eq!(
+            calls[0].0,
+            vec![pr_key("o/r", 7), pr_key("o/r", 9)],
+            "two sessions plus a watch on o/r#7 must contribute a single deduped key",
+        );
+        assert!(calls[0].1.is_empty(), "sessions that already track a PR contribute no branch keys");
+    }
+
+    /// Merge detection must work identically on the batched path: the
+    /// snapshot's `merged` flag drives the same `handle_merge_detection`
+    /// transition (Done + `terminal_at`) and the same single `WorkerDone`
+    /// notification the legacy path produces.
+    #[tokio::test]
+    async fn batched_poll_marks_merged_session_done_and_notifies_orchestrator() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status          = SessionStatus::Working;
+        s.orchestrator_id = Some("orch1".into());
+        s.repo            = "Owner/repo".into();
+        s.pr_number       = Some(7);
+        store.upsert_session(&s).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        {
+            let mut merged = open_snapshot(7);
+            merged.status.merged = true;
+            merged.status.state  = "closed".into();
+            batch.result.lock().unwrap().prs.insert(pr_key("Owner/repo", 7), merged);
+        }
+
+        let engine = batch_engine(store.clone(), batch);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched().await;
+
+        let after = store.get_session("w1").unwrap().unwrap();
+        assert!(matches!(after.status, SessionStatus::Done), "a merged PR's session must transition to Done");
+        assert!(after.terminal_at.is_some(), "Done via merge detection must stamp terminal_at");
+        assert_eq!(after.pr_id, Some(7), "pr_id must be persisted before merge detection ends the session");
+
+        let events = drain_events(&mut rx);
+        let merged_notifs = events.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+        )).count();
+        assert_eq!(merged_notifs, 1, "exactly one WorkerDone notification for the merge");
+    }
+
+    /// The enrichment half must reuse the exact `ingest_ci`/`scan_reviews`/
+    /// `apply_status_and_gate` helpers the legacy path uses — so a snapshot
+    /// carrying one failing check and one CHANGES_REQUESTED review yields the
+    /// same CI row, comment row, PR row and derived session status.
+    #[tokio::test]
+    async fn batched_poll_ingests_ci_and_reviews_like_legacy() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        {
+            let mut snap = open_snapshot(50);
+            snap.checks = vec![
+                CheckRun { name: "lint".into(), status: "completed".into(), conclusion: Some("success".into()) },
+                CheckRun { name: "test".into(), status: "completed".into(), conclusion: Some("failure".into()) },
+            ];
+            snap.threads = vec![crate::github::ReviewThread {
+                id: 601, author: "alice".into(), body: "please fix".into(),
+                path: None, line: None, state: "CHANGES_REQUESTED".into(), created_at: 7_000,
+            }];
+            snap.issue_comments = vec![Comment {
+                id: 900, pr_id: 0, author: "erin".into(), body: "ping".into(),
+                path: None, line: None, created_at: 8_000,
+            }];
+            batch.result.lock().unwrap().prs.insert(pr_key("Owner/repo", 50), snap);
+        }
+
+        let engine = batch_engine(store.clone(), batch);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched().await;
+
+        let events = drain_events(&mut rx);
+
+        let ci = events.iter().find_map(|e| match e {
+            Event::CiUpdated { pr_id: 50, status } => Some(status.clone()),
+            _ => None,
+        }).expect("CiUpdated must be emitted for the batched snapshot's checks");
+        assert_eq!((ci.total, ci.passing, ci.failing), (2, 1, 1));
+
+        let mut persisted: Vec<i64> = store.list_comments().unwrap().iter().map(|c| c.id).collect();
+        persisted.sort();
+        assert_eq!(persisted, vec![601, 900], "review and issue comments must both be captured");
+        assert_eq!(
+            store.list_comments().unwrap().iter().find(|c| c.id == 900).unwrap().pr_id, 50,
+            "pr_id must be stamped from the resolved PR",
+        );
+
+        let pr_row = store.get_pr(50).unwrap().expect("the PR row must be upserted from the snapshot");
+        assert_eq!(pr_row.url, "https://github.com/Owner/repo/pull/50");
+        assert_eq!(pr_row.session_id, "s1");
+
+        let after = store.get_session("s1").unwrap().unwrap();
+        assert!(
+            matches!(after.status, SessionStatus::CiFailed),
+            "a failing check must drive the same derived status as the legacy path, got {:?}", after.status,
+        );
+        let gate = after.gate_status.expect("gate must be computed on the batched path too");
+        assert!(matches!(gate.ci, GateCheck::Failing));
+        assert!(matches!(gate.review, GateCheck::Failing));
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e, Event::Notification(n) if n.kind == crate::types::NotificationKind::PrNeedsAttention
+            )),
+            "a CHANGES_REQUESTED review must still drive the review reaction path",
+        );
+    }
+
+    /// The batched path subsumes `poll_pr_reconciliation`: a session with no
+    /// tracked PR contributes a branch key for every candidate remote, and
+    /// whatever open PR comes back is adopted (number, repo, PrOpen).
+    #[tokio::test]
+    async fn batched_poll_adopts_branch_pr_for_prless_session() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", &workspace)).unwrap();
+
+        let branch_key = crate::github_graphql::BranchKey {
+            repo: "Owner/repo".into(), branch: "worker-branch".into(),
+        };
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        batch.result.lock().unwrap().branch_prs.insert(
+            branch_key.clone(),
+            Some(crate::github::PrRef { number: 9, url: "https://github.com/Owner/repo/pull/9".into() }),
+        );
+
+        let engine = batch_engine(store.clone(), batch.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched().await;
+
+        let calls = batch.calls.lock().unwrap().clone();
+        assert_eq!(calls[0].1, vec![branch_key], "a PR-less session must contribute its branch key");
+
+        let after = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(after.pr_number, Some(9), "the branch's open PR must be adopted");
+        assert_eq!(after.repo, "Owner/repo", "adoption must record the repo the PR was found in");
+        assert!(matches!(after.status, SessionStatus::PrOpen));
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e, Event::SessionUpdated(s, fields)
+                    if s.id == "s1"
+                    && s.pr_number == Some(9)
+                    && fields.contains(SessionFields::PR_LINK)
+                    && fields.contains(SessionFields::STATUS)
+            )),
+            "adoption must broadcast the PR link and status to the UI",
+        );
+    }
+
+    /// The batched path deliberately drops the legacy cross-repo 404 fallback
+    /// (see `poll_github_batched`'s doc comment): a key missing from the
+    /// result map is a lookup failure, notified exactly once per run of
+    /// consecutive failures — not once per tick.
+    #[tokio::test]
+    async fn batched_poll_missing_alias_fires_lookup_failed_once() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        // Empty result: the `Owner/repo#50` alias errored out server-side.
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        let engine = batch_engine(store.clone(), batch.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched().await;
+        poller.poll_github_batched().await;
+
+        assert_eq!(batch.calls.lock().unwrap().len(), 2, "both ticks must have actually fetched");
+
+        let failures = drain_events(&mut rx).iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::GithubLookupFailed
+        )).count();
+        assert_eq!(failures, 1, "a missing alias must notify once, not once per tick");
     }
 
     // ── Update check ─────────────────────────────────────────────────────────
