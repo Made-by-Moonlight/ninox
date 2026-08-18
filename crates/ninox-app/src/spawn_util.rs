@@ -988,26 +988,24 @@ pub async fn create_worker_worktree(
 ///   deletes the branch along with the worktree, and that's fine: a fresh
 ///   branch is cut from the repo's HEAD in that case (the conversation
 ///   lookup only needs the *path* back, not the branch), while a surviving
-///   branch is checked out again. Re-seeds the brain skill the original
-///   spawn wrote (git-excluded, so never on the branch either way).
+///   branch is checked out again. Re-seeds the worker skills the original
+///   spawn wrote (git-excluded, so never on the branch either way) via
+///   [`seed_worker_skills`], gated by `config` exactly as the spawn was.
 /// - Missing and anything else → error, so the spawn fails visibly instead
 ///   of the agent silently running in the wrong directory.
 pub async fn ensure_session_workspace(
     workspace:         &str,
     session_id:        &str,
     is_orchestrator:   bool,
-    inbox_enabled:     bool,
-    pr_watch_enabled:  bool,
+    config:            &ninox_core::config::AppConfig,
 ) -> anyhow::Result<()> {
     if is_orchestrator {
         std::fs::create_dir_all(workspace)?;
         return Ok(());
     }
     if std::path::Path::new(workspace).is_dir() {
-        ensure_statusline_settings(std::path::Path::new(workspace), inbox_enabled);
-        if let Err(e) = seed_worker_brain_skill(workspace).await {
-            tracing::warn!("failed to re-seed brain skill for {session_id}: {e}");
-        }
+        ensure_statusline_settings(std::path::Path::new(workspace), config.inbox_messaging.enabled);
+        seed_worker_skills(workspace, config).await;
         return Ok(());
     }
     if let Some(mut managed) = ninox_core::worktree::ManagedWorktree::load_for_workspace(
@@ -1015,14 +1013,12 @@ pub async fn ensure_session_workspace(
         session_id,
     )? {
         managed.add_checkout()?;
-        ensure_statusline_settings(&managed.worktree_path, inbox_enabled);
+        ensure_statusline_settings(&managed.worktree_path, config.inbox_messaging.enabled);
         if let Err(error) = managed.persist() {
             let _ = managed.remove_checkout_if_matches_with_metadata(false);
             return Err(error);
         }
-        if let Err(e) = seed_worker_brain_skill(workspace).await {
-            tracing::warn!("failed to re-seed brain skill for {session_id}: {e}");
-        }
+        seed_worker_skills(workspace, config).await;
         return Ok(());
     }
     let suffix = format!("/.claude/worktrees/{session_id}");
@@ -1039,16 +1035,9 @@ pub async fn ensure_session_workspace(
         std::path::Path::new(repo_root),
         std::path::Path::new(workspace),
         session_id,
-        inbox_enabled,
+        config.inbox_messaging.enabled,
     )?;
-    if let Err(e) = seed_worker_brain_skill(workspace).await {
-        tracing::warn!("failed to re-seed brain skill for {session_id}: {e}");
-    }
-    if pr_watch_enabled {
-        if let Err(e) = seed_worker_watch_pr_skill(workspace).await {
-            tracing::warn!("failed to re-seed watch-pr skill for {session_id}: {e}");
-        }
-    }
+    seed_worker_skills(workspace, config).await;
     Ok(())
 }
 
@@ -1057,8 +1046,7 @@ pub async fn ensure_session_workspace_with_store(
     workspace: &str,
     session_id: &str,
     is_orchestrator: bool,
-    inbox_enabled: bool,
-    pr_watch_enabled: bool,
+    config: &ninox_core::config::AppConfig,
 ) -> anyhow::Result<()> {
     if !is_orchestrator {
         if let Some(mut record) = store.pooled_checkout_by_session(session_id)? {
@@ -1110,15 +1098,8 @@ pub async fn ensure_session_workspace_with_store(
                 "pooled checkout {} no longer matches its Ninox identity",
                 record.path.display()
             );
-            ensure_statusline_settings(&record.path, inbox_enabled);
-            if let Err(e) = seed_worker_brain_skill(workspace).await {
-                tracing::warn!("failed to re-seed brain skill for {session_id}: {e}");
-            }
-            if pr_watch_enabled {
-                if let Err(e) = seed_worker_watch_pr_skill(workspace).await {
-                    tracing::warn!("failed to re-seed watch-pr skill for {session_id}: {e}");
-                }
-            }
+            ensure_statusline_settings(&record.path, config.inbox_messaging.enabled);
+            seed_worker_skills(workspace, config).await;
             return Ok(());
         }
         if let Some(record) =
@@ -1131,7 +1112,7 @@ pub async fn ensure_session_workspace_with_store(
             );
         }
     }
-    ensure_session_workspace(workspace, session_id, is_orchestrator, inbox_enabled, pr_watch_enabled).await
+    ensure_session_workspace(workspace, session_id, is_orchestrator, config).await
 }
 
 /// Walk up from `start` (inclusive) looking for the nearest ancestor
@@ -1293,80 +1274,6 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
     }
 }
 
-const WORKER_BRAIN_SKILL: &str = r#"---
-name: brain
-description: Read and write Ninox's shared knowledge brain. Use before touching code you haven't seen before, and before finishing your task.
----
-
-# Read and Write the Brain
-
-The brain is Ninox's persistent, shared knowledge store. Your session's
-brain is already resolved via `NINOX_BRAIN` — these commands act on it with
-no extra configuration.
-
-## Before exploring unfamiliar code
-
-Query first — it blends keyword and semantic matches automatically:
-
-```bash
-ninox brain query "<name or concept>"
-```
-
-If a relevant entry exists, read it before you start digging through files
-yourself. It may save you the exploration entirely.
-
-## Before you finish
-
-Write down anything you discovered that the next session — orchestrator or
-worker — would otherwise have to rediscover: where something lives, why
-it's built the way it is, a gotcha you hit. Write it as a Markdown file
-under the section that fits:
-
-```
-repos/          where repositories live, their purpose, entry points
-symbols/        where types, functions, and modules are defined
-concepts/       domain terminology and mental models
-patterns/       conventions and recurring implementation shapes
-decisions/      why something was built a certain way (ADRs)
-architecture/   how the system is structured — components, data flows
-relationships/  how repos, services, and teams connect
-errors/         known failure modes and how to resolve them
-```
-
-Each entry needs YAML frontmatter followed by a Markdown body. Use
-`ninox brain add <path>` to write it — this indexes the entry immediately,
-so it's queryable right away with no separate reindex step:
-
-```bash
-ninox brain add repos/my-crate.md <<'EOF'
----
-type: repo
-name: my-crate
-tags: [auth, core]
-repos: [my-crate]
-updated: 2026-07-06
----
-
-# my-crate
-
-Entry point: `src/main.rs`
-Build: `cargo build`
-
-Facts, not prose. Link related entries with `[[other-entry]]`.
-EOF
-```
-
-If this brain is remote-backed (team-shared), `ninox brain index` also
-pushes your new entries to the team and pulls theirs — nothing extra to
-do. If it reports a conflict copy (`*.conflict-*.md`), merge it into the
-canonical entry and delete the copy when you're confident.
-
-## The Rule
-
-**Query before touching unfamiliar code. Write down what you found before
-you're done.** A stale or empty brain is no better than no brain at all.
-"#;
-
 fn git_path_is_tracked(workspace: &std::path::Path, relative_path: &str) -> bool {
     std::process::Command::new("git")
         .arg("-C")
@@ -1417,55 +1324,6 @@ fn exclude_generated_provider_file(workspace: &std::path::Path, relative_path: &
     let _ = writeln!(file, "{relative_path}");
 }
 
-const WORKER_WATCH_PR_SKILL: &str = r#"---
-name: watch-pr
-description: register extra GitHub PRs for consolidated watching instead of polling gh.
----
-
-# Watch PRs Without Polling
-
-Your own PR is watched automatically by ninox — do not register it
-yourself; ninox already delivers merge/CI-failure/changes-requested
-notifications into your session for it.
-
-## Never poll GitHub in a loop
-
-Do not run `gh pr checks --watch`, `gh run watch`, or repeated `gh pr view`
-calls in a loop. Every one of those burns the shared GitHub API rate limit
-for the whole fleet.
-
-## Watching an additional PR
-
-If you need to track a PR that isn't yours — a dependency PR, a teammate's
-PR you're blocked on — register a watch instead:
-
-```bash
-ninox open --pr <pr-url>
-```
-
-ninox delivers merge/CI-failure/changes-requested notifications into your
-session for that PR. When you stop caring:
-
-```bash
-ninox close --pr <pr-url>
-```
-
-Watches also auto-close on their own once the PR merges or closes — closing
-early is only needed if you lose interest before that.
-
-To see everything you're currently watching:
-
-```bash
-ninox list --prs
-```
-
-## If watching isn't available
-
-If `ninox open --pr` warns that `pr_watch` is disabled, the watch is not
-active. Fall back to checking `gh pr view` sparingly — single one-off
-calls, never a watch loop.
-"#;
-
 /// Writes `content` as `SKILL.md` under `.claude/skills/<name>/` inside
 /// `workspace`, so a spawned worker/standalone session sees `<name>` as a
 /// real Claude Code skill from the moment it starts, and makes sure the file
@@ -1474,11 +1332,10 @@ calls, never a watch loop.
 /// (mirrors how `setup_orchestrator_root`'s own failures are handled in
 /// `main.rs`).
 ///
-/// Shared mechanism behind [`seed_worker_brain_skill`] and
-/// [`seed_worker_watch_pr_skill`]: (1) refuse to clobber a copy that's
-/// already tracked in git, (2) write the file, (3) idempotently exclude its
-/// path from the repo's shared `info/exclude` so it never shows up as
-/// untracked/stageable.
+/// Shared mechanism behind [`seed_worker_skills`]: (1) refuse to clobber a
+/// copy that's already tracked in git, (2) write the file, (3) idempotently
+/// exclude its path from the repo's shared `info/exclude` so it never shows
+/// up as untracked/stageable.
 async fn seed_worker_skill(workspace: &str, name: &str, content: &str) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use tokio::fs;
@@ -1560,25 +1417,33 @@ async fn seed_worker_skill(workspace: &str, name: &str, content: &str) -> anyhow
     Ok(())
 }
 
-/// Writes a worker-flavored brain skill into `workspace` so a spawned
-/// worker/standalone session sees "brain" as a real Claude Code skill from
-/// the moment it starts, and makes sure the file can never end up in a
-/// commit. Best-effort: any failure here should be logged and swallowed by
-/// the caller, not treated as fatal to the spawn (mirrors how
-/// `setup_orchestrator_root`'s own failures are handled in `main.rs`).
-pub async fn seed_worker_brain_skill(workspace: &str) -> anyhow::Result<()> {
-    seed_worker_skill(workspace, "brain", WORKER_BRAIN_SKILL).await
-}
+/// Seeds every worker-facing capability that `config` currently enables
+/// into `workspace`, so a spawned worker/standalone session sees them as
+/// real Claude Code skills from the moment it starts — durable, on-disk
+/// instructions rather than one-shot lines in its initial prompt (which are
+/// lost after context compaction).
+///
+/// The list, the markdown, and the per-capability gates all come from
+/// `ninox_core::capabilities::REGISTRY`; `config` is read once here rather
+/// than having each call site thread gating booleans down (today only the
+/// worker `watch-pr` entry is gated, on `[pr_watch].enabled`).
+///
+/// Best-effort and infallible by design: an individual skill that can't be
+/// written (e.g. a tracked copy already in the repo) is logged and skipped,
+/// never fatal to the spawn — mirroring how `setup_orchestrator_root`'s own
+/// failures are handled in `main.rs`.
+pub async fn seed_worker_skills(workspace: &str, config: &ninox_core::config::AppConfig) {
+    use ninox_core::capabilities::{for_audience, Audience};
 
-/// Writes a worker-flavored `watch-pr` skill into `workspace`, mirroring
-/// [`seed_worker_brain_skill`], so a spawned worker sees `ninox open/close
-/// --pr` as a durable, on-disk instruction rather than a one-shot line in
-/// its initial prompt (which is lost after context compaction). Only ever
-/// called by spawn paths when `AppConfig.pr_watch.enabled` is true — see
-/// the call sites in `main.rs::run_spawn` and
-/// [`ensure_session_workspace`].
-pub async fn seed_worker_watch_pr_skill(workspace: &str) -> anyhow::Result<()> {
-    seed_worker_skill(workspace, "watch-pr", WORKER_WATCH_PR_SKILL).await
+    for cap in for_audience(Audience::Worker) {
+        if !(cap.enabled)(config) {
+            continue;
+        }
+        let Some(md) = cap.worker_md else { continue };
+        if let Err(e) = seed_worker_skill(workspace, cap.name, md).await {
+            tracing::warn!("failed to seed {} skill in {workspace}: {e}", cap.name);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1600,6 +1465,23 @@ mod tests {
         );
     }
 
+    /// An `AppConfig` differing from the default only in `[pr_watch]`, the
+    /// one toggle any worker capability is gated on today.
+    fn cfg(pr_watch: bool) -> ninox_core::config::AppConfig {
+        let mut c = ninox_core::config::AppConfig::default();
+        c.pr_watch.enabled = pr_watch;
+        c
+    }
+
+    /// The registry's worker markdown for `name` — used by the tests that
+    /// drive [`seed_worker_skill`] directly (they need its `Result`, which
+    /// the best-effort [`seed_worker_skills`] loop deliberately swallows).
+    fn worker_md(name: &str) -> &'static str {
+        ninox_core::capabilities::for_audience(ninox_core::capabilities::Audience::Worker)
+            .find(|c| c.name == name)
+            .and_then(|c| c.worker_md)
+            .unwrap_or_else(|| panic!("no worker capability named {name}"))
+    }
 
     /// Minimal real git repo so `git worktree add` has a commit to branch
     /// from — `create_worker_worktree` shells out to real `git`.
@@ -2148,13 +2030,13 @@ mod tests {
         .await
         .unwrap();
 
-        seed_worker_brain_skill(&checkout.workspace).await.unwrap();
+        seed_worker_skills(&checkout.workspace, &cfg(false)).await;
         let seeded = std::fs::read_to_string(
             std::path::Path::new(&checkout.workspace)
                 .join(".claude/skills/brain/SKILL.md"),
         )
         .unwrap();
-        assert_eq!(seeded.as_bytes(), WORKER_BRAIN_SKILL.as_bytes());
+        assert_eq!(seeded.as_bytes(), worker_md("brain").as_bytes());
     }
 
     #[tokio::test]
@@ -2258,7 +2140,7 @@ mod tests {
             .unwrap();
         assert!(!std::path::Path::new(&worktree).exists(), "sanity: worktree removed");
 
-        ensure_session_workspace(&worktree, "ensure-ws-1", false, false, false).await.unwrap();
+        ensure_session_workspace(&worktree, "ensure-ws-1", false, &cfg(false)).await.unwrap();
 
         assert!(std::path::Path::new(&worktree).is_dir(), "worktree must be recreated at the same path");
         let out = std::process::Command::new("git")
@@ -2287,7 +2169,7 @@ mod tests {
             .output()
             .unwrap();
 
-        ensure_session_workspace(&worktree, "ensure-ws-2", false, false, false).await.unwrap();
+        ensure_session_workspace(&worktree, "ensure-ws-2", false, &cfg(false)).await.unwrap();
 
         assert!(std::path::Path::new(&worktree).is_dir(), "worktree must be recreated at the same path");
         let out = std::process::Command::new("git")
@@ -2310,7 +2192,7 @@ mod tests {
         // `git worktree add` fail on both the -b and existing-branch paths.
         std::fs::remove_dir_all(&worktree).unwrap();
 
-        ensure_session_workspace(&worktree, "ensure-ws-3", false, false, false).await.unwrap();
+        ensure_session_workspace(&worktree, "ensure-ws-3", false, &cfg(false)).await.unwrap();
 
         assert!(std::path::Path::new(&worktree).is_dir(), "worktree must be recreated at the same path");
         let out = std::process::Command::new("git")
@@ -2323,7 +2205,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_session_workspace_is_a_noop_when_the_dir_exists() {
         let dir = tempdir().unwrap().keep();
-        ensure_session_workspace(dir.to_str().unwrap(), "whatever", false, false, false).await.unwrap();
+        ensure_session_workspace(dir.to_str().unwrap(), "whatever", false, &cfg(false)).await.unwrap();
         assert!(dir.is_dir());
     }
 
@@ -2332,7 +2214,7 @@ mod tests {
         // A missing dir that is NOT a ninox worktree ({repo}/.claude/
         // worktrees/{session_id}) can't be safely recreated — error out so
         // the spawn fails visibly instead of claude starting in $HOME.
-        let result = ensure_session_workspace("/definitely/not/a/real/dir", "sess-x", false, false, false).await;
+        let result = ensure_session_workspace("/definitely/not/a/real/dir", "sess-x", false, &cfg(false)).await;
         assert!(result.is_err());
     }
 
@@ -2345,7 +2227,7 @@ mod tests {
         let ws = parent.join("orch-1");
         assert!(!ws.exists());
 
-        ensure_session_workspace(ws.to_str().unwrap(), "orch-1", true, false, false).await.unwrap();
+        ensure_session_workspace(ws.to_str().unwrap(), "orch-1", true, &cfg(false)).await.unwrap();
 
         assert!(ws.is_dir(), "orchestrator workspace must be recreated as a plain dir");
     }
@@ -2637,7 +2519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_brain_skill_writes_skill_with_frontmatter() {
+    async fn seeding_brain_skill_writes_skill_with_frontmatter() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let ws = dir.path().to_str().unwrap().to_string();
@@ -2647,7 +2529,7 @@ mod tests {
             .await
             .unwrap();
 
-        seed_worker_brain_skill(&ws).await.unwrap();
+        seed_worker_skills(&ws, &cfg(false)).await;
 
         let skill = tokio::fs::read_to_string(
             dir.path().join(".claude").join("skills").join("brain").join("SKILL.md"),
@@ -2661,7 +2543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_brain_skill_excludes_itself_from_git_idempotently() {
+    async fn seeding_brain_skill_excludes_itself_from_git_idempotently() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let ws = dir.path().to_str().unwrap().to_string();
@@ -2671,8 +2553,8 @@ mod tests {
             .await
             .unwrap();
 
-        seed_worker_brain_skill(&ws).await.unwrap();
-        seed_worker_brain_skill(&ws).await.unwrap();
+        seed_worker_skills(&ws, &cfg(false)).await;
+        seed_worker_skills(&ws, &cfg(false)).await;
 
         let exclude = tokio::fs::read_to_string(dir.path().join(".git").join("info").join("exclude"))
             .await
@@ -2694,12 +2576,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_brain_skill_skips_exclude_when_not_a_git_repo() {
+    async fn seeding_brain_skill_skips_exclude_when_not_a_git_repo() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let ws = dir.path().to_str().unwrap().to_string();
 
-        seed_worker_brain_skill(&ws).await.unwrap();
+        seed_worker_skills(&ws, &cfg(false)).await;
 
         assert!(
             dir.path().join(".claude").join("skills").join("brain").join("SKILL.md").exists(),
@@ -2709,7 +2591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_brain_skill_refuses_to_overwrite_a_tracked_copy() {
+    async fn seeding_brain_skill_refuses_to_overwrite_a_tracked_copy() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let ws = dir.path().to_str().unwrap().to_string();
@@ -2737,7 +2619,7 @@ mod tests {
             .unwrap();
         assert!(commit_status.success(), "git commit must succeed to simulate a tracked copy");
 
-        let result = seed_worker_brain_skill(&ws).await;
+        let result = seed_worker_skill(&ws, "brain", worker_md("brain")).await;
         assert!(result.is_err(), "must refuse to silently overwrite a tracked copy");
 
         let content = tokio::fs::read_to_string(skill_dir.join("SKILL.md")).await.unwrap();
@@ -2745,7 +2627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_brain_skill_targets_shared_common_dir_from_a_worktree() {
+    async fn seeding_brain_skill_targets_shared_common_dir_from_a_worktree() {
         use tempfile::tempdir;
         let repo_dir = tempdir().unwrap();
         let repo = repo_dir.path().to_str().unwrap().to_string();
@@ -2780,7 +2662,7 @@ mod tests {
             .await
             .unwrap();
 
-        seed_worker_brain_skill(&worktree).await.unwrap();
+        seed_worker_skills(&worktree, &cfg(false)).await;
 
         // The exclude must land in the MAIN repo's shared .git/info/exclude,
         // not anywhere under the linked worktree's own (file-based) .git.
@@ -2798,7 +2680,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_watch_pr_skill_writes_skill_with_frontmatter() {
+    async fn seeding_watch_pr_skill_writes_skill_with_frontmatter() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let ws = dir.path().to_str().unwrap().to_string();
@@ -2808,7 +2690,7 @@ mod tests {
             .await
             .unwrap();
 
-        seed_worker_watch_pr_skill(&ws).await.unwrap();
+        seed_worker_skills(&ws, &cfg(true)).await;
 
         let skill = tokio::fs::read_to_string(
             dir.path().join(".claude").join("skills").join("watch-pr").join("SKILL.md"),
@@ -2823,7 +2705,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_watch_pr_skill_excludes_itself_from_git_idempotently() {
+    async fn seeding_watch_pr_skill_excludes_itself_from_git_idempotently() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let ws = dir.path().to_str().unwrap().to_string();
@@ -2833,8 +2715,8 @@ mod tests {
             .await
             .unwrap();
 
-        seed_worker_watch_pr_skill(&ws).await.unwrap();
-        seed_worker_watch_pr_skill(&ws).await.unwrap();
+        seed_worker_skills(&ws, &cfg(true)).await;
+        seed_worker_skills(&ws, &cfg(true)).await;
 
         let exclude = tokio::fs::read_to_string(dir.path().join(".git").join("info").join("exclude"))
             .await
@@ -2856,7 +2738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_watch_pr_skill_refuses_to_overwrite_a_tracked_copy() {
+    async fn seeding_watch_pr_skill_refuses_to_overwrite_a_tracked_copy() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let ws = dir.path().to_str().unwrap().to_string();
@@ -2884,7 +2766,7 @@ mod tests {
             .unwrap();
         assert!(commit_status.success(), "git commit must succeed to simulate a tracked copy");
 
-        let result = seed_worker_watch_pr_skill(&ws).await;
+        let result = seed_worker_skill(&ws, "watch-pr", worker_md("watch-pr")).await;
         assert!(result.is_err(), "must refuse to silently overwrite a tracked copy");
 
         let content = tokio::fs::read_to_string(skill_dir.join("SKILL.md")).await.unwrap();
@@ -2892,12 +2774,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_watch_pr_skill_skips_exclude_when_not_a_git_repo() {
+    async fn seeding_watch_pr_skill_skips_exclude_when_not_a_git_repo() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let ws = dir.path().to_str().unwrap().to_string();
 
-        seed_worker_watch_pr_skill(&ws).await.unwrap();
+        seed_worker_skills(&ws, &cfg(true)).await;
 
         assert!(
             dir.path().join(".claude").join("skills").join("watch-pr").join("SKILL.md").exists(),
@@ -2907,12 +2789,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_watch_pr_skill_targets_shared_common_dir_from_a_worktree() {
+    async fn seeding_watch_pr_skill_targets_shared_common_dir_from_a_worktree() {
         use tempfile::tempdir;
         let repo_dir = tempdir().unwrap();
         let repo = repo_dir.path().to_str().unwrap().to_string();
         tokio::process::Command::new("git").args(["init", "-q", &repo]).status().await.unwrap();
-        // See seed_worker_brain_skill_targets_shared_common_dir_from_a_worktree
+        // See seeding_brain_skill_targets_shared_common_dir_from_a_worktree
         // for why `.success()` is checked here rather than just `.status()`.
         let commit_status = tokio::process::Command::new("git")
             .args([
@@ -2934,7 +2816,7 @@ mod tests {
             .await
             .unwrap();
 
-        seed_worker_watch_pr_skill(&worktree).await.unwrap();
+        seed_worker_skills(&worktree, &cfg(true)).await;
 
         // The exclude must land in the MAIN repo's shared .git/info/exclude,
         // not anywhere under the linked worktree's own (file-based) .git.
@@ -2951,6 +2833,89 @@ mod tests {
         );
     }
 
+    /// The loop must seed *every* enabled worker capability the registry
+    /// declares, not a hand-maintained subset — this is the assertion that
+    /// fails if someone adds a registry entry and the seeding drifts.
+    #[tokio::test]
+    async fn seed_worker_skills_seeds_every_enabled_registry_entry() {
+        use ninox_core::capabilities::{for_audience, Audience};
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git").args(["init", "-q", &ws]).status().await.unwrap();
+
+        let config = cfg(true);
+        seed_worker_skills(&ws, &config).await;
+
+        let expected: Vec<_> = for_audience(Audience::Worker)
+            .filter(|c| (c.enabled)(&config))
+            .collect();
+        assert!(expected.len() >= 2, "sanity: registry should declare worker skills");
+        for cap in expected {
+            let path = dir.path().join(".claude").join("skills").join(cap.name).join("SKILL.md");
+            let body = tokio::fs::read_to_string(&path)
+                .await
+                .unwrap_or_else(|e| panic!("{} not seeded: {e}", cap.name));
+            assert_eq!(body, cap.worker_md.unwrap(), "{} body must be the registry's", cap.name);
+        }
+    }
+
+    /// Gated entries are skipped, not seeded-then-hidden: with `[pr_watch]`
+    /// off the worker `watch-pr` file must never appear, while the ungated
+    /// entries still land.
+    #[tokio::test]
+    async fn seed_worker_skills_skips_disabled_capabilities() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git").args(["init", "-q", &ws]).status().await.unwrap();
+
+        seed_worker_skills(&ws, &cfg(false)).await;
+
+        let skills = dir.path().join(".claude").join("skills");
+        assert!(skills.join("brain").join("SKILL.md").exists(), "ungated skills must still seed");
+        assert!(
+            !skills.join("watch-pr").join("SKILL.md").exists(),
+            "watch-pr must not be seeded when pr_watch is disabled"
+        );
+    }
+
+    /// Best-effort by design: one capability that can't be written (here, a
+    /// tracked `brain` copy the seeder refuses to clobber) must not abort
+    /// the loop and cost the worker its remaining skills.
+    #[tokio::test]
+    async fn seed_worker_skills_continues_past_a_failing_capability() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git").args(["init", "-q", &ws]).status().await.unwrap();
+
+        let brain_dir = dir.path().join(".claude").join("skills").join("brain");
+        tokio::fs::create_dir_all(&brain_dir).await.unwrap();
+        tokio::fs::write(brain_dir.join("SKILL.md"), "tracked content\n").await.unwrap();
+        tokio::process::Command::new("git")
+            .args(["-C", &ws, "add", ".claude/skills/brain/SKILL.md"])
+            .status().await.unwrap();
+        let commit = tokio::process::Command::new("git")
+            .args([
+                "-C", &ws,
+                "-c", "user.email=test@example.com",
+                "-c", "user.name=Test",
+                "commit", "-q", "-m", "tracked",
+            ])
+            .status().await.unwrap();
+        assert!(commit.success(), "git commit must succeed to simulate a tracked copy");
+
+        seed_worker_skills(&ws, &cfg(true)).await;
+
+        assert_eq!(
+            tokio::fs::read_to_string(brain_dir.join("SKILL.md")).await.unwrap(),
+            "tracked content\n",
+            "the tracked copy must still be left untouched",
+        );
+        assert!(
+            dir.path().join(".claude").join("skills").join("watch-pr").join("SKILL.md").exists(),
+            "a failing capability must not stop the ones after it",
+        );
+    }
+
     /// `ensure_session_workspace`'s own gate: a recreated worker worktree
     /// only gets the watch-pr skill seeded when `pr_watch_enabled` is true —
     /// mirrors the `worker_context_footer` gating in `main.rs::run_spawn`
@@ -2964,7 +2929,7 @@ mod tests {
             .output()
             .unwrap();
 
-        ensure_session_workspace(&worktree, "ensure-ws-prw", false, false, false).await.unwrap();
+        ensure_session_workspace(&worktree, "ensure-ws-prw", false, &cfg(false)).await.unwrap();
         assert!(
             !std::path::Path::new(&worktree).join(".claude").join("skills").join("watch-pr").join("SKILL.md").exists(),
             "watch-pr skill must not be seeded when pr_watch is disabled"
@@ -2975,7 +2940,7 @@ mod tests {
             .output()
             .unwrap();
 
-        ensure_session_workspace(&worktree, "ensure-ws-prw", false, false, true).await.unwrap();
+        ensure_session_workspace(&worktree, "ensure-ws-prw", false, &cfg(true)).await.unwrap();
         assert!(
             std::path::Path::new(&worktree).join(".claude").join("skills").join("watch-pr").join("SKILL.md").exists(),
             "watch-pr skill must be seeded when pr_watch is enabled"

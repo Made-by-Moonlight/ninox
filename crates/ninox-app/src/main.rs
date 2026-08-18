@@ -8,10 +8,10 @@ mod theme;
 
 use anyhow::Context as _;
 use spawn_util::{
-    acquire_worker_checkout_for_incarnation, repo_from_workspace, seed_worker_brain_skill,
-    seed_worker_watch_pr_skill,
+    acquire_worker_checkout_for_incarnation, repo_from_workspace, seed_worker_skills,
 };
 use ninox_core::{
+    capabilities::Audience,
     config::AppConfig,
     events::Engine,
     github::resolve_token,
@@ -172,6 +172,19 @@ enum Command {
         /// List active PR watches
         #[arg(long)]
         prs: bool,
+    },
+    /// List the agent-facing capabilities Ninox currently offers, with each
+    /// one's live enabled/disabled state (see `ninox_core::capabilities`).
+    Capabilities {
+        /// Show only worker-facing capabilities
+        #[arg(long)]
+        worker: bool,
+        /// Show only orchestrator-facing capabilities
+        #[arg(long)]
+        orchestrator: bool,
+        /// Emit JSON instead of one line per capability
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -391,6 +404,22 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Agents run this to discover what ninox can do for them (the bootstrap
+    // line in every worker footer and the orchestrator AGENTS.md points
+    // here), so it must stay as cheap as Statusline/Inbox/Open above: it
+    // reads the config and nothing else — no store, no tmux, no wrappers.
+    if let Some(Command::Capabilities { worker, orchestrator, json }) = command {
+        let filter = match (worker, orchestrator) {
+            (true, false) => Some(Audience::Worker),
+            (false, true) => Some(Audience::Orchestrator),
+            // Neither flag, or both — no filter, list everything.
+            _ => None,
+        };
+        let config = AppConfig::load().unwrap_or_default();
+        println!("{}", run_capabilities(&config, filter, json));
+        return Ok(());
+    }
+
     if let Err(e) = tmux::write_server_config() {
         eprintln!("failed to write tmux config: {e}");
     }
@@ -464,6 +493,10 @@ async fn main() -> anyhow::Result<()> {
         // that across the early `return`.
         Some(Command::Open { .. } | Command::Close { .. } | Command::List { .. }) => {
             unreachable!("Open/Close/List short-circuit and return earlier in main()")
+        }
+        // Same story as Open/Close/List: handled by the early return above.
+        Some(Command::Capabilities { .. }) => {
+            unreachable!("Capabilities short-circuits and returns earlier in main()")
         }
         None => run_tui(store, args.port, args.headless).await,
     }
@@ -894,18 +927,12 @@ async fn run_spawn(
         anyhow::bail!("worker incarnation changed before checkout binding");
     }
 
-    if let Err(e) = seed_worker_brain_skill(&effective_workspace).await {
-        tracing::warn!("failed to seed brain skill for {id}: {e}");
-    }
-    // Durable, on-disk counterpart to the `worker_context_footer` PR-watch
-    // line below: the footer is lost after context compaction, but a
-    // seeded SKILL.md survives for the life of the worktree. Gated the
-    // same way the footer line is — only when [pr_watch] is enabled.
-    if config.pr_watch.enabled {
-        if let Err(e) = seed_worker_watch_pr_skill(&effective_workspace).await {
-            tracing::warn!("failed to seed watch-pr skill for {id}: {e}");
-        }
-    }
+    // Durable, on-disk counterpart to the `worker_context_footer` below: the
+    // footer is lost after context compaction, but a seeded SKILL.md
+    // survives for the life of the worktree. Which skills land (and whether
+    // gated ones like watch-pr are among them) is decided by the capability
+    // registry against this config — see `seed_worker_skills`.
+    seed_worker_skills(&effective_workspace, &config).await;
 
     // Derive the GitHub repo slug from the workspace's git remote so that
     // poll_github can call the GitHub API with the correct owner/repo.
@@ -1288,9 +1315,11 @@ fn worker_context_footer(
 
 /// The context footer appended to every worker's task prompt: its own
 /// session id, its orchestrator's id, the channels back to the orchestrator,
-/// and the one-worker-one-PR scope rule. When `pr_watch_enabled` (mirrors
-/// `AppConfig.pr_watch.enabled`), also tells the worker to register PR
-/// watches instead of polling `gh` directly.
+/// and the one-worker-one-PR scope rule. Always ends with the `ninox
+/// capabilities` bootstrap line so a worker can discover the rest of what
+/// ninox offers it without that list being restated here. When
+/// `pr_watch_enabled` (mirrors `AppConfig.pr_watch.enabled`), also tells the
+/// worker to register PR watches instead of polling `gh` directly.
 fn pr_worker_context_footer(id: &str, orch_id: &str, pr_watch_enabled: bool) -> String {
     let mut footer = format!(
         "\n\n---\n\
@@ -1320,6 +1349,9 @@ fn pr_worker_context_footer(id: &str, orch_id: &str, pr_watch_enabled: bool) -> 
              `ninox close --pr <url>` when done.",
         );
     }
+    footer.push_str(
+        "\n\nRun `ninox capabilities` to list what ninox can currently do.",
+    );
     footer
 }
 
@@ -2140,6 +2172,53 @@ fn run_pr_watch(
                 .join("\n"))
         }
     }
+}
+
+/// Core of `ninox capabilities`, split out from arg parsing so it can be
+/// tested against a constructed [`AppConfig`] rather than the machine's
+/// real one.
+///
+/// Walks `ninox_core::capabilities::REGISTRY` (filtered to `audience_filter`,
+/// or unfiltered when `None`) and reports each entry's name, whether its
+/// config gate is currently satisfied, and its frontmatter description.
+/// Disabled capabilities are listed rather than hidden — an agent asking
+/// what ninox can do is better served by "watch-pr is off" than by silence.
+fn run_capabilities(
+    config: &AppConfig,
+    audience_filter: Option<Audience>,
+    json: bool,
+) -> String {
+    use ninox_core::capabilities;
+
+    // `Audience::Both` matches every entry, so it doubles as "no filter".
+    let filter = audience_filter.unwrap_or(Audience::Both);
+    let caps: Vec<_> = capabilities::for_audience(filter).collect();
+
+    if json {
+        let items: Vec<_> = caps
+            .iter()
+            .map(|cap| {
+                serde_json::json!({
+                    "name":        cap.name,
+                    "audience":    cap.audience.as_str(),
+                    "enabled":     (cap.enabled)(config),
+                    "description": cap.md_for(filter).and_then(capabilities::description).unwrap_or(""),
+                })
+            })
+            .collect();
+        return serde_json::to_string_pretty(&items)
+            .unwrap_or_else(|_| "[]".to_string());
+    }
+
+    let width = caps.iter().map(|c| c.name.len()).max().unwrap_or(0);
+    caps.iter()
+        .map(|cap| {
+            let status = if (cap.enabled)(config) { "[enabled]" } else { "[disabled]" };
+            let desc = cap.md_for(filter).and_then(capabilities::description).unwrap_or("");
+            format!("{:<width$}  {:<10}  {}", cap.name, status, desc, width = width)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Handler for `ninox statusline`. Never returns an error and never
@@ -3085,6 +3164,20 @@ mod worker_env_tests {
         );
     }
 
+    /// The capability-discovery bootstrap line is ungated — a worker must
+    /// always be told how to find out what ninox can do for it, regardless
+    /// of which individual capabilities happen to be enabled.
+    #[test]
+    fn worker_footer_always_points_at_the_capabilities_command() {
+        for pr_watch in [false, true] {
+            let footer = worker_context_footer("w1", "orch1", WorkerDelivery::Pr, pr_watch);
+            assert!(
+                footer.contains("ninox capabilities"),
+                "capabilities bootstrap line must be present with pr_watch={pr_watch}"
+            );
+        }
+    }
+
     #[test]
     fn forwards_brain_and_config_when_present() {
         let env = worker_env_vars(
@@ -3708,5 +3801,107 @@ mod orchestrator_cli_tests {
         let skipped = reap_report_line("w1", ReapOutcome::SkippedResumable);
         assert!(skipped.contains("resumable") && skipped.contains("--force"), "{skipped}");
         assert!(reap_report_line("w1", ReapOutcome::NotFound).contains("not one of your workers"));
+    }
+}
+
+#[cfg(test)]
+mod capabilities_cli_tests {
+    use super::*;
+    use ninox_core::capabilities::{Audience, REGISTRY};
+
+    #[test]
+    fn lists_every_registry_entry_by_default() {
+        let out = run_capabilities(&AppConfig::default(), None, false);
+        assert_eq!(
+            out.lines().count(),
+            REGISTRY.len(),
+            "one line per registry entry, no filter applied"
+        );
+        for cap in REGISTRY {
+            assert!(out.contains(cap.name), "{} missing from output", cap.name);
+        }
+    }
+
+    #[test]
+    fn each_line_carries_a_status_and_a_description() {
+        let out = run_capabilities(&AppConfig::default(), None, false);
+        for line in out.lines() {
+            assert!(
+                line.contains("[enabled]") || line.contains("[disabled]"),
+                "line must carry a status: {line}"
+            );
+            let after_status = line.split(']').nth(1).unwrap_or("").trim();
+            assert!(!after_status.is_empty(), "line must carry a description: {line}");
+        }
+    }
+
+    #[test]
+    fn audience_filters_narrow_the_listing() {
+        let cfg = AppConfig::default();
+        let worker = run_capabilities(&cfg, Some(Audience::Worker), false);
+        assert!(worker.contains("brain"));
+        assert!(worker.contains("watch-pr"));
+        assert!(!worker.contains("spawn-worker"), "worker listing must not show orchestrator-only skills");
+
+        let orch = run_capabilities(&cfg, Some(Audience::Orchestrator), false);
+        assert!(orch.contains("spawn-worker"));
+        assert!(orch.contains("set-agent-config"));
+    }
+
+    /// The one gated capability: flipping `[pr_watch]` off must show the
+    /// worker `watch-pr` entry as disabled rather than hiding it.
+    #[test]
+    fn disabled_toggle_marks_worker_watch_pr_disabled() {
+        let mut cfg = AppConfig::default();
+        cfg.pr_watch.enabled = false;
+        let out = run_capabilities(&cfg, Some(Audience::Worker), false);
+        let line = out.lines().find(|l| l.starts_with("watch-pr")).expect("watch-pr line");
+        assert!(line.contains("[disabled]"), "expected disabled, got: {line}");
+
+        cfg.pr_watch.enabled = true;
+        let out = run_capabilities(&cfg, Some(Audience::Worker), false);
+        let line = out.lines().find(|l| l.starts_with("watch-pr")).expect("watch-pr line");
+        assert!(line.contains("[enabled]"), "expected enabled, got: {line}");
+    }
+
+    /// The orchestrator copy of `watch-pr` is ungated — it stays enabled
+    /// even with `[pr_watch]` off (matching what gets seeded on disk).
+    #[test]
+    fn orchestrator_watch_pr_stays_enabled_with_pr_watch_off() {
+        let mut cfg = AppConfig::default();
+        cfg.pr_watch.enabled = false;
+        let out = run_capabilities(&cfg, Some(Audience::Orchestrator), false);
+        let line = out.lines().find(|l| l.starts_with("watch-pr")).expect("watch-pr line");
+        assert!(line.contains("[enabled]"), "expected enabled, got: {line}");
+    }
+
+    #[test]
+    fn json_output_parses_with_the_documented_shape() {
+        let mut cfg = AppConfig::default();
+        cfg.pr_watch.enabled = false;
+        let out = run_capabilities(&cfg, None, true);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let arr = parsed.as_array().expect("top level array");
+        assert_eq!(arr.len(), REGISTRY.len());
+        for item in arr {
+            assert!(item["name"].is_string());
+            assert!(item["audience"].is_string());
+            assert!(item["enabled"].is_boolean());
+            assert!(item["description"].is_string());
+        }
+        let worker_watch = arr
+            .iter()
+            .find(|i| i["name"] == "watch-pr" && i["audience"] == "worker")
+            .expect("worker watch-pr entry");
+        assert_eq!(worker_watch["enabled"], serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn json_honors_the_audience_filter() {
+        let out = run_capabilities(&AppConfig::default(), Some(Audience::Orchestrator), true);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert!(arr.iter().all(|i| i["audience"] != "worker"));
+        assert!(arr.iter().any(|i| i["name"] == "spawn-worker"));
     }
 }

@@ -2071,7 +2071,6 @@ impl App {
                         let inbox_enabled = state.config.inbox_messaging.enabled;
                         let repositories_root = state.config.resolved_repositories_root();
                         let worktree_root = state.config.resolved_worktree_root();
-                        let pr_watch_enabled = state.config.pr_watch.enabled;
 
                         Task::future(async move {
                             let source_workspace = exact_worktree_source
@@ -2233,14 +2232,7 @@ impl App {
                                     Message::Noop
                                 };
                             }
-                            if let Err(e) = crate::spawn_util::seed_worker_brain_skill(&effective_ws).await {
-                                tracing::warn!("failed to seed brain skill for {sid}: {e}");
-                            }
-                            if pr_watch_enabled {
-                                if let Err(e) = crate::spawn_util::seed_worker_watch_pr_skill(&effective_ws).await {
-                                    tracing::warn!("failed to seed watch-pr skill for {sid}: {e}");
-                                }
-                            }
+                            crate::spawn_util::seed_worker_skills(&effective_ws, &config).await;
 
                             // Repo slug from the base workspace's git remote so
                             // poll_github can talk to the right owner/repo.
@@ -2563,7 +2555,6 @@ impl App {
                 let inbox_enabled = state.config.inbox_messaging.enabled;
                 let repositories_root = state.config.resolved_repositories_root();
                 let worktree_root = state.config.resolved_worktree_root();
-                let pr_watch_enabled = state.config.pr_watch.enabled;
                 Task::future(async move {
                     let current_worker = if is_orch {
                         None
@@ -2712,8 +2703,7 @@ impl App {
                         &plan.workspace,
                         &id,
                         is_orch,
-                        inbox_enabled,
-                        pr_watch_enabled,
+                        &config,
                     ).await {
                         tracing::warn!("re-file {id}: cannot restore workspace: {e}");
                         emit_checkout_unavailable(&engine, &id, &name, &e);
@@ -2896,8 +2886,7 @@ impl App {
                 let repo    = session.repo.clone();
                 let orch_id = session.orchestrator_id.clone();
                 let summary = session.summary.clone();
-                let inbox_enabled = state.config.inbox_messaging.enabled;
-                let pr_watch_enabled = state.config.pr_watch.enabled;
+                let config = state.config.clone();
                 Task::future(async move {
                     let mut runtime_claim = runtime_claim;
                     if let Err(error) = ninox_core::tmux::kill_session(&id).await {
@@ -2917,8 +2906,7 @@ impl App {
                         &plan.workspace,
                         &id,
                         is_orch,
-                        inbox_enabled,
-                        pr_watch_enabled,
+                        &config,
                     ).await {
                         tracing::warn!("resume {id}: cannot restore workspace: {e}");
                         emit_checkout_unavailable(&engine, &id, &name, &e);
@@ -4462,8 +4450,15 @@ pub fn pr_url_for_session(
 
 /// Seeds `~/.config/ninox/orchestrator/` (or the configured root) with the
 /// files that orchestrator sessions need: AGENTS.md (canonical, CLAUDE.md
-/// symlinks to it), spawn-worker skill, set-agent-config skill, brain skill,
-/// and the subagent-blocker PreToolUse hook.
+/// symlinks to it), one SKILL.md per orchestrator-facing capability in
+/// `ninox_core::capabilities::REGISTRY`, and the subagent-blocker PreToolUse
+/// hook.
+///
+/// Both the seeded skills and AGENTS.md's "Available Skills" list are driven
+/// by that registry, so adding a capability needs no edit here. Skill bodies
+/// go through `capabilities::render` to substitute the seed-time
+/// placeholders (`{{NINOX_BIN}}`, `{{CONFIG_PATH}}`) — see the
+/// `ninox_core::capabilities` module docs.
 ///
 /// AGENTS.md and settings.json are skipped if already present (user-editable).
 /// Generated skills are refreshed while untouched; user-modified skills and
@@ -4473,50 +4468,56 @@ pub async fn setup_orchestrator_root(
     ninox_bin: &str,
     config_path: &str,
 ) -> anyhow::Result<()> {
+    use ninox_core::capabilities::{self, Audience};
     use tokio::fs;
 
     let claude_dir        = root.join(".claude");
     let claude_skills_dir = claude_dir.join("skills");
-    let spawn_skill_dir     = claude_skills_dir.join("spawn-worker");
     let reap_skill_dir      = claude_skills_dir.join("reap-workers");
     let orch_skill_dir      = claude_skills_dir.join("spawn-orchestrator");
-    let config_skill_dir    = claude_skills_dir.join("set-agent-config");
-    let brain_skill_dir     = claude_skills_dir.join("brain");
-    let watch_pr_skill_dir  = claude_skills_dir.join("watch-pr");
     fs::create_dir_all(&claude_dir).await?;
-    fs::create_dir_all(&spawn_skill_dir).await?;
     fs::create_dir_all(&reap_skill_dir).await?;
     fs::create_dir_all(&orch_skill_dir).await?;
-    fs::create_dir_all(&config_skill_dir).await?;
-    fs::create_dir_all(&brain_skill_dir).await?;
-    fs::create_dir_all(&watch_pr_skill_dir).await?;
 
-    let spawn_skill_path    = spawn_skill_dir.join("SKILL.md");
     let reap_skill_path     = reap_skill_dir.join("SKILL.md");
     let orch_skill_path     = orch_skill_dir.join("SKILL.md");
-    let config_skill_path   = config_skill_dir.join("SKILL.md");
-    let brain_skill_path    = brain_skill_dir.join("SKILL.md");
-    let watch_pr_skill_path = watch_pr_skill_dir.join("SKILL.md");
+
+    let skill_path = |name: &str| claude_skills_dir.join(name).join("SKILL.md");
+
+    // Skill files — always overwritten, so an upgraded ninox re-seeds the
+    // current wording over whatever the previous version wrote.
+    for cap in capabilities::for_audience(Audience::Orchestrator) {
+        let Some(md) = cap.orchestrator_md else { continue };
+        let dir = claude_skills_dir.join(cap.name);
+        fs::create_dir_all(&dir).await?;
+        fs::write(dir.join("SKILL.md"), capabilities::render(md, ninox_bin, config_path)).await?;
+    }
 
     // AGENTS.md is canonical; CLAUDE.md symlinks to it.
     let agents_md_path = root.join("AGENTS.md");
     if !agents_md_path.exists() {
+        let mut skills = String::new();
+        for cap in capabilities::for_audience(Audience::Orchestrator) {
+            let Some(md) = cap.orchestrator_md else { continue };
+            skills.push_str(&format!(
+                "- `{}` — {}\n",
+                skill_path(cap.name).display(),
+                capabilities::description(md).unwrap_or(""),
+            ));
+        }
         let body = format!(
             "# Ninox Orchestrator\n\n\
              Before doing anything else, read and follow: `{spawn_skill}`\n\n\
              ## Available Skills\n\n\
-             - `{spawn_skill}` — spawning worker sessions\n\
              - `{reap_skill}` — cleaning up workers you are done with\n\
              - `{orch_skill}` — spawning another orchestrator (only on the user's request)\n\
-             - `{config_skill}` — changing agent harness or model\n\
-             - `{brain_skill}` — reading and writing the shared knowledge brain\n\
-             - `{watch_pr_skill}` — registering PRs for consolidated watching instead of polling gh\n",
-            spawn_skill    = spawn_skill_path.display(),
-            reap_skill     = reap_skill_path.display(),
-            orch_skill     = orch_skill_path.display(),
-            config_skill   = config_skill_path.display(),
-            brain_skill    = brain_skill_path.display(),
-            watch_pr_skill = watch_pr_skill_path.display(),
+             {skills}\n\
+             Run `{ninox_bin} capabilities` to list what ninox can currently do.\n",
+            spawn_skill = skill_path("spawn-worker").display(),
+            reap_skill  = reap_skill_path.display(),
+            orch_skill  = orch_skill_path.display(),
+            skills      = skills,
+            ninox_bin   = ninox_bin,
         );
         fs::write(&agents_md_path, body).await?;
     }
@@ -4530,113 +4531,6 @@ pub async fn setup_orchestrator_root(
             fs::write(&claude_md_path, body).await?;
         }
     }
-
-    // spawn-worker skill — always overwritten.
-    let spawn_skill_content = format!(
-        r#"---
-name: spawn-worker
-description: Use before starting any implementation task as a Ninox orchestrator — spawn a worker session instead of doing the work yourself.
----
-
-# Spawn a Worker, Not a Subagent
-
-You are a **Ninox orchestrator agent**. You coordinate — you do not implement.
-
-## Your Role
-
-- Spawn worker sessions for all implementation tasks
-- Monitor worker progress; direct workers when they get stuck
-- Never implement code, run tests, or create PRs yourself
-
-## Spawning Workers
-
-Name workers after the ticket or task so they are easy to reference:
-
-```bash
-{ninox_bin} spawn \
-  --name "ath-123-auth-fix" \
-  --prompt "Complete task description with acceptance criteria, repo path, and branch" \
-  --workspace /absolute/path/to/repo \
-  --delivery pr
-```
-
-`--name` becomes the session ID. Names are slugified automatically (`"ATH-123 auth"` → `"ath-123-auth"`).
-Omitting `--name` generates a timestamp ID (`worker-…`).
-
-`NINOX_ORCHESTRATOR_ID` is set in your environment and picked up automatically.
-Each spawn prints the session ID (`spawned ath-123-auth-fix`) — use it to send follow-ups.
-
-## Choosing Delivery
-
-Choose the contract explicitly:
-
-- `--delivery pr` — code changes that must be delivered through a branch,
-  commit, push, and pull request.
-- `--delivery direct` — research, operational tasks, direct-file/artifact
-  work, and all non-Git workspaces. The worker validates its artifacts or
-  direct changes and reports either a blocker or completion; it does not
-  create branches, remotes, commits, or PRs.
-
-When `--delivery` is omitted, Ninox preserves PR delivery for Git repositories
-and selects direct delivery for non-Git workspaces. Prefer an explicit choice
-so the worker contract reflects the task rather than only the workspace type.
-
-For PR delivery, always pass the primary repository checkout to `--workspace`.
-When that checkout is directly under Ninox's configured repositories root,
-Ninox leases a warm sibling checkout (`<repo>-w1`, `<repo>-w2`, …). Ninox
-chooses and manages the pool slot; never pass a `-wN` path yourself. The
-primary checkout remains untouched.
-
-## Messaging Workers (Orchestrator → Worker)
-
-Send instructions or follow-ups to a worker using its session ID:
-
-```bash
-{ninox_bin} send ath-123-auth-fix "Focus on the token refresh path first"
-```
-
-## Work Requests (Worker → Orchestrator)
-
-Workers are scoped to one task and one delivery. When a worker discovers
-additional work, it runs `{ninox_bin} request-work "<description>"` and
-Ninox forwards the request to you as a
-`[Ninox] Worker … requested additional work` message.
-
-When one arrives: decide whether the work is worth doing, and if so
-spawn a new worker for it with `{ninox_bin} spawn`. **Never** tell a worker to widen
-its own task or delivery — extra scope always gets its own worker. For PR
-delivery, Ninox will also warn you (`[Ninox] Worker … opened N PRs beyond its
-tracked PR`) if a worker opens extra PRs anyway; review each extra PR and
-either close it or hand it to a dedicated worker.
-
-## Cleaning Up Workers
-
-A finished worker keeps its git worktree checked out until someone clears it.
-Reap the ones you are done with:
-
-```bash
-{ninox_bin} reap
-```
-
-See the `reap-workers` skill for the full contract.
-
-Workers can register extra PR watches — see the `watch-pr` skill.
-
-## The Rule
-
-**Never use the Agent tool for implementation work.** All implementation goes
-through `{ninox_bin} spawn`. Read-only Explore/Plan agents are permitted.
-
-| Thought | Reality |
-|---|---|
-| "The task is small" | Size doesn't matter. Workers handle small tasks fine. |
-| "I'm already mid-context" | Offload work to preserve orchestrator context. |
-| "It's just a push/PR" | Pushes need auth wiring subagents don't have. |
-| "The Agent tool is easier" | It's always easier. That's why this rule exists. |
-"#,
-        ninox_bin = ninox_bin,
-    );
-    fs::write(&spawn_skill_path, spawn_skill_content).await?;
 
     // reap-workers skill — always overwritten.
     let reap_skill_content = format!(
@@ -4772,165 +4666,6 @@ cannot reap it — `{ninox_bin} reap` only ever touches your own workers.
         ninox_bin = ninox_bin,
     );
     fs::write(&orch_skill_path, orch_skill_content).await?;
-
-    // set-agent-config skill — always overwritten.
-    let config_skill_content = format!(
-        r#"---
-name: set-agent-config
-description: Use when the user asks to change the orchestrator's or worker's agent harness or model.
----
-
-# Set Ninox Agent Config
-
-Use this skill when the user asks to change the agent harness or model.
-
-## Config file
-
-```
-{config_path}
-```
-
-## Format
-
-```toml
-[orchestrator]
-harness = "claude-code"   # claude-code | codex | aider | opencode
-model = "model-name"      # omit to use the harness default
-
-[worker]
-harness = "claude-code"
-model = "model-name"
-```
-
-Use the Edit tool to update the relevant field. Changes take effect on the next spawn.
-"#,
-        config_path = config_path,
-    );
-    fs::write(&config_skill_path, config_skill_content).await?;
-
-    // brain skill — always overwritten.
-    let brain_skill_content = format!(
-        r#"---
-name: brain
-description: Read and write Ninox's shared knowledge brain. Use before exploring unfamiliar code (query first) and as soon as you learn something worth keeping — write it down, don't wait until the end.
----
-
-# Read and Write the Brain
-
-The brain is Ninox's persistent, shared knowledge store. As you explore
-codebases you discover things — where a type is defined, how two repos
-relate, why a decision was made. Without a place to put that, every new
-session starts cold. Write it down so the next orchestrator doesn't have to
-rediscover it.
-
-Your session's brain is already resolved — these commands act on it with no
-extra configuration.
-
-## 1. Query first
-
-`brain query` blends keyword and semantic matches automatically — no new
-syntax needed. Before writing a new entry, check whether one already exists:
-
-```bash
-{ninox_bin} brain query "<name or concept>"
-```
-
-Narrow with filters:
-
-```bash
-{ninox_bin} brain query "<text>" --entry-type repo
-{ninox_bin} brain query "<text>" --tag auth
-```
-
-If a relevant entry exists, update it instead of creating a duplicate.
-
-## 2. Write a fact
-
-Create or update a Markdown file under the section that fits, then rebuild
-the index:
-
-```
-repos/          where repositories live, their purpose, entry points
-symbols/        where types, functions, and modules are defined
-concepts/       domain terminology and mental models
-patterns/       conventions and recurring implementation shapes
-decisions/      why something was built a certain way (ADRs)
-architecture/   how the system is structured — components, data flows
-relationships/  how repos, services, and teams connect
-errors/         known failure modes and how to resolve them
-```
-
-Each file needs YAML frontmatter followed by Markdown body:
-
-```markdown
----
-type: repo
-name: my-crate
-tags: [auth, core]
-repos: [my-crate]
-updated: 2026-07-06
----
-
-# my-crate
-
-Entry point: `src/main.rs`
-Build: `cargo build`
-
-Facts, not prose. Link related entries with `[[other-entry]]`.
-```
-
-Then rebuild the index so the write becomes queryable:
-
-```bash
-{ninox_bin} brain index
-```
-
-## 3. Read for context
-
-At the start of work in unfamiliar territory, query before exploring:
-
-```bash
-{ninox_bin} brain query "" --entry-type architecture
-{ninox_bin} brain query "" --entry-type repo
-{ninox_bin} brain show <path-from-a-query-result>
-```
-
-## The Rule
-
-**Before exploring anything unfamiliar, query first.** As soon as you learn
-something a future session would want to know — don't wait until the end
-of your session — write it down and index it. A stale or empty brain is no
-better than no brain at all.
-"#,
-        ninox_bin = ninox_bin,
-    );
-    fs::write(&brain_skill_path, brain_skill_content).await?;
-
-    // watch-pr skill — always overwritten.
-    let watch_pr_skill_content = r#"---
-name: watch-pr
-description: Register a GitHub PR for consolidated watching so you get pinged on merge, CI failures, and review activity instead of polling gh yourself.
----
-
-# Watching a PR
-
-NEVER poll GitHub for PR/CI state in a loop (`gh pr checks --watch`,
-`gh run watch`, repeated `gh pr view`) — it burns the shared API rate
-limit. Register a watch instead:
-
-    ninox open --pr <pr-url>
-
-Ninox's poller then delivers merge, CI-failure, and changes-requested
-notifications straight into your session. When you stop caring:
-
-    ninox close --pr <pr-url>
-
-Watches auto-close when the PR merges or closes. `ninox list --prs`
-shows active watches. Workers' own PRs are watched automatically — this
-is for *additional* PRs (a dependency PR, a teammate's PR, a PR you
-opened outside ninox).
-"#;
-    fs::write(&watch_pr_skill_path, watch_pr_skill_content).await?;
 
     // subagent-blocker hook — always overwritten.
     let blocker = r#"#!/usr/bin/env node
@@ -8651,6 +8386,63 @@ mod tests {
             agents_md.contains(&skill_path.display().to_string()),
             "AGENTS.md should point orchestrators at the brain skill"
         );
+    }
+
+    /// Seeding is registry-driven: every orchestrator-facing capability gets
+    /// a SKILL.md whose body is that entry's markdown with the seed-time
+    /// placeholders substituted, and AGENTS.md lists all of them.
+    #[tokio::test]
+    async fn setup_orchestrator_root_seeds_every_registry_orchestrator_skill() {
+        use ninox_core::capabilities::{self, Audience};
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, "/path/to/ninox", "/cfg.toml").await.unwrap();
+
+        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        for cap in capabilities::for_audience(Audience::Orchestrator) {
+            let md = cap.orchestrator_md.expect("orchestrator entry has markdown");
+            let path = root.join(".claude").join("skills").join(cap.name).join("SKILL.md");
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{} not seeded: {e}", cap.name));
+            assert_eq!(
+                body,
+                capabilities::render(md, "/path/to/ninox", "/cfg.toml"),
+                "{} must be seeded as the rendered registry markdown",
+                cap.name,
+            );
+            assert!(!body.contains("{{"), "{} left an unsubstituted placeholder", cap.name);
+            assert!(
+                agents_md.contains(&path.display().to_string()),
+                "AGENTS.md must list {} under Available Skills",
+                cap.name,
+            );
+            assert!(
+                agents_md.contains(capabilities::description(md).unwrap()),
+                "AGENTS.md must describe {} from its frontmatter",
+                cap.name,
+            );
+        }
+        assert!(
+            agents_md.contains("/path/to/ninox capabilities"),
+            "AGENTS.md must point at the capabilities command"
+        );
+    }
+
+    /// The skills are always re-seeded, so a stale copy from an older ninox
+    /// is replaced rather than left in place (AGENTS.md, by contrast, stays
+    /// user-editable and is only written when absent).
+    #[tokio::test]
+    async fn setup_orchestrator_root_overwrites_stale_skills_but_not_agents_md() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+
+        let skill = root.join(".claude").join("skills").join("brain").join("SKILL.md");
+        std::fs::write(&skill, "stale\n").unwrap();
+        std::fs::write(root.join("AGENTS.md"), "hand-edited\n").unwrap();
+
+        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+
+        assert_ne!(std::fs::read_to_string(&skill).unwrap(), "stale\n");
+        assert_eq!(std::fs::read_to_string(root.join("AGENTS.md")).unwrap(), "hand-edited\n");
     }
 
     #[tokio::test]
