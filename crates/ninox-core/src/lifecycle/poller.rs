@@ -568,7 +568,27 @@ impl Poller {
             Ok(None)      => return None,
             Err(_)        => snapshot.clone(),
         };
+        let was_terminal = row.status.is_terminal();
         apply(&mut row);
+        // Never resurrect a terminal row to a live status. Every caller
+        // derives its new status from the tick-start *snapshot* (e.g.
+        // `poll_github`'s `derive_session_status(&session.status, ...)`), so a
+        // status that became terminal during this tick's awaits is invisible
+        // to that decision. `ninox reap` runs in its own process and is the
+        // first writer that can land a `status` write inside that window: it
+        // kills the worker, deletes its worktree, and writes `Terminated`,
+        // and this closure would then put the row back to `Mergeable`. That
+        // row is unrecoverable — `sweep_retired_sessions` only purges
+        // `Done`/`Terminated`, and `poll_pids` needs a `pid`, which a
+        // CLI-spawned worker never has (`run_spawn` inserts `pid: None`) — so
+        // it would sit on the fleet board as live forever, with no session
+        // and no worktree behind it.
+        if was_terminal && !row.status.is_terminal() {
+            row.status = self.engine.store.get_session(&snapshot.id)
+                .ok()
+                .flatten()
+                .map_or(row.status, |fresh| fresh.status);
+        }
         let _ = self.engine.store.upsert_session(&row);
         Some(row)
     }
@@ -2629,6 +2649,60 @@ mod tests {
             store.get_session("s1").unwrap().is_none(),
             "a session deleted mid-poll must not be re-inserted by the status/gate write",
         );
+    }
+
+    /// A status write must never resurrect a row that reached a terminal
+    /// state mid-tick. `poll_github` derives `new_status` from the tick-start
+    /// snapshot, so a `Terminated` written during its GitHub awaits is
+    /// invisible to that decision — and `ninox reap` runs in its own process,
+    /// making it the first writer that can land one there. Writing
+    /// `Mergeable` back over it would be unrecoverable: `sweep_retired_sessions`
+    /// only purges `Done`/`Terminated`, and `poll_pids` needs a `pid`, which a
+    /// CLI-spawned worker never has — so the card would sit on the fleet board
+    /// as live forever with no session and no worktree behind it.
+    #[tokio::test]
+    async fn poll_github_status_write_does_not_resurrect_a_session_reaped_mid_poll() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".to_string(), "repo".to_string(), 50),
+            crate::github::PrStatus {
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "t".into(), number: 50, head_sha: "abc".into(),
+            },
+        );
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.repo = "Owner/repo".into();
+        session.pr_number = Some(50);
+        session.pr_id = Some(50); // fully consistent — no self-heal write this tick
+        session.status = SessionStatus::PrOpen;
+        store.upsert_session(&session).unwrap();
+
+        // Simulate `ninox reap s1 --force` landing mid-tick: killed, worktree
+        // gone, row written Terminated with the countdown started.
+        let mut reaped = session.clone();
+        reaped.status = SessionStatus::Terminated;
+        reaped.terminal_at = Some(1_000);
+        *fake.mid_review_upsert.lock().unwrap() = Some((store.clone(), reaped));
+
+        let engine = github_engine(store.clone(), fake);
+        let poller = Poller::new(engine);
+
+        poller.poll_github().await;
+
+        let after = store.get_session("s1").unwrap().unwrap();
+        assert!(
+            matches!(after.status, SessionStatus::Terminated),
+            "a reaped session must stay Terminated, got {:?} — anything live here is a \
+             permanent ghost the sweep and poll_pids can both never clean up", after.status,
+        );
+        assert_eq!(after.terminal_at, Some(1_000), "the reap's countdown must survive");
     }
 
     /// Per the `SessionFields` contract (see its doc comment), a producer

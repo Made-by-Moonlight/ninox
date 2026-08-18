@@ -646,6 +646,31 @@ pub struct RefilePlan {
     pub extra_env:      Vec<(String, String)>,
 }
 
+/// Whether `Message::PollSessions` should overwrite a tracked session's
+/// status with the one the store now holds.
+///
+/// True whenever the store holds a *different terminal* status than app
+/// memory. Those are the changes the app can't hear about any other way: an
+/// out-of-process mutation (today, `ninox reap`) writes the store directly
+/// and its `Event`s never reach this process.
+///
+/// Both directions matter, and the second is easy to miss:
+/// - live → terminal: a worker was killed out from under us.
+/// - terminal → terminal: force-reaping an `Interrupted` worker writes
+///   `Terminated`, because its worktree is gone and it can no longer be
+///   resumed. Ignoring that leaves the card sitting in the Working column
+///   (`fleet_board::session_matches_column`), counted as interrupted, and —
+///   worst of all — still picked up by `Message::ResumeAllSessions`, which
+///   filters on the in-memory status and would silently resurrect a session
+///   the orchestrator deliberately reaped.
+///
+/// A *live* status from the store is never adopted: terminal → live is the
+/// app's own transition (Resume/Re-file), so a store snapshot read
+/// mid-respawn must not be able to undo it.
+fn adopts_terminal_status(known: &SessionStatus, from_store: &SessionStatus) -> bool {
+    from_store.is_terminal() && from_store != known
+}
+
 /// Decide what a session's status becomes when its tmux pane is found
 /// gone at startup. `has_resume_args` is the harness's capability (from
 /// `HarnessRegistry::resume_cmd(...).is_some()` against a placeholder id —
@@ -725,6 +750,55 @@ async fn reconcile_live_sessions_at_startup_with<F, Fut>(
             reconciled_status_for_dead_session(&session.claude_session_id, has_resume_args);
         let _ = engine.store.upsert_session(&dead);
         engine.emit(CoreEvent::SessionUpdated(dead, SessionFields::STATUS));
+    }
+}
+
+#[cfg(test)]
+mod poll_adoption_tests {
+    use super::*;
+
+    /// The gap `ninox reap` exposed: a CLI process writes the store directly
+    /// and its `Event`s never reach the running app, so without adopting the
+    /// store's terminal status on poll a reaped worker keeps rendering as
+    /// live on the fleet board for the whole retention window.
+    #[test]
+    fn adopts_a_terminal_status_the_store_has_and_app_memory_does_not() {
+        assert!(adopts_terminal_status(&SessionStatus::Working, &SessionStatus::Terminated));
+        assert!(adopts_terminal_status(&SessionStatus::PrOpen,  &SessionStatus::Done));
+        assert!(adopts_terminal_status(&SessionStatus::CiFailed, &SessionStatus::Interrupted));
+    }
+
+    /// Terminal → live is the app's OWN transition (Resume/Re-file). A store
+    /// snapshot read mid-respawn must never undo it, or the poll tick would
+    /// fight the spawn it just started.
+    #[test]
+    fn never_reverts_a_session_the_app_just_respawned() {
+        assert!(!adopts_terminal_status(&SessionStatus::Terminated, &SessionStatus::Working));
+        assert!(!adopts_terminal_status(&SessionStatus::Interrupted, &SessionStatus::Working));
+    }
+
+    #[test]
+    fn ignores_live_to_live_churn() {
+        // CI flipping, a review landing — all of that already arrives as
+        // events; re-adopting it here would add a second, racier path.
+        assert!(!adopts_terminal_status(&SessionStatus::Working, &SessionStatus::PrOpen));
+    }
+
+    #[test]
+    fn ignores_a_status_that_has_not_changed() {
+        for s in [SessionStatus::Done, SessionStatus::Terminated, SessionStatus::Interrupted] {
+            assert!(!adopts_terminal_status(&s, &s), "{s:?} → {s:?} is not a change");
+        }
+    }
+
+    /// Force-reaping an `Interrupted` worker writes `Terminated` out of
+    /// process. Missing that transition leaves the card in the Working
+    /// column, counted as interrupted, and still selected by
+    /// `Message::ResumeAllSessions` — which filters on the in-memory status
+    /// and would resurrect a session the orchestrator deliberately reaped.
+    #[test]
+    fn adopts_a_force_reaped_interrupted_worker_becoming_terminated() {
+        assert!(adopts_terminal_status(&SessionStatus::Interrupted, &SessionStatus::Terminated));
     }
 }
 
@@ -3164,9 +3238,27 @@ impl App {
                 // above purges their store record. PTY streaming is NOT
                 // started here — NavigateSession handles that on demand with
                 // the correct window dimensions.
+                //
+                // For sessions already tracked, adopt a terminal status the
+                // store has but app memory doesn't. Everything else in this
+                // process learns about status changes from `Event`s, but an
+                // out-of-process mutation (`ninox reap` runs in its own CLI
+                // process, whose `Engine` has no subscribers here) emits into
+                // the void — without this, a reaped worker would keep
+                // rendering as live on the fleet board for the whole
+                // retention window. Deliberately narrow: only terminal
+                // statuses, and only in the live → terminal direction, so
+                // this can never fight the app's own in-flight updates or
+                // resurrect a session the app just respawned.
                 for session in db_sessions {
-                    if !state.sessions.contains_key(&session.id) {
-                        state.sessions.insert(session.id.clone(), session);
+                    match state.sessions.get(&session.id) {
+                        None => {
+                            state.sessions.insert(session.id.clone(), session);
+                        }
+                        Some(known) if adopts_terminal_status(&known.status, &session.status) => {
+                            state.sessions.insert(session.id.clone(), session);
+                        }
+                        Some(_) => {}
                     }
                 }
 
@@ -4365,14 +4457,20 @@ pub async fn setup_orchestrator_root(
     let claude_dir        = root.join(".claude");
     let claude_skills_dir = claude_dir.join("skills");
     let spawn_skill_dir   = claude_skills_dir.join("spawn-worker");
+    let reap_skill_dir    = claude_skills_dir.join("reap-workers");
+    let orch_skill_dir    = claude_skills_dir.join("spawn-orchestrator");
     let config_skill_dir  = claude_skills_dir.join("set-agent-config");
     let brain_skill_dir   = claude_skills_dir.join("brain");
     fs::create_dir_all(&claude_dir).await?;
     fs::create_dir_all(&spawn_skill_dir).await?;
+    fs::create_dir_all(&reap_skill_dir).await?;
+    fs::create_dir_all(&orch_skill_dir).await?;
     fs::create_dir_all(&config_skill_dir).await?;
     fs::create_dir_all(&brain_skill_dir).await?;
 
     let spawn_skill_path  = spawn_skill_dir.join("SKILL.md");
+    let reap_skill_path   = reap_skill_dir.join("SKILL.md");
+    let orch_skill_path   = orch_skill_dir.join("SKILL.md");
     let config_skill_path = config_skill_dir.join("SKILL.md");
     let brain_skill_path  = brain_skill_dir.join("SKILL.md");
 
@@ -4384,9 +4482,13 @@ pub async fn setup_orchestrator_root(
              Before doing anything else, read and follow: `{spawn_skill}`\n\n\
              ## Available Skills\n\n\
              - `{spawn_skill}` — spawning worker sessions\n\
+             - `{reap_skill}` — cleaning up workers you are done with\n\
+             - `{orch_skill}` — spawning another orchestrator (only on the user's request)\n\
              - `{config_skill}` — changing agent harness or model\n\
              - `{brain_skill}` — reading and writing the shared knowledge brain\n",
             spawn_skill  = spawn_skill_path.display(),
+            reap_skill   = reap_skill_path.display(),
+            orch_skill   = orch_skill_path.display(),
             config_skill = config_skill_path.display(),
             brain_skill  = brain_skill_path.display(),
         );
@@ -4481,6 +4583,17 @@ delivery, Ninox will also warn you (`[Ninox] Worker … opened N PRs beyond its
 tracked PR`) if a worker opens extra PRs anyway; review each extra PR and
 either close it or hand it to a dedicated worker.
 
+## Cleaning Up Workers
+
+A finished worker keeps its git worktree checked out until someone clears it.
+Reap the ones you are done with:
+
+```bash
+{ninox_bin} reap
+```
+
+See the `reap-workers` skill for the full contract.
+
 ## The Rule
 
 **Never use the Agent tool for implementation work.** All implementation goes
@@ -4496,6 +4609,141 @@ through `{ninox_bin} spawn`. Read-only Explore/Plan agents are permitted.
         ninox_bin = ninox_bin,
     );
     fs::write(&spawn_skill_path, spawn_skill_content).await?;
+
+    // reap-workers skill — always overwritten.
+    let reap_skill_content = format!(
+        r#"---
+name: reap-workers
+description: Use when workers have finished (PR merged, session dead, work abandoned) and you want their sessions and worktrees cleaned up.
+---
+
+# Reap Your Workers
+
+Every worker you spawn checks out its own git worktree under
+`{{repo}}/.claude/worktrees/{{session-id}}`. When the worker finishes, that
+worktree stays on disk until it is reaped. Reaping kills the worker's
+session, removes its worktree, and lets its card age off the fleet board.
+Anything the worker reported but Ninox has not processed yet (a work request,
+a freshly opened PR) is left alone for Ninox to pick up.
+
+You can only ever reap **your own** workers — an id belonging to another
+orchestrator is refused, not cleaned up.
+
+## Reap everything that has finished
+
+```bash
+{ninox_bin} reap
+```
+
+This is the safe default: it touches only workers that are finished for good
+(PR merged, process exited, terminated). Two kinds of worker are never
+selected by it:
+
+- **Still running** — reaping would destroy work in progress.
+- **Interrupted** — its pane died with the machine (a reboot), but its
+  conversation and branch survive and the user can resume it. Reaping gives
+  that up.
+
+## Reap specific workers
+
+```bash
+{ninox_bin} reap ath-123-auth-fix ath-124-api
+```
+
+## Reap a running or interrupted worker
+
+Both need an explicit `--force`, plus `--all` to select them in bulk:
+
+```bash
+{ninox_bin} reap ath-123-auth-fix --force   # this worker whatever state it's in
+{ninox_bin} reap --all --force              # every worker you own
+```
+
+Without `--force` those workers are reported as skipped and left completely
+alone.
+
+## When to reap
+
+- A worker's PR merged and Ninox told you so — reap it.
+- A worker died or was terminated and you have read whatever you needed
+  from it — reap it.
+- You decided a worker's task is no longer wanted — `--force` reap it.
+
+## When NOT to reap
+
+- **Not while a worker is still working.** Message it (`{ninox_bin} send`) or
+  wait. Force-reaping destroys uncommitted work in its worktree.
+- **Not an interrupted worker the user may want back.** After a reboot every
+  worker is interrupted, not finished. `{ninox_bin} reap --all --force` at
+  that moment throws away every resumable session — ask first.
+- **Not to "restart" a worker.** Reap and re-spawn is a fresh session with
+  no memory of the old one.
+- **Not another orchestrator's workers.** They aren't yours; the command
+  will refuse.
+"#,
+        ninox_bin = ninox_bin,
+    );
+    fs::write(&reap_skill_path, reap_skill_content).await?;
+
+    // spawn-orchestrator skill — always overwritten.
+    let orch_skill_content = format!(
+        r#"---
+name: spawn-orchestrator
+description: Use ONLY when the user explicitly asks for another orchestrator. Never spawn one on your own initiative — work you decided to delegate goes to a worker instead.
+---
+
+# Spawn an Orchestrator — Only When Asked
+
+You can stand up another orchestrator. You almost never should.
+
+An orchestrator is a *peer*, not a subordinate: it coordinates its own fleet
+of workers, spends its own context, and costs money for as long as it runs.
+Nothing about your own workload justifies creating one.
+
+## The Rule
+
+**Spawn an orchestrator only when the user explicitly asks for one.**
+
+If you are thinking "this would go faster with another orchestrator", the
+answer is a worker (`{ninox_bin} spawn`). Workers are the unit of
+delegation — always.
+
+The command enforces this with a flag you must pass deliberately:
+
+```bash
+{ninox_bin} spawn-orchestrator \
+  --name "billing-migration" \
+  --prompt "Coordinate the billing migration: <goal, scope, constraints>" \
+  --user-requested
+```
+
+`--user-requested` is your assertion that the user asked for this
+orchestrator in this conversation. Without it the command refuses. Do not
+pass it to get around the refusal.
+
+| Thought | Reality |
+|---|---|
+| "Two orchestrators would parallelize this" | Spawn more workers instead. |
+| "This work is a separate concern" | Separate concern, same fleet. Spawn a worker. |
+| "The user would probably want one" | Probably isn't asked. Ask them. |
+| "I'll spawn one and mention it after" | The user decides, before. |
+
+## What the new orchestrator gets
+
+- `--name` is slugified into its session ID (`"Billing Migration"` →
+  `billing-migration`), which must not collide with an existing session.
+- `--prompt` is delivered as its opening brief once its harness is ready,
+  with a footer telling it that it reports back to you. Omit it to start it
+  empty and follow up with `{ninox_bin} send <id> "..."`.
+- It inherits the same brain, the orchestrator skills, and its own workspace
+  under the orchestrator root.
+
+It is a peer, so it does not appear under you on the fleet board and you
+cannot reap it — `{ninox_bin} reap` only ever touches your own workers.
+"#,
+        ninox_bin = ninox_bin,
+    );
+    fs::write(&orch_skill_path, orch_skill_content).await?;
 
     // set-agent-config skill — always overwritten.
     let config_skill_content = format!(
@@ -8215,6 +8463,76 @@ mod tests {
             skill.to_lowercase().contains("never") && skill.to_lowercase().contains("widen"),
             "skill must forbid widening an existing worker's scope"
         );
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_seeds_reap_skill() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+
+        let skill_path = root.join(".claude").join("skills").join("reap-workers").join("SKILL.md");
+        let skill = std::fs::read_to_string(&skill_path).unwrap();
+        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
+        assert!(skill.contains("name: reap-workers"));
+        assert!(skill.contains("description:"));
+        assert!(skill.contains("ninox reap"));
+        assert!(
+            skill.contains("--force"),
+            "skill must document the flag that reaping a live worker needs"
+        );
+        assert!(
+            skill.to_lowercase().contains("not while a worker is still working"),
+            "skill must warn against force-reaping live work"
+        );
+
+        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(
+            agents_md.contains(&skill_path.display().to_string()),
+            "AGENTS.md should point orchestrators at the reap skill"
+        );
+    }
+
+    /// The spawn-worker skill is rewritten on every startup, so it reaches
+    /// orchestrator roots whose (user-editable, never-overwritten) AGENTS.md
+    /// predates reaping and will never list the new skill.
+    #[tokio::test]
+    async fn spawn_skill_points_at_reaping() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+
+        let skill = std::fs::read_to_string(
+            root.join(".claude").join("skills").join("spawn-worker").join("SKILL.md"),
+        ).unwrap();
+        assert!(skill.contains("ninox reap"));
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_seeds_spawn_orchestrator_skill() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
+
+        let skill_path = root.join(".claude").join("skills").join("spawn-orchestrator").join("SKILL.md");
+        let skill = std::fs::read_to_string(&skill_path).unwrap();
+        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
+        assert!(skill.contains("name: spawn-orchestrator"));
+        assert!(skill.contains("ninox spawn-orchestrator"));
+        assert!(
+            skill.contains("--user-requested"),
+            "skill must name the flag the command requires"
+        );
+        // The whole point of this skill is the restraint, not the mechanics.
+        let lower = skill.to_lowercase();
+        assert!(
+            lower.contains("only when the user explicitly asks"),
+            "skill must state the by-request-only rule"
+        );
+        assert!(
+            skill.contains("--description") || skill.contains("description:"),
+            "skill must carry a description for discovery"
+        );
+
+        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(agents_md.contains(&skill_path.display().to_string()));
     }
 
     #[tokio::test]

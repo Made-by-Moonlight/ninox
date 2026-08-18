@@ -172,6 +172,15 @@ pub enum SessionStatus {
 }
 
 impl SessionStatus {
+    /// No live agent process behind this status: the session has finished,
+    /// been killed, or lost its pane. The canonical definition — several
+    /// places need "is this session still live?" and they must agree, since
+    /// a row that ends up non-terminal without a live process is a permanent
+    /// ghost (`sweep_retired_sessions` only purges `Done`/`Terminated`, and
+    /// `poll_pids` needs a `pid`, which a CLI-spawned worker never has).
+    ///
+    /// Note this is broader than `events`' reap-local `is_finished`, which
+    /// deliberately excludes the resumable `Interrupted`.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Done | Self::Terminated | Self::Interrupted)
     }

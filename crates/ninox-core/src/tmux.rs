@@ -999,6 +999,34 @@ pub async fn wake_idle_session(session_id: &str) -> Result<()> {
     run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await.map(|_| ())
 }
 
+/// How often [`wait_for_input_prompt`] re-checks the pane while waiting.
+const PROMPT_POLL_DELAY_MS: u64 = 500;
+
+/// Wait until `session_id`'s pane shows an agent input prompt (`❯`), i.e.
+/// the harness has finished booting and will actually accept typed input.
+/// Returns `true` once the prompt appears, `false` if `timeout` elapses
+/// first.
+///
+/// Exists for the one caller that types into a session it just created
+/// (`ninox spawn-orchestrator`'s initial brief): [`send_keys`]'s verify/
+/// retry loop recovers a message stuck in a *rendered* input box, but
+/// nothing recovers keystrokes sent at a TUI that hasn't drawn its input
+/// box yet — those are simply swallowed by the welcome/auth screens. A
+/// timeout is not an error: the caller is expected to try the send anyway
+/// and report the failure, which beats silently declining to deliver.
+pub async fn wait_for_input_prompt(session_id: &str, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if prompt_line_content(&capture_visible_plain(session_id).await).is_some() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(PROMPT_POLL_DELAY_MS)).await;
+    }
+}
+
 /// Write `bytes` to the session's master PTY via tmux's paste-buffer
 /// mechanism — the supported way to inject raw input (as opposed to
 /// `send-keys`, which tmux may reinterpret). `tmp_path` is a scratch file
@@ -1267,6 +1295,34 @@ mod tests {
         let result = create_session(&id, "/definitely/not/a/real/dir", "sleep 30", &[]).await;
         assert!(result.is_err(), "missing workspace must be an error, not a silent $HOME fallback");
         assert!(!has_session(&id).await, "no session may be left behind on failure");
+    }
+
+    #[tokio::test]
+    async fn wait_for_input_prompt_returns_once_the_prompt_is_drawn() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        // Stand in for a harness that takes a moment to draw its input box:
+        // nothing prompt-like on screen at first, `❯` a beat later.
+        create_session(&id, "/tmp", "sleep 1; printf '\\n❯ '; sleep 30", &[]).await.unwrap();
+
+        let ready = wait_for_input_prompt(&id, Duration::from_secs(10)).await;
+
+        assert!(ready, "must return as soon as the input prompt appears");
+        kill_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_input_prompt_gives_up_at_the_timeout() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        // A pane that never draws a prompt — the caller still needs control
+        // back so it can try the send (and report the failure) anyway.
+        create_session(&id, "/tmp", "sleep 30", &[]).await.unwrap();
+
+        let ready = wait_for_input_prompt(&id, Duration::from_millis(600)).await;
+
+        assert!(!ready, "must time out rather than block forever");
+        kill_session(&id).await.unwrap();
     }
 
     #[tokio::test]

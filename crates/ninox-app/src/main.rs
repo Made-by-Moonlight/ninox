@@ -70,6 +70,41 @@ enum Command {
         #[arg(long)]
         orchestrator_id: Option<String>,
     },
+    /// Spawn a peer orchestrator session (used by orchestrator agents, and
+    /// only ever when the user explicitly asks for another orchestrator —
+    /// hence the mandatory `--user-requested`)
+    SpawnOrchestrator {
+        /// Display name for the orchestrator; slugified into its session ID
+        #[arg(long, short)]
+        name: String,
+        /// Initial brief, delivered once the new orchestrator's harness is
+        /// ready for input. Omit to start it empty and follow up with
+        /// `ninox send`.
+        #[arg(long, short)]
+        prompt: Option<String>,
+        /// Confirms the user asked for this orchestrator. Required — an
+        /// orchestrator must never spin one up on its own initiative.
+        #[arg(long)]
+        user_requested: bool,
+    },
+    /// Clean up this orchestrator's workers: kill their sessions and remove
+    /// their worktrees and hook artifacts (used by orchestrator agents).
+    /// Finished workers only, unless `--force` is given.
+    Reap {
+        /// Worker session IDs to reap. Omit to reap every finished worker.
+        session_ids: Vec<String>,
+        /// Select every worker, not just the finished ones. Live workers
+        /// still need `--force` to actually be reaped.
+        #[arg(long)]
+        all: bool,
+        /// Reap selected workers even while they are still running.
+        #[arg(long)]
+        force: bool,
+        /// Orchestrator whose workers to reap (read from
+        /// NINOX_ORCHESTRATOR_ID if not supplied)
+        #[arg(long)]
+        orchestrator_id: Option<String>,
+    },
     /// Send a text message to a session's terminal (injected as keyboard input)
     Send {
         /// Target session ID
@@ -380,6 +415,13 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Release { session_id, orchestrator_id }) => {
             let rust_cache = AppConfig::load().unwrap_or_default().rust_cache;
             run_release(store, &session_id, orchestrator_id, rust_cache).await
+        }
+        Some(Command::SpawnOrchestrator { name, prompt, user_requested }) => {
+            let config = AppConfig::load().unwrap_or_default();
+            run_spawn_orchestrator(store, config, name, prompt, user_requested).await
+        }
+        Some(Command::Reap { session_ids, all, force, orchestrator_id }) => {
+            run_reap(store, session_ids, all, force, orchestrator_id).await
         }
         Some(Command::Send { session_id, message }) => {
             let config = AppConfig::load().unwrap_or_default();
@@ -1290,6 +1332,42 @@ fn worker_env_vars<'a>(
 }
 
 
+/// Decide which orchestrator a `ninox reap` acts on, refusing the calls that
+/// must never be allowed to reap anything.
+///
+/// `NINOX_CALLER_TYPE` is `orchestrator` on every path that launches one
+/// (fresh spawn, Re-file, Resume — see `app::refile_plan`/`resume_plan`) and
+/// on none that launches a worker, which is what separates "an orchestrator
+/// is asking" from "a worker is asking". Workers DO carry
+/// `NINOX_ORCHESTRATOR_ID`, pointing at their parent, so that variable alone
+/// would happily let one reap its own siblings.
+///
+/// `--orchestrator-id` exists for deliberate out-of-session calls (a human at
+/// a terminal, a script), so it skips the ambient-env lookup — but it is NOT
+/// an escape hatch from the guard. Inside any session that isn't an
+/// orchestrator it is refused too. Otherwise a worker could pass its own
+/// parent's id and reap the whole sibling fleet — including itself, whose
+/// `kill_session` would take down the very process running the reap, leaving
+/// a `Working` row with no worktree that neither `poll_pids` nor the retention
+/// sweep will ever clean up.
+///
+/// `caller_is_orchestrator` is resolved from the STORE (is `NINOX_SESSION` an
+/// orchestrator row?), with the env var as a fallback only when there's no
+/// session id to look up. Env alone is not trustworthy for a destructive
+/// command: `NINOX_CALLER_TYPE` lives in the agent's own shell, so a worker
+/// could simply export `NINOX_CALLER_TYPE=orchestrator` and reap its fleet.
+/// This does not defeat *determined* evasion — stripping `NINOX_SESSION` and
+/// passing `--orchestrator-id` looks identical to a human at a terminal — but
+/// it does mean the guard can't be undone by setting one variable.
+/// Whether the process calling `ninox reap` is itself an orchestrator.
+///
+/// Resolved from the STORE whenever there's a session id to look up: an
+/// orchestrator's session id is exactly an `orchestrators` row id, and a
+/// worker's never is. `NINOX_CALLER_TYPE` is only consulted when there is no
+/// `NINOX_SESSION` at all (a plain shell), because for a destructive command
+/// that variable is not evidence — it lives in the agent's own environment,
+/// so a worker could export `NINOX_CALLER_TYPE=orchestrator` and reap its
+/// whole fleet, including itself.
 fn caller_is_orchestrator(
     env_session:     Option<&str>,
     orchestrator_ids: &[&str],
@@ -1319,6 +1397,29 @@ fn resolve_release_orchestrator(
         .or(env_orch_id)
         .ok_or_else(|| anyhow::anyhow!(
             "NINOX_ORCHESTRATOR_ID is not set — `ninox release` runs inside an \
+             orchestrator session, or pass --orchestrator-id explicitly"
+        ))
+}
+
+fn resolve_reap_orchestrator(
+    explicit:               Option<String>,
+    env_orch_id:            Option<String>,
+    caller_is_orchestrator: bool,
+    env_session:            Option<String>,
+) -> anyhow::Result<String> {
+    let is_orchestrator = caller_is_orchestrator;
+    let in_a_session    = env_session.is_some() || env_orch_id.is_some();
+    if in_a_session && !is_orchestrator {
+        anyhow::bail!(
+            "`ninox reap` is an orchestrator command — a worker cannot reap its \
+             siblings, with or without --orchestrator-id. Ask your orchestrator \
+             to clean up instead (it will see your session finish on its own)."
+        );
+    }
+    explicit
+        .or(env_orch_id)
+        .ok_or_else(|| anyhow::anyhow!(
+            "NINOX_ORCHESTRATOR_ID is not set — `ninox reap` runs inside an \
              orchestrator session, or pass --orchestrator-id explicitly"
         ))
 }
@@ -1570,6 +1671,313 @@ async fn release_retained_worker_checkout(
     })
     .await
     .context("worker release task panicked")?
+}
+
+/// `ninox reap` — clean up the calling orchestrator's workers: kill each
+/// one's session and reclaim its worktree and hook artifacts. The store
+/// record survives in a terminal state so the fleet board keeps the card for
+/// the retention window and `sweep_retired_sessions` stays the only thing
+/// that deletes a session row (see `Engine::reap_workers`).
+async fn run_reap(
+    store:           Arc<Store>,
+    session_ids:     Vec<String>,
+    all:             bool,
+    force:           bool,
+    orchestrator_id: Option<String>,
+) -> anyhow::Result<()> {
+    use ninox_core::events::{ReapOutcome, ReapSelection};
+
+    let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    let env_session = env("NINOX_SESSION");
+    let orchestrators = store.list_orchestrators()?;
+    let orch_ids: Vec<&str> = orchestrators.iter().map(|o| o.id.as_str()).collect();
+    let caller_is_orchestrator = caller_is_orchestrator(
+        env_session.as_deref(), &orch_ids, env("NINOX_CALLER_TYPE").as_deref(),
+    );
+    let orch_id = resolve_reap_orchestrator(
+        orchestrator_id,
+        env("NINOX_ORCHESTRATOR_ID"),
+        caller_is_orchestrator,
+        env_session,
+    )?;
+    // A typo'd id would otherwise "succeed" with `nothing to reap`, since
+    // `sessions_by_orchestrator` can't tell an unknown orchestrator from one
+    // with no workers.
+    if !orchestrators.iter().any(|o| o.id == orch_id) {
+        anyhow::bail!("no orchestrator named {orch_id} — check the id");
+    }
+
+    let selection = if !session_ids.is_empty() {
+        ReapSelection::Ids(&session_ids)
+    } else if all {
+        ReapSelection::All
+    } else {
+        ReapSelection::Finished
+    };
+
+    let engine = Engine::new(store);
+    let outcomes = engine.reap_workers(&orch_id, selection, force).await?;
+
+    if outcomes.is_empty() {
+        println!("nothing to reap — {orch_id} has no finished workers");
+        println!("(still-running and interrupted-but-resumable workers are never reaped by default)");
+        return Ok(());
+    }
+    for (id, outcome) in &outcomes {
+        println!("{}", reap_report_line(id, *outcome));
+    }
+    if outcomes.iter().any(|(_, o)| matches!(o, ReapOutcome::SkippedLive | ReapOutcome::SkippedResumable)) {
+        println!("\nWorkers that were still running or still resumable were left alone — re-run with --force to reap them too.");
+    }
+    // The retry has to name the ids AND `--force`: the row is still whatever
+    // non-terminal status it had, so a bare `ninox reap` (finished workers
+    // only) would never select it again — and nothing else would either,
+    // since a CLI-spawned worker has no `pid` for `poll_pids` to notice and
+    // the retention sweep ignores non-terminal rows. Telling the caller to
+    // "re-run reap" without that would leave a permanent live ghost for a
+    // worker whose session and worktree are already gone.
+    let unrecorded: Vec<&str> = outcomes.iter()
+        .filter(|(_, o)| matches!(o, ReapOutcome::CleanedButNotRecorded))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    if !unrecorded.is_empty() {
+        anyhow::bail!(
+            "cleaned up but could NOT update the record for: {ids}. Their sessions and \
+             worktrees are gone while the store still shows them live, and nothing will \
+             reconcile that on its own. Once the store is writable, run:\n  \
+             ninox reap {ids_space} --force",
+            ids       = unrecorded.join(", "),
+            ids_space = unrecorded.join(" "),
+        );
+    }
+    // Only an explicitly named id can come back NotFound, and that means the
+    // caller asked for something that isn't theirs (or no longer exists) —
+    // a failure, not a quiet no-op.
+    let missing: Vec<&str> = outcomes.iter()
+        .filter(|(_, o)| matches!(o, ReapOutcome::NotFound))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "not workers of {orch_id}: {} — they may already have been purged, or belong to another orchestrator",
+            missing.join(", "),
+        );
+    }
+    Ok(())
+}
+
+/// One human-readable line per reap outcome.
+fn reap_report_line(id: &str, outcome: ninox_core::events::ReapOutcome) -> String {
+    use ninox_core::events::ReapOutcome;
+    match outcome {
+        ReapOutcome::Reaped          => format!("reaped {id}"),
+        ReapOutcome::ReapedLive      => format!("reaped {id} (was still running — killed)"),
+        ReapOutcome::ReapedResumable => format!("reaped {id} (was interrupted — no longer resumable)"),
+        ReapOutcome::SkippedLive     => format!("skipped {id} — still running (use --force)"),
+        ReapOutcome::SkippedResumable => {
+            format!("skipped {id} — interrupted but resumable (use --force to give that up)")
+        }
+        ReapOutcome::NotFound        => format!("skipped {id} — not one of your workers"),
+        ReapOutcome::CleanedButNotRecorded => {
+            format!("reaped {id} BUT could not record it — the session and worktree are gone, the record is not; see the log")
+        }
+    }
+}
+
+/// `ninox spawn-orchestrator` — stand up a peer orchestrator session.
+///
+/// Mirrors the app's own Spawn-modal orchestrator path (`app.rs`,
+/// `SpawnKind::Orchestrator`): a workspace under the orchestrator root, an
+/// `Orchestrator` row plus its session row, and the caller-type env that
+/// makes the new session behave as an orchestrator. Like `run_spawn`, it
+/// creates the tmux session directly rather than going through
+/// `spawn_interactive_session` — this is a short-lived CLI process with no
+/// UI to stream a PTY into, and the app adopts the new session on its next
+/// store poll.
+async fn run_spawn_orchestrator(
+    store:          Arc<Store>,
+    config:         AppConfig,
+    name:           String,
+    prompt:         Option<String>,
+    user_requested: bool,
+) -> anyhow::Result<()> {
+    if !user_requested {
+        anyhow::bail!(
+            "refusing to spawn an orchestrator without --user-requested. \
+             Orchestrators are spawned only when the user explicitly asks for \
+             one — for work you decided to do yourself, spawn a worker \
+             (`ninox spawn`) instead."
+        );
+    }
+
+    let id = slugify(&name);
+    if id.is_empty() {
+        anyhow::bail!("--name must contain at least one alphanumeric character");
+    }
+    // Same hazard the app's modal guards: a duplicate id would upsert over an
+    // existing record, then fail the tmux create and mark the hijacked
+    // session Terminated.
+    if store.get_session(&id)?.is_some()
+        || store.list_orchestrators()?.iter().any(|o| o.id == id)
+    {
+        anyhow::bail!("a session named {id} already exists — pick another name");
+    }
+
+    let agent = config.orchestrator.clone();
+    let ninox_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "ninox".to_string());
+    let config_path = AppConfig::config_path().to_string_lossy().to_string();
+
+    // The root carries AGENTS.md/CLAUDE.md, the skills, and the subagent
+    // blocker, which every orchestrator session inherits. Normally seeded at
+    // app startup, but a spawn must not depend on the app having run first.
+    let root = config.resolved_orchestrator_root();
+    if let Err(e) = app::setup_orchestrator_root(&root, &ninox_bin, &config_path).await {
+        tracing::warn!("orchestrator root setup failed: {e}");
+    }
+    let ws = root.join(&id);
+    tokio::fs::create_dir_all(&ws).await?;
+    let ws_str = ws.to_string_lossy().to_string();
+
+    // The new orchestrator thinks with the same brain as its spawner when
+    // there is one (NINOX_BRAIN is set inside a session), falling back to the
+    // configured default for an out-of-session call.
+    let catalogue_path = std::env::var("NINOX_BRAIN").ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let claude_session_id = ninox_core::harness::new_claude_session_id();
+
+    store.upsert_orchestrator(&ninox_core::types::Orchestrator {
+        id:         id.clone(),
+        name:       name.clone(),
+        created_at: ts,
+    })?;
+    let session = Session {
+        id:              id.clone(),
+        orchestrator_id: None,
+        name:            name.clone(),
+        repo:            String::new(),
+        status:          SessionStatus::Working,
+        agent_type:      agent.harness.clone(),
+        cost_usd:        0.0,
+        started_at:      ts,
+        pr_number:       None,
+        pr_id:           None,
+        workspace_path:  Some(ws_str.clone()),
+        pid:             None,
+        model:           agent.model.clone(),
+        context_tokens:  None,
+        catalogue_path:  Some(catalogue_path.clone()),
+        context_used_pct: None, context_total_tokens: None, context_window_size: None,
+        claude_session_id: Some(claude_session_id.clone()),
+        summary:         None,
+        terminal_at:     None, gate_status: None,
+    };
+    store.upsert_session(&session)?;
+
+    let sessions_dir = ninox_core::config::AppConfig::sessions_dir();
+    std::fs::create_dir_all(&sessions_dir).ok();
+    let sessions_dir_str = sessions_dir.to_string_lossy().to_string();
+
+    // Same PATH-prepend reasoning as `run_spawn`: rc files re-order PATH, so
+    // exporting inside the launch command is what puts our shims first.
+    let bin_dir = ninox_core::config::AppConfig::ninox_bin_dir().display().to_string();
+    let cmd = format!(
+        "export PATH='{}':\"$PATH\"; {}",
+        bin_dir.replace('\'', "'\\''"),
+        config.registry().interactive_cmd(&agent, &claude_session_id),
+    );
+    let env = orchestrator_env_vars(
+        &ninox_bin, &config_path, &catalogue_path, &id, &sessions_dir_str,
+    );
+
+    if let Err(e) = tmux::create_session(&id, &ws_str, &cmd, &env).await {
+        // Roll BOTH rows back rather than marking the session Terminated the
+        // way `run_spawn` does for a worker. A worker's Terminated row is a
+        // useful record that the retention sweep eventually purges; an
+        // orchestrator's never is — `sweep_retired_sessions` skips every
+        // session id that belongs to an orchestrator — so a ghost row here
+        // would sit in the store forever AND permanently burn the name, since
+        // the duplicate-name guard above would keep finding it. Nothing ran,
+        // so there is nothing worth recording.
+        let _ = store.delete_session(&id);
+        let _ = store.delete_orchestrator(&id);
+        return Err(e);
+    }
+    println!("spawned orchestrator {id}");
+
+    let Some(brief) = prompt else {
+        println!("send it a brief with: ninox send {id} \"<your message>\"");
+        return Ok(());
+    };
+
+    // Typing at a harness that hasn't drawn its input box yet is swallowed
+    // outright, so wait for the prompt before delivering the brief.
+    let spawner = std::env::var("NINOX_ORCHESTRATOR_ID").ok().filter(|s| !s.is_empty());
+    let message = format!("{brief}{}", orchestrator_context_footer(&id, spawner.as_deref()));
+    if !tmux::wait_for_input_prompt(&id, std::time::Duration::from_secs(90)).await {
+        eprintln!("warning: {id} is still starting up — sending the brief anyway");
+    }
+    if let Err(e) = ninox_core::messaging::deliver_message(
+        &store, &sessions_dir, &id, &message, config.inbox_messaging.enabled,
+    ).await {
+        eprintln!(
+            "warning: could not deliver the initial brief to {id}: {e}\n\
+             retry with: ninox send {id} \"<the brief>\""
+        );
+    }
+    Ok(())
+}
+
+/// The tmux env for a CLI-spawned orchestrator. Mirrors
+/// `spawn_util::interactive_env_vars` plus the two vars that make a session
+/// an *orchestrator*: its own id (so workers it spawns report back to it)
+/// and the caller type (which gates the subagent blocker and `ninox reap`).
+fn orchestrator_env_vars<'a>(
+    ninox_bin:      &'a str,
+    ninox_config:   &'a str,
+    catalogue_path: &'a str,
+    session_id:     &'a str,
+    sessions_dir:   &'a str,
+) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("NINOX_BIN",             ninox_bin),
+        ("NINOX_CONFIG",          ninox_config),
+        ("NINOX_BRAIN",           catalogue_path),
+        ("NINOX_SESSION",         session_id),
+        ("NINOX_DATA_DIR",        sessions_dir),
+        ("NINOX_ORCHESTRATOR_ID", session_id),
+        ("NINOX_CALLER_TYPE",     "orchestrator"),
+    ]
+}
+
+/// The context footer appended to a spawned orchestrator's initial brief:
+/// who it is, that it coordinates rather than implements, and (when spawned
+/// by another orchestrator) the channel back to whoever asked for it.
+fn orchestrator_context_footer(id: &str, spawner: Option<&str>) -> String {
+    let mut footer = format!(
+        "\n\n---\n\
+         Ninox orchestrator `{id}`\n\n\
+         **Role:** you are an orchestrator, not a worker. Spawn workers \
+         (`ninox spawn`) for the brief above — never implement it yourself.\n",
+    );
+    if let Some(spawner) = spawner {
+        footer.push_str(&format!(
+            "\nSpawned by orchestrator `{spawner}`. Report back when the work is \
+             done or you need a decision:\n\
+             ```bash\n\
+             ninox send {spawner} \"<your message>\"\n\
+             ```\n",
+        ));
+    }
+    footer
 }
 
 /// `ninox request-work` — record a work request in this worker's session
@@ -3014,5 +3422,254 @@ mod pr_watch_cli_tests {
         let msg = run_pr_watch(&store, true, PrWatchCliAction::List, None).unwrap();
         assert!(msg.contains("o/r#7"));
         assert!(msg.contains("sess-a"));
+    }
+}
+
+#[cfg(test)]
+mod orchestrator_cli_tests {
+    use super::{
+        caller_is_orchestrator, orchestrator_context_footer, orchestrator_env_vars,
+        reap_report_line, resolve_reap_orchestrator, run_spawn_orchestrator,
+    };
+    use ninox_core::events::ReapOutcome;
+    use std::sync::Arc;
+
+    fn store() -> Arc<ninox_core::store::Store> {
+        Arc::new(
+            ninox_core::store::Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn spawn_orchestrator_refuses_without_the_user_requested_flag() {
+        let store = store();
+        let result = run_spawn_orchestrator(
+            store.clone(),
+            ninox_core::config::AppConfig::default(),
+            "unrequested".into(),
+            None,
+            false,
+        )
+        .await;
+
+        let err = result.expect_err("must refuse an unrequested orchestrator").to_string();
+        assert!(err.contains("--user-requested"), "error must name the missing flag: {err}");
+        assert!(
+            store.list_orchestrators().unwrap().is_empty(),
+            "a refused spawn must not leave an orchestrator record behind",
+        );
+        assert!(store.get_session("unrequested").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn spawn_orchestrator_refuses_a_name_that_slugifies_to_nothing() {
+        let result = run_spawn_orchestrator(
+            store(),
+            ninox_core::config::AppConfig::default(),
+            "!!!".into(),
+            None,
+            true,
+        )
+        .await;
+        assert!(result.is_err(), "a nameless orchestrator has no addressable session id");
+    }
+
+    #[tokio::test]
+    async fn spawn_orchestrator_refuses_a_duplicate_name() {
+        // A duplicate id would upsert over the existing record and then get
+        // marked Terminated by the tmux-create failure — hijacking a live
+        // session. Same guard the app's spawn modal applies.
+        let store = store();
+        store.upsert_session(&ninox_core::types::Session {
+            id: "taken".into(), orchestrator_id: None, name: "taken".into(),
+            repo: String::new(), status: ninox_core::SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None,
+        }).unwrap();
+
+        let result = run_spawn_orchestrator(
+            store.clone(),
+            ninox_core::config::AppConfig::default(),
+            "Taken".into(),
+            None,
+            true,
+        )
+        .await;
+
+        assert!(result.is_err(), "a colliding name must be refused");
+        let survivor = store.get_session("taken").unwrap().unwrap();
+        assert!(
+            matches!(survivor.status, ninox_core::SessionStatus::Working),
+            "the existing session must be left untouched, got {:?}", survivor.status,
+        );
+    }
+
+    /// A failed spawn must leave NOTHING behind. Unlike a worker's
+    /// Terminated row (which `sweep_retired_sessions` eventually purges), an
+    /// orchestrator's row is skipped by the sweep forever — so a ghost would
+    /// both linger in the store and permanently burn the name against the
+    /// duplicate-name guard, with no CLI way to clear it.
+    #[tokio::test]
+    async fn failed_spawn_orchestrator_rolls_back_both_rows_so_the_name_is_reusable() {
+        let store = store();
+        let scratch = tempfile::tempdir().unwrap();
+        let config = ninox_core::config::AppConfig {
+            orchestrator_root: Some(scratch.path().join("root")),
+            ..Default::default()
+        };
+        // A live tmux session under the same id forces `create_session` to
+        // fail deterministically on any tmux build ("duplicate session"),
+        // which is what `spawn_util`'s own failure test relies on too.
+        let ws = scratch.path().join("occupied");
+        std::fs::create_dir_all(&ws).unwrap();
+        ninox_core::tmux::create_session(
+            "ghost-orch", ws.to_str().unwrap(), "sleep 30", &[],
+        ).await.unwrap();
+
+        let result = run_spawn_orchestrator(
+            store.clone(), config, "ghost orch".into(), None, true,
+        ).await;
+
+        ninox_core::tmux::kill_session("ghost-orch").await.ok();
+        assert!(result.is_err(), "spawn must fail for a duplicate tmux session id");
+        assert!(
+            store.get_session("ghost-orch").unwrap().is_none(),
+            "no session row may survive a failed spawn",
+        );
+        assert!(
+            !store.list_orchestrators().unwrap().iter().any(|o| o.id == "ghost-orch"),
+            "no orchestrator row may survive a failed spawn — the sweep never purges one",
+        );
+    }
+
+    #[test]
+    fn orchestrator_env_marks_the_session_as_an_orchestrator() {
+        let env = orchestrator_env_vars("/bin/ninox", "/cfg.toml", "/brain", "orch-2", "/data");
+        // Its own id, so workers it spawns report back to it.
+        assert!(env.contains(&("NINOX_ORCHESTRATOR_ID", "orch-2")));
+        // The caller type gates the subagent blocker and `ninox reap`.
+        assert!(env.contains(&("NINOX_CALLER_TYPE", "orchestrator")));
+        assert!(env.contains(&("NINOX_SESSION", "orch-2")));
+        assert!(env.contains(&("NINOX_DATA_DIR", "/data")));
+        assert!(env.contains(&("NINOX_BRAIN", "/brain")));
+        assert!(env.contains(&("NINOX_CONFIG", "/cfg.toml")));
+        assert!(env.contains(&("NINOX_BIN", "/bin/ninox")));
+    }
+
+    #[test]
+    fn orchestrator_footer_names_the_spawner_as_the_report_back_channel() {
+        let footer = orchestrator_context_footer("child", Some("parent"));
+        assert!(footer.contains("`child`"), "must name the new orchestrator");
+        assert!(footer.contains("ninox send parent"), "must route replies to the spawner");
+        assert!(footer.contains("ninox spawn"), "must keep it coordinating, not implementing");
+    }
+
+    #[test]
+    fn orchestrator_footer_omits_the_report_back_channel_with_no_spawner() {
+        // Spawned from a plain terminal: there is no orchestrator to report
+        // back to, so the footer must not invent one.
+        let footer = orchestrator_context_footer("solo", None);
+        assert!(footer.contains("`solo`"));
+        assert!(!footer.contains("ninox send"), "no spawner means no report-back line: {footer}");
+    }
+
+    // ── reap guard ──────────────────────────────────────────────────────────
+
+    fn orch(s: &str) -> Option<String> { Some(s.to_string()) }
+
+    #[test]
+    fn reap_guard_accepts_an_orchestrator_session() {
+        let id = resolve_reap_orchestrator(None, orch("orch-1"), true, orch("orch-1")).unwrap();
+        assert_eq!(id, "orch-1");
+    }
+
+    #[test]
+    fn reap_guard_refuses_a_worker_session() {
+        // A worker carries NINOX_ORCHESTRATOR_ID (its parent's) but no
+        // caller type — that ambient id must not make its siblings reapable.
+        let err = resolve_reap_orchestrator(None, orch("orch-1"), false, orch("w1"))
+            .expect_err("a worker must not reap")
+            .to_string();
+        assert!(err.contains("cannot reap its siblings"), "{err}");
+    }
+
+    /// The bypass the reviewer found: `--orchestrator-id` is for out-of-session
+    /// use, not an escape hatch. A worker passing its own parent's id would
+    /// otherwise reap the whole sibling fleet — and itself, killing the pane
+    /// running the reap and stranding a `Working` row with no worktree that
+    /// nothing ever cleans up.
+    #[test]
+    fn reap_guard_refuses_a_worker_even_with_an_explicit_orchestrator_id() {
+        let err = resolve_reap_orchestrator(orch("orch-1"), orch("orch-1"), false, orch("w1"))
+            .expect_err("--orchestrator-id must not bypass the guard")
+            .to_string();
+        assert!(err.contains("with or without --orchestrator-id"), "{err}");
+    }
+
+    #[test]
+    fn reap_guard_allows_an_explicit_id_outside_any_session() {
+        // A human at a terminal / a script: no session env at all.
+        let id = resolve_reap_orchestrator(orch("orch-7"), None, false, None).unwrap();
+        assert_eq!(id, "orch-7");
+    }
+
+    #[test]
+    fn reap_guard_needs_an_id_from_somewhere() {
+        let err = resolve_reap_orchestrator(None, None, false, None)
+            .expect_err("no id anywhere must fail")
+            .to_string();
+        assert!(err.contains("NINOX_ORCHESTRATOR_ID"), "{err}");
+    }
+
+    #[test]
+    fn reap_guard_prefers_the_explicit_id_over_the_ambient_one() {
+        let id = resolve_reap_orchestrator(
+            orch("orch-explicit"), orch("orch-ambient"), true, orch("orch-ambient"),
+        ).unwrap();
+        assert_eq!(id, "orch-explicit");
+    }
+
+    /// The store, not the environment, decides who is an orchestrator.
+    /// `NINOX_CALLER_TYPE` lives in the agent's own shell, so if it were
+    /// trusted a worker could `export NINOX_CALLER_TYPE=orchestrator` and reap
+    /// its whole fleet — including itself, where the kill takes down the pane
+    /// running the reap and strands a row nothing ever cleans up.
+    #[test]
+    fn caller_type_env_cannot_promote_a_worker_to_an_orchestrator() {
+        assert!(
+            !caller_is_orchestrator(Some("w1"), &["orch-1"], Some("orchestrator")),
+            "a spoofed caller type must not beat the store",
+        );
+    }
+
+    #[test]
+    fn a_session_id_that_is_an_orchestrator_row_is_an_orchestrator() {
+        assert!(caller_is_orchestrator(Some("orch-1"), &["orch-1", "orch-2"], None));
+    }
+
+    #[test]
+    fn caller_type_is_only_consulted_outside_a_session() {
+        // A plain shell has no NINOX_SESSION to look up.
+        assert!(caller_is_orchestrator(None, &[], Some("orchestrator")));
+        assert!(!caller_is_orchestrator(None, &[], None));
+    }
+
+    #[test]
+    fn reap_report_distinguishes_every_outcome() {
+        assert_eq!(reap_report_line("w1", ReapOutcome::Reaped), "reaped w1");
+        let killed = reap_report_line("w1", ReapOutcome::ReapedLive);
+        assert!(killed.contains("still running"), "a killed worker must be called out: {killed}");
+        let resumable = reap_report_line("w1", ReapOutcome::ReapedResumable);
+        assert!(
+            resumable.contains("no longer resumable"),
+            "giving up resumability must be stated, not silent: {resumable}",
+        );
+        assert!(reap_report_line("w1", ReapOutcome::SkippedLive).contains("--force"));
+        let skipped = reap_report_line("w1", ReapOutcome::SkippedResumable);
+        assert!(skipped.contains("resumable") && skipped.contains("--force"), "{skipped}");
+        assert!(reap_report_line("w1", ReapOutcome::NotFound).contains("not one of your workers"));
     }
 }
