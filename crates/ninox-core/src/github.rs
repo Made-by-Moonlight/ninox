@@ -387,7 +387,9 @@ pub fn parse_pr_url(url: &str) -> Option<(String, u64)> {
     if parts.next()? != "pull" {
         return None;
     }
-    let number: u64 = parts.next()?.parse().ok()?;
+    let seg = parts.next()?;
+    let num = seg.split(['?', '#']).next()?;
+    let number: u64 = num.parse().ok()?;
     Some((format!("{owner}/{repo}"), number))
 }
 
@@ -572,6 +574,24 @@ mod tests {
     fn parse_pr_url_tolerates_trailing_slash_www_and_subpaths() {
         assert_eq!(parse_pr_url("https://www.github.com/o/r/pull/7/"), Some(("o/r".to_string(), 7)));
         assert_eq!(parse_pr_url("https://github.com/o/r/pull/7/files"), Some(("o/r".to_string(), 7)));
+    }
+
+    #[test]
+    fn parse_pr_url_strips_query_and_fragment() {
+        assert_eq!(
+            parse_pr_url("https://github.com/o/r/pull/7#discussion_r123"),
+            Some(("o/r".to_string(), 7))
+        );
+        assert_eq!(
+            parse_pr_url("https://github.com/o/r/pull/7?diff=split"),
+            Some(("o/r".to_string(), 7))
+        );
+    }
+
+    #[test]
+    fn parse_pr_url_still_rejects_non_numeric_after_stripping() {
+        assert_eq!(parse_pr_url("https://github.com/o/r/pull/abc#x"), None);
+        assert_eq!(parse_pr_url("https://github.com/o/r/pull/?x=1"), None);
     }
 
     #[test]
