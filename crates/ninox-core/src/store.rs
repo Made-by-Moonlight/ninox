@@ -616,6 +616,13 @@ impl Store {
                 ON worker_completion_outbox(acknowledged_at,next_attempt_at);
             CREATE INDEX IF NOT EXISTS worker_completion_attempts_completion
                 ON worker_completion_delivery_attempts(completion_id,attempt);
+            CREATE TABLE IF NOT EXISTS pr_watches (
+                repo TEXT NOT NULL, pr_number INTEGER NOT NULL,
+                pr_url TEXT NOT NULL,
+                opener_session_id TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (repo, pr_number, opener_session_id)
+            );
         ")?;
         migrate_legacy_worker_incarnations(&mut conn)?;
         // Migrations for columns added after initial release — idempotent so
@@ -1619,6 +1626,56 @@ impl Store {
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    pub fn upsert_pr_watch(&self, w: &PrWatch) -> Result<()> {
+        let opener = w.opener_session_id.as_deref().unwrap_or("");
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO pr_watches (repo, pr_number, pr_url, opener_session_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(repo, pr_number, opener_session_id) DO UPDATE SET
+             pr_url = excluded.pr_url",
+            params![w.repo, w.pr_number, w.pr_url, opener, w.created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_pr_watch(&self, repo: &str, pr_number: u64, opener: Option<&str>) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM pr_watches WHERE repo = ?1 AND pr_number = ?2 AND opener_session_id = ?3",
+            params![repo, pr_number, opener.unwrap_or("")],
+        )?;
+        Ok(n)
+    }
+
+    pub fn delete_pr_watches_for_pr(&self, repo: &str, pr_number: u64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM pr_watches WHERE repo = ?1 AND pr_number = ?2",
+            params![repo, pr_number],
+        )?;
+        Ok(n)
+    }
+
+    pub fn list_pr_watches(&self) -> Result<Vec<PrWatch>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT repo, pr_number, pr_url, opener_session_id, created_at
+             FROM pr_watches ORDER BY repo, pr_number, opener_session_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let opener: String = r.get(3)?;
+            Ok(PrWatch {
+                repo:              r.get(0)?,
+                pr_number:         r.get(1)?,
+                pr_url:            r.get(2)?,
+                opener_session_id: if opener.is_empty() { None } else { Some(opener) },
+                created_at:        r.get(4)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn list_orchestrators(&self) -> Result<Vec<Orchestrator>> {
@@ -7103,5 +7160,55 @@ mod tests {
                 .incarnation_id,
             "inc-live",
         );
+    }
+
+    #[test]
+    fn pr_watch_upsert_is_idempotent_and_lists() {
+        let store = test_store();
+        let w = PrWatch {
+            repo: "o/r".into(), pr_number: 7,
+            pr_url: "https://github.com/o/r/pull/7".into(),
+            opener_session_id: Some("sess-a".into()), created_at: 1000,
+        };
+        store.upsert_pr_watch(&w).unwrap();
+        store.upsert_pr_watch(&w).unwrap(); // same key — must not duplicate
+        assert_eq!(store.list_pr_watches().unwrap(), vec![w]);
+    }
+
+    #[test]
+    fn pr_watch_same_pr_different_openers_are_distinct_rows() {
+        let store = test_store();
+        let a = PrWatch { repo: "o/r".into(), pr_number: 7, pr_url: "u".into(), opener_session_id: Some("sess-a".into()), created_at: 1 };
+        let b = PrWatch { opener_session_id: Some("sess-b".into()), ..a.clone() };
+        let unowned = PrWatch { opener_session_id: None, ..a.clone() };
+        store.upsert_pr_watch(&a).unwrap();
+        store.upsert_pr_watch(&b).unwrap();
+        store.upsert_pr_watch(&unowned).unwrap();
+        store.upsert_pr_watch(&unowned).unwrap(); // unowned must dedup too
+        assert_eq!(store.list_pr_watches().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn pr_watch_delete_removes_only_the_callers_row() {
+        let store = test_store();
+        let a = PrWatch { repo: "o/r".into(), pr_number: 7, pr_url: "u".into(), opener_session_id: Some("sess-a".into()), created_at: 1 };
+        let b = PrWatch { opener_session_id: Some("sess-b".into()), ..a.clone() };
+        store.upsert_pr_watch(&a).unwrap();
+        store.upsert_pr_watch(&b).unwrap();
+        assert_eq!(store.delete_pr_watch("o/r", 7, Some("sess-a")).unwrap(), 1);
+        assert_eq!(store.list_pr_watches().unwrap(), vec![b]);
+    }
+
+    #[test]
+    fn pr_watch_delete_for_pr_removes_all_openers() {
+        let store = test_store();
+        let a = PrWatch { repo: "o/r".into(), pr_number: 7, pr_url: "u".into(), opener_session_id: Some("sess-a".into()), created_at: 1 };
+        let b = PrWatch { opener_session_id: None, ..a.clone() };
+        let other = PrWatch { pr_number: 8, ..a.clone() };
+        store.upsert_pr_watch(&a).unwrap();
+        store.upsert_pr_watch(&b).unwrap();
+        store.upsert_pr_watch(&other).unwrap();
+        assert_eq!(store.delete_pr_watches_for_pr("o/r", 7).unwrap(), 2);
+        assert_eq!(store.list_pr_watches().unwrap(), vec![other]);
     }
 }

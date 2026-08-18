@@ -414,6 +414,20 @@ pub struct Comment {
     pub created_at: i64,
 }
 
+/// An explicit PR watch registered via `ninox open --pr` — additive to the
+/// implicit watching of session-attached PRs. `opener_session_id = None`
+/// means the watch was registered outside any ninox session (state/UI
+/// events only, no tmux delivery target). Auto-removed when the PR merges
+/// or closes; otherwise lives until `ninox close --pr`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrWatch {
+    pub repo:              String,
+    pub pr_number:         u64,
+    pub pr_url:            String,
+    pub opener_session_id: Option<String>,
+    pub created_at:        i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationKind {
