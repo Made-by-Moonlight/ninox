@@ -2891,6 +2891,66 @@ mod tests {
         assert_eq!(content, "tracked content\n", "tracked content must be left untouched");
     }
 
+    #[tokio::test]
+    async fn seed_worker_watch_pr_skill_skips_exclude_when_not_a_git_repo() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+
+        seed_worker_watch_pr_skill(&ws).await.unwrap();
+
+        assert!(
+            dir.path().join(".claude").join("skills").join("watch-pr").join("SKILL.md").exists(),
+            "skill file must still be written even outside a git repo"
+        );
+        assert!(!dir.path().join(".git").exists(), "test setup sanity check: no git repo here");
+    }
+
+    #[tokio::test]
+    async fn seed_worker_watch_pr_skill_targets_shared_common_dir_from_a_worktree() {
+        use tempfile::tempdir;
+        let repo_dir = tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git").args(["init", "-q", &repo]).status().await.unwrap();
+        // See seed_worker_brain_skill_targets_shared_common_dir_from_a_worktree
+        // for why `.success()` is checked here rather than just `.status()`.
+        let commit_status = tokio::process::Command::new("git")
+            .args([
+                "-C", &repo,
+                "-c", "user.email=test@example.com",
+                "-c", "user.name=Test",
+                "commit", "-q", "-m", "init", "--allow-empty",
+            ])
+            .status()
+            .await
+            .unwrap();
+        assert!(commit_status.success(), "git commit must succeed to give the worktree a branch point");
+
+        let worktree_path = repo_dir.path().join("wt");
+        let worktree = worktree_path.to_str().unwrap().to_string();
+        tokio::process::Command::new("git")
+            .args(["-C", &repo, "worktree", "add", &worktree, "-b", "wt-branch"])
+            .status()
+            .await
+            .unwrap();
+
+        seed_worker_watch_pr_skill(&worktree).await.unwrap();
+
+        // The exclude must land in the MAIN repo's shared .git/info/exclude,
+        // not anywhere under the linked worktree's own (file-based) .git.
+        let exclude = tokio::fs::read_to_string(
+            repo_dir.path().join(".git").join("info").join("exclude"),
+        )
+        .await
+        .unwrap();
+        assert!(exclude.lines().any(|l| l.trim() == ".claude/skills/watch-pr/"));
+
+        assert!(
+            worktree_path.join(".claude").join("skills").join("watch-pr").join("SKILL.md").exists(),
+            "skill file must be written into the worktree itself"
+        );
+    }
+
     /// `ensure_session_workspace`'s own gate: a recreated worker worktree
     /// only gets the watch-pr skill seeded when `pr_watch_enabled` is true —
     /// mirrors the `worker_context_footer` gating in `main.rs::run_spawn`

@@ -2071,6 +2071,7 @@ impl App {
                         let inbox_enabled = state.config.inbox_messaging.enabled;
                         let repositories_root = state.config.resolved_repositories_root();
                         let worktree_root = state.config.resolved_worktree_root();
+                        let pr_watch_enabled = state.config.pr_watch.enabled;
 
                         Task::future(async move {
                             let source_workspace = exact_worktree_source
@@ -2234,6 +2235,11 @@ impl App {
                             }
                             if let Err(e) = crate::spawn_util::seed_worker_brain_skill(&effective_ws).await {
                                 tracing::warn!("failed to seed brain skill for {sid}: {e}");
+                            }
+                            if pr_watch_enabled {
+                                if let Err(e) = crate::spawn_util::seed_worker_watch_pr_skill(&effective_ws).await {
+                                    tracing::warn!("failed to seed watch-pr skill for {sid}: {e}");
+                                }
                             }
 
                             // Repo slug from the base workspace's git remote so
