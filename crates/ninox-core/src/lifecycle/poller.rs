@@ -84,6 +84,14 @@ pub struct Poller {
     /// called — a skipped tick, never a blocked task — so it costs nothing
     /// beyond the interval's own tick.
     rate_limit_pause_until: Arc<std::sync::Mutex<i64>>,
+    /// The backoff duration (seconds) applied by the *last* Retry-After-less
+    /// `RateLimitedError`, so consecutive such errors double it instead of
+    /// re-pausing for a flat 120s each time (0 = no backoff established
+    /// yet). A `RateLimitedError` that carries its own `Retry-After` uses
+    /// that value directly and leaves this untouched. Reset to 0 by
+    /// `note_rate_limit` on any successful fetch, so a fresh outage after a
+    /// recovery starts the doubling over from 120s.
+    rate_limit_backoff_secs: Arc<std::sync::Mutex<u64>>,
 }
 
 impl Poller {
@@ -101,6 +109,7 @@ impl Poller {
             update_source:    Arc::new(CargoRegistryUpdateSource),
             last_notified_update: Arc::new(std::sync::Mutex::new(None)),
             rate_limit_pause_until: Arc::new(std::sync::Mutex::new(0)),
+            rate_limit_backoff_secs: Arc::new(std::sync::Mutex::new(0)),
         }
     }
 
@@ -118,6 +127,14 @@ impl Poller {
     #[cfg(test)]
     fn set_pause_until(&self, t: i64) {
         *self.rate_limit_pause_until.lock().unwrap_or_else(|e| e.into_inner()) = t;
+    }
+
+    /// Test seam: read `rate_limit_pause_until` directly, so exponential
+    /// backoff (successive Retry-After-less `RateLimitedError`s doubling
+    /// the pause) is assertable without waiting on a real clock.
+    #[cfg(test)]
+    fn pause_until(&self) -> i64 {
+        *self.rate_limit_pause_until.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The (created-on-first-use) lock for a given vault path — see
@@ -980,18 +997,32 @@ impl Poller {
 
     /// A whole batched fetch failed — every target this tick is unobserved.
     /// `RateLimitedError` (403/429 from GitHub's GraphQL endpoint) pauses
-    /// `poll_github_batched` for its `Retry-After` hint, or a fixed 120s
-    /// when GitHub sent none; any other error (a transient network blip,
-    /// say) is logged only — polling must not stall over something that
-    /// will very likely have cleared up by the next tick. `{e:#}` logs the
-    /// full `anyhow` cause chain, not just the top-level message, so a
-    /// sustained outage (which otherwise notifies nobody — watches/sessions
-    /// simply go quiet) is still diagnosable from logs alone.
+    /// `poll_github_batched` for its `Retry-After` hint, or an exponentially
+    /// doubling backoff (120s, 240s, 480s, ... capped at 3600s) when GitHub
+    /// sent none — consecutive Retry-After-less errors keep doubling
+    /// `rate_limit_backoff_secs` instead of re-pausing for a flat 120s
+    /// every time, so a sustained outage backs off instead of hammering
+    /// GitHub every two minutes. A Retry-After-bearing error uses GitHub's
+    /// own value and leaves the stored backoff untouched — it isn't a
+    /// signal about the *next* Retry-After-less error's pause. Any other
+    /// error (a transient network blip, say) is logged only — polling must
+    /// not stall over something that will very likely have cleared up by
+    /// the next tick. `{e:#}` logs the full `anyhow` cause chain, not just
+    /// the top-level message, so a sustained outage (which otherwise
+    /// notifies nobody — watches/sessions simply go quiet) is still
+    /// diagnosable from logs alone.
     fn note_batch_error(&self, e: &anyhow::Error) {
         if let Some(rl) = e.downcast_ref::<crate::github_graphql::RateLimitedError>() {
             let pause_until = match rl.retry_after_secs {
                 Some(secs) => now_millis() + secs as i64 * 1000,
-                None       => now_millis() + 120_000,
+                None       => {
+                    let mut backoff = self.rate_limit_backoff_secs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let next = if *backoff == 0 { 120 } else { (*backoff * 2).min(3600) };
+                    *backoff = next;
+                    now_millis() + next as i64 * 1000
+                }
             };
             *self.rate_limit_pause_until.lock().unwrap_or_else(|e| e.into_inner()) = pause_until;
             tracing::warn!("github batch fetch rate limited, pausing until {pause_until}: {e:#}");
@@ -1009,6 +1040,11 @@ impl Poller {
     /// has actually elapsed, so re-warning here would only fire for a pause
     /// that's already expired — i.e. genuinely new.
     fn note_rate_limit(&self, rate_limit: &crate::github_graphql::RateLimitInfo) {
+        // This only ever runs after a successful fetch (the caller returns
+        // early on error before reaching here) — reset the Retry-After-less
+        // backoff so a fresh outage after a recovery starts doubling over
+        // from 120s again, not from wherever the last outage left off.
+        *self.rate_limit_backoff_secs.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         if rate_limit.remaining >= 100 || rate_limit.reset_at <= now_millis() {
             return;
         }
@@ -3993,6 +4029,105 @@ mod tests {
         assert_eq!(
             batch.calls.lock().unwrap().len(), 1,
             "a Retry-After-bearing rate limit error must pause the next tick",
+        );
+    }
+
+    /// Consecutive `RateLimitedError`s with no `Retry-After` hint must
+    /// double the pause each time (120s, then 240s, then 480s) instead of
+    /// re-pausing for a flat 120s every tick.
+    #[tokio::test]
+    async fn rate_limited_error_without_retry_after_backs_off_exponentially() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        let engine = batch_engine(store.clone(), batch.clone());
+        let poller = Poller::new(engine);
+
+        let queue_error = || {
+            batch.queued_errors.lock().unwrap().push_back(
+                anyhow::Error::new(crate::github_graphql::RateLimitedError { retry_after_secs: None })
+            );
+        };
+
+        let before = now_millis();
+        queue_error();
+        poller.poll_github_batched().await;
+        let first_pause = poller.pause_until() - before;
+        assert!(
+            (110_000..=130_000).contains(&first_pause),
+            "the first Retry-After-less rate limit must pause ~120s, got {first_pause}ms",
+        );
+
+        // Clear the pause so the next tick actually reaches `fetch_batch`
+        // instead of being skipped by the pause it just set.
+        poller.set_pause_until(0);
+        queue_error();
+        poller.poll_github_batched().await;
+        let second_pause = poller.pause_until() - before;
+        assert!(
+            second_pause >= 2 * first_pause - 10_000,
+            "a second consecutive error must double the pause, got {second_pause}ms after a first of {first_pause}ms",
+        );
+
+        poller.set_pause_until(0);
+        queue_error();
+        poller.poll_github_batched().await;
+        let third_pause = poller.pause_until() - before;
+        assert!(
+            third_pause >= 2 * second_pause - 10_000,
+            "a third consecutive error must double again, got {third_pause}ms after a second of {second_pause}ms",
+        );
+    }
+
+    /// A successful fetch resets the stored Retry-After-less backoff, so a
+    /// fresh outage after a recovery starts doubling over from 120s again
+    /// instead of continuing where a prior outage left off.
+    #[tokio::test]
+    async fn successful_fetch_resets_rate_limit_backoff() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        let engine = batch_engine(store.clone(), batch.clone());
+        let poller = Poller::new(engine);
+
+        let queue_error = || {
+            batch.queued_errors.lock().unwrap().push_back(
+                anyhow::Error::new(crate::github_graphql::RateLimitedError { retry_after_secs: None })
+            );
+        };
+
+        // Two consecutive errors double the backoff away from the 120s floor.
+        queue_error();
+        poller.poll_github_batched().await;
+        poller.set_pause_until(0);
+        queue_error();
+        poller.poll_github_batched().await;
+        let doubled_pause = poller.pause_until();
+        poller.set_pause_until(0);
+        assert!(
+            doubled_pause - now_millis() > 200_000,
+            "sanity check: two consecutive errors must have doubled past 120s",
+        );
+
+        // A successful fetch in between must reset the stored backoff.
+        batch.result.lock().unwrap().prs.insert(pr_key("Owner/repo", 50), open_snapshot(50));
+        poller.poll_github_batched().await;
+
+        // A fresh error after the success must pause ~120s again, not
+        // continue doubling from where the prior outage left off.
+        let before = now_millis();
+        queue_error();
+        poller.poll_github_batched().await;
+        let fresh_pause = poller.pause_until() - before;
+        assert!(
+            (110_000..=130_000).contains(&fresh_pause),
+            "a fresh error after a success must pause ~120s again, got {fresh_pause}ms",
         );
     }
 
