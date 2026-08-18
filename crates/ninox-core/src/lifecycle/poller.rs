@@ -737,51 +737,7 @@ impl Poller {
                 Ok(c)  => c,
                 Err(e) => { tracing::warn!("github ci checks: {e}"); vec![] }
             };
-            let ci = summarize_checks(pr_id, &checks);
-            let _ = self.engine.store.upsert_ci_status(&ci);
-            self.engine.emit(Event::CiUpdated { pr_id, status: ci.clone() });
-
-            // -- Detect CI transition and update session status --
-            let (newly_failing, ci_reaction_already_sent) = {
-                let mut cache = self.enrichment_cache.lock().unwrap();
-                let state = cache.entry(session.id.clone()).or_default();
-
-                let newly_failing = state.prev_failing.is_none_or(|p| p == 0)
-                    && ci.failing > 0;
-                state.prev_failing = Some(ci.failing);
-
-                let already_sent = state.ci_reaction_sent;
-                if newly_failing && !already_sent {
-                    state.ci_reaction_sent = true;
-                }
-                if ci.failing == 0 {
-                    state.ci_reaction_sent = false;
-                }
-                (newly_failing, already_sent)
-            };
-
-            if newly_failing && !ci_reaction_already_sent {
-                self.engine.emit(Event::Notification(Notification {
-                    id:         format!("ci-{}", session.id),
-                    kind:       NotificationKind::CiFailure,
-                    title:      format!("CI failing — {}", session.name),
-                    body:       format!("{}/{} checks failing", ci.failing, ci.total),
-                    session_id: Some(session.id.clone()),
-                    created_at: now_millis(),
-                }));
-                // Send reaction to the agent in the tmux session
-                let failing_names: Vec<String> = checks.iter()
-                    .filter(|c| c.conclusion.as_deref() == Some("failure")
-                             || c.conclusion.as_deref() == Some("timed_out"))
-                    .map(|c| c.name.clone())
-                    .collect();
-                let msg = crate::lifecycle::reactions::format_ci_reaction(
-                    &session, &ci, &failing_names
-                );
-                if let Err(e) = self.engine.send_to_session(&session.id, &msg).await {
-                    tracing::warn!("send ci reaction to {}: {e}", session.id);
-                }
-            }
+            let ci = self.ingest_ci(&session, pr_id, &checks).await;
 
             // -- Review threads + issue comments (throttled via seen_comment_ids) --
             let threads = match gh.get_review_threads(&owner, &repo, pr_number).await {
@@ -792,113 +748,211 @@ impl Poller {
                 Ok(c)  => c,
                 Err(e) => { tracing::warn!("github issue comments: {e}"); vec![] }
             };
+            let (has_new, review_reaction_already_sent, new_comments, has_changes_requested) =
+                self.scan_reviews(&session.id, pr_id, &threads, &issue_comments);
 
-            let has_changes_requested = threads.iter().any(|t| t.state == "CHANGES_REQUESTED");
+            self.apply_status_and_gate(&session, &pr_status, &ci, has_changes_requested);
 
-            let (has_new, review_reaction_already_sent, new_comments) = {
-                let mut cache = self.enrichment_cache.lock().unwrap();
-                let state = cache.entry(session.id.clone()).or_default();
-                let mut has_new = false;
-                let mut new_comments: Vec<Comment> = Vec::new();
+            self.emit_review_reaction(&session, has_new, review_reaction_already_sent, &new_comments).await;
+        }
+    }
 
-                // Persist + emit every displayable comment — CHANGES_REQUESTED
-                // and plain COMMENTED reviews (which also covers inline diff
-                // comments, tagged COMMENTED by `get_review_threads`) — so the
-                // Info panel's Marginalia feed shows the whole conversation.
-                // `has_new`/`new_comments` stay CHANGES_REQUESTED-only: they
-                // drive the reaction/notification path below, which must not
-                // widen just because the display feed did. A bare
-                // empty-body "Comment" review (whose only content is inline
-                // comments, already captured separately) is skipped so the
-                // feed doesn't show blank entries — but never for
-                // CHANGES_REQUESTED, which must keep being captured (and
-                // reacted to) exactly as before regardless of body content.
-                for thread in &threads {
-                    let is_changes_requested = thread.state == "CHANGES_REQUESTED";
-                    let is_displayable = is_changes_requested || thread.state == "COMMENTED";
-                    if !is_displayable || state.seen_comment_ids.contains(&thread.id) {
-                        continue;
-                    }
-                    if !is_changes_requested && thread.body.trim().is_empty() {
-                        continue;
-                    }
-                    state.seen_comment_ids.insert(thread.id);
-                    let comment = Comment {
-                        id:         thread.id,
-                        pr_id,
-                        author:     thread.author.clone(),
-                        body:       thread.body.clone(),
-                        path:       thread.path.clone(),
-                        line:       thread.line,
-                        created_at: thread.created_at,
-                    };
-                    let _ = self.engine.store.upsert_comment(&comment);
-                    self.engine.emit(Event::ReviewComment { pr_id, comment: comment.clone() });
-                    if is_changes_requested {
-                        has_new = true;
-                        new_comments.push(comment);
-                    }
-                }
+    /// The CI block: summarize → upsert → `CiUpdated` emit → newly-failing
+    /// transition (via `enrichment_cache`) → `CiFailure` notification +
+    /// `format_ci_reaction` sent into the session's tmux. Takes already-fetched
+    /// checks (the caller owns the `get_ci_checks` network call) so a
+    /// non-REST caller can reuse this. Returns the computed `CIStatus`.
+    async fn ingest_ci(&self, session: &Session, pr_id: PrId, checks: &[CheckRun]) -> CIStatus {
+        let ci = summarize_checks(pr_id, checks);
+        let _ = self.engine.store.upsert_ci_status(&ci);
+        self.engine.emit(Event::CiUpdated { pr_id, status: ci.clone() });
 
-                for issue_comment in &issue_comments {
-                    if state.seen_comment_ids.contains(&issue_comment.id) {
-                        continue;
-                    }
-                    state.seen_comment_ids.insert(issue_comment.id);
-                    let comment = Comment { pr_id, ..issue_comment.clone() };
-                    let _ = self.engine.store.upsert_comment(&comment);
-                    self.engine.emit(Event::ReviewComment { pr_id, comment });
-                }
+        // -- Detect CI transition and update session status --
+        let (newly_failing, ci_reaction_already_sent) = {
+            let mut cache = self.enrichment_cache.lock().unwrap();
+            let state = cache.entry(session.id.clone()).or_default();
 
-                let already_sent = state.review_reaction_sent;
-                if has_new && !already_sent {
-                    state.review_reaction_sent = true;
-                }
-                // Reset when all CHANGES_REQUESTED are resolved
-                if !has_changes_requested {
-                    state.review_reaction_sent = false;
-                }
-                (has_new, already_sent, new_comments)
-            };
+            let newly_failing = state.prev_failing.is_none_or(|p| p == 0)
+                && ci.failing > 0;
+            state.prev_failing = Some(ci.failing);
 
-            // Update session status in DB (after review threads so has_changes_requested is known)
-            let new_status = derive_session_status(&session.status, &pr_status, &ci, has_changes_requested);
-            let new_gate = compute_new_gate(
-                &session.status, &ci, has_changes_requested, pr_status.mergeable,
-                session.gate_status.as_ref(), now_millis(),
+            let already_sent = state.ci_reaction_sent;
+            if newly_failing && !already_sent {
+                state.ci_reaction_sent = true;
+            }
+            if ci.failing == 0 {
+                state.ci_reaction_sent = false;
+            }
+            (newly_failing, already_sent)
+        };
+
+        if newly_failing && !ci_reaction_already_sent {
+            self.engine.emit(Event::Notification(Notification {
+                id:         format!("ci-{}", session.id),
+                kind:       NotificationKind::CiFailure,
+                title:      format!("CI failing — {}", session.name),
+                body:       format!("{}/{} checks failing", ci.failing, ci.total),
+                session_id: Some(session.id.clone()),
+                created_at: now_millis(),
+            }));
+            // Send reaction to the agent in the tmux session
+            let failing_names: Vec<String> = checks.iter()
+                .filter(|c| c.conclusion.as_deref() == Some("failure")
+                         || c.conclusion.as_deref() == Some("timed_out"))
+                .map(|c| c.name.clone())
+                .collect();
+            let msg = crate::lifecycle::reactions::format_ci_reaction(
+                session, &ci, &failing_names
             );
-            if new_status != session.status || new_gate != session.gate_status {
-                // `session` is the tick-start snapshot, several GitHub
-                // awaits old — write through the live row instead (see
-                // `update_live_session_row`), and skip both write and emit
-                // if the session was deleted mid-tick.
-                if let Some(updated) = self.update_live_session_row(&session, |row| {
-                    row.status = new_status;
-                    row.gate_status = new_gate;
-                }) {
-                    self.engine.emit(Event::SessionUpdated(
-                        updated,
-                        SessionFields::STATUS | SessionFields::GATE,
-                    ));
+            if let Err(e) = self.engine.send_to_session(&session.id, &msg).await {
+                tracing::warn!("send ci reaction to {}: {e}", session.id);
+            }
+        }
+
+        ci
+    }
+
+    /// The review-scan block: dedup via `seen_comment_ids`, then
+    /// `upsert_comment` and `ReviewComment` emits. Pure w.r.t. the network —
+    /// the caller owns the `get_review_threads`/`get_issue_comments`
+    /// fetches. Returns `(has_new, review_reaction_already_sent,
+    /// new_comments, has_changes_requested)`.
+    fn scan_reviews(
+        &self,
+        session_id: &str,
+        pr_id: PrId,
+        threads: &[crate::github::ReviewThread],
+        issue_comments: &[Comment],
+    ) -> (bool, bool, Vec<Comment>, bool) {
+        let has_changes_requested = threads.iter().any(|t| t.state == "CHANGES_REQUESTED");
+
+        let (has_new, review_reaction_already_sent, new_comments) = {
+            let mut cache = self.enrichment_cache.lock().unwrap();
+            let state = cache.entry(session_id.to_string()).or_default();
+            let mut has_new = false;
+            let mut new_comments: Vec<Comment> = Vec::new();
+
+            // Persist + emit every displayable comment — CHANGES_REQUESTED
+            // and plain COMMENTED reviews (which also covers inline diff
+            // comments, tagged COMMENTED by `get_review_threads`) — so the
+            // Info panel's Marginalia feed shows the whole conversation.
+            // `has_new`/`new_comments` stay CHANGES_REQUESTED-only: they
+            // drive the reaction/notification path below, which must not
+            // widen just because the display feed did. A bare
+            // empty-body "Comment" review (whose only content is inline
+            // comments, already captured separately) is skipped so the
+            // feed doesn't show blank entries — but never for
+            // CHANGES_REQUESTED, which must keep being captured (and
+            // reacted to) exactly as before regardless of body content.
+            for thread in threads {
+                let is_changes_requested = thread.state == "CHANGES_REQUESTED";
+                let is_displayable = is_changes_requested || thread.state == "COMMENTED";
+                if !is_displayable || state.seen_comment_ids.contains(&thread.id) {
+                    continue;
+                }
+                if !is_changes_requested && thread.body.trim().is_empty() {
+                    continue;
+                }
+                state.seen_comment_ids.insert(thread.id);
+                let comment = Comment {
+                    id:         thread.id,
+                    pr_id,
+                    author:     thread.author.clone(),
+                    body:       thread.body.clone(),
+                    path:       thread.path.clone(),
+                    line:       thread.line,
+                    created_at: thread.created_at,
+                };
+                let _ = self.engine.store.upsert_comment(&comment);
+                self.engine.emit(Event::ReviewComment { pr_id, comment: comment.clone() });
+                if is_changes_requested {
+                    has_new = true;
+                    new_comments.push(comment);
                 }
             }
 
-            if has_new && !review_reaction_already_sent {
-                self.engine.emit(Event::Notification(Notification {
-                    id:         format!("review-{}", session.id),
-                    kind:       NotificationKind::PrNeedsAttention,
-                    title:      format!("Review comments — {}", session.name),
-                    body:       "Changes requested on your PR".to_string(),
-                    session_id: Some(session.id.clone()),
-                    created_at: now_millis(),
-                }));
-                if !new_comments.is_empty() {
-                    let msg = crate::lifecycle::reactions::format_review_reaction(
-                        &session, &new_comments
-                    );
-                    if let Err(e) = self.engine.send_to_session(&session.id, &msg).await {
-                        tracing::warn!("send review reaction to {}: {e}", session.id);
-                    }
+            for issue_comment in issue_comments {
+                if state.seen_comment_ids.contains(&issue_comment.id) {
+                    continue;
+                }
+                state.seen_comment_ids.insert(issue_comment.id);
+                let comment = Comment { pr_id, ..issue_comment.clone() };
+                let _ = self.engine.store.upsert_comment(&comment);
+                self.engine.emit(Event::ReviewComment { pr_id, comment });
+            }
+
+            let already_sent = state.review_reaction_sent;
+            if has_new && !already_sent {
+                state.review_reaction_sent = true;
+            }
+            // Reset when all CHANGES_REQUESTED are resolved
+            if !has_changes_requested {
+                state.review_reaction_sent = false;
+            }
+            (has_new, already_sent, new_comments)
+        };
+
+        (has_new, review_reaction_already_sent, new_comments, has_changes_requested)
+    }
+
+    /// The status/gate write block: derive the new status/gate, write
+    /// through the live session row, and emit `SessionUpdated(STATUS |
+    /// GATE)` only when something actually changed.
+    fn apply_status_and_gate(
+        &self,
+        session: &Session,
+        pr_status: &crate::github::PrStatus,
+        ci: &CIStatus,
+        has_changes_requested: bool,
+    ) {
+        // Update session status in DB (after review threads so has_changes_requested is known)
+        let new_status = derive_session_status(&session.status, pr_status, ci, has_changes_requested);
+        let new_gate = compute_new_gate(
+            &session.status, ci, has_changes_requested, pr_status.mergeable,
+            session.gate_status.as_ref(), now_millis(),
+        );
+        if new_status != session.status || new_gate != session.gate_status {
+            // `session` is the tick-start snapshot, several GitHub
+            // awaits old — write through the live row instead (see
+            // `update_live_session_row`), and skip both write and emit
+            // if the session was deleted mid-tick.
+            if let Some(updated) = self.update_live_session_row(session, |row| {
+                row.status = new_status;
+                row.gate_status = new_gate;
+            }) {
+                self.engine.emit(Event::SessionUpdated(
+                    updated,
+                    SessionFields::STATUS | SessionFields::GATE,
+                ));
+            }
+        }
+    }
+
+    /// The review notification/reaction block: `PrNeedsAttention`
+    /// notification plus `format_review_reaction` sent into the session's
+    /// tmux for newly-seen CHANGES_REQUESTED comments.
+    async fn emit_review_reaction(
+        &self,
+        session: &Session,
+        has_new: bool,
+        already_sent: bool,
+        new_comments: &[Comment],
+    ) {
+        if has_new && !already_sent {
+            self.engine.emit(Event::Notification(Notification {
+                id:         format!("review-{}", session.id),
+                kind:       NotificationKind::PrNeedsAttention,
+                title:      format!("Review comments — {}", session.name),
+                body:       "Changes requested on your PR".to_string(),
+                session_id: Some(session.id.clone()),
+                created_at: now_millis(),
+            }));
+            if !new_comments.is_empty() {
+                let msg = crate::lifecycle::reactions::format_review_reaction(
+                    session, new_comments
+                );
+                if let Err(e) = self.engine.send_to_session(&session.id, &msg).await {
+                    tracing::warn!("send review reaction to {}: {e}", session.id);
                 }
             }
         }
