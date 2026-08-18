@@ -4499,12 +4499,14 @@ pub async fn setup_orchestrator_root(
              - `{reap_skill}` — cleaning up workers you are done with\n\
              - `{orch_skill}` — spawning another orchestrator (only on the user's request)\n\
              - `{config_skill}` — changing agent harness or model\n\
-             - `{brain_skill}` — reading and writing the shared knowledge brain\n",
-            spawn_skill  = spawn_skill_path.display(),
-            reap_skill   = reap_skill_path.display(),
-            orch_skill   = orch_skill_path.display(),
-            config_skill = config_skill_path.display(),
-            brain_skill  = brain_skill_path.display(),
+             - `{brain_skill}` — reading and writing the shared knowledge brain\n\
+             - `{watch_pr_skill}` — registering PRs for consolidated watching instead of polling gh\n",
+            spawn_skill    = spawn_skill_path.display(),
+            reap_skill     = reap_skill_path.display(),
+            orch_skill     = orch_skill_path.display(),
+            config_skill   = config_skill_path.display(),
+            brain_skill    = brain_skill_path.display(),
+            watch_pr_skill = watch_pr_skill_path.display(),
         );
         fs::write(&agents_md_path, body).await?;
     }
@@ -8582,9 +8584,8 @@ mod tests {
         let root = tempdir().unwrap().keep();
         setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
 
-        let skill = std::fs::read_to_string(
-            root.join(".claude").join("skills").join("watch-pr").join("SKILL.md"),
-        ).unwrap();
+        let skill_path = root.join(".claude").join("skills").join("watch-pr").join("SKILL.md");
+        let skill = std::fs::read_to_string(&skill_path).unwrap();
         assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
         assert!(skill.contains("name: watch-pr"));
         assert!(skill.contains("description:"));
@@ -8598,6 +8599,12 @@ mod tests {
         assert!(
             spawn_skill.contains("see the `watch-pr` skill"),
             "spawn-worker skill must cross-link the watch-pr skill"
+        );
+
+        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(
+            agents_md.contains(&skill_path.display().to_string()),
+            "AGENTS.md should list the watch-pr skill in Available Skills"
         );
     }
 
