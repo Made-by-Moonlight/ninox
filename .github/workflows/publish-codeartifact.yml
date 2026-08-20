@@ -7,10 +7,21 @@ name: Publish to CodeArtifact
 # entirely from repo settings, not YAML conditions:
 #   - this (public) repo:  this workflow is disabled
 #                           (`gh workflow disable publish-codeartifact.yml`)
-#   - the private mirror:  publish.yml and release.yml are disabled
-#                           (`gh workflow disable publish.yml`,
-#                            `gh workflow disable release.yml`)
-#                           ci.yml and this workflow stay enabled.
+#   - the private mirror:  publish.yml (crates.io) is disabled
+#                           (`gh workflow disable publish.yml`); ci.yml,
+#                           release.yml, and this workflow all stay enabled.
+#                           release.yml on the private mirror cuts its own
+#                           version bump + tag from internal-only merges
+#                           (PRs opened directly there, not synced from this
+#                           repo) — that's what actually triggers this
+#                           workflow's tag-push path for them, the same way
+#                           this (public) repo's release.yml drives
+#                           publish.yml. The two repos mint `vX.Y.Z` tags
+#                           independently from their own commit history, so
+#                           the same version number can point at different
+#                           content between them; accepted, since each
+#                           publishes to a separate registry (CodeArtifact
+#                           vs crates.io) with no shared namespace.
 #
 # As belt-and-braces on top of that disable scheme, this workflow also no-ops
 # gracefully (see "Check CodeArtifact configuration" below) if its required
