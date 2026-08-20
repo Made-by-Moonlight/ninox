@@ -1,7 +1,7 @@
 use std::{collections::{HashMap, VecDeque}, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use ninox_core::{
-    config::{AppConfig, EditorChoice, ThemeVariant},
+    config::{AppConfig, EditorChoice, SendMechanism, ThemeVariant},
     events::{Engine, Event},
     slugify,
     types::*,
@@ -474,14 +474,16 @@ pub enum Message {
     SettingsWorkerModel(String),
     SettingsWorkerCustomModel(String),
     SettingsWorkerCustomCommit,
-    /// Flip the opt-in file-based inbox toggle (`[inbox_messaging].enabled`,
-    /// default off — see `ninox_core::config::InboxMessagingConfig`).
-    SettingsToggleInboxMessaging,
     SettingsToggleRustCache,
     SettingsRustCacheExecutable(String),
     SettingsRustCacheDir(String),
     SettingsRustCacheSize(String),
     SettingsToggleRustCachePrune,
+    /// Choose how orchestrator↔worker messages are delivered
+    /// (`[messaging].mechanism` — see `ninox_core::config::SendMechanism`).
+    /// Replaces the `SettingsToggleInboxMessaging` bool: the inbox is now
+    /// one of three mutually exclusive mechanisms rather than on/off.
+    SettingsSetSendMechanism(SendMechanism),
     /// Flip the opt-in consolidated PR-watching toggle (`[pr_watch].enabled`,
     /// default off — see `ninox_core::config::PrWatchConfig`).
     SettingsTogglePrWatch,
@@ -1991,7 +1993,7 @@ impl App {
                                             &ws_path,
                                             &sid,
                                             &incarnation.incarnation_id,
-                                            state.config.inbox_messaging.enabled,
+                                            state.config.send_mechanism() == SendMechanism::Inbox,
                                         )
                                     {
                                         Ok(checkout) => {
@@ -2068,7 +2070,7 @@ impl App {
                         let nm     = name;
                         let ts_i64 = ts as i64;
                         let config = state.config.clone();
-                        let inbox_enabled = state.config.inbox_messaging.enabled;
+                        let inbox_enabled = state.config.send_mechanism() == SendMechanism::Inbox;
                         let repositories_root = state.config.resolved_repositories_root();
                         let worktree_root = state.config.resolved_worktree_root();
 
@@ -2552,7 +2554,7 @@ impl App {
                 let orch_id = session.orchestrator_id.clone();
                 let summary = session.summary.clone();
                 let config = state.config.clone();
-                let inbox_enabled = state.config.inbox_messaging.enabled;
+                let inbox_enabled = state.config.send_mechanism() == SendMechanism::Inbox;
                 let repositories_root = state.config.resolved_repositories_root();
                 let worktree_root = state.config.resolved_worktree_root();
                 Task::future(async move {
@@ -3387,10 +3389,10 @@ impl App {
                 Task::none()
             }
 
-            Message::SettingsToggleInboxMessaging => {
-                state.config.inbox_messaging.enabled = !state.config.inbox_messaging.enabled;
+            Message::SettingsSetSendMechanism(mechanism) => {
+                state.config.set_send_mechanism(mechanism);
                 if let Err(e) = state.config.save() {
-                    tracing::warn!("failed to save config after toggling inbox messaging: {e}");
+                    tracing::warn!("failed to save config after choosing send mechanism: {e}");
                 }
                 Task::none()
             }

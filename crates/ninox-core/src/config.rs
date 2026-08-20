@@ -152,23 +152,97 @@ impl Default for BrainHarvestConfig {
 // Inbox messaging configuration
 // ---------------------------------------------------------------------------
 
-/// Opt-in (default OFF) file-based inbox for orchestrator↔worker messaging.
+/// How `ninox send` and `Engine::send_to_session` get a message into a
+/// running agent session. Exactly one of these is in effect at a time —
+/// see `crate::messaging::deliver_message` for the dispatch and for what
+/// each path falls back to when the target cannot accept it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendMechanism {
+    /// `tmux::send_keys` — the message is typed at the target's prompt as
+    /// verified keyboard input (hardened in PR #69 with a pre-Enter delay
+    /// and verify/retry). Works against any harness in a tmux session, and
+    /// is what the other two mechanisms fall back to.
+    Keystrokes,
+    /// The per-session file-based inbox (`crate::inbox`), drained by the
+    /// Stop/UserPromptSubmit hooks installed in the worker's worktree
+    /// settings (see `ninox_app::spawn_util::ensure_statusline_settings`).
+    /// Keystrokes are then only a best-effort idle-wake nudge
+    /// (`tmux::wake_idle_session`), not the message itself.
+    Inbox,
+    /// Claude Code's own cross-session messaging socket
+    /// (`crate::session_socket`) — the transport its `SendMessage` tool
+    /// uses between sessions. The message is written as one JSON line to
+    /// the Unix socket the target session advertises in its registry
+    /// record, and is enqueued for its next turn.
+    ///
+    /// The default: unlike keystrokes it cannot collide with whatever the
+    /// human happens to be typing, and unlike the inbox it needs no hooks
+    /// installed ahead of time and reaches an idle session without relying
+    /// on a nudge landing.
+    #[default]
+    SessionSocket,
+}
+
+impl SendMechanism {
+    /// Every mechanism, in the order the settings picker offers them.
+    pub const ALL: [SendMechanism; 3] =
+        [SendMechanism::SessionSocket, SendMechanism::Inbox, SendMechanism::Keystrokes];
+
+    /// One line on what this mechanism does, for the settings card.
+    pub fn description(&self) -> &'static str {
+        match self {
+            SendMechanism::SessionSocket =>
+                "Writes to the target's Claude Code messaging socket, the same transport its \
+                 SendMessage tool uses between sessions. Nothing is typed, so nothing can collide \
+                 with what you are typing, and an idle session receives the message immediately. \
+                 Falls back to keystrokes for sessions that advertise no socket.",
+            SendMechanism::Inbox =>
+                "Writes the message to a per-session file drained by Stop/UserPromptSubmit hooks, \
+                 installed into worker worktrees created from now on. Keystrokes are used only to \
+                 wake an idle session, and a message can sit undelivered if that nudge misses.",
+            SendMechanism::Keystrokes =>
+                "Types the message into the session's prompt as verified keyboard input. Works \
+                 with every harness, and is what the other two fall back to.",
+        }
+    }
+}
+
+impl std::fmt::Display for SendMechanism {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SendMechanism::Keystrokes    => "Keystrokes",
+            SendMechanism::Inbox         => "File-based inbox",
+            SendMechanism::SessionSocket => "Session socket",
+        })
+    }
+}
+
+/// Which delivery mechanism orchestrator↔worker messaging uses.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct MessagingConfig {
+    #[serde(default)]
+    pub mechanism: SendMechanism,
+}
+
+/// Superseded by [`MessagingConfig`] — retained only so an existing
+/// `[inbox_messaging].enabled = true` keeps selecting
+/// [`SendMechanism::Inbox`] after upgrading, rather than silently moving
+/// that user onto the new default. See `AppConfig::send_mechanism`.
 ///
-/// Off (default): `ninox send` and `Engine::send_to_session` behave exactly
-/// as before — the message is injected directly as verified keyboard input
-/// (`tmux::send_keys`, hardened in PR #69 with a pre-Enter delay and
-/// verify/retry).
-///
-/// On: the message is instead written durably to the target session's
-/// file-based inbox (`ninox_core::inbox`), drained by the Stop/
-/// UserPromptSubmit hooks installed in the worker's worktree settings (see
-/// `ninox_app::spawn_util::ensure_statusline_settings`) — keystrokes are
-/// then only a best-effort idle-wake nudge (`tmux::wake_idle_session`), not
-/// the message itself.
+/// Never written back once the mechanism is set explicitly
+/// (`AppConfig::set_send_mechanism` clears it), and omitted from a saved
+/// config entirely while it holds its default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InboxMessagingConfig {
     #[serde(default)]
     pub enabled: bool,
+}
+
+impl InboxMessagingConfig {
+    fn is_default(&self) -> bool {
+        !self.enabled
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,9 +453,14 @@ pub struct AppConfig {
     /// `SessionRetentionConfig`.
     #[serde(default)]
     pub session_retention: SessionRetentionConfig,
-    /// File-based inbox toggle for orchestrator↔worker messaging. Opt-in,
-    /// default off — see `InboxMessagingConfig`.
+    /// Which mechanism orchestrator↔worker messages are delivered by.
+    /// Absent means "never chosen explicitly" — resolved by
+    /// `send_mechanism()`, which is the only thing that should read this.
     #[serde(default)]
+    pub messaging: Option<MessagingConfig>,
+    /// Legacy pre-`[messaging]` toggle, kept for migration only — see
+    /// `InboxMessagingConfig` and `send_mechanism()`.
+    #[serde(default, skip_serializing_if = "InboxMessagingConfig::is_default")]
     pub inbox_messaging: InboxMessagingConfig,
     /// Bounded worker-only shared sccache and release-pruning policy.
     #[serde(default)]
@@ -442,6 +521,7 @@ impl Default for AppConfig {
             sidebar_width:    default_sidebar_width(),
             sidebar_hidden:   false,
             harnesses:        BTreeMap::new(),
+            messaging:        None,
             inbox_messaging:  InboxMessagingConfig::default(),
             rust_cache:       RustCacheConfig::default(),
             pr_watch:         PrWatchConfig::default(),
@@ -561,6 +641,34 @@ impl AppConfig {
     /// config's `[harnesses.*]` entries.
     pub fn registry(&self) -> HarnessRegistry {
         HarnessRegistry::from_config(&self.harnesses)
+    }
+
+    /// Which mechanism to deliver orchestrator↔worker messages by.
+    ///
+    /// An explicit `[messaging] mechanism` always wins. Failing that, a
+    /// config written before `[messaging]` existed is migrated by its
+    /// legacy `[inbox_messaging].enabled` flag: someone who had opted into
+    /// the file-based inbox stays on it rather than being moved onto the
+    /// new default behind their back. Everything else — including a config
+    /// that never mentioned messaging at all — gets
+    /// [`SendMechanism::default()`].
+    ///
+    /// Read this rather than either field directly; the fields alone don't
+    /// tell you what will actually happen.
+    pub fn send_mechanism(&self) -> SendMechanism {
+        match self.messaging {
+            Some(m) => m.mechanism,
+            None if self.inbox_messaging.enabled => SendMechanism::Inbox,
+            None => SendMechanism::default(),
+        }
+    }
+
+    /// Choose the delivery mechanism, retiring the legacy inbox flag so the
+    /// two can never disagree — after this, `send_mechanism()` is answered
+    /// entirely by `[messaging]`.
+    pub fn set_send_mechanism(&mut self, mechanism: SendMechanism) {
+        self.messaging = Some(MessagingConfig { mechanism });
+        self.inbox_messaging.enabled = false;
     }
 
     /// Path to the knowledge-base (brain) directory.
@@ -1087,21 +1195,77 @@ mod tests {
     }
 
     #[test]
-    fn inbox_messaging_defaults_to_disabled() {
-        assert!(!AppConfig::default().inbox_messaging.enabled);
+    fn send_mechanism_defaults_to_the_session_socket() {
+        assert_eq!(AppConfig::default().send_mechanism(), SendMechanism::SessionSocket);
     }
 
     #[test]
-    fn inbox_messaging_missing_table_defaults_to_disabled() {
+    fn send_mechanism_missing_tables_default_to_the_session_socket() {
         let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert_eq!(cfg.send_mechanism(), SendMechanism::SessionSocket);
+    }
+
+    #[test]
+    fn send_mechanism_reads_an_explicit_choice() {
+        for (value, expected) in [
+            ("keystrokes", SendMechanism::Keystrokes),
+            ("inbox", SendMechanism::Inbox),
+            ("session_socket", SendMechanism::SessionSocket),
+        ] {
+            let toml_src = format!("port = 8080\nfont_size = 13.0\n\n[messaging]\nmechanism = \"{value}\"\n");
+            let cfg: AppConfig = toml::from_str(&toml_src).unwrap();
+            assert_eq!(cfg.send_mechanism(), expected, "for mechanism = {value:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_inbox_toggle_still_selects_the_inbox() {
+        // Someone who opted into the file-based inbox before [messaging]
+        // existed must stay on it across the upgrade, not be moved onto the
+        // new default behind their back.
+        let toml_src = "port = 8080\nfont_size = 13.0\n\n[inbox_messaging]\nenabled = true\n";
+        let cfg: AppConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.send_mechanism(), SendMechanism::Inbox);
+    }
+
+    #[test]
+    fn an_explicit_mechanism_overrides_the_legacy_inbox_toggle() {
+        let toml_src = "port = 8080\nfont_size = 13.0\n\n[messaging]\nmechanism = \"keystrokes\"\n\n[inbox_messaging]\nenabled = true\n";
+        let cfg: AppConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.send_mechanism(), SendMechanism::Keystrokes);
+    }
+
+    #[test]
+    fn setting_a_mechanism_retires_the_legacy_inbox_toggle() {
+        // Otherwise a config could carry `enabled = true` alongside an
+        // explicit non-inbox mechanism — two fields disagreeing about one
+        // choice, with the answer depending on which one you happened to read.
+        let mut cfg: AppConfig =
+            toml::from_str("port = 8080\nfont_size = 13.0\n\n[inbox_messaging]\nenabled = true\n").unwrap();
+        cfg.set_send_mechanism(SendMechanism::Keystrokes);
+        assert_eq!(cfg.send_mechanism(), SendMechanism::Keystrokes);
         assert!(!cfg.inbox_messaging.enabled);
     }
 
     #[test]
-    fn inbox_messaging_can_be_enabled_via_config() {
-        let toml_src = "port = 8080\nfont_size = 13.0\n\n[inbox_messaging]\nenabled = true\n";
-        let cfg: AppConfig = toml::from_str(toml_src).unwrap();
-        assert!(cfg.inbox_messaging.enabled);
+    fn a_chosen_mechanism_survives_a_save_load_round_trip() {
+        // Guards the TOML shape as much as the value: `toml::to_string`
+        // rejects a plain value emitted after a table, so a new table field
+        // landing in the wrong position breaks saving for everyone.
+        let mut cfg = AppConfig::default();
+        cfg.set_send_mechanism(SendMechanism::Inbox);
+        let serialized = toml::to_string(&cfg).unwrap();
+        let reloaded: AppConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reloaded.send_mechanism(), SendMechanism::Inbox);
+    }
+
+    #[test]
+    fn a_default_config_does_not_write_the_legacy_inbox_table() {
+        let serialized = toml::to_string(&AppConfig::default()).unwrap();
+        assert!(
+            !serialized.contains("inbox_messaging"),
+            "the legacy table is migration-only and should not be re-emitted:\n{serialized}"
+        );
     }
 
     #[test]

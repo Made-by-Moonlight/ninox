@@ -16,6 +16,7 @@ pub mod messaging;
 pub mod plugin;
 pub mod pty;
 pub mod rust_cache;
+pub mod session_socket;
 pub mod store;
 pub mod tmux;
 pub mod types;

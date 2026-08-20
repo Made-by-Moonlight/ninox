@@ -1,22 +1,34 @@
-//! Orchestrator↔worker message delivery, gated by the opt-in file-based
-//! inbox toggle (`config::InboxMessagingConfig`, default off). Shared by
-//! both callers that inject a message into a session: the `ninox send` CLI
-//! and `Engine::send_to_session` (poller reactions).
+//! Orchestrator↔worker message delivery across the mechanisms in
+//! `config::SendMechanism`. Shared by both callers that inject a message
+//! into a session: the `ninox send` CLI and `Engine::send_to_session`
+//! (poller reactions).
 
-use crate::{inbox, store::Store, tmux};
+use crate::{config::SendMechanism, inbox, session_socket, store::Store, tmux};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-/// Deliver `message` to `session_id`.
+/// Deliver `message` to `session_id` by `mechanism`.
 ///
-/// - `inbox_enabled = false` (default): unchanged pre-existing behavior —
-///   `tmux::send_keys` injects the message directly as verified keyboard
-///   input (hardened in PR #69 with a pre-Enter delay and verify/retry).
-/// - `inbox_enabled = true` AND the target can actually drain a file-based
-///   inbox (see [`target_can_drain_inbox`]): the message is written durably
-///   to the target session's file-based inbox (`inbox::write_message`),
-///   which the Stop/UserPromptSubmit hooks installed in the worker's
-///   worktree settings drain (see
+/// Both of the non-keystroke mechanisms need something to be true of the
+/// target that ninox does not control, so each is paired with a capability
+/// check and falls back to `tmux::send_keys` when it fails. That fallback
+/// is not a nicety: handing a message to a transport nobody is reading
+/// would be silent, permanent loss, which is never the better outcome.
+///
+/// - [`SendMechanism::SessionSocket`] (default): if the target advertises a
+///   Claude Code messaging socket (see [`session_socket::find_peer`]), the
+///   message is written to it as one JSON line and enqueued for the
+///   session's next turn. No keystrokes are involved, so nothing can
+///   collide with what the human is typing, and an idle session gets it
+///   immediately rather than depending on a wake nudge. Falls back to
+///   keystrokes when no peer is advertised (non-Claude harness, a build or
+///   configuration without cross-session messaging) and, because a registry
+///   record can outlive its process, also when the socket turns out to be
+///   dead on connect.
+/// - [`SendMechanism::Inbox`]: if the target can actually drain a file-based
+///   inbox (see [`target_can_drain_inbox`]), the message is written durably
+///   to it (`inbox::write_message`) for the Stop/UserPromptSubmit hooks in
+///   the worker's worktree settings to drain (see
 ///   `ninox_app::spawn_util::ensure_statusline_settings`). Keystrokes are
 ///   then only a best-effort idle-wake nudge (`tmux::wake_idle_session`).
 ///   Failing to WRITE the inbox file is a real delivery failure and
@@ -29,37 +41,73 @@ use std::path::{Path, PathBuf};
 ///   `tmux::wake_idle_session`'s own doc comment for exactly what can make
 ///   it not fire). If it doesn't land, the message stays durably pending
 ///   but genuinely undelivered until something else makes the session
-///   active again (a human interacting with it, or a later message
-///   triggering another nudge attempt) — this is a known residual gap, not
-///   a "will always eventually drain" guarantee. Given this whole feature
-///   is opt-in and default-off, closing that gap (e.g. a poller loop that
-///   keeps re-nudging a session with pending mail) is left as a follow-up
-///   rather than built into this change.
-/// - `inbox_enabled = true` but the target CANNOT drain a file-based inbox
-///   (an orchestrator — hooks are only ever installed in worker worktrees;
-///   a pre-existing worktree whose settings.json predates the toggle being
-///   turned on; a non-`claude-code` harness with no Claude Code hook
-///   mechanism at all): falls back to the same verified keystroke path as
-///   the toggle-off case. Writing to an inbox nobody drains would be
-///   silent, permanent message loss — never acceptable regardless of the
-///   toggle.
+///   active again. This residual gap is the reason the session socket, and
+///   not the inbox, is the default.
+/// - [`SendMechanism::Keystrokes`]: `tmux::send_keys` injects the message
+///   directly as verified keyboard input (hardened in PR #69 with a
+///   pre-Enter delay and verify/retry). Always available, and what the
+///   other two degrade to.
 pub async fn deliver_message(
-    store:         &Store,
-    sessions_dir:  &Path,
-    session_id:    &str,
-    message:       &str,
-    inbox_enabled: bool,
+    store:        &Store,
+    sessions_dir: &Path,
+    session_id:   &str,
+    message:      &str,
+    mechanism:    SendMechanism,
 ) -> Result<()> {
-    if !inbox_enabled || !target_can_drain_inbox(store, session_id) {
-        return tmux::send_keys(session_id, message).await;
+    match mechanism {
+        SendMechanism::SessionSocket => {
+            deliver_via_session_socket(session_socket::find_peer(session_id), session_id, message).await
+        }
+        SendMechanism::Inbox if target_can_drain_inbox(store, session_id) => {
+            inbox::write_message(sessions_dir, session_id, message)?;
+            if let Err(e) = tmux::wake_idle_session(session_id).await {
+                tracing::warn!(
+                    "idle-wake nudge failed for {session_id} (message already delivered via inbox): {e}"
+                );
+            }
+            Ok(())
+        }
+        SendMechanism::Inbox | SendMechanism::Keystrokes => {
+            tmux::send_keys(session_id, message).await
+        }
     }
-    inbox::write_message(sessions_dir, session_id, message)?;
-    if let Err(e) = tmux::wake_idle_session(session_id).await {
-        tracing::warn!(
-            "idle-wake nudge failed for {session_id} (message already delivered via inbox): {e}"
+}
+
+/// The [`SendMechanism::SessionSocket`] path, with its two fallbacks.
+///
+/// The second one is the subtle one: `find_peer` reads a file, and the file
+/// outlives the process that wrote it, so `Some(peer)` is a claim about the
+/// registry rather than about anything listening. Connecting is the only
+/// real liveness test, which means the dead-socket case can only be
+/// discovered after we have already committed to this mechanism — hence
+/// falling back on the write failing rather than probing up front.
+///
+/// Takes the lookup result rather than performing it so the delivery
+/// behavior can be tested against a real socket without redirecting the
+/// process-global registry path; [`session_socket::find_peer_in`] covers
+/// the lookup itself.
+async fn deliver_via_session_socket(
+    peer:       Option<session_socket::PeerSession>,
+    session_id: &str,
+    message:    &str,
+) -> Result<()> {
+    let Some(peer) = peer else {
+        tracing::debug!(
+            "{session_id} advertises no Claude Code messaging socket; sending as keystrokes"
         );
+        return tmux::send_keys(session_id, message).await;
+    };
+    match session_socket::send(&peer, message).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                "session socket for {session_id} (pid {}) did not accept the message, \
+                 falling back to keystrokes: {e}",
+                peer.pid
+            );
+            tmux::send_keys(session_id, message).await
+        }
     }
-    Ok(())
 }
 
 /// Whether `session_id`'s recorded workspace can actually drain a
@@ -268,7 +316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbox_enabled_writes_the_message_when_target_can_drain() {
+    async fn the_inbox_mechanism_writes_the_message_when_target_can_drain() {
         let store = Store::open(tempdir().unwrap().keep().join("t.db")).unwrap();
         let ws = tempdir().unwrap().keep();
         write_installed_hooks(&ws);
@@ -278,7 +326,9 @@ mod tests {
         // No real tmux session named this exists — the best-effort idle-wake
         // nudge must degrade to a no-op rather than surfacing as an error,
         // since the message is already durably written by this point.
-        deliver_message(&store, sessions_dir.path(), "worker-1", "hello worker", true).await.unwrap();
+        deliver_message(&store, sessions_dir.path(), "worker-1", "hello worker", SendMechanism::Inbox)
+            .await
+            .unwrap();
 
         let pending = inbox::read_pending_messages(sessions_dir.path(), "worker-1").unwrap();
         assert_eq!(pending.len(), 1);
@@ -288,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn falls_back_to_keystrokes_when_target_cannot_drain_an_inbox() {
         // Regression test for the orchestrator-target silent-loss gap:
-        // toggle on, but the target (here: no recorded session at all,
+        // inbox selected, but the target (here: no recorded session at all,
         // the same shape as an orchestrator/unknown target) has nowhere to
         // drain a written inbox message. The message must NOT be written
         // to the inbox — falling back to send_keys, which then errors
@@ -297,7 +347,8 @@ mod tests {
         let store = Store::open(tempdir().unwrap().keep().join("t.db")).unwrap();
         let sessions_dir = tempdir().unwrap();
 
-        let result = deliver_message(&store, sessions_dir.path(), "orch-1", "hello", true).await;
+        let result =
+            deliver_message(&store, sessions_dir.path(), "orch-1", "hello", SendMechanism::Inbox).await;
 
         assert!(result.is_err(), "must fall back to (and surface failures from) send_keys");
         assert!(
@@ -307,7 +358,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbox_disabled_never_touches_the_inbox() {
+    async fn the_keystrokes_mechanism_never_touches_the_inbox() {
         let store = Store::open(tempdir().unwrap().keep().join("t.db")).unwrap();
         let ws = tempdir().unwrap().keep();
         write_installed_hooks(&ws);
@@ -315,11 +366,62 @@ mod tests {
         let sessions_dir = tempdir().unwrap();
 
         // send_keys against a nonexistent tmux session errors —
-        // deliver_message must propagate that, not swallow it, when the
-        // toggle is off, even though this target COULD drain an inbox.
-        let result = deliver_message(&store, sessions_dir.path(), "worker-1", "hello", false).await;
+        // deliver_message must propagate that, not swallow it, when
+        // keystrokes are selected, even though this target COULD drain an
+        // inbox.
+        let result =
+            deliver_message(&store, sessions_dir.path(), "worker-1", "hello", SendMechanism::Keystrokes).await;
         assert!(result.is_err());
         assert!(inbox::read_pending_messages(sessions_dir.path(), "worker-1").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_session_socket_mechanism_delivers_to_a_listening_peer() {
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("peer.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let accept = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut received).await.unwrap();
+            received
+        });
+
+        let peer = session_socket::PeerSession { pid: 1, socket_path, started_at: 0 };
+        deliver_via_session_socket(Some(peer), "worker-1", "hello worker").await.unwrap();
+
+        let frame: serde_json::Value =
+            serde_json::from_slice(String::from_utf8(accept.await.unwrap()).unwrap().trim_end().as_bytes())
+                .unwrap();
+        assert_eq!(frame["message"]["content"], "hello worker");
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_keystrokes_when_no_peer_advertises_a_socket() {
+        // A non-Claude harness, or a Claude Code build/configuration without
+        // cross-session messaging. send_keys erroring against a nonexistent
+        // tmux session is what proves the fallback ran.
+        assert!(
+            deliver_via_session_socket(None, "worker-1", "hello").await.is_err(),
+            "must fall back to (and surface failures from) send_keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_keystrokes_when_the_advertised_socket_is_dead() {
+        // The registry record outlived the process that wrote it. Nothing is
+        // listening, so the message would vanish if we treated "a peer was
+        // found" as "a peer will receive it".
+        let dir = tempdir().unwrap();
+        let peer = session_socket::PeerSession {
+            pid:         1,
+            socket_path: dir.path().join("stale.sock"),
+            started_at:  0,
+        };
+        assert!(
+            deliver_via_session_socket(Some(peer), "worker-1", "hello").await.is_err(),
+            "a dead socket must fall back to send_keys, not swallow the message"
+        );
     }
 
     #[test]

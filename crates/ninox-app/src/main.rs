@@ -12,7 +12,7 @@ use spawn_util::{
 };
 use ninox_core::{
     capabilities::Audience,
-    config::AppConfig,
+    config::{AppConfig, SendMechanism},
     events::Engine,
     github::resolve_token,
     lifecycle::{poller::Poller, repo_discovery},
@@ -140,7 +140,7 @@ enum Command {
     /// hook (see `.claude/settings.json`), not intended for direct use.
     Statusline,
     /// File-based inbox drain hooks (installed in a worker's worktree
-    /// settings only when `[inbox_messaging].enabled = true` — see
+    /// settings only when `[messaging].mechanism = "inbox"` — see
     /// `ninox_core::inbox`). Invoked by Claude Code's own Stop/
     /// UserPromptSubmit hooks, not intended for direct use.
     Inbox {
@@ -465,7 +465,7 @@ async fn main() -> anyhow::Result<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(AppConfig::sessions_dir);
             ninox_core::messaging::deliver_message(
-                &store, &sessions_dir, &session_id, &message, config.inbox_messaging.enabled,
+                &store, &sessions_dir, &session_id, &message, config.send_mechanism(),
             )
             .await
         }
@@ -875,7 +875,7 @@ async fn run_spawn(
         &incarnation.incarnation_id,
         repositories_root.as_deref(),
         &config.resolved_worktree_root(),
-        config.inbox_messaging.enabled,
+        config.send_mechanism() == SendMechanism::Inbox,
     )
     .await
     {
@@ -1380,6 +1380,12 @@ fn worker_env_vars<'a>(
         (spawn_util::EXECUTION_ROLE_ENV, spawn_util::WORKER_EXECUTION_ROLE),
         ("NINOX_CALLER_TYPE", "worker"),
         ("NINOX_DATA_DIR", sessions_dir),
+        // Same reasoning as the app spawn path — see
+        // `ninox_core::session_socket::CLAUDE_MESSAGING_GATE_ENV`. Workers
+        // are the usual target of orchestrator messages, so a worker that
+        // came up without a socket is exactly the case that would quietly
+        // never use the configured mechanism.
+        (ninox_core::session_socket::CLAUDE_MESSAGING_GATE_ENV, "1"),
     ];
     if !orch_id.is_empty() {
         env_vec.push(("NINOX_ORCHESTRATOR_ID", orch_id));
@@ -1988,7 +1994,7 @@ async fn run_spawn_orchestrator(
         eprintln!("warning: {id} is still starting up — sending the brief anyway");
     }
     if let Err(e) = ninox_core::messaging::deliver_message(
-        &store, &sessions_dir, &id, &message, config.inbox_messaging.enabled,
+        &store, &sessions_dir, &id, &message, config.send_mechanism(),
     ).await {
         eprintln!(
             "warning: could not deliver the initial brief to {id}: {e}\n\
@@ -2017,6 +2023,12 @@ fn orchestrator_env_vars<'a>(
         ("NINOX_DATA_DIR",        sessions_dir),
         ("NINOX_ORCHESTRATOR_ID", session_id),
         ("NINOX_CALLER_TYPE",     "orchestrator"),
+        // A CLI-spawned orchestrator is messaged the same way any other
+        // session is — its initial brief goes out through `deliver_message`
+        // a few lines after it starts — so it needs the messaging gate on
+        // for the same reason the other two spawn paths do. See
+        // `ninox_core::session_socket::CLAUDE_MESSAGING_GATE_ENV`.
+        (ninox_core::session_socket::CLAUDE_MESSAGING_GATE_ENV, "1"),
     ]
 }
 
@@ -3210,6 +3222,11 @@ mod worker_env_tests {
         )));
         assert!(env.contains(&("NINOX_CALLER_TYPE", "worker")));
         assert!(env.contains(&("NINOX_DATA_DIR", "/data")));
+        // Workers are the usual target of orchestrator messages; without
+        // this they come up with no messaging socket and the configured
+        // send mechanism silently degrades. See
+        // `ninox_core::session_socket::CLAUDE_MESSAGING_GATE_ENV`.
+        assert!(env.contains(&(ninox_core::session_socket::CLAUDE_MESSAGING_GATE_ENV, "1")));
         // The legacy ATHENE_* transition names are gone.
         assert!(!env.iter().any(|(k, _)| k.starts_with("ATHENE_")));
     }
@@ -3698,6 +3715,10 @@ mod orchestrator_cli_tests {
         assert!(env.contains(&("NINOX_BRAIN", "/brain")));
         assert!(env.contains(&("NINOX_CONFIG", "/cfg.toml")));
         assert!(env.contains(&("NINOX_BIN", "/bin/ninox")));
+        // Its initial brief is delivered through `deliver_message`, so it
+        // needs a messaging socket like every other spawned session — see
+        // `ninox_core::session_socket::CLAUDE_MESSAGING_GATE_ENV`.
+        assert!(env.contains(&(ninox_core::session_socket::CLAUDE_MESSAGING_GATE_ENV, "1")));
     }
 
     #[test]

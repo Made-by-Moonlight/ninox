@@ -588,29 +588,25 @@ impl Engine {
 
     /// Send a text message to a session (used by poller reactions).
     ///
-    /// Gated by `AppConfig.inbox_messaging.enabled` (opt-in, default off —
-    /// see `crate::messaging::deliver_message`):
-    /// - off: unchanged — the message is injected as keyboard input, verified
-    ///   via `tmux::send_keys` (delivery-verified + Enter-retried, PR #69).
-    ///   Errors if the session has no active tmux window, tmux is
-    ///   unavailable, or the message is still sitting unsubmitted at the
-    ///   input prompt after the Enter retries.
-    /// - on: the message is written durably to the session's file-based
-    ///   inbox and a best-effort idle-wake nudge is sent; errors only if the
-    ///   inbox write itself fails.
+    /// Delivered by the configured `AppConfig::send_mechanism()` — see
+    /// `crate::messaging::deliver_message` for each mechanism and what it
+    /// falls back to. Errors surface only when the chosen mechanism AND its
+    /// keystroke fallback both fail: no active tmux window, tmux
+    /// unavailable, or the message still sitting unsubmitted at the input
+    /// prompt after the Enter retries.
     pub async fn send_to_session(&self, session_id: &str, message: &str) -> anyhow::Result<()> {
         // `AppConfig::load()` is a small synchronous TOML read; called
         // directly (not via `spawn_blocking`) here matches the existing
         // convention elsewhere in this codebase (e.g. `main.rs::run_spawn`).
-        let inbox_enabled = crate::config::AppConfig::load()
-            .map(|c| c.inbox_messaging.enabled)
-            .unwrap_or(false);
+        let mechanism = crate::config::AppConfig::load()
+            .map(|c| c.send_mechanism())
+            .unwrap_or_default();
         // No `NINOX_DATA_DIR` fallback needed here (unlike the `ninox send`
         // CLI / `run_request_work`): this runs inside the app's own
         // process, which never has that env var set — only sessions the
         // app spawns do.
         crate::messaging::deliver_message(
-            &self.store, &crate::config::AppConfig::sessions_dir(), session_id, message, inbox_enabled,
+            &self.store, &crate::config::AppConfig::sessions_dir(), session_id, message, mechanism,
         )
         .await
     }

@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use ninox_core::{
-    events::Engine, pty, tmux, Event, PooledCheckoutLease, PooledCheckoutState, Session,
-    SessionFields, SessionStatus, Store,
+    events::Engine, pty, session_socket::CLAUDE_MESSAGING_GATE_ENV, tmux, Event,
+    PooledCheckoutLease, PooledCheckoutState, Session, SessionFields, SessionStatus, Store,
 };
 
 pub const EXECUTION_ROLE_ENV: &str = "NINOX_EXECUTION_ROLE";
@@ -279,6 +279,17 @@ fn interactive_env_vars<'a>(
         ("NINOX_BRAIN",    catalogue_path),
         ("NINOX_SESSION",  session_id),
         ("NINOX_DATA_DIR", sessions_dir),
+        // Claude Code gates its cross-session messaging socket behind a
+        // remote flag that defaults to OFF, and a session started without
+        // it advertises no socket at all. Since that socket is what
+        // `SendMechanism::SessionSocket` delivers over, leaving the gate to
+        // chance means the configured mechanism silently degrades to
+        // keystrokes on any machine the flag has not reached — working, but
+        // never actually the mechanism that was chosen. This env var is the
+        // gate's own first branch, so setting it makes the behaviour of a
+        // ninox-spawned session deterministic instead of dependent on
+        // someone else's rollout.
+        (CLAUDE_MESSAGING_GATE_ENV, "1"),
     ];
     for (k, v) in extra_env {
         env.push((k.as_str(), v.as_str()));
@@ -944,7 +955,9 @@ pub async fn stop_exact_worker_runtime(
 /// running it directly on the calling task would tie up a runtime worker
 /// thread for that whole checkout.
 ///
-/// `inbox_enabled` is the caller's `AppConfig.inbox_messaging.enabled` —
+/// `inbox_enabled` is whether the caller's configured send mechanism is
+/// `SendMechanism::Inbox` (`AppConfig::send_mechanism()`), which is the only
+/// one whose delivery depends on drain hooks existing in the worktree —
 /// threaded through explicitly (rather than read here via
 /// `AppConfig::load()`) so callers control it and tests can exercise both
 /// states without touching the real user config file. See
@@ -1004,7 +1017,7 @@ pub async fn ensure_session_workspace(
         return Ok(());
     }
     if std::path::Path::new(workspace).is_dir() {
-        ensure_statusline_settings(std::path::Path::new(workspace), config.inbox_messaging.enabled);
+        ensure_statusline_settings(std::path::Path::new(workspace), config.send_mechanism() == ninox_core::config::SendMechanism::Inbox);
         seed_worker_skills(workspace, config).await;
         return Ok(());
     }
@@ -1013,7 +1026,7 @@ pub async fn ensure_session_workspace(
         session_id,
     )? {
         managed.add_checkout()?;
-        ensure_statusline_settings(&managed.worktree_path, config.inbox_messaging.enabled);
+        ensure_statusline_settings(&managed.worktree_path, config.send_mechanism() == ninox_core::config::SendMechanism::Inbox);
         if let Err(error) = managed.persist() {
             let _ = managed.remove_checkout_if_matches_with_metadata(false);
             return Err(error);
@@ -1035,7 +1048,7 @@ pub async fn ensure_session_workspace(
         std::path::Path::new(repo_root),
         std::path::Path::new(workspace),
         session_id,
-        config.inbox_messaging.enabled,
+        config.send_mechanism() == ninox_core::config::SendMechanism::Inbox,
     )?;
     seed_worker_skills(workspace, config).await;
     Ok(())
@@ -1098,7 +1111,7 @@ pub async fn ensure_session_workspace_with_store(
                 "pooled checkout {} no longer matches its Ninox identity",
                 record.path.display()
             );
-            ensure_statusline_settings(&record.path, config.inbox_messaging.enabled);
+            ensure_statusline_settings(&record.path, config.send_mechanism() == ninox_core::config::SendMechanism::Inbox);
             seed_worker_skills(workspace, config).await;
             return Ok(());
         }
@@ -2350,6 +2363,19 @@ mod tests {
         // The legacy ATHENE_* transition names are gone.
         assert!(!env.iter().any(|(k, _)| k.starts_with("ATHENE_")));
         assert!(env.contains(&("NINOX_ORCHESTRATOR_ID", "orch-1")));
+    }
+
+    /// The session-socket mechanism is only reachable if the spawned session
+    /// binds a socket, and that is gated behind a remote flag defaulting to
+    /// off. Without this the default mechanism degrades to keystrokes on any
+    /// machine the flag has not reached — silently, since delivery still
+    /// works. See `ninox_core::session_socket::CLAUDE_MESSAGING_GATE_ENV`.
+    #[test]
+    fn interactive_env_vars_forces_the_cross_session_messaging_gate_on() {
+        let env = interactive_env_vars(
+            "/usr/local/bin/ninox", "/cfg/config.toml", "/brain", "sess-1", "/data/sessions", &[],
+        );
+        assert!(env.contains(&(CLAUDE_MESSAGING_GATE_ENV, "1")));
     }
 
     #[tokio::test]
