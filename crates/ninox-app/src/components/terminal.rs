@@ -23,6 +23,8 @@ pub const TERM_FONT: iced::Font = iced::Font {
     style:   iced::font::Style::Normal,
 };
 
+const CONTEXTUAL_FONT_ANCHOR: char = '\u{feff}';
+
 fn term_font_has_glyph(character: char) -> bool {
     use std::sync::OnceLock;
     static FACE: OnceLock<ttf_parser::Face<'static>> = OnceLock::new();
@@ -83,10 +85,10 @@ fn draw_contextual_glyph(
     mut text: iced::widget::canvas::Text,
 ) {
     // Advanced shaping is reliable when the requested font is already
-    // established by an adjacent bundled glyph. U+200B is covered by
-    // JetBrains Mono but has no advance, so it anchors font selection without
+    // established by an adjacent bundled glyph. JetBrains Mono's U+FEFF glyph
+    // has no outline or advance, so it anchors font selection without
     // painting or shifting the terminal cell.
-    text.content = format!("\u{200b}{character}");
+    text.content = format!("{CONTEXTUAL_FONT_ANCHOR}{character}");
     text.shaping = iced::widget::text::Shaping::Advanced;
     frame.fill_text(text);
 }
@@ -1170,7 +1172,7 @@ mod tests {
 
     #[test]
     fn unicode_punctuation_uses_context_without_changing_fallback_policy() {
-        assert!(term_font_has_glyph('\u{200b}'));
+        assert!(term_font_has_glyph(CONTEXTUAL_FONT_ANCHOR));
         assert_eq!(glyph_rendering('\''), GlyphRendering::Basic);
         assert_eq!(glyph_rendering('\u{e0b0}'), GlyphRendering::Basic);
         for character in ['’', '“', '”', '→'] {
@@ -1185,6 +1187,41 @@ mod tests {
         use alacritty_terminal::index::{Column, Line};
         assert_eq!(state.term.grid()[Line(0)][Column(0)].c, '⠰');
         assert_eq!(state.term.grid()[Line(0)][Column(1)].c, '⠳');
+    }
+
+    #[test]
+    fn cold_font_system_keeps_contextual_glyph_at_cell_origin() {
+        use iced::advanced::graphics::text::cosmic_text;
+
+        let face = ttf_parser::Face::parse(TERM_FONT_BYTES, 0).unwrap();
+        let anchor = face.glyph_index(CONTEXTUAL_FONT_ANCHOR).unwrap();
+        assert_eq!(face.glyph_hor_advance(anchor), Some(0));
+        assert!(face.glyph_bounding_box(anchor).is_none());
+
+        let mut db = cosmic_text::fontdb::Database::new();
+        db.load_font_data(TERM_FONT_BYTES.to_vec());
+        let mut fonts = cosmic_text::FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let mut buffer =
+            cosmic_text::Buffer::new(&mut fonts, cosmic_text::Metrics::new(13.0, 18.0));
+        let content = format!("{CONTEXTUAL_FONT_ANCHOR}’");
+        buffer.set_text(
+            &mut fonts,
+            &content,
+            cosmic_text::Attrs::new()
+                .family(cosmic_text::Family::Name("JetBrains Mono")),
+            cosmic_text::Shaping::Advanced,
+        );
+
+        let visible = buffer
+            .layout_runs()
+            .next()
+            .unwrap()
+            .glyphs
+            .iter()
+            .find(|glyph| glyph.start >= CONTEXTUAL_FONT_ANCHOR.len_utf8())
+            .unwrap();
+        assert_eq!(visible.x, 0.0);
+        assert_ne!(visible.glyph_id, 0);
     }
 
     #[test]
