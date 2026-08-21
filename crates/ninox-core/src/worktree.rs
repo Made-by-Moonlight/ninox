@@ -11,6 +11,7 @@ const METADATA_SUFFIX: &str = ".ninox-worktree.json";
 pub struct RepositoryIdentity {
     pub top_level: PathBuf,
     pub common_git_dir: PathBuf,
+    pub git_dir: PathBuf,
 }
 
 impl RepositoryIdentity {
@@ -22,10 +23,20 @@ impl RepositoryIdentity {
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         )
         .context("resolve repository common git directory")?;
+        let git_dir = git_path(
+            workspace,
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+        )
+        .context("resolve checkout git directory")?;
         Ok(Self {
             top_level,
             common_git_dir,
+            git_dir,
         })
+    }
+
+    pub fn is_primary_checkout(&self) -> bool {
+        self.git_dir == self.common_git_dir
     }
 }
 
@@ -35,15 +46,16 @@ impl RepositoryIdentity {
 /// paths). Requiring the repository top-level to be an immediate child keeps
 /// similarly-prefixed, nested, and unrelated repositories out of the pool.
 pub fn is_pooling_eligible(
-    canonical_repository_top_level: &Path,
+    repository: &RepositoryIdentity,
     canonical_repositories_root: Option<&Path>,
 ) -> bool {
     let Some(repositories_root) = canonical_repositories_root else {
         return false;
     };
-    canonical_repository_top_level.is_absolute()
+    repository.is_primary_checkout()
+        && repository.top_level.is_absolute()
         && repositories_root.is_absolute()
-        && canonical_repository_top_level.parent() == Some(repositories_root)
+        && repository.top_level.starts_with(repositories_root)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +132,23 @@ impl PooledWorktree {
             .arg(&head)
             .output()
             .context("create pooled linked worktree")?;
-        ensure_git_success(output, "git worktree add")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::ensure!(
+                stderr.contains("already exists"),
+                "git worktree add: {}",
+                stderr.trim()
+            );
+            let existing = std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&lease.common_git_dir)
+                .args(["worktree", "add"])
+                .arg(&lease.path)
+                .arg(&lease.branch)
+                .output()
+                .context("create pooled linked worktree from existing branch")?;
+            ensure_git_success(existing, "git worktree add existing branch")?;
+        }
 
         let identity = RepositoryIdentity::resolve(&lease.path)?;
         anyhow::ensure!(
@@ -247,6 +275,22 @@ impl PooledWorktree {
             && marker.as_deref() == Some(self.worktree_identity.as_str()))
     }
 
+    pub fn lock_identity(&self) -> Result<std::fs::File> {
+        let marker = self.worktree_git_dir.join("ninox-identity");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&marker)
+            .with_context(|| format!("open pooled checkout identity {}", marker.display()))?;
+        file.lock()
+            .with_context(|| format!("lock pooled checkout identity {}", marker.display()))?;
+        anyhow::ensure!(
+            self.matches_identity()?,
+            "pooled checkout identity changed while acquiring release lock"
+        );
+        Ok(file)
+    }
+
     /// Switches an owned clean free slot to a fresh branch at source HEAD.
     /// No reset or clean is performed, so ignored caches remain in place.
     pub fn prepare_for_lease(lease: &PooledCheckoutLease) -> Result<Self> {
@@ -291,6 +335,43 @@ impl PooledWorktree {
         Ok(pooled)
     }
 
+    pub fn recover_quarantined_creation(record: &PooledCheckoutRecord) -> Result<Self> {
+        anyhow::ensure!(
+            matches!(record.state, crate::types::PooledCheckoutState::Quarantined),
+            "pooled checkout is not quarantined"
+        );
+        let branch = record
+            .branch
+            .as_deref()
+            .context("quarantined pooled checkout has no branch")?;
+        let identity = RepositoryIdentity::resolve(&record.path)?;
+        anyhow::ensure!(
+            identity.common_git_dir == record.common_git_dir
+                && identity.top_level == record.path,
+            "quarantined checkout does not match its registered repository/path"
+        );
+        let actual_branch =
+            git_text(&record.path, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        anyhow::ensure!(
+            actual_branch == branch,
+            "quarantined checkout branch is {actual_branch}, expected {branch}"
+        );
+        let worktree_git_dir = identity.git_dir;
+        let marker = worktree_git_dir.join("ninox-identity");
+        let worktree_identity = read_identity_marker(&marker)?
+            .map_or_else(
+                || recover_identity_marker_exclusively(&worktree_git_dir, &marker),
+                Ok,
+            )?;
+        Ok(Self {
+            source_repo: record.source_repo.clone(),
+            path: identity.top_level,
+            common_git_dir: identity.common_git_dir,
+            worktree_git_dir,
+            worktree_identity,
+        })
+    }
+
     /// Detaches a clean leased slot while retaining ignored files and the old
     /// branch. Dirty content is reported and never reset or deleted.
     pub fn release_clean(&self) -> Result<String> {
@@ -309,6 +390,59 @@ impl PooledWorktree {
             .context("detach pooled checkout")?;
         ensure_git_success(output, "git switch --detach")?;
         Ok(branch)
+    }
+
+    /// Release a finalized checkout only when its exact branch is clean and
+    /// every commit at its tip is represented by a remote-tracking ref.
+    pub fn release_recyclable(&self, expected_branch: &str) -> Result<String> {
+        anyhow::ensure!(
+            self.matches_identity()?,
+            "pooled checkout identity does not match registry"
+        );
+        ensure_clean(&self.path)?;
+        let symbolic = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.path)
+            .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .output()
+            .context("inspect pooled checkout branch")?;
+        let already_detached = !symbolic.status.success();
+        if already_detached {
+            let head = git_text(&self.path, &["rev-parse", "HEAD"])?;
+            let branch_head =
+                git_text(&self.path, &["rev-parse", &format!("refs/heads/{expected_branch}")])?;
+            anyhow::ensure!(
+                head == branch_head,
+                "detached pooled checkout no longer matches retained branch {expected_branch}"
+            );
+        } else {
+            let branch = String::from_utf8(symbolic.stdout)
+                .context("pooled checkout branch is not UTF-8")?
+                .trim()
+                .to_string();
+            anyhow::ensure!(
+                branch == expected_branch,
+                "pooled checkout branch is {branch}, expected {expected_branch}"
+            );
+        }
+        let containing = git_text(
+            &self.path,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "--contains=HEAD",
+                "refs/remotes",
+            ],
+        )?;
+        anyhow::ensure!(
+            !containing.trim().is_empty(),
+            "pooled checkout contains unpushed or remotely unreachable work"
+        );
+        if already_detached {
+            Ok(expected_branch.to_string())
+        } else {
+            self.release_clean()
+        }
     }
 
     pub fn ensure_clean(&self) -> Result<()> {
@@ -340,6 +474,61 @@ impl PooledWorktree {
             .context("detach pooled checkout")?;
         ensure_git_success(output, "git switch --detach")
     }
+}
+
+fn read_identity_marker(marker: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(marker) {
+        Ok(value) if value.is_empty() => Ok(None),
+        Ok(value) => {
+            uuid::Uuid::parse_str(&value)
+                .context("quarantined pooled worktree marker is not a UUID")?;
+            Ok(Some(value))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("read pooled worktree marker {}", marker.display())),
+    }
+}
+
+fn recover_identity_marker_exclusively(worktree_git_dir: &Path, marker: &Path) -> Result<String> {
+    let claim = worktree_git_dir.join("ninox-identity-recovery");
+    let claim_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&claim)?;
+    claim_file.lock()?;
+    let result = (|| {
+        if let Some(existing) = read_identity_marker(marker)? {
+            return Ok(existing);
+        }
+        if marker.try_exists()? {
+            std::fs::remove_file(marker)?;
+        }
+        let identity = uuid::Uuid::new_v4().to_string();
+        let temporary =
+            worktree_git_dir.join(format!(".ninox-identity-{}.tmp", uuid::Uuid::new_v4()));
+        let mut file =
+            std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        file.write_all(identity.as_bytes())?;
+        file.sync_all()?;
+        let published = match std::fs::hard_link(&temporary, marker) {
+            Ok(()) => identity,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                read_identity_marker(marker)?
+                    .context("concurrent marker winner published an empty identity")?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        std::fs::remove_file(temporary)?;
+        Ok(published)
+    })();
+    let unlock = claim_file.unlock();
+    result.and_then(|identity| {
+        unlock?;
+        Ok(identity)
+    })
 }
 
 impl ManagedWorktree {
@@ -393,6 +582,8 @@ impl ManagedWorktree {
             .branch
             .as_deref()
             .context("managed worktree metadata has no branch")?;
+        let head = git_text(&self.source_repo, &["rev-parse", "HEAD"])
+            .context("resolve authoritative worktree HEAD")?;
 
         let _ = std::process::Command::new("git")
             .arg("--git-dir")
@@ -406,6 +597,7 @@ impl ManagedWorktree {
             .args(["worktree", "add"])
             .arg(&self.worktree_path)
             .args(["-b", branch])
+            .arg(&head)
             .output()
             .context("git worktree add")?;
         let result = if out.status.success() {
@@ -773,13 +965,14 @@ mod tests {
             worktree_git_dir: identity.map(|pooled| pooled.worktree_git_dir.clone()),
             worktree_identity: identity.map(|pooled| pooled.worktree_identity.clone()),
             session_id: session_id.to_string(),
+            owner_incarnation_id: session_id.to_string(),
             lease_id: uuid::Uuid::new_v4().to_string(),
             branch: branch.to_string(),
         }
     }
 
     #[test]
-    fn pooling_eligibility_requires_repository_directly_below_configured_root() {
+    fn pooling_eligibility_uses_component_containment_and_primary_checkout_identity() {
         let repositories_root = tempdir().unwrap();
         let direct = repositories_root.path().join("direct");
         let nested = repositories_root.path().join("group/nested");
@@ -793,10 +986,32 @@ mod tests {
         let nested = nested.canonicalize().unwrap();
         let outside = outside.canonicalize().unwrap();
 
-        assert!(is_pooling_eligible(&direct, Some(&repositories_root)));
-        assert!(!is_pooling_eligible(&nested, Some(&repositories_root)));
-        assert!(!is_pooling_eligible(&outside, Some(&repositories_root)));
-        assert!(!is_pooling_eligible(&direct, None));
+        let identity = |top_level: PathBuf, linked: bool| RepositoryIdentity {
+            common_git_dir: top_level.join(".git"),
+            git_dir: if linked {
+                top_level.join(".git/worktrees/linked")
+            } else {
+                top_level.join(".git")
+            },
+            top_level,
+        };
+        assert!(is_pooling_eligible(
+            &identity(direct.clone(), false),
+            Some(&repositories_root)
+        ));
+        assert!(is_pooling_eligible(
+            &identity(nested, false),
+            Some(&repositories_root)
+        ));
+        assert!(!is_pooling_eligible(
+            &identity(outside, false),
+            Some(&repositories_root)
+        ));
+        assert!(!is_pooling_eligible(
+            &identity(direct.clone(), true),
+            Some(&repositories_root)
+        ));
+        assert!(!is_pooling_eligible(&identity(direct, false), None));
     }
 
     #[test]
@@ -994,6 +1209,53 @@ mod tests {
     }
 
     #[test]
+    fn managed_worktree_starts_at_supplied_linked_worktree_head() {
+        let repo = init_git_repo();
+        let linked = repo.with_extension("authoritative-linked");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "-q", "-b", "authoritative"])
+            .arg(&linked)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(linked.join("authoritative.txt"), "linked\n").unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&linked)
+            .args(["add", "authoritative.txt"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&linked)
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "authoritative",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let authoritative_head = git_text(&linked, &["rev-parse", "HEAD"]).unwrap();
+        assert_ne!(authoritative_head, git_text(&repo, &["rev-parse", "HEAD"]).unwrap());
+
+        let target = repo.with_extension("authoritative-managed");
+        let mut managed =
+            ManagedWorktree::new_at(&linked, &target, "managed-authoritative", "managed").unwrap();
+        managed.add_checkout().unwrap();
+
+        assert_eq!(git_text(&target, &["rev-parse", "HEAD"]).unwrap(), authoritative_head);
+    }
+
+    #[test]
     fn pooled_worktree_identity_rejects_replaced_marker() {
         let repo = init_git_repo();
         let target = repo.with_extension("pooled-identity");
@@ -1024,6 +1286,55 @@ mod tests {
         assert_eq!(
             git_text(&target, &["branch", "--show-current"]).unwrap(),
             "dirty-session",
+        );
+    }
+
+    #[test]
+    fn recyclable_release_refuses_unpushed_or_wrong_branch_without_detaching() {
+        let repo = init_git_repo();
+        let target = repo.with_extension("pooled-unreachable");
+        let lease = pooled_lease(&repo, &target, "release-session", "release-session", None);
+        let pooled = PooledWorktree::create(&lease).unwrap();
+
+        let error = pooled
+            .release_recyclable("release-session")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unpushed or remotely unreachable"));
+        assert_eq!(
+            git_text(&target, &["branch", "--show-current"]).unwrap(),
+            "release-session"
+        );
+        assert!(pooled.release_recyclable("other-branch").is_err());
+    }
+
+    #[test]
+    fn recyclable_release_preserves_branch_ref_and_detaches_reachable_tip() {
+        let repo = init_git_repo();
+        let target = repo.with_extension("pooled-reachable");
+        let lease = pooled_lease(&repo, &target, "release-session", "release-session", None);
+        let pooled = PooledWorktree::create(&lease).unwrap();
+        let head = git_text(&target, &["rev-parse", "HEAD"]).unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&target)
+            .args(["update-ref", "refs/remotes/origin/release-session", &head])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        assert_eq!(
+            pooled.release_recyclable("release-session").unwrap(),
+            "release-session"
+        );
+        assert_eq!(
+            git_text(&repo, &["rev-parse", "refs/heads/release-session"]).unwrap(),
+            head
+        );
+        assert!(git_text(&target, &["branch", "--show-current"]).unwrap().is_empty());
+        assert_eq!(
+            pooled.release_recyclable("release-session").unwrap(),
+            "release-session"
         );
     }
 

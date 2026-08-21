@@ -24,6 +24,7 @@ pub struct PooledCheckoutRecord {
     pub worktree_identity: Option<String>,
     pub state: PooledCheckoutState,
     pub session_id: Option<SessionId>,
+    pub owner_incarnation_id: Option<String>,
     pub lease_id: Option<String>,
     pub branch: Option<String>,
     pub quarantine_reason: Option<String>,
@@ -42,8 +43,33 @@ pub struct PooledCheckoutLease {
     pub worktree_git_dir: Option<std::path::PathBuf>,
     pub worktree_identity: Option<String>,
     pub session_id: SessionId,
+    pub owner_incarnation_id: String,
     pub lease_id: String,
     pub branch: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerIncarnationState {
+    Allocating,
+    Active,
+    Retained,
+    CleanupClaimed,
+    ReleaseClaimed,
+    Released,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerIncarnation {
+    pub session_id: SessionId,
+    pub incarnation_id: String,
+    pub orchestrator_id: Option<OrchestratorId>,
+    pub started_at: i64,
+    pub source_workspace: String,
+    pub workspace_path: String,
+    pub lease_id: Option<String>,
+    pub checkout_backed: bool,
+    pub state: WorkerIncarnationState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -59,6 +85,12 @@ pub enum SessionStatus {
     /// silently: only the startup reconciliation in `app.rs` assigns it,
     /// and only a user-triggered Resume action clears it.
     Interrupted,
+}
+
+impl SessionStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done | Self::Terminated | Self::Interrupted)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

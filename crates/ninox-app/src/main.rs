@@ -6,8 +6,10 @@ mod spawn_util;
 mod style;
 mod theme;
 
+use anyhow::Context as _;
 use spawn_util::{
-    acquire_worker_checkout, repo_from_workspace, rollback_worker_checkout, seed_worker_brain_skill,
+    acquire_worker_checkout_for_incarnation, repo_from_workspace, rollback_worker_checkout,
+    seed_worker_brain_skill,
 };
 use ninox_core::{
     config::AppConfig,
@@ -58,6 +60,14 @@ enum Command {
         #[arg(long, short)]
         name: Option<String>,
         /// Orchestrator session ID (read from NINOX_ORCHESTRATOR_ID if not supplied)
+        #[arg(long)]
+        orchestrator_id: Option<String>,
+    },
+    /// Release a finalized clean worker checkout for warm reuse.
+    Release {
+        /// Retained worker session ID.
+        session_id: String,
+        /// Owning orchestrator (read from NINOX_ORCHESTRATOR_ID if omitted).
         #[arg(long)]
         orchestrator_id: Option<String>,
     },
@@ -248,6 +258,9 @@ async fn main() -> anyhow::Result<()> {
             let config = AppConfig::load().unwrap_or_default();
             run_spawn(store, config, prompt, workspace, delivery, name, orchestrator_id).await
         }
+        Some(Command::Release { session_id, orchestrator_id }) => {
+            run_release(store, &session_id, orchestrator_id).await
+        }
         Some(Command::Send { session_id, message }) => {
             let config = AppConfig::load().unwrap_or_default();
             let sessions_dir = std::env::var("NINOX_DATA_DIR")
@@ -287,6 +300,7 @@ async fn run_spawn(
     name: Option<String>,
     orchestrator_id: Option<String>,
 ) -> anyhow::Result<()> {
+    reject_recursive_worker_spawn(std::env::var("NINOX_CALLER_TYPE").ok().as_deref())?;
     let agent = config.worker.clone();
     // Refuse worker-incapable harnesses BEFORE any side effect (worktree
     // creation, session upsert) — bailing after the upsert would leave a
@@ -324,6 +338,27 @@ async fn run_spawn(
         store.get_session(&id)?.is_none(),
         "a session named {id} already exists — pick another name"
     );
+    let checkout_backed =
+        ninox_core::worktree::RepositoryIdentity::resolve(std::path::Path::new(&workspace)).is_ok();
+    let checkout_cap = config.validated_worker_checkout_cap()?;
+    let incarnation = match store.prepare_worker_incarnation(
+        &id,
+        orchestrator_id.as_deref(),
+        ts,
+        &workspace,
+        checkout_backed,
+        checkout_cap,
+    ) {
+        Ok(incarnation) => incarnation,
+        Err(error) if error.to_string().contains("worker cap reached") => {
+            let candidates = store.checkout_worker_candidates(orchestrator_id.as_deref())?;
+            anyhow::bail!(
+                "{error}. {}",
+                release_candidate_guidance(orchestrator_id.as_deref(), &candidates)
+            )
+        }
+        Err(error) => return Err(error),
+    };
     let mut pending = Session {
         id: id.clone(),
         orchestrator_id: orchestrator_id.clone(),
@@ -348,42 +383,81 @@ async fn run_spawn(
         terminal_at: None,
         gate_status: None,
     };
-    store.upsert_session(&pending)?;
-
-    let checkout = if delivery == WorkerDelivery::Pr {
-        let repositories_root = config.resolved_repositories_root();
-        match acquire_worker_checkout(
+    if let Err(error) = store.upsert_session(&pending) {
+        rollback_worker_incarnation(
             store.clone(),
-            &workspace,
             &id,
-            repositories_root.as_deref(),
-            &config.resolved_worktree_root(),
-            config.inbox_messaging.enabled,
+            &incarnation.incarnation_id,
+            None,
         )
-        .await
-        {
-            Ok(checkout) => Some(checkout),
-            Err(error) => {
-                pending.status = SessionStatus::Terminated;
-                pending.workspace_path = Some(workspace.clone());
-                let _ = store.upsert_session(&pending);
-                return Err(error);
-            }
+        .await;
+        return Err(error);
+    }
+
+    let repositories_root = config.resolved_repositories_root();
+    let checkout = match acquire_worker_checkout_for_incarnation(
+        store.clone(),
+        &workspace,
+        &id,
+        &incarnation.incarnation_id,
+        repositories_root.as_deref(),
+        &config.resolved_worktree_root(),
+        config.inbox_messaging.enabled,
+    )
+    .await
+    {
+        Ok(checkout) => Some(checkout),
+        Err(error) => {
+            pending.status = SessionStatus::Terminated;
+            pending.workspace_path = Some(workspace.clone());
+            let _ = store.upsert_session(&pending);
+            rollback_worker_incarnation(
+                store.clone(),
+                &id,
+                &incarnation.incarnation_id,
+                None,
+            )
+            .await;
+            return Err(error);
         }
-    } else if std::path::Path::new(&workspace).is_dir() {
-        None
-    } else {
-        pending.status = SessionStatus::Terminated;
-        let _ = store.upsert_session(&pending);
-        return Err(anyhow::anyhow!(
-            "workspace does not exist or is not a directory: {workspace}"
-        ));
     };
     let effective_workspace = checkout
         .as_ref()
         .map_or_else(|| workspace.clone(), |checkout| checkout.workspace.clone());
+    let canonical_source_workspace = checkout
+        .as_ref()
+        .map_or_else(|| workspace.clone(), |checkout| checkout.source_workspace.clone());
     pending.workspace_path = Some(effective_workspace.clone());
-    store.upsert_session(&pending)?;
+    if let Err(error) = store.upsert_session(&pending) {
+        rollback_worker_incarnation(
+            store.clone(),
+            &id,
+            &incarnation.incarnation_id,
+            checkout.as_ref(),
+        )
+        .await;
+        return Err(error);
+    }
+    if !store.bind_worker_incarnation(
+            &id,
+            &incarnation.incarnation_id,
+            &canonical_source_workspace,
+            &effective_workspace,
+            checkout
+                .as_ref()
+                .and_then(|checkout| checkout.pooled_lease.as_ref())
+                .map(|lease| lease.lease_id.as_str()),
+        )?
+    {
+        rollback_worker_incarnation(
+            store.clone(),
+            &id,
+            &incarnation.incarnation_id,
+            checkout.as_ref(),
+        )
+        .await;
+        anyhow::bail!("worker incarnation changed before checkout binding");
+    }
 
     if let Err(e) = seed_worker_brain_skill(&effective_workspace).await {
         tracing::warn!("failed to seed brain skill for {id}: {e}");
@@ -404,8 +478,13 @@ async fn run_spawn(
 
     // Append worker context so every agent knows its session ID, delivery
     // contract, orchestrator ID, and how to communicate back when done.
-    let mut effective_prompt =
-        worker_prompt_for_workspace(&prompt, &workspace, &effective_workspace, delivery);
+    let mut effective_prompt = worker_prompt_for_canonical_workspace(
+        &prompt,
+        &workspace,
+        &canonical_source_workspace,
+        &effective_workspace,
+        delivery,
+    );
     if !orch_id_env.is_empty() {
         effective_prompt.push_str(&worker_context_footer(&id, &orch_id_env, delivery));
     }
@@ -437,7 +516,16 @@ async fn run_spawn(
         terminal_at: None, gate_status: None,
     };
 
-    store.upsert_session(&session)?;
+    if let Err(error) = store.upsert_session(&session) {
+        rollback_worker_incarnation(
+            store.clone(),
+            &id,
+            &incarnation.incarnation_id,
+            checkout.as_ref(),
+        )
+        .await;
+        return Err(error);
+    }
     println!("spawned {}", session.id);
 
     // Prepend the ninox bin dir inside the shell command rather than via tmux
@@ -480,9 +568,13 @@ async fn run_spawn(
     // invisible to poll_pids and would linger until the next app restart's
     // reconciliation.
     if let Err(e) = tmux::create_session(&id, &effective_workspace, &cmd, &env_vec).await {
-        if let Some(checkout) = &checkout {
-            let _ = rollback_worker_checkout(store.clone(), checkout, &id).await;
-        }
+        rollback_worker_incarnation(
+            store.clone(),
+            &id,
+            &incarnation.incarnation_id,
+            checkout.as_ref(),
+        )
+        .await;
         if let Ok(Some(mut s)) = store.get_session(&id) {
             s.status = SessionStatus::Terminated;
             s.workspace_path = Some(workspace.clone());
@@ -492,6 +584,75 @@ async fn run_spawn(
     }
 
     Ok(())
+}
+
+async fn rollback_worker_incarnation(
+    store: Arc<Store>,
+    session_id: &str,
+    incarnation_id: &str,
+    checkout: Option<&spawn_util::WorkerCheckout>,
+) {
+    if let Ok(Some(claim)) = store.claim_worker_cleanup(session_id, incarnation_id) {
+        if let Some(checkout) = checkout {
+            let _ = rollback_worker_checkout(store.clone(), checkout, session_id).await;
+        }
+        let _ = store.complete_worker_claim(
+            session_id,
+            &claim.incarnation_id,
+            ninox_core::types::WorkerIncarnationState::CleanupClaimed,
+        );
+    }
+}
+
+fn reject_recursive_worker_spawn(caller_type: Option<&str>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        caller_type != Some("worker"),
+        "worker sessions cannot recursively spawn workers; return the request to the orchestrator"
+    );
+    Ok(())
+}
+
+fn release_candidate_guidance(
+    orchestrator_id: Option<&str>,
+    candidates: &[ninox_core::types::WorkerIncarnation],
+) -> String {
+    if candidates.is_empty() {
+        return "no finalized clean recycle candidate exists; finish or explicitly remove an existing worker"
+            .to_string();
+    }
+    let scope = orchestrator_id
+        .map(|id| format!(" --orchestrator-id {id}"))
+        .unwrap_or_default();
+    let candidates = candidates
+        .iter()
+        .map(|worker| {
+            if worker.orchestrator_id.as_deref() != orchestrator_id {
+                return format!(
+                    "{} is owned by {} and {:?} at {}",
+                    worker.session_id,
+                    worker.orchestrator_id.as_deref().unwrap_or("a standalone caller"),
+                    worker.state,
+                    worker.workspace_path,
+                );
+            }
+            if matches!(
+                worker.state,
+                ninox_core::types::WorkerIncarnationState::Retained
+            ) {
+                format!(
+                    "`ninox release {}{scope}` ({})",
+                    worker.session_id, worker.workspace_path
+                )
+            } else {
+                format!(
+                    "{} is {:?} at {} (finish it or `ninox reap {} --force{scope}`)",
+                    worker.session_id, worker.state, worker.workspace_path, worker.session_id
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("existing checkout-backed workers (recycle one before retrying): {candidates}")
 }
 
 fn resolve_worker_delivery(
@@ -510,18 +671,44 @@ fn resolve_worker_delivery(
 
 /// Make the allocated workspace authoritative even when the source checkout's
 /// absolute path appears in the task prompt.
+#[cfg(test)]
 fn worker_prompt_for_workspace(
     prompt: &str,
     source_workspace: &str,
     worker_workspace: &str,
     delivery: WorkerDelivery,
 ) -> String {
-    let remapped = if source_workspace == worker_workspace {
-        prompt.to_string()
-    } else {
-        prompt.replace(source_workspace, worker_workspace)
-    };
-    let source_note = if source_workspace == worker_workspace {
+    let canonical_source = ninox_core::worktree::RepositoryIdentity::resolve(
+        std::path::Path::new(source_workspace),
+    )
+    .map(|identity| identity.top_level)
+    .or_else(|_| std::path::Path::new(source_workspace).canonicalize())
+    .ok()
+    .and_then(|path| path.to_str().map(str::to_string))
+    .unwrap_or_else(|| source_workspace.to_string());
+    worker_prompt_for_canonical_workspace(
+        prompt,
+        source_workspace,
+        &canonical_source,
+        worker_workspace,
+        delivery,
+    )
+}
+
+fn worker_prompt_for_canonical_workspace(
+    prompt: &str,
+    source_workspace: &str,
+    canonical_source: &str,
+    worker_workspace: &str,
+    delivery: WorkerDelivery,
+) -> String {
+    let remapped = remap_workspace_paths(
+        prompt,
+        workspace_path_mappings(source_workspace, canonical_source, worker_workspace),
+        worker_workspace,
+    )
+    .expect("workspace remapping must not retain source-checkout aliases");
+    let source_note = if canonical_source == worker_workspace {
         String::new()
     } else {
         " The original source checkout is repository context only; \
@@ -541,30 +728,349 @@ fn worker_prompt_for_workspace(
     )
 }
 
+fn workspace_path_mappings(
+    supplied_source_workspace: &str,
+    canonical_source_workspace: &str,
+    worker_workspace: &str,
+) -> Vec<(String, String)> {
+    let canonical_supplied = std::path::Path::new(supplied_source_workspace)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(supplied_source_workspace));
+    let canonical_root = std::path::Path::new(canonical_source_workspace)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(canonical_source_workspace));
+    let relative = canonical_supplied
+        .strip_prefix(&canonical_root)
+        .unwrap_or_else(|_| std::path::Path::new(""));
+    let supplied_target = std::path::Path::new(worker_workspace).join(relative);
+    let mut mappings = vec![
+        (
+            supplied_source_workspace.to_string(),
+            supplied_target.to_string_lossy().into_owned(),
+        ),
+        (
+            canonical_supplied.to_string_lossy().into_owned(),
+            supplied_target.to_string_lossy().into_owned(),
+        ),
+        (
+            canonical_source_workspace.to_string(),
+            worker_workspace.to_string(),
+        ),
+        (
+            canonical_root.to_string_lossy().into_owned(),
+            worker_workspace.to_string(),
+        ),
+    ];
+    mappings.retain(|(source, target)| !source.is_empty() && source != target);
+    mappings.sort_unstable_by_key(|(source, _)| std::cmp::Reverse(source.len()));
+    mappings.dedup_by(|left, right| left.0 == right.0);
+    mappings
+}
+
+fn remap_workspace_paths(
+    prompt: &str,
+    mappings: Vec<(String, String)>,
+    worker_workspace: &str,
+) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+
+    let mut mappings = mappings
+        .into_iter()
+        .map(|(source, target)| {
+            let source = normalize_absolute_path(std::path::Path::new(&source))
+                .context("normalize source workspace mapping")?;
+            let target = normalize_absolute_path(std::path::Path::new(&target))
+                .context("normalize worker workspace mapping")?;
+            Ok((source, target))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    mappings.sort_unstable_by_key(|(source, _)| {
+        std::cmp::Reverse(source.components().count())
+    });
+    let worker_root = normalize_absolute_path(std::path::Path::new(worker_workspace))
+        .context("normalize authoritative worker workspace")?;
+    let source_roots = mappings
+        .iter()
+        .map(|(source, _)| source.clone())
+        .collect::<Vec<_>>();
+    let mut output = String::with_capacity(prompt.len());
+    let mut cursor = 0;
+    while let Some((start, end)) = next_workspace_path_token(prompt, cursor) {
+        output.push_str(&prompt[cursor..start]);
+        let token = &prompt[start..end];
+        let (path_token, punctuation) = split_path_token_punctuation(token);
+        let (normalized, render_prefix, escaped_spaces, file_uri) =
+            normalize_prompt_path_token(prompt, start, path_token, &worker_root)
+                .with_context(|| format!("normalize workspace path token {token}"))?;
+        if let Some((source, target)) = mappings
+            .iter()
+            .find(|(source, _)| normalized.strip_prefix(source).is_ok())
+        {
+            let relative = normalized.strip_prefix(source)?;
+            let mapped = normalize_absolute_path(&target.join(relative))
+                .context("normalize remapped worker path")?;
+            anyhow::ensure!(
+                mapped.starts_with(&worker_root),
+                "workspace path remap escaped authoritative worker workspace"
+            );
+            output.push_str(render_prefix);
+            let mapped = mapped.to_string_lossy();
+            if file_uri {
+                output.push_str(&percent_encode_file_uri_path(&mapped));
+            } else if escaped_spaces {
+                output.push_str(&mapped.replace(' ', "\\ "));
+            } else {
+                output.push_str(&mapped);
+            }
+            output.push_str(punctuation);
+        } else {
+            output.push_str(token);
+        }
+        cursor = end;
+    }
+    output.push_str(&prompt[cursor..]);
+
+    let mut cursor = 0;
+    while let Some((start, end)) = next_workspace_path_token(&output, cursor) {
+        let token = &output[start..end];
+        let (path_token, _) = split_path_token_punctuation(token);
+        let (normalized, _, _, _) =
+            normalize_prompt_path_token(&output, start, path_token, &worker_root)
+                .with_context(|| format!("validate remapped workspace path token {token}"))?;
+        anyhow::ensure!(
+            !source_roots.iter().any(|source| {
+                source != &worker_root && normalized.starts_with(source)
+            }),
+            "prompt retains a normalized source-checkout path after remapping: {token}"
+        );
+        cursor = end;
+    }
+    Ok(output)
+}
+
+fn split_path_token_punctuation(token: &str) -> (&str, &str) {
+    if token.ends_with('.') && !token.ends_with("/.") && !token.ends_with("/..") {
+        (&token[..token.len() - 1], ".")
+    } else {
+        (token, "")
+    }
+}
+
+fn normalize_absolute_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Some(normalized)
+}
+
+fn normalize_prompt_path_token<'a>(
+    input: &'a str,
+    start: usize,
+    token: &str,
+    worker_root: &std::path::Path,
+) -> Option<(std::path::PathBuf, &'a str, bool, bool)> {
+    let file_scheme = input
+        .as_bytes()
+        .get(..start)?
+        .get(start.saturating_sub("file:".len())..)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"file:"));
+    let localhost = token
+        .as_bytes()
+        .get(.."//localhost".len())
+        .is_some_and(|authority| authority.eq_ignore_ascii_case(b"//localhost"))
+        && token.as_bytes().get("//localhost".len()) == Some(&b'/');
+    let (path, render_prefix) = if file_scheme && localhost {
+        (&token["//localhost".len()..], "//localhost")
+    } else if file_scheme && token.starts_with("///") {
+        (token, "//")
+    } else {
+        (token, "")
+    };
+    let file_uri = !render_prefix.is_empty();
+    let escaped_spaces = path.contains("\\ ");
+    let decoded = if file_uri {
+        percent_decode_file_uri_path(path)?
+    } else {
+        path.replace("\\ ", " ")
+    };
+    let path = std::path::Path::new(&decoded);
+    let normalized = if path.is_absolute() {
+        normalize_absolute_path(path)?
+    } else {
+        normalize_absolute_path(&worker_root.join(path))?
+    };
+    Some((normalized, render_prefix, escaped_spaces, file_uri))
+}
+
+fn percent_decode_file_uri_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'%' {
+            decoded.push(bytes[cursor]);
+            cursor += 1;
+            continue;
+        }
+        let value = hex_value(*bytes.get(cursor + 1)?)? * 16
+            + hex_value(*bytes.get(cursor + 2)?)?;
+        if value == 0 {
+            return None;
+        }
+        decoded.push(value);
+        cursor += 3;
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_encode_file_uri_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    encoded
+}
+
+fn next_workspace_path_token(input: &str, from: usize) -> Option<(usize, usize)> {
+    for (relative, character) in input[from..].char_indices() {
+        let start = from + relative;
+        if is_workspace_path_delimiter(character) {
+            continue;
+        }
+        let before = input[..start].chars().next_back();
+        if !before.is_none_or(is_workspace_path_delimiter) {
+            continue;
+        }
+        let quote = before.filter(|character| matches!(character, '\'' | '"' | '`'));
+        let end = workspace_path_token_end(input, start, quote);
+        let candidate = &input[start..end];
+        let relative_path = !candidate.starts_with('/')
+            && candidate.contains('/')
+            && candidate
+                .split('/')
+                .any(|component| matches!(component, "." | ".."));
+        if character != '/' && !relative_path {
+            continue;
+        }
+        return Some((start, end));
+    }
+    None
+}
+
+fn workspace_path_token_end(input: &str, start: usize, quote: Option<char>) -> usize {
+    let mut escaped = false;
+    input[start..]
+        .char_indices()
+        .skip(1)
+        .find_map(|(offset, character)| {
+            if escaped {
+                escaped = false;
+                return None;
+            }
+            if character == '\\' {
+                escaped = true;
+                return None;
+            }
+            if quote.is_some_and(|quote| character == quote) {
+                return Some(start + offset);
+            }
+            (quote.is_none() && is_workspace_path_delimiter(character))
+                .then_some(start + offset)
+        })
+        .unwrap_or(input.len())
+}
+
+fn is_workspace_path_delimiter(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | ':'
+                | '!' | '?' | '=' | '@'
+        )
+}
+
 fn worker_context_footer(
     id: &str,
     orch_id: &str,
     delivery: WorkerDelivery,
 ) -> String {
     match delivery {
-        WorkerDelivery::Pr => pr_worker_context_footer(id, orch_id),
+        WorkerDelivery::Pr if !orch_id.is_empty() => pr_worker_context_footer(id, orch_id),
+        WorkerDelivery::Pr => format!(
+            "\n\n---\n\
+             Ninox session `{id}`\n\n\
+             **Goal:** complete the task and open a pull request.\n\n\
+             **Scope:** one worker, one task, one pull request. Do not perform \
+             additional out-of-scope work or open another PR; return it in the \
+             final handoff.\n\n\
+             Return a blocker-or-completion handoff to the caller.",
+        ),
         WorkerDelivery::Direct => format!(
             "\n\n---\n\
-             Ninox session `{id}` · orchestrator `{orch_id}` · direct delivery\n\n\
+             Ninox session `{id}`{orchestrator} · direct delivery\n\n\
              **Goal:** complete the task through validated artifacts or direct changes \
              in the authoritative workspace.\n\n\
-             **Delivery:** Do not create branches, remotes, commits, or pull requests. \
+             **Delivery:** Do not create branches, remotes, or commits; do not push or \
+             open pull requests. \
              Validate the delivered artifacts or direct changes before handoff.\n\n\
-             **Scope:** one worker, one task. If you discover additional work outside \
-             this task, do not do it — hand it to the orchestrator instead:\n\
-             ```bash\n\
-             ninox request-work \"<description of the additional work>\"\n\
-             ```\n\
-             Report back with a blocker-or-completion handoff:\n\
-             ```bash\n\
-             ninox send {orch_id} \"<blocked and needs a decision, or complete with artifacts/direct changes and validation>\"\n\
-             ```\n\
-             Stop after reporting that you are blocked or the direct delivery is complete.",
+             {scope}\n\
+             {handoff}",
+            orchestrator = if orch_id.is_empty() {
+                String::new()
+            } else {
+                format!(" · orchestrator `{orch_id}`")
+            },
+            scope = if orch_id.is_empty() {
+                "**Scope:** one worker, one task. Do not perform additional out-of-scope \
+                 work; return it in the final handoff."
+                    .to_string()
+            } else {
+                "**Scope:** one worker, one task. If you discover additional work outside \
+                 this task, do not do it — hand it to the orchestrator instead:\n\
+                 ```bash\n\
+                 ninox request-work \"<description of the additional work>\"\n\
+                 ```"
+                    .to_string()
+            },
+            handoff = if orch_id.is_empty() {
+                "Return a blocker-or-completion handoff to the caller, then stop after \
+                 reporting that you are blocked or the direct delivery is complete."
+                    .to_string()
+            } else {
+                format!(
+                    "Report back with a blocker-or-completion handoff:\n\
+                     ```bash\n\
+                     ninox send {orch_id} \"<blocked and needs a decision, or complete with artifacts/direct changes and validation>\"\n\
+                     ```\n\
+                     Stop after reporting that you are blocked or the direct delivery is complete."
+                )
+            },
         ),
     }
 }
@@ -605,6 +1111,7 @@ fn worker_env_vars<'a>(
 ) -> Vec<(&'a str, &'a str)> {
     let mut env_vec: Vec<(&str, &str)> = vec![
         ("NINOX_SESSION",  id),
+        ("NINOX_CALLER_TYPE", "worker"),
         ("NINOX_DATA_DIR", sessions_dir),
     ];
     if !orch_id.is_empty() {
@@ -620,6 +1127,204 @@ fn worker_env_vars<'a>(
 }
 
 
+fn caller_is_orchestrator(
+    env_session:     Option<&str>,
+    orchestrator_ids: &[&str],
+    env_caller_type: Option<&str>,
+) -> bool {
+    match env_session {
+        Some(sid) => orchestrator_ids.contains(&sid),
+        None      => env_caller_type == Some("orchestrator"),
+    }
+}
+
+fn resolve_release_orchestrator(
+    explicit:               Option<String>,
+    env_orch_id:            Option<String>,
+    caller_is_orchestrator: bool,
+    env_session:            Option<String>,
+) -> anyhow::Result<String> {
+    let is_orchestrator = caller_is_orchestrator;
+    let in_a_session    = env_session.is_some() || env_orch_id.is_some();
+    if in_a_session && !is_orchestrator {
+        anyhow::bail!(
+            "`ninox release` is an orchestrator command — a worker cannot release its \
+             siblings' checkouts, with or without --orchestrator-id."
+        );
+    }
+    explicit
+        .or(env_orch_id)
+        .ok_or_else(|| anyhow::anyhow!(
+            "NINOX_ORCHESTRATOR_ID is not set — `ninox release` runs inside an \
+             orchestrator session, or pass --orchestrator-id explicitly"
+        ))
+}
+
+/// `ninox release` — hand a finalized, clean worker checkout back to the
+/// pool for warm reuse by a later worker on the same repository.
+async fn run_release(
+    store: Arc<Store>,
+    session_id: &str,
+    orchestrator_id: Option<String>,
+) -> anyhow::Result<()> {
+    let env = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
+    let env_session = env("NINOX_SESSION");
+    let orchestrators = store.list_orchestrators()?;
+    let orchestrator_ids: Vec<&str> =
+        orchestrators.iter().map(|orchestrator| orchestrator.id.as_str()).collect();
+    let caller = caller_is_orchestrator(
+        env_session.as_deref(),
+        &orchestrator_ids,
+        env("NINOX_CALLER_TYPE").as_deref(),
+    );
+    let orchestrator_id = resolve_release_orchestrator(
+        orchestrator_id,
+        env("NINOX_ORCHESTRATOR_ID"),
+        caller,
+        env_session,
+    )?;
+    let session = store
+        .get_session(session_id)?
+        .with_context(|| format!("no worker named {session_id}"))?;
+    anyhow::ensure!(
+        session.orchestrator_id.as_deref() == Some(orchestrator_id.as_str()),
+        "worker {session_id} is not owned by orchestrator {orchestrator_id}"
+    );
+    let worker = store
+        .current_worker_incarnation(session_id)?
+        .with_context(|| format!("worker {session_id} has no durable checkout capability"))?;
+    anyhow::ensure!(
+        worker.orchestrator_id.as_deref() == Some(orchestrator_id.as_str()),
+        "worker checkout ownership does not match orchestrator {orchestrator_id}"
+    );
+    let _release_lock = lock_worker_release(&store, &worker)?;
+    let worker = store
+        .current_worker_incarnation(session_id)?
+        .with_context(|| format!("worker {session_id} release completed concurrently"))?;
+    let claim = if matches!(
+        worker.state,
+        ninox_core::types::WorkerIncarnationState::ReleaseClaimed
+    ) {
+        worker
+    } else {
+        anyhow::ensure!(
+            matches!(
+                worker.state,
+                ninox_core::types::WorkerIncarnationState::Retained
+            ),
+            "worker {session_id} is not finalized and retained"
+        );
+        store
+            .claim_worker_release(session_id, &worker.incarnation_id)?
+            .context("worker release lost its exact incarnation/lease claim")?
+    };
+    let result = release_retained_worker_checkout(store.clone(), &claim).await;
+    match result {
+        Ok(()) => {
+            anyhow::ensure!(
+                store.complete_worker_claim(
+                    session_id,
+                    &claim.incarnation_id,
+                    ninox_core::types::WorkerIncarnationState::ReleaseClaimed,
+                )?,
+                "worker release completion lost its exact incarnation claim"
+            );
+            println!("released {session_id}; preserved branch/ref and warm cache");
+            Ok(())
+        }
+        Err(error) => {
+            let _ = store.abort_worker_claim(
+                session_id,
+                &claim.incarnation_id,
+                ninox_core::types::WorkerIncarnationState::ReleaseClaimed,
+                ninox_core::types::WorkerIncarnationState::Retained,
+            );
+            Err(error)
+        }
+    }
+}
+
+fn lock_worker_release(
+    store: &Store,
+    worker: &ninox_core::types::WorkerIncarnation,
+) -> anyhow::Result<Option<std::fs::File>> {
+    let record = store
+        .pooled_checkout_by_session(&worker.session_id)?
+        .or(store.pooled_checkout_by_path(std::path::Path::new(
+            &worker.workspace_path,
+        ))?);
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    if !record.path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(
+        ninox_core::worktree::PooledWorktree::from_record(&record)?.lock_identity()?,
+    ))
+}
+
+async fn release_retained_worker_checkout(
+    store: Arc<Store>,
+    worker: &ninox_core::types::WorkerIncarnation,
+) -> anyhow::Result<()> {
+    let record = match store.pooled_checkout_by_session(&worker.session_id)? {
+        Some(record) => record,
+        None => match store.pooled_checkout_by_path(std::path::Path::new(
+            &worker.workspace_path,
+        ))? {
+            Some(record) if matches!(record.state, ninox_core::types::PooledCheckoutState::Free) => {
+                return Ok(());
+            }
+            None if matches!(
+                worker.state,
+                ninox_core::types::WorkerIncarnationState::ReleaseClaimed
+            ) && !std::path::Path::new(&worker.workspace_path).exists() =>
+            {
+                return Ok(());
+            }
+            _ => anyhow::bail!("retained worker has no active reusable pooled checkout"),
+        },
+    };
+    anyhow::ensure!(
+        record.owner_incarnation_id.as_deref() == Some(worker.incarnation_id.as_str())
+            && record.lease_id.as_deref() == worker.lease_id.as_deref(),
+        "retained checkout capability is stale or ambiguous"
+    );
+    let lease_id = worker.lease_id.clone().context("retained worker has no lease")?;
+    if !record.path.exists() {
+        anyhow::ensure!(
+            store.remove_missing_pooled_checkout_for_incarnation(
+                &record.path,
+                &worker.session_id,
+                &worker.incarnation_id,
+                &lease_id,
+            )?,
+            "missing retained checkout changed before reconciliation"
+        );
+        return Ok(());
+    }
+    let branch = record.branch.clone().context("retained checkout has no branch")?;
+    let path = record.path.clone();
+    let session_id = worker.session_id.clone();
+    let incarnation_id = worker.incarnation_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let pooled = ninox_core::worktree::PooledWorktree::from_record(&record)?;
+        pooled.release_recyclable(&branch)?;
+        anyhow::ensure!(
+            store.release_pooled_checkout_for_incarnation(
+                &path,
+                &session_id,
+                &incarnation_id,
+                &lease_id,
+            )?,
+            "pooled checkout lease changed after safe detach"
+        );
+        Ok(())
+    })
+    .await
+    .context("worker release task panicked")?
+}
 /// `ninox request-work` — record a work request in this worker's session
 /// metadata. The engine's poller notices it within one tick, notifies the
 /// UI, and forwards it to the orchestrator's terminal.
@@ -1313,9 +2018,10 @@ fn has_display() -> bool {
 #[cfg(test)]
 mod worker_env_tests {
     use super::{
-        first_line, pr_worker_context_footer, resolve_worker_delivery, run_spawn,
-        worker_context_footer, worker_env_vars, worker_prompt_for_workspace, Args, Command,
-        WorkerDelivery,
+        first_line, pr_worker_context_footer, reject_recursive_worker_spawn,
+        resolve_worker_delivery, run_spawn,
+        worker_context_footer, worker_env_vars, worker_prompt_for_canonical_workspace,
+        worker_prompt_for_workspace, Args, Command, WorkerDelivery,
     };
     use clap::Parser;
 
@@ -1487,6 +2193,17 @@ mod worker_env_tests {
     }
 
     #[test]
+    fn direct_worker_without_orchestrator_still_gets_no_git_delivery_contract() {
+        let footer = worker_context_footer("w1", "", WorkerDelivery::Direct);
+
+        assert!(footer.contains("Do not create branches"));
+        assert!(footer.contains("do not push"));
+        assert!(footer.contains("open pull requests"));
+        assert!(!footer.contains("ninox send "));
+        assert!(!footer.contains("ninox request-work"));
+    }
+
+    #[test]
     fn worker_prompt_remaps_source_checkout_paths_to_the_managed_worktree() {
         let prompt =
             "Edit /Users/mu/dev/repo/src/main.rs, then run git in /Users/mu/dev/repo.";
@@ -1503,6 +2220,52 @@ mod worker_env_tests {
             3,
         );
         assert!(mapped.contains("do not read, write, or run Git commands there"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_prompt_maps_nested_symlink_aliases_by_path_components() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("repo");
+        let alias = parent.path().join("repo-alias");
+        let worker = parent.path().join("repo-w1");
+        std::fs::create_dir_all(source.join("src/nested")).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["-C", source.to_str().unwrap(), "init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        symlink(&source, &alias).unwrap();
+
+        let supplied = alias.join("src/nested");
+        let prompt = format!(
+            "Edit {}/deep.rs and {}/root.rs; preserve {}-archive/root.rs.",
+            supplied.display(),
+            source.display(),
+            source.display(),
+        );
+        let mapped = worker_prompt_for_canonical_workspace(
+            &prompt,
+            supplied.to_str().unwrap(),
+            source.to_str().unwrap(),
+            worker.to_str().unwrap(),
+            WorkerDelivery::Pr,
+        );
+
+        assert!(
+            mapped.contains(&format!("{}/src/nested/deep.rs", worker.display())),
+            "{mapped}"
+        );
+        assert!(
+            mapped.contains(&format!("{}/root.rs", worker.display())),
+            "{mapped}"
+        );
+        assert!(mapped.contains(&format!("{}-archive/root.rs", source.display())));
+        assert!(!mapped.contains(alias.to_str().unwrap()));
     }
 
     #[test]
@@ -1526,6 +2289,7 @@ mod worker_env_tests {
         assert!(env.contains(&("NINOX_BRAIN", "/brain.db")));
         assert!(env.contains(&("NINOX_CONFIG", "/cfg.toml")));
         assert!(env.contains(&("NINOX_SESSION", "w1")));
+        assert!(env.contains(&("NINOX_CALLER_TYPE", "worker")));
         assert!(env.contains(&("NINOX_DATA_DIR", "/data")));
         // The legacy ATHENE_* transition names are gone.
         assert!(!env.iter().any(|(k, _)| k.starts_with("ATHENE_")));
@@ -1537,5 +2301,12 @@ mod worker_env_tests {
         assert!(!env.iter().any(|(k, _)| *k == "NINOX_ORCHESTRATOR_ID"));
         assert!(!env.iter().any(|(k, _)| *k == "NINOX_BRAIN"));
         assert!(!env.iter().any(|(k, _)| *k == "NINOX_CONFIG"));
+    }
+
+    #[test]
+    fn recursive_worker_spawn_is_rejected_before_allocation() {
+        assert!(reject_recursive_worker_spawn(Some("worker")).is_err());
+        assert!(reject_recursive_worker_spawn(Some("orchestrator")).is_ok());
+        assert!(reject_recursive_worker_spawn(None).is_ok());
     }
 }

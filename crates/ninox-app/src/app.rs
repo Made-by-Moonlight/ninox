@@ -34,14 +34,34 @@ fn emit_checkout_unavailable(
     session_name: &str,
     error: &dyn std::fmt::Display,
 ) {
+    let body = checkout_error_with_candidates(engine, error);
     engine.emit(Event::Notification(Notification {
         id: format!("checkout-unavailable-{session_id}"),
         kind: NotificationKind::CheckoutUnavailable,
         title: format!("Checkout unavailable — {session_name}"),
-        body: error.to_string(),
+        body,
         session_id: Some(session_id.to_string()),
         created_at: ninox_core::lifecycle::poller::now_millis(),
     }));
+}
+
+fn checkout_error_with_candidates(engine: &Engine, error: &dyn std::fmt::Display) -> String {
+    let error = error.to_string();
+    if !error.contains("checkout-backed worker cap reached") {
+        return error;
+    }
+    let candidates = engine
+        .store
+        .checkout_worker_candidates(None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|worker| format!("{} ({:?}, {})", worker.session_id, worker.state, worker.workspace_path))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        error
+    } else {
+        format!("{error}; finish, release, or reap one of: {}", candidates.join(", "))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,9 +1297,25 @@ impl App {
                             return Task::none();
                         }
 
-                        let mut workspace = crate::spawn_util::expand_tilde(&workspace_input);
-                        let exact_worktree_path =
-                            !std::path::Path::new(&workspace).exists();
+                        let workspace = crate::spawn_util::expand_tilde(&workspace_input);
+                        let ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        let slug = slugify(&name);
+                        let sid = if slug.is_empty() { format!("session-{ts}") } else { slug };
+                        if state.sessions.contains_key(&sid) {
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!(
+                                    "a session named {sid} already exists — pick another name"
+                                ));
+                            }
+                            return Task::none();
+                        }
+                        let exact_worktree_path = !std::path::Path::new(&workspace).exists();
+                        let mut exact_worktree_source = None;
+                        let mut prepared_incarnation = None;
+                        let mut preallocated_checkout = None;
                         if !std::path::Path::new(&workspace).exists() {
                             // The path doesn't exist yet — if it's nested
                             // under a git repo (e.g. this project's own
@@ -1291,19 +1327,71 @@ impl App {
 
                             match repo_root {
                                 Some(root) => {
-                                    let branch = ws_path
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or(&workspace)
-                                        .to_string();
-                                    match crate::spawn_util::create_worktree_at(
-                                        &root, &ws_path, &branch, state.config.inbox_messaging.enabled,
-                                    ) {
-                                        Ok(created) => workspace = created,
-                                        Err(e) => {
+                                    let source = root.to_string_lossy().into_owned();
+                                    let cap = match state.config.validated_worker_checkout_cap() {
+                                        Ok(cap) => cap,
+                                        Err(error) => {
+                                            if let Some(f) = &mut state.spawn_modal {
+                                                f.error = Some(checkout_error_with_candidates(
+                                                    &state.engine,
+                                                    &error,
+                                                ));
+                                            }
+                                            return Task::none();
+                                        }
+                                    };
+                                    let incarnation = match state.engine.store
+                                        .prepare_worker_incarnation(
+                                            &sid,
+                                            None,
+                                            ts as i64,
+                                            &source,
+                                            true,
+                                            cap,
+                                        )
+                                    {
+                                        Ok(incarnation) => incarnation,
+                                        Err(error) => {
+                                            if let Some(f) = &mut state.spawn_modal {
+                                                f.error = Some(checkout_error_with_candidates(
+                                                    &state.engine,
+                                                    &error,
+                                                ));
+                                            }
+                                            return Task::none();
+                                        }
+                                    };
+                                    match crate::spawn_util::
+                                        acquire_worker_checkout_at_for_incarnation_blocking(
+                                            &state.engine.store,
+                                            &source,
+                                            &ws_path,
+                                            &sid,
+                                            &incarnation.incarnation_id,
+                                            state.config.inbox_messaging.enabled,
+                                        )
+                                    {
+                                        Ok(checkout) => {
+                                            exact_worktree_source = Some(source);
+                                            prepared_incarnation = Some(incarnation);
+                                            preallocated_checkout = Some(checkout);
+                                        }
+                                        Err(error) => {
+                                            if let Ok(Some(claim)) = state.engine.store
+                                                .claim_worker_cleanup(
+                                                    &sid,
+                                                    &incarnation.incarnation_id,
+                                                )
+                                            {
+                                                let _ = state.engine.store.complete_worker_claim(
+                                                    &sid,
+                                                    &claim.incarnation_id,
+                                                    ninox_core::types::WorkerIncarnationState::CleanupClaimed,
+                                                );
+                                            }
                                             if let Some(f) = &mut state.spawn_modal {
                                                 f.error = Some(format!(
-                                                    "failed to create worktree at {workspace}: {e}"
+                                                    "failed to create worktree at {workspace}: {error}"
                                                 ));
                                             }
                                             return Task::none();
@@ -1321,28 +1409,6 @@ impl App {
                                     return Task::none();
                                 }
                             }
-                        }
-
-                        let ts = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis();
-                        let slug = slugify(&name);
-                        let sid = if slug.is_empty() { format!("session-{ts}") } else { slug };
-
-                        if state.sessions.contains_key(&sid) {
-                            // Slugified name collides with an existing session
-                            // id — upserting would silently overwrite that
-                            // session's stored record, and the subsequent
-                            // tmux-create (same session name) would then fail
-                            // and mark the *hijacked* record Terminated. Keep
-                            // the modal open so the user can rename instead.
-                            if let Some(f) = &mut state.spawn_modal {
-                                f.error = Some(format!(
-                                    "a session named {sid} already exists — pick another name"
-                                ));
-                            }
-                            return Task::none();
                         }
                         state.spawn_modal = None;
 
@@ -1394,20 +1460,69 @@ impl App {
                         let engine = state.engine.clone();
                         let nm     = name;
                         let ts_i64 = ts as i64;
+                        let config = state.config.clone();
                         let inbox_enabled = state.config.inbox_messaging.enabled;
                         let repositories_root = state.config.resolved_repositories_root();
                         let worktree_root = state.config.resolved_worktree_root();
 
                         Task::future(async move {
-                            let checkout_result = if exact_worktree_path {
-                                Ok(crate::spawn_util::WorkerCheckout::shared(
-                                    workspace.clone(),
-                                ))
+                            let source_workspace = exact_worktree_source
+                                .as_deref()
+                                .unwrap_or(workspace.as_str());
+                            let checkout_backed = exact_worktree_path
+                                || ninox_core::worktree::RepositoryIdentity::resolve(
+                                    std::path::Path::new(&workspace),
+                                )
+                                .is_ok();
+                            let incarnation = match prepared_incarnation {
+                                Some(incarnation) => incarnation,
+                                None => {
+                                    let checkout_cap =
+                                        match config.validated_worker_checkout_cap() {
+                                            Ok(cap) => cap,
+                                            Err(error) => {
+                                                emit_checkout_unavailable(
+                                                    &engine, &sid, &nm, &error,
+                                                );
+                                                return Message::Noop;
+                                            }
+                                        };
+                                    match engine.store.prepare_worker_incarnation(
+                                        &sid,
+                                        None,
+                                        ts_i64,
+                                        source_workspace,
+                                        checkout_backed,
+                                        checkout_cap,
+                                    ) {
+                                        Ok(incarnation) => incarnation,
+                                        Err(error) => {
+                                            emit_checkout_unavailable(
+                                                &engine, &sid, &nm, &error,
+                                            );
+                                            return Message::Noop;
+                                        }
+                                    }
+                                }
+                            };
+                            let checkout_result = if let Some(checkout) = preallocated_checkout {
+                                Ok(checkout)
+                            } else if exact_worktree_path {
+                                crate::spawn_util::acquire_worker_checkout_at_for_incarnation(
+                                    engine.store.clone(),
+                                    source_workspace,
+                                    std::path::Path::new(&workspace),
+                                    &sid,
+                                    &incarnation.incarnation_id,
+                                    inbox_enabled,
+                                )
+                                .await
                             } else {
-                                crate::spawn_util::acquire_worker_checkout(
+                                crate::spawn_util::acquire_worker_checkout_for_incarnation(
                                     engine.store.clone(),
                                     &workspace,
                                     &sid,
+                                    &incarnation.incarnation_id,
                                     repositories_root.as_deref(),
                                     &worktree_root,
                                     inbox_enabled,
@@ -1438,10 +1553,42 @@ impl App {
                                                 | SessionFields::WORKSPACE,
                                         ));
                                     }
+                                    if let Ok(Some(claim)) = engine.store.claim_worker_cleanup(
+                                        &sid,
+                                        &incarnation.incarnation_id,
+                                    ) {
+                                        let _ = engine.store.complete_worker_claim(
+                                            &sid,
+                                            &claim.incarnation_id,
+                                            ninox_core::types::WorkerIncarnationState::CleanupClaimed,
+                                        );
+                                    }
                                     return Message::Noop;
                                 }
                             };
                             let effective_ws = checkout.workspace.clone();
+                            if !engine.store.bind_worker_incarnation(
+                                &sid,
+                                &incarnation.incarnation_id,
+                                &checkout.source_workspace,
+                                &effective_ws,
+                                checkout
+                                    .pooled_lease
+                                    .as_ref()
+                                    .map(|lease| lease.lease_id.as_str()),
+                            ).unwrap_or(false) {
+                                let error = anyhow::anyhow!(
+                                    "worker incarnation changed before checkout binding"
+                                );
+                                emit_checkout_unavailable(&engine, &sid, &nm, &error);
+                                let _ = crate::spawn_util::rollback_worker_checkout(
+                                    engine.store.clone(),
+                                    &checkout,
+                                    &sid,
+                                )
+                                .await;
+                                return Message::Noop;
+                            }
                             if let Err(e) = crate::spawn_util::seed_worker_brain_skill(&effective_ws).await {
                                 tracing::warn!("failed to seed brain skill for {sid}: {e}");
                             }
@@ -1476,12 +1623,22 @@ impl App {
                             match attach {
                                 Some(argv) => Message::ClientAttach { session_id: attach_sid, argv },
                                 None => {
-                                    let _ = crate::spawn_util::rollback_worker_checkout(
-                                        engine.store.clone(),
-                                        &checkout,
+                                    if let Ok(Some(claim)) = engine.store.claim_worker_cleanup(
                                         &attach_sid,
-                                    )
-                                    .await;
+                                        &incarnation.incarnation_id,
+                                    ) {
+                                        let _ = crate::spawn_util::rollback_worker_checkout(
+                                            engine.store.clone(),
+                                            &checkout,
+                                            &attach_sid,
+                                        )
+                                        .await;
+                                        let _ = engine.store.complete_worker_claim(
+                                            &attach_sid,
+                                            &claim.incarnation_id,
+                                            ninox_core::types::WorkerIncarnationState::CleanupClaimed,
+                                        );
+                                    }
                                     Message::Noop
                                 }
                             }
@@ -1718,10 +1875,42 @@ impl App {
                 let repo    = session.repo.clone();
                 let orch_id = session.orchestrator_id.clone();
                 let summary = session.summary.clone();
+                let config = state.config.clone();
                 let inbox_enabled = state.config.inbox_messaging.enabled;
                 let repositories_root = state.config.resolved_repositories_root();
                 let worktree_root = state.config.resolved_worktree_root();
                 Task::future(async move {
+                    let checkout_backed = !is_orch
+                        && (engine
+                            .store
+                            .current_worker_incarnation(&id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|worker| worker.checkout_backed)
+                            || ninox_core::worktree::RepositoryIdentity::resolve(
+                                std::path::Path::new(&plan.workspace),
+                            )
+                            .is_ok());
+                    let incarnation = if is_orch {
+                        None
+                    } else {
+                        match config.validated_worker_checkout_cap().and_then(|cap| {
+                            engine.store.prepare_worker_incarnation(
+                                &id,
+                                orch_id.as_deref(),
+                                ts,
+                                &plan.workspace,
+                                checkout_backed,
+                                cap,
+                            )
+                        }) {
+                            Ok(incarnation) => Some(incarnation),
+                            Err(error) => {
+                                emit_checkout_unavailable(&engine, &id, &name, &error);
+                                return Message::Noop;
+                            }
+                        }
+                    };
                     // Ignore kill errors — a Terminated husk has no tmux
                     // session, and Re-file on one "just spawns". The
                     // respawn upserts the record back to Working, carrying
@@ -1748,10 +1937,14 @@ impl App {
                         {
                             let source_repo =
                                 prior_pool.source_repo.to_string_lossy().to_string();
-                            match crate::spawn_util::acquire_worker_checkout(
+                            match crate::spawn_util::acquire_worker_checkout_for_incarnation(
                                 engine.store.clone(),
                                 &source_repo,
                                 &id,
+                                &incarnation
+                                    .as_ref()
+                                    .expect("worker Re-file has an incarnation")
+                                    .incarnation_id,
                                 repositories_root.as_deref(),
                                 &worktree_root,
                                 inbox_enabled,
@@ -1803,6 +1996,35 @@ impl App {
                         emit_checkout_unavailable(&engine, &id, &name, &e);
                         return Message::Noop;
                     }
+                    if let Some(incarnation) = &incarnation {
+                        let source_workspace = reacquired_checkout
+                            .as_ref()
+                            .map_or(incarnation.source_workspace.as_str(), |checkout| {
+                                checkout.source_workspace.as_str()
+                            });
+                        let lease_id = reacquired_checkout
+                            .as_ref()
+                            .and_then(|checkout| checkout.pooled_lease.as_ref())
+                            .map(|lease| lease.lease_id.as_str())
+                            .or(incarnation.lease_id.as_deref());
+                        if !engine
+                            .store
+                            .bind_worker_incarnation(
+                                &id,
+                                &incarnation.incarnation_id,
+                                source_workspace,
+                                &plan.workspace,
+                                lease_id,
+                            )
+                            .unwrap_or(false)
+                        {
+                            let error = anyhow::anyhow!(
+                                "worker incarnation changed before Re-file binding"
+                            );
+                            emit_checkout_unavailable(&engine, &id, &name, &error);
+                            return Message::Noop;
+                        }
+                    }
                     let attach = crate::spawn_util::spawn_interactive_session(
                         engine.clone(),
                         crate::spawn_util::InteractiveSpawnParams {
@@ -1825,13 +2047,32 @@ impl App {
                     match attach {
                         Some(argv) => Message::ClientAttach { session_id: id, argv },
                         None => {
-                            if let Some(checkout) = &reacquired_checkout {
-                                let _ = crate::spawn_util::rollback_worker_checkout(
-                                    engine.store.clone(),
-                                    checkout,
+                            if let Some(incarnation) = &incarnation {
+                                if let Ok(Some(claim)) = engine.store.claim_worker_cleanup(
                                     &id,
-                                )
-                                .await;
+                                    &incarnation.incarnation_id,
+                                ) {
+                                    if let Some(checkout) = &reacquired_checkout {
+                                        let _ = crate::spawn_util::rollback_worker_checkout(
+                                            engine.store.clone(),
+                                            checkout,
+                                            &id,
+                                        )
+                                        .await;
+                                        let _ = engine.store.complete_worker_claim(
+                                            &id,
+                                            &claim.incarnation_id,
+                                            ninox_core::types::WorkerIncarnationState::CleanupClaimed,
+                                        );
+                                    } else {
+                                        let _ = engine.store.abort_worker_claim(
+                                            &id,
+                                            &claim.incarnation_id,
+                                            ninox_core::types::WorkerIncarnationState::CleanupClaimed,
+                                            ninox_core::types::WorkerIncarnationState::Retained,
+                                        );
+                                    }
+                                }
                             }
                             Message::Noop
                         }
@@ -2968,7 +3209,8 @@ pub fn pr_url_for_session(
 /// and the subagent-blocker PreToolUse hook.
 ///
 /// AGENTS.md and settings.json are skipped if already present (user-editable).
-/// Skill files and the blocker are always overwritten to stay in sync.
+/// Generated skills are refreshed while untouched; user-modified skills and
+/// unrelated files are preserved. The blocker is always overwritten.
 pub async fn setup_orchestrator_root(
     root: &std::path::Path,
     ninox_bin: &str,

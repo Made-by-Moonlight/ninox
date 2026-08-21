@@ -177,6 +177,9 @@ impl SessionRetentionConfig {
 // App configuration
 // ---------------------------------------------------------------------------
 
+fn default_worker_checkout_cap() -> u8 { 3 }
+
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub port:      u16,
@@ -194,6 +197,10 @@ pub struct AppConfig {
     /// Pooling remains disabled when unset.
     #[serde(default)]
     pub repositories_root: Option<PathBuf>,
+    /// Maximum checkout-backed workers owned by one orchestrator. Local
+    /// delivery is deliberately bounded to three retained or active slots.
+    #[serde(default = "default_worker_checkout_cap")]
+    pub worker_checkout_cap: u8,
     /// Agent harness and model for orchestrator sessions.
     #[serde(default)]
     pub orchestrator: AgentConfig,
@@ -240,6 +247,7 @@ impl Default for AppConfig {
             orchestrator_root: None,
             worktree_root:    None,
             repositories_root: None,
+            worker_checkout_cap: default_worker_checkout_cap(),
             orchestrator:     AgentConfig::default(),
             worker:           AgentConfig::default(),
             github_token:     None,
@@ -254,6 +262,14 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    pub fn validated_worker_checkout_cap(&self) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            (1..=3).contains(&self.worker_checkout_cap),
+            "worker_checkout_cap must be between 1 and 3"
+        );
+        Ok(self.worker_checkout_cap as usize)
+    }
+
     /// The effective harness registry: builtin specs overlaid by this
     /// config's `[harnesses.*]` entries.
     pub fn registry(&self) -> HarnessRegistry {
@@ -547,6 +563,16 @@ mod tests {
             toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
         assert!(old.worktree_root.is_none());
         assert!(old.repositories_root.is_none());
+    }
+
+    #[test]
+    fn worker_checkout_cap_defaults_to_three_and_rejects_out_of_range_values() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.validated_worker_checkout_cap().unwrap(), 3);
+        config.worker_checkout_cap = 0;
+        assert!(config.validated_worker_checkout_cap().is_err());
+        config.worker_checkout_cap = 4;
+        assert!(config.validated_worker_checkout_cap().is_err());
     }
 
     #[test]

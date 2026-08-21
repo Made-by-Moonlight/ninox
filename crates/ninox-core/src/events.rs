@@ -125,7 +125,27 @@ impl Engine {
     pub async fn remove_orchestrator(&self, orchestrator_id: &str) -> anyhow::Result<()> {
         let workers = self.store.sessions_by_orchestrator(orchestrator_id)?;
         let sessions_dir = crate::config::AppConfig::sessions_dir();
+        let mut removed_workers = Vec::new();
         for session in &workers {
+            let claim = self
+                .store
+                .claim_worker_cleanup_snapshot(&session.id, session.started_at)?;
+            if claim.is_none() {
+                let already_released = self
+                    .store
+                    .worker_incarnation_for_snapshot(&session.id, session.started_at)?
+                    .is_some_and(|worker| {
+                        matches!(
+                            worker.state,
+                            crate::types::WorkerIncarnationState::Released
+                        )
+                    });
+                if already_released {
+                    self.store.delete_session(&session.id)?;
+                    removed_workers.push(session.id.clone());
+                }
+                continue;
+            }
             let _ = crate::tmux::kill_session(&session.id).await;
             remove_worktree_and_artifacts(
                 &self.store,
@@ -133,33 +153,73 @@ impl Engine {
                 session.workspace_path.as_deref(),
                 &sessions_dir,
                 RecoveryMetadata::Remove,
+                claim.as_ref(),
             )
             .await;
+            self.store.delete_session(&session.id)?;
+            if let Some(claim) = claim {
+                let _ = self.store.complete_worker_claim(
+                    &session.id,
+                    &claim.incarnation_id,
+                    crate::types::WorkerIncarnationState::CleanupClaimed,
+                );
+            }
+            removed_workers.push(session.id.clone());
         }
+        for session_id in &removed_workers {
+            self.emit(Event::SessionDone(session_id.clone()));
+        }
+        anyhow::ensure!(
+            removed_workers.len() == workers.len(),
+            "orchestrator workers changed while cleanup was being claimed"
+        );
         // Also kill the orchestrator's own tmux session (same id as orchestrator).
         let _ = crate::tmux::kill_session(orchestrator_id).await;
         self.store.delete_orchestrator(orchestrator_id)?;
-        for session in workers {
-            self.emit(Event::SessionDone(session.id));
-        }
         self.emit(Event::OrchestratorRemoved(orchestrator_id.to_string()));
         Ok(())
     }
 
     /// Kill the tmux session and delete it from the DB entirely.
     pub async fn remove_session(&self, session_id: &str) -> anyhow::Result<()> {
+        let Some(session) = self.store.get_session(session_id)? else {
+            return Ok(());
+        };
+        let claim = self
+            .store
+            .claim_worker_cleanup_snapshot(session_id, session.started_at)?;
+        let Some(claim) = claim else {
+            let already_released = self
+                .store
+                .worker_incarnation_for_snapshot(session_id, session.started_at)?
+                .is_some_and(|worker| {
+                    matches!(
+                        worker.state,
+                        crate::types::WorkerIncarnationState::Released
+                    )
+                });
+            if already_released {
+                self.store.delete_session(session_id)?;
+                self.emit(Event::SessionDone(session_id.to_string()));
+            }
+            return Ok(());
+        };
         let _ = crate::tmux::kill_session(session_id).await;
-        let workspace_path = self.store.get_session(session_id).ok().flatten()
-            .and_then(|s| s.workspace_path);
         remove_worktree_and_artifacts(
             &self.store,
             session_id,
-            workspace_path.as_deref(),
+            session.workspace_path.as_deref(),
             &crate::config::AppConfig::sessions_dir(),
             RecoveryMetadata::Remove,
+            Some(&claim),
         )
         .await;
         self.store.delete_session(session_id)?;
+        let _ = self.store.complete_worker_claim(
+            session_id,
+            &claim.incarnation_id,
+            crate::types::WorkerIncarnationState::CleanupClaimed,
+        );
         self.emit(Event::SessionDone(session_id.to_string()));
         Ok(())
     }
@@ -237,23 +297,42 @@ impl Engine {
         session_id:   &str,
         sessions_dir: &std::path::Path,
     ) -> anyhow::Result<()> {
+        let Some(mut session) = self.store.get_session(session_id)? else {
+            return Ok(());
+        };
+        let Some(claim) = self
+            .store
+            .claim_worker_cleanup_snapshot(session_id, session.started_at)?
+        else {
+            return Ok(());
+        };
         // Best-effort tmux kill — session may already be dead.
         let _ = crate::tmux::kill_session(session_id).await;
 
-        if let Some(mut session) = self.store.get_session(session_id)? {
-            remove_worktree_and_artifacts(
-                &self.store,
-                session_id,
-                session.workspace_path.as_deref(),
-                sessions_dir,
-                RecoveryMetadata::Retain,
-            )
-            .await;
-            session.status = crate::types::SessionStatus::Done;
-            session.terminal_at = Some(crate::lifecycle::poller::now_millis());
-            self.store.upsert_session(&session)?;
-            self.emit(Event::SessionUpdated(session, SessionFields::STATUS | SessionFields::TERMINAL_AT));
+        remove_worktree_and_artifacts(
+            &self.store,
+            session_id,
+            session.workspace_path.as_deref(),
+            sessions_dir,
+            RecoveryMetadata::Retain,
+            Some(&claim),
+        )
+        .await;
+        session.status = crate::types::SessionStatus::Done;
+        session.terminal_at = Some(crate::lifecycle::poller::now_millis());
+        let update = self.store.upsert_session(&session);
+        if update.is_ok() {
+            self.emit(Event::SessionUpdated(
+                session,
+                SessionFields::STATUS | SessionFields::TERMINAL_AT,
+            ));
         }
+        let _ = self.store.complete_worker_claim(
+            session_id,
+            &claim.incarnation_id,
+            crate::types::WorkerIncarnationState::CleanupClaimed,
+        );
+        update?;
         Ok(())
     }
 }
@@ -274,8 +353,9 @@ async fn remove_worktree_and_artifacts(
     workspace_path: Option<&str>,
     sessions_dir:   &std::path::Path,
     recovery_metadata: RecoveryMetadata,
+    worker: Option<&crate::types::WorkerIncarnation>,
 ) {
-    let pooled = release_pooled_checkout(store, session_id).await;
+    let pooled = release_pooled_checkout(store, session_id, worker).await;
     if !pooled {
         if let Some(wp) = workspace_path {
             remove_worker_worktree(wp, session_id, recovery_metadata).await;
@@ -286,17 +366,32 @@ async fn remove_worktree_and_artifacts(
 
 /// Release only the exact lease currently owned by `session_id`. A dirty or
 /// replaced checkout is quarantined and left untouched for manual recovery.
-async fn release_pooled_checkout(store: &crate::store::Store, session_id: &str) -> bool {
+async fn release_pooled_checkout(
+    store: &crate::store::Store,
+    session_id: &str,
+    worker: Option<&crate::types::WorkerIncarnation>,
+) -> bool {
     let Ok(Some(record)) = store.pooled_checkout_by_session(session_id) else {
         return false;
     };
-    let (Some(lease_id), Some(branch)) = (record.lease_id.clone(), record.branch.clone()) else {
+    let (Some(owner_incarnation_id), Some(lease_id), Some(branch)) = (
+        record.owner_incarnation_id.clone(),
+        record.lease_id.clone(),
+        record.branch.clone(),
+    ) else {
         let _ = store.quarantine_pooled_checkout(
             &record.path,
             "active pooled checkout is missing lease metadata",
         );
         return true;
     };
+    if let Some(worker) = worker {
+        if owner_incarnation_id != worker.incarnation_id
+            || worker.lease_id.as_deref() != Some(lease_id.as_str())
+        {
+            return true;
+        }
+    }
     let lease = crate::types::PooledCheckoutLease {
         path: record.path,
         source_repo: record.source_repo,
@@ -305,6 +400,7 @@ async fn release_pooled_checkout(store: &crate::store::Store, session_id: &str) 
         worktree_git_dir: record.worktree_git_dir,
         worktree_identity: record.worktree_identity,
         session_id: session_id.to_string(),
+        owner_incarnation_id,
         lease_id,
         branch,
     };
@@ -315,16 +411,18 @@ async fn release_pooled_checkout(store: &crate::store::Store, session_id: &str) 
     .await;
     match store_result {
         Ok(Ok(_)) => {
-            let _ = store.release_pooled_checkout(
+            let _ = store.release_pooled_checkout_for_incarnation(
                 &lease.path,
                 &lease.session_id,
+                &lease.owner_incarnation_id,
                 &lease.lease_id,
             );
         }
         Ok(Err(error)) => {
-            let _ = store.quarantine_pooled_checkout_lease(
+            let _ = store.quarantine_pooled_checkout_lease_for_incarnation(
                 &lease.path,
                 &lease.session_id,
+                &lease.owner_incarnation_id,
                 &lease.lease_id,
                 &error.to_string(),
             );
