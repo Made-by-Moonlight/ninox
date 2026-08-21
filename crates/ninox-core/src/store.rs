@@ -6,6 +6,18 @@ use std::{
     sync::Mutex,
 };
 
+fn process_is_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -13,7 +25,7 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.execute_batch("
             PRAGMA journal_mode=WAL;
             PRAGMA busy_timeout=5000;
@@ -74,6 +86,7 @@ impl Store {
                 source_workspace TEXT NOT NULL,
                 workspace_path TEXT NOT NULL,
                 lease_id TEXT,
+                allocator_pid INTEGER,
                 checkout_backed INTEGER NOT NULL CHECK(checkout_backed IN (0,1)),
                 state TEXT NOT NULL CHECK(state IN (
                     'allocating','active','retained','cleanup_claimed',
@@ -105,6 +118,12 @@ impl Store {
                 [],
             )?;
         }
+        if !Self::column_exists(&conn, "worker_incarnations", "allocator_pid")? {
+            conn.execute(
+                "ALTER TABLE worker_incarnations ADD COLUMN allocator_pid INTEGER",
+                [],
+            )?;
+        }
         conn.execute(
             "UPDATE pooled_checkouts
              SET owner_incarnation_id=session_id
@@ -128,6 +147,8 @@ impl Store {
                AND p.lease_id IS NOT NULL",
             [],
         )?;
+        Self::reclaim_dead_allocations(&mut conn)?;
+        Self::backfill_legacy_managed_workers(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -138,6 +159,113 @@ impl Store {
             .filter_map(|r| r.ok())
             .any(|c| c == column);
         Ok(exists)
+    }
+
+    fn reclaim_dead_allocations(conn: &mut Connection) -> Result<()> {
+        let stale = {
+            let mut stmt = conn.prepare(
+                "SELECT session_id,incarnation_id,lease_id,allocator_pid
+                 FROM worker_incarnations WHERE state='allocating'",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<u32>>(3)?,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|(_, _, _, pid)| pid.is_none_or(|pid| !process_is_alive(pid)))
+                .collect::<Vec<_>>()
+        };
+        if stale.is_empty() {
+            return Ok(());
+        }
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (session_id, incarnation_id, _, _) in stale {
+            tx.execute(
+                "UPDATE pooled_checkouts
+                 SET state='quarantined',session_id=NULL,owner_incarnation_id=NULL,
+                     lease_id=NULL,quarantine_reason='allocator process exited before bind'
+                 WHERE session_id=?1 AND owner_incarnation_id=?2
+                   AND state IN ('provisioning','leased')",
+                params![session_id, incarnation_id],
+            )?;
+            tx.execute(
+                "UPDATE worker_incarnations
+                 SET state='released',allocator_pid=NULL
+                 WHERE session_id=?1 AND incarnation_id=?2 AND state='allocating'",
+                params![session_id, incarnation_id],
+            )?;
+            tx.execute(
+                "UPDATE sessions SET status='terminated'
+                 WHERE id=?1 AND started_at=(
+                    SELECT started_at FROM worker_incarnations
+                    WHERE session_id=?1 AND incarnation_id=?2
+                 ) AND status='spawning'",
+                params![session_id, incarnation_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn backfill_legacy_managed_workers(conn: &Connection) -> Result<()> {
+        let candidates = {
+            let mut stmt = conn.prepare(
+                "SELECT s.id,s.orchestrator_id,s.started_at,s.status,s.workspace_path
+                 FROM sessions s
+                 LEFT JOIN worker_incarnations w ON w.session_id=s.id
+                 WHERE w.session_id IS NULL AND s.workspace_path IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (session_id, orchestrator_id, started_at, status, workspace) in candidates {
+            let workspace_path = Path::new(&workspace);
+            let metadata =
+                match crate::worktree::ManagedWorktree::load_for_workspace(
+                    workspace_path,
+                    &session_id,
+                ) {
+                    Ok(Some(metadata)) => metadata,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            "ignore invalid legacy managed-worktree metadata for {session_id}: {error}"
+                        );
+                        continue;
+                    }
+                };
+            let state = if status == "done" { "retained" } else { "active" };
+            conn.execute(
+                "INSERT OR IGNORE INTO worker_incarnations(
+                    session_id,incarnation_id,orchestrator_id,started_at,
+                    source_workspace,workspace_path,lease_id,allocator_pid,
+                    checkout_backed,state
+                 ) VALUES(?1,?2,?3,?4,?5,?6,NULL,NULL,1,?7)",
+                params![
+                    session_id,
+                    uuid::Uuid::new_v4().to_string(),
+                    orchestrator_id,
+                    started_at,
+                    metadata.source_repo.to_string_lossy(),
+                    workspace,
+                    state,
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn upsert_session(&self, s: &Session) -> Result<()> {
@@ -498,9 +626,24 @@ impl Store {
         let workspace_path = previous
             .as_ref()
             .map_or(source_workspace, |worker| worker.workspace_path.as_str());
-        let lease_id = previous.as_ref().and_then(|worker| worker.lease_id.as_deref());
+        let pooled_lease_id = if let Some(previous) = &previous {
+            tx.query_row(
+                "SELECT lease_id FROM pooled_checkouts
+                 WHERE session_id=?1 AND owner_incarnation_id=?2
+                   AND state IN ('provisioning','leased')",
+                params![session_id, previous.incarnation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        let lease_id = previous
+            .as_ref()
+            .and_then(|worker| worker.lease_id.as_deref())
+            .or(pooled_lease_id.as_deref());
         if let Some(previous) = &previous {
-            if let Some(lease_id) = previous.lease_id.as_deref() {
+            if let Some(lease_id) = lease_id {
                 let changed = tx.execute(
                     "UPDATE pooled_checkouts SET owner_incarnation_id=?4
                      WHERE session_id=?1 AND owner_incarnation_id=?2
@@ -521,8 +664,8 @@ impl Store {
         tx.execute(
             "INSERT INTO worker_incarnations(
                 session_id,incarnation_id,orchestrator_id,started_at,
-                source_workspace,workspace_path,lease_id,checkout_backed,state
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'allocating')
+                source_workspace,workspace_path,lease_id,allocator_pid,checkout_backed,state
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'allocating')
              ON CONFLICT(session_id) DO UPDATE SET
                 incarnation_id=excluded.incarnation_id,
                 orchestrator_id=excluded.orchestrator_id,
@@ -530,6 +673,7 @@ impl Store {
                 source_workspace=excluded.source_workspace,
                 workspace_path=excluded.workspace_path,
                 lease_id=excluded.lease_id,
+                allocator_pid=excluded.allocator_pid,
                 checkout_backed=excluded.checkout_backed,
                 state='allocating'",
             params![
@@ -540,6 +684,7 @@ impl Store {
                 source_workspace,
                 workspace_path,
                 lease_id,
+                std::process::id(),
                 checkout_backed as i64,
             ],
         )?;
@@ -574,7 +719,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
             "UPDATE worker_incarnations
-             SET source_workspace=?3,workspace_path=?4,lease_id=?5,state='active'
+             SET source_workspace=?3,workspace_path=?4,lease_id=?5,
+                 allocator_pid=NULL,state='active'
              WHERE session_id=?1 AND incarnation_id=?2 AND state='allocating'",
             params![session_id, incarnation_id, source_workspace, workspace_path, lease_id],
         )?;
@@ -625,6 +771,51 @@ impl Store {
             &["allocating", "active", "retained"],
             "cleanup_claimed",
         )
+    }
+
+    pub fn claim_worker_cleanup_with_lease(
+        &self,
+        session_id: &str,
+        incarnation_id: &str,
+        lease_id: &str,
+    ) -> Result<Option<WorkerIncarnation>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exact: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pooled_checkouts
+                WHERE session_id=?1 AND owner_incarnation_id=?2 AND lease_id=?3
+                  AND state IN ('provisioning','leased')
+            )",
+            params![session_id, incarnation_id, lease_id],
+            |row| row.get(0),
+        )?;
+        if !exact {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let changed = tx.execute(
+            "UPDATE worker_incarnations
+             SET lease_id=?3,state='cleanup_claimed'
+             WHERE session_id=?1 AND incarnation_id=?2
+               AND state IN ('allocating','active','retained')
+               AND (lease_id IS NULL OR lease_id=?3)",
+            params![session_id, incarnation_id, lease_id],
+        )?;
+        if changed != 1 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let raw = tx.query_row(
+            &format!(
+                "{WORKER_INCARNATION_COLUMNS}
+                 WHERE session_id=?1 AND incarnation_id=?2"
+            ),
+            params![session_id, incarnation_id],
+            worker_incarnation_row,
+        )?;
+        tx.commit()?;
+        Ok(Some(raw_worker_incarnation(raw)?))
     }
 
     pub fn claim_worker_cleanup_snapshot(
@@ -1003,12 +1194,63 @@ impl Store {
         Ok(Some(record_into_lease(record)?))
     }
 
+    pub fn claim_free_pooled_checkout_at_for_incarnation(
+        &self,
+        path: &Path,
+        common_git_dir: &Path,
+        session_id: &str,
+        owner_incarnation_id: &str,
+        branch: &str,
+    ) -> Result<Option<PooledCheckoutLease>> {
+        validate_lease_inputs(session_id, branch)?;
+        let path = absolute_db_path(path)?;
+        let common_git_dir = canonical_db_path(common_git_dir)?;
+        let lease_id = uuid::Uuid::new_v4().to_string();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let selected = tx
+            .query_row(
+                &format!(
+                    "{POOLED_CHECKOUT_COLUMNS}
+                     WHERE path=?1 AND common_git_dir=?2 AND state='free'"
+                ),
+                params![path, common_git_dir],
+                pooled_checkout_row,
+            )
+            .optional()?;
+        let Some(mut record) = selected.map(raw_pooled_checkout).transpose()? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let changed = tx.execute(
+            "UPDATE pooled_checkouts
+             SET state='provisioning',session_id=?2,owner_incarnation_id=?3,
+                 lease_id=?4,branch=?5,quarantine_reason=NULL
+             WHERE path=?1 AND common_git_dir=?6 AND state='free'",
+            params![
+                path,
+                session_id,
+                owner_incarnation_id,
+                lease_id,
+                branch,
+                common_git_dir,
+            ],
+        )?;
+        anyhow::ensure!(changed == 1, "requested pooled checkout changed during claim");
+        tx.commit()?;
+        record.state = PooledCheckoutState::Provisioning;
+        record.session_id = Some(session_id.to_string());
+        record.owner_incarnation_id = Some(owner_incarnation_id.to_string());
+        record.lease_id = Some(lease_id);
+        record.branch = Some(branch.to_string());
+        Ok(Some(record_into_lease(record)?))
+    }
+
     /// Atomically allocates the next slot and reserves its deterministic path.
     pub fn reserve_pooled_checkout_for_incarnation(
         &self,
         source_repo: &Path,
         common_git_dir: &Path,
-        repositories_root: &Path,
         session_id: &str,
         owner_incarnation_id: &str,
         branch: &str,
@@ -1016,7 +1258,6 @@ impl Store {
         validate_lease_inputs(session_id, branch)?;
         let source_repo = canonical_db_path(source_repo)?;
         let common_git_dir = canonical_db_path(common_git_dir)?;
-        let repositories_root = canonical_db_path(repositories_root)?;
         let repository_name = Path::new(&source_repo)
             .file_name()
             .and_then(|name| name.to_str())
@@ -1040,7 +1281,10 @@ impl Store {
             }
             candidate
         };
-        let path = PathBuf::from(&repositories_root)
+        let source_parent = Path::new(&source_repo)
+            .parent()
+            .context("source repository has no parent directory")?;
+        let path = source_parent
             .join(format!("{repository_name}-w{}", slot + 1));
         let path_str = path_text(&path)?;
         tx.execute(
@@ -1399,14 +1643,12 @@ impl Store {
         &self,
         source_repo: &Path,
         common_git_dir: &Path,
-        repositories_root: &Path,
         session_id: &str,
         branch: &str,
     ) -> Result<PooledCheckoutLease> {
         self.reserve_pooled_checkout_for_incarnation(
             source_repo,
             common_git_dir,
-            repositories_root,
             session_id,
             session_id,
             branch,
@@ -2131,7 +2373,7 @@ mod tests {
         session: &str,
     ) -> PooledCheckoutLease {
         let lease = store
-            .reserve_pooled_checkout(source, common, slots, session, &format!("branch-{session}"))
+            .reserve_pooled_checkout(source, common, session, &format!("branch-{session}"))
             .unwrap();
         let admin = slots.join(format!("admin-{session}"));
         std::fs::create_dir_all(&admin).unwrap();
@@ -2229,14 +2471,12 @@ mod tests {
             |store: Store, session: &'static str, barrier: std::sync::Arc<std::sync::Barrier>| {
                 let source = source.clone();
                 let common = common.clone();
-                let slots = slots.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
                     store
                         .reserve_pooled_checkout(
                             &source,
                             &common,
-                            &slots,
                             session,
                             &format!("branch-{session}"),
                         )
@@ -2254,7 +2494,7 @@ mod tests {
     fn pooled_release_requires_matching_session_and_lease() {
         let (store, source, common, slots) = pool_fixture();
         let lease = store
-            .reserve_pooled_checkout(&source, &common, &slots, "owner", "branch-owner")
+            .reserve_pooled_checkout(&source, &common, "owner", "branch-owner")
             .unwrap();
         let admin = slots.join("admin");
         std::fs::create_dir(&admin).unwrap();
@@ -2346,8 +2586,146 @@ mod tests {
     }
 
     #[test]
+    fn restart_reclaims_dead_prebind_allocation_from_capacity() {
+        let root = tempdir().unwrap().keep();
+        let db = root.join("restart.db");
+        let store = Store::open(&db).unwrap();
+        let stale = store
+            .prepare_worker_incarnation("stale", None, 1, "/repo", true, 3)
+            .unwrap();
+        let source = root.join("repo");
+        let common = source.join(".git");
+        let admin = common.join("worktrees").join("stale");
+        std::fs::create_dir_all(&admin).unwrap();
+        let lease = store
+            .reserve_pooled_checkout_for_incarnation(
+                &source,
+                &common,
+                "stale",
+                &stale.incarnation_id,
+                "stale",
+            )
+            .unwrap();
+        assert!(store
+            .finalize_pooled_checkout_for_incarnation(
+                &lease.path,
+                "stale",
+                &stale.incarnation_id,
+                &lease.lease_id,
+                &admin,
+                "identity",
+            )
+            .unwrap());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE worker_incarnations SET allocator_pid=?2
+                 WHERE session_id=?1 AND incarnation_id=?3",
+                params!["stale", 999_999_u32, stale.incarnation_id],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(db).unwrap();
+        assert!(matches!(
+            reopened
+                .current_worker_incarnation("stale")
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkerIncarnationState::Released
+        ));
+        let record = reopened.pooled_checkout_by_path(&lease.path).unwrap().unwrap();
+        assert!(matches!(record.state, PooledCheckoutState::Quarantined));
+        assert!(record.session_id.is_none());
+        for index in 0..3 {
+            reopened
+                .prepare_worker_incarnation(
+                    &format!("replacement-{index}"),
+                    None,
+                    index,
+                    "/repo",
+                    true,
+                    3,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_backfills_legacy_managed_worktree_into_capacity() {
+        let root = tempdir().unwrap().keep();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        let target = root.join("legacy-worker");
+        let mut managed =
+            crate::worktree::ManagedWorktree::new_at(&repo, &target, "legacy", "legacy").unwrap();
+        managed.add_checkout().unwrap();
+        managed.persist().unwrap();
+        let db = root.join("migration.db");
+        let store = Store::open(&db).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO sessions(
+                    id,name,repo,status,agent_type,cost_usd,started_at,workspace_path
+                 ) VALUES('legacy','legacy','','done','claude-code',0,1,?1)",
+                [target.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(db).unwrap();
+        let legacy = reopened
+            .current_worker_incarnation("legacy")
+            .unwrap()
+            .expect("legacy managed worker must count after migration");
+        assert!(legacy.checkout_backed);
+        for index in 0..2 {
+            reopened
+                .prepare_worker_incarnation(
+                    &format!("new-{index}"),
+                    None,
+                    index + 2,
+                    "/repo",
+                    true,
+                    3,
+                )
+                .unwrap();
+        }
+        assert!(reopened
+            .prepare_worker_incarnation("over-cap", None, 4, "/repo", true, 3)
+            .is_err());
+    }
+
+    #[test]
     fn stale_incarnation_cannot_claim_transferred_refile_lease() {
-        let (store, source, common, slots) = pool_fixture();
+        let (store, source, common, _slots) = pool_fixture();
         let old = store
             .prepare_worker_incarnation("worker", Some("orch"), 1, "/repo", true, 3)
             .unwrap();
@@ -2355,7 +2733,6 @@ mod tests {
             .reserve_pooled_checkout_for_incarnation(
                 &source,
                 &common,
-                &slots,
                 "worker",
                 &old.incarnation_id,
                 "worker",
@@ -2391,6 +2768,49 @@ mod tests {
                 &lease.lease_id,
             )
             .unwrap());
+    }
+
+    #[test]
+    fn failed_bind_rollback_cannot_claim_or_detach_refile_successor_lease() {
+        let (store, source, common, _slots) = pool_fixture();
+        let old = store
+            .prepare_worker_incarnation("worker", Some("orch"), 1, "/repo", true, 3)
+            .unwrap();
+        let lease = store
+            .reserve_pooled_checkout_for_incarnation(
+                &source,
+                &common,
+                "worker",
+                &old.incarnation_id,
+                "worker",
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE worker_incarnations SET lease_id=?2 WHERE session_id=?1",
+                params!["worker", lease.lease_id],
+            )
+            .unwrap();
+        let successor = store
+            .prepare_worker_incarnation("worker", Some("orch"), 2, "/repo", true, 3)
+            .unwrap();
+
+        assert!(store
+            .claim_worker_cleanup_with_lease("worker", &old.incarnation_id, &lease.lease_id)
+            .unwrap()
+            .is_none());
+        let record = store.pooled_checkout_by_path(&lease.path).unwrap().unwrap();
+        assert_eq!(
+            record.owner_incarnation_id.as_deref(),
+            Some(successor.incarnation_id.as_str())
+        );
+        assert!(matches!(
+            store.current_worker_incarnation("worker").unwrap().unwrap().state,
+            WorkerIncarnationState::Allocating
+        ));
     }
 
     #[test]
@@ -2436,22 +2856,66 @@ mod tests {
 
     #[test]
     fn removed_low_slot_is_reused_without_suffix_growth() {
-        let (store, source, common, slots) = pool_fixture();
+        let (store, source, common, _slots) = pool_fixture();
         let first = store
-            .reserve_pooled_checkout(&source, &common, &slots, "first", "first")
+            .reserve_pooled_checkout(&source, &common, "first", "first")
             .unwrap();
         let second = store
-            .reserve_pooled_checkout(&source, &common, &slots, "second", "second")
+            .reserve_pooled_checkout(&source, &common, "second", "second")
             .unwrap();
         assert_eq!((first.slot, second.slot), (0, 1));
         assert!(store
             .remove_failed_pooled_checkout(&first.path, "first", &first.lease_id)
             .unwrap());
         let reused = store
-            .reserve_pooled_checkout(&source, &common, &slots, "reused", "reused")
+            .reserve_pooled_checkout(&source, &common, "reused", "reused")
             .unwrap();
         assert_eq!(reused.slot, 0);
         assert!(reused.path.ends_with("source-w1"));
+    }
+
+    #[test]
+    fn pooled_slot_is_derived_from_source_parent() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("repo");
+        let common = source.join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        let store = test_store();
+
+        let lease = store
+            .reserve_pooled_checkout(&source, &common, "worker", "worker")
+            .unwrap();
+
+        assert_eq!(lease.path, root.path().canonicalize().unwrap().join("repo-w1"));
+        assert!(!lease.path.starts_with(source.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn same_named_nested_repositories_get_distinct_sibling_slots() {
+        let root = tempdir().unwrap();
+        let outer = root.path().join("repo");
+        let nested = outer.join("nested").join("repo");
+        let outer_common = outer.join(".git");
+        let nested_common = nested.join(".git");
+        std::fs::create_dir_all(&outer_common).unwrap();
+        std::fs::create_dir_all(&nested_common).unwrap();
+        let store = test_store();
+
+        let outer_lease = store
+            .reserve_pooled_checkout(&outer, &outer_common, "outer", "outer")
+            .unwrap();
+        let nested_lease = store
+            .reserve_pooled_checkout(&nested, &nested_common, "nested", "nested")
+            .unwrap();
+
+        let canonical_root = root.path().canonicalize().unwrap();
+        assert_eq!(outer_lease.path, canonical_root.join("repo-w1"));
+        assert_eq!(
+            nested_lease.path,
+            canonical_root.join("repo").join("nested").join("repo-w1")
+        );
+        assert_ne!(outer_lease.path, nested_lease.path);
+        assert!(!nested_lease.path.starts_with(nested.canonicalize().unwrap()));
     }
 
     #[test]

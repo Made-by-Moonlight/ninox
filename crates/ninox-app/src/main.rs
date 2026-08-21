@@ -8,8 +8,7 @@ mod theme;
 
 use anyhow::Context as _;
 use spawn_util::{
-    acquire_worker_checkout_for_incarnation, repo_from_workspace, rollback_worker_checkout,
-    seed_worker_brain_skill,
+    acquire_worker_checkout_for_incarnation, repo_from_workspace, seed_worker_brain_skill,
 };
 use ninox_core::{
     config::AppConfig,
@@ -341,24 +340,6 @@ async fn run_spawn(
     let checkout_backed =
         ninox_core::worktree::RepositoryIdentity::resolve(std::path::Path::new(&workspace)).is_ok();
     let checkout_cap = config.validated_worker_checkout_cap()?;
-    let incarnation = match store.prepare_worker_incarnation(
-        &id,
-        orchestrator_id.as_deref(),
-        ts,
-        &workspace,
-        checkout_backed,
-        checkout_cap,
-    ) {
-        Ok(incarnation) => incarnation,
-        Err(error) if error.to_string().contains("worker cap reached") => {
-            let candidates = store.checkout_worker_candidates(orchestrator_id.as_deref())?;
-            anyhow::bail!(
-                "{error}. {}",
-                release_candidate_guidance(orchestrator_id.as_deref(), &candidates)
-            )
-        }
-        Err(error) => return Err(error),
-    };
     let mut pending = Session {
         id: id.clone(),
         orchestrator_id: orchestrator_id.clone(),
@@ -383,16 +364,29 @@ async fn run_spawn(
         terminal_at: None,
         gate_status: None,
     };
-    if let Err(error) = store.upsert_session(&pending) {
-        rollback_worker_incarnation(
-            store.clone(),
-            &id,
-            &incarnation.incarnation_id,
-            None,
-        )
-        .await;
-        return Err(error);
-    }
+    store.upsert_session(&pending)?;
+    let incarnation = match store.prepare_worker_incarnation(
+        &id,
+        orchestrator_id.as_deref(),
+        ts,
+        &workspace,
+        checkout_backed,
+        checkout_cap,
+    ) {
+        Ok(incarnation) => incarnation,
+        Err(error) if error.to_string().contains("worker cap reached") => {
+            let _ = store.delete_session(&id);
+            let candidates = store.checkout_worker_candidates(orchestrator_id.as_deref())?;
+            anyhow::bail!(
+                "{error}. {}",
+                release_candidate_guidance(orchestrator_id.as_deref(), &candidates)
+            )
+        }
+        Err(error) => {
+            let _ = store.delete_session(&id);
+            return Err(error);
+        }
+    };
 
     let repositories_root = config.resolved_repositories_root();
     let checkout = match acquire_worker_checkout_for_incarnation(
@@ -478,13 +472,28 @@ async fn run_spawn(
 
     // Append worker context so every agent knows its session ID, delivery
     // contract, orchestrator ID, and how to communicate back when done.
-    let mut effective_prompt = worker_prompt_for_canonical_workspace(
+    let mut effective_prompt = match worker_prompt_for_canonical_workspace(
         &prompt,
         &workspace,
         &canonical_source_workspace,
         &effective_workspace,
         delivery,
-    );
+    ) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            pending.status = SessionStatus::Terminated;
+            pending.workspace_path = Some(workspace.clone());
+            let _ = store.upsert_session(&pending);
+            rollback_worker_incarnation(
+                store.clone(),
+                &id,
+                &incarnation.incarnation_id,
+                checkout.as_ref(),
+            )
+            .await;
+            return Err(error.context("prepare worker prompt"));
+        }
+    };
     if !orch_id_env.is_empty() {
         effective_prompt.push_str(&worker_context_footer(&id, &orch_id_env, delivery));
     }
@@ -532,9 +541,22 @@ async fn run_spawn(
     // -e PATH=..., because the login shell (-l) sources rc files that may
     // re-prepend Homebrew or nvm directories, pushing our wrapper behind the
     // real `gh`. By exporting PATH here we win the race after rc files run.
-    let cmd_base = registry
-        .worker_cmd(&agent, &effective_prompt, &claude_session_id)
-        .expect("worker-capability checked before any side effect above");
+    let Some(cmd_base) = registry.worker_cmd(&agent, &effective_prompt, &claude_session_id) else {
+        pending.status = SessionStatus::Terminated;
+        pending.workspace_path = Some(workspace.clone());
+        let _ = store.upsert_session(&pending);
+        rollback_worker_incarnation(
+            store.clone(),
+            &id,
+            &incarnation.incarnation_id,
+            checkout.as_ref(),
+        )
+        .await;
+        anyhow::bail!(
+            "harness '{}' lost its worker capability during spawn",
+            agent.harness
+        );
+    };
     let cmd = format!(
         "export PATH='{}':\"$PATH\"; {}",
         ninox_bin_str.replace('\'', "'\\''"),
@@ -592,16 +614,13 @@ async fn rollback_worker_incarnation(
     incarnation_id: &str,
     checkout: Option<&spawn_util::WorkerCheckout>,
 ) {
-    if let Ok(Some(claim)) = store.claim_worker_cleanup(session_id, incarnation_id) {
-        if let Some(checkout) = checkout {
-            let _ = rollback_worker_checkout(store.clone(), checkout, session_id).await;
-        }
-        let _ = store.complete_worker_claim(
-            session_id,
-            &claim.incarnation_id,
-            ninox_core::types::WorkerIncarnationState::CleanupClaimed,
-        );
-    }
+    let _ = spawn_util::rollback_worker_incarnation_checkout(
+        store,
+        session_id,
+        incarnation_id,
+        checkout,
+    )
+    .await;
 }
 
 fn reject_recursive_worker_spawn(caller_type: Option<&str>) -> anyhow::Result<()> {
@@ -677,7 +696,7 @@ fn worker_prompt_for_workspace(
     source_workspace: &str,
     worker_workspace: &str,
     delivery: WorkerDelivery,
-) -> String {
+) -> anyhow::Result<String> {
     let canonical_source = ninox_core::worktree::RepositoryIdentity::resolve(
         std::path::Path::new(source_workspace),
     )
@@ -701,13 +720,12 @@ fn worker_prompt_for_canonical_workspace(
     canonical_source: &str,
     worker_workspace: &str,
     delivery: WorkerDelivery,
-) -> String {
+) -> anyhow::Result<String> {
     let remapped = remap_workspace_paths(
         prompt,
         workspace_path_mappings(source_workspace, canonical_source, worker_workspace),
         worker_workspace,
-    )
-    .expect("workspace remapping must not retain source-checkout aliases");
+    )?;
     let source_note = if canonical_source == worker_workspace {
         String::new()
     } else {
@@ -721,11 +739,11 @@ fn worker_prompt_for_canonical_workspace(
         WorkerDelivery::Direct =>
             "Perform all task work and write artifacts or direct changes inside it.",
     };
-    format!(
+    Ok(format!(
         "{remapped}\n\n---\n\
          **Ninox workspace:** `{worker_workspace}` is the authoritative workspace. \
          {workspace_contract}{source_note}"
-    )
+    ))
 }
 
 fn workspace_path_mappings(
@@ -950,8 +968,10 @@ fn percent_encode_file_uri_path(path: &str) -> String {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~') {
             encoded.push(char::from(byte));
         } else {
-            use std::fmt::Write as _;
-            write!(encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
         }
     }
     encoded
@@ -1177,25 +1197,37 @@ async fn run_release(
         &orchestrator_ids,
         env("NINOX_CALLER_TYPE").as_deref(),
     );
-    let orchestrator_id = resolve_release_orchestrator(
-        orchestrator_id,
-        env("NINOX_ORCHESTRATOR_ID"),
-        caller,
-        env_session,
-    )?;
     let session = store
         .get_session(session_id)?
         .with_context(|| format!("no worker named {session_id}"))?;
-    anyhow::ensure!(
-        session.orchestrator_id.as_deref() == Some(orchestrator_id.as_str()),
-        "worker {session_id} is not owned by orchestrator {orchestrator_id}"
-    );
+    let ambient_orchestrator = env("NINOX_ORCHESTRATOR_ID");
+    let owner = if let Some(owner) = session.orchestrator_id.as_deref() {
+        let resolved = resolve_release_orchestrator(
+            orchestrator_id,
+            ambient_orchestrator,
+            caller,
+            env_session,
+        )?;
+        anyhow::ensure!(
+            owner == resolved,
+            "worker {session_id} is not owned by orchestrator {resolved}"
+        );
+        Some(resolved)
+    } else {
+        validate_standalone_release_scope(
+            session_id,
+            orchestrator_id.as_deref(),
+            ambient_orchestrator.as_deref(),
+            env_session.as_deref(),
+        )?;
+        None
+    };
     let worker = store
         .current_worker_incarnation(session_id)?
         .with_context(|| format!("worker {session_id} has no durable checkout capability"))?;
     anyhow::ensure!(
-        worker.orchestrator_id.as_deref() == Some(orchestrator_id.as_str()),
-        "worker checkout ownership does not match orchestrator {orchestrator_id}"
+        worker.orchestrator_id.as_deref() == owner.as_deref(),
+        "worker checkout ownership does not match its session owner"
     );
     let _release_lock = lock_worker_release(&store, &worker)?;
     let worker = store
@@ -1242,6 +1274,23 @@ async fn run_release(
             Err(error)
         }
     }
+}
+
+fn validate_standalone_release_scope(
+    session_id: &str,
+    requested_orchestrator: Option<&str>,
+    ambient_orchestrator: Option<&str>,
+    caller_session: Option<&str>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        requested_orchestrator.is_none() && ambient_orchestrator.is_none(),
+        "standalone worker {session_id} has no orchestrator owner"
+    );
+    anyhow::ensure!(
+        caller_session.is_none_or(|caller| caller == session_id),
+        "standalone worker {session_id} cannot be released from another session"
+    );
+    Ok(())
 }
 
 fn lock_worker_release(
@@ -2134,6 +2183,78 @@ mod worker_env_tests {
         );
     }
 
+    #[tokio::test]
+    async fn malformed_prompt_after_lease_binding_rolls_back_incarnation_and_lease() {
+        use std::sync::Arc;
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        let store = Arc::new(
+            ninox_core::store::Store::open(root.path().join("t.db")).unwrap(),
+        );
+        let config = ninox_core::config::AppConfig {
+            repositories_root: Some(root.path().to_path_buf()),
+            worktree_root: Some(root.path().join("managed")),
+            ..Default::default()
+        };
+        let prompt = format!("inspect file://{}/bad%GG", repo.display());
+
+        let error = run_spawn(
+            store.clone(),
+            config,
+            prompt,
+            repo.to_string_lossy().into_owned(),
+            None,
+            Some("malformed-prompt".into()),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("prepare worker prompt"), "{error:#}");
+        assert!(matches!(
+            store
+                .current_worker_incarnation("malformed-prompt")
+                .unwrap()
+                .unwrap()
+                .state,
+            ninox_core::types::WorkerIncarnationState::Released
+        ));
+        assert!(store
+            .pooled_checkout_by_session("malformed-prompt")
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            store
+                .pooled_checkouts_by_repo(&repo)
+                .unwrap()
+                .as_slice(),
+            [record] if matches!(record.state, ninox_core::types::PooledCheckoutState::Free)
+        ));
+    }
+
     #[test]
     fn first_line_takes_first_non_empty_line_trimmed() {
         assert_eq!(first_line("  Fix the flaky test  \n\nDetails follow.", 140).as_deref(), Some("Fix the flaky test"));
@@ -2212,7 +2333,8 @@ mod worker_env_tests {
             "/Users/mu/dev/repo",
             "/Users/mu/dev/_wts/repo/worker-1",
             WorkerDelivery::Pr,
-        );
+        )
+        .unwrap();
 
         assert!(!mapped.contains("/Users/mu/dev/repo"));
         assert_eq!(
@@ -2254,7 +2376,8 @@ mod worker_env_tests {
             source.to_str().unwrap(),
             worker.to_str().unwrap(),
             WorkerDelivery::Pr,
-        );
+        )
+        .unwrap();
 
         assert!(
             mapped.contains(&format!("{}/src/nested/deep.rs", worker.display())),
@@ -2275,7 +2398,8 @@ mod worker_env_tests {
             "/tmp/research",
             "/tmp/research",
             WorkerDelivery::Direct,
-        );
+        )
+        .unwrap();
 
         assert!(prompt.contains("write artifacts or direct changes"));
         assert!(!prompt.contains("Git command"));
@@ -2308,5 +2432,103 @@ mod worker_env_tests {
         assert!(reject_recursive_worker_spawn(Some("worker")).is_err());
         assert!(reject_recursive_worker_spawn(Some("orchestrator")).is_ok());
         assert!(reject_recursive_worker_spawn(None).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod release_cli_tests {
+    use super::{caller_is_orchestrator, resolve_release_orchestrator, validate_standalone_release_scope};
+
+    #[test]
+    fn standalone_release_allows_local_admin_or_exact_session_only() {
+        assert!(validate_standalone_release_scope("solo", None, None, None).is_ok());
+        assert!(
+            validate_standalone_release_scope("solo", None, None, Some("solo")).is_ok()
+        );
+        assert!(
+            validate_standalone_release_scope("solo", None, None, Some("other")).is_err()
+        );
+        assert!(
+            validate_standalone_release_scope("solo", Some("orch"), None, None).is_err()
+        );
+        assert!(
+            validate_standalone_release_scope("solo", None, Some("orch"), None).is_err()
+        );
+    }
+
+    fn orch(s: &str) -> Option<String> { Some(s.to_string()) }
+
+    #[test]
+    fn release_guard_accepts_an_orchestrator_session() {
+        let id = resolve_release_orchestrator(None, orch("orch-1"), true, orch("orch-1")).unwrap();
+        assert_eq!(id, "orch-1");
+    }
+
+    #[test]
+    fn release_guard_refuses_a_worker_session() {
+        // A worker carries NINOX_ORCHESTRATOR_ID (its parent's) but no
+        // caller type — that ambient id must not make its siblings' checkouts releasable.
+        let err = resolve_release_orchestrator(None, orch("orch-1"), false, orch("w1"))
+            .expect_err("a worker must not release")
+            .to_string();
+        assert!(err.contains("cannot release its siblings"), "{err}");
+    }
+
+    /// `--orchestrator-id` is for out-of-session use, not an escape hatch. A
+    /// worker passing its own parent's id would otherwise release its
+    /// sibling fleet's checkouts.
+    #[test]
+    fn release_guard_refuses_a_worker_even_with_an_explicit_orchestrator_id() {
+        let err = resolve_release_orchestrator(orch("orch-1"), orch("orch-1"), false, orch("w1"))
+            .expect_err("--orchestrator-id must not bypass the guard")
+            .to_string();
+        assert!(err.contains("with or without --orchestrator-id"), "{err}");
+    }
+
+    #[test]
+    fn release_guard_allows_an_explicit_id_outside_any_session() {
+        // A human at a terminal / a script: no session env at all.
+        let id = resolve_release_orchestrator(orch("orch-7"), None, false, None).unwrap();
+        assert_eq!(id, "orch-7");
+    }
+
+    #[test]
+    fn release_guard_needs_an_id_from_somewhere() {
+        let err = resolve_release_orchestrator(None, None, false, None)
+            .expect_err("no id anywhere must fail")
+            .to_string();
+        assert!(err.contains("NINOX_ORCHESTRATOR_ID"), "{err}");
+    }
+
+    #[test]
+    fn release_guard_prefers_the_explicit_id_over_the_ambient_one() {
+        let id = resolve_release_orchestrator(
+            orch("orch-explicit"), orch("orch-ambient"), true, orch("orch-ambient"),
+        ).unwrap();
+        assert_eq!(id, "orch-explicit");
+    }
+
+    /// The store, not the environment, decides who is an orchestrator.
+    /// `NINOX_CALLER_TYPE` lives in the agent's own shell, so if it were
+    /// trusted a worker could `export NINOX_CALLER_TYPE=orchestrator` and
+    /// release its whole fleet's checkouts.
+    #[test]
+    fn caller_type_env_cannot_promote_a_worker_to_an_orchestrator() {
+        assert!(
+            !caller_is_orchestrator(Some("w1"), &["orch-1"], Some("orchestrator")),
+            "a spoofed caller type must not beat the store",
+        );
+    }
+
+    #[test]
+    fn a_session_id_that_is_an_orchestrator_row_is_an_orchestrator() {
+        assert!(caller_is_orchestrator(Some("orch-1"), &["orch-1", "orch-2"], None));
+    }
+
+    #[test]
+    fn caller_type_is_only_consulted_outside_a_session() {
+        // A plain shell has no NINOX_SESSION to look up.
+        assert!(caller_is_orchestrator(None, &[], Some("orchestrator")));
+        assert!(!caller_is_orchestrator(None, &[], None));
     }
 }

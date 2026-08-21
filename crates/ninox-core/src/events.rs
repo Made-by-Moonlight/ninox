@@ -683,7 +683,6 @@ mod tests {
             .reserve_pooled_checkout(
                 &identity.top_level,
                 &identity.common_git_dir,
-                root.path(),
                 "pooled-done",
                 "pooled-done",
             )

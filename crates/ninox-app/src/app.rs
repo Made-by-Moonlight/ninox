@@ -1312,6 +1312,33 @@ impl App {
                             }
                             return Task::none();
                         }
+                        let session = Session {
+                            id:              sid.clone(),
+                            orchestrator_id: None,
+                            name:            name.clone(),
+                            repo:            String::new(),
+                            status:          SessionStatus::Spawning,
+                            agent_type:      agent.harness.clone(),
+                            cost_usd:        0.0,
+                            started_at:      ts as i64,
+                            pr_number:       None,
+                            pr_id:           None,
+                            workspace_path:  Some(workspace.clone()),
+                            pid:             None,
+                            model:           agent.model.clone(),
+                            context_tokens:  None,
+                            catalogue_path:  Some(catalogue_path.clone()),
+                            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+                            claude_session_id: Some(claude_session_id.clone()),
+                            summary:         None,
+                            terminal_at:         None, gate_status: None,
+                        };
+                        if let Err(error) = state.engine.store.upsert_session(&session) {
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(error.to_string());
+                            }
+                            return Task::none();
+                        }
                         let exact_worktree_path = !std::path::Path::new(&workspace).exists();
                         let mut exact_worktree_source = None;
                         let mut prepared_incarnation = None;
@@ -1331,6 +1358,7 @@ impl App {
                                     let cap = match state.config.validated_worker_checkout_cap() {
                                         Ok(cap) => cap,
                                         Err(error) => {
+                                            let _ = state.engine.store.delete_session(&sid);
                                             if let Some(f) = &mut state.spawn_modal {
                                                 f.error = Some(checkout_error_with_candidates(
                                                     &state.engine,
@@ -1352,6 +1380,7 @@ impl App {
                                     {
                                         Ok(incarnation) => incarnation,
                                         Err(error) => {
+                                            let _ = state.engine.store.delete_session(&sid);
                                             if let Some(f) = &mut state.spawn_modal {
                                                 f.error = Some(checkout_error_with_candidates(
                                                     &state.engine,
@@ -1377,18 +1406,13 @@ impl App {
                                             preallocated_checkout = Some(checkout);
                                         }
                                         Err(error) => {
-                                            if let Ok(Some(claim)) = state.engine.store
-                                                .claim_worker_cleanup(
+                                            crate::spawn_util::
+                                                release_unbound_worker_incarnation_blocking(
+                                                    &state.engine.store,
                                                     &sid,
                                                     &incarnation.incarnation_id,
-                                                )
-                                            {
-                                                let _ = state.engine.store.complete_worker_claim(
-                                                    &sid,
-                                                    &claim.incarnation_id,
-                                                    ninox_core::types::WorkerIncarnationState::CleanupClaimed,
                                                 );
-                                            }
+                                            let _ = state.engine.store.delete_session(&sid);
                                             if let Some(f) = &mut state.spawn_modal {
                                                 f.error = Some(format!(
                                                     "failed to create worktree at {workspace}: {error}"
@@ -1406,6 +1430,7 @@ impl App {
                                     if let Some(f) = &mut state.spawn_modal {
                                         f.error = Some(format!("workspace {workspace} does not exist"));
                                     }
+                                    let _ = state.engine.store.delete_session(&sid);
                                     return Task::none();
                                 }
                             }
@@ -1427,28 +1452,6 @@ impl App {
                             }
                         }
 
-                        let session = Session {
-                            id:              sid.clone(),
-                            orchestrator_id: None,
-                            name:            name.clone(),
-                            repo:            String::new(),
-                            status:          SessionStatus::Working,
-                            agent_type:      agent.harness.clone(),
-                            cost_usd:        0.0,
-                            started_at:      ts as i64,
-                            pr_number:       None,
-                            pr_id:           None,
-                            workspace_path:  Some(workspace.clone()),
-                            pid:             None,
-                            model:           agent.model.clone(),
-                            context_tokens:  None,
-                            catalogue_path:  Some(catalogue_path.clone()),
-                            context_used_pct: None, context_total_tokens: None, context_window_size: None,
-                            claude_session_id: Some(claude_session_id.clone()),
-                            summary:         None,
-                            terminal_at:         None, gate_status: None,
-                        };
-                        let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
                         state.engine.emit(Event::SessionSpawned(session));
 
@@ -1553,16 +1556,14 @@ impl App {
                                                 | SessionFields::WORKSPACE,
                                         ));
                                     }
-                                    if let Ok(Some(claim)) = engine.store.claim_worker_cleanup(
-                                        &sid,
-                                        &incarnation.incarnation_id,
-                                    ) {
-                                        let _ = engine.store.complete_worker_claim(
+                                    let _ = crate::spawn_util::
+                                        rollback_worker_incarnation_checkout(
+                                            engine.store.clone(),
                                             &sid,
-                                            &claim.incarnation_id,
-                                            ninox_core::types::WorkerIncarnationState::CleanupClaimed,
-                                        );
-                                    }
+                                            &incarnation.incarnation_id,
+                                            None,
+                                        )
+                                        .await;
                                     return Message::Noop;
                                 }
                             };
@@ -1581,10 +1582,12 @@ impl App {
                                     "worker incarnation changed before checkout binding"
                                 );
                                 emit_checkout_unavailable(&engine, &sid, &nm, &error);
-                                let _ = crate::spawn_util::rollback_worker_checkout(
+                                let _ = crate::spawn_util::
+                                    rollback_worker_incarnation_checkout(
                                     engine.store.clone(),
-                                    &checkout,
                                     &sid,
+                                    &incarnation.incarnation_id,
+                                    Some(&checkout),
                                 )
                                 .await;
                                 return Message::Noop;
@@ -1623,22 +1626,14 @@ impl App {
                             match attach {
                                 Some(argv) => Message::ClientAttach { session_id: attach_sid, argv },
                                 None => {
-                                    if let Ok(Some(claim)) = engine.store.claim_worker_cleanup(
+                                    let _ = crate::spawn_util::
+                                        rollback_worker_incarnation_checkout(
+                                        engine.store.clone(),
                                         &attach_sid,
                                         &incarnation.incarnation_id,
-                                    ) {
-                                        let _ = crate::spawn_util::rollback_worker_checkout(
-                                            engine.store.clone(),
-                                            &checkout,
-                                            &attach_sid,
-                                        )
-                                        .await;
-                                        let _ = engine.store.complete_worker_claim(
-                                            &attach_sid,
-                                            &claim.incarnation_id,
-                                            ninox_core::types::WorkerIncarnationState::CleanupClaimed,
-                                        );
-                                    }
+                                        Some(&checkout),
+                                    )
+                                    .await;
                                     Message::Noop
                                 }
                             }
@@ -1937,14 +1932,15 @@ impl App {
                         {
                             let source_repo =
                                 prior_pool.source_repo.to_string_lossy().to_string();
+                            let Some(worker_incarnation) = incarnation.as_ref() else {
+                                tracing::error!("re-file {id}: worker incarnation was not prepared");
+                                return Message::Noop;
+                            };
                             match crate::spawn_util::acquire_worker_checkout_for_incarnation(
                                 engine.store.clone(),
                                 &source_repo,
                                 &id,
-                                &incarnation
-                                    .as_ref()
-                                    .expect("worker Re-file has an incarnation")
-                                    .incarnation_id,
+                                &worker_incarnation.incarnation_id,
                                 repositories_root.as_deref(),
                                 &worktree_root,
                                 inbox_enabled,
@@ -1977,6 +1973,14 @@ impl App {
                                         &name,
                                         &error,
                                     );
+                                    let _ = crate::spawn_util::
+                                        rollback_worker_incarnation_checkout(
+                                            engine.store.clone(),
+                                            &id,
+                                            &worker_incarnation.incarnation_id,
+                                            None,
+                                        )
+                                        .await;
                                     return Message::Noop;
                                 }
                             }
@@ -1994,6 +1998,16 @@ impl App {
                     ).await {
                         tracing::warn!("re-file {id}: cannot restore workspace: {e}");
                         emit_checkout_unavailable(&engine, &id, &name, &e);
+                        if let Some(incarnation) = &incarnation {
+                            let _ = crate::spawn_util::
+                                rollback_worker_incarnation_checkout(
+                                    engine.store.clone(),
+                                    &id,
+                                    &incarnation.incarnation_id,
+                                    reacquired_checkout.as_ref(),
+                                )
+                                .await;
+                        }
                         return Message::Noop;
                     }
                     if let Some(incarnation) = &incarnation {
@@ -2022,6 +2036,14 @@ impl App {
                                 "worker incarnation changed before Re-file binding"
                             );
                             emit_checkout_unavailable(&engine, &id, &name, &error);
+                            let _ = crate::spawn_util::
+                                rollback_worker_incarnation_checkout(
+                                    engine.store.clone(),
+                                    &id,
+                                    &incarnation.incarnation_id,
+                                    reacquired_checkout.as_ref(),
+                                )
+                                .await;
                             return Message::Noop;
                         }
                     }
