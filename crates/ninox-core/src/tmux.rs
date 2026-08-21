@@ -174,6 +174,7 @@ fn is_missing_session(e: &anyhow::Error) -> bool {
     let msg = e.to_string();
     msg.contains("can't find session")
         || msg.contains("session not found")
+        || msg.contains("no such session")
         || msg.contains("no server running")
         || msg.contains("no sessions")
         // tmux's message for a session-targeted command (has-session,
@@ -333,6 +334,26 @@ pub async fn kill_session(id: &str) -> Result<()> {
 /// Returns `true` if a tmux session with this name is currently running.
 pub async fn has_session(id: &str) -> bool {
     run_session_scoped(&["has-session", "-t", id]).await.is_ok()
+}
+
+/// Read one variable from an exact tmux session. `None` means the session is
+/// absent; a live session without the requested capability is an error.
+pub async fn session_env(id: &str, key: &str) -> Result<Option<String>> {
+    anyhow::ensure!(
+        !key.is_empty() && !key.contains('='),
+        "invalid tmux environment key"
+    );
+    match run_session_scoped(&["show-environment", "-t", id, key]).await {
+        Ok(value) => {
+            let prefix = format!("{key}=");
+            value
+                .strip_prefix(&prefix)
+                .map(|value| Some(value.to_string()))
+                .context("live tmux session is missing its runtime capability")
+        }
+        Err(error) if is_missing_session(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// List every live tmux session.  Sessions on the ninox server are listed

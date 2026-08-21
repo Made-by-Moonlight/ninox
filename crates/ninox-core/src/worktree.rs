@@ -532,6 +532,16 @@ fn recover_identity_marker_exclusively(worktree_git_dir: &Path, marker: &Path) -
 }
 
 impl ManagedWorktree {
+    pub fn pool_root(
+        source_repo: &Path,
+        remote_repo: Option<&str>,
+        worktree_root: &Path,
+    ) -> Result<PathBuf> {
+        let identity = RepositoryIdentity::resolve(source_repo)?;
+        let root = absolute_path(worktree_root)?;
+        Ok(root.join(repo_key(&identity.common_git_dir, remote_repo)))
+    }
+
     pub fn new(
         source_repo: &Path,
         remote_repo: Option<&str>,
@@ -540,12 +550,11 @@ impl ManagedWorktree {
     ) -> Result<Self> {
         validate_session_id(session_id)?;
         let identity = RepositoryIdentity::resolve(source_repo)?;
-        let root = absolute_path(worktree_root)?;
-        let key = repo_key(&identity.common_git_dir, remote_repo);
+        let pool_root = Self::pool_root(source_repo, remote_repo, worktree_root)?;
         Ok(Self {
             session_id: session_id.to_string(),
             source_repo: identity.top_level,
-            worktree_path: root.join(key).join(session_id),
+            worktree_path: pool_root.join(session_id),
             common_git_dir: Some(identity.common_git_dir),
             worktree_git_dir: None,
             worktree_identity: None,
@@ -962,6 +971,7 @@ mod tests {
             source_repo: repo_identity.top_level,
             common_git_dir: repo_identity.common_git_dir,
             slot: 0,
+            kind: crate::types::PooledCheckoutKind::Sibling,
             worktree_git_dir: identity.map(|pooled| pooled.worktree_git_dir.clone()),
             worktree_identity: identity.map(|pooled| pooled.worktree_identity.clone()),
             session_id: session_id.to_string(),

@@ -13,6 +13,15 @@ pub enum PooledCheckoutState {
     Quarantined,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PooledCheckoutKind {
+    Sibling,
+    Managed,
+    Explicit,
+    UnsafeLegacy,
+}
+
 /// Durable registry entry for a reusable linked Git worktree.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PooledCheckoutRecord {
@@ -20,6 +29,7 @@ pub struct PooledCheckoutRecord {
     pub source_repo: std::path::PathBuf,
     pub common_git_dir: std::path::PathBuf,
     pub slot: u32,
+    pub kind: PooledCheckoutKind,
     pub worktree_git_dir: Option<std::path::PathBuf>,
     pub worktree_identity: Option<String>,
     pub state: PooledCheckoutState,
@@ -40,6 +50,7 @@ pub struct PooledCheckoutLease {
     pub source_repo: std::path::PathBuf,
     pub common_git_dir: std::path::PathBuf,
     pub slot: u32,
+    pub kind: PooledCheckoutKind,
     pub worktree_git_dir: Option<std::path::PathBuf>,
     pub worktree_identity: Option<String>,
     pub session_id: SessionId,
@@ -405,7 +416,10 @@ mod tests {
             (NotificationKind::UpdateAvailable, "\"update_available\""),
             (NotificationKind::UpdateInstalled, "\"update_installed\""),
             (NotificationKind::UpdateFailed,    "\"update_failed\""),
-            (NotificationKind::CheckoutUnavailable, "\"checkout_unavailable\""),
+            (
+                NotificationKind::CheckoutUnavailable,
+                "\"checkout_unavailable\"",
+            ),
         ] {
             assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
             let parsed: NotificationKind = serde_json::from_str(wire).unwrap();

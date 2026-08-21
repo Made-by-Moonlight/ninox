@@ -397,6 +397,7 @@ async fn release_pooled_checkout(
         source_repo: record.source_repo,
         common_git_dir: record.common_git_dir,
         slot: record.slot,
+        kind: record.kind,
         worktree_git_dir: record.worktree_git_dir,
         worktree_identity: record.worktree_identity,
         session_id: session_id.to_string(),

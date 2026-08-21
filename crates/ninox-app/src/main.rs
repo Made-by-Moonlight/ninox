@@ -340,7 +340,7 @@ async fn run_spawn(
     let checkout_backed =
         ninox_core::worktree::RepositoryIdentity::resolve(std::path::Path::new(&workspace)).is_ok();
     let checkout_cap = config.validated_worker_checkout_cap()?;
-    let mut pending = Session {
+    let pending = Session {
         id: id.clone(),
         orchestrator_id: orchestrator_id.clone(),
         name: display_name.clone(),
@@ -364,7 +364,10 @@ async fn run_spawn(
         terminal_at: None,
         gate_status: None,
     };
-    store.upsert_session(&pending)?;
+    anyhow::ensure!(
+        store.insert_spawning_session(&pending)?,
+        "session {id} already exists"
+    );
     let incarnation = match store.prepare_worker_incarnation(
         &id,
         orchestrator_id.as_deref(),
@@ -375,7 +378,7 @@ async fn run_spawn(
     ) {
         Ok(incarnation) => incarnation,
         Err(error) if error.to_string().contains("worker cap reached") => {
-            let _ = store.delete_session(&id);
+            let _ = store.delete_spawning_session_snapshot(&id, ts, None);
             let candidates = store.checkout_worker_candidates(orchestrator_id.as_deref())?;
             anyhow::bail!(
                 "{error}. {}",
@@ -383,7 +386,7 @@ async fn run_spawn(
             )
         }
         Err(error) => {
-            let _ = store.delete_session(&id);
+            let _ = store.delete_spawning_session_snapshot(&id, ts, None);
             return Err(error);
         }
     };
@@ -402,16 +405,12 @@ async fn run_spawn(
     {
         Ok(checkout) => Some(checkout),
         Err(error) => {
-            pending.status = SessionStatus::Terminated;
-            pending.workspace_path = Some(workspace.clone());
-            let _ = store.upsert_session(&pending);
-            rollback_worker_incarnation(
-                store.clone(),
-                &id,
-                &incarnation.incarnation_id,
-                None,
-            )
-            .await;
+            let rolled_back =
+                rollback_worker_incarnation(store.clone(), &id, &incarnation.incarnation_id, None)
+                    .await;
+            if rolled_back {
+                let _ = store.terminalize_spawning_session_snapshot(&id, ts, &workspace);
+            }
             return Err(error);
         }
     };
@@ -421,8 +420,11 @@ async fn run_spawn(
     let canonical_source_workspace = checkout
         .as_ref()
         .map_or_else(|| workspace.clone(), |checkout| checkout.source_workspace.clone());
-    pending.workspace_path = Some(effective_workspace.clone());
-    if let Err(error) = store.upsert_session(&pending) {
+    if !store.update_spawning_session_workspace_snapshot(
+        &id,
+        ts,
+        &effective_workspace,
+    )? {
         rollback_worker_incarnation(
             store.clone(),
             &id,
@@ -430,7 +432,7 @@ async fn run_spawn(
             checkout.as_ref(),
         )
         .await;
-        return Err(error);
+        anyhow::bail!("worker session changed before checkout binding");
     }
     if !store.bind_worker_incarnation(
             &id,
@@ -481,16 +483,16 @@ async fn run_spawn(
     ) {
         Ok(prompt) => prompt,
         Err(error) => {
-            pending.status = SessionStatus::Terminated;
-            pending.workspace_path = Some(workspace.clone());
-            let _ = store.upsert_session(&pending);
-            rollback_worker_incarnation(
+            let rolled_back = rollback_worker_incarnation(
                 store.clone(),
                 &id,
                 &incarnation.incarnation_id,
                 checkout.as_ref(),
             )
             .await;
+            if rolled_back {
+                let _ = store.terminalize_spawning_session_snapshot(&id, ts, &workspace);
+            }
             return Err(error.context("prepare worker prompt"));
         }
     };
@@ -542,16 +544,16 @@ async fn run_spawn(
     // re-prepend Homebrew or nvm directories, pushing our wrapper behind the
     // real `gh`. By exporting PATH here we win the race after rc files run.
     let Some(cmd_base) = registry.worker_cmd(&agent, &effective_prompt, &claude_session_id) else {
-        pending.status = SessionStatus::Terminated;
-        pending.workspace_path = Some(workspace.clone());
-        let _ = store.upsert_session(&pending);
-        rollback_worker_incarnation(
+        let rolled_back = rollback_worker_incarnation(
             store.clone(),
             &id,
             &incarnation.incarnation_id,
             checkout.as_ref(),
         )
         .await;
+        if rolled_back {
+            let _ = store.terminalize_spawning_session_snapshot(&id, ts, &workspace);
+        }
         anyhow::bail!(
             "harness '{}' lost its worker capability during spawn",
             agent.harness
@@ -578,6 +580,7 @@ async fn run_spawn(
 
     let env_vec = worker_env_vars(
         &id,
+        &incarnation.incarnation_id,
         &sessions_dir_str,
         &orch_id_env,
         ninox_brain_env.as_deref(),
@@ -590,17 +593,15 @@ async fn run_spawn(
     // invisible to poll_pids and would linger until the next app restart's
     // reconciliation.
     if let Err(e) = tmux::create_session(&id, &effective_workspace, &cmd, &env_vec).await {
-        rollback_worker_incarnation(
+        let rolled_back = rollback_worker_incarnation(
             store.clone(),
             &id,
             &incarnation.incarnation_id,
             checkout.as_ref(),
         )
         .await;
-        if let Ok(Some(mut s)) = store.get_session(&id) {
-            s.status = SessionStatus::Terminated;
-            s.workspace_path = Some(workspace.clone());
-            let _ = store.upsert_session(&s);
+        if rolled_back {
+            let _ = store.terminalize_spawning_session_snapshot(&id, ts, &workspace);
         }
         return Err(e);
     }
@@ -613,14 +614,9 @@ async fn rollback_worker_incarnation(
     session_id: &str,
     incarnation_id: &str,
     checkout: Option<&spawn_util::WorkerCheckout>,
-) {
-    let _ = spawn_util::rollback_worker_incarnation_checkout(
-        store,
-        session_id,
-        incarnation_id,
-        checkout,
-    )
-    .await;
+) -> bool {
+    spawn_util::rollback_worker_incarnation_checkout(store, session_id, incarnation_id, checkout)
+        .await
 }
 
 fn reject_recursive_worker_spawn(caller_type: Option<&str>) -> anyhow::Result<()> {
@@ -1124,13 +1120,15 @@ fn pr_worker_context_footer(id: &str, orch_id: &str) -> String {
 /// forwarded as an empty string).
 fn worker_env_vars<'a>(
     id: &'a str,
+    incarnation_id: &'a str,
     sessions_dir: &'a str,
     orch_id: &'a str,
     ninox_brain: Option<&'a str>,
     ninox_config: Option<&'a str>,
 ) -> Vec<(&'a str, &'a str)> {
     let mut env_vec: Vec<(&str, &str)> = vec![
-        ("NINOX_SESSION",  id),
+        ("NINOX_SESSION", id),
+        ("NINOX_WORKER_INCARNATION", incarnation_id),
         ("NINOX_CALLER_TYPE", "worker"),
         ("NINOX_DATA_DIR", sessions_dir),
     ];
@@ -1189,6 +1187,7 @@ async fn run_release(
 ) -> anyhow::Result<()> {
     let env = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
     let env_session = env("NINOX_SESSION");
+    let caller_session = env_session.clone();
     let orchestrators = store.list_orchestrators()?;
     let orchestrator_ids: Vec<&str> =
         orchestrators.iter().map(|orchestrator| orchestrator.id.as_str()).collect();
@@ -1206,7 +1205,7 @@ async fn run_release(
             orchestrator_id,
             ambient_orchestrator,
             caller,
-            env_session,
+            env_session.clone(),
         )?;
         anyhow::ensure!(
             owner == resolved,
@@ -1250,6 +1249,21 @@ async fn run_release(
             .claim_worker_release(session_id, &worker.incarnation_id)?
             .context("worker release lost its exact incarnation/lease claim")?
     };
+    if let Err(error) = spawn_util::stop_exact_worker_runtime(
+        session_id,
+        &claim.incarnation_id,
+        caller_session.as_deref(),
+    )
+    .await
+    {
+        let _ = store.abort_worker_claim(
+            session_id,
+            &claim.incarnation_id,
+            ninox_core::types::WorkerIncarnationState::ReleaseClaimed,
+            ninox_core::types::WorkerIncarnationState::Retained,
+        );
+        return Err(error);
+    }
     let result = release_retained_worker_checkout(store.clone(), &claim).await;
     match result {
         Ok(()) => {
@@ -2408,11 +2422,19 @@ mod worker_env_tests {
 
     #[test]
     fn forwards_brain_and_config_when_present() {
-        let env = worker_env_vars("w1", "/data", "orch1", Some("/brain.db"), Some("/cfg.toml"));
+        let env = worker_env_vars(
+            "w1",
+            "incarnation",
+            "/data",
+            "orch1",
+            Some("/brain.db"),
+            Some("/cfg.toml"),
+        );
         assert!(env.contains(&("NINOX_ORCHESTRATOR_ID", "orch1")));
         assert!(env.contains(&("NINOX_BRAIN", "/brain.db")));
         assert!(env.contains(&("NINOX_CONFIG", "/cfg.toml")));
         assert!(env.contains(&("NINOX_SESSION", "w1")));
+        assert!(env.contains(&("NINOX_WORKER_INCARNATION", "incarnation")));
         assert!(env.contains(&("NINOX_CALLER_TYPE", "worker")));
         assert!(env.contains(&("NINOX_DATA_DIR", "/data")));
         // The legacy ATHENE_* transition names are gone.
@@ -2421,7 +2443,7 @@ mod worker_env_tests {
 
     #[test]
     fn omits_brain_config_and_orchestrator_id_when_absent() {
-        let env = worker_env_vars("w1", "/data", "", None, None);
+        let env = worker_env_vars("w1", "incarnation", "/data", "", None, None);
         assert!(!env.iter().any(|(k, _)| *k == "NINOX_ORCHESTRATOR_ID"));
         assert!(!env.iter().any(|(k, _)| *k == "NINOX_BRAIN"));
         assert!(!env.iter().any(|(k, _)| *k == "NINOX_CONFIG"));
@@ -2438,6 +2460,7 @@ mod worker_env_tests {
 #[cfg(test)]
 mod release_cli_tests {
     use super::{caller_is_orchestrator, resolve_release_orchestrator, validate_standalone_release_scope};
+    use crate::spawn_util;
 
     #[test]
     fn standalone_release_allows_local_admin_or_exact_session_only() {
@@ -2454,6 +2477,53 @@ mod release_cli_tests {
         assert!(
             validate_standalone_release_scope("solo", None, Some("orch"), None).is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn release_stops_and_confirms_only_the_exact_worker_runtime() {
+        let id = format!(
+            "release-runtime-{}",
+            ninox_core::harness::new_claude_session_id()
+        );
+        ninox_core::tmux::create_session(
+            &id,
+            "/tmp",
+            "sleep 30",
+            &[("NINOX_WORKER_INCARNATION", "incarnation")],
+        )
+        .await
+        .unwrap();
+
+        let self_release =
+            spawn_util::stop_exact_worker_runtime(&id, "incarnation", Some(&id)).await;
+        assert!(self_release.is_err());
+        assert!(ninox_core::tmux::has_session(&id).await);
+
+        spawn_util::stop_exact_worker_runtime(&id, "incarnation", None)
+            .await
+            .unwrap();
+        assert!(!ninox_core::tmux::has_session(&id).await);
+    }
+
+    #[tokio::test]
+    async fn release_never_stops_a_successor_runtime() {
+        let id = format!(
+            "release-successor-{}",
+            ninox_core::harness::new_claude_session_id()
+        );
+        ninox_core::tmux::create_session(
+            &id,
+            "/tmp",
+            "sleep 30",
+            &[("NINOX_WORKER_INCARNATION", "successor")],
+        )
+        .await
+        .unwrap();
+
+        let result = spawn_util::stop_exact_worker_runtime(&id, "old", None).await;
+        assert!(result.is_err());
+        assert!(ninox_core::tmux::has_session(&id).await);
+        ninox_core::tmux::kill_session(&id).await.unwrap();
     }
 
     fn orch(s: &str) -> Option<String> { Some(s.to_string()) }
