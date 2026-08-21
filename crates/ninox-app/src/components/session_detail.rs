@@ -327,6 +327,34 @@ pub fn session_detail<'a>(
     if let Some(name) = orch_name {
         subline_parts.push(format!("worker of {name}"));
     }
+    let pooled_checkout = app
+        .engine
+        .store
+        .pooled_checkout_by_session(session_id)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            session.workspace_path.as_deref().and_then(|workspace| {
+                app.engine
+                    .store
+                    .pooled_checkout_by_path(std::path::Path::new(workspace))
+                    .ok()
+                    .flatten()
+            })
+        });
+    if let Some(checkout) = pooled_checkout {
+        let slot = checkout
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("pooled checkout");
+        let state = match checkout.state {
+            ninox_core::PooledCheckoutState::Quarantined => "pooled checkout quarantined",
+            ninox_core::PooledCheckoutState::Free => "pooled checkout released",
+            _ => "pooled checkout",
+        };
+        subline_parts.push(format!("{state} · {slot}"));
+    }
     let subline = subline_parts.join(" · ");
 
     let identity = column![
@@ -386,7 +414,27 @@ pub fn session_detail<'a>(
             .into()
     };
 
-    let resume_btn: Element<Message> = if can_resume(session, is_orchestrator, &app.config) {
+    let released_pool = !is_orchestrator
+        && session
+            .workspace_path
+            .as_deref()
+            .and_then(|workspace| {
+                app.engine
+                    .store
+                    .pooled_checkout_by_path(std::path::Path::new(workspace))
+                    .ok()
+                    .flatten()
+            })
+            .is_some()
+        && app
+            .engine
+            .store
+            .pooled_checkout_by_session(&session.id)
+            .ok()
+            .flatten()
+            .is_none();
+    let resume_btn: Element<Message> =
+        if can_resume(session, is_orchestrator, &app.config) && !released_pool {
         let sid = session_id.to_string();
         button(crate::style::micro_label(resume_label(&session.status), s.status_review).size(10.0))
             .on_press(Message::ResumeSession(sid))

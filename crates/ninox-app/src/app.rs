@@ -28,6 +28,22 @@ const MAX_NOTIFICATIONS: usize = 50;
 /// the more literally correct source for a user-facing version display).
 pub const NINOX_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn emit_checkout_unavailable(
+    engine: &Engine,
+    session_id: &str,
+    session_name: &str,
+    error: &dyn std::fmt::Display,
+) {
+    engine.emit(Event::Notification(Notification {
+        id: format!("checkout-unavailable-{session_id}"),
+        kind: NotificationKind::CheckoutUnavailable,
+        title: format!("Checkout unavailable — {session_name}"),
+        body: error.to_string(),
+        session_id: Some(session_id.to_string()),
+        created_at: ninox_core::lifecycle::poller::now_millis(),
+    }));
+}
+
 // ---------------------------------------------------------------------------
 // View state
 // ---------------------------------------------------------------------------
@@ -1262,6 +1278,8 @@ impl App {
                         }
 
                         let mut workspace = crate::spawn_util::expand_tilde(&workspace_input);
+                        let exact_worktree_path =
+                            !std::path::Path::new(&workspace).exists();
                         if !std::path::Path::new(&workspace).exists() {
                             // The path doesn't exist yet — if it's nested
                             // under a git repo (e.g. this project's own
@@ -1377,21 +1395,53 @@ impl App {
                         let nm     = name;
                         let ts_i64 = ts as i64;
                         let inbox_enabled = state.config.inbox_messaging.enabled;
+                        let repositories_root = state.config.resolved_repositories_root();
+                        let worktree_root = state.config.resolved_worktree_root();
 
                         Task::future(async move {
-                            // Isolate the session on its own branch/worktree when
-                            // the workspace is a git repo; otherwise work in the
-                            // directory itself (same fallback as run_spawn).
-                            let effective_ws =
-                                match crate::spawn_util::create_worker_worktree(&workspace, &sid, inbox_enabled).await {
-                                    Ok(path) => path,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "worktree creation failed for {sid}, using shared workspace: {e}"
-                                        );
-                                        workspace.clone()
+                            let checkout_result = if exact_worktree_path {
+                                Ok(crate::spawn_util::WorkerCheckout::shared(
+                                    workspace.clone(),
+                                ))
+                            } else {
+                                crate::spawn_util::acquire_worker_checkout(
+                                    engine.store.clone(),
+                                    &workspace,
+                                    &sid,
+                                    repositories_root.as_deref(),
+                                    &worktree_root,
+                                    inbox_enabled,
+                                )
+                                .await
+                            };
+                            let checkout = match checkout_result {
+                                Ok(checkout) => checkout,
+                                Err(error) => {
+                                    tracing::error!(
+                                        "allocate worker checkout for {sid}: {error}"
+                                    );
+                                    emit_checkout_unavailable(
+                                        &engine,
+                                        &sid,
+                                        &nm,
+                                        &error,
+                                    );
+                                    if let Ok(Some(mut failed)) =
+                                        engine.store.get_session(&sid)
+                                    {
+                                        failed.status = SessionStatus::Terminated;
+                                        failed.workspace_path = Some(workspace.clone());
+                                        let _ = engine.store.upsert_session(&failed);
+                                        engine.emit(Event::SessionUpdated(
+                                            failed,
+                                            SessionFields::STATUS
+                                                | SessionFields::WORKSPACE,
+                                        ));
                                     }
-                                };
+                                    return Message::Noop;
+                                }
+                            };
+                            let effective_ws = checkout.workspace.clone();
                             if let Err(e) = crate::spawn_util::seed_worker_brain_skill(&effective_ws).await {
                                 tracing::warn!("failed to seed brain skill for {sid}: {e}");
                             }
@@ -1405,7 +1455,7 @@ impl App {
                             // this session is unattached and reports to no one.
                             let attach_sid = sid.clone();
                             let attach = crate::spawn_util::spawn_interactive_session(
-                                engine,
+                                engine.clone(),
                                 crate::spawn_util::InteractiveSpawnParams {
                                     session_id:      sid,
                                     name:            nm,
@@ -1425,7 +1475,15 @@ impl App {
                             .await;
                             match attach {
                                 Some(argv) => Message::ClientAttach { session_id: attach_sid, argv },
-                                None => Message::Noop,
+                                None => {
+                                    let _ = crate::spawn_util::rollback_worker_checkout(
+                                        engine.store.clone(),
+                                        &checkout,
+                                        &attach_sid,
+                                    )
+                                    .await;
+                                    Message::Noop
+                                }
                             }
                         })
                     }
@@ -1638,7 +1696,7 @@ impl App {
                 let Some(session) = state.sessions.get(&id).cloned() else { return Task::none(); };
                 let is_orch = state.orchestrators.iter().any(|o| o.id == id);
                 let claude_session_id = ninox_core::harness::new_claude_session_id();
-                let Some(plan) = refile_plan(&session, is_orch, &state.config, &claude_session_id) else {
+                let Some(mut plan) = refile_plan(&session, is_orch, &state.config, &claude_session_id) else {
                     tracing::warn!("refile {id}: no workspace recorded, cannot respawn");
                     return Task::none();
                 };
@@ -1661,6 +1719,8 @@ impl App {
                 let orch_id = session.orchestrator_id.clone();
                 let summary = session.summary.clone();
                 let inbox_enabled = state.config.inbox_messaging.enabled;
+                let repositories_root = state.config.resolved_repositories_root();
+                let worktree_root = state.config.resolved_worktree_root();
                 Task::future(async move {
                     // Ignore kill errors — a Terminated husk has no tmux
                     // session, and Re-file on one "just spawns". The
@@ -1669,14 +1729,82 @@ impl App {
                     // keeps re-ingesting absolute spend from the workspace
                     // transcript either way.
                     let _ = ninox_core::tmux::kill_session(&id).await;
+                    let mut reacquired_checkout = None;
+                    if !is_orch
+                        && engine
+                            .store
+                            .pooled_checkout_by_session(&id)
+                            .ok()
+                            .flatten()
+                            .is_none()
+                    {
+                        if let Some(prior_pool) = engine
+                            .store
+                            .pooled_checkout_by_path(
+                                std::path::Path::new(&plan.workspace),
+                            )
+                            .ok()
+                            .flatten()
+                        {
+                            let source_repo =
+                                prior_pool.source_repo.to_string_lossy().to_string();
+                            match crate::spawn_util::acquire_worker_checkout(
+                                engine.store.clone(),
+                                &source_repo,
+                                &id,
+                                repositories_root.as_deref(),
+                                &worktree_root,
+                                inbox_enabled,
+                            )
+                            .await
+                            {
+                                Ok(checkout) => {
+                                    plan.workspace = checkout.workspace.clone();
+                                    if let Ok(Some(mut persisted)) =
+                                        engine.store.get_session(&id)
+                                    {
+                                        persisted.workspace_path =
+                                            Some(plan.workspace.clone());
+                                        let _ =
+                                            engine.store.upsert_session(&persisted);
+                                        engine.emit(Event::SessionUpdated(
+                                            persisted,
+                                            SessionFields::WORKSPACE,
+                                        ));
+                                    }
+                                    reacquired_checkout = Some(checkout);
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "re-file {id}: cannot reacquire pooled checkout: {error}"
+                                    );
+                                    emit_checkout_unavailable(
+                                        &engine,
+                                        &id,
+                                        &name,
+                                        &error,
+                                    );
+                                    return Message::Noop;
+                                }
+                            }
+                        }
+                    }
                     // Same workspace-restoration guard as Resume below —
                     // without it a torn-down worktree makes tmux silently
                     // start the fresh agent in $HOME.
-                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id, is_orch, inbox_enabled).await {
+                    if let Err(e) = crate::spawn_util::ensure_session_workspace_with_store(
+                        &engine.store,
+                        &plan.workspace,
+                        &id,
+                        is_orch,
+                        inbox_enabled,
+                    ).await {
                         tracing::warn!("re-file {id}: cannot restore workspace: {e}");
+                        emit_checkout_unavailable(&engine, &id, &name, &e);
+                        return Message::Noop;
                     }
                     let attach = crate::spawn_util::spawn_interactive_session(
-                        engine,
+                        engine.clone(),
                         crate::spawn_util::InteractiveSpawnParams {
                             session_id:      id.clone(),
                             name,
@@ -1696,7 +1824,17 @@ impl App {
                     .await;
                     match attach {
                         Some(argv) => Message::ClientAttach { session_id: id, argv },
-                        None       => Message::Noop,
+                        None => {
+                            if let Some(checkout) = &reacquired_checkout {
+                                let _ = crate::spawn_util::rollback_worker_checkout(
+                                    engine.store.clone(),
+                                    checkout,
+                                    &id,
+                                )
+                                .await;
+                            }
+                            Message::Noop
+                        }
                     }
                 })
             }
@@ -1738,8 +1876,16 @@ impl App {
                     // rejects a missing workspace, so the spawn fails
                     // visibly into `failure_status` instead of the agent
                     // silently starting in $HOME.
-                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id, is_orch, inbox_enabled).await {
+                    if let Err(e) = crate::spawn_util::ensure_session_workspace_with_store(
+                        &engine.store,
+                        &plan.workspace,
+                        &id,
+                        is_orch,
+                        inbox_enabled,
+                    ).await {
                         tracing::warn!("resume {id}: cannot restore workspace: {e}");
+                        emit_checkout_unavailable(&engine, &id, &name, &e);
+                        return Message::Noop;
                     }
                     let attach = crate::spawn_util::spawn_interactive_session(
                         engine,
@@ -2896,7 +3042,8 @@ Name workers after the ticket or task so they are easy to reference:
 {ninox_bin} spawn \
   --name "ath-123-auth-fix" \
   --prompt "Complete task description with acceptance criteria, repo path, and branch" \
-  --workspace /absolute/path/to/repo
+  --workspace /absolute/path/to/repo \
+  --delivery pr
 ```
 
 `--name` becomes the session ID. Names are slugified automatically (`"ATH-123 auth"` → `"ath-123-auth"`).
@@ -2904,6 +3051,27 @@ Omitting `--name` generates a timestamp ID (`worker-…`).
 
 `NINOX_ORCHESTRATOR_ID` is set in your environment and picked up automatically.
 Each spawn prints the session ID (`spawned ath-123-auth-fix`) — use it to send follow-ups.
+
+## Choosing Delivery
+
+Choose the contract explicitly:
+
+- `--delivery pr` — code changes that must be delivered through a branch,
+  commit, push, and pull request.
+- `--delivery direct` — research, operational tasks, direct-file/artifact
+  work, and all non-Git workspaces. The worker validates its artifacts or
+  direct changes and reports either a blocker or completion; it does not
+  create branches, remotes, commits, or PRs.
+
+When `--delivery` is omitted, Ninox preserves PR delivery for Git repositories
+and selects direct delivery for non-Git workspaces. Prefer an explicit choice
+so the worker contract reflects the task rather than only the workspace type.
+
+For PR delivery, always pass the primary repository checkout to `--workspace`.
+When that checkout is directly under Ninox's configured repositories root,
+Ninox leases a warm sibling checkout (`<repo>-w1`, `<repo>-w2`, …). Ninox
+chooses and manages the pool slot; never pass a `-wN` path yourself. The
+primary checkout remains untouched.
 
 ## Messaging Workers (Orchestrator → Worker)
 
@@ -2915,16 +3083,17 @@ Send instructions or follow-ups to a worker using its session ID:
 
 ## Work Requests (Worker → Orchestrator)
 
-Workers are scoped to one task and one PR. When a worker discovers additional
-work, it runs `{ninox_bin} request-work "<description>"` and Ninox forwards
-the request to you as a `[Ninox] Worker … requested additional work` message.
+Workers are scoped to one task and one delivery. When a worker discovers
+additional work, it runs `{ninox_bin} request-work "<description>"` and
+Ninox forwards the request to you as a
+`[Ninox] Worker … requested additional work` message.
 
 When one arrives: decide whether the work is worth doing, and if so
 spawn a new worker for it with `{ninox_bin} spawn`. **Never** tell a worker to widen
-its own task or PR — extra scope always gets its own worker. Ninox will also
-warn you (`[Ninox] Worker … opened N PRs beyond its tracked PR`) if a worker
-opens extra PRs anyway; review each extra PR and either close it or hand it
-to a dedicated worker.
+its own task or delivery — extra scope always gets its own worker. For PR
+delivery, Ninox will also warn you (`[Ninox] Worker … opened N PRs beyond its
+tracked PR`) if a worker opens extra PRs anyway; review each extra PR and
+either close it or hand it to a dedicated worker.
 
 ## The Rule
 
@@ -5896,6 +6065,10 @@ mod tests {
         assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
         assert!(skill.contains("name: spawn-worker"));
         assert!(skill.contains("description:"));
+        assert!(skill.contains("--delivery pr"));
+        assert!(skill.contains("--delivery direct"));
+        assert!(skill.contains("primary repository checkout"));
+        assert!(skill.contains("<repo>-w1"));
         assert!(
             skill.contains("request-work"),
             "skill must explain the worker→orchestrator work-request channel"

@@ -30,7 +30,7 @@ type ContextSnapshot = (f64, Option<f64>, Option<u64>);
 /// Unix epoch milliseconds "now" — used to stamp `Notification::created_at`
 /// and `Session::terminal_at`. `pub(crate)` so `events::cleanup_session` can
 /// stamp the same clock when it marks a session `Done`.
-pub(crate) fn now_millis() -> i64 {
+pub fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

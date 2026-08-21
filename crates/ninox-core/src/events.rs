@@ -127,7 +127,14 @@ impl Engine {
         let sessions_dir = crate::config::AppConfig::sessions_dir();
         for session in &workers {
             let _ = crate::tmux::kill_session(&session.id).await;
-            remove_worktree_and_artifacts(&session.id, session.workspace_path.as_deref(), &sessions_dir).await;
+            remove_worktree_and_artifacts(
+                &self.store,
+                &session.id,
+                session.workspace_path.as_deref(),
+                &sessions_dir,
+                RecoveryMetadata::Remove,
+            )
+            .await;
         }
         // Also kill the orchestrator's own tmux session (same id as orchestrator).
         let _ = crate::tmux::kill_session(orchestrator_id).await;
@@ -145,8 +152,13 @@ impl Engine {
         let workspace_path = self.store.get_session(session_id).ok().flatten()
             .and_then(|s| s.workspace_path);
         remove_worktree_and_artifacts(
-            session_id, workspace_path.as_deref(), &crate::config::AppConfig::sessions_dir(),
-        ).await;
+            &self.store,
+            session_id,
+            workspace_path.as_deref(),
+            &crate::config::AppConfig::sessions_dir(),
+            RecoveryMetadata::Remove,
+        )
+        .await;
         self.store.delete_session(session_id)?;
         self.emit(Event::SessionDone(session_id.to_string()));
         Ok(())
@@ -229,7 +241,14 @@ impl Engine {
         let _ = crate::tmux::kill_session(session_id).await;
 
         if let Some(mut session) = self.store.get_session(session_id)? {
-            remove_worktree_and_artifacts(session_id, session.workspace_path.as_deref(), sessions_dir).await;
+            remove_worktree_and_artifacts(
+                &self.store,
+                session_id,
+                session.workspace_path.as_deref(),
+                sessions_dir,
+                RecoveryMetadata::Retain,
+            )
+            .await;
             session.status = crate::types::SessionStatus::Done;
             session.terminal_at = Some(crate::lifecycle::poller::now_millis());
             self.store.upsert_session(&session)?;
@@ -239,26 +258,109 @@ impl Engine {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RecoveryMetadata {
+    Retain,
+    Remove,
+}
+
 /// Remove a session's worktree (if any) and hook artifacts — the shared
 /// teardown tail of `remove_orchestrator`, `remove_session`, and
 /// `cleanup_session`, so none of them leak a checked-out worktree or
 /// per-session hook files.
 async fn remove_worktree_and_artifacts(
+    store:          &crate::store::Store,
     session_id:     &str,
     workspace_path: Option<&str>,
     sessions_dir:   &std::path::Path,
+    recovery_metadata: RecoveryMetadata,
 ) {
-    if let Some(wp) = workspace_path {
-        remove_worker_worktree(wp, session_id).await;
+    let pooled = release_pooled_checkout(store, session_id).await;
+    if !pooled {
+        if let Some(wp) = workspace_path {
+            remove_worker_worktree(wp, session_id, recovery_metadata).await;
+        }
     }
     crate::hooks::remove_session_artifacts(sessions_dir, session_id);
 }
 
+/// Release only the exact lease currently owned by `session_id`. A dirty or
+/// replaced checkout is quarantined and left untouched for manual recovery.
+async fn release_pooled_checkout(store: &crate::store::Store, session_id: &str) -> bool {
+    let Ok(Some(record)) = store.pooled_checkout_by_session(session_id) else {
+        return false;
+    };
+    let (Some(lease_id), Some(branch)) = (record.lease_id.clone(), record.branch.clone()) else {
+        let _ = store.quarantine_pooled_checkout(
+            &record.path,
+            "active pooled checkout is missing lease metadata",
+        );
+        return true;
+    };
+    let lease = crate::types::PooledCheckoutLease {
+        path: record.path,
+        source_repo: record.source_repo,
+        common_git_dir: record.common_git_dir,
+        slot: record.slot,
+        worktree_git_dir: record.worktree_git_dir,
+        worktree_identity: record.worktree_identity,
+        session_id: session_id.to_string(),
+        lease_id,
+        branch,
+    };
+    let store_result = tokio::task::spawn_blocking({
+        let lease = lease.clone();
+        move || crate::worktree::PooledWorktree::from_lease(&lease)?.release_clean()
+    })
+    .await;
+    match store_result {
+        Ok(Ok(_)) => {
+            let _ = store.release_pooled_checkout(
+                &lease.path,
+                &lease.session_id,
+                &lease.lease_id,
+            );
+        }
+        Ok(Err(error)) => {
+            let _ = store.quarantine_pooled_checkout_lease(
+                &lease.path,
+                &lease.session_id,
+                &lease.lease_id,
+                &error.to_string(),
+            );
+        }
+        Err(error) => {
+            let _ = store.quarantine_pooled_checkout_lease(
+                &lease.path,
+                &lease.session_id,
+                &lease.lease_id,
+                &format!("pooled checkout release task failed: {error}"),
+            );
+        }
+    }
+    true
+}
+
 /// Remove a Ninox-managed git worktree (best-effort, never propagates errors).
 ///
-/// Only acts on paths that match the `.claude/worktrees/{session_id}` pattern
-/// so it never touches unrelated directories.
-async fn remove_worker_worktree(workspace_path: &str, session_id: &str) {
+/// Managed-root worktrees require matching sidecar metadata. Legacy nested
+/// worktrees retain their strict path-shape check.
+async fn remove_worker_worktree(
+    workspace_path: &str,
+    session_id: &str,
+    recovery_metadata: RecoveryMetadata,
+) {
+    if let Ok(Some(metadata)) = crate::worktree::ManagedWorktree::load_for_workspace(
+        std::path::Path::new(workspace_path),
+        session_id,
+    ) {
+        let remove_metadata = matches!(recovery_metadata, RecoveryMetadata::Remove);
+        let _ = tokio::task::spawn_blocking(move || {
+            metadata.remove_checkout_if_matches_with_metadata(remove_metadata)
+        })
+        .await;
+        return;
+    }
     let suffix = format!("/.claude/worktrees/{session_id}");
     if !workspace_path.ends_with(&suffix) {
         return; // Not a Ninox worktree — leave it alone.
@@ -448,12 +550,120 @@ mod tests {
         assert!(matches!(after.status, crate::types::SessionStatus::Done));
     }
 
+
+    #[tokio::test]
+    async fn cleanup_session_releases_pooled_checkout_without_removing_warm_cache() {
+        let root = tempdir().unwrap();
+        let repo = root.path().join("widgets");
+        std::fs::create_dir(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        run(&["add", ".gitignore"]);
+        run(&[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+
+        let store = Arc::new(Store::open(root.path().join("ninox.db")).unwrap());
+        let identity = crate::worktree::RepositoryIdentity::resolve(&repo).unwrap();
+        let lease = store
+            .reserve_pooled_checkout(
+                &identity.top_level,
+                &identity.common_git_dir,
+                root.path(),
+                "pooled-done",
+                "pooled-done",
+            )
+            .unwrap();
+        let pooled = crate::worktree::PooledWorktree::create(&lease).unwrap();
+        assert!(store
+            .finalize_pooled_checkout(
+                &lease.path,
+                &lease.session_id,
+                &lease.lease_id,
+                &pooled.worktree_git_dir,
+                &pooled.worktree_identity,
+            )
+            .unwrap());
+        let cache = pooled.path.join("target/cache.bin");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, "warm").unwrap();
+
+        store
+            .upsert_session(&crate::types::Session {
+                id: "pooled-done".into(),
+                orchestrator_id: None,
+                name: "worker".into(),
+                repo: "Owner/widgets".into(),
+                status: crate::types::SessionStatus::PrOpen,
+                agent_type: "c".into(),
+                cost_usd: 0.0,
+                started_at: 0,
+                pr_number: Some(1),
+                pr_id: Some(1),
+                workspace_path: Some(pooled.path.to_string_lossy().to_string()),
+                pid: None,
+                model: None,
+                context_tokens: None,
+                catalogue_path: None,
+                context_used_pct: None,
+                context_total_tokens: None,
+                context_window_size: None,
+                claude_session_id: None,
+                summary: None,
+                terminal_at: None,
+                gate_status: None,
+            })
+            .unwrap();
+        let engine = Engine::new(store.clone());
+        let sessions_dir = tempdir().unwrap();
+
+        engine
+            .cleanup_session_in("pooled-done", sessions_dir.path())
+            .await
+            .unwrap();
+
+        assert!(pooled.path.is_dir());
+        assert_eq!(std::fs::read_to_string(cache).unwrap(), "warm");
+        let record = store
+            .pooled_checkout_by_path(&pooled.path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, crate::types::PooledCheckoutState::Free);
+        assert!(record.session_id.is_none());
+    }
+
     #[tokio::test]
     async fn remove_worker_worktree_ignores_non_ninox_paths() {
         // Should be a no-op for paths that don't match .claude/worktrees/{id}.
         // We just verify it doesn't panic or error.
-        remove_worker_worktree("/some/random/path", "s1").await;
-        remove_worker_worktree("/repo/.claude/worktrees/other-id", "s1").await;
-        remove_worker_worktree("", "s1").await;
+        remove_worker_worktree(
+            "/some/random/path",
+            "s1",
+            RecoveryMetadata::Remove,
+        )
+        .await;
+        remove_worker_worktree(
+            "/repo/.claude/worktrees/other-id",
+            "s1",
+            RecoveryMetadata::Remove,
+        )
+        .await;
+        remove_worker_worktree("", "s1", RecoveryMetadata::Remove).await;
     }
 }

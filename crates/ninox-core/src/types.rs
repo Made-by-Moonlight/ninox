@@ -4,6 +4,48 @@ pub type SessionId      = String;
 pub type OrchestratorId = String;
 pub type PrId           = i64;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PooledCheckoutState {
+    Provisioning,
+    Leased,
+    Free,
+    Quarantined,
+}
+
+/// Durable registry entry for a reusable linked Git worktree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PooledCheckoutRecord {
+    pub path: std::path::PathBuf,
+    pub source_repo: std::path::PathBuf,
+    pub common_git_dir: std::path::PathBuf,
+    pub slot: u32,
+    pub worktree_git_dir: Option<std::path::PathBuf>,
+    pub worktree_identity: Option<String>,
+    pub state: PooledCheckoutState,
+    pub session_id: Option<SessionId>,
+    pub lease_id: Option<String>,
+    pub branch: Option<String>,
+    pub quarantine_reason: Option<String>,
+}
+
+/// Capability returned while a checkout is reserved for one session.
+///
+/// Mutating registry operations require both IDs so stale session cleanup
+/// cannot release or quarantine a checkout that has since been re-leased.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PooledCheckoutLease {
+    pub path: std::path::PathBuf,
+    pub source_repo: std::path::PathBuf,
+    pub common_git_dir: std::path::PathBuf,
+    pub slot: u32,
+    pub worktree_git_dir: Option<std::path::PathBuf>,
+    pub worktree_identity: Option<String>,
+    pub session_id: SessionId,
+    pub lease_id: String,
+    pub branch: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
@@ -283,6 +325,8 @@ pub enum NotificationKind {
     /// The `cargo install` subprocess triggered by `UpdateAvailable`'s
     /// "Update now" action exited non-zero.
     UpdateFailed,
+    /// A worker checkout could not be safely allocated or restored.
+    CheckoutUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn notification_kind_serde_covers_work_requested_and_extra_pr() {
+    fn notification_kind_serde_covers_added_variants() {
         for (kind, wire) in [
             (NotificationKind::WorkRequested,  "\"work_requested\""),
             (NotificationKind::ExtraPr,        "\"extra_pr\""),
@@ -329,6 +373,7 @@ mod tests {
             (NotificationKind::UpdateAvailable, "\"update_available\""),
             (NotificationKind::UpdateInstalled, "\"update_installed\""),
             (NotificationKind::UpdateFailed,    "\"update_failed\""),
+            (NotificationKind::CheckoutUnavailable, "\"checkout_unavailable\""),
         ] {
             assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
             let parsed: NotificationKind = serde_json::from_str(wire).unwrap();

@@ -1,7 +1,10 @@
 use crate::types::*;
-use anyhow::Result;
-use rusqlite::{params, Connection};
-use std::{path::Path, sync::Mutex};
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use std::{
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -41,6 +44,26 @@ impl Store {
                 author TEXT NOT NULL, body TEXT NOT NULL,
                 path TEXT, line INTEGER, created_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS pooled_checkouts (
+                path TEXT PRIMARY KEY,
+                source_repo TEXT NOT NULL,
+                common_git_dir TEXT NOT NULL,
+                slot INTEGER NOT NULL CHECK(slot >= 0),
+                worktree_git_dir TEXT,
+                worktree_identity TEXT,
+                state TEXT NOT NULL CHECK(state IN ('provisioning','leased','free','quarantined')),
+                session_id TEXT,
+                lease_id TEXT,
+                branch TEXT,
+                quarantine_reason TEXT,
+                UNIQUE(common_git_dir, slot),
+                CHECK((session_id IS NULL) = (lease_id IS NULL)),
+                CHECK(state NOT IN ('provisioning','leased') OR
+                      (session_id IS NOT NULL AND lease_id IS NOT NULL AND branch IS NOT NULL))
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS pooled_checkouts_active_session
+                ON pooled_checkouts(session_id)
+                WHERE session_id IS NOT NULL AND state IN ('provisioning','leased');
         ")?;
         // Migrations for columns added after initial release — idempotent so
         // both fresh and pre-existing databases end up with the same schema.
@@ -372,6 +395,412 @@ impl Store {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    /// Atomically reserves the lowest-numbered free checkout for a session.
+    ///
+    /// The checkout remains `provisioning` until its Git branch is prepared
+    /// and `finalize_pooled_checkout` records the verified worktree identity.
+    pub fn claim_lowest_free_pooled_checkout(
+        &self,
+        common_git_dir: &Path,
+        session_id: &str,
+        branch: &str,
+    ) -> Result<Option<PooledCheckoutLease>> {
+        validate_lease_inputs(session_id, branch)?;
+        let common_git_dir = canonical_db_path(common_git_dir)?;
+        let lease_id = uuid::Uuid::new_v4().to_string();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let selected = tx
+            .query_row(
+                &format!(
+                    "{POOLED_CHECKOUT_COLUMNS}
+                     WHERE common_git_dir = ?1 AND state = 'free'
+                     ORDER BY slot ASC LIMIT 1"
+                ),
+                [&common_git_dir],
+                pooled_checkout_row,
+            )
+            .optional()?;
+        let Some(mut record) = selected.map(raw_pooled_checkout).transpose()? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let changed = tx.execute(
+            "UPDATE pooled_checkouts
+             SET state='provisioning', session_id=?2, lease_id=?3, branch=?4,
+                 quarantine_reason=NULL
+             WHERE path=?1 AND state='free'",
+            params![path_text(&record.path)?, session_id, lease_id, branch],
+        )?;
+        anyhow::ensure!(changed == 1, "free pooled checkout changed during claim");
+        tx.commit()?;
+
+        record.state = PooledCheckoutState::Provisioning;
+        record.session_id = Some(session_id.to_string());
+        record.lease_id = Some(lease_id);
+        record.branch = Some(branch.to_string());
+        Ok(Some(record_into_lease(record)?))
+    }
+
+    /// Atomically allocates the next slot and reserves its deterministic path.
+    pub fn reserve_pooled_checkout(
+        &self,
+        source_repo: &Path,
+        common_git_dir: &Path,
+        repositories_root: &Path,
+        session_id: &str,
+        branch: &str,
+    ) -> Result<PooledCheckoutLease> {
+        validate_lease_inputs(session_id, branch)?;
+        let source_repo = canonical_db_path(source_repo)?;
+        let common_git_dir = canonical_db_path(common_git_dir)?;
+        let repositories_root = canonical_db_path(repositories_root)?;
+        let repository_name = Path::new(&source_repo)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("source repository has no UTF-8 directory name")?;
+        let lease_id = uuid::Uuid::new_v4().to_string();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let slot: u32 = tx.query_row(
+            "SELECT COALESCE(MAX(slot), -1) + 1
+             FROM pooled_checkouts WHERE common_git_dir = ?1",
+            [&common_git_dir],
+            |row| row.get(0),
+        )?;
+        let path = PathBuf::from(&repositories_root)
+            .join(format!("{repository_name}-w{}", slot + 1));
+        let path_str = path_text(&path)?;
+        tx.execute(
+            "INSERT INTO pooled_checkouts(
+                path,source_repo,common_git_dir,slot,state,session_id,lease_id,branch
+             ) VALUES(?1,?2,?3,?4,'provisioning',?5,?6,?7)",
+            params![
+                path_str,
+                source_repo,
+                common_git_dir,
+                slot,
+                session_id,
+                lease_id,
+                branch,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(PooledCheckoutLease {
+            path,
+            source_repo: PathBuf::from(source_repo),
+            common_git_dir: PathBuf::from(common_git_dir),
+            slot,
+            worktree_git_dir: None,
+            worktree_identity: None,
+            session_id: session_id.to_string(),
+            lease_id,
+            branch: branch.to_string(),
+        })
+    }
+
+    /// Completes a matching reservation after Git identity was established.
+    pub fn finalize_pooled_checkout(
+        &self,
+        path: &Path,
+        session_id: &str,
+        lease_id: &str,
+        worktree_git_dir: &Path,
+        worktree_identity: &str,
+    ) -> Result<bool> {
+        anyhow::ensure!(!worktree_identity.is_empty(), "worktree identity cannot be empty");
+        let path = absolute_db_path(path)?;
+        let worktree_git_dir = canonical_db_path(worktree_git_dir)?;
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE pooled_checkouts
+             SET state='leased', worktree_git_dir=?4, worktree_identity=?5,
+                 quarantine_reason=NULL
+             WHERE path=?1 AND state='provisioning'
+               AND session_id=?2 AND lease_id=?3",
+            params![path, session_id, lease_id, worktree_git_dir, worktree_identity],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn pooled_checkout_by_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<PooledCheckoutRecord>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!(
+                "{POOLED_CHECKOUT_COLUMNS}
+                 WHERE session_id=?1 AND state IN ('provisioning','leased')"
+            ),
+            [session_id],
+            pooled_checkout_row,
+        )
+        .optional()?
+        .map(raw_pooled_checkout)
+        .transpose()
+    }
+
+    pub fn pooled_checkout_by_path(&self, path: &Path) -> Result<Option<PooledCheckoutRecord>> {
+        let path = absolute_db_path(path)?;
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!("{POOLED_CHECKOUT_COLUMNS} WHERE path=?1"),
+            [path],
+            pooled_checkout_row,
+        )
+        .optional()?
+        .map(raw_pooled_checkout)
+        .transpose()
+    }
+
+    /// All records for one canonical source checkout, ordered by slot.
+    pub fn pooled_checkouts_by_repo(
+        &self,
+        source_repo: &Path,
+    ) -> Result<Vec<PooledCheckoutRecord>> {
+        let source_repo = canonical_db_path(source_repo)?;
+        self.query_pooled_checkouts(
+            &format!("{POOLED_CHECKOUT_COLUMNS} WHERE source_repo=?1 ORDER BY slot ASC"),
+            &source_repo,
+        )
+    }
+
+    /// All records sharing a Git object database, ordered for reconciliation.
+    pub fn pooled_checkouts_by_common_git_dir(
+        &self,
+        common_git_dir: &Path,
+    ) -> Result<Vec<PooledCheckoutRecord>> {
+        let common_git_dir = canonical_db_path(common_git_dir)?;
+        self.query_pooled_checkouts(
+            &format!("{POOLED_CHECKOUT_COLUMNS} WHERE common_git_dir=?1 ORDER BY slot ASC"),
+            &common_git_dir,
+        )
+    }
+
+    pub fn list_pooled_checkouts(&self) -> Result<Vec<PooledCheckoutRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "{POOLED_CHECKOUT_COLUMNS} ORDER BY common_git_dir ASC, slot ASC"
+        ))?;
+        let rows = stmt.query_map([], pooled_checkout_row)?;
+        rows.map(|row| raw_pooled_checkout(row?)).collect()
+    }
+
+    /// Releases only the exact active capability. The old branch is retained
+    /// in the record for reconciliation and is never deleted by the registry.
+    pub fn release_pooled_checkout(
+        &self,
+        path: &Path,
+        session_id: &str,
+        lease_id: &str,
+    ) -> Result<bool> {
+        let path = absolute_db_path(path)?;
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE pooled_checkouts
+             SET state='free', session_id=NULL, lease_id=NULL,
+                 quarantine_reason=NULL
+             WHERE path=?1 AND state='leased' AND session_id=?2 AND lease_id=?3",
+            params![path, session_id, lease_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Quarantines the current reservation only if its capability still
+    /// matches, preventing stale cleanup from affecting a later lease.
+    pub fn quarantine_pooled_checkout_lease(
+        &self,
+        path: &Path,
+        session_id: &str,
+        lease_id: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        anyhow::ensure!(!reason.trim().is_empty(), "quarantine reason cannot be empty");
+        let path = absolute_db_path(path)?;
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE pooled_checkouts
+             SET state='quarantined', session_id=NULL, lease_id=NULL,
+                 quarantine_reason=?4
+             WHERE path=?1 AND state IN ('provisioning','leased')
+               AND session_id=?2 AND lease_id=?3",
+            params![path, session_id, lease_id, reason],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Reconciliation-only quarantine for a record not controlled by a live
+    /// lease holder.
+    pub fn quarantine_pooled_checkout(&self, path: &Path, reason: &str) -> Result<bool> {
+        anyhow::ensure!(!reason.trim().is_empty(), "quarantine reason cannot be empty");
+        let path = absolute_db_path(path)?;
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE pooled_checkouts
+             SET state='quarantined', session_id=NULL, lease_id=NULL,
+                 quarantine_reason=?2
+             WHERE path=?1",
+            params![path, reason],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Returns a user-cleaned, identity-verified quarantined slot to the pool.
+    /// Callers must perform the Git ownership and cleanliness checks first.
+    pub fn restore_quarantined_pooled_checkout(&self, path: &Path) -> Result<bool> {
+        let path = absolute_db_path(path)?;
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE pooled_checkouts
+             SET state='free', quarantine_reason=NULL
+             WHERE path=?1 AND state='quarantined'
+               AND worktree_git_dir IS NOT NULL AND worktree_identity IS NOT NULL",
+            [path],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn remove_failed_pooled_checkout(
+        &self,
+        path: &Path,
+        session_id: &str,
+        lease_id: &str,
+    ) -> Result<bool> {
+        let path = absolute_db_path(path)?;
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "DELETE FROM pooled_checkouts
+             WHERE path=?1 AND state='provisioning'
+               AND session_id=?2 AND lease_id=?3",
+            params![path, session_id, lease_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    fn query_pooled_checkouts(
+        &self,
+        sql: &str,
+        parameter: &str,
+    ) -> Result<Vec<PooledCheckoutRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([parameter], pooled_checkout_row)?;
+        rows.map(|row| raw_pooled_checkout(row?)).collect()
+    }
+}
+
+const POOLED_CHECKOUT_COLUMNS: &str =
+    "SELECT path,source_repo,common_git_dir,slot,worktree_git_dir,
+            worktree_identity,state,session_id,lease_id,branch,quarantine_reason
+     FROM pooled_checkouts";
+
+type RawPooledCheckout = (
+    String,
+    String,
+    String,
+    u32,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn pooled_checkout_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawPooledCheckout> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
+}
+
+fn raw_pooled_checkout(raw: RawPooledCheckout) -> Result<PooledCheckoutRecord> {
+    let (
+        path,
+        source_repo,
+        common_git_dir,
+        slot,
+        worktree_git_dir,
+        worktree_identity,
+        state,
+        session_id,
+        lease_id,
+        branch,
+        quarantine_reason,
+    ) = raw;
+    let state = match state.as_str() {
+        "provisioning" => PooledCheckoutState::Provisioning,
+        "leased" => PooledCheckoutState::Leased,
+        "free" => PooledCheckoutState::Free,
+        "quarantined" => PooledCheckoutState::Quarantined,
+        other => anyhow::bail!("invalid pooled checkout state {other:?}"),
+    };
+    Ok(PooledCheckoutRecord {
+        path: PathBuf::from(path),
+        source_repo: PathBuf::from(source_repo),
+        common_git_dir: PathBuf::from(common_git_dir),
+        slot,
+        worktree_git_dir: worktree_git_dir.map(PathBuf::from),
+        worktree_identity,
+        state,
+        session_id,
+        lease_id,
+        branch,
+        quarantine_reason,
+    })
+}
+
+fn record_into_lease(record: PooledCheckoutRecord) -> Result<PooledCheckoutLease> {
+    Ok(PooledCheckoutLease {
+        path: record.path,
+        source_repo: record.source_repo,
+        common_git_dir: record.common_git_dir,
+        slot: record.slot,
+        worktree_git_dir: record.worktree_git_dir,
+        worktree_identity: record.worktree_identity,
+        session_id: record.session_id.context("active checkout has no session")?,
+        lease_id: record.lease_id.context("active checkout has no lease")?,
+        branch: record.branch.context("active checkout has no branch")?,
+    })
+}
+
+fn validate_lease_inputs(session_id: &str, branch: &str) -> Result<()> {
+    anyhow::ensure!(!session_id.is_empty(), "session id cannot be empty");
+    anyhow::ensure!(!branch.is_empty(), "checkout branch cannot be empty");
+    Ok(())
+}
+
+fn canonical_db_path(path: &Path) -> Result<String> {
+    path.canonicalize()
+        .with_context(|| format!("canonicalize {}", path.display()))
+        .and_then(|path| path_text(&path))
+}
+
+fn absolute_db_path(path: &Path) -> Result<String> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    path_text(&path)
+}
+
+fn path_text(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .with_context(|| format!("path is not valid UTF-8: {}", path.display()))
 }
 
 #[cfg(test)]
@@ -796,5 +1225,184 @@ mod tests {
         store.upsert_session(&session).unwrap();
         let fetched = store.get_session("s2").unwrap().unwrap();
         assert_eq!(fetched.gate_status, None);
+    }
+
+    fn pool_fixture() -> (Store, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let root = tempdir().unwrap().keep();
+        let source = root.join("source");
+        let common = root.join("common.git");
+        let slots = root.join("slots");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&common).unwrap();
+        std::fs::create_dir_all(&slots).unwrap();
+        (
+            Store::open(root.join("pool.db")).unwrap(),
+            source.canonicalize().unwrap(),
+            common.canonicalize().unwrap(),
+            slots.canonicalize().unwrap(),
+        )
+    }
+
+    fn make_free(
+        store: &Store,
+        source: &Path,
+        common: &Path,
+        slots: &Path,
+        session: &str,
+    ) -> PooledCheckoutLease {
+        let lease = store
+            .reserve_pooled_checkout(source, common, slots, session, &format!("branch-{session}"))
+            .unwrap();
+        let admin = slots.join(format!("admin-{session}"));
+        std::fs::create_dir_all(&admin).unwrap();
+        assert!(store
+            .finalize_pooled_checkout(
+                &lease.path,
+                &lease.session_id,
+                &lease.lease_id,
+                &admin,
+                &format!("identity-{session}"),
+            )
+            .unwrap());
+        assert!(store
+            .release_pooled_checkout(&lease.path, &lease.session_id, &lease.lease_id)
+            .unwrap());
+        lease
+    }
+
+    #[test]
+    fn pooled_checkout_claims_lowest_free_slot_atomically() {
+        let (store, source, common, slots) = pool_fixture();
+        let low = make_free(&store, &source, &common, &slots, "first");
+        let high = make_free(&store, &source, &common, &slots, "second");
+        assert_eq!((low.slot, high.slot), (0, 1));
+
+        let claimed = store
+            .claim_lowest_free_pooled_checkout(&common, "next", "branch-next")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.slot, 0);
+        assert_eq!(claimed.path, low.path);
+        assert_eq!(
+            store
+                .pooled_checkout_by_session("next")
+                .unwrap()
+                .unwrap()
+                .state,
+            PooledCheckoutState::Provisioning,
+        );
+    }
+
+    #[test]
+    fn concurrent_pooled_claims_cannot_select_the_same_lowest_slot() {
+        let root = tempdir().unwrap().keep();
+        let db = root.join("pool.db");
+        let source = root.join("source");
+        let common = root.join("common.git");
+        let slots = root.join("slots");
+        for path in [&source, &common, &slots] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let first = Store::open(&db).unwrap();
+        make_free(&first, &source, &common, &slots, "free-zero");
+        make_free(&first, &source, &common, &slots, "free-one");
+        let second = Store::open(&db).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let spawn =
+            |store: Store, session: &'static str, barrier: std::sync::Arc<std::sync::Barrier>| {
+                let common = common.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .claim_lowest_free_pooled_checkout(
+                            &common,
+                            session,
+                            &format!("branch-{session}"),
+                        )
+                        .unwrap()
+                        .unwrap()
+                })
+            };
+        let a = spawn(first, "claim-a", barrier.clone());
+        let b = spawn(second, "claim-b", barrier);
+        let mut claimed = [a.join().unwrap().slot, b.join().unwrap().slot];
+        claimed.sort();
+        assert_eq!(claimed, [0, 1]);
+    }
+
+    #[test]
+    fn concurrent_pooled_reservations_get_unique_slots() {
+        let root = tempdir().unwrap().keep();
+        let db = root.join("pool.db");
+        let source = root.join("source");
+        let common = root.join("common.git");
+        let slots = root.join("slots");
+        for path in [&source, &common, &slots] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let first = Store::open(&db).unwrap();
+        let second = Store::open(&db).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let spawn =
+            |store: Store, session: &'static str, barrier: std::sync::Arc<std::sync::Barrier>| {
+                let source = source.clone();
+                let common = common.clone();
+                let slots = slots.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .reserve_pooled_checkout(
+                            &source,
+                            &common,
+                            &slots,
+                            session,
+                            &format!("branch-{session}"),
+                        )
+                        .unwrap()
+                })
+            };
+        let a = spawn(first, "a", barrier.clone());
+        let b = spawn(second, "b", barrier);
+        let mut slots = [a.join().unwrap().slot, b.join().unwrap().slot];
+        slots.sort();
+        assert_eq!(slots, [0, 1]);
+    }
+
+    #[test]
+    fn pooled_release_requires_matching_session_and_lease() {
+        let (store, source, common, slots) = pool_fixture();
+        let lease = store
+            .reserve_pooled_checkout(&source, &common, &slots, "owner", "branch-owner")
+            .unwrap();
+        let admin = slots.join("admin");
+        std::fs::create_dir(&admin).unwrap();
+        assert!(store
+            .finalize_pooled_checkout(&lease.path, "owner", &lease.lease_id, &admin, "identity")
+            .unwrap());
+
+        assert!(!store
+            .release_pooled_checkout(&lease.path, "other", &lease.lease_id)
+            .unwrap());
+        assert!(!store
+            .release_pooled_checkout(&lease.path, "owner", "stale-lease")
+            .unwrap());
+        assert_eq!(
+            store
+                .pooled_checkout_by_path(&lease.path)
+                .unwrap()
+                .unwrap()
+                .state,
+            PooledCheckoutState::Leased,
+        );
+        assert!(store
+            .release_pooled_checkout(&lease.path, "owner", &lease.lease_id)
+            .unwrap());
+        let free = store.pooled_checkout_by_path(&lease.path).unwrap().unwrap();
+        assert_eq!(free.state, PooledCheckoutState::Free);
+        assert_eq!(free.branch.as_deref(), Some("branch-owner"));
+        assert!(free.session_id.is_none());
+        assert!(free.lease_id.is_none());
     }
 }

@@ -6,7 +6,9 @@ mod spawn_util;
 mod style;
 mod theme;
 
-use spawn_util::{create_worker_worktree, repo_from_workspace, seed_worker_brain_skill};
+use spawn_util::{
+    acquire_worker_checkout, repo_from_workspace, rollback_worker_checkout, seed_worker_brain_skill,
+};
 use ninox_core::{
     config::AppConfig,
     events::Engine,
@@ -18,7 +20,7 @@ use ninox_core::{
     types::{Session, SessionStatus},
     BrainIndex, QueryFilters,
 };
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -49,6 +51,9 @@ enum Command {
         /// Absolute path to the repository the worker should operate in
         #[arg(long, short)]
         workspace: String,
+        /// Delivery contract. Defaults to PR for Git workspaces, direct otherwise.
+        #[arg(long, value_enum)]
+        delivery: Option<WorkerDelivery>,
         /// Display name for the session (defaults to first four words of prompt)
         #[arg(long, short)]
         name: Option<String>,
@@ -87,6 +92,12 @@ enum Command {
         #[command(subcommand)]
         action: InboxAction,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum WorkerDelivery {
+    Pr,
+    Direct,
 }
 
 #[derive(Subcommand)]
@@ -233,9 +244,9 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(Store::open(&db_path)?);
 
     match command {
-        Some(Command::Spawn { prompt, workspace, name, orchestrator_id }) => {
+        Some(Command::Spawn { prompt, workspace, delivery, name, orchestrator_id }) => {
             let config = AppConfig::load().unwrap_or_default();
-            run_spawn(store, config, prompt, workspace, name, orchestrator_id).await
+            run_spawn(store, config, prompt, workspace, delivery, name, orchestrator_id).await
         }
         Some(Command::Send { session_id, message }) => {
             let config = AppConfig::load().unwrap_or_default();
@@ -272,6 +283,7 @@ async fn run_spawn(
     config: AppConfig,
     prompt: String,
     workspace: String,
+    requested_delivery: Option<WorkerDelivery>,
     name: Option<String>,
     orchestrator_id: Option<String>,
 ) -> anyhow::Result<()> {
@@ -307,16 +319,72 @@ async fn run_spawn(
     let summary = first_line(&prompt, 140);
     let orchestrator_id = orchestrator_id
         .or_else(|| std::env::var("NINOX_ORCHESTRATOR_ID").ok());
-
-    // Create an isolated git worktree so workers don't share a branch.
-    // Falls back to the shared workspace if the repo check fails (e.g. not git).
-    let effective_workspace = match create_worker_worktree(&workspace, &id, config.inbox_messaging.enabled).await {
-        Ok(path) => path,
-        Err(e) => {
-            tracing::warn!("worktree creation failed for {id}, using shared workspace: {e}");
-            workspace.clone()
-        }
+    let delivery = resolve_worker_delivery(requested_delivery, &workspace);
+    anyhow::ensure!(
+        store.get_session(&id)?.is_none(),
+        "a session named {id} already exists — pick another name"
+    );
+    let mut pending = Session {
+        id: id.clone(),
+        orchestrator_id: orchestrator_id.clone(),
+        name: display_name.clone(),
+        repo: repo_from_workspace(&workspace).unwrap_or_default(),
+        status: SessionStatus::Spawning,
+        agent_type: agent.harness.clone(),
+        cost_usd: 0.0,
+        started_at: ts,
+        pr_number: None,
+        pr_id: None,
+        workspace_path: Some(workspace.clone()),
+        pid: None,
+        model: agent.model.clone(),
+        context_tokens: None,
+        catalogue_path: std::env::var("NINOX_BRAIN").ok().filter(|s| !s.is_empty()),
+        context_used_pct: None,
+        context_total_tokens: None,
+        context_window_size: None,
+        claude_session_id: None,
+        summary: summary.clone(),
+        terminal_at: None,
+        gate_status: None,
     };
+    store.upsert_session(&pending)?;
+
+    let checkout = if delivery == WorkerDelivery::Pr {
+        let repositories_root = config.resolved_repositories_root();
+        match acquire_worker_checkout(
+            store.clone(),
+            &workspace,
+            &id,
+            repositories_root.as_deref(),
+            &config.resolved_worktree_root(),
+            config.inbox_messaging.enabled,
+        )
+        .await
+        {
+            Ok(checkout) => Some(checkout),
+            Err(error) => {
+                pending.status = SessionStatus::Terminated;
+                pending.workspace_path = Some(workspace.clone());
+                let _ = store.upsert_session(&pending);
+                return Err(error);
+            }
+        }
+    } else if std::path::Path::new(&workspace).is_dir() {
+        None
+    } else {
+        pending.status = SessionStatus::Terminated;
+        let _ = store.upsert_session(&pending);
+        return Err(anyhow::anyhow!(
+            "workspace does not exist or is not a directory: {workspace}"
+        ));
+    };
+    let effective_workspace = checkout
+        .as_ref()
+        .map_or_else(|| workspace.clone(), |checkout| checkout.workspace.clone());
+    pending.workspace_path = Some(effective_workspace.clone());
+    store.upsert_session(&pending)?;
+
     if let Err(e) = seed_worker_brain_skill(&effective_workspace).await {
         tracing::warn!("failed to seed brain skill for {id}: {e}");
     }
@@ -334,11 +402,12 @@ async fn run_spawn(
 
     let orch_id_env = orchestrator_id.as_deref().unwrap_or("").to_string();
 
-    // Append worker context so every agent knows its session ID, its
-    // orchestrator's ID, and how to communicate back when done or stuck.
-    let mut effective_prompt = prompt;
+    // Append worker context so every agent knows its session ID, delivery
+    // contract, orchestrator ID, and how to communicate back when done.
+    let mut effective_prompt =
+        worker_prompt_for_workspace(&prompt, &workspace, &effective_workspace, delivery);
     if !orch_id_env.is_empty() {
-        effective_prompt.push_str(&worker_context_footer(&id, &orch_id_env));
+        effective_prompt.push_str(&worker_context_footer(&id, &orch_id_env, delivery));
     }
 
     let claude_session_id = ninox_core::harness::new_claude_session_id();
@@ -411,8 +480,12 @@ async fn run_spawn(
     // invisible to poll_pids and would linger until the next app restart's
     // reconciliation.
     if let Err(e) = tmux::create_session(&id, &effective_workspace, &cmd, &env_vec).await {
+        if let Some(checkout) = &checkout {
+            let _ = rollback_worker_checkout(store.clone(), checkout, &id).await;
+        }
         if let Ok(Some(mut s)) = store.get_session(&id) {
             s.status = SessionStatus::Terminated;
+            s.workspace_path = Some(workspace.clone());
             let _ = store.upsert_session(&s);
         }
         return Err(e);
@@ -421,10 +494,85 @@ async fn run_spawn(
     Ok(())
 }
 
+fn resolve_worker_delivery(
+    requested: Option<WorkerDelivery>,
+    workspace: &str,
+) -> WorkerDelivery {
+    requested.unwrap_or_else(|| {
+        if ninox_core::worktree::RepositoryIdentity::resolve(std::path::Path::new(workspace)).is_ok()
+        {
+            WorkerDelivery::Pr
+        } else {
+            WorkerDelivery::Direct
+        }
+    })
+}
+
+/// Make the allocated workspace authoritative even when the source checkout's
+/// absolute path appears in the task prompt.
+fn worker_prompt_for_workspace(
+    prompt: &str,
+    source_workspace: &str,
+    worker_workspace: &str,
+    delivery: WorkerDelivery,
+) -> String {
+    let remapped = if source_workspace == worker_workspace {
+        prompt.to_string()
+    } else {
+        prompt.replace(source_workspace, worker_workspace)
+    };
+    let source_note = if source_workspace == worker_workspace {
+        String::new()
+    } else {
+        " The original source checkout is repository context only; \
+         do not read, write, or run Git commands there."
+            .to_string()
+    };
+    let workspace_contract = match delivery {
+        WorkerDelivery::Pr =>
+            "Perform every repository read, write, and Git command inside it.",
+        WorkerDelivery::Direct =>
+            "Perform all task work and write artifacts or direct changes inside it.",
+    };
+    format!(
+        "{remapped}\n\n---\n\
+         **Ninox workspace:** `{worker_workspace}` is the authoritative workspace. \
+         {workspace_contract}{source_note}"
+    )
+}
+
+fn worker_context_footer(
+    id: &str,
+    orch_id: &str,
+    delivery: WorkerDelivery,
+) -> String {
+    match delivery {
+        WorkerDelivery::Pr => pr_worker_context_footer(id, orch_id),
+        WorkerDelivery::Direct => format!(
+            "\n\n---\n\
+             Ninox session `{id}` · orchestrator `{orch_id}` · direct delivery\n\n\
+             **Goal:** complete the task through validated artifacts or direct changes \
+             in the authoritative workspace.\n\n\
+             **Delivery:** Do not create branches, remotes, commits, or pull requests. \
+             Validate the delivered artifacts or direct changes before handoff.\n\n\
+             **Scope:** one worker, one task. If you discover additional work outside \
+             this task, do not do it — hand it to the orchestrator instead:\n\
+             ```bash\n\
+             ninox request-work \"<description of the additional work>\"\n\
+             ```\n\
+             Report back with a blocker-or-completion handoff:\n\
+             ```bash\n\
+             ninox send {orch_id} \"<blocked and needs a decision, or complete with artifacts/direct changes and validation>\"\n\
+             ```\n\
+             Stop after reporting that you are blocked or the direct delivery is complete.",
+        ),
+    }
+}
+
 /// The context footer appended to every worker's task prompt: its own
 /// session id, its orchestrator's id, the channels back to the orchestrator,
 /// and the one-worker-one-PR scope rule.
-fn worker_context_footer(id: &str, orch_id: &str) -> String {
+fn pr_worker_context_footer(id: &str, orch_id: &str) -> String {
     format!(
         "\n\n---\n\
          Ninox session `{id}` · orchestrator `{orch_id}`\n\n\
@@ -1164,7 +1312,90 @@ fn has_display() -> bool {
 
 #[cfg(test)]
 mod worker_env_tests {
-    use super::{first_line, run_spawn, worker_context_footer, worker_env_vars};
+    use super::{
+        first_line, pr_worker_context_footer, resolve_worker_delivery, run_spawn,
+        worker_context_footer, worker_env_vars, worker_prompt_for_workspace, Args, Command,
+        WorkerDelivery,
+    };
+    use clap::Parser;
+
+    fn init_git_repo() -> std::path::PathBuf {
+        let repo = tempfile::tempdir().unwrap().keep();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        repo
+    }
+
+    fn parsed_delivery(value: Option<&str>) -> Option<WorkerDelivery> {
+        let mut args = vec![
+            "ninox",
+            "spawn",
+            "--prompt",
+            "research the incident",
+            "--workspace",
+            "/tmp/workspace",
+        ];
+        if let Some(value) = value {
+            args.extend(["--delivery", value]);
+        }
+        let parsed = Args::try_parse_from(args).unwrap();
+        let Some(Command::Spawn { delivery, .. }) = parsed.command else {
+            panic!("expected spawn command");
+        };
+        delivery
+    }
+
+    #[test]
+    fn spawn_cli_parses_explicit_delivery_modes_and_keeps_omission_distinct() {
+        assert_eq!(parsed_delivery(Some("pr")), Some(WorkerDelivery::Pr));
+        assert_eq!(parsed_delivery(Some("direct")), Some(WorkerDelivery::Direct));
+        assert_eq!(parsed_delivery(None), None);
+    }
+
+    #[test]
+    fn omitted_delivery_defaults_by_git_workspace_and_explicit_choice_wins() {
+        let repo = init_git_repo();
+        let plain = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            resolve_worker_delivery(None, repo.to_str().unwrap()),
+            WorkerDelivery::Pr,
+        );
+        assert_eq!(
+            resolve_worker_delivery(None, plain.path().to_str().unwrap()),
+            WorkerDelivery::Direct,
+        );
+        assert_eq!(
+            resolve_worker_delivery(Some(WorkerDelivery::Direct), repo.to_str().unwrap()),
+            WorkerDelivery::Direct,
+        );
+        assert_eq!(
+            resolve_worker_delivery(Some(WorkerDelivery::Pr), plain.path().to_str().unwrap()),
+            WorkerDelivery::Pr,
+        );
+    }
 
     #[tokio::test]
     async fn run_spawn_marks_the_session_terminated_when_tmux_create_fails() {
@@ -1183,6 +1414,7 @@ mod worker_env_tests {
             ninox_core::config::AppConfig::default(),
             "do the task".into(),
             "/definitely/not/a/real/dir".into(),
+            None,
             Some("ghost-spawn-test".into()),
             None,
         )
@@ -1221,7 +1453,7 @@ mod worker_env_tests {
 
     #[test]
     fn worker_footer_scopes_to_one_pr_and_routes_extra_work_to_request_work() {
-        let footer = worker_context_footer("w1", "orch1");
+        let footer = worker_context_footer("w1", "orch1", WorkerDelivery::Pr);
         assert!(footer.contains("`w1`"), "must name the worker's own session");
         assert!(footer.contains("ninox send orch1"), "must keep the message-back channel");
         assert!(footer.contains("ninox request-work"), "must offer the work-request channel");
@@ -1233,6 +1465,58 @@ mod worker_env_tests {
             footer.contains("one pull request") || footer.contains("one PR"),
             "must state the one-worker-one-PR contract",
         );
+    }
+
+    #[test]
+    fn pr_delivery_wrapper_is_byte_identical_to_upstream_footer() {
+        assert_eq!(
+            worker_context_footer("w1", "orch1", WorkerDelivery::Pr),
+            pr_worker_context_footer("w1", "orch1"),
+        );
+    }
+
+    #[test]
+    fn direct_worker_contract_has_no_pr_delivery_workflow() {
+        let footer = worker_context_footer("w1", "orch1", WorkerDelivery::Direct);
+        assert!(footer.contains("validated artifacts or direct changes"));
+        assert!(footer.contains("blocked") && footer.contains("complete"));
+        assert!(!footer.contains("complete the task and open a pull request"));
+        assert!(!footer.contains("one worker, one task, one pull request"));
+        assert!(!footer.contains("ninox open --pr"));
+        assert!(!footer.contains("ninox close --pr"));
+    }
+
+    #[test]
+    fn worker_prompt_remaps_source_checkout_paths_to_the_managed_worktree() {
+        let prompt =
+            "Edit /Users/mu/dev/repo/src/main.rs, then run git in /Users/mu/dev/repo.";
+        let mapped = worker_prompt_for_workspace(
+            prompt,
+            "/Users/mu/dev/repo",
+            "/Users/mu/dev/_wts/repo/worker-1",
+            WorkerDelivery::Pr,
+        );
+
+        assert!(!mapped.contains("/Users/mu/dev/repo"));
+        assert_eq!(
+            mapped.matches("/Users/mu/dev/_wts/repo/worker-1").count(),
+            3,
+        );
+        assert!(mapped.contains("do not read, write, or run Git commands there"));
+    }
+
+    #[test]
+    fn direct_worker_workspace_prompt_avoids_git_workflow_guidance() {
+        let prompt = worker_prompt_for_workspace(
+            "Write the incident report.",
+            "/tmp/research",
+            "/tmp/research",
+            WorkerDelivery::Direct,
+        );
+
+        assert!(prompt.contains("write artifacts or direct changes"));
+        assert!(!prompt.contains("Git command"));
+        assert!(!prompt.contains("repository read"));
     }
 
     #[test]
