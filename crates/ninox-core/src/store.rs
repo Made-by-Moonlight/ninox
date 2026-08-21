@@ -35,7 +35,7 @@ fn allocation_lock_is_reclaimable(
     expected_token: Option<&str>,
 ) -> Result<bool> {
     let Some(expected_token) = expected_token else {
-        return Ok(true);
+        return Ok(false);
     };
     let path = allocation_lock_path(lock_dir, incarnation_id);
     let mut file = match std::fs::OpenOptions::new()
@@ -85,6 +85,7 @@ pub struct Store {
     conn: Mutex<Connection>,
     allocator_lock_dir: PathBuf,
     allocator_locks: Mutex<HashMap<String, File>>,
+    runtime_claim_locks: Mutex<HashMap<String, File>>,
 }
 
 
@@ -165,6 +166,13 @@ impl Store {
                     'release_claimed','released'
                 ))
             );
+            CREATE TABLE IF NOT EXISTS worker_runtime_claims (
+                session_id TEXT PRIMARY KEY,
+                incarnation_id TEXT NOT NULL,
+                claim_id TEXT NOT NULL UNIQUE,
+                claim_token TEXT NOT NULL,
+                prior_state TEXT NOT NULL CHECK(prior_state IN ('active','retained'))
+            );
         ")?;
         // Migrations for columns added after initial release — idempotent so
         // both fresh and pre-existing databases end up with the same schema.
@@ -213,7 +221,6 @@ impl Store {
                AND state IN ('provisioning','leased')",
             [],
         )?;
-        Self::reconcile_pooled_checkout_paths(&mut conn)?;
         conn.execute(
             "INSERT OR IGNORE INTO worker_incarnations(
                 session_id,incarnation_id,orchestrator_id,started_at,
@@ -229,13 +236,16 @@ impl Store {
                AND p.lease_id IS NOT NULL",
             [],
         )?;
+        Self::reconcile_pooled_checkout_paths(&mut conn)?;
         Self::reclaim_dead_allocations(&mut conn, &allocator_lock_dir)?;
+        Self::reclaim_dead_runtime_claims(&mut conn, &allocator_lock_dir)?;
         Self::backfill_legacy_managed_workers(&conn)?;
         Self::remove_orphan_spawning_sessions(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             allocator_lock_dir,
             allocator_locks: Mutex::new(HashMap::new()),
+            runtime_claim_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -370,6 +380,47 @@ impl Store {
         Ok(())
     }
 
+    fn reclaim_dead_runtime_claims(conn: &mut Connection, lock_dir: &Path) -> Result<()> {
+        let stale = {
+            let mut stmt = conn.prepare(
+                "SELECT session_id,incarnation_id,claim_id,claim_token
+                 FROM worker_runtime_claims",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|(_, _, claim_id, token)| {
+                    allocation_lock_is_reclaimable(
+                        lock_dir,
+                        &format!("runtime-{claim_id}"),
+                        Some(token),
+                    )
+                    .unwrap_or(false)
+                })
+                .collect::<Vec<_>>()
+        };
+        for (session_id, incarnation_id, claim_id, claim_token) in stale {
+            conn.execute(
+                "DELETE FROM worker_runtime_claims
+                 WHERE session_id=?1 AND incarnation_id=?2
+                   AND claim_id=?3 AND claim_token=?4",
+                params![session_id, incarnation_id, claim_id, claim_token],
+            )?;
+            let _ = std::fs::remove_file(allocation_lock_path(
+                lock_dir,
+                &format!("runtime-{claim_id}"),
+            ));
+        }
+        Ok(())
+    }
+
     fn backfill_legacy_managed_workers(conn: &Connection) -> Result<()> {
         let candidates = {
             let mut stmt = conn.prepare(
@@ -428,6 +479,16 @@ impl Store {
 
     fn remove_orphan_spawning_sessions(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE sessions SET status='terminated'
+             WHERE status='working' AND pid IS NULL AND EXISTS(
+                SELECT 1 FROM worker_incarnations w
+                WHERE w.session_id=sessions.id
+                  AND w.started_at=sessions.started_at
+                  AND w.state='released'
+             )",
+            [],
+        )?;
         tx.execute(
             "DELETE FROM sessions
              WHERE status='spawning' AND NOT EXISTS(
@@ -927,6 +988,17 @@ impl Store {
         };
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let runtime_claimed: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM worker_runtime_claims WHERE session_id=?1
+            )",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            !runtime_claimed,
+            "worker {session_id} runtime start is already in progress"
+        );
         let previous = tx
             .query_row(
                 &format!("{WORKER_INCARNATION_COLUMNS} WHERE session_id=?1"),
@@ -1119,6 +1191,175 @@ impl Store {
         .transpose()
     }
 
+    pub fn worker_runtime_claimed(&self, session_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM worker_runtime_claims WHERE session_id=?1
+            )",
+            [session_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn claim_worker_runtime_start(
+        &self,
+        session_id: &str,
+        incarnation_id: &str,
+    ) -> Result<Option<WorkerRuntimeClaim>> {
+        let claim_id = uuid::Uuid::new_v4().to_string();
+        let claim_token = uuid::Uuid::new_v4().to_string();
+        let lock_key = format!("runtime-{claim_id}");
+        let lock_path = allocation_lock_path(&self.allocator_lock_dir, &lock_key);
+        let mut lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)?;
+        lock_file.write_all(claim_token.as_bytes())?;
+        lock_file.sync_all()?;
+        lock_file.lock()?;
+        let pending_lock = PendingAllocationLock {
+            path: lock_path,
+            file: Some(lock_file),
+        };
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(raw) = tx
+            .query_row(
+                &format!(
+                    "{WORKER_INCARNATION_COLUMNS}
+                     WHERE session_id=?1 AND incarnation_id=?2"
+                ),
+                params![session_id, incarnation_id],
+                worker_incarnation_row,
+            )
+            .optional()?
+        else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let worker = raw_worker_incarnation(raw)?;
+        if !matches!(
+            worker.state,
+            WorkerIncarnationState::Active | WorkerIncarnationState::Retained
+        ) {
+            tx.commit()?;
+            return Ok(None);
+        }
+        if let Some(lease_id) = worker.lease_id.as_deref() {
+            let exact: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pooled_checkouts
+                    WHERE session_id=?1 AND owner_incarnation_id=?2
+                      AND lease_id=?3 AND state IN ('provisioning','leased')
+                )",
+                params![session_id, incarnation_id, lease_id],
+                |row| row.get(0),
+            )?;
+            if !exact {
+                tx.commit()?;
+                return Ok(None);
+            }
+        }
+        let inserted = tx.execute(
+            "INSERT INTO worker_runtime_claims(
+                session_id,incarnation_id,claim_id,claim_token,prior_state
+             ) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(session_id) DO NOTHING",
+            params![
+                session_id,
+                incarnation_id,
+                claim_id,
+                claim_token,
+                worker_state_name(worker.state),
+            ],
+        )?;
+        if inserted != 1 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        tx.commit()?;
+        let lock_file = pending_lock
+            .persist()
+            .context("pending runtime claim lock disappeared")?;
+        self.runtime_claim_locks
+            .lock()
+            .unwrap()
+            .insert(claim_id.clone(), lock_file);
+        Ok(Some(WorkerRuntimeClaim { worker, claim_id }))
+    }
+
+    pub fn complete_worker_runtime_start(
+        &self,
+        session_id: &str,
+        incarnation_id: &str,
+        claim_id: &str,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prior_state = tx
+            .query_row(
+                "SELECT prior_state FROM worker_runtime_claims
+                 WHERE session_id=?1 AND incarnation_id=?2 AND claim_id=?3",
+                params![session_id, incarnation_id, claim_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(prior_state) = prior_state else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        let changed = tx.execute(
+            "UPDATE worker_incarnations SET state='active'
+             WHERE session_id=?1 AND incarnation_id=?2 AND state=?3",
+            params![session_id, incarnation_id, prior_state],
+        )?;
+        if changed != 1 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "DELETE FROM worker_runtime_claims
+             WHERE session_id=?1 AND incarnation_id=?2 AND claim_id=?3",
+            params![session_id, incarnation_id, claim_id],
+        )?;
+        tx.commit()?;
+        self.release_runtime_claim_lock(claim_id);
+        Ok(true)
+    }
+
+    pub fn abort_worker_runtime_start(
+        &self,
+        session_id: &str,
+        incarnation_id: &str,
+        claim_id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "DELETE FROM worker_runtime_claims
+             WHERE session_id=?1 AND incarnation_id=?2 AND claim_id=?3",
+            params![session_id, incarnation_id, claim_id],
+        )?;
+        drop(conn);
+        if changed == 1 {
+            self.release_runtime_claim_lock(claim_id);
+        }
+        Ok(changed == 1)
+    }
+
+    fn release_runtime_claim_lock(&self, claim_id: &str) {
+        if let Some(file) = self.runtime_claim_locks.lock().unwrap().remove(claim_id) {
+            let _ = file.unlock();
+        }
+        let _ = std::fs::remove_file(allocation_lock_path(
+            &self.allocator_lock_dir,
+            &format!("runtime-{claim_id}"),
+        ));
+    }
+
     pub fn claim_worker_cleanup(
         &self,
         session_id: &str,
@@ -1158,7 +1399,12 @@ impl Store {
              SET lease_id=?3,state='cleanup_claimed'
              WHERE session_id=?1 AND incarnation_id=?2
                AND state IN ('allocating','active','retained')
-               AND (lease_id IS NULL OR lease_id=?3)",
+               AND (lease_id IS NULL OR lease_id=?3)
+               AND NOT EXISTS(
+                   SELECT 1 FROM worker_runtime_claims r
+                   WHERE r.session_id=worker_incarnations.session_id
+                     AND r.incarnation_id=worker_incarnations.incarnation_id
+               )",
             params![session_id, incarnation_id, lease_id],
         )?;
         if changed != 1 {
@@ -1184,6 +1430,17 @@ impl Store {
     ) -> Result<Option<WorkerIncarnation>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let runtime_claimed: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM worker_runtime_claims WHERE session_id=?1
+            )",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        if runtime_claimed {
+            tx.commit()?;
+            return Ok(None);
+        }
         if let Some(raw) = tx
             .query_row(
                 &format!(
@@ -1331,6 +1588,18 @@ impl Store {
     ) -> Result<Option<WorkerIncarnation>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let runtime_claimed: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM worker_runtime_claims
+                WHERE session_id=?1 AND incarnation_id=?2
+            )",
+            params![session_id, incarnation_id],
+            |row| row.get(0),
+        )?;
+        if runtime_claimed {
+            tx.commit()?;
+            return Ok(None);
+        }
         let Some(raw) = tx
             .query_row(
                 &format!(
@@ -1434,7 +1703,12 @@ impl Store {
         let changed = tx.execute(
             "UPDATE worker_incarnations SET state='retained'
              WHERE session_id=?1 AND incarnation_id=?2 AND started_at=?3
-               AND state='active'",
+               AND state='active'
+               AND NOT EXISTS(
+                   SELECT 1 FROM worker_runtime_claims r
+                   WHERE r.session_id=worker_incarnations.session_id
+                     AND r.incarnation_id=worker_incarnations.incarnation_id
+               )",
             params![session_id, incarnation_id, started_at],
         )?;
         if changed != 1 {
@@ -3175,6 +3449,41 @@ mod tests {
     }
 
     #[test]
+    fn restart_preserves_mixed_version_live_tokenless_allocation() {
+        let root = tempdir().unwrap().keep();
+        let db = root.join("mixed-version.db");
+        let store = Store::open(&db).unwrap();
+        let worker = store
+            .prepare_worker_incarnation("legacy", None, 1, "/repo", true, 1)
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE worker_incarnations
+                 SET allocator_token=NULL,allocator_pid=?3
+                 WHERE session_id=?1 AND incarnation_id=?2",
+                params!["legacy", worker.incarnation_id, std::process::id()],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(&db).unwrap();
+        assert!(matches!(
+            reopened
+                .current_worker_incarnation("legacy")
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkerIncarnationState::Allocating
+        ));
+        assert!(reopened
+            .prepare_worker_incarnation("replacement", None, 2, "/repo", true, 1)
+            .is_err());
+    }
+
+    #[test]
     fn startup_removes_orphan_spawning_session_and_name_is_reusable() {
         let root = tempdir().unwrap().keep();
         let db = root.join("orphan-spawn.db");
@@ -3193,6 +3502,37 @@ mod tests {
             .prepare_worker_incarnation("worker", None, 2, "/repo", true, 3)
             .unwrap();
         assert_eq!(worker.started_at, 2);
+    }
+
+    #[test]
+    fn startup_terminalizes_legacy_working_ghost_after_failed_launch() {
+        let root = tempdir().unwrap().keep();
+        let db = root.join("working-ghost.db");
+        let store = Store::open(&db).unwrap();
+        let mut session = spawning_session("worker", 1);
+        session.status = SessionStatus::Working;
+        store.upsert_session(&session).unwrap();
+        let worker = store
+            .prepare_worker_incarnation("worker", None, 1, "/repo", true, 3)
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE worker_incarnations
+                 SET state='released',allocator_token=NULL,allocator_pid=NULL
+                 WHERE session_id=?1 AND incarnation_id=?2",
+                params!["worker", worker.incarnation_id],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(db).unwrap();
+        assert!(matches!(
+            reopened.get_session("worker").unwrap().unwrap().status,
+            SessionStatus::Terminated
+        ));
     }
 
     #[test]
@@ -3438,6 +3778,199 @@ mod tests {
     }
 
     #[test]
+    fn runtime_start_claim_blocks_release_cleanup_and_refile_through_launch() {
+        let store = test_store();
+        let worker = store
+            .prepare_worker_incarnation("worker", Some("orch"), 1, "/repo", true, 3)
+            .unwrap();
+        assert!(store
+            .bind_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "/repo",
+                "/repo-w1",
+                None,
+            )
+            .unwrap());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE worker_incarnations SET state='retained'
+                 WHERE session_id='worker'",
+                [],
+            )
+            .unwrap();
+
+        let claim = store
+            .claim_worker_runtime_start("worker", &worker.incarnation_id)
+            .unwrap()
+            .unwrap();
+        assert!(store.worker_runtime_claimed("worker").unwrap());
+        assert!(store
+            .claim_worker_release("worker", &worker.incarnation_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .claim_worker_cleanup("worker", &worker.incarnation_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .prepare_worker_incarnation("worker", Some("orch"), 2, "/repo", true, 3)
+            .is_err());
+
+        assert!(store
+            .complete_worker_runtime_start(
+                "worker",
+                &worker.incarnation_id,
+                &claim.claim_id,
+            )
+            .unwrap());
+        assert!(!store.worker_runtime_claimed("worker").unwrap());
+        assert!(matches!(
+            store.current_worker_incarnation("worker").unwrap().unwrap().state,
+            WorkerIncarnationState::Active
+        ));
+        assert!(store
+            .claim_worker_release("worker", &worker.incarnation_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn release_claim_blocks_runtime_start() {
+        let store = test_store();
+        let worker = store
+            .prepare_worker_incarnation("worker", Some("orch"), 1, "/repo", true, 3)
+            .unwrap();
+        assert!(store
+            .bind_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "/repo",
+                "/repo-w1",
+                None,
+            )
+            .unwrap());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE worker_incarnations SET state='retained'
+                 WHERE session_id='worker'",
+                [],
+            )
+            .unwrap();
+
+        assert!(store
+            .claim_worker_release("worker", &worker.incarnation_id)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .claim_worker_runtime_start("worker", &worker.incarnation_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn release_and_runtime_start_have_one_concurrent_winner() {
+        let root = tempdir().unwrap().keep();
+        let db = root.join("release-resume-race.db");
+        let store = Store::open(&db).unwrap();
+        let worker = store
+            .prepare_worker_incarnation("worker", Some("orch"), 1, "/repo", true, 3)
+            .unwrap();
+        assert!(store
+            .bind_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "/repo",
+                "/repo-w1",
+                None,
+            )
+            .unwrap());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE worker_incarnations SET state='retained'
+                 WHERE session_id='worker'",
+                [],
+            )
+            .unwrap();
+        let resume_store = Store::open(&db).unwrap();
+        let release_store = Store::open(&db).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume_barrier = barrier.clone();
+        let resume_incarnation = worker.incarnation_id.clone();
+        let resume = std::thread::spawn(move || {
+            resume_barrier.wait();
+            resume_store
+                .claim_worker_runtime_start("worker", &resume_incarnation)
+                .unwrap()
+                .is_some()
+        });
+        let release_incarnation = worker.incarnation_id.clone();
+        let release = std::thread::spawn(move || {
+            barrier.wait();
+            release_store
+                .claim_worker_release("worker", &release_incarnation)
+                .unwrap()
+                .is_some()
+        });
+
+        let resume_won = resume.join().unwrap();
+        let release_won = release.join().unwrap();
+        assert_ne!(resume_won, release_won);
+        assert_eq!(store.worker_runtime_claimed("worker").unwrap(), resume_won);
+        assert_eq!(
+            matches!(
+                store.current_worker_incarnation("worker").unwrap().unwrap().state,
+                WorkerIncarnationState::ReleaseClaimed
+            ),
+            release_won
+        );
+    }
+
+    #[test]
+    fn restart_reclaims_only_dead_runtime_start_claim() {
+        let root = tempdir().unwrap().keep();
+        let db = root.join("runtime-claim-restart.db");
+        let store = Store::open(&db).unwrap();
+        let worker = store
+            .prepare_worker_incarnation("worker", None, 1, "/repo", false, 3)
+            .unwrap();
+        assert!(store
+            .bind_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "/repo",
+                "/repo",
+                None,
+            )
+            .unwrap());
+        store
+            .claim_worker_runtime_start("worker", &worker.incarnation_id)
+            .unwrap()
+            .unwrap();
+
+        let concurrent = Store::open(&db).unwrap();
+        assert!(concurrent.worker_runtime_claimed("worker").unwrap());
+        drop(concurrent);
+        drop(store);
+
+        let reopened = Store::open(db).unwrap();
+        assert!(!reopened.worker_runtime_claimed("worker").unwrap());
+        assert!(matches!(
+            reopened.current_worker_incarnation("worker").unwrap().unwrap().state,
+            WorkerIncarnationState::Active
+        ));
+    }
+
+    #[test]
     fn removed_low_slot_is_reused_without_suffix_growth() {
         let (store, source, common, _slots) = pool_fixture();
         let first = store
@@ -3584,6 +4117,56 @@ mod tests {
             .unwrap();
         assert!(reopened
             .prepare_worker_incarnation("replacement-3", None, 4, "/repo", true, 3)
+            .is_err());
+    }
+
+    #[test]
+    fn direct_upgrade_backfills_unsafe_pool_owner_before_quarantine() {
+        let root = tempdir().unwrap().keep();
+        let db = root.join("early-pr-upgrade.db");
+        let source = root.join("repo");
+        let common = source.join(".git");
+        let unsafe_path = source.join("worker-w1");
+        std::fs::create_dir_all(&common).unwrap();
+        let store = Store::open(&db).unwrap();
+        let mut session = spawning_session("legacy", 1);
+        session.status = SessionStatus::Working;
+        session.workspace_path = Some(unsafe_path.to_string_lossy().to_string());
+        store.upsert_session(&session).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO pooled_checkouts(
+                    path,source_repo,common_git_dir,slot,path_kind,state,
+                    session_id,owner_incarnation_id,lease_id,branch
+                 ) VALUES(?1,?2,?3,0,'sibling','leased',
+                          'legacy','legacy-inc','legacy-lease','legacy')",
+                params![
+                    path_text(&unsafe_path).unwrap(),
+                    canonical_db_path(&source).unwrap(),
+                    canonical_db_path(&common).unwrap(),
+                ],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(&db).unwrap();
+        let worker = reopened
+            .current_worker_incarnation("legacy")
+            .unwrap()
+            .unwrap();
+        assert_eq!(worker.incarnation_id, "legacy-inc");
+        assert!(matches!(worker.state, WorkerIncarnationState::Retained));
+        let pool = reopened
+            .pooled_checkout_by_path(&unsafe_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pool.state, PooledCheckoutState::Quarantined);
+        assert_eq!(pool.kind, PooledCheckoutKind::UnsafeLegacy);
+        assert!(reopened
+            .prepare_worker_incarnation("replacement-1", None, 2, "/repo", true, 1)
             .is_err());
     }
 

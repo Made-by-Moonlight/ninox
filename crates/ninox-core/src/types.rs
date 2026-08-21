@@ -83,6 +83,12 @@ pub struct WorkerIncarnation {
     pub state: WorkerIncarnationState,
 }
 
+#[derive(Debug)]
+pub struct WorkerRuntimeClaim {
+    pub worker: WorkerIncarnation,
+    pub claim_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {

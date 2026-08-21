@@ -64,6 +64,56 @@ fn checkout_error_with_candidates(engine: &Engine, error: &dyn std::fmt::Display
     }
 }
 
+struct RuntimeStartGuard {
+    store: Arc<ninox_core::store::Store>,
+    claim: Option<ninox_core::types::WorkerRuntimeClaim>,
+}
+
+impl RuntimeStartGuard {
+    fn new(
+        store: Arc<ninox_core::store::Store>,
+        claim: ninox_core::types::WorkerRuntimeClaim,
+    ) -> Self {
+        Self {
+            store,
+            claim: Some(claim),
+        }
+    }
+
+    fn claim(&self) -> &ninox_core::types::WorkerRuntimeClaim {
+        self.claim
+            .as_ref()
+            .expect("runtime start guard is incomplete")
+    }
+
+    fn complete(&mut self) -> anyhow::Result<bool> {
+        let Some(claim) = self.claim.as_ref() else {
+            return Ok(false);
+        };
+        let completed = self.store.complete_worker_runtime_start(
+            &claim.worker.session_id,
+            &claim.worker.incarnation_id,
+            &claim.claim_id,
+        )?;
+        if completed {
+            self.claim = None;
+        }
+        Ok(completed)
+    }
+}
+
+impl Drop for RuntimeStartGuard {
+    fn drop(&mut self) {
+        if let Some(claim) = self.claim.take() {
+            let _ = self.store.abort_worker_runtime_start(
+                &claim.worker.session_id,
+                &claim.worker.incarnation_id,
+                &claim.claim_id,
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // View state
 // ---------------------------------------------------------------------------
@@ -2219,14 +2269,45 @@ impl App {
                     tracing::warn!("resume {id}: no workspace/claude_session_id/resume-capable harness, cannot resume");
                     return Task::none();
                 };
-                if !is_orch {
-                    if let Ok(Some(worker)) = state.engine.store.current_worker_incarnation(&id) {
-                        plan.extra_env.push((
-                            "NINOX_WORKER_INCARNATION".to_string(),
-                            worker.incarnation_id,
-                        ));
+                let runtime_claim = if is_orch {
+                    None
+                } else {
+                    match state.engine.store.current_worker_incarnation(&id) {
+                        Ok(Some(worker)) => {
+                            match state
+                                .engine
+                                .store
+                                .claim_worker_runtime_start(&id, &worker.incarnation_id)
+                            {
+                                Ok(Some(claim)) => {
+                                    plan.extra_env.push((
+                                        "NINOX_WORKER_INCARNATION".to_string(),
+                                        claim.worker.incarnation_id.clone(),
+                                    ));
+                                    Some(RuntimeStartGuard::new(
+                                        state.engine.store.clone(),
+                                        claim,
+                                    ))
+                                }
+                                Ok(None) => {
+                                    tracing::warn!(
+                                        "resume {id}: worker lifecycle is already claimed"
+                                    );
+                                    return Task::none();
+                                }
+                                Err(error) => {
+                                    tracing::warn!("resume {id}: cannot claim runtime: {error}");
+                                    return Task::none();
+                                }
+                            }
+                        }
+                        Ok(None) => None,
+                        Err(error) => {
+                            tracing::warn!("resume {id}: cannot load worker: {error}");
+                            return Task::none();
+                        }
                     }
-                }
+                };
                 let Some(claude_session_id) = session.claude_session_id.clone() else {
                     return Task::none(); // unreachable: resume_plan already required this
                 };
@@ -2248,7 +2329,11 @@ impl App {
                 let summary = session.summary.clone();
                 let inbox_enabled = state.config.inbox_messaging.enabled;
                 Task::future(async move {
-                    let _ = ninox_core::tmux::kill_session(&id).await;
+                    let mut runtime_claim = runtime_claim;
+                    if let Err(error) = ninox_core::tmux::kill_session(&id).await {
+                        tracing::warn!("resume {id}: cannot stop prior runtime: {error}");
+                        return Message::Noop;
+                    }
                     // The worktree may have been torn down since the session
                     // ran (merge cleanup, manual prune). Recreate it at the
                     // same path — claude-code keys the conversation to that
@@ -2269,7 +2354,7 @@ impl App {
                         return Message::Noop;
                     }
                     let attach = crate::spawn_util::spawn_interactive_session(
-                        engine,
+                        engine.clone(),
                         crate::spawn_util::InteractiveSpawnParams {
                             session_id:      id.clone(),
                             name,
@@ -2288,8 +2373,28 @@ impl App {
                     )
                     .await;
                     match attach {
-                        Some(argv) => Message::ClientAttach { session_id: id, argv },
-                        None       => Message::Noop,
+                        Some(argv) => {
+                            if let Some(claim) = &runtime_claim {
+                                let incarnation_id =
+                                    claim.claim().worker.incarnation_id.clone();
+                                if !runtime_claim
+                                    .as_mut()
+                                    .is_some_and(|claim| claim.complete().unwrap_or(false))
+                                {
+                                    let _ = crate::spawn_util::stop_exact_worker_runtime(
+                                        &id,
+                                        &incarnation_id,
+                                        None,
+                                    )
+                                    .await;
+                                    return Message::Noop;
+                                }
+                            }
+                            Message::ClientAttach { session_id: id, argv }
+                        }
+                        None => {
+                            Message::Noop
+                        }
                     }
                 })
             }
@@ -4110,6 +4215,63 @@ mod tests {
         m.diffs.insert("s1".into(), Some("stale diff text".into()));
         let (m, _) = m.update(Message::ResumeSession("s1".into()));
         assert!(!m.diffs.contains_key("s1"), "resume must not leave the pre-resume diff cached");
+    }
+
+    #[test]
+    fn resume_message_cannot_cross_an_exact_release_claim() {
+        let e = test_engine();
+        let mut m = base(e);
+        let mut session = refile_session("s1");
+        session.status = SessionStatus::Done;
+        session.claude_session_id = Some("stored-uuid".into());
+        m.engine.store.upsert_session(&session).unwrap();
+        let worker = m
+            .engine
+            .store
+            .prepare_worker_incarnation("s1", None, session.started_at, "/tmp/ws", false, 3)
+            .unwrap();
+        assert!(m
+            .engine
+            .store
+            .bind_worker_incarnation(
+                "s1",
+                &worker.incarnation_id,
+                "/tmp/ws",
+                "/tmp/ws",
+                None,
+            )
+            .unwrap());
+        let cleanup = m
+            .engine
+            .store
+            .claim_worker_cleanup("s1", &worker.incarnation_id)
+            .unwrap()
+            .unwrap();
+        assert!(m
+            .engine
+            .store
+            .abort_worker_claim(
+                "s1",
+                &cleanup.incarnation_id,
+                WorkerIncarnationState::CleanupClaimed,
+                WorkerIncarnationState::Retained,
+            )
+            .unwrap());
+        assert!(m
+            .engine
+            .store
+            .claim_worker_release("s1", &worker.incarnation_id)
+            .unwrap()
+            .is_some());
+        m.sessions.insert("s1".into(), session);
+        m.terminals
+            .insert("s1".into(), TerminalState::new(80, 24, None));
+        m.diffs.insert("s1".into(), Some("preserve".into()));
+
+        let (m, _) = m.update(Message::ResumeSession("s1".into()));
+
+        assert!(m.terminals.contains_key("s1"));
+        assert!(m.diffs.contains_key("s1"));
     }
 
     #[tokio::test]

@@ -552,7 +552,8 @@ async fn run_spawn(
         )
         .await;
         if rolled_back {
-            let _ = store.terminalize_spawning_session_snapshot(&id, ts, &workspace);
+            let _ =
+                store.update_session_status_snapshot(&id, ts, SessionStatus::Terminated);
         }
         anyhow::bail!(
             "harness '{}' lost its worker capability during spawn",
@@ -601,7 +602,8 @@ async fn run_spawn(
         )
         .await;
         if rolled_back {
-            let _ = store.terminalize_spawning_session_snapshot(&id, ts, &workspace);
+            let _ =
+                store.update_session_status_snapshot(&id, ts, SessionStatus::Terminated);
         }
         return Err(e);
     }
@@ -1232,6 +1234,10 @@ async fn run_release(
     let worker = store
         .current_worker_incarnation(session_id)?
         .with_context(|| format!("worker {session_id} release completed concurrently"))?;
+    anyhow::ensure!(
+        !store.worker_runtime_claimed(session_id)?,
+        "worker {session_id} runtime start is already in progress"
+    );
     let claim = if matches!(
         worker.state,
         ninox_core::types::WorkerIncarnationState::ReleaseClaimed
