@@ -83,6 +83,15 @@ pub struct WorkerIncarnation {
     pub state: WorkerIncarnationState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyWorkerRuntimeCapability {
+    pub session_id: SessionId,
+    pub incarnation_id: String,
+    pub physical_tmux_name: String,
+    pub pane_id: String,
+    pub pane_pid: u32,
+}
+
 #[derive(Debug)]
 pub struct WorkerRuntimeClaim {
     pub worker: WorkerIncarnation,

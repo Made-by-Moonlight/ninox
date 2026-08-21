@@ -195,6 +195,13 @@ pub struct TmuxSession {
     pub tty:        Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactTmuxSession {
+    pub physical_tmux_name: String,
+    pub pane_id: String,
+    pub pane_pid: u32,
+}
+
 /// Run a tmux subcommand against the ninox server and return trimmed stdout.
 async fn run(args: &[&str]) -> Result<String> {
     ensure_server_ready().await;
@@ -334,6 +341,53 @@ pub async fn kill_session(id: &str) -> Result<()> {
 /// Returns `true` if a tmux session with this name is currently running.
 pub async fn has_session(id: &str) -> bool {
     run_session_scoped(&["has-session", "-t", id]).await.is_ok()
+}
+
+/// Resolve one immutable physical runtime on the private server only.
+///
+/// Exact selectors avoid tmux prefix matching. Multiple panes are ambiguous
+/// and therefore never accepted as a worker runtime capability.
+pub async fn exact_private_session(id: &str) -> Result<Option<ExactTmuxSession>> {
+    let selector = format!("={id}:");
+    let output = match run(&[
+        "list-panes",
+        "-t",
+        &selector,
+        "-F",
+        "#{session_name}|#{pane_id}|#{pane_pid}|#{pane_dead}",
+    ])
+    .await
+    {
+        Ok(output) => output,
+        Err(error) if is_missing_session(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let panes = output.lines().filter(|line| !line.is_empty()).collect::<Vec<_>>();
+    anyhow::ensure!(
+        panes.len() == 1,
+        "exact physical runtime has {} panes",
+        panes.len()
+    );
+    let mut fields = panes[0].splitn(4, '|');
+    let physical_tmux_name = fields.next().unwrap_or_default();
+    let pane_id = fields.next().unwrap_or_default();
+    let pane_pid = fields.next().unwrap_or_default();
+    let pane_dead = fields.next().unwrap_or_default();
+    anyhow::ensure!(
+        physical_tmux_name == id && pane_id.starts_with('%'),
+        "exact physical runtime identity is malformed"
+    );
+    if pane_dead == "1" {
+        return Ok(None);
+    }
+    let pane_pid = pane_pid
+        .parse::<u32>()
+        .context("exact physical runtime has invalid pane PID")?;
+    Ok(Some(ExactTmuxSession {
+        physical_tmux_name: physical_tmux_name.to_string(),
+        pane_id: pane_id.to_string(),
+        pane_pid,
+    }))
 }
 
 /// Read one variable from an exact tmux session. `None` means the session is

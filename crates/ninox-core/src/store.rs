@@ -81,6 +81,383 @@ impl Drop for PendingAllocationLock {
     }
 }
 
+const CURRENT_WORKER_INCARNATION_COLUMNS: &[&str] = &[
+    "session_id",
+    "incarnation_id",
+    "orchestrator_id",
+    "started_at",
+    "source_workspace",
+    "workspace_path",
+    "lease_id",
+    "allocator_pid",
+    "allocator_token",
+    "checkout_backed",
+    "state",
+];
+
+const LEGACY_WORKER_INCARNATION_COLUMNS: &[&str] = &[
+    "session_id",
+    "incarnation_id",
+    "phase",
+    "ui_outcome",
+    "physical_tmux_name",
+    "pane_id",
+    "pane_pid",
+    "workspace_path",
+    "pool_path",
+    "lease_id",
+    "worktree_identity",
+    "artifact_dir",
+    "started_at",
+    "terminal_at",
+    "migration_hold",
+    "allocator_pid",
+    "allocator_token",
+];
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| Ok((row.get(1)?, row.get(5)?)))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
+fn create_legacy_runtime_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS legacy_worker_runtimes (
+            session_id TEXT PRIMARY KEY,
+            incarnation_id TEXT NOT NULL UNIQUE,
+            physical_tmux_name TEXT NOT NULL UNIQUE,
+            pane_id TEXT NOT NULL,
+            pane_pid INTEGER NOT NULL
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+fn migrate_legacy_worker_incarnations(conn: &mut Connection) -> Result<()> {
+    let columns = table_columns(conn, "worker_incarnations")?;
+    let names = columns.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
+    if names == CURRENT_WORKER_INCARNATION_COLUMNS
+        && columns.first().is_some_and(|(_, pk)| *pk == 1)
+        && columns.get(1).is_some_and(|(_, pk)| *pk == 0)
+    {
+        create_legacy_runtime_table(conn)?;
+        return Ok(());
+    }
+
+    let legacy_columns_with_additions = LEGACY_WORKER_INCARNATION_COLUMNS
+        .iter()
+        .copied()
+        .chain([
+            "orchestrator_id",
+            "source_workspace",
+            "checkout_backed",
+            "state",
+        ])
+        .collect::<Vec<_>>();
+    let legacy_shape =
+        names == LEGACY_WORKER_INCARNATION_COLUMNS || names == legacy_columns_with_additions;
+    anyhow::ensure!(
+        legacy_shape
+            && columns.first().is_some_and(|(_, pk)| *pk == 1)
+            && columns.get(1).is_some_and(|(_, pk)| *pk == 2),
+        "unsupported worker_incarnations schema; refusing ambiguous migration"
+    );
+    for column in ["current_incarnation_id", "incarnation"] {
+        anyhow::ensure!(
+            Store::column_exists(conn, "sessions", column)?,
+            "legacy worker migration requires sessions.{column}"
+        );
+    }
+    anyhow::ensure!(
+        Store::column_exists(conn, "pooled_checkouts", "owner_incarnation_id")?,
+        "legacy worker migration requires pooled checkout ownership capabilities"
+    );
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "
+        CREATE TEMP TABLE worker_migration_candidates (
+            session_id TEXT NOT NULL,
+            incarnation_id TEXT NOT NULL,
+            priority INTEGER NOT NULL,
+            PRIMARY KEY(session_id, incarnation_id)
+        );
+
+        INSERT INTO worker_migration_candidates(session_id,incarnation_id,priority)
+        SELECT
+            w.session_id,
+            w.incarnation_id,
+            CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM pooled_checkouts p
+                    WHERE p.session_id=w.session_id
+                      AND p.owner_incarnation_id=w.incarnation_id
+                      AND p.lease_id IS w.lease_id
+                      AND p.state IN ('provisioning','leased')
+                ) THEN 10
+                WHEN EXISTS (
+                    SELECT 1 FROM sessions s
+                    WHERE s.id=w.session_id
+                      AND COALESCE(
+                          NULLIF(s.current_incarnation_id,''),
+                          NULLIF(s.incarnation,'')
+                      )=w.incarnation_id
+                      AND s.status NOT IN ('done','terminated','interrupted')
+                ) THEN 20
+                WHEN EXISTS (
+                    SELECT 1 FROM worker_retention r
+                    WHERE r.session_id=w.session_id
+                      AND r.incarnation=w.incarnation_id
+                      AND r.finalized_at IS NULL
+                ) THEN 30
+                WHEN EXISTS (
+                    SELECT 1 FROM worker_retention r
+                    WHERE r.session_id=w.session_id
+                      AND r.incarnation=w.incarnation_id
+                ) THEN 31
+                ELSE 40
+            END
+        FROM worker_incarnations w
+        WHERE EXISTS (
+                SELECT 1 FROM pooled_checkouts p
+                WHERE p.session_id=w.session_id
+                  AND p.owner_incarnation_id=w.incarnation_id
+                  AND p.lease_id IS w.lease_id
+                  AND p.state IN ('provisioning','leased')
+            )
+            OR EXISTS (
+                SELECT 1 FROM sessions s
+                WHERE s.id=w.session_id
+                  AND COALESCE(
+                      NULLIF(s.current_incarnation_id,''),
+                      NULLIF(s.incarnation,'')
+                  )=w.incarnation_id
+                  AND s.status NOT IN ('done','terminated','interrupted')
+            )
+            OR EXISTS (
+                SELECT 1 FROM worker_retention r
+                WHERE r.session_id=w.session_id
+                  AND r.incarnation=w.incarnation_id
+            )
+            OR (
+                SELECT COUNT(*) FROM worker_incarnations siblings
+                WHERE siblings.session_id=w.session_id
+            )=1;
+        ",
+    )?;
+
+    let unresolved: i64 = tx.query_row(
+        "SELECT
+            (SELECT COUNT(DISTINCT session_id) FROM worker_incarnations)
+            - (SELECT COUNT(DISTINCT session_id) FROM worker_migration_candidates)",
+        [],
+        |row| row.get(0),
+    )?;
+    let tied: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM (
+            SELECT c.session_id
+            FROM worker_migration_candidates c
+            JOIN (
+                SELECT session_id,MIN(priority) priority
+                FROM worker_migration_candidates GROUP BY session_id
+            ) strongest
+              ON strongest.session_id=c.session_id
+             AND strongest.priority=c.priority
+            GROUP BY c.session_id
+            HAVING COUNT(*)<>1
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        unresolved == 0 && tied == 0,
+        "ambiguous legacy worker incarnation authority"
+    );
+
+    tx.execute_batch(
+        "
+        CREATE TEMP TABLE worker_migration_survivors AS
+        SELECT
+            w.session_id,
+            w.incarnation_id,
+            COALESCE(
+                s.orchestrator_id,
+                (
+                    SELECT r.orchestrator_id FROM worker_retention r
+                    WHERE r.session_id=w.session_id
+                      AND r.incarnation=w.incarnation_id
+                    LIMIT 1
+                )
+            ) AS orchestrator_id,
+            w.started_at,
+            COALESCE(
+                (
+                    SELECT p.source_repo FROM pooled_checkouts p
+                    WHERE p.path=COALESCE(w.pool_path,w.workspace_path)
+                    LIMIT 1
+                ),
+                w.workspace_path
+            ) AS source_workspace,
+            COALESCE(
+                (
+                    SELECT p.path FROM pooled_checkouts p
+                    WHERE p.session_id=w.session_id
+                      AND p.owner_incarnation_id=w.incarnation_id
+                      AND p.lease_id IS w.lease_id
+                      AND p.state IN ('provisioning','leased')
+                    LIMIT 1
+                ),
+                w.workspace_path,
+                w.pool_path
+            ) AS workspace_path,
+            w.lease_id,
+            w.allocator_pid,
+            w.allocator_token,
+            CASE WHEN EXISTS (
+                SELECT 1 FROM pooled_checkouts p
+                WHERE p.path=COALESCE(w.pool_path,w.workspace_path)
+            ) THEN 1 ELSE 0 END AS checkout_backed,
+            CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM pooled_checkouts p
+                    WHERE p.session_id=w.session_id
+                      AND p.owner_incarnation_id=w.incarnation_id
+                      AND p.lease_id IS w.lease_id
+                      AND p.state IN ('provisioning','leased')
+                ) THEN CASE
+                    WHEN w.phase IN ('preparing','starting') THEN 'allocating'
+                    ELSE 'active'
+                END
+                WHEN EXISTS (
+                    SELECT 1 FROM sessions active
+                    WHERE active.id=w.session_id
+                      AND COALESCE(
+                          NULLIF(active.current_incarnation_id,''),
+                          NULLIF(active.incarnation,'')
+                      )=w.incarnation_id
+                      AND active.status NOT IN ('done','terminated','interrupted')
+                ) THEN CASE w.phase
+                    WHEN 'preparing' THEN 'allocating'
+                    WHEN 'starting' THEN 'allocating'
+                    WHEN 'retained' THEN 'retained'
+                    WHEN 'cleanup_claimed' THEN 'cleanup_claimed'
+                    ELSE 'active'
+                END
+                WHEN EXISTS (
+                    SELECT 1 FROM worker_retention r
+                    WHERE r.session_id=w.session_id
+                      AND r.incarnation=w.incarnation_id
+                      AND r.finalized_at IS NULL
+                ) THEN 'retained'
+                WHEN EXISTS (
+                    SELECT 1 FROM worker_retention r
+                    WHERE r.session_id=w.session_id
+                      AND r.incarnation=w.incarnation_id
+                ) THEN 'released'
+                WHEN w.phase IN ('preparing','starting') THEN 'allocating'
+                WHEN w.phase='running' THEN 'active'
+                WHEN w.phase='retained' THEN 'retained'
+                WHEN w.phase='cleanup_claimed' THEN 'cleanup_claimed'
+                ELSE 'released'
+            END AS state,
+            w.phase,
+            w.physical_tmux_name,
+            w.pane_id,
+            w.pane_pid,
+            s.status AS session_status,
+            s.pid AS session_pid,
+            COALESCE(
+                NULLIF(s.current_incarnation_id,''),
+                NULLIF(s.incarnation,'')
+            ) AS session_incarnation
+        FROM worker_migration_candidates c
+        JOIN (
+            SELECT session_id,MIN(priority) priority
+            FROM worker_migration_candidates GROUP BY session_id
+        ) strongest
+          ON strongest.session_id=c.session_id
+         AND strongest.priority=c.priority
+        JOIN worker_incarnations w
+          ON w.session_id=c.session_id
+         AND w.incarnation_id=c.incarnation_id
+        LEFT JOIN sessions s ON s.id=w.session_id;
+
+        ALTER TABLE worker_incarnations RENAME TO worker_incarnations_legacy;
+
+        CREATE TABLE worker_incarnations (
+            session_id TEXT PRIMARY KEY,
+            incarnation_id TEXT NOT NULL UNIQUE,
+            orchestrator_id TEXT,
+            started_at INTEGER NOT NULL,
+            source_workspace TEXT NOT NULL,
+            workspace_path TEXT NOT NULL,
+            lease_id TEXT,
+            allocator_pid INTEGER,
+            allocator_token TEXT,
+            checkout_backed INTEGER NOT NULL CHECK(checkout_backed IN (0,1)),
+            state TEXT NOT NULL CHECK(state IN (
+                'allocating','active','retained','cleanup_claimed',
+                'release_claimed','released'
+            ))
+        );
+
+        INSERT INTO worker_incarnations(
+            session_id,incarnation_id,orchestrator_id,started_at,
+            source_workspace,workspace_path,lease_id,allocator_pid,
+            allocator_token,checkout_backed,state
+        )
+        SELECT
+            session_id,incarnation_id,orchestrator_id,started_at,
+            source_workspace,workspace_path,lease_id,allocator_pid,
+            allocator_token,checkout_backed,state
+        FROM worker_migration_survivors;
+
+        CREATE TABLE legacy_worker_runtimes (
+            session_id TEXT PRIMARY KEY,
+            incarnation_id TEXT NOT NULL UNIQUE,
+            physical_tmux_name TEXT NOT NULL UNIQUE,
+            pane_id TEXT NOT NULL,
+            pane_pid INTEGER NOT NULL
+        );
+
+        INSERT INTO legacy_worker_runtimes(
+            session_id,incarnation_id,physical_tmux_name,pane_id,pane_pid
+        )
+        SELECT
+            session_id,incarnation_id,physical_tmux_name,pane_id,pane_pid
+        FROM worker_migration_survivors
+        WHERE state='active'
+          AND phase='running'
+          AND session_status='working'
+          AND session_incarnation=incarnation_id
+          AND session_pid=pane_pid
+          AND pane_id IS NOT NULL
+          AND pane_id LIKE '!%%' ESCAPE '!'
+          AND pane_pid IS NOT NULL
+          AND physical_tmux_name<>session_id;
+
+        DROP TABLE worker_incarnations_legacy;
+        ",
+    )?;
+
+    let migrated: i64 =
+        tx.query_row("SELECT COUNT(*) FROM worker_incarnations", [], |row| row.get(0))?;
+    let expected: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM worker_migration_survivors",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        migrated == expected,
+        "legacy worker migration lost authoritative rows"
+    );
+    tx.commit()?;
+    Ok(())
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
     allocator_lock_dir: PathBuf,
@@ -174,6 +551,7 @@ impl Store {
                 prior_state TEXT NOT NULL CHECK(prior_state IN ('active','retained'))
             );
         ")?;
+        migrate_legacy_worker_incarnations(&mut conn)?;
         // Migrations for columns added after initial release — idempotent so
         // both fresh and pre-existing databases end up with the same schema.
         for (col, ddl) in [
@@ -1189,6 +1567,43 @@ impl Store {
         .optional()?
         .map(raw_worker_incarnation)
         .transpose()
+    }
+
+    pub fn legacy_worker_runtime(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<LegacyWorkerRuntimeCapability>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT r.session_id,r.incarnation_id,r.physical_tmux_name,
+                    r.pane_id,r.pane_pid
+             FROM legacy_worker_runtimes r
+             JOIN worker_incarnations w
+               ON w.session_id=r.session_id
+              AND w.incarnation_id=r.incarnation_id
+              AND w.state='active'
+             WHERE r.session_id=?1",
+            [session_id],
+            |row| {
+                let pane_pid = row.get::<_, i64>(4)?;
+                let pane_pid = u32::try_from(pane_pid).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(LegacyWorkerRuntimeCapability {
+                    session_id: row.get(0)?,
+                    incarnation_id: row.get(1)?,
+                    physical_tmux_name: row.get(2)?,
+                    pane_id: row.get(3)?,
+                    pane_pid,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn worker_runtime_claimed(&self, session_id: &str) -> Result<bool> {
@@ -2720,6 +3135,273 @@ mod tests {
             terminal_at: None,
             gate_status: None,
         }
+    }
+
+    fn production_legacy_worker_fixture(path: &Path, ambiguous: bool) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, orchestrator_id TEXT,
+                name TEXT NOT NULL, repo TEXT NOT NULL,
+                status TEXT NOT NULL, agent_type TEXT NOT NULL,
+                cost_usd REAL NOT NULL DEFAULT 0, started_at INTEGER NOT NULL,
+                pr_number INTEGER, pr_id INTEGER, workspace_path TEXT, pid INTEGER,
+                model TEXT, context_tokens INTEGER, current_incarnation_id TEXT,
+                incarnation TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE pooled_checkouts (
+                path TEXT PRIMARY KEY, source_repo TEXT NOT NULL,
+                common_git_dir TEXT NOT NULL, slot INTEGER NOT NULL,
+                path_kind TEXT NOT NULL, worktree_git_dir TEXT,
+                worktree_identity TEXT, state TEXT NOT NULL, session_id TEXT,
+                owner_incarnation_id TEXT, lease_id TEXT, branch TEXT,
+                quarantine_reason TEXT
+            );
+            CREATE TABLE worker_retention (
+                session_id TEXT NOT NULL, orchestrator_id TEXT NOT NULL,
+                incarnation TEXT NOT NULL, retained_at INTEGER NOT NULL,
+                finalized_at INTEGER,
+                PRIMARY KEY(session_id, incarnation)
+            );
+            CREATE TABLE worker_incarnations (
+                session_id TEXT NOT NULL,
+                incarnation_id TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                ui_outcome TEXT,
+                physical_tmux_name TEXT NOT NULL,
+                pane_id TEXT,
+                pane_pid INTEGER,
+                workspace_path TEXT,
+                pool_path TEXT,
+                lease_id TEXT,
+                worktree_identity TEXT,
+                artifact_dir TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                terminal_at INTEGER,
+                migration_hold INTEGER NOT NULL DEFAULT 0,
+                allocator_pid INTEGER,
+                allocator_token TEXT,
+                orchestrator_id TEXT,
+                source_workspace TEXT,
+                checkout_backed INTEGER,
+                state TEXT,
+                PRIMARY KEY(session_id, incarnation_id),
+                UNIQUE(physical_tmux_name)
+            );
+            CREATE INDEX worker_incarnations_phase ON worker_incarnations(phase);
+
+            INSERT INTO sessions(
+                id,orchestrator_id,name,repo,status,agent_type,started_at,
+                workspace_path,pid,current_incarnation_id,incarnation
+            ) VALUES
+                ('live-pooled','orch','live-pooled','org/repo','working','cursor-agent',
+                 200,'/repo-w1',22001,'inc-live','inc-live'),
+                ('unrelated-live','other','unrelated-live','org/other','working','cursor-agent',
+                 400,'/other-w1',44001,'inc-other','inc-other'),
+                ('released-w8','orch','released-w8','org/ninox','terminated','cursor-agent',
+                 600,'/ninox-w8',NULL,'inc-w8','inc-w8');
+
+            INSERT INTO pooled_checkouts(
+                path,source_repo,common_git_dir,slot,path_kind,state,session_id,
+                owner_incarnation_id,lease_id,branch
+            ) VALUES
+                ('/repo-w1','/repo','/repo/.git',0,'explicit','leased',
+                 'live-pooled','inc-live','lease-live','live-branch'),
+                ('/ninox-w8','/ninox','/ninox/.git',7,'explicit','free',
+                 NULL,NULL,NULL,'released-branch');
+
+            INSERT INTO worker_retention(
+                session_id,orchestrator_id,incarnation,retained_at,finalized_at
+            ) VALUES ('released-w8','orch','inc-w8',650,700);
+
+            INSERT INTO worker_incarnations VALUES
+                ('live-pooled','inc-old','superseded',NULL,'live-pooled',NULL,NULL,
+                 '/repo',NULL,NULL,NULL,'/artifacts/inc-old',100,NULL,0,NULL,NULL,
+                 'orch','/repo',0,'released'),
+                ('live-pooled','inc-live','running',NULL,'nxw-live-inc', '%11',22001,
+                 '/repo-w1','/repo-w1','lease-live','identity-live','/sessions/inc-live',
+                 200,NULL,0,NULL,NULL,'orch','/repo',1,'active'),
+                ('unrelated-live','inc-other-old','superseded',NULL,'unrelated-live',
+                 NULL,NULL,'/other',NULL,NULL,NULL,'/artifacts/inc-other-old',
+                 300,NULL,0,NULL,NULL,'other','/other',0,'released'),
+                ('unrelated-live','inc-other','running',NULL,'nxw-other-inc','%12',44001,
+                 '/other-w1',NULL,NULL,NULL,'/sessions/inc-other',
+                 400,NULL,0,NULL,NULL,'other','/other',0,'active'),
+                ('released-w8','inc-w8-old','superseded',NULL,'released-w8',NULL,NULL,
+                 '/ninox',NULL,NULL,NULL,'/artifacts/inc-w8-old',500,NULL,0,NULL,NULL,
+                 'orch','/ninox',0,'released'),
+                ('released-w8','inc-w8','retained','terminated','nxw-w8-inc','%13',88001,
+                 '/ninox-w8','/ninox-w8','lease-w8','identity-w8','/sessions/inc-w8',
+                 600,700,0,NULL,NULL,'orch','/ninox',1,'released');
+            ",
+        )
+        .unwrap();
+        if ambiguous {
+            conn.execute_batch(
+                "
+                INSERT INTO sessions(
+                    id,orchestrator_id,name,repo,status,agent_type,started_at,
+                    workspace_path,pid,current_incarnation_id,incarnation
+                ) VALUES (
+                    'ambiguous','orch','ambiguous','org/repo','working','cursor-agent',
+                    800,'/ambiguous',NULL,NULL,''
+                );
+                INSERT INTO worker_incarnations VALUES
+                    ('ambiguous','amb-a','running',NULL,'nxw-amb-a','%21',21001,
+                     '/ambiguous',NULL,NULL,NULL,'/sessions/amb-a',800,NULL,0,NULL,NULL,
+                     'orch','/ambiguous',0,'active'),
+                    ('ambiguous','amb-b','running',NULL,'nxw-amb-b','%22',22002,
+                     '/ambiguous',NULL,NULL,NULL,'/sessions/amb-b',800,NULL,0,NULL,NULL,
+                     'orch','/ambiguous',0,'active');
+                ",
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn opens_authentic_composite_worker_schema_and_keeps_authoritative_rows() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("production.db");
+        production_legacy_worker_fixture(&db, false);
+
+        let store = Store::open(&db).unwrap();
+
+        for (session, incarnation, state) in [
+            ("live-pooled", "inc-live", WorkerIncarnationState::Active),
+            ("unrelated-live", "inc-other", WorkerIncarnationState::Active),
+            ("released-w8", "inc-w8", WorkerIncarnationState::Released),
+        ] {
+            let worker = store.current_worker_incarnation(session).unwrap().unwrap();
+            assert_eq!(worker.incarnation_id, incarnation);
+            assert_eq!(worker.state, state);
+        }
+        drop(store);
+
+        let conn = Connection::open(&db).unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(worker_incarnations)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            vec![
+                ("session_id".into(), 1),
+                ("incarnation_id".into(), 0),
+                ("orchestrator_id".into(), 0),
+                ("started_at".into(), 0),
+                ("source_workspace".into(), 0),
+                ("workspace_path".into(), 0),
+                ("lease_id".into(), 0),
+                ("allocator_pid".into(), 0),
+                ("allocator_token".into(), 0),
+                ("checkout_backed".into(), 0),
+                ("state".into(), 0),
+            ]
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM worker_incarnations", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM legacy_worker_runtimes",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM pooled_checkouts
+                 WHERE path='/ninox-w8' AND state='free'
+                   AND session_id IS NULL AND owner_incarnation_id IS NULL
+                   AND lease_id IS NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute(
+            "INSERT INTO worker_incarnations(
+                session_id,incarnation_id,started_at,source_workspace,
+                workspace_path,checkout_backed,state
+             ) VALUES('live-pooled','replacement',900,'/repo','/repo',0,'active')
+             ON CONFLICT(session_id) DO UPDATE SET incarnation_id=excluded.incarnation_id",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_worker_migration_fails_closed_on_ambiguous_current_row() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("ambiguous.db");
+        production_legacy_worker_fixture(&db, true);
+
+        let error = match Store::open(&db) {
+            Ok(_) => panic!("ambiguous legacy rows must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("ambiguous"));
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('worker_incarnations')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            21
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM worker_incarnations WHERE session_id='ambiguous'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn opens_pre_additive_legacy_worker_schema() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("pre-additive.db");
+        production_legacy_worker_fixture(&db, false);
+        let conn = Connection::open(&db).unwrap();
+        for column in [
+            "state",
+            "checkout_backed",
+            "source_workspace",
+            "orchestrator_id",
+        ] {
+            conn.execute(&format!("ALTER TABLE worker_incarnations DROP COLUMN {column}"), [])
+                .unwrap();
+        }
+        drop(conn);
+
+        let store = Store::open(&db).unwrap();
+
+        assert_eq!(
+            store
+                .current_worker_incarnation("live-pooled")
+                .unwrap()
+                .unwrap()
+                .incarnation_id,
+            "inc-live"
+        );
     }
 
     #[test]

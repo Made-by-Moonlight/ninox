@@ -482,9 +482,216 @@ fn reconciled_status_for_dead_session(
     }
 }
 
+async fn reconcile_live_sessions_at_startup_with<F, Fut>(
+    engine: &Engine,
+    registry: &ninox_core::harness::HarnessRegistry,
+    exact_legacy_lookup: F,
+) where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<
+        Output = anyhow::Result<Option<ninox_core::tmux::ExactTmuxSession>>,
+    >,
+{
+    use ninox_core::{tmux, Event as CoreEvent};
+
+    let sessions = match engine.store.list_sessions() {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::error!("restore: list_sessions: {error}");
+            return;
+        }
+    };
+    for session in sessions {
+        if matches!(
+            session.status,
+            SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted
+        ) {
+            continue;
+        }
+
+        let runtime_alive = match engine.store.legacy_worker_runtime(&session.id) {
+            Ok(Some(capability)) => {
+                if session.pid != Some(capability.pane_pid) {
+                    continue;
+                }
+                match exact_legacy_lookup(capability.physical_tmux_name.clone()).await {
+                    Ok(Some(runtime))
+                        if runtime.physical_tmux_name == capability.physical_tmux_name
+                            && runtime.pane_id == capability.pane_id
+                            && runtime.pane_pid == capability.pane_pid =>
+                    {
+                        true
+                    }
+                    Ok(None) => false,
+                    // A live but mismatched runtime, multiple panes, or lookup
+                    // failure is uncertain. Never bless it or mutate status.
+                    Ok(Some(_)) | Err(_) => continue,
+                }
+            }
+            Ok(None) => tmux::has_session(&session.id).await,
+            Err(_) => continue,
+        };
+        if runtime_alive {
+            continue;
+        }
+
+        let agent = ninox_core::config::AgentConfig {
+            harness: session.agent_type.clone(),
+            model: session.model.clone(),
+        };
+        let has_resume_args = registry.resume_cmd(&agent, "placeholder").is_some();
+        let mut dead = session.clone();
+        dead.status =
+            reconciled_status_for_dead_session(&session.claude_session_id, has_resume_args);
+        let _ = engine.store.upsert_session(&dead);
+        engine.emit(CoreEvent::SessionUpdated(dead, SessionFields::STATUS));
+    }
+}
+
 #[cfg(test)]
 mod reconciliation_tests {
     use super::*;
+
+    fn migrated_live_legacy_worker() -> (tempfile::TempDir, Arc<Engine>) {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("legacy.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, orchestrator_id TEXT,
+                name TEXT NOT NULL, repo TEXT NOT NULL,
+                status TEXT NOT NULL, agent_type TEXT NOT NULL,
+                cost_usd REAL NOT NULL DEFAULT 0, started_at INTEGER NOT NULL,
+                pr_number INTEGER, pr_id INTEGER, workspace_path TEXT, pid INTEGER,
+                model TEXT, context_tokens INTEGER, current_incarnation_id TEXT,
+                incarnation TEXT NOT NULL DEFAULT ''
+            );
+            INSERT INTO sessions(
+                id,orchestrator_id,name,repo,status,agent_type,started_at,
+                workspace_path,pid,current_incarnation_id,incarnation
+            ) VALUES (
+                'legacy-live','orch','legacy-live','org/repo','working','cursor-agent',
+                100,'/repo-w1',4242,'inc-live','inc-live'
+            );
+            CREATE TABLE pooled_checkouts (
+                path TEXT PRIMARY KEY, source_repo TEXT NOT NULL,
+                common_git_dir TEXT NOT NULL, slot INTEGER NOT NULL,
+                path_kind TEXT NOT NULL, worktree_git_dir TEXT,
+                worktree_identity TEXT, state TEXT NOT NULL, session_id TEXT,
+                owner_incarnation_id TEXT, lease_id TEXT, branch TEXT,
+                quarantine_reason TEXT
+            );
+            INSERT INTO pooled_checkouts(
+                path,source_repo,common_git_dir,slot,path_kind,state,session_id,
+                owner_incarnation_id,lease_id,branch
+            ) VALUES (
+                '/repo-w1','/repo','/repo/.git',0,'explicit','leased',
+                'legacy-live','inc-live','lease-live','worker-branch'
+            );
+            CREATE TABLE worker_retention (
+                session_id TEXT NOT NULL, orchestrator_id TEXT NOT NULL,
+                incarnation TEXT NOT NULL, retained_at INTEGER NOT NULL,
+                finalized_at INTEGER,
+                PRIMARY KEY(session_id,incarnation)
+            );
+            CREATE TABLE worker_incarnations (
+                session_id TEXT NOT NULL, incarnation_id TEXT NOT NULL,
+                phase TEXT NOT NULL, ui_outcome TEXT,
+                physical_tmux_name TEXT NOT NULL, pane_id TEXT, pane_pid INTEGER,
+                workspace_path TEXT, pool_path TEXT, lease_id TEXT,
+                worktree_identity TEXT, artifact_dir TEXT NOT NULL,
+                started_at INTEGER NOT NULL, terminal_at INTEGER,
+                migration_hold INTEGER NOT NULL DEFAULT 0,
+                allocator_pid INTEGER, allocator_token TEXT,
+                orchestrator_id TEXT, source_workspace TEXT,
+                checkout_backed INTEGER, state TEXT,
+                PRIMARY KEY(session_id,incarnation_id),
+                UNIQUE(physical_tmux_name)
+            );
+            INSERT INTO worker_incarnations VALUES (
+                'legacy-live','inc-live','running',NULL,'nxw-live-inc','%42',4242,
+                '/repo-w1','/repo-w1','lease-live','identity','/sessions/inc-live',
+                100,NULL,0,NULL,NULL,'orch','/repo',1,'active'
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+        let store = Arc::new(ninox_core::store::Store::open(&db).unwrap());
+        (root, Engine::new(store))
+    }
+
+    #[tokio::test]
+    async fn startup_preserves_working_for_exact_live_legacy_runtime() {
+        let (_root, engine) = migrated_live_legacy_worker();
+        let registry = AppConfig::default().registry();
+
+        reconcile_live_sessions_at_startup_with(&engine, &registry, |physical| async move {
+            assert_eq!(physical, "nxw-live-inc");
+            Ok(Some(ninox_core::tmux::ExactTmuxSession {
+                physical_tmux_name: physical,
+                pane_id: "%42".into(),
+                pane_pid: 4242,
+            }))
+        })
+        .await;
+
+        let session = engine.store.get_session("legacy-live").unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::Working);
+        assert_eq!(session.pid, Some(4242));
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_adopt_ambiguous_legacy_runtime() {
+        let (_root, engine) = migrated_live_legacy_worker();
+        let registry = AppConfig::default().registry();
+
+        reconcile_live_sessions_at_startup_with(&engine, &registry, |_physical| async move {
+            anyhow::bail!("exact physical runtime has multiple panes")
+        })
+        .await;
+
+        assert_eq!(
+            engine.store.get_session("legacy-live").unwrap().unwrap().status,
+            SessionStatus::Working
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_fall_back_when_legacy_pid_capability_mismatches() {
+        let (_root, engine) = migrated_live_legacy_worker();
+        let registry = AppConfig::default().registry();
+        let mut session = engine.store.get_session("legacy-live").unwrap().unwrap();
+        session.pid = Some(9999);
+        engine.store.upsert_session(&session).unwrap();
+
+        reconcile_live_sessions_at_startup_with(&engine, &registry, |_physical| async move {
+            panic!("mismatched DB capability must not probe or fall back");
+        })
+        .await;
+
+        assert_eq!(
+            engine.store.get_session("legacy-live").unwrap().unwrap().status,
+            SessionStatus::Working
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_interrupts_confirmed_missing_legacy_runtime() {
+        let (_root, engine) = migrated_live_legacy_worker();
+        let registry = AppConfig::default().registry();
+
+        reconcile_live_sessions_at_startup_with(&engine, &registry, |_physical| async move {
+            Ok(None)
+        })
+        .await;
+
+        assert_ne!(
+            engine.store.get_session("legacy-live").unwrap().unwrap().status,
+            SessionStatus::Working
+        );
+    }
 
     #[test]
     fn session_with_id_and_resumable_harness_becomes_interrupted() {
@@ -704,40 +911,11 @@ impl App {
         // that race with NavigateSession and re-populate state.terminals with
         // wrong-dimension content, causing the garbled-terminal bug.
         let task = Task::future(async move {
-            use ninox_core::{tmux, Event as CoreEvent, SessionStatus};
-
-            let sessions = match engine.store.list_sessions() {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("restore: list_sessions: {e}");
-                    return Message::Noop;
-                }
-            };
-
             let registry = AppConfig::load().unwrap_or_default().registry();
-
-            for session in sessions {
-                if matches!(
-                    session.status,
-                    SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted
-                ) {
-                    continue;
-                }
-
-                if !tmux::has_session(&session.id).await {
-                    let agent = ninox_core::config::AgentConfig {
-                        harness: session.agent_type.clone(),
-                        model:   session.model.clone(),
-                    };
-                    let has_resume_args = registry.resume_cmd(&agent, "placeholder").is_some();
-                    let mut dead = session.clone();
-                    dead.status = reconciled_status_for_dead_session(
-                        &session.claude_session_id, has_resume_args,
-                    );
-                    let _ = engine.store.upsert_session(&dead);
-                    engine.emit(CoreEvent::SessionUpdated(dead, SessionFields::STATUS));
-                }
-            }
+            reconcile_live_sessions_at_startup_with(&engine, &registry, |physical| async move {
+                ninox_core::tmux::exact_private_session(&physical).await
+            })
+            .await;
 
             Message::Noop
         });
