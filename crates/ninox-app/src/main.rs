@@ -19,7 +19,7 @@ use ninox_core::{
     store::Store,
     tmux,
     types::{Session, SessionStatus},
-    BrainIndex, QueryFilters,
+    workers, BrainIndex, QueryFilters,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use std::{
@@ -101,12 +101,30 @@ enum Command {
         #[command(subcommand)]
         action: InboxAction,
     },
+    /// Inspect and safely finalize workers owned by this orchestrator.
+    Workers {
+        #[command(subcommand)]
+        action: WorkersAction,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum WorkerDelivery {
     Pr,
     Direct,
+}
+
+#[derive(Subcommand)]
+enum WorkersAction {
+    /// List every worker owned by this orchestrator as JSON.
+    List,
+    /// Inspect one owned worker as JSON.
+    Inspect { session_id: String },
+    /// Stop and retain one or more owned workers. Workspaces are never deleted.
+    Finalize {
+        #[arg(required = true)]
+        session_ids: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -235,6 +253,12 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Some(Command::Workers { action }) = command {
+        let db_path = args.db.unwrap_or_else(default_db_path);
+        std::process::exit(run_workers_cli(action, db_path).await);
+    }
+
+
     if let Err(e) = tmux::write_server_config() {
         eprintln!("failed to write tmux config: {e}");
     }
@@ -286,7 +310,186 @@ async fn main() -> anyhow::Result<()> {
             run_inbox(action);
             Ok(())
         }
+        // Workers always short-circuit-returns above before reaching this
+        // match; unreachable in practice, but the compiler can't see that
+        // across the early `return`.
+        Some(Command::Workers { .. }) => {
+            unreachable!("Workers short-circuits and returns earlier in main()")
+        }
         None => run_tui(store, args.port, args.headless).await,
+    }
+}
+
+const WORKERS_CLI_SCHEMA_VERSION: u32 = 1;
+
+fn workers_error(code: &str, message: impl Into<String>, retryable: bool) -> serde_json::Value {
+    serde_json::json!({
+        "code": code,
+        "message": message.into(),
+        "retryable": retryable,
+    })
+}
+
+fn classify_worker_error(error: &anyhow::Error) -> serde_json::Value {
+    let message = error.to_string();
+    if message.contains("not found") {
+        workers_error("not_found", message, false)
+    } else if message.contains("runtime start") || message.contains("in-progress") {
+        workers_error("worker_spawning", message, true)
+    } else if message.contains("cleanup was already claimed") {
+        workers_error("cleanup_claimed", message, false)
+    } else {
+        workers_error("operation_failed", message, false)
+    }
+}
+
+fn emit_workers_envelope(ok: bool, data: serde_json::Value, error: serde_json::Value) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema_version": WORKERS_CLI_SCHEMA_VERSION,
+            "command": "workers",
+            "ok": ok,
+            "data": data,
+            "error": error,
+        })
+    );
+}
+
+async fn run_workers_cli(action: WorkersAction, db_path: PathBuf) -> i32 {
+    if let Some(parent) = db_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            emit_workers_envelope(
+                false,
+                serde_json::Value::Null,
+                workers_error("database_error", error.to_string(), false),
+            );
+            return 4;
+        }
+    }
+    let store = match Store::open(db_path) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            emit_workers_envelope(
+                false,
+                serde_json::Value::Null,
+                workers_error("database_error", error.to_string(), false),
+            );
+            return 4;
+        }
+    };
+    let runtime = match tmux::current_private_pane_identity().await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            emit_workers_envelope(
+                false,
+                serde_json::Value::Null,
+                workers_error("authorization_failed", error.to_string(), false),
+            );
+            return 2;
+        }
+    };
+    let orchestrator_id = match workers::authorize_orchestrator(
+        &store,
+        std::env::var("NINOX_ORCHESTRATOR_ID").ok().as_deref(),
+        std::env::var("NINOX_CALLER_TYPE").ok().as_deref(),
+        runtime.as_ref(),
+    ) {
+        Ok(orchestrator_id) => orchestrator_id,
+        Err(error) => {
+            emit_workers_envelope(
+                false,
+                serde_json::Value::Null,
+                workers_error("authorization_failed", error.to_string(), false),
+            );
+            return 2;
+        }
+    };
+
+    match action {
+        WorkersAction::List => match workers::list_owned_workers(&store, &orchestrator_id).await {
+            Ok(owned) => {
+                emit_workers_envelope(true, serde_json::json!(owned), serde_json::Value::Null);
+                0
+            }
+            Err(error) => {
+                emit_workers_envelope(
+                    false,
+                    serde_json::Value::Null,
+                    classify_worker_error(&error),
+                );
+                1
+            }
+        },
+        WorkersAction::Inspect { session_id } => {
+            match workers::inspect_owned_worker(&store, &orchestrator_id, &session_id).await {
+                Ok(worker) => {
+                    emit_workers_envelope(
+                        true,
+                        serde_json::json!(worker),
+                        serde_json::Value::Null,
+                    );
+                    0
+                }
+                Err(error) => {
+                    let classified = classify_worker_error(&error);
+                    let exit = if classified["code"] == "not_found" {
+                        3
+                    } else {
+                        1
+                    };
+                    emit_workers_envelope(false, serde_json::Value::Null, classified);
+                    exit
+                }
+            }
+        }
+        WorkersAction::Finalize { session_ids } => {
+            let mut failed = false;
+            let mut results = Vec::with_capacity(session_ids.len());
+            for session_id in session_ids {
+                match workers::finalize_owned_worker(
+                    store.clone(),
+                    &orchestrator_id,
+                    &session_id,
+                )
+                .await
+                {
+                    Ok(result) => results.push(serde_json::json!({
+                        "session_id": session_id,
+                        "ok": true,
+                        "result": result,
+                        "error": null,
+                    })),
+                    Err(error) => {
+                        failed = true;
+                        results.push(serde_json::json!({
+                            "session_id": session_id,
+                            "ok": false,
+                            "result": null,
+                            "error": classify_worker_error(&error),
+                        }));
+                    }
+                }
+            }
+            emit_workers_envelope(
+                !failed,
+                serde_json::json!({ "results": results }),
+                if failed {
+                    workers_error(
+                        "partial_failure",
+                        "one or more workers could not be finalized",
+                        false,
+                    )
+                } else {
+                    serde_json::Value::Null
+                },
+            );
+            if failed {
+                5
+            } else {
+                0
+            }
+        }
     }
 }
 
@@ -537,7 +740,6 @@ async fn run_spawn(
         .await;
         return Err(error);
     }
-    println!("spawned {}", session.id);
 
     // Prepend the ninox bin dir inside the shell command rather than via tmux
     // -e PATH=..., because the login shell (-l) sources rc files that may
@@ -587,6 +789,9 @@ async fn run_spawn(
         ninox_brain_env.as_deref(),
         ninox_config_env.as_deref(),
     );
+    let runtime_claim = store
+        .claim_worker_runtime_start(&id, &incarnation.incarnation_id)?
+        .context("worker incarnation changed before runtime launch")?;
     // The session was already upserted as Working above; if tmux refuses
     // the spawn (e.g. the workspace dir doesn't exist — create_session
     // rejects that rather than letting the pane silently start in $HOME),
@@ -594,6 +799,11 @@ async fn run_spawn(
     // invisible to poll_pids and would linger until the next app restart's
     // reconciliation.
     if let Err(e) = tmux::create_session(&id, &effective_workspace, &cmd, &env_vec).await {
+        let _ = store.abort_worker_runtime_start(
+            &id,
+            &incarnation.incarnation_id,
+            &runtime_claim.claim_id,
+        );
         let rolled_back = rollback_worker_incarnation(
             store.clone(),
             &id,
@@ -607,6 +817,15 @@ async fn run_spawn(
         }
         return Err(e);
     }
+    if !store.complete_worker_runtime_start(
+        &id,
+        &incarnation.incarnation_id,
+        &runtime_claim.claim_id,
+    )? {
+        let _ = tmux::kill_private_session(&id).await;
+        anyhow::bail!("worker incarnation changed before runtime launch completed");
+    }
+    println!("spawned {}", session.id);
 
     Ok(())
 }

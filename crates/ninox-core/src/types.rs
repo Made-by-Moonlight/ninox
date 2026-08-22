@@ -98,6 +98,33 @@ pub struct WorkerRuntimeClaim {
     pub claim_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrchestratorRuntimeIdentity {
+    pub orchestrator_id: String,
+    pub runtime_id: String,
+    pub server_epoch: String,
+    pub physical_tmux_name: String,
+    pub pane_id: String,
+    pub root_pid: u32,
+    pub root_created_at: i64,
+    pub registered_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerFinalization {
+    pub session_id: String,
+    pub incarnation_id: String,
+    pub orchestrator_id: String,
+    pub claimed_at: i64,
+    pub finalized_at: Option<i64>,
+}
+
+#[derive(Debug)]
+pub enum WorkerFinalizationIntent {
+    Apply(WorkerIncarnation),
+    AlreadyFinalized(WorkerIncarnation),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {

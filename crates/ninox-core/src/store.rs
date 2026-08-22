@@ -550,6 +550,23 @@ impl Store {
                 claim_token TEXT NOT NULL,
                 prior_state TEXT NOT NULL CHECK(prior_state IN ('active','retained'))
             );
+            CREATE TABLE IF NOT EXISTS orchestrator_runtimes (
+                orchestrator_id TEXT PRIMARY KEY,
+                runtime_id TEXT NOT NULL UNIQUE,
+                server_epoch TEXT NOT NULL,
+                physical_tmux_name TEXT NOT NULL,
+                pane_id TEXT NOT NULL,
+                root_pid INTEGER NOT NULL,
+                root_created_at INTEGER NOT NULL,
+                registered_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS worker_finalizations (
+                session_id TEXT PRIMARY KEY,
+                incarnation_id TEXT NOT NULL,
+                orchestrator_id TEXT NOT NULL,
+                claimed_at INTEGER NOT NULL,
+                finalized_at INTEGER
+            );
         ")?;
         migrate_legacy_worker_incarnations(&mut conn)?;
         // Migrations for columns added after initial release — idempotent so
@@ -869,7 +886,8 @@ impl Store {
         )?;
         tx.execute(
             "DELETE FROM sessions
-             WHERE status='spawning' AND NOT EXISTS(
+             WHERE status='spawning' AND orchestrator_id IS NULL
+               AND NOT EXISTS(
                 SELECT 1 FROM worker_incarnations w
                 WHERE w.session_id=sessions.id AND w.state<>'released'
              ) AND NOT EXISTS(
@@ -1221,15 +1239,154 @@ impl Store {
         Ok(())
     }
 
+    pub fn is_orchestrator(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM orchestrators WHERE id=?1)",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn register_orchestrator_runtime(
+        &self,
+        runtime: &OrchestratorRuntimeIdentity,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        anyhow::ensure!(
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM orchestrators WHERE id=?1)",
+                [&runtime.orchestrator_id],
+                |row| row.get::<_, bool>(0),
+            )?,
+            "orchestrator is not persisted"
+        );
+        conn.execute(
+            "INSERT INTO orchestrator_runtimes(
+                orchestrator_id,runtime_id,server_epoch,physical_tmux_name,
+                pane_id,root_pid,root_created_at,registered_at
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(orchestrator_id) DO UPDATE SET
+                runtime_id=excluded.runtime_id,
+                server_epoch=excluded.server_epoch,
+                physical_tmux_name=excluded.physical_tmux_name,
+                pane_id=excluded.pane_id,
+                root_pid=excluded.root_pid,
+                root_created_at=excluded.root_created_at,
+                registered_at=excluded.registered_at",
+            params![
+                runtime.orchestrator_id,
+                runtime.runtime_id,
+                runtime.server_epoch,
+                runtime.physical_tmux_name,
+                runtime.pane_id,
+                runtime.root_pid,
+                runtime.root_created_at,
+                runtime.registered_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn register_migrated_orchestrator_runtime(
+        &self,
+        runtime: &OrchestratorRuntimeIdentity,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let eligible: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM orchestrators o
+                JOIN sessions s ON s.id=o.id
+                WHERE o.id=?1 AND s.pid=?2
+                  AND NOT EXISTS(
+                    SELECT 1 FROM orchestrator_runtimes r
+                    WHERE r.orchestrator_id=o.id
+                  )
+            )",
+            params![runtime.orchestrator_id, runtime.root_pid],
+            |row| row.get(0),
+        )?;
+        if !eligible || runtime.physical_tmux_name != runtime.orchestrator_id {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "INSERT INTO orchestrator_runtimes(
+                orchestrator_id,runtime_id,server_epoch,physical_tmux_name,
+                pane_id,root_pid,root_created_at,registered_at
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(orchestrator_id) DO NOTHING",
+            params![
+                runtime.orchestrator_id,
+                runtime.runtime_id,
+                runtime.server_epoch,
+                runtime.physical_tmux_name,
+                runtime.pane_id,
+                runtime.root_pid,
+                runtime.root_created_at,
+                runtime.registered_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn orchestrator_runtime_identity(
+        &self,
+        orchestrator_id: &str,
+    ) -> Result<Option<OrchestratorRuntimeIdentity>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT orchestrator_id,runtime_id,server_epoch,physical_tmux_name,
+                    pane_id,root_pid,root_created_at,registered_at
+             FROM orchestrator_runtimes WHERE orchestrator_id=?1",
+            [orchestrator_id],
+            |row| {
+                let root_pid = u32::try_from(row.get::<_, i64>(5)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(OrchestratorRuntimeIdentity {
+                    orchestrator_id: row.get(0)?,
+                    runtime_id: row.get(1)?,
+                    server_epoch: row.get(2)?,
+                    physical_tmux_name: row.get(3)?,
+                    pane_id: row.get(4)?,
+                    root_pid,
+                    root_created_at: row.get(6)?,
+                    registered_at: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn sessions_by_orchestrator(&self, orchestrator_id: &str) -> Result<Vec<Session>> {
         let sessions = self.list_sessions()?;
         Ok(sessions.into_iter().filter(|s| s.orchestrator_id.as_deref() == Some(orchestrator_id)).collect())
+    }
+
+    pub fn get_owned_session(
+        &self,
+        orchestrator_id: &str,
+        session_id: &str,
+    ) -> Result<Option<Session>> {
+        Ok(self
+            .get_session(session_id)?
+            .filter(|session| session.orchestrator_id.as_deref() == Some(orchestrator_id)))
     }
 
     pub fn delete_session(&self, id: &str) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM worker_finalizations WHERE session_id=?1", [id])?;
         tx.execute(
             "DELETE FROM worker_incarnations
              WHERE session_id=?1 AND state IN ('cleanup_claimed','release_claimed','released')",
@@ -1242,6 +1399,7 @@ impl Store {
     pub fn delete_orchestrator(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+        conn.execute("DELETE FROM orchestrator_runtimes WHERE orchestrator_id=?1", [id])?;
         conn.execute("DELETE FROM orchestrators WHERE id = ?1", [id])?;
         Ok(())
     }
@@ -1369,13 +1527,16 @@ impl Store {
         let runtime_claimed: bool = tx.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM worker_runtime_claims WHERE session_id=?1
+                UNION ALL
+                SELECT 1 FROM worker_finalizations
+                WHERE session_id=?1 AND finalized_at IS NULL
             )",
             [session_id],
             |row| row.get(0),
         )?;
         anyhow::ensure!(
             !runtime_claimed,
-            "worker {session_id} runtime start is already in progress"
+            "worker {session_id} has an in-progress runtime or finalization claim"
         );
         let previous = tx
             .query_row(
@@ -1517,7 +1678,12 @@ impl Store {
             "UPDATE worker_incarnations
              SET source_workspace=?3,workspace_path=?4,lease_id=?5,
                  allocator_pid=NULL,allocator_token=NULL,state='active'
-             WHERE session_id=?1 AND incarnation_id=?2 AND state='allocating'",
+             WHERE session_id=?1 AND incarnation_id=?2 AND state='allocating'
+               AND NOT EXISTS(
+                SELECT 1 FROM worker_finalizations f
+                WHERE f.session_id=?1 AND f.incarnation_id=?2
+                  AND f.finalized_at IS NULL
+               )",
             params![session_id, incarnation_id, source_workspace, workspace_path, lease_id],
         )?;
         if changed == 1 {
@@ -1567,6 +1733,264 @@ impl Store {
         .optional()?
         .map(raw_worker_incarnation)
         .transpose()
+    }
+
+    pub fn worker_finalization(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<WorkerFinalization>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT session_id,incarnation_id,orchestrator_id,claimed_at,finalized_at
+             FROM worker_finalizations WHERE session_id=?1",
+            [session_id],
+            |row| {
+                Ok(WorkerFinalization {
+                    session_id: row.get(0)?,
+                    incarnation_id: row.get(1)?,
+                    orchestrator_id: row.get(2)?,
+                    claimed_at: row.get(3)?,
+                    finalized_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn begin_worker_finalization(
+        &self,
+        orchestrator_id: &str,
+        session_id: &str,
+    ) -> Result<WorkerFinalizationIntent> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = tx
+            .query_row(
+                "SELECT orchestrator_id,started_at,workspace_path,status
+                 FROM sessions WHERE id=?1",
+                [session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .with_context(|| format!("worker {session_id:?} not found"))?;
+        anyhow::ensure!(
+            session.0.as_deref() == Some(orchestrator_id),
+            "worker {session_id:?} not found"
+        );
+
+        let mut worker = tx
+            .query_row(
+                &format!("{WORKER_INCARNATION_COLUMNS} WHERE session_id=?1"),
+                [session_id],
+                worker_incarnation_row,
+            )
+            .optional()?
+            .map(raw_worker_incarnation)
+            .transpose()?;
+        if worker.is_none() {
+            let pool = tx
+                .query_row(
+                    "SELECT owner_incarnation_id,lease_id,source_repo,path
+                     FROM pooled_checkouts
+                     WHERE session_id=?1 AND state IN ('provisioning','leased')",
+                    [session_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let incarnation_id = pool
+                .as_ref()
+                .and_then(|pool| pool.0.clone())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let workspace = session.2.clone().unwrap_or_default();
+            let source_workspace =
+                pool.as_ref().map_or_else(|| workspace.clone(), |pool| pool.2.clone());
+            let workspace_path =
+                pool.as_ref().map_or_else(|| workspace, |pool| pool.3.clone());
+            let lease_id = pool.as_ref().and_then(|pool| pool.1.clone());
+            let state = if session.3 == "spawning" {
+                "allocating"
+            } else if session.3 == "done" {
+                "retained"
+            } else {
+                "active"
+            };
+            tx.execute(
+                "INSERT INTO worker_incarnations(
+                    session_id,incarnation_id,orchestrator_id,started_at,
+                    source_workspace,workspace_path,lease_id,checkout_backed,state
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    session_id,
+                    incarnation_id,
+                    orchestrator_id,
+                    session.1,
+                    source_workspace,
+                    workspace_path,
+                    lease_id,
+                    pool.is_some() as i64,
+                    state,
+                ],
+            )?;
+            worker = Some(WorkerIncarnation {
+                session_id: session_id.to_string(),
+                incarnation_id,
+                orchestrator_id: Some(orchestrator_id.to_string()),
+                started_at: session.1,
+                source_workspace,
+                workspace_path,
+                lease_id,
+                checkout_backed: pool.is_some(),
+                state: parse_worker_state(state)?,
+            });
+        }
+        let worker = worker.expect("worker was loaded or adopted");
+        anyhow::ensure!(
+            worker.orchestrator_id.as_deref() == Some(orchestrator_id),
+            "worker checkout ownership does not match its session owner"
+        );
+        anyhow::ensure!(
+            matches!(
+                worker.state,
+                WorkerIncarnationState::Allocating
+                    | WorkerIncarnationState::Active
+                    | WorkerIncarnationState::Retained
+            ),
+            "worker cleanup was already claimed"
+        );
+        let existing = tx
+            .query_row(
+                "SELECT incarnation_id,finalized_at
+                 FROM worker_finalizations WHERE session_id=?1",
+                [session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?;
+        if let Some((incarnation_id, finalized_at)) = existing.as_ref() {
+            if incarnation_id == &worker.incarnation_id {
+                tx.commit()?;
+                return Ok(if finalized_at.is_some() {
+                    WorkerFinalizationIntent::AlreadyFinalized(worker)
+                } else {
+                    WorkerFinalizationIntent::Apply(worker)
+                });
+            }
+            anyhow::ensure!(
+                finalized_at.is_some(),
+                "worker operation became stale"
+            );
+        }
+        let runtime_claimed: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM worker_runtime_claims
+                WHERE session_id=?1 AND incarnation_id=?2
+            )",
+            params![session_id, worker.incarnation_id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            !runtime_claimed,
+            "worker runtime start is already in progress"
+        );
+        let now = crate::lifecycle::poller::now_millis();
+        tx.execute(
+            "INSERT INTO worker_finalizations(
+                session_id,incarnation_id,orchestrator_id,claimed_at,finalized_at
+             ) VALUES(?1,?2,?3,?4,NULL)
+             ON CONFLICT(session_id) DO UPDATE SET
+                incarnation_id=excluded.incarnation_id,
+                orchestrator_id=excluded.orchestrator_id,
+                claimed_at=excluded.claimed_at,
+                finalized_at=NULL",
+            params![
+                session_id,
+                worker.incarnation_id,
+                orchestrator_id,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(WorkerFinalizationIntent::Apply(worker))
+    }
+
+    pub fn complete_worker_finalization(
+        &self,
+        session_id: &str,
+        incarnation_id: &str,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = crate::lifecycle::poller::now_millis();
+        let started_at = tx
+            .query_row(
+                "SELECT started_at FROM worker_incarnations
+                 WHERE session_id=?1 AND incarnation_id=?2
+                   AND state IN ('allocating','active','retained')
+                   AND EXISTS(
+                    SELECT 1 FROM worker_finalizations f
+                    WHERE f.session_id=?1 AND f.incarnation_id=?2
+                      AND f.finalized_at IS NULL
+                   )
+                   AND NOT EXISTS(
+                    SELECT 1 FROM worker_runtime_claims r
+                    WHERE r.session_id=?1 AND r.incarnation_id=?2
+                   )",
+                params![session_id, incarnation_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(started_at) = started_at else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        let session_changed = tx.execute(
+            "UPDATE sessions
+             SET status=CASE WHEN status='done' THEN status ELSE 'terminated' END,
+                 terminal_at=COALESCE(terminal_at,?3)
+             WHERE id=?1 AND started_at=?2",
+            params![session_id, started_at, now],
+        )?;
+        if session_changed != 1 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let worker_changed = tx.execute(
+            "UPDATE worker_incarnations SET state='retained',
+                 allocator_pid=NULL,allocator_token=NULL
+             WHERE session_id=?1 AND incarnation_id=?2
+               AND state IN ('allocating','active','retained')",
+            params![session_id, incarnation_id],
+        )?;
+        if worker_changed != 1 {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        let finalized = tx.execute(
+            "UPDATE worker_finalizations SET finalized_at=?3
+             WHERE session_id=?1 AND incarnation_id=?2 AND finalized_at IS NULL",
+            params![session_id, incarnation_id, now],
+        )?;
+        if finalized != 1 {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.commit()?;
+        self.release_allocator_lock(incarnation_id);
+        Ok(true)
     }
 
     pub fn legacy_worker_runtime(
@@ -1642,6 +2066,19 @@ impl Store {
 
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let finalizing: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM worker_finalizations
+                WHERE session_id=?1 AND incarnation_id=?2
+                  AND finalized_at IS NULL
+            )",
+            params![session_id, incarnation_id],
+            |row| row.get(0),
+        )?;
+        if finalizing {
+            tx.commit()?;
+            return Ok(None);
+        }
         let Some(raw) = tx
             .query_row(
                 &format!(
@@ -1816,6 +2253,11 @@ impl Store {
                AND state IN ('allocating','active','retained')
                AND (lease_id IS NULL OR lease_id=?3)
                AND NOT EXISTS(
+                   SELECT 1 FROM worker_finalizations f
+                   WHERE f.session_id=?1 AND f.incarnation_id=?2
+                     AND f.finalized_at IS NULL
+               )
+               AND NOT EXISTS(
                    SELECT 1 FROM worker_runtime_claims r
                    WHERE r.session_id=worker_incarnations.session_id
                      AND r.incarnation_id=worker_incarnations.incarnation_id
@@ -1848,6 +2290,9 @@ impl Store {
         let runtime_claimed: bool = tx.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM worker_runtime_claims WHERE session_id=?1
+                UNION ALL
+                SELECT 1 FROM worker_finalizations
+                WHERE session_id=?1 AND finalized_at IS NULL
             )",
             [session_id],
             |row| row.get(0),
@@ -2007,6 +2452,10 @@ impl Store {
             "SELECT EXISTS(
                 SELECT 1 FROM worker_runtime_claims
                 WHERE session_id=?1 AND incarnation_id=?2
+                UNION ALL
+                SELECT 1 FROM worker_finalizations
+                WHERE session_id=?1 AND incarnation_id=?2
+                  AND finalized_at IS NULL
             )",
             params![session_id, incarnation_id],
             |row| row.get(0),
@@ -2232,6 +2681,10 @@ impl Store {
         let lease_id = uuid::Uuid::new_v4().to_string();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !worker_allocation_is_current(&tx, session_id, owner_incarnation_id)? {
+            tx.commit()?;
+            return Ok(None);
+        }
         let selected = tx
             .query_row(
                 &format!(
@@ -2287,6 +2740,10 @@ impl Store {
         let lease_id = uuid::Uuid::new_v4().to_string();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !worker_allocation_is_current(&tx, session_id, owner_incarnation_id)? {
+            tx.commit()?;
+            return Ok(None);
+        }
         let selected = tx
             .query_row(
                 &format!(
@@ -2346,6 +2803,10 @@ impl Store {
         let lease_id = uuid::Uuid::new_v4().to_string();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        anyhow::ensure!(
+            worker_allocation_is_current(&tx, session_id, owner_incarnation_id)?,
+            "worker incarnation changed before pooled checkout reservation"
+        );
         let slot: u32 = {
             let mut stmt = tx.prepare(
                 "SELECT slot FROM pooled_checkouts
@@ -2416,6 +2877,10 @@ impl Store {
         let lease_id = uuid::Uuid::new_v4().to_string();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        anyhow::ensure!(
+            worker_allocation_is_current(&tx, session_id, owner_incarnation_id)?,
+            "worker incarnation changed before managed checkout reservation"
+        );
         let slot: u32 = {
             let mut stmt = tx.prepare(
                 "SELECT slot FROM pooled_checkouts
@@ -2483,6 +2948,10 @@ impl Store {
         let kind_name = pooled_checkout_kind_name(kind);
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        anyhow::ensure!(
+            worker_allocation_is_current(&tx, session_id, owner_incarnation_id)?,
+            "worker incarnation changed before explicit checkout reservation"
+        );
         let slot: u32 = {
             let mut stmt = tx.prepare(
                 "SELECT slot FROM pooled_checkouts
@@ -2551,7 +3020,23 @@ impl Store {
              SET state='leased', worktree_git_dir=?5, worktree_identity=?6,
                  quarantine_reason=NULL
              WHERE path=?1 AND state='provisioning'
-               AND session_id=?2 AND owner_incarnation_id=?3 AND lease_id=?4",
+               AND session_id=?2 AND owner_incarnation_id=?3 AND lease_id=?4
+               AND (
+                   EXISTS(
+                       SELECT 1 FROM worker_incarnations w
+                       WHERE w.session_id=?2 AND w.incarnation_id=?3
+                         AND w.state='allocating'
+                   )
+                   OR NOT EXISTS(
+                       SELECT 1 FROM worker_incarnations w
+                       WHERE w.session_id=?2
+                   )
+               )
+               AND NOT EXISTS(
+                   SELECT 1 FROM worker_finalizations f
+                   WHERE f.session_id=?2 AND f.incarnation_id=?3
+                     AND f.finalized_at IS NULL
+               )",
             params![
                 path,
                 session_id,
@@ -3068,6 +3553,37 @@ fn record_into_lease(record: PooledCheckoutRecord) -> Result<PooledCheckoutLease
         lease_id: record.lease_id.context("active checkout has no lease")?,
         branch: record.branch.context("active checkout has no branch")?,
     })
+}
+
+fn worker_allocation_is_current(
+    conn: &Connection,
+    session_id: &str,
+    incarnation_id: &str,
+) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            WHERE NOT EXISTS(
+                    SELECT 1 FROM worker_finalizations f
+                    WHERE f.session_id=?1 AND f.incarnation_id=?2
+                      AND f.finalized_at IS NULL
+                  )
+              AND (
+                    EXISTS(
+                        SELECT 1 FROM worker_incarnations w
+                        WHERE w.session_id=?1 AND w.incarnation_id=?2
+                          AND w.state='allocating'
+                    )
+                    OR NOT EXISTS(
+                        SELECT 1 FROM worker_incarnations w
+                        WHERE w.session_id=?1
+                    )
+                  )
+        )",
+        params![session_id, incarnation_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 fn validate_lease_inputs(session_id: &str, branch: &str) -> Result<()> {

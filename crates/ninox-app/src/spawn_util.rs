@@ -71,6 +71,10 @@ pub async fn spawn_interactive_session(
     p: InteractiveSpawnParams,
 ) -> Option<Vec<String>> {
     let sid = p.session_id;
+    let is_orchestrator = p
+        .extra_env
+        .iter()
+        .any(|(key, value)| key == "NINOX_CALLER_TYPE" && value == "orchestrator");
 
     let ninox_bin = std::env::current_exe()
         .ok()
@@ -114,6 +118,18 @@ pub async fn spawn_interactive_session(
             }
         }
         return None;
+    }
+    if is_orchestrator {
+        if let Err(error) =
+            ninox_core::workers::register_live_orchestrator_runtime(&engine.store, &sid).await
+        {
+            tracing::error!("orchestrator runtime registration failed for {sid}: {error}");
+            let _ = tmux::kill_private_session(&sid).await;
+            let _ = engine
+                .store
+                .update_session_status_snapshot(&sid, p.started_at, p.failure_status);
+            return None;
+        }
     }
 
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
