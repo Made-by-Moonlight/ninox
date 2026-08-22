@@ -649,6 +649,10 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
             }
 
             Event::Mouse(MouseEvent::WheelScrolled { delta }) => {
+                if cursor.position_in(bounds).is_none() {
+                    return (iced::widget::canvas::event::Status::Ignored, None);
+                }
+
                 // Positive y = scroll up into history. Fractional trackpad
                 // motion is retained in canvas state until it crosses a row.
                 let lines = state.consume_scroll_delta(delta, cell_h);
@@ -1149,6 +1153,75 @@ mod tests {
         let mut state = SelectionState::default();
         let delta = iced::mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 };
         assert_eq!(state.consume_scroll_delta(&delta, 18.0), 3);
+    }
+
+    #[test]
+    fn wheel_targets_keep_sidebar_and_terminal_positions_isolated() {
+        use iced::widget::canvas::Program;
+
+        fn dispatch_wheel(
+            terminal: &mut TerminalState,
+            sidebar_offset: &mut usize,
+            pointer: iced::Point,
+            sidebar_bounds: Rectangle,
+            terminal_bounds: Rectangle,
+        ) -> iced::widget::canvas::event::Status {
+            if sidebar_bounds.contains(pointer) {
+                *sidebar_offset += 3;
+            }
+
+            let widget = test_widget(terminal);
+            let mut canvas_state = SelectionState::default();
+            let (status, message) = widget.update(
+                &mut canvas_state,
+                iced::widget::canvas::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                    delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+                }),
+                terminal_bounds,
+                iced::mouse::Cursor::Available(pointer),
+            );
+
+            if let Some(Message::ScrollTerminal { delta, .. }) = message {
+                terminal.scroll(delta);
+            }
+            status
+        }
+
+        let sidebar_bounds =
+            Rectangle::new(iced::Point::ORIGIN, Size::new(240.0, 600.0));
+        let terminal_bounds =
+            Rectangle::new(iced::Point::new(240.0, 0.0), Size::new(800.0, 600.0));
+        let mut terminal = TerminalState::new(80, 24, None);
+        terminal.scrollback.absorb(vec![vec![]; 100], -100, true);
+        let mut sidebar_offset = 0;
+
+        let sidebar_status = dispatch_wheel(
+            &mut terminal,
+            &mut sidebar_offset,
+            iced::Point::new(120.0, 300.0),
+            sidebar_bounds,
+            terminal_bounds,
+        );
+        assert_eq!(sidebar_status, iced::widget::canvas::event::Status::Ignored);
+        assert_eq!(sidebar_offset, 3);
+        assert_eq!(
+            terminal.scrollback.offset, 0,
+            "sidebar-targeted wheel must not move terminal history"
+        );
+
+        let terminal_status = dispatch_wheel(
+            &mut terminal,
+            &mut sidebar_offset,
+            iced::Point::new(640.0, 300.0),
+            sidebar_bounds,
+            terminal_bounds,
+        );
+        assert_eq!(terminal_status, iced::widget::canvas::event::Status::Captured);
+        assert_eq!(
+            sidebar_offset, 3,
+            "terminal-targeted wheel must not move the sidebar"
+        );
+        assert_eq!(terminal.scrollback.offset, 3);
     }
 
     #[test]
