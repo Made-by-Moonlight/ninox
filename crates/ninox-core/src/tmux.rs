@@ -65,7 +65,7 @@ fn supports_extended_keys_format((major, minor): (u32, u32)) -> bool {
 fn server_config_for_version(version: (u32, u32)) -> String {
     let mut cfg = String::from("# Managed by ninox — rewritten on every app start. Do not edit.\n");
     cfg.push_str("set -g  default-terminal \"tmux-256color\"\n");
-    cfg.push_str("set -as terminal-features \"xterm*:RGB:usstyle:extkeys:hyperlinks\"\n");
+    cfg.push_str("set -as terminal-features \"xterm*:RGB:usstyle:extkeys:hyperlinks:sync\"\n");
     cfg.push_str("set -s  extended-keys always\n");
     if supports_extended_keys_format(version) {
         cfg.push_str("set -s  extended-keys-format csi-u\n");
@@ -1024,6 +1024,7 @@ mod tests {
         let body = std::fs::read_to_string(&path).unwrap();
         for required in [
             "default-terminal \"tmux-256color\"",
+            "xterm*:RGB:usstyle:extkeys:hyperlinks:sync",
             "extended-keys always",
             "history-limit 100000",
             "status off",

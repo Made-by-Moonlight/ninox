@@ -1242,6 +1242,44 @@ mod tests {
     }
 
     #[test]
+    fn cursor_tui_sync_frame_hides_delayed_bottom_row_fragments() {
+        use alacritty_terminal::index::{Column, Line};
+
+        fn bottom_rows(state: &TerminalState) -> String {
+            let grid = state.term.grid();
+            (2..4)
+                .map(|row| {
+                    (0..grid.columns())
+                        .map(|column| grid[Line(row)][Column(column)].c)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let mut state = TerminalState::new(40, 4, None);
+        state.process("\x1b[3;1H⠹ Working…\x1b[4;1H❯ waiting".as_bytes());
+        let stable = bottom_rows(&state);
+
+        // Cursor TUI repaint split across independent PTY reads. The first
+        // escape is itself fragmented, and later chunks model pauses longer
+        // than the app's coalescing quiet window without wall-clock sleeps.
+        for fragment in [
+            b"\x1b[?20".as_slice(),
+            b"26h\x1b[3;1H\x1b[2KRead",
+            b"ing app.rs\x1b[4;1H\x1b[2K\xe2\x9d\xaf work",
+        ] {
+            state.process(fragment);
+            assert_eq!(bottom_rows(&state), stable);
+        }
+
+        state.process(b"ing\x1b[?2026l");
+        assert_eq!(bottom_rows(&state), "Reading app.rs\n❯ working");
+    }
+
+    #[test]
     fn emulator_query_responses_are_forwarded_to_reply_channel() {
         // The inner app (via tmux) queries the terminal — e.g. DSR 6 (cursor
         // position report). The emulator's answer must reach the reply
