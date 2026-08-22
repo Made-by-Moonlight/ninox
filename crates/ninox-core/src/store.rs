@@ -474,8 +474,10 @@ pub struct TerminalRuntimeTarget {
 }
 
 pub(crate) struct WorkerCleanupSnapshotClaim {
-    pub worker:        WorkerIncarnation,
-    pub restore_state: Option<WorkerIncarnationState>,
+    pub worker:                        WorkerIncarnation,
+    pub restore_state:                  Option<WorkerIncarnationState>,
+    pub snapshot_started_at:            i64,
+    pub require_legacy_runtime_absence: bool,
 }
 
 
@@ -1733,6 +1735,63 @@ impl Store {
         .transpose()
     }
 
+    pub(crate) fn released_worker_for_cleanup_snapshot(
+        &self,
+        session_id: &str,
+        started_at: i64,
+    ) -> Result<Option<WorkerIncarnation>> {
+        let conn = self.conn.lock().unwrap();
+        let exact = conn
+            .query_row(
+                &format!(
+                    "{WORKER_INCARNATION_COLUMNS}
+                     WHERE session_id=?1 AND started_at=?2 AND state='released'"
+                ),
+                params![session_id, started_at],
+                worker_incarnation_row,
+            )
+            .optional()?
+            .map(raw_worker_incarnation)
+            .transpose()?;
+        if exact.is_some() || !Self::column_exists(&conn, "sessions", "current_incarnation_id")? {
+            return Ok(exact);
+        }
+        conn.query_row(
+            &format!(
+                "{WORKER_INCARNATION_COLUMNS}
+                 WHERE session_id=?1 AND state='released'
+                   AND checkout_backed=0 AND lease_id IS NULL
+                   AND EXISTS(
+                     SELECT 1 FROM sessions s
+                     WHERE s.id=?1 AND s.started_at=?2
+                       AND s.status IN ('done','terminated')
+                       AND s.orchestrator_id IS NOT NULL
+                       AND s.orchestrator_id=worker_incarnations.orchestrator_id
+                       AND s.current_incarnation_id=worker_incarnations.incarnation_id
+                   )
+                   AND NOT EXISTS(
+                     SELECT 1 FROM worker_runtime_claims r WHERE r.session_id=?1
+                   )
+                   AND NOT EXISTS(
+                     SELECT 1 FROM worker_finalizations f WHERE f.session_id=?1
+                   )
+                   AND NOT EXISTS(
+                     SELECT 1 FROM legacy_worker_runtimes r WHERE r.session_id=?1
+                   )
+                   AND NOT EXISTS(
+                     SELECT 1 FROM pooled_checkouts p
+                     WHERE p.session_id=?1 AND p.state IN ('provisioning','leased')
+                   )"
+            ),
+            params![session_id, started_at],
+            worker_incarnation_row,
+        )
+        .optional()?
+        .map(raw_worker_incarnation)
+        .transpose()
+    }
+
+
     pub fn current_worker_incarnation(
         &self,
         session_id: &str,
@@ -2392,6 +2451,97 @@ impl Store {
             return Ok(Some(WorkerCleanupSnapshotClaim {
                 worker,
                 restore_state: Some(restore_state),
+                snapshot_started_at: started_at,
+                require_legacy_runtime_absence: false,
+            }));
+        }
+
+        // A pre-current-schema terminal snapshot can legitimately be newer
+        // than the authoritative migrated incarnation. Adopt that identity
+        // only while every durable ownership capability still agrees; the
+        // caller separately proves the persisted physical runtime is absent.
+        if let Some(raw) = tx
+            .query_row(
+                &format!("{WORKER_INCARNATION_COLUMNS} WHERE session_id=?1"),
+                [session_id],
+                worker_incarnation_row,
+            )
+            .optional()?
+        {
+            let mut worker = raw_worker_incarnation(raw)?;
+            let session = if Self::column_exists(&tx, "sessions", "current_incarnation_id")? {
+                tx.query_row(
+                    "SELECT orchestrator_id,status,current_incarnation_id
+                     FROM sessions WHERE id=?1 AND started_at=?2",
+                    params![session_id, started_at],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+            } else {
+                None
+            };
+            let exact_legacy_runtime: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM legacy_worker_runtimes
+                 WHERE session_id=?1 AND incarnation_id=?2",
+                params![session_id, worker.incarnation_id],
+                |row| row.get(0),
+            )?;
+            let legacy_runtimes: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM legacy_worker_runtimes WHERE session_id=?1",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            let active_pool_leases: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM pooled_checkouts
+                 WHERE session_id=?1 AND state IN ('provisioning','leased')",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            let finalizations: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM worker_finalizations WHERE session_id=?1",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            let adoptable = session.is_some_and(|(owner, status, current_incarnation_id)| {
+                owner.is_some()
+                    && owner == worker.orchestrator_id
+                    && matches!(status.as_str(), "done" | "terminated")
+                    && current_incarnation_id.as_deref() == Some(worker.incarnation_id.as_str())
+            }) && matches!(worker.state, WorkerIncarnationState::Active)
+                && !worker.checkout_backed
+                && worker.lease_id.is_none()
+                && exact_legacy_runtime == 1
+                && legacy_runtimes == 1
+                && active_pool_leases == 0
+                && finalizations == 0;
+            if !adoptable {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let restore_state = worker.state;
+            let changed = tx.execute(
+                "UPDATE worker_incarnations SET state='cleanup_claimed'
+                 WHERE session_id=?1 AND incarnation_id=?2 AND started_at=?3
+                   AND state='active' AND checkout_backed=0 AND lease_id IS NULL",
+                params![session_id, worker.incarnation_id, worker.started_at],
+            )?;
+            if changed != 1 {
+                tx.commit()?;
+                return Ok(None);
+            }
+            tx.commit()?;
+            worker.state = WorkerIncarnationState::CleanupClaimed;
+            return Ok(Some(WorkerCleanupSnapshotClaim {
+                worker,
+                restore_state: Some(restore_state),
+                snapshot_started_at: started_at,
+                require_legacy_runtime_absence: true,
             }));
         }
 
@@ -2464,6 +2614,8 @@ impl Store {
                 state: WorkerIncarnationState::CleanupClaimed,
             },
             restore_state: None,
+            snapshot_started_at: started_at,
+            require_legacy_runtime_absence: false,
         }))
     }
 
@@ -2485,12 +2637,12 @@ impl Store {
                 "invalid worker cleanup restore state"
             );
             tx.execute(
-                "UPDATE worker_incarnations SET state=?5
+                "UPDATE worker_incarnations SET state=?6
                  WHERE session_id=?1 AND incarnation_id=?2 AND started_at=?3
                    AND orchestrator_id IS ?4 AND state='cleanup_claimed'
                    AND EXISTS(
                      SELECT 1 FROM sessions s
-                     WHERE s.id=?1 AND s.started_at=?3
+                     WHERE s.id=?1 AND s.started_at=?5
                        AND s.orchestrator_id IS ?4
                    )",
                 params![
@@ -2498,6 +2650,7 @@ impl Store {
                     worker.incarnation_id,
                     worker.started_at,
                     worker.orchestrator_id,
+                    claim.snapshot_started_at,
                     worker_state_name(restore_state),
                 ],
             )?
@@ -2508,7 +2661,7 @@ impl Store {
                    AND orchestrator_id IS ?4 AND state='cleanup_claimed'
                    AND EXISTS(
                      SELECT 1 FROM sessions s
-                     WHERE s.id=?1 AND s.started_at=?3
+                     WHERE s.id=?1 AND s.started_at=?5
                        AND s.orchestrator_id IS ?4
                    )
                    AND NOT EXISTS(
@@ -2524,6 +2677,7 @@ impl Store {
                     worker.incarnation_id,
                     worker.started_at,
                     worker.orchestrator_id,
+                    claim.snapshot_started_at,
                 ],
             )?
         };

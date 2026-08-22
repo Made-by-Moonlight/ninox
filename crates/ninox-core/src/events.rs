@@ -140,14 +140,9 @@ impl Engine {
             if claim.is_none() {
                 let already_released = match self
                     .store
-                    .worker_incarnation_for_snapshot(&session.id, session.started_at)
+                    .released_worker_for_cleanup_snapshot(&session.id, session.started_at)
                 {
-                    Ok(worker) => worker.is_some_and(|worker| {
-                        matches!(
-                            worker.state,
-                            crate::types::WorkerIncarnationState::Released
-                        )
-                    }),
+                    Ok(worker) => worker.is_some(),
                     Err(error) => {
                         self.abort_recoverable_cleanup_claims(&claims);
                         return Err(error);
@@ -235,9 +230,29 @@ impl Engine {
         &self,
         claim: &crate::store::WorkerCleanupSnapshotClaim,
     ) -> anyhow::Result<()> {
-        let Err(stop_error) =
+        let stop_result = if claim.require_legacy_runtime_absence {
+            async {
+                let runtime = self
+                    .store
+                    .legacy_worker_runtime(&claim.worker.session_id)?
+                    .ok_or_else(|| anyhow::anyhow!("adopted legacy runtime metadata changed"))?;
+                anyhow::ensure!(
+                    runtime.incarnation_id == claim.worker.incarnation_id,
+                    "adopted legacy runtime belongs to another worker incarnation"
+                );
+                anyhow::ensure!(
+                    crate::tmux::exact_private_session(&runtime.physical_tmux_name)
+                        .await?
+                        .is_none(),
+                    "adopted legacy worker runtime is still live"
+                );
+                Ok(())
+            }
+            .await
+        } else {
             crate::workers::stop_exact_runtime(&self.store, &claim.worker).await
-        else {
+        };
+        let Err(stop_error) = stop_result else {
             return Ok(());
         };
         match self.store.abort_worker_cleanup_snapshot(claim) {
@@ -262,13 +277,8 @@ impl Engine {
         let Some(claim) = claim else {
             let already_released = self
                 .store
-                .worker_incarnation_for_snapshot(session_id, session.started_at)?
-                .is_some_and(|worker| {
-                    matches!(
-                        worker.state,
-                        crate::types::WorkerIncarnationState::Released
-                    )
-                });
+                .released_worker_for_cleanup_snapshot(session_id, session.started_at)?
+                .is_some();
             if already_released {
                 self.store.delete_session(session_id)?;
                 self.emit(Event::SessionDone(session_id.to_string()));
