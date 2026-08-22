@@ -465,6 +465,19 @@ pub struct Store {
     runtime_claim_locks: Mutex<HashMap<String, File>>,
 }
 
+/// UI-facing terminal identity: state stays keyed by the logical session while
+/// tmux operations target the persisted physical runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalRuntimeTarget {
+    pub logical_session_id: SessionId,
+    pub tmux_session_id:    String,
+}
+
+pub(crate) struct WorkerCleanupSnapshotClaim {
+    pub worker:        WorkerIncarnation,
+    pub restore_state: Option<WorkerIncarnationState>,
+}
+
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -2005,7 +2018,7 @@ impl Store {
              JOIN worker_incarnations w
                ON w.session_id=r.session_id
               AND w.incarnation_id=r.incarnation_id
-              AND w.state='active'
+              AND w.state IN ('active','cleanup_claimed','release_claimed','released')
              WHERE r.session_id=?1",
             [session_id],
             |row| {
@@ -2028,6 +2041,17 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Resolve a terminal target without probing or mutating runtime state.
+    pub fn terminal_runtime_target(&self, logical_session_id: &str) -> Result<TerminalRuntimeTarget> {
+        let tmux_session_id = self
+            .legacy_worker_runtime(logical_session_id)?
+            .map_or_else(|| logical_session_id.to_owned(), |runtime| runtime.physical_tmux_name);
+        Ok(TerminalRuntimeTarget {
+            logical_session_id: logical_session_id.to_owned(),
+            tmux_session_id,
+        })
     }
 
     pub fn worker_runtime_claimed(&self, session_id: &str) -> Result<bool> {
@@ -2285,6 +2309,16 @@ impl Store {
         session_id: &str,
         started_at: i64,
     ) -> Result<Option<WorkerIncarnation>> {
+        Ok(self
+            .claim_worker_cleanup_snapshot_recoverable(session_id, started_at)?
+            .map(|claim| claim.worker))
+    }
+
+    pub(crate) fn claim_worker_cleanup_snapshot_recoverable(
+        &self,
+        session_id: &str,
+        started_at: i64,
+    ) -> Result<Option<WorkerCleanupSnapshotClaim>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let runtime_claimed: bool = tx.query_row(
@@ -2313,6 +2347,7 @@ impl Store {
             .optional()?
         {
             let mut worker = raw_worker_incarnation(raw)?;
+            let restore_state = worker.state;
             if !matches!(
                 worker.state,
                 WorkerIncarnationState::Allocating
@@ -2354,7 +2389,10 @@ impl Store {
             }
             tx.commit()?;
             worker.state = WorkerIncarnationState::CleanupClaimed;
-            return Ok(Some(worker));
+            return Ok(Some(WorkerCleanupSnapshotClaim {
+                worker,
+                restore_state: Some(restore_state),
+            }));
         }
 
         let legacy = tx
@@ -2413,17 +2451,84 @@ impl Store {
             ],
         )?;
         tx.commit()?;
-        Ok(Some(WorkerIncarnation {
-            session_id: session_id.to_string(),
-            incarnation_id,
-            orchestrator_id,
-            started_at,
-            source_workspace,
-            workspace_path,
-            lease_id,
-            checkout_backed: pool.is_some(),
-            state: WorkerIncarnationState::CleanupClaimed,
+        Ok(Some(WorkerCleanupSnapshotClaim {
+            worker: WorkerIncarnation {
+                session_id: session_id.to_string(),
+                incarnation_id,
+                orchestrator_id,
+                started_at,
+                source_workspace,
+                workspace_path,
+                lease_id,
+                checkout_backed: pool.is_some(),
+                state: WorkerIncarnationState::CleanupClaimed,
+            },
+            restore_state: None,
         }))
+    }
+
+    pub(crate) fn abort_worker_cleanup_snapshot(
+        &self,
+        claim: &WorkerCleanupSnapshotClaim,
+    ) -> Result<bool> {
+        let worker = &claim.worker;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = if let Some(restore_state) = claim.restore_state {
+            anyhow::ensure!(
+                matches!(
+                    restore_state,
+                    WorkerIncarnationState::Allocating
+                        | WorkerIncarnationState::Active
+                        | WorkerIncarnationState::Retained
+                ),
+                "invalid worker cleanup restore state"
+            );
+            tx.execute(
+                "UPDATE worker_incarnations SET state=?5
+                 WHERE session_id=?1 AND incarnation_id=?2 AND started_at=?3
+                   AND orchestrator_id IS ?4 AND state='cleanup_claimed'
+                   AND EXISTS(
+                     SELECT 1 FROM sessions s
+                     WHERE s.id=?1 AND s.started_at=?3
+                       AND s.orchestrator_id IS ?4
+                   )",
+                params![
+                    worker.session_id,
+                    worker.incarnation_id,
+                    worker.started_at,
+                    worker.orchestrator_id,
+                    worker_state_name(restore_state),
+                ],
+            )?
+        } else {
+            tx.execute(
+                "DELETE FROM worker_incarnations
+                 WHERE session_id=?1 AND incarnation_id=?2 AND started_at=?3
+                   AND orchestrator_id IS ?4 AND state='cleanup_claimed'
+                   AND EXISTS(
+                     SELECT 1 FROM sessions s
+                     WHERE s.id=?1 AND s.started_at=?3
+                       AND s.orchestrator_id IS ?4
+                   )
+                   AND NOT EXISTS(
+                     SELECT 1 FROM worker_runtime_claims r
+                     WHERE r.session_id=?1
+                   )
+                   AND NOT EXISTS(
+                     SELECT 1 FROM worker_finalizations f
+                     WHERE f.session_id=?1 AND f.finalized_at IS NULL
+                   )",
+                params![
+                    worker.session_id,
+                    worker.incarnation_id,
+                    worker.started_at,
+                    worker.orchestrator_id,
+                ],
+            )?
+        };
+        tx.commit()?;
+        Ok(changed == 1)
     }
 
     pub fn claim_worker_release(
@@ -2540,13 +2645,22 @@ impl Store {
         incarnation_id: &str,
         claimed_state: WorkerIncarnationState,
     ) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let changed = conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
             "UPDATE worker_incarnations
              SET state='released',allocator_pid=NULL,allocator_token=NULL
              WHERE session_id=?1 AND incarnation_id=?2 AND state=?3",
             params![session_id, incarnation_id, worker_state_name(claimed_state)],
         )?;
+        if changed == 1 {
+            tx.execute(
+                "DELETE FROM legacy_worker_runtimes
+                 WHERE session_id=?1 AND incarnation_id=?2",
+                params![session_id, incarnation_id],
+            )?;
+        }
+        tx.commit()?;
         drop(conn);
         if changed == 1 {
             self.release_allocator_lock(incarnation_id);
@@ -3774,6 +3888,56 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn terminal_runtime_target_preserves_logical_id_and_resolves_physical_name() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("production.db");
+        production_legacy_worker_fixture(&db, false);
+        let store = Store::open(&db).unwrap();
+
+        let migrated = store.terminal_runtime_target("live-pooled").unwrap();
+        assert_eq!(migrated.logical_session_id, "live-pooled");
+        assert_eq!(migrated.tmux_session_id, "nxw-live-inc");
+
+        let ordinary = store.terminal_runtime_target("ordinary").unwrap();
+        assert_eq!(ordinary.logical_session_id, "ordinary");
+        assert_eq!(ordinary.tmux_session_id, "ordinary");
+    }
+
+    #[test]
+    fn completing_migrated_cleanup_removes_exact_legacy_runtime_metadata() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("production.db");
+        production_legacy_worker_fixture(&db, false);
+        let store = Store::open(&db).unwrap();
+
+        let claim = store
+            .claim_worker_cleanup_snapshot("live-pooled", 200)
+            .unwrap()
+            .unwrap();
+        let runtime = store.legacy_worker_runtime("live-pooled").unwrap().unwrap();
+        assert_eq!(runtime.incarnation_id, claim.incarnation_id);
+        assert!(store
+            .complete_worker_claim(
+                "live-pooled",
+                &claim.incarnation_id,
+                WorkerIncarnationState::CleanupClaimed,
+            )
+            .unwrap());
+        drop(store);
+
+        let conn = Connection::open(db).unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM legacy_worker_runtimes
+                 WHERE session_id='live-pooled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[test]

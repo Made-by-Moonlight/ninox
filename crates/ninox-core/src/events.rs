@@ -125,59 +125,130 @@ impl Engine {
     pub async fn remove_orchestrator(&self, orchestrator_id: &str) -> anyhow::Result<()> {
         let workers = self.store.sessions_by_orchestrator(orchestrator_id)?;
         let sessions_dir = crate::config::AppConfig::sessions_dir();
-        let mut removed_workers = Vec::new();
+        let mut claims = Vec::with_capacity(workers.len());
         for session in &workers {
-            let claim = self
+            let claim = match self
                 .store
-                .claim_worker_cleanup_snapshot(&session.id, session.started_at)?;
+                .claim_worker_cleanup_snapshot_recoverable(&session.id, session.started_at)
+            {
+                Ok(claim) => claim,
+                Err(error) => {
+                    self.abort_recoverable_cleanup_claims(&claims);
+                    return Err(error);
+                }
+            };
             if claim.is_none() {
-                let already_released = self
+                let already_released = match self
                     .store
-                    .worker_incarnation_for_snapshot(&session.id, session.started_at)?
-                    .is_some_and(|worker| {
+                    .worker_incarnation_for_snapshot(&session.id, session.started_at)
+                {
+                    Ok(worker) => worker.is_some_and(|worker| {
                         matches!(
                             worker.state,
                             crate::types::WorkerIncarnationState::Released
                         )
-                    });
-                if already_released {
-                    self.store.delete_session(&session.id)?;
-                    removed_workers.push(session.id.clone());
+                    }),
+                    Err(error) => {
+                        self.abort_recoverable_cleanup_claims(&claims);
+                        return Err(error);
+                    }
+                };
+                if !already_released {
+                    self.abort_recoverable_cleanup_claims(&claims);
+                    anyhow::bail!(
+                        "orchestrator worker {} changed while cleanup was being claimed",
+                        session.id
+                    );
                 }
-                continue;
             }
-            let _ = crate::tmux::kill_session(&session.id).await;
-            remove_worktree_and_artifacts(
-                &self.store,
-                &session.id,
-                session.workspace_path.as_deref(),
-                &sessions_dir,
-                RecoveryMetadata::Remove,
-                claim.as_ref(),
-            )
-            .await;
-            self.store.delete_session(&session.id)?;
-            if let Some(claim) = claim {
+            claims.push(claim);
+        }
+        for claim in claims.iter().flatten() {
+            if let Err(error) = self.stop_recoverable_cleanup_claim(claim).await {
+                self.abort_recoverable_cleanup_claims(&claims);
+                return Err(error);
+            }
+        }
+        for (index, (session, cleanup_claim)) in workers.iter().zip(&claims).enumerate() {
+            if let Some(claim) = cleanup_claim.as_ref().map(|claim| &claim.worker) {
+                remove_worktree_and_artifacts(
+                    &self.store,
+                    &session.id,
+                    session.workspace_path.as_deref(),
+                    &sessions_dir,
+                    RecoveryMetadata::Remove,
+                    Some(claim),
+                )
+                .await;
+            }
+            if let Err(error) = self.store.delete_session(&session.id) {
+                if let Some(cleanup_claim) = cleanup_claim {
+                    let claim = &cleanup_claim.worker;
+                    let completed = self.store.complete_worker_claim(
+                        &session.id,
+                        &claim.incarnation_id,
+                        crate::types::WorkerIncarnationState::CleanupClaimed,
+                    );
+                    if !matches!(completed, Ok(true)) {
+                        let _ = self.store.abort_worker_cleanup_snapshot(cleanup_claim);
+                    }
+                }
+                self.abort_recoverable_cleanup_claims(&claims[index + 1..]);
+                return Err(error);
+            }
+            if let Some(claim) = cleanup_claim.as_ref().map(|claim| &claim.worker) {
                 let _ = self.store.complete_worker_claim(
                     &session.id,
                     &claim.incarnation_id,
                     crate::types::WorkerIncarnationState::CleanupClaimed,
                 );
             }
-            removed_workers.push(session.id.clone());
+            self.emit(Event::SessionDone(session.id.clone()));
         }
-        for session_id in &removed_workers {
-            self.emit(Event::SessionDone(session_id.clone()));
-        }
-        anyhow::ensure!(
-            removed_workers.len() == workers.len(),
-            "orchestrator workers changed while cleanup was being claimed"
-        );
         // Also kill the orchestrator's own tmux session (same id as orchestrator).
         let _ = crate::tmux::kill_session(orchestrator_id).await;
         self.store.delete_orchestrator(orchestrator_id)?;
         self.emit(Event::OrchestratorRemoved(orchestrator_id.to_string()));
         Ok(())
+    }
+
+    fn abort_recoverable_cleanup_claims(
+        &self,
+        claims: &[Option<crate::store::WorkerCleanupSnapshotClaim>],
+    ) {
+        for claim in claims.iter().flatten() {
+            match self.store.abort_worker_cleanup_snapshot(claim) {
+                Ok(true) => {}
+                Ok(false) => tracing::error!(
+                    "cleanup {}: exact claim changed before abort",
+                    claim.worker.session_id
+                ),
+                Err(error) => tracing::error!(
+                    "cleanup {}: exact claim abort failed: {error}",
+                    claim.worker.session_id
+                ),
+            }
+        }
+    }
+
+    async fn stop_recoverable_cleanup_claim(
+        &self,
+        claim: &crate::store::WorkerCleanupSnapshotClaim,
+    ) -> anyhow::Result<()> {
+        let Err(stop_error) =
+            crate::workers::stop_exact_runtime(&self.store, &claim.worker).await
+        else {
+            return Ok(());
+        };
+        match self.store.abort_worker_cleanup_snapshot(claim) {
+            Ok(true) => Err(stop_error),
+            Ok(false) => Err(anyhow::anyhow!(
+                "{stop_error}; exact cleanup claim changed before abort"
+            )),
+            Err(abort_error) => Err(anyhow::anyhow!(
+                "{stop_error}; exact cleanup claim abort failed: {abort_error}"
+            )),
+        }
     }
 
     /// Kill the tmux session and delete it from the DB entirely.
@@ -187,7 +258,7 @@ impl Engine {
         };
         let claim = self
             .store
-            .claim_worker_cleanup_snapshot(session_id, session.started_at)?;
+            .claim_worker_cleanup_snapshot_recoverable(session_id, session.started_at)?;
         let Some(claim) = claim else {
             let already_released = self
                 .store
@@ -204,14 +275,15 @@ impl Engine {
             }
             return Ok(());
         };
-        let _ = crate::tmux::kill_session(session_id).await;
+        self.stop_recoverable_cleanup_claim(&claim).await?;
+        let claim = &claim.worker;
         remove_worktree_and_artifacts(
             &self.store,
             session_id,
             session.workspace_path.as_deref(),
             &crate::config::AppConfig::sessions_dir(),
             RecoveryMetadata::Remove,
-            Some(&claim),
+            Some(claim),
         )
         .await;
         self.store.delete_session(session_id)?;
@@ -302,12 +374,12 @@ impl Engine {
         };
         let Some(claim) = self
             .store
-            .claim_worker_cleanup_snapshot(session_id, session.started_at)?
+            .claim_worker_cleanup_snapshot_recoverable(session_id, session.started_at)?
         else {
             return Ok(());
         };
-        // Best-effort tmux kill — session may already be dead.
-        let _ = crate::tmux::kill_session(session_id).await;
+        self.stop_recoverable_cleanup_claim(&claim).await?;
+        let claim = &claim.worker;
 
         remove_worktree_and_artifacts(
             &self.store,
@@ -315,7 +387,7 @@ impl Engine {
             session.workspace_path.as_deref(),
             sessions_dir,
             RecoveryMetadata::Retain,
-            Some(&claim),
+            Some(claim),
         )
         .await;
         session.status = crate::types::SessionStatus::Done;
@@ -744,6 +816,179 @@ mod tests {
             .unwrap();
         assert_eq!(record.state, crate::types::PooledCheckoutState::Free);
         assert!(record.session_id.is_none());
+    }
+
+    // ── Orchestrator removal cleanup claims ───────────────────────────────────
+
+    fn worker(id: &str, orchestrator: &str, status: crate::types::SessionStatus) -> Session {
+        Session {
+            id: id.into(), orchestrator_id: Some(orchestrator.into()), name: id.into(),
+            repo: "r".into(), status, agent_type: "claude-code".into(),
+            cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None, model: None, context_tokens: None,
+            catalogue_path: None, context_used_pct: None, context_total_tokens: None,
+            context_window_size: None, claude_session_id: None, summary: None,
+            terminal_at: None, gate_status: None,
+        }
+    }
+
+    /// Store + engine seeded with `workers`.
+    fn worker_fixture(workers: &[Session]) -> (Arc<Store>, Arc<Engine>) {
+        let store = Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
+        for w in workers {
+            store.upsert_session(w).unwrap();
+        }
+        let engine = Engine::new(Arc::clone(&store));
+        (store, engine)
+    }
+
+    #[tokio::test]
+    async fn remove_orchestrator_does_not_delete_workers_before_all_exact_stops_succeed() {
+        use crate::types::{Orchestrator, SessionStatus::Terminated, WorkerIncarnationState};
+
+        let root = tempdir().unwrap();
+        let safe_id = format!("remove-orch-safe-{}", uuid::Uuid::new_v4());
+        let refused_id = format!("remove-orch-refused-{}", uuid::Uuid::new_v4());
+        let mut safe = worker(&safe_id, "orch-1", Terminated);
+        safe.started_at = 20;
+        safe.workspace_path = Some(root.path().to_string_lossy().into_owned());
+        let mut refused = worker(&refused_id, "orch-1", Terminated);
+        refused.started_at = 10;
+        refused.workspace_path = Some(root.path().to_string_lossy().into_owned());
+        let (store, engine) = worker_fixture(&[safe, refused]);
+        store
+            .upsert_orchestrator(&Orchestrator {
+                id: "orch-1".into(), name: "orchestrator".into(), created_at: 0,
+            })
+            .unwrap();
+        for (session_id, started_at) in [(&safe_id, 20), (&refused_id, 10)] {
+            let worker = store
+                .prepare_worker_incarnation(
+                    session_id,
+                    Some("orch-1"),
+                    started_at,
+                    root.path().to_str().unwrap(),
+                    false,
+                    3,
+                )
+                .unwrap();
+            assert!(store
+                .bind_worker_incarnation(
+                    session_id,
+                    &worker.incarnation_id,
+                    root.path().to_str().unwrap(),
+                    root.path().to_str().unwrap(),
+                    None,
+                )
+                .unwrap());
+        }
+        crate::tmux::create_session(
+            &refused_id,
+            root.path().to_str().unwrap(),
+            "sleep 30",
+            &[("NINOX_WORKER_INCARNATION", "successor")],
+        )
+        .await
+        .unwrap();
+        let mut events = engine.subscribe();
+
+        let result = engine.remove_orchestrator("orch-1").await;
+        let runtime_survived = crate::tmux::has_session(&refused_id).await;
+        let sessions_survived = [safe_id.as_str(), refused_id.as_str()]
+            .into_iter()
+            .all(|id| store.get_session(id).unwrap().is_some());
+        let claims_aborted = [safe_id.as_str(), refused_id.as_str()]
+            .into_iter()
+            .all(|id| {
+                store
+                    .current_worker_incarnation(id)
+                    .unwrap()
+                    .is_some_and(|worker| matches!(worker.state, WorkerIncarnationState::Active))
+            });
+        let orchestrator_survived =
+            store.list_orchestrators().unwrap().iter().any(|orchestrator| orchestrator.id == "orch-1");
+        crate::tmux::kill_private_session(&refused_id).await.unwrap();
+
+        assert!(result.is_err());
+        assert!(runtime_survived, "a mismatched runtime must never be killed");
+        assert!(sessions_survived, "no records may be deleted before all stops succeed");
+        assert!(claims_aborted, "every preclaimed worker must remain retryable");
+        assert!(orchestrator_survived);
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_orchestrator_aborts_remaining_claims_after_delete_failure() {
+        use crate::types::{Orchestrator, SessionStatus::Terminated, WorkerIncarnationState};
+
+        let root = tempdir().unwrap();
+        let db = root.path().join("t.db");
+        let store = Arc::new(Store::open(&db).unwrap());
+        let removed_id = format!("remove-orch-first-{}", uuid::Uuid::new_v4());
+        let failed_id = format!("remove-orch-failed-{}", uuid::Uuid::new_v4());
+        for (session_id, started_at) in [(&removed_id, 20), (&failed_id, 10)] {
+            let mut session = worker(session_id, "orch-1", Terminated);
+            session.started_at = started_at;
+            session.workspace_path = Some(root.path().to_string_lossy().into_owned());
+            store.upsert_session(&session).unwrap();
+            let worker = store
+                .prepare_worker_incarnation(
+                    session_id,
+                    Some("orch-1"),
+                    started_at,
+                    root.path().to_str().unwrap(),
+                    false,
+                    3,
+                )
+                .unwrap();
+            assert!(store
+                .bind_worker_incarnation(
+                    session_id,
+                    &worker.incarnation_id,
+                    root.path().to_str().unwrap(),
+                    root.path().to_str().unwrap(),
+                    None,
+                )
+                .unwrap());
+        }
+        store
+            .upsert_orchestrator(&Orchestrator {
+                id: "orch-1".into(), name: "orchestrator".into(), created_at: 0,
+            })
+            .unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER refuse_session_delete
+             BEFORE DELETE ON sessions WHEN OLD.id='{}'
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            failed_id.replace('\'', "''"),
+        ))
+        .unwrap();
+        drop(conn);
+        let engine = Engine::new(store.clone());
+        let mut events = engine.subscribe();
+
+        let result = engine.remove_orchestrator("orch-1").await;
+
+        assert!(result.is_err());
+        assert!(store.get_session(&removed_id).unwrap().is_none());
+        assert!(store.get_session(&failed_id).unwrap().is_some());
+        assert!(store
+            .current_worker_incarnation(&failed_id)
+            .unwrap()
+            .is_some_and(|worker| matches!(worker.state, WorkerIncarnationState::Released)));
+        assert!(store.list_orchestrators().unwrap().iter().any(|orchestrator| orchestrator.id == "orch-1"));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::SessionDone(session_id)) if session_id == removed_id
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

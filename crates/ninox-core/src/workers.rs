@@ -252,7 +252,7 @@ pub async fn finalize_owned_worker(
     })
 }
 
-async fn stop_exact_runtime(store: &Store, worker: &WorkerIncarnation) -> Result<()> {
+pub(crate) async fn stop_exact_runtime(store: &Store, worker: &WorkerIncarnation) -> Result<()> {
     if let Some(legacy) = store.legacy_worker_runtime(&worker.session_id)? {
         anyhow::ensure!(
             legacy.incarnation_id == worker.incarnation_id,
