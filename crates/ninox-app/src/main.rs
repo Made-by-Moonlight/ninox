@@ -679,7 +679,6 @@ async fn run_spawn(
     // contract, orchestrator ID, and how to communicate back when done.
     let mut effective_prompt = match worker_prompt_for_canonical_workspace(
         &prompt,
-        &workspace,
         &canonical_source_workspace,
         &effective_workspace,
         delivery,
@@ -905,8 +904,8 @@ fn resolve_worker_delivery(
     })
 }
 
-/// Make the allocated workspace authoritative even when the source checkout's
-/// absolute path appears in the task prompt.
+/// Preserve the caller's task verbatim and append the allocated workspace as
+/// authoritative metadata.
 #[cfg(test)]
 fn worker_prompt_for_workspace(
     prompt: &str,
@@ -924,7 +923,6 @@ fn worker_prompt_for_workspace(
     .unwrap_or_else(|| source_workspace.to_string());
     worker_prompt_for_canonical_workspace(
         prompt,
-        source_workspace,
         &canonical_source,
         worker_workspace,
         delivery,
@@ -933,16 +931,10 @@ fn worker_prompt_for_workspace(
 
 fn worker_prompt_for_canonical_workspace(
     prompt: &str,
-    source_workspace: &str,
     canonical_source: &str,
     worker_workspace: &str,
     delivery: WorkerDelivery,
 ) -> anyhow::Result<String> {
-    let remapped = remap_workspace_paths(
-        prompt,
-        workspace_path_mappings(source_workspace, canonical_source, worker_workspace),
-        worker_workspace,
-    )?;
     let source_note = if canonical_source == worker_workspace {
         String::new()
     } else {
@@ -957,299 +949,10 @@ fn worker_prompt_for_canonical_workspace(
             "Perform all task work and write artifacts or direct changes inside it.",
     };
     Ok(format!(
-        "{remapped}\n\n---\n\
+        "{prompt}\n\n---\n\
          **Ninox workspace:** `{worker_workspace}` is the authoritative workspace. \
          {workspace_contract}{source_note}"
     ))
-}
-
-fn workspace_path_mappings(
-    supplied_source_workspace: &str,
-    canonical_source_workspace: &str,
-    worker_workspace: &str,
-) -> Vec<(String, String)> {
-    let canonical_supplied = std::path::Path::new(supplied_source_workspace)
-        .canonicalize()
-        .unwrap_or_else(|_| std::path::PathBuf::from(supplied_source_workspace));
-    let canonical_root = std::path::Path::new(canonical_source_workspace)
-        .canonicalize()
-        .unwrap_or_else(|_| std::path::PathBuf::from(canonical_source_workspace));
-    let relative = canonical_supplied
-        .strip_prefix(&canonical_root)
-        .unwrap_or_else(|_| std::path::Path::new(""));
-    let supplied_target = std::path::Path::new(worker_workspace).join(relative);
-    let mut mappings = vec![
-        (
-            supplied_source_workspace.to_string(),
-            supplied_target.to_string_lossy().into_owned(),
-        ),
-        (
-            canonical_supplied.to_string_lossy().into_owned(),
-            supplied_target.to_string_lossy().into_owned(),
-        ),
-        (
-            canonical_source_workspace.to_string(),
-            worker_workspace.to_string(),
-        ),
-        (
-            canonical_root.to_string_lossy().into_owned(),
-            worker_workspace.to_string(),
-        ),
-    ];
-    mappings.retain(|(source, target)| !source.is_empty() && source != target);
-    mappings.sort_unstable_by_key(|(source, _)| std::cmp::Reverse(source.len()));
-    mappings.dedup_by(|left, right| left.0 == right.0);
-    mappings
-}
-
-fn remap_workspace_paths(
-    prompt: &str,
-    mappings: Vec<(String, String)>,
-    worker_workspace: &str,
-) -> anyhow::Result<String> {
-    use anyhow::Context as _;
-
-    let mut mappings = mappings
-        .into_iter()
-        .map(|(source, target)| {
-            let source = normalize_absolute_path(std::path::Path::new(&source))
-                .context("normalize source workspace mapping")?;
-            let target = normalize_absolute_path(std::path::Path::new(&target))
-                .context("normalize worker workspace mapping")?;
-            Ok((source, target))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    mappings.sort_unstable_by_key(|(source, _)| {
-        std::cmp::Reverse(source.components().count())
-    });
-    let worker_root = normalize_absolute_path(std::path::Path::new(worker_workspace))
-        .context("normalize authoritative worker workspace")?;
-    let source_roots = mappings
-        .iter()
-        .map(|(source, _)| source.clone())
-        .collect::<Vec<_>>();
-    let mut output = String::with_capacity(prompt.len());
-    let mut cursor = 0;
-    while let Some((start, end)) = next_workspace_path_token(prompt, cursor) {
-        output.push_str(&prompt[cursor..start]);
-        let token = &prompt[start..end];
-        let (path_token, punctuation) = split_path_token_punctuation(token);
-        let (normalized, render_prefix, escaped_spaces, file_uri) =
-            normalize_prompt_path_token(prompt, start, path_token, &worker_root)
-                .with_context(|| format!("normalize workspace path token {token}"))?;
-        if let Some((source, target)) = mappings
-            .iter()
-            .find(|(source, _)| normalized.strip_prefix(source).is_ok())
-        {
-            let relative = normalized.strip_prefix(source)?;
-            let mapped = normalize_absolute_path(&target.join(relative))
-                .context("normalize remapped worker path")?;
-            anyhow::ensure!(
-                mapped.starts_with(&worker_root),
-                "workspace path remap escaped authoritative worker workspace"
-            );
-            output.push_str(render_prefix);
-            let mapped = mapped.to_string_lossy();
-            if file_uri {
-                output.push_str(&percent_encode_file_uri_path(&mapped));
-            } else if escaped_spaces {
-                output.push_str(&mapped.replace(' ', "\\ "));
-            } else {
-                output.push_str(&mapped);
-            }
-            output.push_str(punctuation);
-        } else {
-            output.push_str(token);
-        }
-        cursor = end;
-    }
-    output.push_str(&prompt[cursor..]);
-
-    let mut cursor = 0;
-    while let Some((start, end)) = next_workspace_path_token(&output, cursor) {
-        let token = &output[start..end];
-        let (path_token, _) = split_path_token_punctuation(token);
-        let (normalized, _, _, _) =
-            normalize_prompt_path_token(&output, start, path_token, &worker_root)
-                .with_context(|| format!("validate remapped workspace path token {token}"))?;
-        anyhow::ensure!(
-            !source_roots.iter().any(|source| {
-                source != &worker_root && normalized.starts_with(source)
-            }),
-            "prompt retains a normalized source-checkout path after remapping: {token}"
-        );
-        cursor = end;
-    }
-    Ok(output)
-}
-
-fn split_path_token_punctuation(token: &str) -> (&str, &str) {
-    if token.ends_with('.') && !token.ends_with("/.") && !token.ends_with("/..") {
-        (&token[..token.len() - 1], ".")
-    } else {
-        (token, "")
-    }
-}
-
-fn normalize_absolute_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    if !path.is_absolute() {
-        return None;
-    }
-    let mut normalized = std::path::PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if !normalized.pop() {
-                    return None;
-                }
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    Some(normalized)
-}
-
-fn normalize_prompt_path_token<'a>(
-    input: &'a str,
-    start: usize,
-    token: &str,
-    worker_root: &std::path::Path,
-) -> Option<(std::path::PathBuf, &'a str, bool, bool)> {
-    let file_scheme = input
-        .as_bytes()
-        .get(..start)?
-        .get(start.saturating_sub("file:".len())..)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"file:"));
-    let localhost = token
-        .as_bytes()
-        .get(.."//localhost".len())
-        .is_some_and(|authority| authority.eq_ignore_ascii_case(b"//localhost"))
-        && token.as_bytes().get("//localhost".len()) == Some(&b'/');
-    let (path, render_prefix) = if file_scheme && localhost {
-        (&token["//localhost".len()..], "//localhost")
-    } else if file_scheme && token.starts_with("///") {
-        (token, "//")
-    } else {
-        (token, "")
-    };
-    let file_uri = !render_prefix.is_empty();
-    let escaped_spaces = path.contains("\\ ");
-    let decoded = if file_uri {
-        percent_decode_file_uri_path(path)?
-    } else {
-        path.replace("\\ ", " ")
-    };
-    let path = std::path::Path::new(&decoded);
-    let normalized = if path.is_absolute() {
-        normalize_absolute_path(path)?
-    } else {
-        normalize_absolute_path(&worker_root.join(path))?
-    };
-    Some((normalized, render_prefix, escaped_spaces, file_uri))
-}
-
-fn percent_decode_file_uri_path(path: &str) -> Option<String> {
-    let bytes = path.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        if bytes[cursor] != b'%' {
-            decoded.push(bytes[cursor]);
-            cursor += 1;
-            continue;
-        }
-        let value = hex_value(*bytes.get(cursor + 1)?)? * 16
-            + hex_value(*bytes.get(cursor + 2)?)?;
-        if value == 0 {
-            return None;
-        }
-        decoded.push(value);
-        cursor += 3;
-    }
-    String::from_utf8(decoded).ok()
-}
-
-fn hex_value(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn percent_encode_file_uri_path(path: &str) -> String {
-    let mut encoded = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            const HEX: &[u8; 16] = b"0123456789ABCDEF";
-            encoded.push('%');
-            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-    }
-    encoded
-}
-
-fn next_workspace_path_token(input: &str, from: usize) -> Option<(usize, usize)> {
-    for (relative, character) in input[from..].char_indices() {
-        let start = from + relative;
-        if is_workspace_path_delimiter(character) {
-            continue;
-        }
-        let before = input[..start].chars().next_back();
-        if !before.is_none_or(is_workspace_path_delimiter) {
-            continue;
-        }
-        let quote = before.filter(|character| matches!(character, '\'' | '"' | '`'));
-        let end = workspace_path_token_end(input, start, quote);
-        let candidate = &input[start..end];
-        let relative_path = !candidate.starts_with('/')
-            && candidate.contains('/')
-            && candidate
-                .split('/')
-                .any(|component| matches!(component, "." | ".."));
-        if character != '/' && !relative_path {
-            continue;
-        }
-        return Some((start, end));
-    }
-    None
-}
-
-fn workspace_path_token_end(input: &str, start: usize, quote: Option<char>) -> usize {
-    let mut escaped = false;
-    input[start..]
-        .char_indices()
-        .skip(1)
-        .find_map(|(offset, character)| {
-            if escaped {
-                escaped = false;
-                return None;
-            }
-            if character == '\\' {
-                escaped = true;
-                return None;
-            }
-            if quote.is_some_and(|quote| character == quote) {
-                return Some(start + offset);
-            }
-            (quote.is_none() && is_workspace_path_delimiter(character))
-                .then_some(start + offset)
-        })
-        .unwrap_or(input.len())
-}
-
-fn is_workspace_path_delimiter(character: char) -> bool {
-    character.is_whitespace()
-        || matches!(
-            character,
-            '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | ':'
-                | '!' | '?' | '=' | '@'
-        )
 }
 
 fn worker_context_footer(
@@ -2422,76 +2125,18 @@ mod worker_env_tests {
         );
     }
 
-    #[tokio::test]
-    async fn malformed_prompt_after_lease_binding_rolls_back_incarnation_and_lease() {
-        use std::sync::Arc;
-
-        let root = tempfile::tempdir().unwrap();
-        let repo = root.path().join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        let run = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .status()
-                .unwrap();
-            assert!(status.success());
-        };
-        run(&["init", "-q"]);
-        run(&[
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "user.name=Test",
-            "commit",
-            "--allow-empty",
-            "-q",
-            "-m",
-            "init",
-        ]);
-        let store = Arc::new(
-            ninox_core::store::Store::open(root.path().join("t.db")).unwrap(),
-        );
-        let config = ninox_core::config::AppConfig {
-            repositories_root: Some(root.path().to_path_buf()),
-            worktree_root: Some(root.path().join("managed")),
-            ..Default::default()
-        };
-        let prompt = format!("inspect file://{}/bad%GG", repo.display());
-
-        let error = run_spawn(
-            store.clone(),
-            config,
+    #[test]
+    fn worker_prompt_preserves_path_like_prose_without_parsing_it() {
+        let prompt = "Explain why file:///Users/mu/dev/ninox/bad%GG is malformed.";
+        let prepared = worker_prompt_for_canonical_workspace(
             prompt,
-            repo.to_string_lossy().into_owned(),
-            None,
-            Some("malformed-prompt".into()),
-            None,
+            "/Users/mu/dev/ninox",
+            "/Users/mu/dev/ninox-w2",
+            WorkerDelivery::Pr,
         )
-        .await
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("prepare worker prompt"), "{error:#}");
-        assert!(matches!(
-            store
-                .current_worker_incarnation("malformed-prompt")
-                .unwrap()
-                .unwrap()
-                .state,
-            ninox_core::types::WorkerIncarnationState::Released
-        ));
-        assert!(store
-            .pooled_checkout_by_session("malformed-prompt")
-            .unwrap()
-            .is_none());
-        assert!(matches!(
-            store
-                .pooled_checkouts_by_repo(&repo)
-                .unwrap()
-                .as_slice(),
-            [record] if matches!(record.state, ninox_core::types::PooledCheckoutState::Free)
-        ));
+        assert_eq!(prepared.split_once("\n\n---\n").unwrap().0, prompt);
     }
 
     #[test]
@@ -2564,70 +2209,67 @@ mod worker_env_tests {
     }
 
     #[test]
-    fn worker_prompt_remaps_source_checkout_paths_to_the_managed_worktree() {
-        let prompt =
-            "Edit /Users/mu/dev/repo/src/main.rs, then run git in /Users/mu/dev/repo.";
-        let mapped = worker_prompt_for_workspace(
+    fn worker_prompt_preserves_forbidden_source_and_authorized_worker_distinction() {
+        let prompt = "Never modify the primary checkout /Users/matan.uberstein/dev/ninox. \
+                      Work only in the assigned sibling /Users/matan.uberstein/dev/ninox-w2.";
+        let prepared = worker_prompt_for_workspace(
             prompt,
-            "/Users/mu/dev/repo",
-            "/Users/mu/dev/_wts/repo/worker-1",
+            "/Users/matan.uberstein/dev/ninox",
+            "/Users/matan.uberstein/dev/ninox-w2",
             WorkerDelivery::Pr,
         )
         .unwrap();
 
-        assert!(!mapped.contains("/Users/mu/dev/repo"));
-        assert_eq!(
-            mapped.matches("/Users/mu/dev/_wts/repo/worker-1").count(),
-            3,
-        );
-        assert!(mapped.contains("do not read, write, or run Git commands there"));
+        assert_eq!(prepared.split_once("\n\n---\n").unwrap().0, prompt);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn worker_prompt_maps_nested_symlink_aliases_by_path_components() {
-        use std::os::unix::fs::symlink;
-
-        let parent = tempfile::tempdir().unwrap();
-        let source = parent.path().join("repo");
-        let alias = parent.path().join("repo-alias");
-        let worker = parent.path().join("repo-w1");
-        std::fs::create_dir_all(source.join("src/nested")).unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .args(["-C", source.to_str().unwrap(), "init", "-q"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        symlink(&source, &alias).unwrap();
-
-        let supplied = alias.join("src/nested");
-        let prompt = format!(
-            "Edit {}/deep.rs and {}/root.rs; preserve {}-archive/root.rs.",
-            supplied.display(),
-            source.display(),
-            source.display(),
-        );
-        let mapped = worker_prompt_for_canonical_workspace(
-            &prompt,
-            supplied.to_str().unwrap(),
-            source.to_str().unwrap(),
-            worker.to_str().unwrap(),
+    fn worker_prompt_preserves_source_paths_embedded_in_longer_sibling_names() {
+        let prompt = "Keep /Users/mu/dev/ninox-w2 and /Users/mu/dev/ninox-archive distinct \
+                      from /Users/mu/dev/ninox.";
+        let prepared = worker_prompt_for_canonical_workspace(
+            prompt,
+            "/Users/mu/dev/ninox",
+            "/Users/mu/dev/ninox-w2",
             WorkerDelivery::Pr,
         )
         .unwrap();
 
-        assert!(
-            mapped.contains(&format!("{}/src/nested/deep.rs", worker.display())),
-            "{mapped}"
-        );
-        assert!(
-            mapped.contains(&format!("{}/root.rs", worker.display())),
-            "{mapped}"
-        );
-        assert!(mapped.contains(&format!("{}-archive/root.rs", source.display())));
-        assert!(!mapped.contains(alias.to_str().unwrap()));
+        assert_eq!(prepared.split_once("\n\n---\n").unwrap().0, prompt);
+    }
+
+    #[test]
+    fn worker_prompt_preserves_workspace_comparison_prose() {
+        let prompt = "Compare /Users/mu/dev/ninox/config.toml with \
+                      /Users/mu/dev/ninox-w2/config.toml; explain differences without editing either.";
+        let prepared = worker_prompt_for_canonical_workspace(
+            prompt,
+            "/Users/mu/dev/ninox",
+            "/Users/mu/dev/ninox-w2",
+            WorkerDelivery::Pr,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.split_once("\n\n---\n").unwrap().0, prompt);
+    }
+
+    #[test]
+    fn worker_prompt_appends_authoritative_assigned_workspace_context() {
+        let prepared = worker_prompt_for_canonical_workspace(
+            "Inspect the repository without changing this sentence.",
+            "/Users/mu/dev/ninox",
+            "/Users/mu/dev/ninox-w2",
+            WorkerDelivery::Pr,
+        )
+        .unwrap();
+
+        assert!(prepared.contains(
+            "**Ninox workspace:** `/Users/mu/dev/ninox-w2` is the authoritative workspace."
+        ));
+        assert!(prepared.contains(
+            "The original source checkout is repository context only; \
+             do not read, write, or run Git commands there."
+        ));
     }
 
     #[test]
