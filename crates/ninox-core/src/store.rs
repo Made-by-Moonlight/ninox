@@ -582,6 +582,35 @@ impl Store {
                 claimed_at INTEGER NOT NULL,
                 finalized_at INTEGER
             );
+            CREATE TABLE IF NOT EXISTS worker_completions (
+                completion_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                incarnation_id TEXT NOT NULL,
+                orchestrator_id TEXT NOT NULL,
+                summary TEXT NOT NULL CHECK(length(summary)>0),
+                completed_at INTEGER NOT NULL,
+                UNIQUE(session_id,incarnation_id)
+            );
+            CREATE TABLE IF NOT EXISTS worker_completion_outbox (
+                completion_id TEXT PRIMARY KEY,
+                next_attempt_at INTEGER NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count>=0),
+                acknowledged_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS worker_completion_delivery_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                completion_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL CHECK(attempt>0),
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                outcome TEXT CHECK(outcome IN ('sent','failed')),
+                detail TEXT,
+                UNIQUE(completion_id,attempt)
+            );
+            CREATE INDEX IF NOT EXISTS worker_completion_outbox_pending
+                ON worker_completion_outbox(acknowledged_at,next_attempt_at);
+            CREATE INDEX IF NOT EXISTS worker_completion_attempts_completion
+                ON worker_completion_delivery_attempts(completion_id,attempt);
         ")?;
         migrate_legacy_worker_incarnations(&mut conn)?;
         // Migrations for columns added after initial release — idempotent so
@@ -1400,6 +1429,21 @@ impl Store {
     pub fn delete_session(&self, id: &str) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM worker_completion_delivery_attempts
+             WHERE completion_id IN (
+                SELECT completion_id FROM worker_completions WHERE session_id=?1
+             )",
+            [id],
+        )?;
+        tx.execute(
+            "DELETE FROM worker_completion_outbox
+             WHERE completion_id IN (
+                SELECT completion_id FROM worker_completions WHERE session_id=?1
+             )",
+            [id],
+        )?;
+        tx.execute("DELETE FROM worker_completions WHERE session_id=?1", [id])?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         tx.execute("DELETE FROM worker_finalizations WHERE session_id=?1", [id])?;
         tx.execute(
@@ -1807,6 +1851,289 @@ impl Store {
         .transpose()
     }
 
+    pub fn complete_worker_incarnation(
+        &self,
+        session_id: &str,
+        incarnation_id: &str,
+        orchestrator_id: &str,
+        summary: &str,
+        completed_at: i64,
+    ) -> Result<WorkerCompletionIntent> {
+        anyhow::ensure!(!session_id.is_empty(), "worker session id is not set");
+        anyhow::ensure!(
+            !incarnation_id.is_empty(),
+            "worker incarnation id is not set"
+        );
+        anyhow::ensure!(!orchestrator_id.is_empty(), "worker owner is not set");
+        anyhow::ensure!(
+            !summary.trim().is_empty(),
+            "completion summary cannot be empty"
+        );
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let worker = tx
+            .query_row(
+                &format!("{WORKER_INCARNATION_COLUMNS} WHERE session_id=?1"),
+                [session_id],
+                worker_incarnation_row,
+            )
+            .optional()?
+            .map(raw_worker_incarnation)
+            .transpose()?
+            .with_context(|| format!("worker {session_id:?} not found"))?;
+        anyhow::ensure!(
+            worker.incarnation_id == incarnation_id,
+            "worker completion is stale; the current incarnation changed"
+        );
+        anyhow::ensure!(
+            worker.orchestrator_id.as_deref() == Some(orchestrator_id),
+            "worker completion owner does not match its exact incarnation"
+        );
+
+        let (session_owner, owner_exists, caller_is_orchestrator) = tx
+            .query_row(
+                "SELECT s.orchestrator_id,
+                        EXISTS(SELECT 1 FROM orchestrators o WHERE o.id=?2),
+                        EXISTS(SELECT 1 FROM orchestrators o WHERE o.id=s.id)
+                 FROM sessions s WHERE s.id=?1",
+                params![session_id, orchestrator_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .with_context(|| format!("worker {session_id:?} not found"))?;
+        anyhow::ensure!(
+            session_owner.as_deref() == Some(orchestrator_id),
+            "worker completion owner does not match its session owner"
+        );
+        anyhow::ensure!(
+            owner_exists,
+            "worker completion owner is not an orchestrator"
+        );
+        anyhow::ensure!(
+            !caller_is_orchestrator && session_id != orchestrator_id,
+            "orchestrators cannot complete themselves as workers"
+        );
+
+        let existing = tx
+            .query_row(
+                &format!(
+                    "{WORKER_COMPLETION_COLUMNS}
+                     WHERE session_id=?1 AND incarnation_id=?2"
+                ),
+                params![session_id, incarnation_id],
+                worker_completion_row,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            anyhow::ensure!(
+                existing.orchestrator_id == orchestrator_id && existing.summary == summary,
+                "completion result conflicts with the canonical result already recorded"
+            );
+            tx.commit()?;
+            return Ok(WorkerCompletionIntent::AlreadyCompleted(existing));
+        }
+
+        anyhow::ensure!(
+            matches!(
+                worker.state,
+                WorkerIncarnationState::Active | WorkerIncarnationState::Retained
+            ),
+            "worker completion requires the exact live or retained incarnation"
+        );
+        let blocked: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM worker_runtime_claims
+                WHERE session_id=?1 AND incarnation_id=?2
+                UNION ALL
+                SELECT 1 FROM worker_finalizations
+                WHERE session_id=?1 AND incarnation_id=?2
+                  AND finalized_at IS NULL
+            )",
+            params![session_id, incarnation_id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            !blocked,
+            "worker completion conflicts with an active lifecycle claim"
+        );
+
+        let completion = WorkerCompletion {
+            completion_id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            incarnation_id: incarnation_id.to_string(),
+            orchestrator_id: orchestrator_id.to_string(),
+            summary: summary.to_string(),
+            completed_at,
+        };
+        tx.execute(
+            "INSERT INTO worker_completions(
+                completion_id,session_id,incarnation_id,orchestrator_id,summary,completed_at
+             ) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                completion.completion_id,
+                completion.session_id,
+                completion.incarnation_id,
+                completion.orchestrator_id,
+                completion.summary,
+                completion.completed_at,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO worker_completion_outbox(
+                completion_id,next_attempt_at,attempt_count,acknowledged_at
+             ) VALUES(?1,?2,0,NULL)",
+            params![completion.completion_id, completed_at],
+        )?;
+        let changed = tx.execute(
+            "UPDATE worker_incarnations
+             SET state='retained',allocator_pid=NULL,allocator_token=NULL
+             WHERE session_id=?1 AND incarnation_id=?2 AND orchestrator_id=?3
+               AND state IN ('active','retained')
+               AND NOT EXISTS(
+                    SELECT 1 FROM worker_runtime_claims r
+                    WHERE r.session_id=?1 AND r.incarnation_id=?2
+               )
+               AND NOT EXISTS(
+                    SELECT 1 FROM worker_finalizations f
+                    WHERE f.session_id=?1 AND f.incarnation_id=?2
+                      AND f.finalized_at IS NULL
+               )",
+            params![session_id, incarnation_id, orchestrator_id],
+        )?;
+        anyhow::ensure!(changed == 1, "worker completion became stale before commit");
+        tx.commit()?;
+        self.release_allocator_lock(incarnation_id);
+        Ok(WorkerCompletionIntent::Completed(completion))
+    }
+
+    pub fn claim_worker_completion_delivery(
+        &self,
+        now: i64,
+        retry_after_ms: i64,
+    ) -> Result<Option<WorkerCompletionDelivery>> {
+        anyhow::ensure!(
+            retry_after_ms > 0,
+            "completion retry delay must be positive"
+        );
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pending = tx
+            .query_row(
+                "SELECT c.completion_id,c.session_id,c.incarnation_id,c.orchestrator_id,
+                        c.summary,c.completed_at,o.attempt_count
+                 FROM worker_completions c
+                 JOIN worker_completion_outbox o ON o.completion_id=c.completion_id
+                 WHERE o.acknowledged_at IS NULL AND o.next_attempt_at<=?1
+                 ORDER BY o.next_attempt_at,c.completed_at,c.completion_id
+                 LIMIT 1",
+                [now],
+                |row| Ok((worker_completion_row(row)?, row.get::<_, i64>(6)?)),
+            )
+            .optional()?;
+        let Some((completion, attempts)) = pending else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let attempt = attempts
+            .checked_add(1)
+            .context("completion delivery attempt counter overflowed")?;
+        let next_attempt_at = now.saturating_add(retry_after_ms);
+        let changed = tx.execute(
+            "UPDATE worker_completion_outbox
+             SET attempt_count=?2,next_attempt_at=?3
+             WHERE completion_id=?1 AND attempt_count=?4
+               AND acknowledged_at IS NULL AND next_attempt_at<=?5",
+            params![
+                completion.completion_id,
+                attempt,
+                next_attempt_at,
+                attempts,
+                now,
+            ],
+        )?;
+        if changed != 1 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO worker_completion_delivery_attempts(
+                attempt_id,completion_id,attempt,started_at,finished_at,outcome,detail
+             ) VALUES(?1,?2,?3,?4,NULL,NULL,NULL)",
+            params![attempt_id, completion.completion_id, attempt, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(WorkerCompletionDelivery {
+            completion,
+            attempt_id,
+            attempt: u64::try_from(attempt).context("negative completion delivery attempt")?,
+        }))
+    }
+
+    pub fn finish_worker_completion_delivery_attempt(
+        &self,
+        completion_id: &str,
+        attempt_id: &str,
+        finished_at: i64,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let outcome = if error.is_some() { "failed" } else { "sent" };
+        let changed = conn.execute(
+            "UPDATE worker_completion_delivery_attempts
+             SET finished_at=?3,outcome=?4,detail=?5
+             WHERE attempt_id=?1 AND completion_id=?2 AND finished_at IS NULL",
+            params![attempt_id, completion_id, finished_at, outcome, error],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn acknowledge_worker_completion(
+        &self,
+        orchestrator_id: &str,
+        completion_id: &str,
+        acknowledged_at: i64,
+    ) -> Result<WorkerCompletionReceipt> {
+        anyhow::ensure!(!orchestrator_id.is_empty(), "orchestrator id is not set");
+        anyhow::ensure!(!completion_id.is_empty(), "completion id is not set");
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let completion = tx
+            .query_row(
+                "SELECT c.completion_id,c.session_id,c.incarnation_id,c.orchestrator_id,
+                        c.summary,c.completed_at,o.acknowledged_at
+                 FROM worker_completions c
+                 JOIN worker_completion_outbox o ON o.completion_id=c.completion_id
+                 WHERE c.completion_id=?1 AND c.orchestrator_id=?2",
+                params![completion_id, orchestrator_id],
+                |row| Ok((worker_completion_row(row)?, row.get::<_, Option<i64>>(6)?)),
+            )
+            .optional()?
+            .with_context(|| format!("completion {completion_id:?} not found"))?;
+        if completion.1.is_some() {
+            tx.commit()?;
+            return Ok(WorkerCompletionReceipt::AlreadyAcknowledged);
+        }
+        let changed = tx.execute(
+            "UPDATE worker_completion_outbox SET acknowledged_at=?2
+             WHERE completion_id=?1 AND acknowledged_at IS NULL",
+            params![completion_id, acknowledged_at],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "completion acknowledgment changed concurrently"
+        );
+        tx.commit()?;
+        Ok(WorkerCompletionReceipt::Delivered(completion.0))
+    }
+
     pub fn worker_finalization(
         &self,
         session_id: &str,
@@ -2077,7 +2404,9 @@ impl Store {
              JOIN worker_incarnations w
                ON w.session_id=r.session_id
               AND w.incarnation_id=r.incarnation_id
-              AND w.state IN ('active','cleanup_claimed','release_claimed','released')
+              AND w.state IN (
+                  'active','retained','cleanup_claimed','release_claimed','released'
+              )
              WHERE r.session_id=?1",
             [session_id],
             |row| {
@@ -2832,16 +3161,34 @@ impl Store {
     ) -> Result<Option<Session>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prior_state = tx
+            .query_row(
+                "SELECT state FROM worker_incarnations
+                 WHERE session_id=?1 AND incarnation_id=?2 AND started_at=?3
+                   AND state IN ('active','retained')
+                   AND NOT EXISTS(
+                       SELECT 1 FROM worker_runtime_claims r
+                       WHERE r.session_id=worker_incarnations.session_id
+                         AND r.incarnation_id=worker_incarnations.incarnation_id
+                   )",
+                params![session_id, incarnation_id, started_at],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(prior_state) = prior_state else {
+            tx.commit()?;
+            return Ok(None);
+        };
         let changed = tx.execute(
             "UPDATE worker_incarnations SET state='retained'
              WHERE session_id=?1 AND incarnation_id=?2 AND started_at=?3
-               AND state='active'
+               AND state=?4
                AND NOT EXISTS(
                    SELECT 1 FROM worker_runtime_claims r
                    WHERE r.session_id=worker_incarnations.session_id
                      AND r.incarnation_id=worker_incarnations.incarnation_id
                )",
-            params![session_id, incarnation_id, started_at],
+            params![session_id, incarnation_id, started_at, prior_state],
         )?;
         if changed != 1 {
             tx.commit()?;
@@ -2850,14 +3197,14 @@ impl Store {
         let status = "done";
         let changed = tx.execute(
             "UPDATE sessions SET status=?4,terminal_at=?5
-             WHERE id=?1 AND started_at=?2 AND pr_number=?3",
+             WHERE id=?1 AND started_at=?2 AND pr_number=?3 AND status<>'done'",
             params![session_id, started_at, pr_number, status, terminal_at],
         )?;
         if changed != 1 {
             tx.execute(
-                "UPDATE worker_incarnations SET state='active'
+                "UPDATE worker_incarnations SET state=?3
                  WHERE session_id=?1 AND incarnation_id=?2 AND state='retained'",
-                params![session_id, incarnation_id],
+                params![session_id, incarnation_id, prior_state],
             )?;
             tx.commit()?;
             return Ok(None);
@@ -3645,6 +3992,21 @@ const WORKER_INCARNATION_COLUMNS: &str =
     "SELECT session_id,incarnation_id,orchestrator_id,started_at,
             source_workspace,workspace_path,lease_id,checkout_backed,state
      FROM worker_incarnations";
+
+const WORKER_COMPLETION_COLUMNS: &str =
+    "SELECT completion_id,session_id,incarnation_id,orchestrator_id,summary,completed_at
+     FROM worker_completions";
+
+fn worker_completion_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerCompletion> {
+    Ok(WorkerCompletion {
+        completion_id: row.get(0)?,
+        session_id: row.get(1)?,
+        incarnation_id: row.get(2)?,
+        orchestrator_id: row.get(3)?,
+        summary: row.get(4)?,
+        completed_at: row.get(5)?,
+    })
+}
 
 type RawWorkerIncarnation = (
     String,
@@ -5767,5 +6129,638 @@ mod tests {
             store.get_session("legacy").unwrap().unwrap().status,
             SessionStatus::Working
         ));
+    }
+
+    fn completion_fixture(store: &Store, session_id: &str) -> WorkerIncarnation {
+        store
+            .upsert_orchestrator(&Orchestrator {
+                id: "orch".into(),
+                name: "orchestrator".into(),
+                created_at: 1,
+            })
+            .unwrap();
+        let mut session = spawning_session(session_id, 10);
+        session.orchestrator_id = Some("orch".into());
+        session.status = SessionStatus::PrOpen;
+        store.upsert_session(&session).unwrap();
+        let worker = store
+            .prepare_worker_incarnation(session_id, Some("orch"), 10, "/repo", false, 3)
+            .unwrap();
+        assert!(store
+            .bind_worker_incarnation(session_id, &worker.incarnation_id, "/repo", "/repo", None,)
+            .unwrap());
+        store
+            .current_worker_incarnation(session_id)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn worker_completion_and_outbox_intent_commit_atomically() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_completion_outbox
+                 BEFORE INSERT ON worker_completion_outbox
+                 BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END;",
+            )
+            .unwrap();
+
+        assert!(store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "canonical summary",
+                100,
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .current_worker_incarnation("worker")
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkerIncarnationState::Active,
+        );
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM worker_completions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0,
+        );
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_completion_outbox")
+            .unwrap();
+        let WorkerCompletionIntent::Completed(completion) = store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "canonical summary",
+                100,
+            )
+            .unwrap()
+        else {
+            panic!("first completion must commit");
+        };
+        assert_eq!(completion.summary, "canonical summary");
+        assert_eq!(
+            store
+                .current_worker_incarnation("worker")
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkerIncarnationState::Retained,
+        );
+        assert!(matches!(
+            store.get_session("worker").unwrap().unwrap().status,
+            SessionStatus::PrOpen,
+        ));
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM worker_completion_outbox
+                     WHERE completion_id=?1 AND acknowledged_at IS NULL",
+                    [&completion.completion_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+        );
+    }
+
+    #[test]
+    fn committed_completion_survives_restart_before_delivery() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("completion.db");
+        let completion = {
+            let store = Store::open(&db).unwrap();
+            let worker = completion_fixture(&store, "worker");
+            let WorkerCompletionIntent::Completed(completion) = store
+                .complete_worker_incarnation(
+                    "worker",
+                    &worker.incarnation_id,
+                    "orch",
+                    "survives restart",
+                    100,
+                )
+                .unwrap()
+            else {
+                panic!("first completion must commit");
+            };
+            completion
+        };
+
+        let reopened = Store::open(&db).unwrap();
+        let delivery = reopened
+            .claim_worker_completion_delivery(101, 30_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.completion, completion);
+        assert_eq!(delivery.attempt, 1);
+    }
+
+    #[test]
+    fn unacknowledged_delivery_retries_after_restart() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("completion.db");
+        let completion_id = {
+            let store = Store::open(&db).unwrap();
+            let worker = completion_fixture(&store, "worker");
+            let WorkerCompletionIntent::Completed(completion) = store
+                .complete_worker_incarnation(
+                    "worker",
+                    &worker.incarnation_id,
+                    "orch",
+                    "retry me",
+                    100,
+                )
+                .unwrap()
+            else {
+                panic!("first completion must commit");
+            };
+            let first = store
+                .claim_worker_completion_delivery(101, 30_000)
+                .unwrap()
+                .unwrap();
+            assert_eq!(first.attempt, 1);
+            completion.completion_id
+        };
+
+        let reopened = Store::open(&db).unwrap();
+        assert!(reopened
+            .claim_worker_completion_delivery(30_100, 30_000)
+            .unwrap()
+            .is_none());
+        let retry = reopened
+            .claim_worker_completion_delivery(30_101, 30_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.completion.completion_id, completion_id);
+        assert_eq!(retry.attempt, 2);
+    }
+
+    #[test]
+    fn delivery_attempt_diagnostics_survive_acknowledgment() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        let WorkerCompletionIntent::Completed(completion) = store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "diagnose delivery",
+                100,
+            )
+            .unwrap()
+        else {
+            panic!("first completion must commit");
+        };
+        let failed = store
+            .claim_worker_completion_delivery(101, 30_000)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .finish_worker_completion_delivery_attempt(
+                &completion.completion_id,
+                &failed.attempt_id,
+                102,
+                Some("orchestrator unavailable"),
+            )
+            .unwrap());
+        let sent = store
+            .claim_worker_completion_delivery(30_101, 30_000)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .finish_worker_completion_delivery_attempt(
+                &completion.completion_id,
+                &sent.attempt_id,
+                30_102,
+                None,
+            )
+            .unwrap());
+        store
+            .acknowledge_worker_completion("orch", &completion.completion_id, 30_103)
+            .unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT attempt,outcome,detail
+                 FROM worker_completion_delivery_attempts
+                 WHERE completion_id=?1 ORDER BY attempt",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([&completion.completion_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    1,
+                    "failed".to_string(),
+                    Some("orchestrator unavailable".to_string()),
+                ),
+                (2, "sent".to_string(), None),
+            ],
+        );
+    }
+
+    #[test]
+    fn deleting_completed_session_stops_outbox_retries() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        let WorkerCompletionIntent::Completed(completion) = store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "remove delivery",
+                100,
+            )
+            .unwrap()
+        else {
+            panic!("first completion must commit");
+        };
+        let attempt = store
+            .claim_worker_completion_delivery(101, 30_000)
+            .unwrap()
+            .unwrap();
+        store
+            .finish_worker_completion_delivery_attempt(
+                &completion.completion_id,
+                &attempt.attempt_id,
+                102,
+                Some("orchestrator unavailable"),
+            )
+            .unwrap();
+
+        store.delete_session("worker").unwrap();
+
+        assert!(store
+            .claim_worker_completion_delivery(1_000_000, 30_000)
+            .unwrap()
+            .is_none());
+        let conn = store.conn.lock().unwrap();
+        for table in [
+            "worker_completions",
+            "worker_completion_outbox",
+            "worker_completion_delivery_attempts",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0,
+                "{table} must not outlive its deleted worker",
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_completion_and_ack_surface_one_canonical_result() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        let WorkerCompletionIntent::Completed(completion) = store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "one result",
+                100,
+            )
+            .unwrap()
+        else {
+            panic!("first completion must commit");
+        };
+        assert!(matches!(
+            store
+                .complete_worker_incarnation(
+                    "worker",
+                    &worker.incarnation_id,
+                    "orch",
+                    "one result",
+                    101,
+                )
+                .unwrap(),
+            WorkerCompletionIntent::AlreadyCompleted(ref same)
+                if same.completion_id == completion.completion_id
+        ));
+        assert!(store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "changed result",
+                102,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts"));
+
+        let WorkerCompletionReceipt::Delivered(delivered) = store
+            .acknowledge_worker_completion("orch", &completion.completion_id, 200)
+            .unwrap()
+        else {
+            panic!("first acknowledgment must surface the result");
+        };
+        assert_eq!(delivered.summary, "one result");
+        assert!(matches!(
+            store
+                .acknowledge_worker_completion("orch", &completion.completion_id, 201)
+                .unwrap(),
+            WorkerCompletionReceipt::AlreadyAcknowledged,
+        ));
+        assert!(store
+            .claim_worker_completion_delivery(1_000_000, 30_000)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn explicitly_completed_worker_still_emits_one_later_merge_transition() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        let mut session = store.get_session("worker").unwrap().unwrap();
+        session.status = SessionStatus::Mergeable;
+        session.pr_number = Some(46);
+        session.pr_id = Some(46);
+        store.upsert_session(&session).unwrap();
+        store
+            .complete_worker_incarnation("worker", &worker.incarnation_id, "orch", "PR ready", 100)
+            .unwrap();
+
+        let merged = store
+            .retain_worker_after_merge("worker", &worker.incarnation_id, worker.started_at, 46, 200)
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(merged.status, SessionStatus::Done));
+        assert_eq!(
+            store
+                .current_worker_incarnation("worker")
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkerIncarnationState::Retained,
+        );
+        assert!(
+            store
+                .retain_worker_after_merge(
+                    "worker",
+                    &worker.incarnation_id,
+                    worker.started_at,
+                    46,
+                    201,
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn merged_worker_can_still_submit_its_canonical_completion() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        let mut session = store.get_session("worker").unwrap().unwrap();
+        session.status = SessionStatus::Mergeable;
+        session.pr_number = Some(46);
+        session.pr_id = Some(46);
+        store.upsert_session(&session).unwrap();
+        store
+            .retain_worker_after_merge("worker", &worker.incarnation_id, worker.started_at, 46, 100)
+            .unwrap()
+            .unwrap();
+
+        let WorkerCompletionIntent::Completed(completion) = store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "merged canonical summary",
+                101,
+            )
+            .unwrap()
+        else {
+            panic!("merged worker must still record its explicit completion");
+        };
+
+        assert_eq!(completion.summary, "merged canonical summary");
+        assert_eq!(
+            store
+                .claim_worker_completion_delivery(102, 30_000)
+                .unwrap()
+                .unwrap()
+                .completion,
+            completion,
+        );
+    }
+
+    #[test]
+    fn merged_legacy_worker_keeps_its_exact_runtime_capability() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO legacy_worker_runtimes(
+                    session_id,incarnation_id,physical_tmux_name,pane_id,pane_pid
+                 ) VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    "worker",
+                    worker.incarnation_id,
+                    "ninox-worker-worker-legacy",
+                    "%legacy",
+                    42,
+                ],
+            )
+            .unwrap();
+        let mut session = store.get_session("worker").unwrap().unwrap();
+        session.status = SessionStatus::Mergeable;
+        session.pr_number = Some(46);
+        session.pr_id = Some(46);
+        store.upsert_session(&session).unwrap();
+        store
+            .retain_worker_after_merge("worker", &worker.incarnation_id, worker.started_at, 46, 100)
+            .unwrap()
+            .unwrap();
+
+        let runtime = store.legacy_worker_runtime("worker").unwrap().unwrap();
+        assert_eq!(runtime.incarnation_id, worker.incarnation_id);
+        assert_eq!(runtime.physical_tmux_name, "ninox-worker-worker-legacy");
+    }
+
+    #[test]
+    fn stale_refiled_incarnation_and_wrong_owner_fail_closed() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        let WorkerCompletionIntent::Completed(completion) = store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "old incarnation",
+                100,
+            )
+            .unwrap()
+        else {
+            panic!("first completion must commit");
+        };
+        let successor = store
+            .prepare_worker_incarnation("worker", Some("orch"), 20, "/repo", false, 3)
+            .unwrap();
+
+        assert!(store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "old incarnation",
+                101,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("stale"));
+        assert!(store
+            .complete_worker_incarnation(
+                "worker",
+                &successor.incarnation_id,
+                "other",
+                "wrong owner",
+                102,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("owner"));
+        assert!(store
+            .acknowledge_worker_completion("other", &completion.completion_id, 200)
+            .unwrap_err()
+            .to_string()
+            .contains("not found"));
+    }
+
+    #[test]
+    fn concurrent_acknowledgments_return_the_summary_once() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("completion.db");
+        let store = Store::open(&db).unwrap();
+        let worker = completion_fixture(&store, "worker");
+        let WorkerCompletionIntent::Completed(completion) = store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "exactly once",
+                100,
+            )
+            .unwrap()
+        else {
+            panic!("first completion must commit");
+        };
+        drop(store);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut threads = Vec::new();
+        for now in [200, 201] {
+            let db = db.clone();
+            let completion_id = completion.completion_id.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                let store = Store::open(db).unwrap();
+                barrier.wait();
+                store
+                    .acknowledge_worker_completion("orch", &completion_id, now)
+                    .unwrap()
+            }));
+        }
+        let receipts = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| matches!(receipt, WorkerCompletionReceipt::Delivered(_)))
+                .count(),
+            1,
+        );
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| {
+                    matches!(receipt, WorkerCompletionReceipt::AlreadyAcknowledged)
+                })
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn production_schema_migrates_completion_outbox_without_losing_workers() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("production.db");
+        production_legacy_worker_fixture(&db, false);
+
+        let store = Store::open(&db).unwrap();
+
+        for table in [
+            "worker_completions",
+            "worker_completion_outbox",
+            "worker_completion_delivery_attempts",
+        ] {
+            assert_eq!(
+                store
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master
+                         WHERE type='table' AND name=?1",
+                        [table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "{table} must be added to the production schema",
+            );
+        }
+        assert_eq!(
+            store
+                .current_worker_incarnation("live-pooled")
+                .unwrap()
+                .unwrap()
+                .incarnation_id,
+            "inc-live",
+        );
     }
 }

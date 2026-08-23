@@ -125,6 +125,35 @@ pub enum WorkerFinalizationIntent {
     AlreadyFinalized(WorkerIncarnation),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerCompletion {
+    pub completion_id: String,
+    pub session_id: String,
+    pub incarnation_id: String,
+    pub orchestrator_id: String,
+    pub summary: String,
+    pub completed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerCompletionIntent {
+    Completed(WorkerCompletion),
+    AlreadyCompleted(WorkerCompletion),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerCompletionDelivery {
+    pub completion: WorkerCompletion,
+    pub attempt_id: String,
+    pub attempt: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerCompletionReceipt {
+    Delivered(WorkerCompletion),
+    AlreadyAcknowledged,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {

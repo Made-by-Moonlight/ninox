@@ -84,6 +84,16 @@ enum Command {
         /// Description of the additional work
         description: String,
     },
+    /// Complete this exact worker incarnation with its canonical final summary.
+    Complete {
+        /// Canonical final handoff delivered durably to the owning orchestrator.
+        summary: String,
+    },
+    /// Atomically receive and acknowledge one durable worker completion.
+    ReceiveCompletion {
+        /// Completion ID from Ninox's delivery nudge.
+        completion_id: String,
+    },
     /// Knowledge base operations
     Brain {
         #[command(subcommand)]
@@ -264,6 +274,27 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if matches!(
+        command,
+        Some(Command::Complete { .. } | Command::ReceiveCompletion { .. })
+    ) {
+        let db_path = args.db.unwrap_or_else(default_db_path);
+        if let Some(parent) = db_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let store = Arc::new(Store::open(db_path)?);
+        return match command.expect("completion command matched above") {
+            Command::Complete { summary } => run_complete(store, &summary).await,
+            Command::ReceiveCompletion { completion_id } => {
+                run_receive_completion(store, &completion_id).await
+            }
+            _ => unreachable!("completion commands were matched above"),
+        };
+    }
+
     if let Some(Command::Workers { action }) = command {
         let db_path = args.db.unwrap_or_else(default_db_path);
         std::process::exit(run_workers_cli(action, db_path).await);
@@ -310,6 +341,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::RequestWork { description }) => {
             run_request_work(&description)
         }
+        Some(Command::Complete { .. } | Command::ReceiveCompletion { .. }) => {
+            unreachable!("completion commands short-circuit and return earlier in main()")
+        }
         Some(Command::Brain { action }) => {
             run_brain(action, store).await
         }
@@ -329,6 +363,80 @@ async fn main() -> anyhow::Result<()> {
         }
         None => run_tui(store, args.port, args.headless).await,
     }
+}
+
+async fn run_complete(store: Arc<Store>, summary: &str) -> anyhow::Result<()> {
+    let session_id = std::env::var("NINOX_SESSION").ok();
+    let incarnation_id = std::env::var("NINOX_WORKER_INCARNATION").ok();
+    let orchestrator_id = std::env::var("NINOX_ORCHESTRATOR_ID").ok();
+    let execution_role = std::env::var(spawn_util::EXECUTION_ROLE_ENV).ok();
+    let caller_type = std::env::var("NINOX_CALLER_TYPE").ok();
+    let runtime = tmux::current_private_pane_identity().await?;
+    let legacy_runtime = session_id
+        .as_deref()
+        .map(|session_id| store.legacy_worker_runtime(session_id))
+        .transpose()?
+        .flatten();
+    let runtime_incarnation = match (runtime.as_ref(), legacy_runtime.as_ref()) {
+        (Some(runtime), None) => {
+            tmux::private_session_env(&runtime.physical_tmux_name, "NINOX_WORKER_INCARNATION")
+                .await?
+        }
+        _ => None,
+    };
+    let worker = workers::authorize_worker_completion(
+        &store,
+        session_id.as_deref(),
+        incarnation_id.as_deref(),
+        orchestrator_id.as_deref(),
+        (execution_role.as_deref(), caller_type.as_deref()),
+        runtime.as_ref(),
+        runtime_incarnation.as_deref(),
+    )?;
+    let orchestrator_id = worker
+        .orchestrator_id
+        .as_deref()
+        .context("worker has no owning orchestrator")?;
+    let result = store.complete_worker_incarnation(
+        &worker.session_id,
+        &worker.incarnation_id,
+        orchestrator_id,
+        summary,
+        ninox_core::lifecycle::poller::now_millis(),
+    )?;
+    let completion = match result {
+        ninox_core::types::WorkerCompletionIntent::Completed(completion)
+        | ninox_core::types::WorkerCompletionIntent::AlreadyCompleted(completion) => completion,
+    };
+    println!(
+        "completion {} durably queued for {}",
+        completion.completion_id, completion.orchestrator_id
+    );
+    Ok(())
+}
+
+async fn run_receive_completion(store: Arc<Store>, completion_id: &str) -> anyhow::Result<()> {
+    let runtime = tmux::current_private_pane_identity().await?;
+    let orchestrator_id = workers::authorize_orchestrator(
+        &store,
+        std::env::var("NINOX_ORCHESTRATOR_ID").ok().as_deref(),
+        std::env::var(spawn_util::EXECUTION_ROLE_ENV).ok().as_deref(),
+        std::env::var("NINOX_CALLER_TYPE").ok().as_deref(),
+        runtime.as_ref(),
+    )?;
+    match store.acknowledge_worker_completion(
+        &orchestrator_id,
+        completion_id,
+        ninox_core::lifecycle::poller::now_millis(),
+    )? {
+        ninox_core::types::WorkerCompletionReceipt::Delivered(completion) => {
+            println!("{}", completion.summary);
+        }
+        ninox_core::types::WorkerCompletionReceipt::AlreadyAcknowledged => {
+            println!("completion already acknowledged; canonical summary not repeated");
+        }
+    }
+    Ok(())
 }
 
 const WORKERS_CLI_SCHEMA_VERSION: u32 = 1;
@@ -403,6 +511,7 @@ async fn run_workers_cli(action: WorkersAction, db_path: PathBuf) -> i32 {
     let orchestrator_id = match workers::authorize_orchestrator(
         &store,
         std::env::var("NINOX_ORCHESTRATOR_ID").ok().as_deref(),
+        std::env::var(spawn_util::EXECUTION_ROLE_ENV).ok().as_deref(),
         std::env::var("NINOX_CALLER_TYPE").ok().as_deref(),
         runtime.as_ref(),
     ) {
@@ -1029,11 +1138,15 @@ fn worker_context_footer(
                     .to_string()
             } else {
                 format!(
-                    "Report back with a blocker-or-completion handoff:\n\
+                    "Report a blocker with:\n\
                      ```bash\n\
-                     ninox send {orch_id} \"<blocked and needs a decision, or complete with artifacts/direct changes and validation>\"\n\
+                     ninox send {orch_id} \"<blocked and needs a decision>\"\n\
                      ```\n\
-                     Stop after reporting that you are blocked or the direct delivery is complete."
+                     When complete, durably hand off the canonical final summary with:\n\
+                     ```bash\n\
+                     ninox complete \"<artifacts/direct changes and validation>\"\n\
+                     ```\n\
+                     Stop after reporting a blocker or completing the direct delivery."
                 )
             },
         ),
@@ -1058,8 +1171,12 @@ fn pr_worker_context_footer(id: &str, orch_id: &str) -> String {
          ```bash\n\
          ninox send {orch_id} \"<your message>\"\n\
          ```\n\
-         Report back when: (a) you are blocked and need a decision, \
-         or (b) the PR is open and the task is done.",
+         When the PR is open and the task is done, durably hand off the canonical \
+         final summary with:\n\
+         ```bash\n\
+         ninox complete \"<root cause/design, commit, PR URL, and validation>\"\n\
+         ```\n\
+         Use `ninox send` for blockers or progress, not successful completion.",
     )
 }
 
@@ -2099,6 +2216,22 @@ mod worker_env_tests {
     }
 
     #[test]
+    fn completion_cli_parses_worker_and_orchestrator_protocol_commands() {
+        let complete = Args::try_parse_from(["ninox", "complete", "canonical summary"]).unwrap();
+        assert!(matches!(
+            complete.command,
+            Some(Command::Complete { summary }) if summary == "canonical summary"
+        ));
+        let receive =
+            Args::try_parse_from(["ninox", "receive-completion", "completion-id"]).unwrap();
+        assert!(matches!(
+            receive.command,
+            Some(Command::ReceiveCompletion { completion_id })
+                if completion_id == "completion-id"
+        ));
+    }
+
+    #[test]
     fn omitted_delivery_defaults_by_git_workspace_and_explicit_choice_wins() {
         let repo = init_git_repo();
         let plain = tempfile::tempdir().unwrap();
@@ -2194,6 +2327,10 @@ mod worker_env_tests {
         let footer = worker_context_footer("w1", "orch1", WorkerDelivery::Pr);
         assert!(footer.contains("`w1`"), "must name the worker's own session");
         assert!(footer.contains("ninox send orch1"), "must keep the message-back channel");
+        assert!(
+            footer.contains("ninox complete"),
+            "must use the durable completion handshake"
+        );
         assert!(footer.contains("ninox request-work"), "must offer the work-request channel");
         assert!(
             footer.to_lowercase().contains("do not"),
@@ -2218,6 +2355,7 @@ mod worker_env_tests {
         let footer = worker_context_footer("w1", "orch1", WorkerDelivery::Direct);
         assert!(footer.contains("validated artifacts or direct changes"));
         assert!(footer.contains("blocked") && footer.contains("complete"));
+        assert!(footer.contains("ninox complete"));
         assert!(!footer.contains("complete the task and open a pull request"));
         assert!(!footer.contains("one worker, one task, one pull request"));
         assert!(!footer.contains("ninox open --pr"));
