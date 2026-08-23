@@ -37,3 +37,33 @@ erase and cursor-only reads cause zero commits; the final content frame causes
 one. Incomplete frames recover after tmux's one-second synchronization bound as
 one synthetic atomic close, while ordinary unframed echo/log output commits
 without that recovery delay.
+
+## Follow-up live capture
+
+Captured from the installed and running `6caa0e5e692e02f63b87b6c52f4c17a77a7c5db0`
+bundle. Its executable SHA-256 was
+`f0bee8d0444f5de930c736833d05ed356941986f5c9bbbe787eec369dc069fd2`.
+The attached `xterm-256color` client reported `sync` in its effective features,
+and the managed config contained `xterm*:RGB:usstyle:extkeys:hyperlinks:sync`.
+
+An already hydrated Cursor terminal showed a different steady-state boundary
+than the earlier split-frame capture:
+
+- Pane-side output contained no DEC 2026 markers.
+- One bottom-region repaint arrived as 1.5–1.8 KiB over two PTY reads within
+  0.6 ms. The 3 ms quiet / 8 ms hard-cap coalescer correctly made it one event.
+- The event contained 7–10 erase-line commands plus the complete replacement
+  text, so alacritty advanced to one final grid and Ninox invalidated the iced
+  canvas once.
+- 10–190 ms later, tmux repeatedly emitted a separate exact 16-byte
+  `\x1b[?2026h\x1b[?2026l` frame with no payload.
+- `TerminalOutputFramer` forwarded that empty frame. Alacritty made no visible
+  grid mutation, but `commit_output` still cleared the whole canvas cache and
+  scheduled a second identical draw.
+
+No cursor visibility sequences occurred in these events, and ScreenCaptureKit
+sampling found no independent blank compositor frame. The remaining redundant
+paint therefore began at Ninox's no-op frame handling, after tmux framing and
+PTY/event batching but before iced cache invalidation. The deterministic
+regression replays the observed two-event topology and requires one renderer
+commit, not two.

@@ -147,6 +147,7 @@ impl alacritty_terminal::event::EventListener for EventProxy {
 
 const SYNC_START: &[u8] = b"\x1b[?2026h";
 const SYNC_END: &[u8] = b"\x1b[?2026l";
+const EMPTY_SYNC_FRAME: &[u8] = b"\x1b[?2026h\x1b[?2026l";
 
 #[derive(Debug, Default)]
 struct TerminalOutputFramer {
@@ -231,6 +232,12 @@ impl TerminalOutputFramer {
     }
 
     fn finish_frame(&mut self, frame: Vec<u8>, ready: &mut Vec<u8>) {
+        // tmux can emit an empty outer transaction after an unframed pane
+        // repaint. It carries no terminal state, so advancing alacritty would
+        // only invalidate and redraw an unchanged iced canvas.
+        if frame == EMPTY_SYNC_FRAME {
+            return;
+        }
         let has_text = contains_terminal_text(&frame);
         if !self.deferred.is_empty() {
             self.deferred.extend_from_slice(&frame);
@@ -2362,6 +2369,25 @@ mod tests {
             .map(|column| state.term.grid()[Line(0)][Column(column)].c)
             .collect();
         assert_eq!(row.trim_end(), "second");
+    }
+
+    #[test]
+    fn trailing_empty_tmux_sync_frame_does_not_reinvalidate_live_repaint() {
+        let mut state = TerminalState::new(40, 4, None);
+        state.process(b"stable");
+        let before = state.output_commit_count();
+
+        // Live tmux 3.7b output: Cursor's complete structural repaint arrives
+        // unframed, then a separate balanced frame with no payload follows.
+        let repaint = state.process(
+            b"\x1b[2A\x1b[KRunning\r\n\x1b[Kstatus\r\n\x1b[Kprompt",
+        );
+        assert!(repaint.committed);
+        assert_eq!(state.output_commit_count(), before + 1);
+
+        let empty_frame = state.process(b"\x1b[?2026h\x1b[?2026l");
+        assert!(!empty_frame.committed);
+        assert_eq!(state.output_commit_count(), before + 1);
     }
 
     #[test]
