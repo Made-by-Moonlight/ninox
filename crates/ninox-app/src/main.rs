@@ -236,6 +236,17 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let command = args.command;
 
+    // `spawn` must reject worker callers before the shared CLI startup below:
+    // that path writes tmux config and wrappers, creates the DB parent, and
+    // opens the store. Role is stamped by Ninox when the runtime launches;
+    // `NINOX_CALLER_TYPE` keeps sessions launched by older Ninox versions safe.
+    if matches!(command, Some(Command::Spawn { .. })) {
+        reject_recursive_worker_spawn(
+            std::env::var(spawn_util::EXECUTION_ROLE_ENV).ok().as_deref(),
+            std::env::var("NINOX_CALLER_TYPE").ok().as_deref(),
+        )?;
+    }
+
     // Fires on every assistant turn (event-driven) or every `refreshInterval`
     // seconds for every session Ninox spawns — must stay fast and never
     // trigger the tmux-config/wrapper-hook/self-shim setup below, none of
@@ -502,7 +513,10 @@ async fn run_spawn(
     name: Option<String>,
     orchestrator_id: Option<String>,
 ) -> anyhow::Result<()> {
-    reject_recursive_worker_spawn(std::env::var("NINOX_CALLER_TYPE").ok().as_deref())?;
+    reject_recursive_worker_spawn(
+        std::env::var(spawn_util::EXECUTION_ROLE_ENV).ok().as_deref(),
+        std::env::var("NINOX_CALLER_TYPE").ok().as_deref(),
+    )?;
     let agent = config.worker.clone();
     // Refuse worker-incapable harnesses BEFORE any side effect (worktree
     // creation, session upsert) — bailing after the upsert would leave a
@@ -839,12 +853,23 @@ async fn rollback_worker_incarnation(
         .await
 }
 
-fn reject_recursive_worker_spawn(caller_type: Option<&str>) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        caller_type != Some("worker"),
-        "worker sessions cannot recursively spawn workers; return the request to the orchestrator"
-    );
-    Ok(())
+fn reject_recursive_worker_spawn(
+    execution_role: Option<&str>,
+    legacy_caller_type: Option<&str>,
+) -> anyhow::Result<()> {
+    // Deliberate worker fan-out stays default-denied until Ninox can issue a
+    // parent-authorized, non-inheriting capability and durably record the
+    // parent worker lineage. An ambient opt-out would recreate this bug.
+    match execution_role.or(legacy_caller_type) {
+        Some(spawn_util::WORKER_EXECUTION_ROLE) => anyhow::bail!(
+            "worker sessions cannot spawn workers; ask the orchestrator to delegate this task"
+        ),
+        Some(spawn_util::ORCHESTRATOR_EXECUTION_ROLE) | None => Ok(()),
+        Some(role) => anyhow::bail!(
+            "unrecognized {}={role:?}; refusing to spawn a worker",
+            spawn_util::EXECUTION_ROLE_ENV,
+        ),
+    }
 }
 
 fn release_candidate_guidance(
@@ -1053,6 +1078,7 @@ fn worker_env_vars<'a>(
     let mut env_vec: Vec<(&str, &str)> = vec![
         ("NINOX_SESSION", id),
         ("NINOX_WORKER_INCARNATION", incarnation_id),
+        (spawn_util::EXECUTION_ROLE_ENV, spawn_util::WORKER_EXECUTION_ROLE),
         ("NINOX_CALLER_TYPE", "worker"),
         ("NINOX_DATA_DIR", sessions_dir),
     ];
@@ -1316,6 +1342,7 @@ async fn release_retained_worker_checkout(
     .await
     .context("worker release task panicked")?
 }
+
 /// `ninox request-work` — record a work request in this worker's session
 /// metadata. The engine's poller notices it within one tick, notifies the
 /// UI, and forwards it to the orchestrator's terminal.
@@ -2302,6 +2329,10 @@ mod worker_env_tests {
         assert!(env.contains(&("NINOX_CONFIG", "/cfg.toml")));
         assert!(env.contains(&("NINOX_SESSION", "w1")));
         assert!(env.contains(&("NINOX_WORKER_INCARNATION", "incarnation")));
+        assert!(env.contains(&(
+            crate::spawn_util::EXECUTION_ROLE_ENV,
+            crate::spawn_util::WORKER_EXECUTION_ROLE,
+        )));
         assert!(env.contains(&("NINOX_CALLER_TYPE", "worker")));
         assert!(env.contains(&("NINOX_DATA_DIR", "/data")));
         // The legacy ATHENE_* transition names are gone.
@@ -2318,9 +2349,12 @@ mod worker_env_tests {
 
     #[test]
     fn recursive_worker_spawn_is_rejected_before_allocation() {
-        assert!(reject_recursive_worker_spawn(Some("worker")).is_err());
-        assert!(reject_recursive_worker_spawn(Some("orchestrator")).is_ok());
-        assert!(reject_recursive_worker_spawn(None).is_ok());
+        assert!(reject_recursive_worker_spawn(Some("worker"), Some("orchestrator")).is_err());
+        assert!(reject_recursive_worker_spawn(None, Some("worker")).is_err());
+        assert!(reject_recursive_worker_spawn(Some("orchestrator"), Some("worker")).is_ok());
+        assert!(reject_recursive_worker_spawn(None, Some("orchestrator")).is_ok());
+        assert!(reject_recursive_worker_spawn(None, None).is_ok());
+        assert!(reject_recursive_worker_spawn(Some("invalid"), None).is_err());
     }
 }
 

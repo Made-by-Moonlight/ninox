@@ -739,11 +739,18 @@ pub fn refile_plan(
         .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
     let extra_env = if is_orchestrator {
         vec![
+            (
+                crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+                crate::spawn_util::ORCHESTRATOR_EXECUTION_ROLE.to_string(),
+            ),
             ("NINOX_ORCHESTRATOR_ID".to_string(), session.id.clone()),
             ("NINOX_CALLER_TYPE".to_string(),     "orchestrator".to_string()),
         ]
     } else {
-        Vec::new()
+        vec![(
+            crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+            crate::spawn_util::WORKER_EXECUTION_ROLE.to_string(),
+        )]
     };
     Some(RefilePlan { agent, base_cmd, workspace, catalogue_path, extra_env })
 }
@@ -769,11 +776,18 @@ pub fn resume_plan(
         .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
     let extra_env = if is_orchestrator {
         vec![
+            (
+                crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+                crate::spawn_util::ORCHESTRATOR_EXECUTION_ROLE.to_string(),
+            ),
             ("NINOX_ORCHESTRATOR_ID".to_string(), session.id.clone()),
             ("NINOX_CALLER_TYPE".to_string(),     "orchestrator".to_string()),
         ]
     } else {
-        Vec::new()
+        vec![(
+            crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+            crate::spawn_util::WORKER_EXECUTION_ROLE.to_string(),
+        )]
     };
     Some(RefilePlan { agent, base_cmd, workspace, catalogue_path, extra_env })
 }
@@ -1894,8 +1908,8 @@ impl App {
                             let repo = crate::spawn_util::repo_from_workspace(&workspace)
                                 .unwrap_or_default();
 
-                            // No NINOX_ORCHESTRATOR_ID and no caller-type vars:
-                            // this session is unattached and reports to no one.
+                            // No NINOX_ORCHESTRATOR_ID: this worker is unattached
+                            // and reports to no one, but still carries its role.
                             let attach_sid = sid.clone();
                             let attach = crate::spawn_util::spawn_interactive_session(
                                 engine.clone(),
@@ -1908,10 +1922,16 @@ impl App {
                                     agent,
                                     base_cmd,
                                     catalogue_path,
-                                    extra_env: vec![(
-                                        "NINOX_WORKER_INCARNATION".to_string(),
-                                        incarnation.incarnation_id.clone(),
-                                    )],
+                                    extra_env: vec![
+                                        (
+                                            crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+                                            crate::spawn_util::WORKER_EXECUTION_ROLE.to_string(),
+                                        ),
+                                        (
+                                            "NINOX_WORKER_INCARNATION".to_string(),
+                                            incarnation.incarnation_id.clone(),
+                                        ),
+                                    ],
                                     started_at: ts_i64,
                                     claude_session_id,
                                     failure_status:  ninox_core::SessionStatus::Terminated,
@@ -2051,10 +2071,14 @@ impl App {
                                 tracing::error!("mkdir orchestrator workspace {ws}: {e}");
                             }
 
-                            // Orchestrator sessions get the caller-type vars and
-                            // their own id so spawned workers can report back.
+                            // Orchestrator sessions get an explicit execution role
+                            // and their own id so spawned workers can report back.
                             let extra_env = vec![
                                 ("NINOX_ORCHESTRATOR_ID".to_string(), sid.clone()),
+                                (
+                                    crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+                                    crate::spawn_util::ORCHESTRATOR_EXECUTION_ROLE.to_string(),
+                                ),
                                 ("NINOX_CALLER_TYPE".to_string(),     "orchestrator".to_string()),
                             ];
 
@@ -4363,7 +4387,10 @@ mod tests {
         assert_eq!(plan.base_cmd, "claude-nightly --model 'claude-opus-4-8'");
         assert_eq!(plan.workspace, "/tmp/ws");
         assert_eq!(plan.catalogue_path, "/brains/b");
-        assert!(plan.extra_env.is_empty());
+        assert!(plan.extra_env.iter().any(|(key, value)| {
+            key == crate::spawn_util::EXECUTION_ROLE_ENV
+                && value == crate::spawn_util::WORKER_EXECUTION_ROLE
+        }));
         assert_eq!(plan.agent.harness, "claude-code");
         assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
     }
@@ -4375,6 +4402,10 @@ mod tests {
         session.catalogue_path = None;
         let plan = refile_plan(&session, true, &cfg, "fresh-uuid").expect("plan");
         assert!(plan.extra_env.iter().any(|(k, v)| k == "NINOX_ORCHESTRATOR_ID" && v == "o1"));
+        assert!(plan.extra_env.iter().any(|(key, value)| {
+            key == crate::spawn_util::EXECUTION_ROLE_ENV
+                && value == crate::spawn_util::ORCHESTRATOR_EXECUTION_ROLE
+        }));
         assert!(plan.extra_env.iter().any(|(k, _)| k == "NINOX_CALLER_TYPE"));
         // The legacy ATHENE_/AO_ transition names are gone.
         assert!(!plan.extra_env.iter().any(|(k, _)| k == "ATHENE_CALLER_TYPE" || k == "AO_CALLER_TYPE"));
@@ -4468,6 +4499,10 @@ mod tests {
         assert!(plan.base_cmd.contains("--resume"));
         assert!(plan.base_cmd.contains("stored-uuid"));
         assert_eq!(plan.workspace, "/tmp/ws");
+        assert!(plan.extra_env.iter().any(|(key, value)| {
+            key == crate::spawn_util::EXECUTION_ROLE_ENV
+                && value == crate::spawn_util::WORKER_EXECUTION_ROLE
+        }));
     }
 
     #[test]

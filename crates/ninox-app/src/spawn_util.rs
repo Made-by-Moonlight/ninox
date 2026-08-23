@@ -11,6 +11,10 @@ use ninox_core::{
     SessionFields, SessionStatus, Store,
 };
 
+pub const EXECUTION_ROLE_ENV: &str = "NINOX_EXECUTION_ROLE";
+pub const WORKER_EXECUTION_ROLE: &str = "worker";
+pub const ORCHESTRATOR_EXECUTION_ROLE: &str = "orchestrator";
+
 /// The per-kind differences between the spawn-modal launch paths
 /// (standalone vs orchestrator). Everything else — env resolution,
 /// PATH-prepend launch command, tmux session creation, pid lookup,
@@ -71,10 +75,19 @@ pub async fn spawn_interactive_session(
     p: InteractiveSpawnParams,
 ) -> Option<Vec<String>> {
     let sid = p.session_id;
-    let is_orchestrator = p
+    let execution_role = p
         .extra_env
         .iter()
-        .any(|(key, value)| key == "NINOX_CALLER_TYPE" && value == "orchestrator");
+        .find(|(key, _)| key == EXECUTION_ROLE_ENV)
+        .map(|(_, value)| value.as_str());
+    let is_orchestrator = execution_role.map_or_else(
+        || {
+            p.extra_env
+                .iter()
+                .any(|(key, value)| key == "NINOX_CALLER_TYPE" && value == "orchestrator")
+        },
+        |role| role == ORCHESTRATOR_EXECUTION_ROLE,
+    );
 
     let ninox_bin = std::env::current_exe()
         .ok()
