@@ -230,6 +230,7 @@ pub enum DragTarget { Sidebar, InfoPanel }
 #[derive(Debug, Clone)]
 pub enum Message {
     EngineEvent(Box<Event>),
+    EngineEvents(Vec<Event>),
     NavigateFleet { scope: Option<OrchestratorId> },
     NavigateSession(SessionId),
     /// Attach argv resolved — spawn the hidden tmux client for this session.
@@ -930,6 +931,11 @@ impl App {
     fn apply(state: &mut Self, message: Message) -> Task<Message> {
         match message {
             Message::EngineEvent(event) => Self::handle_engine_event(state, *event),
+            Message::EngineEvents(events) => Task::batch(
+                events
+                    .into_iter()
+                    .map(|event| Self::handle_engine_event(state, event)),
+            ),
 
             Message::NavigateFleet { scope } => {
                 state.last_fleet_scope = scope.clone();
@@ -2717,12 +2723,8 @@ impl App {
     }
 }
 
-/// Pull one `Event` off `rx`, merging adjacent `ClientOutput` chunks for the
-/// same client generation into it.
-/// `pending` carries a lookahead event across calls: an event that turns out
-/// not to match can't be put back on the channel, so it's stashed here and
-/// returned as-is on the following call instead of being dropped or
-/// clobbering the event already in hand.
+/// Pull an ordered event batch off `rx`, merging adjacent `ClientOutput`
+/// chunks for the same client generation.
 ///
 /// The PTY reader thread (`AttachedClient::spawn`) emits one `ClientOutput`
 /// per raw `read()`, capped at 8KB — a single full-screen repaint (a tmux
@@ -2733,32 +2735,55 @@ impl App {
 /// of settling directly on the final one. A short quiet interval catches
 /// repaint fragments split across adjacent event-loop ticks, while a hard
 /// total interval keeps continuous output from starving rendering or input.
-/// Chunks from a different session or generation are never merged together,
-/// matching the same stale-vs-current-client distinction `ClientOutput`'s
-/// handler already relies on elsewhere.
-async fn next_coalesced_event(
+/// Engine events can land between adjacent PTY reads. Keep those events in
+/// order inside one iced message so they cannot split a repaint across two
+/// presented frames. Chunks from a different session or generation remain
+/// distinct, matching the stale-vs-current-client distinction in the handler.
+async fn next_coalesced_events(
     rx: &mut broadcast::Receiver<Event>,
-    pending: &mut Option<Event>,
-) -> Option<Event> {
-    let event = if let Some(event) = pending.take() {
-        event
-    } else {
-        loop {
-            match rx.recv().await {
-                Ok(event) => break event,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return None,
-            }
+) -> Option<Vec<Event>> {
+    let event = loop {
+        match rx.recv().await {
+            Ok(event) => break event,
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return None,
         }
     };
 
-    // Extend `bytes` in place rather than re-cloning the merged-so-far
-    // buffer on every iteration — a bursty repaint can queue dozens of
-    // chunks, and cloning each time would copy O(chunks²) bytes instead
-    // of O(total bytes).
-    let Event::ClientOutput { session_id, generation, mut bytes } = event else {
-        return Some(event);
-    };
+    if !matches!(event, Event::ClientOutput { .. }) {
+        return Some(vec![event]);
+    }
+
+    fn push_ordered(events: &mut Vec<Event>, event: Event) {
+        match event {
+            Event::ClientOutput {
+                session_id: next_session,
+                generation: next_generation,
+                bytes: next_bytes,
+            } => {
+                if let Some(Event::ClientOutput {
+                    session_id,
+                    generation,
+                    bytes,
+                }) = events.last_mut()
+                {
+                    if *session_id == next_session && *generation == next_generation {
+                        bytes.extend(next_bytes);
+                        return;
+                    }
+                }
+
+                events.push(Event::ClientOutput {
+                    session_id: next_session,
+                    generation: next_generation,
+                    bytes: next_bytes,
+                });
+            }
+            other => events.push(other),
+        }
+    }
+
+    let mut events = vec![event];
     let started = tokio::time::Instant::now();
     let hard_deadline = started + CLIENT_OUTPUT_MAX_COALESCE_INTERVAL;
     let mut quiet_deadline = started + CLIENT_OUTPUT_QUIET_INTERVAL;
@@ -2770,16 +2795,13 @@ async fn next_coalesced_event(
 
         let deadline = quiet_deadline.min(hard_deadline);
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Ok(Event::ClientOutput { session_id: sid2, generation: gen2, bytes: more }))
-                if sid2 == session_id && gen2 == generation =>
-            {
-                bytes.extend(more);
-                quiet_deadline =
-                    tokio::time::Instant::now() + CLIENT_OUTPUT_QUIET_INTERVAL;
-            }
-            Ok(Ok(other)) => {
-                *pending = Some(other);
-                break;
+            Ok(Ok(event)) => {
+                let extends_output_burst = matches!(event, Event::ClientOutput { .. });
+                push_ordered(&mut events, event);
+                if extends_output_burst {
+                    quiet_deadline =
+                        tokio::time::Instant::now() + CLIENT_OUTPUT_QUIET_INTERVAL;
+                }
             }
             Ok(Err(
                 broadcast::error::RecvError::Lagged(_) | broadcast::error::RecvError::Closed,
@@ -2788,19 +2810,22 @@ async fn next_coalesced_event(
         }
     }
 
-    Some(Event::ClientOutput { session_id, generation, bytes })
+    Some(events)
 }
 
 impl App {
-    /// Subscription that drives `Message::EngineEvent` from the engine broadcast channel.
+    /// Subscription that drives engine event batches into one iced update.
     pub fn subscription(state: &Self) -> Subscription<Message> {
         let mut rx: broadcast::Receiver<Event> = state.engine.subscribe();
-        let mut pending: Option<Event> = None;
         let engine_sub = Subscription::run_with_id(
             "engine-events",
             async_stream::stream! {
-                while let Some(event) = next_coalesced_event(&mut rx, &mut pending).await {
-                    yield Message::EngineEvent(Box::new(event));
+                while let Some(mut events) = next_coalesced_events(&mut rx).await {
+                    if events.len() == 1 {
+                        yield Message::EngineEvent(Box::new(events.pop().unwrap()));
+                    } else {
+                        yield Message::EngineEvents(events);
+                    }
                 }
             },
         );
@@ -3204,36 +3229,34 @@ mod tests {
     #[tokio::test]
     async fn coalesces_buffered_client_output_for_the_same_generation() {
         // Send three chunks before ever polling — all three are already
-        // sitting in the channel by the time `next_coalesced_event` looks,
+        // sitting in the channel by the time `next_coalesced_events` looks,
         // so one call must return them merged into a single event rather
         // than requiring three separate (and three separately rendered)
         // frames.
         let (tx, mut rx) = broadcast::channel(16);
-        let mut pending = None;
         tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"foo".to_vec() }).unwrap();
         tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"bar".to_vec() }).unwrap();
         tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"baz".to_vec() }).unwrap();
 
-        match next_coalesced_event(&mut rx, &mut pending).await {
-            Some(Event::ClientOutput { bytes, .. }) => assert_eq!(bytes, b"foobarbaz".to_vec()),
+        match next_coalesced_events(&mut rx).await.as_deref() {
+            Some([Event::ClientOutput { bytes, .. }]) => assert_eq!(bytes, b"foobarbaz"),
             other => panic!("expected merged ClientOutput, got {other:?}"),
         }
 
         drop(tx);
-        assert!(next_coalesced_event(&mut rx, &mut pending).await.is_none());
+        assert!(next_coalesced_events(&mut rx).await.is_none());
     }
 
     #[tokio::test]
     async fn coalesces_client_output_that_arrives_after_polling_begins() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut pending = None;
         tx.send(Event::ClientOutput {
             session_id: "s1".into(),
             generation: 1,
             bytes: b"foo".to_vec(),
         }).unwrap();
 
-        let event = next_coalesced_event(&mut rx, &mut pending);
+        let event = next_coalesced_events(&mut rx);
         tokio::pin!(event);
         assert!(matches!(
             futures::poll!(event.as_mut()),
@@ -3246,56 +3269,114 @@ mod tests {
             bytes: b"bar".to_vec(),
         }).unwrap();
 
-        assert!(
-            matches!(event.await, Some(Event::ClientOutput { bytes, .. }) if bytes == b"foobar")
-        );
+        assert!(matches!(
+            event.await.as_deref(),
+            Some([Event::ClientOutput { bytes, .. }]) if bytes == b"foobar"
+        ));
     }
 
     #[tokio::test]
-    async fn foreign_event_ends_coalescing_and_keeps_its_order() {
+    async fn non_output_event_is_not_delayed_by_pty_batching() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut pending = None;
+        tx.send(Event::ClientClosed {
+            session_id: "s1".into(),
+            generation: 1,
+        }).unwrap();
+
+        let events = next_coalesced_events(&mut rx).await.unwrap();
+        assert!(matches!(
+            &events[..],
+            [Event::ClientClosed { session_id, generation: 1 }] if session_id == "s1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn interleaved_engine_event_cannot_split_pty_repaint_presentation() {
+        const STABLE: &[u8] = b"\x1b[1;1Hspinner-old\x1b[2;1Hbar\x1b[3;1Hprompt\
+            \x1b[4;1Hstatus\x1b[5;1Hpath";
+        const DESTRUCTIVE_PREFIX: &[u8] = b"\x1b[1;1H\x1b[K\x1b[2;1H\x1b[K\
+            \x1b[3;1H\x1b[K\x1b[4;1H\x1b[K\x1b[5;1H\x1b[K\x1b[1;1Hspinner-new";
+        const REPAINT_SUFFIX: &[u8] =
+            b"\x1b[2;1Hbar\x1b[3;1Hprompt\x1b[4;1Hstatus\x1b[5;1Hpath";
+
+        fn rows(terminal: &crate::components::terminal::TerminalState) -> Vec<String> {
+            use alacritty_terminal::index::{Column, Line};
+            let grid = terminal.term.grid();
+            (0..5)
+                .map(|row| {
+                    (0..20)
+                        .map(|column| grid[Line(row)][Column(column)].c)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        }
+
+        let mut transient = crate::components::terminal::TerminalState::new(20, 5, None);
+        transient.process(STABLE);
+        transient.process(DESTRUCTIVE_PREFIX);
+        assert_eq!(
+            rows(&transient),
+            ["spinner-new", "", "", "", ""],
+            "fixture must reproduce the captured blank-footer grid"
+        );
+
+        let (tx, mut rx) = broadcast::channel(16);
         tx.send(Event::ClientOutput {
             session_id: "s1".into(),
             generation: 1,
-            bytes: b"output".to_vec(),
+            bytes: DESTRUCTIVE_PREFIX.to_vec(),
         }).unwrap();
 
-        let first = {
-            let event = next_coalesced_event(&mut rx, &mut pending);
-            tokio::pin!(event);
-            assert!(matches!(
-                futures::poll!(event.as_mut()),
-                std::task::Poll::Pending
-            ));
-
-            tx.send(Event::ClientClosed {
-                session_id: "s1".into(),
-                generation: 1,
-            }).unwrap();
-
-            match futures::poll!(event.as_mut()) {
-                std::task::Poll::Ready(event) => event,
-                std::task::Poll::Pending => panic!("foreign event did not end coalescing"),
-            }
-        };
-        assert!(
-            matches!(first, Some(Event::ClientOutput { bytes, .. }) if bytes == b"output")
-        );
-
+        let event = next_coalesced_events(&mut rx);
+        tokio::pin!(event);
         assert!(matches!(
-            next_coalesced_event(&mut rx, &mut pending).await,
-            Some(Event::ClientClosed {
-                session_id,
-                generation: 1
-            }) if session_id == "s1"
+            futures::poll!(event.as_mut()),
+            std::task::Poll::Pending
         ));
+
+        tx.send(Event::TerminalOutput {
+            session_id: "tap".into(),
+            bytes: b"unrelated".to_vec(),
+        }).unwrap();
+        assert!(
+            matches!(futures::poll!(event.as_mut()), std::task::Poll::Pending),
+            "unrelated engine event exposed the destructive PTY prefix"
+        );
+        tx.send(Event::ClientOutput {
+            session_id: "s1".into(),
+            generation: 1,
+            bytes: REPAINT_SUFFIX.to_vec(),
+        }).unwrap();
+
+        let events = event.await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[0], Event::ClientOutput { session_id, bytes, .. }
+            if session_id == "s1" && bytes == DESTRUCTIVE_PREFIX));
+        assert!(matches!(&events[1], Event::TerminalOutput { session_id, bytes }
+            if session_id == "tap" && bytes == b"unrelated"));
+        assert!(matches!(&events[2], Event::ClientOutput { session_id, bytes, .. }
+            if session_id == "s1" && bytes == REPAINT_SUFFIX));
+
+        let mut presented = crate::components::terminal::TerminalState::new(20, 5, None);
+        presented.process(STABLE);
+        for event in events {
+            if let Event::ClientOutput { session_id, bytes, .. } = event {
+                if session_id == "s1" {
+                    presented.process(&bytes);
+                }
+            }
+        }
+        assert_eq!(
+            rows(&presented),
+            ["spinner-new", "bar", "prompt", "status", "path"]
+        );
     }
 
     #[tokio::test]
     async fn continuous_client_output_does_not_starve_delivery() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut pending = None;
         tx.send(Event::ClientOutput {
             session_id: "s1".into(),
             generation: 1,
@@ -3317,13 +3398,13 @@ mod tests {
 
         let event = tokio::time::timeout(
             Duration::from_millis(100),
-            next_coalesced_event(&mut rx, &mut pending),
+            next_coalesced_events(&mut rx),
         )
         .await
         .expect("continuous output exceeded the hard coalescing bound");
         producer.abort();
 
-        assert!(matches!(event, Some(Event::ClientOutput { .. })));
+        assert!(matches!(event.as_deref(), Some([Event::ClientOutput { .. }])));
     }
 
     #[tokio::test]
@@ -3332,29 +3413,27 @@ mod tests {
         // fresh client's — same reasoning as the `current != Some(generation)`
         // guard in the `ClientOutput` handler.
         let (tx, mut rx) = broadcast::channel(16);
-        let mut pending = None;
         tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"old".to_vec() }).unwrap();
         tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 2, bytes: b"new".to_vec() }).unwrap();
 
-        let first = next_coalesced_event(&mut rx, &mut pending).await.unwrap();
-        assert!(matches!(&first, Event::ClientOutput { generation: 1, bytes, .. } if bytes == b"old"));
-
-        let second = next_coalesced_event(&mut rx, &mut pending).await.unwrap();
-        assert!(matches!(&second, Event::ClientOutput { generation: 2, bytes, .. } if bytes == b"new"));
+        let events = next_coalesced_events(&mut rx).await.unwrap();
+        assert!(matches!(&events[..],
+            [Event::ClientOutput { generation: 1, bytes: old, .. },
+             Event::ClientOutput { generation: 2, bytes: new, .. }]
+            if old == b"old" && new == b"new"));
     }
 
     #[tokio::test]
     async fn does_not_merge_client_output_across_different_sessions() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut pending = None;
         tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"a".to_vec() }).unwrap();
         tx.send(Event::ClientOutput { session_id: "s2".into(), generation: 1, bytes: b"b".to_vec() }).unwrap();
 
-        let first = next_coalesced_event(&mut rx, &mut pending).await.unwrap();
-        assert!(matches!(&first, Event::ClientOutput { session_id, bytes, .. } if session_id == "s1" && bytes == b"a"));
-
-        let second = next_coalesced_event(&mut rx, &mut pending).await.unwrap();
-        assert!(matches!(&second, Event::ClientOutput { session_id, bytes, .. } if session_id == "s2" && bytes == b"b"));
+        let events = next_coalesced_events(&mut rx).await.unwrap();
+        assert!(matches!(&events[..],
+            [Event::ClientOutput { session_id: first, bytes: a, .. },
+             Event::ClientOutput { session_id: second, bytes: b, .. }]
+            if first == "s1" && a == b"a" && second == "s2" && b == b"b"));
     }
 
     fn pr_session(pr_number: Option<u64>, pr_id: Option<i64>, repo: &str) -> Session {

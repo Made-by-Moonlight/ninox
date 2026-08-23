@@ -620,7 +620,7 @@ fn renderable_cursor(term: &Term<EventProxy>) -> alacritty_terminal::term::Rende
     term.renderable_content().cursor
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DisplayCell {
     c:         char,
     zerowidth: Vec<char>,
@@ -639,6 +639,23 @@ impl Default for DisplayCell {
             flags:     Flags::empty(),
         }
     }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+struct RowDrawCommands {
+    cells:          Vec<DisplayCell>,
+    layout:         VisualLine,
+    link_spans:     Vec<crate::components::links::LinkSpan>,
+    logical:        i32,
+    cursor:         Option<(usize, CursorShape)>,
+    selected_cells: Vec<bool>,
+    colors:         Vec<Option<Rgb>>,
+    font_size:      f32,
+    terminal_bg:    IcedColor,
+    terminal_fg:    IcedColor,
+    cursor_color:   IcedColor,
+    ansi:           [IcedColor; 16],
 }
 
 fn visual_layout(cells: &[DisplayCell]) -> VisualLine {
@@ -869,6 +886,46 @@ impl<'a> TerminalWidget<'a> {
             }
         }
         out
+    }
+
+    #[cfg(test)]
+    fn row_draw_commands(&self, selection: &SelectionState) -> Vec<RowDrawCommands> {
+        use alacritty_terminal::index::Line;
+        use alacritty_terminal::term::color::COUNT;
+
+        let grid = self.state.term.grid();
+        let offset = self.state.scrollback.offset as i32;
+        let cursor = renderable_cursor(&self.state.term);
+        let colors = self.state.term.colors();
+        let colors: Vec<_> = (0..COUNT).map(|index| colors[index]).collect();
+
+        (0..grid.screen_lines())
+            .filter_map(|row| {
+                let logical = row as i32 - offset;
+                let cells = self.row_display_cells(row)?;
+                let cursor = (offset == 0
+                    && logical >= 0
+                    && cursor.point.line == Line(logical))
+                    .then_some((cursor.point.column.0, cursor.shape));
+
+                Some(RowDrawCommands {
+                    layout: visual_layout(&cells),
+                    link_spans: self.row_link_spans(row),
+                    selected_cells: (0..grid.columns())
+                        .map(|column| cell_is_selected(selection, row, column))
+                        .collect(),
+                    cells,
+                    logical,
+                    cursor,
+                    colors: colors.clone(),
+                    font_size: self.font_size,
+                    terminal_bg: self.terminal_bg,
+                    terminal_fg: self.terminal_fg,
+                    cursor_color: self.cursor_color,
+                    ansi: self.ansi,
+                })
+            })
+            .collect()
     }
 }
 
@@ -2620,6 +2677,79 @@ mod tests {
             ansi:         [IcedColor::BLACK; 16],
             session_ids:  vec![],
         }
+    }
+
+    fn captured_cursor_footer_redraw(spinner: &str) -> Vec<u8> {
+        let mut frame =
+            b"\x1b[71;1H\x1b[7A\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[64;2H"
+                .to_vec();
+        frame.extend_from_slice(spinner.as_bytes());
+        frame.extend_from_slice(b" Running  357.54k tokens\r\n ");
+        frame.extend("▄".repeat(80).as_bytes());
+        frame.extend_from_slice(b"\x1b[66;1H  \xe2\x86\x92 Add a follow-up");
+        frame.extend_from_slice(b"\x1b[67;1H ");
+        frame.extend("▀".repeat(80).as_bytes());
+        frame.extend_from_slice(
+            b"\x1b[68;1H  1 task\x1b[69;1H  GPT-5.6 Sol 272K High \xc2\xb7 MAX \xc2\xb7 71.7% \xc2\xb7 1 file edited",
+        );
+        frame.extend_from_slice(
+            b"\x1b[70;1H  ~/dev/ninox-w1 \xc2\xb7 mu/ninox/terminal-flicker-visual-root-cause",
+        );
+        frame
+    }
+
+    #[test]
+    fn captured_cursor_spinner_changes_only_its_row_draw_commands() {
+        let mut state = TerminalState::new(157, 71, None);
+        state.process(&captured_cursor_footer_redraw("⠠⠜"));
+        let selection = SelectionState::default();
+        let before = test_widget(&state).row_draw_commands(&selection);
+
+        state.process(&captured_cursor_footer_redraw("⠰⠰"));
+        let after = test_widget(&state).row_draw_commands(&selection);
+        let changed: Vec<_> = before
+            .iter()
+            .zip(&after)
+            .enumerate()
+            .filter_map(|(row, (before, after))| (before != after).then_some(row))
+            .collect();
+
+        assert_eq!(
+            changed,
+            [63],
+            "unchanged footer rows must retain their draw commands"
+        );
+    }
+
+    #[test]
+    fn unchanged_grid_has_stable_row_draw_commands() {
+        let mut state = TerminalState::new(80, 24, None);
+        state.process(b"static shell output\r\nunchanged");
+        let selection = SelectionState::default();
+
+        let first = test_widget(&state).row_draw_commands(&selection);
+        let second = test_widget(&state).row_draw_commands(&selection);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn simple_shell_output_changes_only_its_repainted_row() {
+        let mut state = TerminalState::new(80, 24, None);
+        state.process(b"before");
+        let selection = SelectionState::default();
+        let before = test_widget(&state).row_draw_commands(&selection);
+
+        state.process(b"\rbash: after");
+        let after = test_widget(&state).row_draw_commands(&selection);
+        let changed: Vec<_> = before
+            .iter()
+            .zip(&after)
+            .enumerate()
+            .filter_map(|(row, (before, after))| (before != after).then_some(row))
+            .collect();
+
+        assert_eq!(changed, [0]);
     }
 
     #[test]

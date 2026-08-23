@@ -67,3 +67,38 @@ paint therefore began at Ninox's no-op frame handling, after tmux framing and
 PTY/event batching but before iced cache invalidation. The deterministic
 regression replays the observed two-event topology and requires one renderer
 commit, not two.
+
+## Presented-frame root cause on `a256e8f`
+
+The installed `a256e8fd975d9ba7946e572485e6a7d6890f46a4` build still flickered.
+Successive window captures finally exposed the missing boundary: four of 297
+sampled presentations showed Cursor's rows below the spinner completely blank,
+then restored, while every pixel above the footer remained unchanged.
+
+The corresponding repaint was split into 1,024-byte and 683-byte PTY reads.
+An unrelated engine event can land between those reads. The old
+`next_coalesced_event` immediately returned the destructive first read when it
+saw that event, bypassing the remaining quiet interval. Iced therefore
+presented the real intermediate alacritty grid before the repaint suffix
+arrived. The 3 ms quiet and 8 ms hard limit were not exceeded; the event
+multiplexer ended coalescing early.
+
+Renderer isolation ruled out the canvas, glyph atlas, BiDi layout, cursor,
+scrollback, fractional geometry, and swapchain. A build with independent
+row-level canvas/text caches still produced five blank footers in 263
+presentations. The compositor was faithfully presenting a transient grid, not
+dropping otherwise-stable row geometry.
+
+The presentation boundary now carries all events observed during the existing
+bounded PTY burst as one ordered iced message. Adjacent output from one client
+is still merged; unrelated events and different client generations remain
+distinct and are applied in their original order before iced can redraw.
+No terminal bytes, grid mutations, or legitimate clears are suppressed.
+
+The same live reproduction against that boundary produced 268 successive
+presentations with zero blank footers. Deterministic coverage inserts an
+unrelated engine event between a destructive PTY prefix and its repaint suffix
+and proves the prefix cannot become a separately presented update. The captured
+Cursor footer also has a row-level draw-command fixture: only its spinner row
+changes, a repeated unchanged grid is identical, and simple shell output changes
+only the row it repaints.
