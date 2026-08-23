@@ -78,6 +78,8 @@ pub struct WorkerIncarnation {
     pub started_at: i64,
     pub source_workspace: String,
     pub workspace_path: String,
+    /// Stable canonical Git identity shared by every checkout of one repository.
+    pub repository_key: Option<String>,
     pub lease_id: Option<String>,
     pub checkout_backed: bool,
     pub state: WorkerIncarnationState,

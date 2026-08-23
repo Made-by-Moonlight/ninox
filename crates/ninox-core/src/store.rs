@@ -139,7 +139,12 @@ fn create_legacy_runtime_table(conn: &Connection) -> Result<()> {
 fn migrate_legacy_worker_incarnations(conn: &mut Connection) -> Result<()> {
     let columns = table_columns(conn, "worker_incarnations")?;
     let names = columns.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
-    if names == CURRENT_WORKER_INCARNATION_COLUMNS
+    let current_with_repository_key = CURRENT_WORKER_INCARNATION_COLUMNS
+        .iter()
+        .copied()
+        .chain(["repository_key"])
+        .collect::<Vec<_>>();
+    if (names == CURRENT_WORKER_INCARNATION_COLUMNS || names == current_with_repository_key)
         && columns.first().is_some_and(|(_, pk)| *pk == 1)
         && columns.get(1).is_some_and(|(_, pk)| *pk == 0)
     {
@@ -652,6 +657,17 @@ impl Store {
                 [],
             )?;
         }
+        if !Self::column_exists(&conn, "worker_incarnations", "repository_key")? {
+            conn.execute(
+                "ALTER TABLE worker_incarnations ADD COLUMN repository_key TEXT",
+                [],
+            )?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS worker_incarnations_repository_capacity
+             ON worker_incarnations(repository_key,state)",
+            [],
+        )?;
         conn.execute(
             "UPDATE pooled_checkouts
              SET owner_incarnation_id=session_id
@@ -675,6 +691,23 @@ impl Store {
                AND p.lease_id IS NOT NULL",
             [],
         )?;
+        conn.execute(
+            "UPDATE worker_incarnations
+             SET repository_key=COALESCE(
+                 (
+                     SELECT p.common_git_dir
+                     FROM pooled_checkouts p
+                     WHERE p.session_id=worker_incarnations.session_id
+                       AND p.owner_incarnation_id=worker_incarnations.incarnation_id
+                       AND p.lease_id IS worker_incarnations.lease_id
+                     LIMIT 1
+                 ),
+                 source_workspace
+             )
+             WHERE checkout_backed=1 AND repository_key IS NULL",
+            [],
+        )?;
+        Self::normalize_worker_repository_keys(&conn)?;
         Self::reconcile_pooled_checkout_paths(&mut conn)?;
         Self::reclaim_dead_allocations(&mut conn, &allocator_lock_dir)?;
         Self::reclaim_dead_runtime_claims(&mut conn, &allocator_lock_dir)?;
@@ -695,6 +728,46 @@ impl Store {
             .filter_map(|r| r.ok())
             .any(|c| c == column);
         Ok(exists)
+    }
+
+    fn normalize_worker_repository_keys(conn: &Connection) -> Result<()> {
+        let candidates = {
+            let mut stmt = conn.prepare(
+                "SELECT session_id,source_workspace,workspace_path,repository_key
+                 FROM worker_incarnations
+                 WHERE checkout_backed=1 AND repository_key=source_workspace",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (session_id, source_workspace, workspace_path, stale_key) in candidates {
+            let identity = crate::worktree::RepositoryIdentity::resolve(Path::new(
+                &source_workspace,
+            ))
+            .or_else(|_| {
+                crate::worktree::RepositoryIdentity::resolve(Path::new(&workspace_path))
+            });
+            let Ok(identity) = identity else {
+                continue;
+            };
+            conn.execute(
+                "UPDATE worker_incarnations SET repository_key=?3
+                 WHERE session_id=?1 AND repository_key=?2",
+                params![
+                    session_id,
+                    stale_key,
+                    path_text(&identity.common_git_dir)?
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     fn reconcile_pooled_checkout_paths(conn: &mut Connection) -> Result<()> {
@@ -896,12 +969,22 @@ impl Store {
                     }
                 };
             let state = if status == "done" { "retained" } else { "active" };
+            let repository_key = metadata
+                .common_git_dir
+                .as_deref()
+                .map(canonical_db_path)
+                .transpose()?
+                .or_else(|| {
+                    checkout_repository_identity(&metadata.source_repo)
+                        .ok()
+                        .map(|(key, _)| key)
+                });
             conn.execute(
                 "INSERT OR IGNORE INTO worker_incarnations(
                     session_id,incarnation_id,orchestrator_id,started_at,
-                    source_workspace,workspace_path,lease_id,allocator_pid,
-                    checkout_backed,state
-                 ) VALUES(?1,?2,?3,?4,?5,?6,NULL,NULL,1,?7)",
+                    source_workspace,workspace_path,repository_key,lease_id,
+                    allocator_pid,checkout_backed,state
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,1,?8)",
                 params![
                     session_id,
                     uuid::Uuid::new_v4().to_string(),
@@ -909,6 +992,7 @@ impl Store {
                     started_at,
                     metadata.source_repo.to_string_lossy(),
                     workspace,
+                    repository_key,
                     state,
                 ],
             )?;
@@ -1562,25 +1646,10 @@ impl Store {
         checkout_cap: usize,
     ) -> Result<WorkerIncarnation> {
         anyhow::ensure!(!session_id.is_empty(), "session id cannot be empty");
-        anyhow::ensure!(
-            (1..=3).contains(&checkout_cap),
-            "worker checkout cap must be between 1 and 3"
-        );
-        let incarnation_id = uuid::Uuid::new_v4().to_string();
-        let allocator_token = uuid::Uuid::new_v4().to_string();
-        let allocator_path = allocation_lock_path(&self.allocator_lock_dir, &incarnation_id);
-        let mut allocator_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&allocator_path)?;
-        allocator_file.write_all(allocator_token.as_bytes())?;
-        allocator_file.sync_all()?;
-        allocator_file.lock()?;
-        let allocator_lock = PendingAllocationLock {
-            path: allocator_path,
-            file: Some(allocator_file),
-        };
+        anyhow::ensure!(checkout_cap > 0, "worker checkout cap must be greater than zero");
+        let mut repository = checkout_backed
+            .then(|| checkout_repository_identity(Path::new(source_workspace)))
+            .transpose()?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let runtime_claimed: bool = tx.query_row(
@@ -1616,19 +1685,43 @@ impl Store {
                 ),
                 "worker {session_id} has an in-progress resource claim"
             );
+            if checkout_backed && previous.checkout_backed {
+                if let Some(repository_key) = &previous.repository_key {
+                    let repository_label = repository
+                        .as_ref()
+                        .map_or(source_workspace, |(_, label)| label.as_str());
+                    repository = Some((repository_key.clone(), repository_label.to_string()));
+                }
+            }
         }
-        if checkout_backed {
+        if let Some((repository_key, repository_label)) = &repository {
             let used: usize = tx.query_row(
                 "SELECT COUNT(*) FROM worker_incarnations
-                 WHERE session_id<>?1 AND checkout_backed=1 AND state<>'released'",
-                [session_id],
+                 WHERE session_id<>?1 AND checkout_backed=1
+                   AND repository_key IN (?2,?3) AND state<>'released'",
+                params![session_id, repository_key, repository_label],
                 |row| row.get(0),
             )?;
             anyhow::ensure!(
                 used < checkout_cap,
-                "checkout-backed worker cap reached ({used}/{checkout_cap})"
+                "repository checkout pool saturated for {repository_label} ({used}/{checkout_cap})"
             );
         }
+        let incarnation_id = uuid::Uuid::new_v4().to_string();
+        let allocator_token = uuid::Uuid::new_v4().to_string();
+        let allocator_path = allocation_lock_path(&self.allocator_lock_dir, &incarnation_id);
+        let mut allocator_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&allocator_path)?;
+        allocator_file.write_all(allocator_token.as_bytes())?;
+        allocator_file.sync_all()?;
+        allocator_file.lock()?;
+        let allocator_lock = PendingAllocationLock {
+            path: allocator_path,
+            file: Some(allocator_file),
+        };
         let workspace_path = previous
             .as_ref()
             .map_or(source_workspace, |worker| worker.workspace_path.as_str());
@@ -1670,15 +1763,16 @@ impl Store {
         tx.execute(
             "INSERT INTO worker_incarnations(
                 session_id,incarnation_id,orchestrator_id,started_at,
-                source_workspace,workspace_path,lease_id,allocator_pid,allocator_token,
-                checkout_backed,state
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'allocating')
+                source_workspace,workspace_path,repository_key,lease_id,allocator_pid,
+                allocator_token,checkout_backed,state
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'allocating')
              ON CONFLICT(session_id) DO UPDATE SET
                 incarnation_id=excluded.incarnation_id,
                 orchestrator_id=excluded.orchestrator_id,
                 started_at=excluded.started_at,
                 source_workspace=excluded.source_workspace,
                 workspace_path=excluded.workspace_path,
+                repository_key=excluded.repository_key,
                 lease_id=excluded.lease_id,
                 allocator_pid=excluded.allocator_pid,
                 allocator_token=excluded.allocator_token,
@@ -1691,6 +1785,7 @@ impl Store {
                 started_at,
                 source_workspace,
                 workspace_path,
+                repository.as_ref().map(|(key, _)| key),
                 lease_id,
                 std::process::id(),
                 allocator_token,
@@ -1718,6 +1813,7 @@ impl Store {
             started_at,
             source_workspace: source_workspace.to_string(),
             workspace_path: workspace_path.to_string(),
+            repository_key: repository.map(|(key, _)| key),
             lease_id: lease_id.map(str::to_string),
             checkout_backed,
             state: WorkerIncarnationState::Allocating,
@@ -2197,7 +2293,7 @@ impl Store {
         if worker.is_none() {
             let pool = tx
                 .query_row(
-                    "SELECT owner_incarnation_id,lease_id,source_repo,path
+                    "SELECT owner_incarnation_id,lease_id,source_repo,path,common_git_dir
                      FROM pooled_checkouts
                      WHERE session_id=?1 AND state IN ('provisioning','leased')",
                     [session_id],
@@ -2207,6 +2303,7 @@ impl Store {
                             row.get::<_, Option<String>>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
                         ))
                     },
                 )
@@ -2221,6 +2318,7 @@ impl Store {
             let workspace_path =
                 pool.as_ref().map_or_else(|| workspace, |pool| pool.3.clone());
             let lease_id = pool.as_ref().and_then(|pool| pool.1.clone());
+            let repository_key = pool.as_ref().map(|pool| pool.4.clone());
             let state = if session.3 == "spawning" {
                 "allocating"
             } else if session.3 == "done" {
@@ -2231,8 +2329,8 @@ impl Store {
             tx.execute(
                 "INSERT INTO worker_incarnations(
                     session_id,incarnation_id,orchestrator_id,started_at,
-                    source_workspace,workspace_path,lease_id,checkout_backed,state
-                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    source_workspace,workspace_path,repository_key,lease_id,checkout_backed,state
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![
                     session_id,
                     incarnation_id,
@@ -2240,6 +2338,7 @@ impl Store {
                     session.1,
                     source_workspace,
                     workspace_path,
+                    repository_key,
                     lease_id,
                     pool.is_some() as i64,
                     state,
@@ -2252,6 +2351,7 @@ impl Store {
                 started_at: session.1,
                 source_workspace,
                 workspace_path,
+                repository_key,
                 lease_id,
                 checkout_backed: pool.is_some(),
                 state: parse_worker_state(state)?,
@@ -2888,7 +2988,7 @@ impl Store {
         };
         let pool = tx
             .query_row(
-                "SELECT owner_incarnation_id,lease_id,source_repo,path
+                "SELECT owner_incarnation_id,lease_id,source_repo,path,common_git_dir
                  FROM pooled_checkouts
                  WHERE session_id=?1 AND state IN ('provisioning','leased')",
                 [session_id],
@@ -2898,6 +2998,7 @@ impl Store {
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
@@ -2907,6 +3008,7 @@ impl Store {
             .and_then(|pool| pool.0.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let lease_id = pool.as_ref().and_then(|pool| pool.1.clone());
+        let repository_key = pool.as_ref().map(|pool| pool.4.clone());
         let source_workspace = pool
             .as_ref()
             .map_or_else(|| workspace_path.clone().unwrap_or_default(), |pool| pool.2.clone());
@@ -2916,8 +3018,8 @@ impl Store {
         tx.execute(
             "INSERT INTO worker_incarnations(
                 session_id,incarnation_id,orchestrator_id,started_at,
-                source_workspace,workspace_path,lease_id,checkout_backed,state
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'cleanup_claimed')",
+                source_workspace,workspace_path,repository_key,lease_id,checkout_backed,state
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'cleanup_claimed')",
             params![
                 session_id,
                 incarnation_id,
@@ -2925,6 +3027,7 @@ impl Store {
                 started_at,
                 source_workspace,
                 workspace_path,
+                repository_key,
                 lease_id,
                 pool.is_some() as i64,
             ],
@@ -2938,6 +3041,7 @@ impl Store {
                 started_at,
                 source_workspace,
                 workspace_path,
+                repository_key,
                 lease_id,
                 checkout_backed: pool.is_some(),
                 state: WorkerIncarnationState::CleanupClaimed,
@@ -3241,17 +3345,22 @@ impl Store {
         rows.map(|row| raw_worker_incarnation(row?)).collect()
     }
 
-    pub fn checkout_worker_candidates(
+    pub fn checkout_worker_candidates_for_repository(
         &self,
-        _orchestrator_id: Option<&str>,
+        source_workspace: &str,
     ) -> Result<Vec<WorkerIncarnation>> {
+        let (repository_key, repository_label) =
+            checkout_repository_identity(Path::new(source_workspace))?;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "{WORKER_INCARNATION_COLUMNS}
-             WHERE checkout_backed=1 AND state<>'released'
+             WHERE checkout_backed=1 AND repository_key IN (?1,?2) AND state<>'released'
              ORDER BY CASE state WHEN 'retained' THEN 0 ELSE 1 END, started_at ASC"
         ))?;
-        let rows = stmt.query_map([], worker_incarnation_row)?;
+        let rows = stmt.query_map(
+            params![repository_key, repository_label],
+            worker_incarnation_row,
+        )?;
         rows.map(|row| raw_worker_incarnation(row?)).collect()
     }
 
@@ -3990,7 +4099,7 @@ impl Store {
 
 const WORKER_INCARNATION_COLUMNS: &str =
     "SELECT session_id,incarnation_id,orchestrator_id,started_at,
-            source_workspace,workspace_path,lease_id,checkout_backed,state
+            source_workspace,workspace_path,repository_key,lease_id,checkout_backed,state
      FROM worker_incarnations";
 
 const WORKER_COMPLETION_COLUMNS: &str =
@@ -4016,6 +4125,7 @@ type RawWorkerIncarnation = (
     String,
     String,
     Option<String>,
+    Option<String>,
     bool,
     String,
 );
@@ -4031,6 +4141,7 @@ fn worker_incarnation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawWorker
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
     ))
 }
 
@@ -4042,9 +4153,10 @@ fn raw_worker_incarnation(raw: RawWorkerIncarnation) -> Result<WorkerIncarnation
         started_at: raw.3,
         source_workspace: raw.4,
         workspace_path: raw.5,
-        lease_id: raw.6,
-        checkout_backed: raw.7,
-        state: parse_worker_state(&raw.8)?,
+        repository_key: raw.6,
+        lease_id: raw.7,
+        checkout_backed: raw.8,
+        state: parse_worker_state(&raw.9)?,
     })
 }
 
@@ -4235,6 +4347,25 @@ fn absolute_db_path(path: &Path) -> Result<String> {
         std::env::current_dir()?.join(path)
     };
     path_text(&path)
+}
+
+fn checkout_repository_identity(path: &Path) -> Result<(String, String)> {
+    match crate::worktree::RepositoryIdentity::resolve(path) {
+        Ok(repository) => Ok((
+            path_text(&repository.common_git_dir)?,
+            path_text(&repository.top_level)?,
+        )),
+        Err(_) => {
+            let label = absolute_db_path(path)?;
+            let git_dir = path.join(".git");
+            let key = if git_dir.exists() {
+                canonical_db_path(&git_dir)?
+            } else {
+                label.clone()
+            };
+            Ok((key, label))
+        }
+    }
 }
 
 fn path_text(path: &Path) -> Result<String> {
@@ -4499,12 +4630,23 @@ mod tests {
                 ("allocator_token".into(), 0),
                 ("checkout_backed".into(), 0),
                 ("state".into(), 0),
+                ("repository_key".into(), 0),
             ]
         );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM worker_incarnations", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             3
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT repository_key FROM worker_incarnations
+                 WHERE session_id='live-pooled'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "/repo/.git"
         );
         assert_eq!(
             conn.query_row(
@@ -5189,7 +5331,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_worker_preparation_hard_caps_checkout_backed_slots() {
+    fn concurrent_orchestrators_share_one_repository_pool_cap() {
         let root = tempdir().unwrap().keep();
         let db = root.join("cap.db");
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
@@ -5203,7 +5345,7 @@ mod tests {
                 barrier.wait();
                 store.prepare_worker_incarnation(
                     &format!("worker-{index}"),
-                    Some("orch"),
+                    Some(&format!("orch-{index}")),
                     index as i64,
                     "/repo",
                     true,
@@ -5228,7 +5370,34 @@ mod tests {
     }
 
     #[test]
-    fn checkout_cap_is_local_across_orchestrators() {
+    fn separate_repository_pools_allocate_independently_past_old_global_total() {
+        let store = test_store();
+        for index in 0..5 {
+            store
+                .prepare_worker_incarnation(
+                    &format!("alpha-{index}"),
+                    Some("orch-alpha"),
+                    index,
+                    "/repos/alpha",
+                    true,
+                    5,
+                )
+                .unwrap();
+            store
+                .prepare_worker_incarnation(
+                    &format!("beta-{index}"),
+                    Some("orch-beta"),
+                    index,
+                    "/repos/beta",
+                    true,
+                    5,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn checkout_cap_is_shared_by_repository_across_orchestrators() {
         let store = test_store();
         for index in 0..3 {
             store
@@ -5245,6 +5414,164 @@ mod tests {
         assert!(store
             .prepare_worker_incarnation("worker-3", Some("orch-3"), 3, "/repo", true, 3)
             .is_err());
+    }
+
+    #[test]
+    fn repository_pool_capacity_cannot_be_bypassed_by_path_alias() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&repository, &alias).unwrap();
+        let store = test_store();
+
+        store
+            .prepare_worker_incarnation(
+                "canonical",
+                Some("orch-a"),
+                1,
+                repository.to_str().unwrap(),
+                true,
+                1,
+            )
+            .unwrap();
+        assert!(store
+            .prepare_worker_incarnation(
+                "alias",
+                Some("orch-b"),
+                2,
+                alias.to_str().unwrap(),
+                true,
+                1,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains(repository.to_str().unwrap()));
+    }
+
+    #[test]
+    fn startup_normalizes_non_pooled_legacy_repository_keys() {
+        let root = tempdir().unwrap().keep();
+        let repository = root.join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let db = root.join("legacy-key.db");
+        let store = Store::open(&db).unwrap();
+        store
+            .prepare_worker_incarnation(
+                "legacy",
+                None,
+                1,
+                repository.to_str().unwrap(),
+                true,
+                1,
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE worker_incarnations
+                 SET repository_key=source_workspace,state='retained',
+                     allocator_pid=NULL,allocator_token=NULL
+                 WHERE session_id='legacy'",
+                [],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(db).unwrap();
+        assert!(reopened
+            .prepare_worker_incarnation(
+                "denied",
+                None,
+                2,
+                repository.to_str().unwrap(),
+                true,
+                1,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn repository_capacity_counts_retained_but_not_released_workers() {
+        let store = test_store();
+        let retained = store
+            .prepare_worker_incarnation("retained", None, 1, "/repo", true, 1)
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE worker_incarnations SET state='retained' WHERE session_id='retained'",
+                [],
+            )
+            .unwrap();
+        assert!(store
+            .prepare_worker_incarnation("denied", None, 2, "/repo", true, 1)
+            .is_err());
+        assert!(store
+            .claim_worker_release("retained", &retained.incarnation_id)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .complete_worker_claim(
+                "retained",
+                &retained.incarnation_id,
+                WorkerIncarnationState::ReleaseClaimed,
+            )
+            .unwrap());
+        store
+            .prepare_worker_incarnation("admitted", None, 3, "/repo", true, 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn cap_denial_has_no_incarnation_or_allocator_side_effects_and_scopes_candidates() {
+        let store = test_store();
+        store
+            .prepare_worker_incarnation("alpha", None, 1, "/repos/alpha", true, 1)
+            .unwrap();
+        store
+            .prepare_worker_incarnation("beta", None, 2, "/repos/beta", true, 1)
+            .unwrap();
+        let locks_before = std::fs::read_dir(&store.allocator_lock_dir).unwrap().count();
+
+        let error = store
+            .prepare_worker_incarnation("denied", None, 3, "/repos/alpha", true, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("/repos/alpha"));
+        assert!(!error.contains("/repos/beta"));
+        assert!(store.current_worker_incarnation("denied").unwrap().is_none());
+        assert_eq!(
+            std::fs::read_dir(&store.allocator_lock_dir).unwrap().count(),
+            locks_before
+        );
+        assert_eq!(
+            store
+                .checkout_worker_candidates_for_repository("/repos/alpha")
+                .unwrap()
+                .iter()
+                .map(|worker| worker.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha"]
+        );
     }
 
     #[test]
@@ -5513,14 +5840,21 @@ mod tests {
                     &format!("new-{index}"),
                     None,
                     index + 2,
-                    "/repo",
+                    repo.to_str().unwrap(),
                     true,
                     3,
                 )
                 .unwrap();
         }
         assert!(reopened
-            .prepare_worker_incarnation("over-cap", None, 4, "/repo", true, 3)
+            .prepare_worker_incarnation(
+                "over-cap",
+                None,
+                4,
+                repo.to_str().unwrap(),
+                true,
+                3,
+            )
             .is_err());
     }
 
@@ -6044,7 +6378,14 @@ mod tests {
         assert_eq!(pool.state, PooledCheckoutState::Quarantined);
         assert_eq!(pool.kind, PooledCheckoutKind::UnsafeLegacy);
         assert!(reopened
-            .prepare_worker_incarnation("replacement-1", None, 2, "/repo", true, 1)
+            .prepare_worker_incarnation(
+                "replacement-1",
+                None,
+                2,
+                source.to_str().unwrap(),
+                true,
+                1,
+            )
             .is_err());
     }
 

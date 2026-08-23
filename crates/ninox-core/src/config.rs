@@ -1,8 +1,13 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Component, Path, PathBuf},
+};
 
 use crate::harness::{HarnessRegistry, HarnessSpec};
+use crate::worktree::RepositoryIdentity;
 
 // ---------------------------------------------------------------------------
 // Theme
@@ -177,7 +182,24 @@ impl SessionRetentionConfig {
 // App configuration
 // ---------------------------------------------------------------------------
 
-fn default_worker_checkout_cap() -> u8 { 3 }
+fn default_worker_checkout_cap() -> u32 { 5 }
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if normalized.file_name().is_some() => {
+                normalized.pop();
+            }
+            Component::ParentDir => normalized.push(component),
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component);
+            }
+        }
+    }
+    normalized
+}
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,10 +219,14 @@ pub struct AppConfig {
     /// Pooling remains disabled when unset.
     #[serde(default)]
     pub repositories_root: Option<PathBuf>,
-    /// Maximum checkout-backed workers owned by one orchestrator. Local
-    /// delivery is deliberately bounded to three retained or active slots.
-    #[serde(default = "default_worker_checkout_cap")]
-    pub worker_checkout_cap: u8,
+    /// Default maximum retained or active checkout-backed workers per
+    /// canonical repository pool.
+    #[serde(default = "default_worker_checkout_cap", alias = "worker_checkout_cap")]
+    pub worker_checkout_default_cap: u32,
+    /// Per-repository pool limits. Keys are user-facing repository paths;
+    /// online aliases are matched through their canonical Git identity.
+    #[serde(default)]
+    pub worker_checkout_repository_caps: BTreeMap<String, u32>,
     /// Agent harness and model for orchestrator sessions.
     #[serde(default)]
     pub orchestrator: AgentConfig,
@@ -247,7 +273,8 @@ impl Default for AppConfig {
             orchestrator_root: None,
             worktree_root:    None,
             repositories_root: None,
-            worker_checkout_cap: default_worker_checkout_cap(),
+            worker_checkout_default_cap: default_worker_checkout_cap(),
+            worker_checkout_repository_caps: BTreeMap::new(),
             orchestrator:     AgentConfig::default(),
             worker:           AgentConfig::default(),
             github_token:     None,
@@ -262,12 +289,111 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    pub fn validated_worker_checkout_cap(&self) -> anyhow::Result<usize> {
+    pub fn validated_worker_checkout_default_cap(&self) -> anyhow::Result<usize> {
         anyhow::ensure!(
-            (1..=3).contains(&self.worker_checkout_cap),
-            "worker_checkout_cap must be between 1 and 3"
+            self.worker_checkout_default_cap > 0,
+            "worker_checkout_default_cap must be greater than zero"
         );
-        Ok(self.worker_checkout_cap as usize)
+        Ok(self.worker_checkout_default_cap as usize)
+    }
+
+    pub fn validated_worker_checkout_cap_for_repository(
+        &self,
+        repository: &Path,
+    ) -> anyhow::Result<usize> {
+        let identity = RepositoryIdentity::resolve(repository)?;
+        self.validated_worker_checkout_cap_for_identity(
+            &identity.top_level,
+            Some(identity.common_git_dir.to_string_lossy().as_ref()),
+        )
+    }
+
+    pub fn validated_worker_checkout_cap_for_stored_repository(
+        &self,
+        repository: &Path,
+        repository_key: Option<&str>,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            repository_key.is_some_and(|key| !key.is_empty()),
+            "checkout-backed worker has no canonical repository identity"
+        );
+        self.validated_worker_checkout_cap_for_identity(repository, repository_key)
+    }
+
+    fn validated_worker_checkout_cap_for_identity(
+        &self,
+        repository: &Path,
+        repository_key: Option<&str>,
+    ) -> anyhow::Result<usize> {
+        let default = self.validated_worker_checkout_default_cap()?;
+        let online_identity = RepositoryIdentity::resolve(repository).ok();
+        let target_path = online_identity
+            .as_ref()
+            .map_or_else(|| lexical_normalize(repository), |identity| identity.top_level.clone());
+        let target_key = online_identity
+            .as_ref()
+            .map(|identity| identity.common_git_dir.to_string_lossy())
+            .or_else(|| repository_key.map(std::borrow::Cow::Borrowed));
+        let mut matched = None;
+        for (configured, limit) in &self.worker_checkout_repository_caps {
+            anyhow::ensure!(
+                *limit > 0,
+                "worker checkout limit for {configured} must be greater than zero"
+            );
+            let configured_path =
+                lexical_normalize(&Self::resolve_root_path(PathBuf::from(configured)));
+            let configured_identity = RepositoryIdentity::resolve(&configured_path).ok();
+            let is_match = configured_identity.as_ref().is_some_and(|identity| {
+                target_key
+                    .as_deref()
+                    .is_some_and(|key| identity.common_git_dir.to_string_lossy() == key)
+            }) || configured_path == target_path;
+            if is_match {
+                if let Some(previous) = matched {
+                    anyhow::ensure!(
+                        previous == *limit,
+                        "conflicting worker checkout limits resolve to repository {}",
+                        target_path.display()
+                    );
+                }
+                matched = Some(*limit);
+            }
+        }
+        Ok(matched.map_or(default, |limit| {
+            limit.try_into().expect("u32 always fits usize on supported platforms")
+        }))
+    }
+
+    pub fn set_worker_checkout_repository_cap(
+        &mut self,
+        repository: PathBuf,
+        limit: u32,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(limit > 0, "repository worker checkout limit must be greater than zero");
+        let resolved = lexical_normalize(&Self::resolve_root_path(repository));
+        let identity = RepositoryIdentity::resolve(&resolved).ok();
+        let normalized = identity
+            .as_ref()
+            .map_or_else(|| resolved.clone(), |repository| repository.top_level.clone());
+        let aliases = self
+            .worker_checkout_repository_caps
+            .keys()
+            .filter(|configured| {
+                let configured =
+                    lexical_normalize(&Self::resolve_root_path(PathBuf::from(configured)));
+                identity.as_ref().is_some_and(|target| {
+                    RepositoryIdentity::resolve(&configured)
+                        .is_ok_and(|candidate| candidate.common_git_dir == target.common_git_dir)
+                }) || configured == normalized
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for alias in aliases {
+            self.worker_checkout_repository_caps.remove(&alias);
+        }
+        let key = normalized.to_string_lossy().into_owned();
+        self.worker_checkout_repository_caps.insert(key.clone(), limit);
+        Ok(key)
     }
 
     /// The effective harness registry: builtin specs overlaid by this
@@ -566,13 +692,74 @@ mod tests {
     }
 
     #[test]
-    fn worker_checkout_cap_defaults_to_three_and_rejects_out_of_range_values() {
+    fn worker_checkout_limits_default_to_five_and_preserve_legacy_scalar() {
         let mut config = AppConfig::default();
-        assert_eq!(config.validated_worker_checkout_cap().unwrap(), 3);
-        config.worker_checkout_cap = 0;
-        assert!(config.validated_worker_checkout_cap().is_err());
-        config.worker_checkout_cap = 4;
-        assert!(config.validated_worker_checkout_cap().is_err());
+        assert_eq!(config.validated_worker_checkout_default_cap().unwrap(), 5);
+
+        let legacy: AppConfig =
+            toml::from_str("port = 8080\nfont_size = 13.0\nworker_checkout_cap = 7\n").unwrap();
+        assert_eq!(legacy.validated_worker_checkout_default_cap().unwrap(), 7);
+        assert!(toml::to_string(&legacy)
+            .unwrap()
+            .contains("worker_checkout_default_cap = 7"));
+
+        config.worker_checkout_default_cap = 0;
+        assert!(config.validated_worker_checkout_default_cap().is_err());
+        config.worker_checkout_default_cap = 4;
+        assert_eq!(config.validated_worker_checkout_default_cap().unwrap(), 4);
+    }
+
+    #[test]
+    fn repository_worker_checkout_limits_support_aliases_and_preserve_offline_entries() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        };
+        run(&["init", "-q"]);
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&repository, &alias).unwrap();
+        let offline = root.path().join("offline");
+        let mut config = AppConfig {
+            worker_checkout_repository_caps: BTreeMap::from([
+                (alias.to_string_lossy().into_owned(), 9),
+                (offline.to_string_lossy().into_owned(), 2),
+            ]),
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            config
+                .validated_worker_checkout_cap_for_repository(&repository)
+                .unwrap(),
+            9
+        );
+        assert_eq!(config.worker_checkout_repository_caps.len(), 2);
+        config
+            .set_worker_checkout_repository_cap(repository.clone(), 6)
+            .unwrap();
+        assert_eq!(
+            config
+                .validated_worker_checkout_cap_for_repository(&alias)
+                .unwrap(),
+            6
+        );
+        assert!(config.worker_checkout_repository_caps.contains_key(
+            repository.canonicalize().unwrap().to_string_lossy().as_ref()
+        ));
+        assert!(config
+            .worker_checkout_repository_caps
+            .contains_key(offline.to_string_lossy().as_ref()));
+        assert!(config
+            .set_worker_checkout_repository_cap(repository, 0)
+            .is_err());
     }
 
     #[test]

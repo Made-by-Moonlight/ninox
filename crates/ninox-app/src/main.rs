@@ -663,9 +663,17 @@ async fn run_spawn(
         store.get_session(&id)?.is_none(),
         "a session named {id} already exists — pick another name"
     );
-    let checkout_backed =
-        ninox_core::worktree::RepositoryIdentity::resolve(std::path::Path::new(&workspace)).is_ok();
-    let checkout_cap = config.validated_worker_checkout_cap()?;
+    let repository =
+        ninox_core::worktree::RepositoryIdentity::resolve(std::path::Path::new(&workspace)).ok();
+    let checkout_backed = repository.is_some();
+    let checkout_cap = repository.as_ref().map_or_else(
+        || config.validated_worker_checkout_default_cap(),
+        |repository| config.validated_worker_checkout_cap_for_repository(&repository.top_level),
+    )?;
+    let capacity_workspace = repository
+        .as_ref()
+        .map(|repository| repository.top_level.to_string_lossy().into_owned())
+        .unwrap_or_else(|| workspace.clone());
     let pending = Session {
         id: id.clone(),
         orchestrator_id: orchestrator_id.clone(),
@@ -698,14 +706,15 @@ async fn run_spawn(
         &id,
         orchestrator_id.as_deref(),
         ts,
-        &workspace,
+        &capacity_workspace,
         checkout_backed,
         checkout_cap,
     ) {
         Ok(incarnation) => incarnation,
-        Err(error) if error.to_string().contains("worker cap reached") => {
+        Err(error) if error.to_string().contains("repository checkout pool saturated") => {
             let _ = store.delete_spawning_session_snapshot(&id, ts, None);
-            let candidates = store.checkout_worker_candidates(orchestrator_id.as_deref())?;
+            let candidates =
+                store.checkout_worker_candidates_for_repository(&capacity_workspace)?;
             anyhow::bail!(
                 "{error}. {}",
                 release_candidate_guidance(orchestrator_id.as_deref(), &candidates)

@@ -36,7 +36,7 @@ fn emit_checkout_unavailable(
     session_name: &str,
     error: &dyn std::fmt::Display,
 ) {
-    let body = checkout_error_with_candidates(engine, error);
+    let body = checkout_error_with_candidates(engine, error, None);
     engine.emit(Event::Notification(Notification {
         id: format!("checkout-unavailable-{session_id}"),
         kind: NotificationKind::CheckoutUnavailable,
@@ -47,14 +47,39 @@ fn emit_checkout_unavailable(
     }));
 }
 
-fn checkout_error_with_candidates(engine: &Engine, error: &dyn std::fmt::Display) -> String {
+fn emit_repository_checkout_unavailable(
+    engine: &Engine,
+    session_id: &str,
+    session_name: &str,
+    source_workspace: &str,
+    error: &dyn std::fmt::Display,
+) {
+    let body = checkout_error_with_candidates(engine, error, Some(source_workspace));
+    engine.emit(Event::Notification(Notification {
+        id: format!("checkout-unavailable-{session_id}"),
+        kind: NotificationKind::CheckoutUnavailable,
+        title: format!("Checkout unavailable — {session_name}"),
+        body,
+        session_id: Some(session_id.to_string()),
+        created_at: ninox_core::lifecycle::poller::now_millis(),
+    }));
+}
+
+fn checkout_error_with_candidates(
+    engine: &Engine,
+    error: &dyn std::fmt::Display,
+    source_workspace: Option<&str>,
+) -> String {
     let error = error.to_string();
-    if !error.contains("checkout-backed worker cap reached") {
+    if !error.contains("repository checkout pool saturated") {
         return error;
     }
+    let Some(source_workspace) = source_workspace else {
+        return error;
+    };
     let candidates = engine
         .store
-        .checkout_worker_candidates(None)
+        .checkout_worker_candidates_for_repository(source_workspace)
         .unwrap_or_default()
         .into_iter()
         .map(|worker| format!("{} ({:?}, {})", worker.session_id, worker.state, worker.workspace_path))
@@ -64,6 +89,42 @@ fn checkout_error_with_candidates(engine: &Engine, error: &dyn std::fmt::Display
     } else {
         format!("{error}; finish, release, or reap one of: {}", candidates.join(", "))
     }
+}
+
+fn checkout_capacity(
+    config: &AppConfig,
+    workspace: &str,
+) -> anyhow::Result<(bool, usize, String)> {
+    match ninox_core::worktree::RepositoryIdentity::resolve(std::path::Path::new(workspace)) {
+        Ok(repository) => Ok((
+            true,
+            config.validated_worker_checkout_cap_for_repository(&repository.top_level)?,
+            repository.top_level.to_string_lossy().into_owned(),
+        )),
+        Err(_) => Ok((
+            false,
+            config.validated_worker_checkout_default_cap()?,
+            workspace.to_string(),
+        )),
+    }
+}
+
+fn checkout_capacity_for_worker(
+    config: &AppConfig,
+    workspace: &str,
+    current_worker: Option<&ninox_core::types::WorkerIncarnation>,
+) -> anyhow::Result<(bool, usize, String)> {
+    if let Some(worker) = current_worker.filter(|worker| worker.checkout_backed) {
+        return Ok((
+            true,
+            config.validated_worker_checkout_cap_for_stored_repository(
+                std::path::Path::new(&worker.source_workspace),
+                worker.repository_key.as_deref(),
+            )?,
+            worker.source_workspace.clone(),
+        ));
+    }
+    checkout_capacity(config, workspace)
 }
 
 struct RuntimeStartGuard {
@@ -1615,7 +1676,12 @@ impl App {
                             match repo_root {
                                 Some(root) => {
                                     let source = root.to_string_lossy().into_owned();
-                                    let cap = match state.config.validated_worker_checkout_cap() {
+                                    let cap = match state
+                                        .config
+                                        .validated_worker_checkout_cap_for_repository(
+                                            std::path::Path::new(&source),
+                                        )
+                                    {
                                         Ok(cap) => cap,
                                         Err(error) => {
                                             let _ = state.engine.store.delete_spawning_session_snapshot(
@@ -1627,6 +1693,7 @@ impl App {
                                                 f.error = Some(checkout_error_with_candidates(
                                                     &state.engine,
                                                     &error,
+                                                    Some(&source),
                                                 ));
                                             }
                                             return Task::none();
@@ -1647,6 +1714,7 @@ impl App {
                                                     f.error = Some(checkout_error_with_candidates(
                                                         &state.engine,
                                                         &error,
+                                                        Some(&source),
                                                     ));
                                                 }
                                                 return Task::none();
@@ -1744,46 +1812,47 @@ impl App {
                             let source_workspace = exact_worktree_source
                                 .as_deref()
                                 .unwrap_or(workspace.as_str());
-                            let checkout_backed = exact_worktree_path
-                                || ninox_core::worktree::RepositoryIdentity::resolve(
-                                    std::path::Path::new(&workspace),
-                                )
-                                .is_ok();
+                            let (checkout_backed, checkout_cap, capacity_workspace) =
+                                match checkout_capacity(&config, source_workspace) {
+                                    Ok(capacity) => capacity,
+                                    Err(error) => {
+                                        emit_checkout_unavailable(&engine, &sid, &nm, &error);
+                                        let deleted = engine
+                                            .store
+                                            .delete_spawning_session_snapshot(
+                                                &sid, ts_i64, None,
+                                            )
+                                            .unwrap_or(false);
+                                        return if deleted {
+                                            Message::DiscardFailedSpawn {
+                                                session_id: sid,
+                                                started_at: ts_i64,
+                                            }
+                                        } else {
+                                            Message::Noop
+                                        };
+                                    }
+                                };
                             let incarnation = match prepared_incarnation {
                                 Some(incarnation) => incarnation,
                                 None => {
-                                    let checkout_cap = match config.validated_worker_checkout_cap()
-                                    {
-                                        Ok(cap) => cap,
-                                        Err(error) => {
-                                            emit_checkout_unavailable(&engine, &sid, &nm, &error);
-                                            let deleted = engine
-                                                .store
-                                                .delete_spawning_session_snapshot(
-                                                    &sid, ts_i64, None,
-                                                )
-                                                .unwrap_or(false);
-                                            return if deleted {
-                                                Message::DiscardFailedSpawn {
-                                                    session_id: sid,
-                                                    started_at: ts_i64,
-                                                }
-                                            } else {
-                                                Message::Noop
-                                            };
-                                        }
-                                    };
                                     match engine.store.prepare_worker_incarnation(
                                         &sid,
                                         None,
                                         ts_i64,
-                                        source_workspace,
+                                        &capacity_workspace,
                                         checkout_backed,
                                         checkout_cap,
                                     ) {
                                         Ok(incarnation) => incarnation,
                                         Err(error) => {
-                                            emit_checkout_unavailable(&engine, &sid, &nm, &error);
+                                            emit_repository_checkout_unavailable(
+                                                &engine,
+                                                &sid,
+                                                &nm,
+                                                &capacity_workspace,
+                                                &error,
+                                            );
                                             let deleted = engine
                                                 .store
                                                 .delete_spawning_session_snapshot(
@@ -2245,28 +2314,40 @@ impl App {
                         emit_checkout_unavailable(&engine, &id, &name, &error);
                         return Message::Noop;
                     }
-                    let checkout_backed = !is_orch
-                        && (current_worker.is_some_and(|worker| worker.checkout_backed)
-                            || ninox_core::worktree::RepositoryIdentity::resolve(
-                                std::path::Path::new(&plan.workspace),
-                            )
-                            .is_ok());
+                    let capacity_source = current_worker
+                        .as_ref()
+                        .map_or(plan.workspace.as_str(), |worker| {
+                            worker.source_workspace.as_str()
+                        });
                     let incarnation = if is_orch {
                         None
                     } else {
-                        match config.validated_worker_checkout_cap().and_then(|cap| {
-                            engine.store.prepare_worker_incarnation(
-                                &id,
-                                orch_id.as_deref(),
-                                ts,
-                                &plan.workspace,
-                                checkout_backed,
-                                cap,
-                            )
-                        }) {
+                        match checkout_capacity_for_worker(
+                            &config,
+                            capacity_source,
+                            current_worker.as_ref(),
+                        )
+                        .and_then(
+                            |(checkout_backed, cap, capacity_workspace)| {
+                                engine.store.prepare_worker_incarnation(
+                                    &id,
+                                    orch_id.as_deref(),
+                                    ts,
+                                    &capacity_workspace,
+                                    checkout_backed,
+                                    cap,
+                                )
+                            },
+                        ) {
                             Ok(incarnation) => Some(incarnation),
                             Err(error) => {
-                                emit_checkout_unavailable(&engine, &id, &name, &error);
+                                emit_repository_checkout_unavailable(
+                                    &engine,
+                                    &id,
+                                    &name,
+                                    capacity_source,
+                                    &error,
+                                );
                                 return Message::Noop;
                             }
                         }
@@ -6282,6 +6363,32 @@ mod tests {
             assert!(m.config.registry().enabled_names().contains(&"claude-code".to_string()));
             assert!(m.config.harnesses.is_empty(), "inert toggle must not write config");
         });
+    }
+
+    #[test]
+    fn refile_preserves_checkout_capacity_when_source_is_offline() {
+        let worker = ninox_core::types::WorkerIncarnation {
+            session_id: "worker".into(),
+            incarnation_id: "incarnation".into(),
+            orchestrator_id: Some("orch".into()),
+            started_at: 1,
+            source_workspace: "/offline/repository".into(),
+            workspace_path: "/offline/repository-w1".into(),
+            repository_key: Some("/offline/repository/.git".into()),
+            lease_id: Some("lease".into()),
+            checkout_backed: true,
+            state: ninox_core::types::WorkerIncarnationState::Retained,
+        };
+
+        let (checkout_backed, cap, source) = checkout_capacity_for_worker(
+            &AppConfig::default(),
+            &worker.source_workspace,
+            Some(&worker),
+        )
+        .unwrap();
+        assert!(checkout_backed);
+        assert_eq!(cap, 5);
+        assert_eq!(source, worker.source_workspace);
     }
 
     #[test]
