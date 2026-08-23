@@ -11,6 +11,7 @@ pub const FETCH_CHUNK: i64 = 300;
 #[derive(Debug, Clone, PartialEq)]
 pub struct StyledCell {
     pub c:         char,
+    pub zerowidth: Vec<char>,
     pub fg:        Color,
     pub bg:        Color,
     pub flags:     Flags,
@@ -59,6 +60,7 @@ pub fn parse_capture(bytes: &[u8], cols: u16) -> Vec<StyledLine> {
                 let cell = &grid[line][Column(col)];
                 StyledCell {
                     c:         cell.c,
+                    zerowidth: cell.zerowidth().unwrap_or_default().to_vec(),
                     fg:        cell.fg,
                     bg:        cell.bg,
                     flags:     cell.flags,
@@ -177,6 +179,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_capture_preserves_rtl_and_combining_cells() {
+        let lines = parse_capture("مرحبا ש\u{05b8}לום\n".as_bytes(), 40);
+        let text: String = lines[0]
+            .iter()
+            .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+            .flat_map(|cell| {
+                std::iter::once(cell.c).chain(cell.zerowidth.iter().copied())
+            })
+            .collect();
+        assert_eq!(text, "مرحبا ש\u{05b8}לום");
+    }
+
+    #[test]
     fn scroll_bookkeeping_requests_fetch_at_cache_edge() {
         let mut sb = Scrollback::default();
         // Empty cache: any scroll up needs a fetch.
@@ -220,6 +235,7 @@ mod tests {
         let mk = |ch: char| {
             vec![StyledCell {
             c: ch,
+            zerowidth: Vec::new(),
                 fg: alacritty_terminal::vte::ansi::Color::Named(
                     alacritty_terminal::vte::ansi::NamedColor::Foreground,
                 ),

@@ -6,6 +6,7 @@ use iced::widget::canvas::{Cache, Frame, Geometry, Path};
 use iced::{Color as IcedColor, Rectangle, Size, Theme};
 
 use crate::app::Message;
+use crate::components::terminal_layout::{layout_line, LogicalCell, VisualLine};
 
 const NERD_FONT: iced::Font = iced::Font {
     family: iced::font::Family::Name("Symbols Nerd Font Mono"),
@@ -304,10 +305,13 @@ pub fn ansi_to_iced(
 
 #[derive(Default, Clone)]
 pub struct SelectionState {
-    /// Anchor cell (col, row) where the drag started.
+    /// Logical anchor cell used for links and source-text compatibility.
     anchor: Option<(usize, usize)>,
-    /// Current end cell while dragging.
+    /// Logical end cell used for source-text compatibility.
     end: Option<(usize, usize)>,
+    /// Visual endpoints preserve the exact painted span on BiDi rows.
+    visual_anchor: Option<(usize, usize)>,
+    visual_end:    Option<(usize, usize)>,
     dragging: bool,
     /// Whether the cursor moved after the press (distinguishes click from drag).
     moved: bool,
@@ -320,15 +324,28 @@ pub struct SelectionState {
 }
 
 impl SelectionState {
-    /// Normalised (start, end) in reading order, or None if no selection.
-    fn range(&self) -> Option<((usize, usize), (usize, usize))> {
-        let (a_col, a_row) = self.anchor?;
-        let (e_col, e_row) = self.end?;
+    fn normalized_range(
+        anchor: Option<(usize, usize)>,
+        end: Option<(usize, usize)>,
+    ) -> Option<((usize, usize), (usize, usize))> {
+        let (a_col, a_row) = anchor?;
+        let (e_col, e_row) = end?;
         if a_row < e_row || (a_row == e_row && a_col <= e_col) {
             Some(((a_col, a_row), (e_col, e_row)))
         } else {
             Some(((e_col, e_row), (a_col, a_row)))
         }
+    }
+
+    /// Normalised logical endpoints for legacy/programmatic selections.
+    fn range(&self) -> Option<((usize, usize), (usize, usize))> {
+        Self::normalized_range(self.anchor, self.end)
+    }
+
+    /// Normalised painted endpoints, falling back to logical coordinates for
+    /// programmatic selections that predate visual tracking.
+    fn visual_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        Self::normalized_range(self.visual_anchor, self.visual_end).or_else(|| self.range())
     }
 
     fn pixel_to_cell(
@@ -372,6 +389,45 @@ fn renderable_cursor(term: &Term<EventProxy>) -> alacritty_terminal::term::Rende
     term.renderable_content().cursor
 }
 
+#[derive(Clone)]
+struct DisplayCell {
+    c:         char,
+    zerowidth: Vec<char>,
+    fg:        Color,
+    bg:        Color,
+    flags:     Flags,
+}
+
+impl Default for DisplayCell {
+    fn default() -> Self {
+        Self {
+            c:         ' ',
+            zerowidth: Vec::new(),
+            fg:        Color::Named(NamedColor::Foreground),
+            bg:        Color::Named(NamedColor::Background),
+            flags:     Flags::empty(),
+        }
+    }
+}
+
+fn visual_layout(cells: &[DisplayCell]) -> VisualLine {
+    let logical: Vec<_> = cells
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+        .map(|(column, cell)| {
+            let mut text = String::from(if cell.c == '\0' { ' ' } else { cell.c });
+            text.extend(cell.zerowidth.iter().copied());
+            LogicalCell {
+                column,
+                text,
+                width: if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 },
+            }
+        })
+        .collect();
+    layout_line(&logical, cells.len())
+}
+
 // ---------------------------------------------------------------------------
 // TerminalWidget — iced canvas Program
 // ---------------------------------------------------------------------------
@@ -391,6 +447,70 @@ pub struct TerminalWidget<'a> {
 }
 
 impl<'a> TerminalWidget<'a> {
+    fn row_display_cells(&self, row: usize) -> Option<Vec<DisplayCell>> {
+        use alacritty_terminal::index::{Column, Line};
+
+        let grid = self.state.term.grid();
+        let cols = grid.columns();
+        if row >= grid.screen_lines() {
+            return None;
+        }
+        let logical = row as i32 - self.state.scrollback.offset as i32;
+        if logical < 0 {
+            let history = self.state.scrollback.line_above((-logical - 1) as usize)?;
+            let mut cells: Vec<_> = history
+                .iter()
+                .take(cols)
+                .map(|cell| DisplayCell {
+                    c:         cell.c,
+                    zerowidth: cell.zerowidth.clone(),
+                    fg:        cell.fg,
+                    bg:        cell.bg,
+                    flags:     cell.flags,
+                })
+                .collect();
+            cells.resize(cols, DisplayCell::default());
+            Some(cells)
+        } else {
+            Some(
+                (0..cols)
+                    .map(|column| {
+                        let cell = &grid[Line(logical)][Column(column)];
+                        DisplayCell {
+                            c:         cell.c,
+                            zerowidth: cell.zerowidth().unwrap_or_default().to_vec(),
+                            fg:        cell.fg,
+                            bg:        cell.bg,
+                            flags:     cell.flags,
+                        }
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    fn pixel_to_logical_cell(
+        &self,
+        x: f32,
+        y: f32,
+        cell_w: f32,
+        cell_h: f32,
+        cols: usize,
+        rows: usize,
+    ) -> (usize, usize) {
+        let (visual_col, row) =
+            SelectionState::pixel_to_cell(x, y, cell_w, cell_h, cols, rows);
+        self.visual_to_logical_cell(visual_col, row)
+    }
+
+    fn visual_to_logical_cell(&self, visual_col: usize, row: usize) -> (usize, usize) {
+        let logical_col = self
+            .row_display_cells(row)
+            .map(|cells| visual_layout(&cells).visual_to_logical[visual_col])
+            .unwrap_or(visual_col);
+        (logical_col, row)
+    }
+
     /// The link-detection view of viewport row `row`: each cell's rendered
     /// character plus its OSC 8 hyperlink URI, if any, from either the live
     /// grid or cached scrollback history. Empty if `row` is out of bounds or
@@ -453,7 +573,7 @@ impl<'a> TerminalWidget<'a> {
     }
 
     /// The URL under viewport cell (col, row), if any.
-    fn link_at(&self, col: usize, row: usize) -> Option<String> {
+    fn link_at_logical(&self, col: usize, row: usize) -> Option<String> {
         let mut hyperlink_storage = Vec::new();
         crate::components::links::link_at(&self.row_link_cells(row, &mut hyperlink_storage), col)
     }
@@ -463,10 +583,61 @@ impl<'a> TerminalWidget<'a> {
     /// auto-copy and the explicit Cmd+C / Ctrl+Shift+C shortcut so the two
     /// paths can't drift apart.
     fn copy_message(&self, sel: &SelectionState) -> Option<Message> {
-        sel.range()
-            .map(|((sc, sr), (ec, er))| extract_selection(self.state, sc, sr, ec, er))
+        let selected = if sel.visual_anchor.is_some() && sel.visual_end.is_some() {
+            sel.visual_range()
+                .map(|((sc, sr), (ec, er))| self.extract_visual_selection(sc, sr, ec, er))
+        } else {
+            sel.range()
+                .map(|((sc, sr), (ec, er))| extract_selection(self.state, sc, sr, ec, er))
+        };
+        selected
             .filter(|s| !s.trim().is_empty())
             .map(Message::CopyToClipboard)
+    }
+
+    fn extract_visual_selection(
+        &self,
+        start_col: usize,
+        start_row: usize,
+        end_col: usize,
+        end_row: usize,
+    ) -> String {
+        let cols = self.state.term.grid().columns();
+        let rows = self.state.term.grid().screen_lines();
+        let mut out = String::new();
+
+        for row in start_row..=end_row.min(rows.saturating_sub(1)) {
+            let Some(cells) = self.row_display_cells(row) else {
+                continue;
+            };
+            let col_start = if row == start_row { start_col } else { 0 };
+            let col_end = if row == end_row {
+                end_col
+            } else {
+                cols.saturating_sub(1)
+            }
+            .min(cols.saturating_sub(1));
+            let layout = visual_layout(&cells);
+            let mut logical_columns =
+                layout.visual_to_logical[col_start.min(col_end)..=col_end].to_vec();
+            logical_columns.sort_unstable();
+            logical_columns.dedup();
+
+            let mut line_text = String::new();
+            for logical_col in logical_columns {
+                let cell = &cells[logical_col];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
+                line_text.extend(cell.zerowidth.iter().copied());
+            }
+            out.push_str(line_text.trim_end());
+            if row < end_row {
+                out.push('\n');
+            }
+        }
+        out
     }
 }
 
@@ -491,10 +662,13 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
         match &event {
             Event::Mouse(MouseEvent::ButtonPressed(Button::Left)) => {
                 if let Some(pos) = cursor.position_in(bounds) {
-                    let cell =
+                    let visual =
                         SelectionState::pixel_to_cell(pos.x, pos.y, cell_w, cell_h, cols, rows);
-                    state.anchor   = Some(cell);
-                    state.end      = Some(cell);
+                    let logical = self.visual_to_logical_cell(visual.0, visual.1);
+                    state.anchor = Some(logical);
+                    state.end = Some(logical);
+                    state.visual_anchor = Some(visual);
+                    state.visual_end = Some(visual);
                     state.dragging = true;
                     state.moved    = false;
                 }
@@ -507,19 +681,21 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                 let hovering = cursor
                     .position_in(bounds)
                     .map(|pos| {
-                        SelectionState::pixel_to_cell(pos.x, pos.y, cell_w, cell_h, cols, rows)
+                        self.pixel_to_logical_cell(pos.x, pos.y, cell_w, cell_h, cols, rows)
                     })
-                    .is_some_and(|(col, row)| self.link_at(col, row).is_some());
+                    .is_some_and(|(col, row)| self.link_at_logical(col, row).is_some());
                 state.hovering_link = hovering;
 
                 if state.dragging {
                     if let Some(pos) = cursor.position_in(bounds) {
-                        let cell =
+                        let visual =
                             SelectionState::pixel_to_cell(pos.x, pos.y, cell_w, cell_h, cols, rows);
-                        if state.anchor != Some(cell) {
+                        let logical = self.visual_to_logical_cell(visual.0, visual.1);
+                        if state.visual_anchor != Some(visual) {
                             state.moved = true;
                         }
-                        state.end = Some(cell);
+                        state.end = Some(logical);
+                        state.visual_end = Some(visual);
                         self.state.cache.clear();
                         return (iced::widget::canvas::event::Status::Captured, None);
                     }
@@ -534,10 +710,15 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                     // the pointer; further movement while still past the
                     // edge keeps extending/scrolling one step per event.
                     if let Some(pos) = cursor.position() {
-                        let col = ((pos.x - bounds.x) / cell_w) as usize;
-                        let col = col.min(cols.saturating_sub(1));
+                        let visual_col = ((pos.x - bounds.x) / cell_w) as usize;
+                        let visual_col = visual_col.min(cols.saturating_sub(1));
                         if pos.y < bounds.y {
+                            let col = self
+                                .row_display_cells(0)
+                                .map(|cells| visual_layout(&cells).visual_to_logical[visual_col])
+                                .unwrap_or(visual_col);
                             state.end = Some((col, 0));
+                            state.visual_end = Some((visual_col, 0));
                             state.moved = true;
                             self.state.cache.clear();
                             return (
@@ -549,7 +730,13 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                                 }),
                             );
                         } else if pos.y > bounds.y + bounds.height {
-                            state.end = Some((col, rows.saturating_sub(1)));
+                            let row = rows.saturating_sub(1);
+                            let col = self
+                                .row_display_cells(row)
+                                .map(|cells| visual_layout(&cells).visual_to_logical[visual_col])
+                                .unwrap_or(visual_col);
+                            state.end = Some((col, row));
+                            state.visual_end = Some((visual_col, row));
                             state.moved = true;
                             self.state.cache.clear();
                             return (
@@ -580,9 +767,11 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                         (state.anchor, cursor.position_in(bounds))
                     {
                         let _ = pos; // bounds-checked via anchor
-                        if let Some(url) = self.link_at(col, row) {
+                        if let Some(url) = self.link_at_logical(col, row) {
                             state.anchor = None;
                             state.end    = None;
+                            state.visual_anchor = None;
+                            state.visual_end = None;
                             return (
                                 iced::widget::canvas::event::Status::Captured,
                                 Some(Message::OpenUrl(url)),
@@ -592,6 +781,8 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                         if self.session_ids.iter().any(|id| id == &word) {
                             state.anchor = None;
                             state.end    = None;
+                            state.visual_anchor = None;
+                            state.visual_end = None;
                             return (
                                 iced::widget::canvas::event::Status::Captured,
                                 Some(Message::NavigateSession(word)),
@@ -600,6 +791,8 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                     }
                     state.anchor = None;
                     state.end    = None;
+                    state.visual_anchor = None;
+                    state.visual_end = None;
                     return (iced::widget::canvas::event::Status::Captured, None);
                 }
                 // Drag — copy the selection.
@@ -723,87 +916,89 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
 
                 let logical = row as i32 - offset;
                 let y = row as f32 * cell_h;
-
-                if logical < 0 {
-                    // History line fetched from tmux capture-pane. Content
-                    // between the cached snapshot and the live screen may be
-                    // stale/missing until jump-to-latest — accepted
-                    // trade-off, not a bug (see Scrollback docs).
-                    let Some(cells) = self.state.scrollback.line_above((-logical - 1) as usize)
-                    else {
-                        continue;
-                    };
-                    let link_spans = self.row_link_spans(row);
-                    for (col, cell) in cells.iter().enumerate().take(cols) {
-                        let x = col as f32 * cell_w;
-                        let is_selected = cell_is_selected(sel, row, col);
-                            let is_link = link_spans
-                                .iter()
-                                .any(|s| col >= s.start_col && col <= s.end_col);
-                        draw_cell(
-                                frame,
-                                x,
-                                y,
-                                cell_w,
-                                cell_h,
-                                self.font_size,
-                                cell.c,
-                                cell.fg,
-                                cell.bg,
-                                cell.flags,
-                            false, // cursor never draws in history
-                                cursor_shape,
-                                is_selected,
-                                is_link,
-                                colors,
-                                &self.ansi,
-                                term_bg,
-                                term_fg,
-                                cursor_color,
-                        );
-                    }
+                let Some(cells) = self.row_display_cells(row) else {
                     continue;
-                }
-
-                let line = Line(logical);
+                };
+                let layout = visual_layout(&cells);
                 let link_spans = self.row_link_spans(row);
-                for col in 0..cols {
-                    let column = Column(col);
-                    let cell = &grid[line][column];
-                    let x = col as f32 * cell_w;
+                let mut shaped = vec![false; cols];
+                for run in layout.runs.iter().filter(|run| run.rtl) {
+                    shaped[run.visual_start..(run.visual_start + run.visual_width).min(cols)]
+                        .fill(true);
+                }
+                for (visual_col, is_shaped) in shaped.iter().copied().enumerate() {
+                    let logical_col = layout.visual_to_logical[visual_col];
+                    let cell = &cells[logical_col];
+                    let x = visual_col as f32 * cell_w;
 
                     // The cursor is suppressed whenever the view is scrolled
                     // back — it lives on the live screen, not in history.
-                        let is_cursor = offset == 0
-                            && cursor_point.line == line
-                            && cursor_point.column == column;
-                    let is_selected = cell_is_selected(sel, row, col);
-                        let is_link = link_spans
-                            .iter()
-                            .any(|s| col >= s.start_col && col <= s.end_col);
+                    let is_cursor = offset == 0
+                        && logical >= 0
+                        && cursor_point.line == Line(logical)
+                        && cursor_point.column == Column(logical_col);
+                    let is_selected = cell_is_selected(sel, row, visual_col);
+                    let is_link = link_spans
+                        .iter()
+                        .any(|span| {
+                            logical_col >= span.start_col && logical_col <= span.end_col
+                        });
 
                     draw_cell(
+                        frame,
+                        x,
+                        y,
+                        cell_w,
+                        cell_h,
+                        self.font_size,
+                        if is_shaped || !cell.zerowidth.is_empty() { ' ' } else { cell.c },
+                        cell.fg,
+                        cell.bg,
+                        cell.flags,
+                        is_cursor,
+                        cursor_shape,
+                        is_selected,
+                        is_link,
+                        colors,
+                        &self.ansi,
+                        term_bg,
+                        term_fg,
+                        cursor_color,
+                    );
+                    if !is_shaped && !cell.zerowidth.is_empty() {
+                        draw_combining_cell(
                             frame,
                             x,
                             y,
                             cell_w,
                             cell_h,
                             self.font_size,
-                            cell.c,
-                            cell.fg,
-                            cell.bg,
-                            cell.flags,
-                            is_cursor,
-                            cursor_shape,
-                            is_selected,
-                            is_link,
+                            cell,
+                            is_cursor && cursor_shape == CursorShape::Block,
                             colors,
                             &self.ansi,
                             term_bg,
                             term_fg,
-                            cursor_color,
-                    );
+                        );
+                    }
                 }
+                draw_glyph_runs(
+                    frame,
+                    &layout,
+                    &cells,
+                    y,
+                    cell_w,
+                    cell_h,
+                    self.font_size,
+                    logical,
+                    offset,
+                    cursor_point,
+                    cursor_shape,
+                    colors,
+                    &self.ansi,
+                    term_bg,
+                    term_fg,
+                );
             }
         });
 
@@ -826,7 +1021,7 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
 
 /// Whether canvas cell (col, row) falls inside the current drag selection.
 fn cell_is_selected(sel: &SelectionState, row: usize, col: usize) -> bool {
-    sel.range()
+    sel.visual_range()
         .map(|((sc, sr), (ec, er))| {
         let in_row = row >= sr && row <= er;
             if !in_row {
@@ -856,6 +1051,193 @@ fn stroke_line(frame: &mut Frame, x1: f32, y1: f32, x2: f32, y2: f32, color: Ice
     );
 }
 
+fn resolved_cell_colors(
+    fg_color: Color,
+    bg_color: Color,
+    flags: Flags,
+    colors: &alacritty_terminal::term::color::Colors,
+    ansi: &[IcedColor; 16],
+    term_bg: IcedColor,
+    term_fg: IcedColor,
+) -> (IcedColor, IcedColor) {
+    let mut fg = ansi_to_iced(fg_color, colors, ansi, term_bg, term_fg);
+    let mut bg = ansi_to_iced(bg_color, colors, ansi, term_bg, term_fg);
+    if flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if flags.contains(Flags::DIM) {
+        fg.a *= 0.6;
+    }
+    if flags.contains(Flags::HIDDEN) {
+        fg = bg;
+    }
+    (fg, bg)
+}
+
+fn shaped_run_width(content: &str, font: iced::Font, font_size: f32) -> f32 {
+    use iced::advanced::graphics::text::{self, cosmic_text};
+
+    let mut font_system = text::font_system().write().expect("write font system");
+    let mut buffer = cosmic_text::BufferLine::new(
+        content,
+        cosmic_text::LineEnding::default(),
+        cosmic_text::AttrsList::new(text::to_attributes(font)),
+        cosmic_text::Shaping::Advanced,
+    );
+    buffer
+        .layout(
+            font_system.raw(),
+            font_size,
+            None,
+            cosmic_text::Wrap::None,
+            None,
+            4,
+        )
+        .iter()
+        .map(|line| line.w)
+        .fold(0.0, f32::max)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_combining_cell(
+    frame: &mut Frame,
+    x: f32,
+    y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    font_size: f32,
+    cell: &DisplayCell,
+    block_cursor: bool,
+    colors: &alacritty_terminal::term::color::Colors,
+    ansi: &[IcedColor; 16],
+    term_bg: IcedColor,
+    term_fg: IcedColor,
+) {
+    let font = font_for_cell(cell.c, cell.flags);
+    let (mut fg, _) =
+        resolved_cell_colors(cell.fg, cell.bg, cell.flags, colors, ansi, term_bg, term_fg);
+    if block_cursor {
+        fg = term_bg;
+    }
+    let mut content = String::from(CONTEXTUAL_FONT_ANCHOR);
+    content.push(cell.c);
+    content.extend(cell.zerowidth.iter().copied());
+    let natural_width = shaped_run_width(&content, font, font_size);
+    let target_width = if cell.flags.contains(Flags::WIDE_CHAR) {
+        2.0 * cell_w
+    } else {
+        cell_w
+    };
+    let scale_x = if natural_width > 0.0 { target_width / natural_width } else { 1.0 };
+    let clip = Rectangle::new(iced::Point::new(x, y), Size::new(target_width, cell_h));
+    frame.with_clip(clip, |frame| {
+        frame.with_save(|frame| {
+            frame.scale_nonuniform(iced::Vector::new(scale_x, 1.0));
+            frame.fill_text(iced::widget::canvas::Text {
+                content,
+                position: iced::Point::new(x / scale_x, y),
+                color: fg,
+                size: iced::Pixels(font_size),
+                font,
+                horizontal_alignment: iced::alignment::Horizontal::Left,
+                vertical_alignment: iced::alignment::Vertical::Top,
+                line_height: iced::widget::text::LineHeight::Relative(cell_h / font_size),
+                shaping: iced::widget::text::Shaping::Advanced,
+            });
+        });
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_glyph_runs(
+    frame: &mut Frame,
+    layout: &VisualLine,
+    cells: &[DisplayCell],
+    y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    font_size: f32,
+    logical_row: i32,
+    scroll_offset: i32,
+    cursor_point: alacritty_terminal::index::Point,
+    cursor_shape: CursorShape,
+    colors: &alacritty_terminal::term::color::Colors,
+    ansi: &[IcedColor; 16],
+    term_bg: IcedColor,
+    term_fg: IcedColor,
+) {
+    use alacritty_terminal::index::{Column, Line};
+
+    for run in layout.runs.iter().filter(|run| run.rtl) {
+        let start_x = run.visual_start as f32 * cell_w;
+        let end_x = (run.visual_start + run.visual_width) as f32 * cell_w;
+        let content = format!("{CONTEXTUAL_FONT_ANCHOR}{}", run.text);
+
+        // Render the same fully shaped run through style-span clips. This keeps
+        // joining context across SGR boundaries while preserving each span's
+        // color and fixed cell geometry.
+        let run_end = run.visual_start + run.visual_width;
+        let glyph_style = |visual_col: usize| {
+            let logical_col = layout.visual_to_logical[visual_col];
+            let cell = &cells[logical_col];
+            let (mut fg, _) = resolved_cell_colors(
+                cell.fg, cell.bg, cell.flags, colors, ansi, term_bg, term_fg,
+            );
+            let block_cursor = scroll_offset == 0
+                && logical_row >= 0
+                && cursor_point.line == Line(logical_row)
+                && cursor_point.column == Column(logical_col)
+                && cursor_shape == CursorShape::Block;
+            if block_cursor {
+                fg = term_bg;
+            }
+            (font_for_cell(cell.c, cell.flags), fg)
+        };
+        let mut visual_col = run.visual_start;
+        while visual_col < run_end {
+            let (font, fg) = glyph_style(visual_col);
+            let mut span_end = visual_col + 1;
+            while span_end < run_end && glyph_style(span_end) == (font, fg) {
+                span_end += 1;
+            }
+            let clip = Rectangle::new(
+                iced::Point::new(visual_col as f32 * cell_w, y),
+                Size::new((span_end - visual_col) as f32 * cell_w, cell_h),
+            );
+            let natural_width = shaped_run_width(&content, font, font_size);
+            let scale_x = if natural_width > 0.0 {
+                (run.visual_width as f32 * cell_w) / natural_width
+            } else {
+                1.0
+            };
+            frame.with_clip(clip, |frame| {
+                frame.with_save(|frame| {
+                    frame.scale_nonuniform(iced::Vector::new(scale_x, 1.0));
+                    frame.fill_text(iced::widget::canvas::Text {
+                        content: content.clone(),
+                        position: iced::Point::new(
+                            if run.rtl { end_x / scale_x } else { start_x / scale_x },
+                            y,
+                        ),
+                        color: fg,
+                        size: iced::Pixels(font_size),
+                        font,
+                        horizontal_alignment: if run.rtl {
+                            iced::alignment::Horizontal::Right
+                        } else {
+                            iced::alignment::Horizontal::Left
+                        },
+                        vertical_alignment: iced::alignment::Vertical::Top,
+                        line_height: iced::widget::text::LineHeight::Relative(cell_h / font_size),
+                        shaping: iced::widget::text::Shaping::Advanced,
+                    });
+                });
+            });
+            visual_col = span_end;
+        }
+    }
+}
+
 /// Draw one terminal cell (background/cursor/selection rect + glyph +
 /// decorations). Shared by live grid rows and tmux-history rows so both
 /// render identically — style resolution (fg/bg/flags → colors+font) lives
@@ -883,17 +1265,8 @@ fn draw_cell(
     cursor_color: IcedColor,
 ) {
     // Resolve colors, then apply attribute transforms.
-    let mut fg = ansi_to_iced(fg_color, colors, ansi, term_bg, term_fg);
-    let mut bg = ansi_to_iced(bg_color, colors, ansi, term_bg, term_fg);
-    if flags.contains(Flags::INVERSE) {
-        std::mem::swap(&mut fg, &mut bg);
-    }
-    if flags.contains(Flags::DIM) {
-        fg.a *= 0.6;
-    }
-    if flags.contains(Flags::HIDDEN) {
-        fg = bg;
-    }
+    let (fg, bg) =
+        resolved_cell_colors(fg_color, bg_color, flags, colors, ansi, term_bg, term_fg);
 
     // Block cursor is a filled rect with an inverted glyph — the historical
     // behavior. Beam/Underline/HollowBlock draw the cell normally and
@@ -1088,14 +1461,22 @@ pub fn extract_selection(
             // History row — same index math as the draw path.
             if let Some(cells) = state.scrollback.line_above((-logical - 1) as usize) {
                 for cell in cells.iter().skip(col_start).take(col_end + 1 - col_start) {
+                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                        continue;
+                    }
                     line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
+                    line_text.extend(cell.zerowidth.iter().copied());
                 }
             }
         } else {
             let line = Line(logical);
             for col in col_start..=col_end {
                 let cell = &grid[line][Column(col)];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
                 line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
+                line_text.extend(cell.zerowidth().unwrap_or_default().iter().copied());
             }
         }
         // Strip trailing spaces from each line.
@@ -1297,6 +1678,287 @@ mod tests {
         assert_ne!(visible.glyph_id, 0);
     }
 
+    fn shaped_glyphs_by_character(text: &str, per_cell: bool) -> Vec<u16> {
+        use iced::advanced::graphics::text::cosmic_text;
+
+        let mut fonts = cosmic_text::FontSystem::new();
+        fonts.db_mut().load_font_data(TERM_FONT_BYTES.to_vec());
+        let attrs =
+            cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrains Mono"));
+
+        if per_cell {
+            return text
+                .chars()
+                .map(|character| {
+                    let mut buffer =
+                        cosmic_text::Buffer::new(&mut fonts, cosmic_text::Metrics::new(13.0, 18.0));
+                    let content = format!("{CONTEXTUAL_FONT_ANCHOR}{character}");
+                    buffer.set_text(
+                        &mut fonts,
+                        &content,
+                        attrs,
+                        cosmic_text::Shaping::Advanced,
+                    );
+                    buffer
+                        .layout_runs()
+                        .next()
+                        .unwrap()
+                        .glyphs
+                        .iter()
+                        .find(|glyph| glyph.start >= CONTEXTUAL_FONT_ANCHOR.len_utf8())
+                        .unwrap()
+                        .glyph_id
+                })
+                .collect();
+        }
+
+        let mut buffer =
+            cosmic_text::Buffer::new(&mut fonts, cosmic_text::Metrics::new(13.0, 18.0));
+        buffer.set_text(&mut fonts, text, attrs, cosmic_text::Shaping::Advanced);
+        let glyphs = buffer.layout_runs().next().unwrap().glyphs;
+        text.char_indices()
+            .map(|(start, _)| {
+                glyphs
+                    .iter()
+                    .find(|glyph| glyph.start <= start && start < glyph.end)
+                    .unwrap()
+                    .glyph_id
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fragmented_utf8_reaches_logical_terminal_cells_unchanged() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let text = "مرحبا שלום";
+        let mut state = TerminalState::new(20, 1, None);
+        for fragment in text.as_bytes().chunks(2) {
+            state.process(fragment);
+        }
+
+        let cells: String = (0..text.chars().count())
+            .map(|column| state.term.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert_eq!(cells, text);
+    }
+
+    #[test]
+    fn arabic_cells_are_contextually_shaped() {
+        let text = "مرحبا";
+        let isolated = shaped_glyphs_by_character(text, true);
+        let contextual = shaped_glyphs_by_character(text, false);
+        let layout = visual_layout(
+            &text
+                .chars()
+                .map(|c| DisplayCell { c, ..DisplayCell::default() })
+                .collect::<Vec<_>>(),
+        );
+
+        assert_ne!(isolated, contextual, "test must distinguish joining forms");
+        assert_eq!(layout.runs.len(), 1);
+        assert_eq!(layout.runs[0].text, text);
+        assert_eq!(
+            shaped_glyphs_by_character(&layout.runs[0].text, false),
+            contextual
+        );
+    }
+
+    #[test]
+    fn proportional_rtl_fallback_is_normalized_to_terminal_cell_width() {
+        let text = format!("{CONTEXTUAL_FONT_ANCHOR}مرحبا");
+        let natural_width = shaped_run_width(&text, TERM_FONT, FONT_SIZE);
+        let target_width = 5.0 * cell_size(FONT_SIZE).0;
+        assert!(natural_width > 0.0);
+        let scale = target_width / natural_width;
+        assert!((natural_width * scale - target_width).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn mixed_direction_line_is_painted_in_unicode_visual_order() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let logical = "English مرحبا 123, שלום!";
+        let mut state = TerminalState::new(40, 1, None);
+        state.process(logical.as_bytes());
+        let currently_painted: String = (0..logical.chars().count())
+            .map(|column| state.term.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert_eq!(
+            currently_painted, logical,
+            "the emulator grid must stay in logical order"
+        );
+
+        let bidi = unicode_bidi::BidiInfo::new(logical, None);
+        let paragraph = &bidi.paragraphs[0];
+        let expected = bidi.reorder_line(paragraph, paragraph.range.clone());
+        let cells = (0..logical.chars().count())
+            .map(|column| {
+                let cell = &state.term.grid()[Line(0)][Column(column)];
+                DisplayCell {
+                    c:         cell.c,
+                    zerowidth: cell.zerowidth().unwrap_or_default().to_vec(),
+                    fg:        cell.fg,
+                    bg:        cell.bg,
+                    flags:     cell.flags,
+                }
+            })
+            .collect::<Vec<_>>();
+        let layout = visual_layout(&cells);
+        let visually_painted: String = layout.visual_to_logical
+            [..logical.chars().count()]
+            .iter()
+            .map(|&column| state.term.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert_eq!(
+            visually_painted, expected,
+            "the visual mapping must apply line-level BiDi"
+        );
+    }
+
+    #[test]
+    fn mixed_direction_cursor_and_hit_testing_map_back_to_logical_cells() {
+        let logical = "abc مرحبا 123";
+        let mut state = TerminalState::new(20, 2, None);
+        state.process(logical.as_bytes());
+        state.process(b"\x1b[1;6H");
+        let widget = test_widget(&state);
+        let cells = widget.row_display_cells(0).unwrap();
+        let layout = visual_layout(&cells);
+        let cursor_logical = state.term.grid().cursor.point.column.0;
+        let cursor_visual = layout.logical_to_visual[cursor_logical];
+        assert_eq!(layout.visual_to_logical[cursor_visual], cursor_logical);
+
+        let (cell_w, cell_h) = cell_size(FONT_SIZE);
+        for visual in 0..logical.chars().count() {
+            let hit = widget.pixel_to_logical_cell(
+                (visual as f32 + 0.5) * cell_w,
+                cell_h / 2.0,
+                cell_w,
+                cell_h,
+                20,
+                2,
+            );
+            assert_eq!(hit, (layout.visual_to_logical[visual], 0));
+        }
+    }
+
+    #[test]
+    fn mixed_direction_drag_selects_visual_cells_and_copies_source_order() {
+        use iced::mouse::Button;
+        use iced::widget::canvas::Program;
+
+        let mut state = TerminalState::new(20, 2, None);
+        state.process("abc אבג xyz".as_bytes());
+        let widget = test_widget(&state);
+        let (cell_w, cell_h) = cell_size(FONT_SIZE);
+        let bounds =
+            Rectangle::new(iced::Point::ORIGIN, Size::new(20.0 * cell_w, 2.0 * cell_h));
+        let mut selection = SelectionState::default();
+        let start = iced::Point::new(3.5 * cell_w, 0.5 * cell_h);
+        let end = iced::Point::new(4.5 * cell_w, 0.5 * cell_h);
+
+        widget.update(
+            &mut selection,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::ButtonPressed(Button::Left)),
+            bounds,
+            iced::mouse::Cursor::Available(start),
+        );
+        widget.update(
+            &mut selection,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
+            bounds,
+            iced::mouse::Cursor::Available(end),
+        );
+
+        let cells = widget.row_display_cells(0).unwrap();
+        let layout = visual_layout(&cells);
+        let highlighted: Vec<_> = layout
+            .visual_to_logical
+            .iter()
+            .enumerate()
+            .filter_map(|(visual, _)| {
+                cell_is_selected(&selection, 0, visual).then_some(visual)
+            })
+            .collect();
+        assert_eq!(highlighted, vec![3, 4]);
+        assert!(matches!(
+            widget.copy_message(&selection),
+            Some(Message::CopyToClipboard(text)) if text == " ג"
+        ));
+    }
+
+    #[test]
+    fn selection_copy_stays_logical_and_preserves_combining_and_bidi_controls() {
+        let logical = "A\u{2067}ש\u{05b8}לום\u{2069} 123";
+        let mut state = TerminalState::new(30, 2, None);
+        state.process(logical.as_bytes());
+
+        let copied = extract_selection(&state, 0, 0, 10, 0);
+        assert_eq!(copied, logical);
+        assert!(copied.contains('\u{2067}'));
+        assert!(copied.contains('\u{2069}'));
+        assert!(copied.contains('\u{05b8}'));
+    }
+
+    #[test]
+    fn latin_emoji_cjk_and_combining_clusters_keep_terminal_widths() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let logical = "A e\u{301} 🙂 界";
+        let mut state = TerminalState::new(20, 2, None);
+        state.process(logical.as_bytes());
+        let grid = state.term.grid();
+        assert_eq!(grid[Line(0)][Column(2)].c, 'e');
+        assert_eq!(
+            grid[Line(0)][Column(2)].zerowidth().unwrap_or_default(),
+            &['\u{301}']
+        );
+        assert!(grid[Line(0)][Column(4)].flags.contains(Flags::WIDE_CHAR));
+        assert!(
+            grid[Line(0)][Column(5)]
+                .flags
+                .contains(Flags::WIDE_CHAR_SPACER)
+        );
+        assert!(grid[Line(0)][Column(7)].flags.contains(Flags::WIDE_CHAR));
+        assert!(
+            grid[Line(0)][Column(8)]
+                .flags
+                .contains(Flags::WIDE_CHAR_SPACER)
+        );
+
+        let layout = visual_layout(&test_widget(&state).row_display_cells(0).unwrap());
+        for logical in 0..20 {
+            let visual = layout.logical_to_visual[logical];
+            assert_eq!(layout.visual_to_logical[visual], logical);
+        }
+    }
+
+    #[test]
+    fn wraps_and_resize_reflow_recompute_visual_layout_from_logical_grid() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let mut state = TerminalState::new(8, 3, None);
+        state.process("abc مرحبا xyz".as_bytes());
+        assert!(
+            state.term.grid()[Line(0)][Column(7)]
+                .flags
+                .contains(Flags::WRAPLINE)
+        );
+        let before = visual_layout(&test_widget(&state).row_display_cells(0).unwrap());
+        assert_ne!(before.visual_to_logical, (0..8).collect::<Vec<_>>());
+
+        state.resize(12, 3);
+        let widget = test_widget(&state);
+        for row in 0..3 {
+            let layout = visual_layout(&widget.row_display_cells(row).unwrap());
+            for logical in 0..12 {
+                let visual = layout.logical_to_visual[logical];
+                assert_eq!(layout.visual_to_logical[visual], logical);
+            }
+        }
+    }
+
     #[test]
     fn render_cursor_honors_tui_visibility_during_repaint() {
         let mut state = TerminalState::new(80, 24, None);
@@ -1415,6 +2077,7 @@ mod tests {
             text.chars()
                 .map(|c| StyledCell {
                 c,
+                zerowidth: Vec::new(),
                 fg: Color::Named(NamedColor::Foreground),
                 bg: Color::Named(NamedColor::Background),
                 flags: Flags::empty(),
@@ -1529,9 +2192,9 @@ mod tests {
         let mut s = TerminalState::new(80, 5, None);
         s.process(b"see http://example.com/path for docs");
         let widget = test_widget(&s);
-        assert_eq!(widget.link_at(0, 0), None); // inside "see "
+        assert_eq!(widget.link_at_logical(0, 0), None); // inside "see "
         assert_eq!(
-            widget.link_at(5, 0),
+            widget.link_at_logical(5, 0),
             Some("http://example.com/path".to_string())
         );
     }

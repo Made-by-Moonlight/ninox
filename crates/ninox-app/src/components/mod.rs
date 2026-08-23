@@ -16,3 +16,4 @@ pub mod settings_panel;
 pub mod sidebar;
 pub mod spawn_modal;
 pub mod terminal;
+pub(crate) mod terminal_layout;
