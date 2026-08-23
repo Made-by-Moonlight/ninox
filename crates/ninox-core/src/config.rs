@@ -179,6 +179,80 @@ impl SessionRetentionConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Shared Rust compilation cache
+// ---------------------------------------------------------------------------
+
+pub const DEFAULT_RUST_CACHE_SIZE_GIB: u16 = 10;
+pub const MAX_RUST_CACHE_SIZE_GIB: u16 = 1024;
+
+/// Opt-in worker-only sccache policy. Cargo target directories remain
+/// checkout-local; only sccache's content-addressed cache is shared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustCacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_sccache_executable")]
+    pub executable: PathBuf,
+    /// Omit for the platform cache directory (`<cache>/ninox/sccache`).
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    #[serde(default = "default_rust_cache_size_gib")]
+    pub cache_size_gib: u16,
+    #[serde(default)]
+    pub prune_on_release: bool,
+}
+
+fn default_sccache_executable() -> PathBuf { PathBuf::from("sccache") }
+fn default_rust_cache_size_gib() -> u16 { DEFAULT_RUST_CACHE_SIZE_GIB }
+
+impl Default for RustCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            executable: default_sccache_executable(),
+            cache_dir: None,
+            cache_size_gib: default_rust_cache_size_gib(),
+            prune_on_release: false,
+        }
+    }
+}
+
+impl RustCacheConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.executable.as_os_str().is_empty(),
+            "rust_cache.executable must not be empty"
+        );
+        anyhow::ensure!(
+            (1..=MAX_RUST_CACHE_SIZE_GIB).contains(&self.cache_size_gib),
+            "rust_cache.cache_size_gib must be between 1 and {MAX_RUST_CACHE_SIZE_GIB}"
+        );
+        Ok(())
+    }
+
+    pub fn resolved_cache_dir(&self) -> PathBuf {
+        self.cache_dir.clone().map_or_else(
+            || {
+                dirs::cache_dir()
+                    .or_else(dirs::config_dir)
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("ninox")
+                    .join("sccache")
+            },
+            AppConfig::resolve_root_path,
+        )
+    }
+
+    pub fn resolved_executable(&self) -> PathBuf {
+        if self.executable.components().count() == 1 {
+            self.executable.clone()
+        } else {
+            AppConfig::resolve_root_path(self.executable.clone())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App configuration
 // ---------------------------------------------------------------------------
 
@@ -251,6 +325,9 @@ pub struct AppConfig {
     /// default off — see `InboxMessagingConfig`.
     #[serde(default)]
     pub inbox_messaging: InboxMessagingConfig,
+    /// Bounded worker-only shared sccache and release-pruning policy.
+    #[serde(default)]
+    pub rust_cache: RustCacheConfig,
     /// Theme file name (resolves to `~/.config/ninox/themes/<name>.toml`) or
     /// an absolute/`~`-relative path. `None` uses `themes/field-notes.toml`
     /// if present, else the built-in Field Notes palettes.
@@ -284,6 +361,7 @@ impl Default for AppConfig {
             theme_file:       None,
             harnesses:        BTreeMap::new(),
             inbox_messaging:  InboxMessagingConfig::default(),
+            rust_cache:       RustCacheConfig::default(),
         }
     }
 }
@@ -496,6 +574,10 @@ impl AppConfig {
 
     pub fn resolved_repositories_root(&self) -> Option<PathBuf> {
         self.repositories_root.clone().map(Self::resolve_root_path)
+    }
+
+    pub fn resolved_rust_cache_dir(&self) -> PathBuf {
+        self.rust_cache.resolved_cache_dir()
     }
 
     fn resolve_root_path(path: PathBuf) -> PathBuf {
@@ -760,6 +842,63 @@ mod tests {
         assert!(config
             .set_worker_checkout_repository_cap(repository, 0)
             .is_err());
+    }
+
+    #[test]
+    fn rust_cache_defaults_are_conservative_and_bounded() {
+        let config = AppConfig::default();
+        assert!(!config.rust_cache.enabled);
+        assert!(!config.rust_cache.prune_on_release);
+        assert_eq!(config.rust_cache.executable, PathBuf::from("sccache"));
+        assert_eq!(config.rust_cache.cache_size_gib, DEFAULT_RUST_CACHE_SIZE_GIB);
+        config.rust_cache.validate().unwrap();
+    }
+
+    #[test]
+    fn rust_cache_validation_rejects_unbounded_or_unusable_config() {
+        assert!(RustCacheConfig {
+            cache_size_gib: 0,
+            ..RustCacheConfig::default()
+        }
+        .validate()
+        .is_err());
+        assert!(RustCacheConfig {
+            cache_size_gib: MAX_RUST_CACHE_SIZE_GIB + 1,
+            ..RustCacheConfig::default()
+        }
+        .validate()
+        .is_err());
+        assert!(RustCacheConfig {
+            executable: PathBuf::new(),
+            ..RustCacheConfig::default()
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn rust_cache_policy_round_trips_and_anchors_relative_cache_dir() {
+        let config_dir = tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let config = AppConfig {
+                rust_cache: RustCacheConfig {
+                    enabled: true,
+                    executable: PathBuf::from("/opt/bin/sccache"),
+                    cache_dir: Some(PathBuf::from("cache/rust")),
+                    cache_size_gib: 24,
+                    prune_on_release: true,
+                },
+                ..AppConfig::default()
+            };
+            let encoded = toml::to_string(&config).unwrap();
+            let decoded: AppConfig = toml::from_str(&encoded).unwrap();
+            assert_eq!(decoded.rust_cache, config.rust_cache);
+            assert_eq!(
+                decoded.resolved_rust_cache_dir(),
+                config_dir.path().join("cache/rust")
+            );
+        });
     }
 
     #[test]

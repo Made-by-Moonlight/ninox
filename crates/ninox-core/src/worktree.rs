@@ -395,6 +395,20 @@ impl PooledWorktree {
     /// Release a finalized checkout only when its exact branch is clean and
     /// every commit at its tip is represented by a remote-tracking ref.
     pub fn release_recyclable(&self, expected_branch: &str) -> Result<String> {
+        let already_detached = self.recyclable_detached_state(expected_branch)?;
+        if already_detached {
+            Ok(expected_branch.to_string())
+        } else {
+            self.release_clean()
+        }
+    }
+
+    /// Prove a checkout can be recycled without changing its branch state.
+    pub fn ensure_recyclable(&self, expected_branch: &str) -> Result<()> {
+        self.recyclable_detached_state(expected_branch).map(|_| ())
+    }
+
+    fn recyclable_detached_state(&self, expected_branch: &str) -> Result<bool> {
         anyhow::ensure!(
             self.matches_identity()?,
             "pooled checkout identity does not match registry"
@@ -438,11 +452,7 @@ impl PooledWorktree {
             !containing.trim().is_empty(),
             "pooled checkout contains unpushed or remotely unreachable work"
         );
-        if already_detached {
-            Ok(expected_branch.to_string())
-        } else {
-            self.release_clean()
-        }
+        Ok(already_detached)
     }
 
     pub fn ensure_clean(&self) -> Result<()> {
@@ -1333,6 +1343,11 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
+        pooled.ensure_recyclable("release-session").unwrap();
+        assert_eq!(
+            git_text(&target, &["branch", "--show-current"]).unwrap(),
+            "release-session"
+        );
         assert_eq!(
             pooled.release_recyclable("release-session").unwrap(),
             "release-session"

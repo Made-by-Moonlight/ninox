@@ -324,7 +324,8 @@ async fn main() -> anyhow::Result<()> {
             run_spawn(store, config, prompt, workspace, delivery, name, orchestrator_id).await
         }
         Some(Command::Release { session_id, orchestrator_id }) => {
-            run_release(store, &session_id, orchestrator_id).await
+            let rust_cache = AppConfig::load().unwrap_or_default().rust_cache;
+            run_release(store, &session_id, orchestrator_id, rust_cache).await
         }
         Some(Command::Send { session_id, message }) => {
             let config = AppConfig::load().unwrap_or_default();
@@ -912,13 +913,21 @@ async fn run_spawn(
     let ninox_brain_env = std::env::var("NINOX_BRAIN").ok();
     let ninox_config_env = std::env::var("NINOX_CONFIG").ok();
 
-    let env_vec = worker_env_vars(
+    let rust_cache_env =
+        spawn_util::configured_worker_rust_cache_env(&config.rust_cache, &effective_workspace)
+            .await;
+    let mut env_vec = worker_env_vars(
         &id,
         &incarnation.incarnation_id,
         &sessions_dir_str,
         &orch_id_env,
         ninox_brain_env.as_deref(),
         ninox_config_env.as_deref(),
+    );
+    env_vec.extend(
+        rust_cache_env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
     );
     let runtime_claim = store
         .claim_worker_runtime_start(&id, &incarnation.incarnation_id)?
@@ -1260,6 +1269,7 @@ async fn run_release(
     store: Arc<Store>,
     session_id: &str,
     orchestrator_id: Option<String>,
+    rust_cache: ninox_core::config::RustCacheConfig,
 ) -> anyhow::Result<()> {
     let env = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
     let env_session = env("NINOX_SESSION");
@@ -1344,26 +1354,47 @@ async fn run_release(
         );
         return Err(error);
     }
-    let result = release_retained_worker_checkout(store.clone(), &claim).await;
+    let result =
+        release_retained_worker_checkout(store.clone(), &claim, rust_cache.prune_on_release).await;
+    match settle_worker_release(&store, &claim, result) {
+        Ok(()) => {
+            println!("released {session_id}; preserved branch/ref");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn settle_worker_release(
+    store: &Store,
+    claim: &ninox_core::types::WorkerIncarnation,
+    result: anyhow::Result<()>,
+) -> anyhow::Result<()> {
     match result {
         Ok(()) => {
             anyhow::ensure!(
                 store.complete_worker_claim(
-                    session_id,
+                    &claim.session_id,
                     &claim.incarnation_id,
                     ninox_core::types::WorkerIncarnationState::ReleaseClaimed,
                 )?,
                 "worker release completion lost its exact incarnation claim"
             );
-            println!("released {session_id}; preserved branch/ref and warm cache");
             Ok(())
         }
         Err(error) => {
-            let _ = store.abort_worker_claim(
-                session_id,
+            let restored = store.abort_worker_claim(
+                &claim.session_id,
                 &claim.incarnation_id,
                 ninox_core::types::WorkerIncarnationState::ReleaseClaimed,
                 ninox_core::types::WorkerIncarnationState::Retained,
+            )
+            .with_context(|| {
+                format!("restore retained state after worker release failed: {error:#}")
+            })?;
+            anyhow::ensure!(
+                restored,
+                "worker release failed ({error:#}) and its exact retained state could not be restored"
             );
             Err(error)
         }
@@ -1410,6 +1441,7 @@ fn lock_worker_release(
 async fn release_retained_worker_checkout(
     store: Arc<Store>,
     worker: &ninox_core::types::WorkerIncarnation,
+    prune_cargo_on_release: bool,
 ) -> anyhow::Result<()> {
     let record = match store.pooled_checkout_by_session(&worker.session_id)? {
         Some(record) => record,
@@ -1453,6 +1485,17 @@ async fn release_retained_worker_checkout(
     let incarnation_id = worker.incarnation_id.clone();
     tokio::task::spawn_blocking(move || {
         let pooled = ninox_core::worktree::PooledWorktree::from_record(&record)?;
+        pooled.ensure_recyclable(&branch)?;
+        if prune_cargo_on_release {
+            let report = ninox_core::rust_cache::prune_cargo_outputs(&pooled)
+                .context("prune checkout-local Cargo outputs before release")?;
+            tracing::info!(
+                path = %path.display(),
+                removed_directories = report.removed_directories,
+                removed_metadata_files = report.removed_metadata_files,
+                "pruned checkout-local Cargo outputs"
+            );
+        }
         pooled.release_recyclable(&branch)?;
         anyhow::ensure!(
             store.release_pooled_checkout_for_incarnation(
@@ -2507,8 +2550,12 @@ mod worker_env_tests {
 
 #[cfg(test)]
 mod release_cli_tests {
-    use super::{caller_is_orchestrator, resolve_release_orchestrator, validate_standalone_release_scope};
+    use super::{
+        caller_is_orchestrator, resolve_release_orchestrator, settle_worker_release,
+        validate_standalone_release_scope,
+    };
     use crate::spawn_util;
+    use ninox_core::types::SessionStatus;
 
     #[test]
     fn standalone_release_allows_local_admin_or_exact_session_only() {
@@ -2524,6 +2571,100 @@ mod release_cli_tests {
         );
         assert!(
             validate_standalone_release_scope("solo", None, Some("orch"), None).is_err()
+        );
+    }
+
+    #[test]
+    fn release_refuses_active_workers_and_cleanup_failure_restores_retained_state() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let store = ninox_core::Store::open(root.path().join("release.db")).unwrap();
+        store
+            .upsert_orchestrator(&ninox_core::types::Orchestrator {
+                id: "orch".into(),
+                name: "orch".into(),
+                created_at: 0,
+            })
+            .unwrap();
+        store
+            .upsert_session(&ninox_core::types::Session {
+                id: "worker".into(),
+                orchestrator_id: Some("orch".into()),
+                name: "worker".into(),
+                repo: String::new(),
+                status: SessionStatus::Working,
+                agent_type: "cursor-agent".into(),
+                cost_usd: 0.0,
+                started_at: 1,
+                pr_number: None,
+                pr_id: None,
+                workspace_path: Some(workspace.to_string_lossy().into_owned()),
+                pid: None,
+                model: None,
+                context_tokens: None,
+                catalogue_path: None,
+                context_used_pct: None,
+                context_total_tokens: None,
+                context_window_size: None,
+                claude_session_id: None,
+                summary: None,
+                terminal_at: None,
+                gate_status: None,
+            })
+            .unwrap();
+        let worker = store
+            .prepare_worker_incarnation(
+                "worker",
+                Some("orch"),
+                1,
+                workspace.to_str().unwrap(),
+                true,
+                3,
+            )
+            .unwrap();
+        assert!(store
+            .bind_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                workspace.to_str().unwrap(),
+                workspace.to_str().unwrap(),
+                None,
+            )
+            .unwrap());
+        assert!(store
+            .claim_worker_release("worker", &worker.incarnation_id)
+            .unwrap()
+            .is_none());
+
+        let intent = store.begin_worker_finalization("orch", "worker").unwrap();
+        let ninox_core::types::WorkerFinalizationIntent::Apply(worker) = intent else {
+            panic!("first finalization must apply");
+        };
+        assert!(store
+            .complete_worker_finalization("worker", &worker.incarnation_id)
+            .unwrap());
+        let claim = store
+            .claim_worker_release("worker", &worker.incarnation_id)
+            .unwrap()
+            .unwrap();
+
+        let error = settle_worker_release(
+            &store,
+            &claim,
+            Err(anyhow::anyhow!("simulated Cargo cleanup failure")),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("simulated Cargo cleanup failure"));
+        assert!(store.is_worker_retained("worker").unwrap());
+        assert_eq!(
+            store
+                .current_worker_incarnation("worker")
+                .unwrap()
+                .unwrap()
+                .state,
+            ninox_core::types::WorkerIncarnationState::Retained
         );
     }
 

@@ -441,6 +441,11 @@ pub enum Message {
     /// Flip the opt-in file-based inbox toggle (`[inbox_messaging].enabled`,
     /// default off — see `ninox_core::config::InboxMessagingConfig`).
     SettingsToggleInboxMessaging,
+    SettingsToggleRustCache,
+    SettingsRustCacheExecutable(String),
+    SettingsRustCacheDir(String),
+    SettingsRustCacheSize(String),
+    SettingsToggleRustCachePrune,
     BrainSelectEntry(String),
     /// The pinboard canvas's hovered node changed (including to/from `None`)
     /// — emitted only on change, never on every mouse move.
@@ -933,6 +938,7 @@ impl App {
         let scheme = themes.scheme(config.theme);
         let active_variant = config.theme;
         let catalogues = config.catalogue_options();
+        let settings = crate::components::settings_panel::SettingsState::from_config(&config);
 
         let mut app = Self {
             engine:             engine.clone(),
@@ -963,7 +969,7 @@ impl App {
             reattach_attempted: std::collections::HashSet::new(),
             next_client_generation: 0,
             model_lists:    HashMap::new(),
-            settings:       Default::default(),
+            settings,
             spawn_modal:    None,
             catalogue_modal: None,
             // Placeholders — corrected below by resize_terminals() using the
@@ -3017,6 +3023,91 @@ impl App {
                 state.config.inbox_messaging.enabled = !state.config.inbox_messaging.enabled;
                 if let Err(e) = state.config.save() {
                     tracing::warn!("failed to save config after toggling inbox messaging: {e}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsToggleRustCache => {
+                let enabled = !state.config.rust_cache.enabled;
+                if enabled {
+                    if let Err(error) = state.config.rust_cache.validate() {
+                        state.settings.rust_cache_error = Some(error.to_string());
+                        return Task::none();
+                    }
+                }
+                state.config.rust_cache.enabled = enabled;
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save shared Rust cache toggle: {error}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsRustCacheExecutable(value) => {
+                state.settings.rust_cache_executable = value;
+                let executable = state.settings.rust_cache_executable.trim();
+                if executable.is_empty() {
+                    state.settings.rust_cache_error =
+                        Some("sccache executable must not be empty".to_string());
+                    return Task::none();
+                }
+                state.config.rust_cache.executable = std::path::PathBuf::from(executable);
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save sccache executable: {error}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsRustCacheDir(value) => {
+                state.settings.rust_cache_dir = value;
+                let cache_dir = state.settings.rust_cache_dir.trim();
+                state.config.rust_cache.cache_dir =
+                    (!cache_dir.is_empty()).then(|| std::path::PathBuf::from(cache_dir));
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save shared Rust cache directory: {error}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsRustCacheSize(value) => {
+                state.settings.rust_cache_size_gib = value;
+                let parsed = state
+                    .settings
+                    .rust_cache_size_gib
+                    .trim()
+                    .parse::<u16>();
+                let Ok(size) = parsed else {
+                    state.settings.rust_cache_error =
+                        Some("cache size must be a whole number of GiB".to_string());
+                    return Task::none();
+                };
+                let prior = state.config.rust_cache.cache_size_gib;
+                state.config.rust_cache.cache_size_gib = size;
+                if let Err(error) = state.config.rust_cache.validate() {
+                    state.config.rust_cache.cache_size_gib = prior;
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    return Task::none();
+                }
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save shared Rust cache size: {error}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsToggleRustCachePrune => {
+                state.config.rust_cache.prune_on_release =
+                    !state.config.rust_cache.prune_on_release;
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save Cargo release-pruning toggle: {error}");
                 }
                 Task::none()
             }
@@ -6362,6 +6453,46 @@ mod tests {
             let (m, _) = m.update(Message::SettingsToggleHarness("claude-code".into()));
             assert!(m.config.registry().enabled_names().contains(&"claude-code".to_string()));
             assert!(m.config.harnesses.is_empty(), "inert toggle must not write config");
+        });
+    }
+
+    #[test]
+    fn rust_cache_settings_validate_and_persist_policy() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("rust_cache_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            AppConfig::default().save().unwrap();
+            let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
+            let (app, _) = App::new(
+                test_engine(),
+                std::path::PathBuf::from("/tmp"),
+                ninox_core::config::AgentConfig::default(),
+                brain,
+            );
+
+            let (app, _) = app.update(Message::SettingsToggleRustCache);
+            assert!(app.config.rust_cache.enabled);
+            let prior_size = app.config.rust_cache.cache_size_gib;
+
+            let (app, _) = app.update(Message::SettingsRustCacheSize("0".into()));
+            assert_eq!(app.config.rust_cache.cache_size_gib, prior_size);
+            assert!(app.settings.rust_cache_error.is_some());
+
+            let (app, _) = app.update(Message::SettingsRustCacheSize("20".into()));
+            let (app, _) = app.update(Message::SettingsRustCacheDir("shared/rust-cache".into()));
+            let (app, _) = app.update(Message::SettingsToggleRustCachePrune);
+            assert_eq!(app.config.rust_cache.cache_size_gib, 20);
+            assert!(app.config.rust_cache.prune_on_release);
+            assert!(app.settings.rust_cache_error.is_none());
+
+            let saved = AppConfig::load().unwrap();
+            assert!(saved.rust_cache.enabled);
+            assert_eq!(saved.rust_cache.cache_size_gib, 20);
+            assert_eq!(
+                saved.rust_cache.cache_dir.as_deref(),
+                Some(std::path::Path::new("shared/rust-cache"))
+            );
+            assert!(saved.rust_cache.prune_on_release);
         });
     }
 

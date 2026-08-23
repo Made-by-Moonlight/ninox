@@ -72,7 +72,7 @@ pub struct InteractiveSpawnParams {
 /// Working forever, and `None` is returned.
 pub async fn spawn_interactive_session(
     engine: Arc<Engine>,
-    p: InteractiveSpawnParams,
+    mut p: InteractiveSpawnParams,
 ) -> Option<Vec<String>> {
     let sid = p.session_id;
     let execution_role = p
@@ -105,6 +105,12 @@ pub async fn spawn_interactive_session(
     std::fs::create_dir_all(&sessions_dir).ok();
     let sessions_dir_str = sessions_dir.to_string_lossy().to_string();
 
+    if !is_orchestrator {
+        let config = ninox_core::config::AppConfig::load().unwrap_or_default();
+        p.extra_env.extend(
+            configured_worker_rust_cache_env(&config.rust_cache, &p.workspace).await,
+        );
+    }
     let env = interactive_env_vars(
         &ninox_bin, &ninox_config, &p.catalogue_path, &sid, &sessions_dir_str, &p.extra_env,
     );
@@ -199,6 +205,53 @@ pub async fn spawn_interactive_session(
 
     // Hidden tmux client attach argv — mirrors NavigateSession's attach flow.
     Some(tmux::attach_args(&sid).await)
+}
+
+pub async fn configured_worker_rust_cache_env(
+    config: &ninox_core::config::RustCacheConfig,
+    workspace: &str,
+) -> Vec<(String, String)> {
+    let config = config.clone();
+    let workspace = std::path::PathBuf::from(workspace);
+    match tokio::task::spawn_blocking(move || {
+        ninox_core::rust_cache::worker_environment(&config, &workspace)
+    })
+    .await
+    {
+        Ok(Ok(status)) => prepared_rust_cache_variables(status),
+        Ok(Err(error)) => {
+            tracing::warn!("shared Rust caching is unavailable for this worker: {error}");
+            Vec::new()
+        }
+        Err(error) => {
+            tracing::warn!("shared Rust cache preparation task panicked: {error}");
+            Vec::new()
+        }
+    }
+}
+
+fn prepared_rust_cache_variables(
+    status: ninox_core::rust_cache::RustCacheEnvironment,
+) -> Vec<(String, String)> {
+    match status {
+        ninox_core::rust_cache::RustCacheEnvironment::Enabled(variables) => variables,
+        ninox_core::rust_cache::RustCacheEnvironment::Unavailable(message) => {
+            tracing::warn!("{message}");
+            Vec::new()
+        }
+        ninox_core::rust_cache::RustCacheEnvironment::ExplicitPolicy(variables) => {
+            let keys = variables
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::info!(
+                "shared Rust caching left unchanged because explicit {keys} policy is present"
+            );
+            variables
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The tmux env for an app-spawned interactive session (Orchestrator or
@@ -1448,6 +1501,21 @@ pub async fn seed_worker_brain_skill(workspace: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn explicit_rust_cache_policy_is_forwarded_to_fresh_tmux_sessions() {
+        let explicit = vec![
+            ("RUSTC_WRAPPER".to_string(), "/user/wrapper".to_string()),
+            ("SCCACHE_DIR".to_string(), "/user/cache".to_string()),
+        ];
+        assert_eq!(
+            prepared_rust_cache_variables(
+                ninox_core::rust_cache::RustCacheEnvironment::ExplicitPolicy(explicit.clone())
+            ),
+            explicit
+        );
+    }
+
 
     /// Minimal real git repo so `git worktree add` has a commit to branch
     /// from — `create_worker_worktree` shells out to real `git`.
