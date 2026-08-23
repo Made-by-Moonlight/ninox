@@ -145,6 +145,193 @@ impl alacritty_terminal::event::EventListener for EventProxy {
 // TerminalState — holds the terminal buffer + PTY sender
 // ---------------------------------------------------------------------------
 
+const SYNC_START: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
+
+#[derive(Debug, Default)]
+struct TerminalOutputFramer {
+    buffered:        Vec<u8>,
+    deferred:        Vec<u8>,
+    sync_open:       bool,
+    recovery_token:  u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TerminalProcessResult {
+    pub recovery_token: Option<u64>,
+    #[cfg(test)]
+    committed:          bool,
+}
+
+impl TerminalOutputFramer {
+    fn push(&mut self, bytes: &[u8]) -> (Vec<u8>, Option<u64>) {
+        let was_pending = self.is_pending();
+        self.buffered.extend_from_slice(bytes);
+        let mut ready = Vec::new();
+
+        loop {
+            if self.sync_open {
+                let Some(end) = find_bytes(&self.buffered, SYNC_END) else {
+                    break;
+                };
+                let frame: Vec<_> = self.buffered.drain(..end + SYNC_END.len()).collect();
+                self.sync_open = false;
+                self.finish_frame(frame, &mut ready);
+                continue;
+            }
+
+            if let Some(start) = find_bytes(&self.buffered, SYNC_START) {
+                let unframed: Vec<_> = self.buffered.drain(..start).collect();
+                self.finish_unframed(unframed, &mut ready);
+                self.sync_open = true;
+                continue;
+            }
+
+            let retained = marker_prefix_suffix_len(&self.buffered, SYNC_START);
+            let unframed: Vec<_> = self
+                .buffered
+                .drain(..self.buffered.len().saturating_sub(retained))
+                .collect();
+            self.finish_unframed(unframed, &mut ready);
+            break;
+        }
+
+        let is_pending = self.is_pending();
+        let recovery_token = if !was_pending && is_pending {
+            self.recovery_token = self.recovery_token.wrapping_add(1);
+            Some(self.recovery_token)
+        } else {
+            None
+        };
+        (ready, recovery_token)
+    }
+
+    fn recover(&mut self, token: u64) -> Vec<u8> {
+        if token != self.recovery_token || !self.is_pending() {
+            return Vec::new();
+        }
+        self.recover_bytes()
+    }
+
+    fn recover_bytes(&mut self) -> Vec<u8> {
+        let mut ready = std::mem::take(&mut self.deferred);
+        if self.sync_open {
+            ready.append(&mut self.buffered);
+            // Complete the parser transaction synthetically. Recovery is one
+            // atomic commit, never a replay of each intermediate fragment.
+            ready.extend_from_slice(SYNC_END);
+        } else {
+            // Ground state retains only a possible prefix of SYNC_START.
+            // Dropping an abandoned partial escape is safer than poisoning
+            // the VTE parser and mistaking later plain bytes for its suffix.
+            self.buffered.clear();
+        }
+        self.sync_open = false;
+        ready
+    }
+
+    fn finish_frame(&mut self, frame: Vec<u8>, ready: &mut Vec<u8>) {
+        let has_text = contains_terminal_text(&frame);
+        if !self.deferred.is_empty() {
+            self.deferred.extend_from_slice(&frame);
+            if has_text {
+                ready.append(&mut self.deferred);
+            }
+        } else if !has_text && contains_structural_csi(&frame) {
+            // tmux 3.7 can leak an erase from an inner synchronized update
+            // into its own balanced outer frame. Hold that destructive-only
+            // frame until tmux's final content repaint arrives.
+            self.deferred = frame;
+        } else {
+            ready.extend_from_slice(&frame);
+        }
+    }
+
+    fn finish_unframed(&mut self, bytes: Vec<u8>, ready: &mut Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.deferred.is_empty() {
+            ready.extend_from_slice(&bytes);
+            return;
+        }
+
+        let has_text = contains_terminal_text(&bytes);
+        self.deferred.extend_from_slice(&bytes);
+        if has_text {
+            ready.append(&mut self.deferred);
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        self.sync_open || !self.buffered.is_empty() || !self.deferred.is_empty()
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+fn marker_prefix_suffix_len(bytes: &[u8], marker: &[u8]) -> usize {
+    (1..marker.len())
+        .rev()
+        .find(|&length| bytes.ends_with(&marker[..length]))
+        .unwrap_or(0)
+}
+
+fn terminal_controls(bytes: &[u8], mut visit_csi: impl FnMut(u8)) -> bool {
+    let mut index = 0;
+    let mut has_text = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            0x1b if bytes.get(index + 1) == Some(&b'[') => {
+                index += 2;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    index += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        visit_csi(byte);
+                        break;
+                    }
+                }
+            }
+            0x1b if bytes.get(index + 1) == Some(&b']') => {
+                index += 2;
+                while index < bytes.len() {
+                    if bytes[index] == 0x07 {
+                        index += 1;
+                        break;
+                    }
+                    if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                        index += 2;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            0x1b => index = (index + 2).min(bytes.len()),
+            byte if byte < 0x20 || byte == 0x7f => index += 1,
+            _ => {
+                has_text = true;
+                index += 1;
+            }
+        }
+    }
+    has_text
+}
+
+fn contains_terminal_text(bytes: &[u8]) -> bool {
+    terminal_controls(bytes, |_| {})
+}
+
+fn contains_structural_csi(bytes: &[u8]) -> bool {
+    let mut structural = false;
+    terminal_controls(bytes, |final_byte| {
+        structural |= matches!(final_byte, b'@' | b'J' | b'K' | b'L' | b'M' | b'P' | b'S' | b'T' | b'X');
+    });
+    structural
+}
+
 pub struct TerminalState {
     pub term: Term<EventProxy>,
     pub cache: Cache,
@@ -154,6 +341,9 @@ pub struct TerminalState {
     /// comes from here.
     pub scrollback: crate::components::scrollback::Scrollback,
     parser: Processor,
+    output_framer: TerminalOutputFramer,
+    #[cfg(test)]
+    output_commits: usize,
 }
 
 impl TerminalState {
@@ -174,13 +364,47 @@ impl TerminalState {
             cache: Cache::new(),
             scrollback: Default::default(),
             parser: Processor::new(),
+            output_framer: TerminalOutputFramer::default(),
+            #[cfg(test)]
+            output_commits: 0,
         }
     }
 
     /// Feed raw bytes from the attached tmux client into the emulator.
-    pub fn process(&mut self, bytes: &[u8]) {
+    pub(crate) fn process(&mut self, bytes: &[u8]) -> TerminalProcessResult {
+        let (ready, recovery_token) = self.output_framer.push(bytes);
+        #[cfg(test)]
+        let committed = self.commit_output(&ready);
+        #[cfg(not(test))]
+        self.commit_output(&ready);
+        TerminalProcessResult {
+            recovery_token,
+            #[cfg(test)]
+            committed,
+        }
+    }
+
+    pub(crate) fn recover_output(&mut self, token: u64) -> bool {
+        let ready = self.output_framer.recover(token);
+        self.commit_output(&ready)
+    }
+
+    fn commit_output(&mut self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
         self.parser.advance(&mut self.term, bytes);
         self.cache.clear();
+        #[cfg(test)]
+        {
+            self.output_commits += 1;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn output_commit_count(&self) -> usize {
+        self.output_commits
     }
 
     /// Scroll by `delta` lines (positive = up). Returns true when older
@@ -2012,6 +2236,213 @@ mod tests {
 
         state.process(b"ing\x1b[?2026l");
         assert_eq!(bottom_rows(&state), "Reading app.rs\n❯ working");
+    }
+
+    #[test]
+    fn tmux_split_sync_replay_does_not_commit_the_intermediate_clear() {
+        use alacritty_terminal::index::{Column, Line};
+
+        fn bottom_rows(state: &TerminalState) -> String {
+            let grid = state.term.grid();
+            (2..4)
+                .map(|row| {
+                    (0..grid.columns())
+                        .map(|column| grid[Line(row)][Column(column)].c)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let mut state = TerminalState::new(40, 4, None);
+        state.process("\x1b[3;1H⠹ Working…\x1b[4;1H❯ waiting\x1b[H".as_bytes());
+        let stable = bottom_rows(&state);
+        let stable_commits = state.output_commit_count();
+
+        // Raw hidden-client reads captured from tmux 3.7b while an inner
+        // synchronized frame crossed pane reads. tmux closes an outer frame
+        // around the leaked erase, then emits a cursor-only frame before the
+        // final repaint. Neither intermediate state is a provider frame.
+        let clear = state.process(b"\x1b[?2026h\x1b[J\x1b[?2026l");
+        assert!(!clear.committed);
+        assert_eq!(bottom_rows(&state), stable);
+        let cursor =
+            state.process(b"\x1b[?2026h\x1b[?25l\x1b[?12l\x1b[?25h\x1b[4;7H\x1b[?2026l");
+        assert!(!cursor.committed);
+        assert_eq!(bottom_rows(&state), stable);
+        assert_eq!(state.output_commit_count(), stable_commits);
+
+        let final_frame = state.process(
+            b"\x1b[?2026h\x1b[?25l\x1b[Hfirst rows\x1b[K\r\n\x1b[K\r\n\
+              \x1b[K\r\nbottom-final\x1b[K\x1b[?12l\x1b[?25h\x1b[4;13H\x1b[?2026l",
+        );
+        assert!(final_frame.committed);
+        assert_eq!(state.output_commit_count(), stable_commits + 1);
+        assert_eq!(bottom_rows(&state), "\nbottom-final");
+    }
+
+    #[test]
+    fn fragmented_balanced_sync_frame_has_one_renderer_commit() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let mut state = TerminalState::new(20, 2, None);
+        state.process(b"old");
+        let before = state.output_commit_count();
+
+        let first = state.process(b"\x1b[?20");
+        assert!(!first.committed);
+        assert!(first.recovery_token.is_some());
+        let second = state.process(b"26h\x1b[H\x1b[2Knew");
+        assert!(!second.committed);
+        let third = state.process(b" value\x1b[?2026l");
+
+        assert!(third.committed);
+        assert_eq!(state.output_commit_count(), before + 1);
+        let row: String = (0..20)
+            .map(|column| state.term.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert_eq!(row.trim_end(), "new value");
+    }
+
+    #[test]
+    fn missing_sync_terminator_recovers_as_one_atomic_commit() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let mut state = TerminalState::new(20, 2, None);
+        state.process(b"stable");
+        let before = state.output_commit_count();
+        let pending = state.process(b"\x1b[?2026h\x1b[H\x1b[2Krecovered");
+        let token = pending.recovery_token.expect("open frame needs recovery");
+
+        assert!(!pending.committed);
+        assert_eq!(state.term.grid()[Line(0)][Column(0)].c, 's');
+        assert!(state.recover_output(token));
+        assert_eq!(state.output_commit_count(), before + 1);
+        let row: String = (0..20)
+            .map(|column| state.term.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert_eq!(row.trim_end(), "recovered");
+        assert!(!state.recover_output(token), "recovery must be idempotent");
+    }
+
+    #[test]
+    fn abandoned_partial_sync_marker_does_not_poison_later_unframed_output() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let mut state = TerminalState::new(20, 2, None);
+        let token = state
+            .process(b"\x1b[?20")
+            .recovery_token
+            .expect("partial marker needs bounded recovery");
+
+        assert!(!state.recover_output(token));
+        let plain = state.process(b"plain");
+        assert!(plain.committed);
+        let row: String = (0..20)
+            .map(|column| state.term.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert_eq!(row.trim_end(), "plain");
+    }
+
+    #[test]
+    fn multiple_sync_frames_in_one_read_share_one_renderer_commit() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let mut state = TerminalState::new(20, 2, None);
+        let result = state.process(
+            b"\x1b[?2026h\x1b[Hfirst\x1b[?2026l\
+              \x1b[?2026h\x1b[H\x1b[2Ksecond\x1b[?2026l",
+        );
+
+        assert!(result.committed);
+        assert_eq!(state.output_commit_count(), 1);
+        let row: String = (0..20)
+            .map(|column| state.term.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert_eq!(row.trim_end(), "second");
+    }
+
+    #[test]
+    fn unframed_input_echo_and_logs_commit_without_sync_recovery_delay() {
+        let mut state = TerminalState::new(40, 4, None);
+
+        let echo = state.process(b"typed");
+        assert!(echo.committed);
+        assert!(echo.recovery_token.is_none());
+        let logs = state.process(b"\r\nlog-1\r\nlog-2\r\n");
+        assert!(logs.committed);
+        assert!(logs.recovery_token.is_none());
+        assert_eq!(state.output_commit_count(), 2);
+    }
+
+    #[test]
+    fn one_unframed_read_with_rapid_bottom_row_replacements_commits_only_final_state() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let mut state = TerminalState::new(20, 2, None);
+        let result =
+            state.process(b"\x1b[2;1Hpartial\rreplacement\rfinal\x1b[K");
+
+        assert!(result.committed);
+        assert_eq!(state.output_commit_count(), 1);
+        let row: String = (0..20)
+            .map(|column| state.term.grid()[Line(1)][Column(column)].c)
+            .collect();
+        assert_eq!(row.trim_end(), "final");
+    }
+
+    #[test]
+    fn reconnect_state_does_not_inherit_pending_sync_recovery() {
+        let mut old = TerminalState::new(20, 2, None);
+        let token = old
+            .process(b"\x1b[?2026h\x1b[Hpartial")
+            .recovery_token
+            .unwrap();
+
+        let mut replacement = TerminalState::new(20, 2, None);
+        let fresh = replacement.process(b"fresh");
+
+        assert!(fresh.committed);
+        assert!(!replacement.recover_output(token));
+        assert_eq!(replacement.output_commit_count(), 1);
+    }
+
+    #[test]
+    fn deferred_tmux_repaint_preserves_rtl_visual_mapping() {
+        let mut state = TerminalState::new(20, 2, None);
+        state.process("old עברית".as_bytes());
+        let before = state.output_commit_count();
+        state.process(b"\x1b[?2026h\x1b[H\x1b[J\x1b[?2026l");
+        let final_frame =
+            state.process("\x1b[?2026h\x1b[Hחדש שלום\x1b[?2026l".as_bytes());
+
+        assert!(final_frame.committed);
+        assert_eq!(state.output_commit_count(), before + 1);
+        let cells = test_widget(&state).row_display_cells(0).unwrap();
+        let layout = visual_layout(&cells);
+        assert_ne!(
+            &layout.visual_to_logical[..8],
+            &(0..8).collect::<Vec<_>>()[..]
+        );
+    }
+
+    #[test]
+    fn destructive_only_sync_frame_has_bounded_atomic_recovery() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let mut state = TerminalState::new(20, 2, None);
+        state.process(b"clear me");
+        let before = state.output_commit_count();
+        let pending = state.process(b"\x1b[?2026h\x1b[H\x1b[J\x1b[?2026l");
+        let token = pending.recovery_token.expect("destructive frame needs recovery");
+
+        assert!(!pending.committed);
+        assert_eq!(state.term.grid()[Line(0)][Column(0)].c, 'c');
+        assert!(state.recover_output(token));
+        assert_eq!(state.output_commit_count(), before + 1);
+        assert_eq!(state.term.grid()[Line(0)][Column(0)].c, ' ');
     }
 
     #[test]

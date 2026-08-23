@@ -680,6 +680,34 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim_end().to_string()
         }
 
+        fn attach_output(&self, session: &str) -> Vec<u8> {
+            use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+            use std::io::Read;
+
+            let pair = native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            let mut command = CommandBuilder::new("tmux");
+            command.args(["-L", &self.socket, "attach-session", "-t", session]);
+            command.env("TMUX_TMPDIR", self.tmpdir.path());
+            command.env("TERM", "xterm-256color");
+            let mut child = pair.slave.spawn_command(command).unwrap();
+            drop(pair.slave);
+            let mut output = Vec::new();
+            pair.master
+                .try_clone_reader()
+                .unwrap()
+                .read_to_end(&mut output)
+                .unwrap();
+            child.wait().unwrap();
+            output
+        }
+
         fn assert_color_capable_environment(&self) {
             let global_environment = self.run(&["show-environment", "-g"]);
             for key in ["NO_COLOR", "FORCE_COLOR"] {
@@ -790,6 +818,46 @@ mod tests {
         server.run(&["source-file", server.config_path().to_str().unwrap()]);
 
         server.assert_color_capable_environment();
+    }
+
+    #[test]
+    fn preserved_server_reconciliation_frames_a_new_hidden_client_with_sync() {
+        if !tmux_available() { return; }
+        let server = IsolatedTmuxServer::new();
+        server.write_config(
+            "set -g default-terminal \"tmux-256color\"\n\
+             set -as terminal-features \"xterm*:RGB\"\n\
+             set -g status off\n\
+             set -g exit-empty off\n",
+        );
+        server.start();
+
+        server.write_config(&server_config_for_version(detected_version_sync()));
+        server.run(&["source-file", server.config_path().to_str().unwrap()]);
+        assert!(
+            server
+                .run(&["show-options", "-gsv", "terminal-features"])
+                .contains("sync")
+        );
+
+        server.run(&[
+            "new-session",
+            "-d",
+            "-s",
+            "sync-client",
+            "sh -c 'sleep 0.2; printf ready; sleep 0.2'",
+        ]);
+        let output = server.attach_output("sync-client");
+        let starts = output
+            .windows(b"\x1b[?2026h".len())
+            .filter(|window| *window == b"\x1b[?2026h")
+            .count();
+        let ends = output
+            .windows(b"\x1b[?2026l".len())
+            .filter(|window| *window == b"\x1b[?2026l")
+            .count();
+        assert!(starts > 0, "reconciled client output was not synchronized: {output:?}");
+        assert_eq!(starts, ends, "reconciled client emitted unbalanced sync frames");
     }
 
     #[tokio::test]

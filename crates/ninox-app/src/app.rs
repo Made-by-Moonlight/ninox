@@ -21,6 +21,8 @@ use crate::{
 const MAX_NOTIFICATIONS: usize = 50;
 const CLIENT_OUTPUT_QUIET_INTERVAL: Duration = Duration::from_millis(3);
 const CLIENT_OUTPUT_MAX_COALESCE_INTERVAL: Duration = Duration::from_millis(8);
+// tmux uses the same bound for an inner DEC 2026 frame that never closes.
+const TERMINAL_OUTPUT_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The running binary's own version — shown in Settings and used as the
 /// baseline for `ensure_version_check`. This crate's `CARGO_PKG_VERSION`,
@@ -232,6 +234,12 @@ pub enum Message {
     NavigateSession(SessionId),
     /// Attach argv resolved — spawn the hidden tmux client for this session.
     ClientAttach { session_id: SessionId, argv: Vec<String> },
+    /// Bounded recovery for an incomplete or destructive-only synchronized frame.
+    RecoverTerminalOutput {
+        session_id:       SessionId,
+        client_generation: u64,
+        recovery_token:   u64,
+    },
     /// Toggle an orchestrator's worker list open/closed in the tree.
     SelectOrchestrator(OrchestratorId),
     SpawnSession,
@@ -1024,6 +1032,20 @@ impl App {
                         }
                     }
                     Err(e) => tracing::error!("attach client for {session_id}: {e}"),
+                }
+                Task::none()
+            }
+
+            Message::RecoverTerminalOutput {
+                session_id,
+                client_generation,
+                recovery_token,
+            } => {
+                let current = state.clients.get(&session_id).map(|client| client.generation);
+                if current == Some(client_generation) {
+                    if let Some(terminal) = state.terminals.get_mut(&session_id) {
+                        terminal.recover_output(recovery_token);
+                    }
                 }
                 Task::none()
             }
@@ -2504,7 +2526,17 @@ impl App {
                     return Task::none();
                 }
                 if let Some(term) = state.terminals.get_mut(&session_id) {
-                    term.process(&bytes);
+                    let result = term.process(&bytes);
+                    if let Some(recovery_token) = result.recovery_token {
+                        return Task::future(async move {
+                            tokio::time::sleep(TERMINAL_OUTPUT_RECOVERY_INTERVAL).await;
+                            Message::RecoverTerminalOutput {
+                                session_id,
+                                client_generation: generation,
+                                recovery_token,
+                            }
+                        });
+                    }
                 }
                 Task::none()
             }
