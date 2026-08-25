@@ -94,7 +94,7 @@ fn draw_advanced_cell_glyph(
     // origin by compensating for JetBrains Mono's one-cell advance.
     let clip = Rectangle::new(text.position, Size::new(target_width, cell_height));
     text.content = format!("{LTR_FONT_ANCHOR}{character}");
-    text.position.x -= cell_width;
+    text.position = iced::Point::new(-cell_width, 0.0);
     text.shaping = iced::widget::text::Shaping::Advanced;
     frame.with_clip(clip, |frame| frame.fill_text(text));
 }
@@ -1515,7 +1515,7 @@ fn draw_combining_cell(
             frame.scale_nonuniform(iced::Vector::new(scale_x, 1.0));
             frame.fill_text(iced::widget::canvas::Text {
                 content,
-                position: iced::Point::new(x / scale_x, y),
+                position: iced::Point::ORIGIN,
                 color: fg,
                 size: iced::Pixels(font_size),
                 font,
@@ -1593,12 +1593,10 @@ fn draw_glyph_runs(
             frame.with_clip(clip, |frame| {
                 frame.with_save(|frame| {
                     frame.scale_nonuniform(iced::Vector::new(scale_x, 1.0));
+                    let anchor_x = if run.rtl { end_x } else { start_x };
                     frame.fill_text(iced::widget::canvas::Text {
                         content: content.clone(),
-                        position: iced::Point::new(
-                            if run.rtl { end_x / scale_x } else { start_x / scale_x },
-                            y,
-                        ),
+                        position: iced::Point::new((anchor_x - clip.x) / scale_x, 0.0),
                         color: fg,
                         size: iced::Pixels(font_size),
                         font,
@@ -2230,6 +2228,113 @@ mod tests {
             assert!(image.placement.height > 0);
             assert!(!image.data.is_empty());
         }
+    }
+
+    #[test]
+    fn cold_canvas_paints_terminal_glyphs_in_their_cells() {
+        use iced::advanced::graphics::geometry::Renderer as _;
+        use iced::widget::canvas::Program as _;
+        use std::borrow::Cow;
+
+        const NERD_FONT_BYTES: &[u8] =
+            include_bytes!("../../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
+        let mut font_system = iced::advanced::graphics::text::font_system()
+            .write()
+            .expect("write font system");
+        font_system.load_font(Cow::Borrowed(TERM_FONT_BYTES));
+        font_system.load_font(Cow::Borrowed(NERD_FONT_BYTES));
+        drop(font_system);
+
+        let backend = iced_tiny_skia::Renderer::new(TERM_FONT, iced::Pixels(FONT_SIZE));
+        let mut renderer = iced::Renderer::Secondary(backend);
+        let (cell_w, cell_h) = cell_size(FONT_SIZE);
+        let cols = 16;
+        let rows = 12;
+        let size = Size::new(cols as f32 * cell_w, rows as f32 * cell_h);
+        let mut state = TerminalState::new(cols, rows, None);
+        state.process(
+            concat!(
+                "\x1b[?25l",
+                "\x1b[1;4H→",
+                "\x1b[2;4H’",
+                "\x1b[3;4H“",
+                "\x1b[4;4H—",
+                "\x1b[5;4H✓",
+                "\x1b[6;4H⠘",
+                "\x1b[7;4H\u{e0b0}",
+                "\x1b[8;4He\u{301}",
+                "\x1b[9;4Hשלום",
+                "\x1b[10;4Hمرحبا",
+            )
+            .as_bytes(),
+        );
+
+        let widget = test_widget(&state);
+        for geometry in widget.draw(
+            &SelectionState::default(),
+            &renderer,
+            &Theme::Dark,
+            Rectangle::with_size(size),
+            iced::mouse::Cursor::Unavailable,
+        ) {
+            renderer.draw_geometry(geometry);
+        }
+
+        let width = size.width.ceil() as u32;
+        let height = size.height.ceil() as u32;
+        let viewport =
+            iced::advanced::graphics::Viewport::with_physical_size(Size::new(width, height), 1.0);
+        let mut pixmap = tiny_skia::Pixmap::new(width, height).unwrap();
+        let mut mask = tiny_skia::Mask::new(width, height).unwrap();
+        let iced::Renderer::Secondary(renderer) = &mut renderer else {
+            unreachable!("test renderer is tiny-skia");
+        };
+        renderer.draw(
+            &mut pixmap.as_mut(),
+            &mut mask,
+            &viewport,
+            &[Rectangle::with_size(size)],
+            IcedColor::BLACK,
+            &[] as &[&str],
+        );
+
+        let pixels = pixmap.data();
+        let cell_has_ink = |col: usize, row: usize| {
+            let left = (col as f32 * cell_w).floor() as u32;
+            let right = (((col + 1) as f32 * cell_w).ceil() as u32).min(width);
+            let top = (row as f32 * cell_h).floor() as u32;
+            let bottom = (((row + 1) as f32 * cell_h).ceil() as u32).min(height);
+            (top..bottom).any(|y| {
+                (left..right).any(|x| {
+                    let pixel = &pixels[((y * width + x) * 4) as usize..][..4];
+                    pixel[..3] != [0, 0, 0]
+                })
+            })
+        };
+
+        for (row, label) in [
+            (0, "arrow"),
+            (1, "curly apostrophe"),
+            (2, "curly quote"),
+            (3, "em dash"),
+            (4, "check mark"),
+            (5, "spinner fallback"),
+            (6, "Powerline"),
+            (7, "combining"),
+        ] {
+            assert!(
+                cell_has_ink(3, row),
+                "{label} missing from its terminal cell"
+            );
+        }
+        assert!(
+            (3..7).any(|col| cell_has_ink(col, 8)),
+            "Hebrew run missing from its terminal cells"
+        );
+        assert!(
+            (3..8).any(|col| cell_has_ink(col, 9)),
+            "Arabic run missing from its terminal cells"
+        );
     }
 
     fn shaped_glyphs_by_character(text: &str, per_cell: bool) -> Vec<u16> {
