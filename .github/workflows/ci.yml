@@ -89,10 +89,14 @@ jobs:
       # the binary covers static init; the ignored embedder tests download
       # the real model (cached above under ~/.cache/ninox) and run actual
       # inference through the prebuilt runtime.
+      # The filter pins this to the embedder tests: a bare `-- --ignored`
+      # would also sweep in unrelated ignored tests (e.g. the 5000-file
+      # brain rebuild benchmark) and silently adopt any future ignored test
+      # whose requirements this container doesn't meet.
       - name: Run binary and real-inference embedder tests
         run: |
           ./target/debug/ninox --help > /dev/null
-          cargo test --locked -p ninox-core -- --ignored
+          cargo test --locked -p ninox-core -- --ignored fast_embed_embedder
 
   bundle-macos:
     name: macOS App Bundle

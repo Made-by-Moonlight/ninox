@@ -80,7 +80,10 @@ impl FastEmbedEmbedder {
     pub fn try_new() -> Result<Self> {
         // No-op call that anchors the ort_link_compat C++ object (and its
         // iostream initializer) into any binary that links the embedder —
-        // see the ort_link_compat module docs.
+        // see the ort_link_compat module docs. This is currently the sole
+        // in-tree entry point into ort; any new one (another constructor,
+        // direct TextEmbedding use) must repeat this call, or ONNX
+        // Runtime's static ctors can link in without the initializer.
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         unsafe {
             ort_link_compat::ninox_ort_link_compat_anchor()
@@ -101,9 +104,11 @@ impl FastEmbedEmbedder {
 /// GCC 13+/glibc 2.38+ toolchain, so their objects reference symbols that
 /// only exist in newer runtimes; on distros with an older toolchain (e.g.
 /// Ubuntu 22.04: GCC 11, glibc 2.35) the final link fails with "undefined
-/// reference" errors without these definitions. On newer systems our
-/// definitions simply take precedence over the identical ones in
-/// libstdc++.so / libc.so — behavior is unchanged either way. The
+/// reference" errors without these definitions. The definitions only
+/// satisfy the statically-linked ONNX Runtime references — the binary does
+/// not export them dynamically, so on newer systems calls from shared
+/// libraries (and libstdc++/glibc internals) still bind to the real
+/// definitions and behavior is unchanged. The
 /// `build-oldest-linux` CI job (bare ubuntu:22.04 container) proves this set
 /// stays sufficient whenever the ort binaries move to a newer toolchain.
 ///
