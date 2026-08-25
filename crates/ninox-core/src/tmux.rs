@@ -501,7 +501,7 @@ pub async fn capture_viewport_tail(
     let cursor_x = fields.next().unwrap_or(0);
     let cursor_y = fields.next().unwrap_or(pane_height.saturating_sub(1));
     let (start, end) = viewport_tail_range(pane_height, viewport_rows);
-    let bytes = run_session_scoped(&[
+    let bytes = run_session_scoped_preserving_output(&[
         "capture-pane",
         "-p",
         "-e",
@@ -513,8 +513,7 @@ pub async fn capture_viewport_tail(
         &end.to_string(),
     ])
     .await
-    .ok()?
-    .into_bytes();
+    .ok()?;
     Some(ViewportTailCapture {
         start,
         end,
