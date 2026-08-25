@@ -29,7 +29,16 @@ Use Ninox when you've outgrown a single agent in a single terminal:
 
 - Rust toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - tmux 3.2+ (3.5+ recommended for full extended-keyboard support)
-- macOS or Linux (Windows not yet supported)
+- macOS or Linux (Windows not yet supported). Ubuntu 22.04 and newer are
+  supported and covered by CI; on Debian/Ubuntu install the build
+  dependencies first:
+
+  ```bash
+  sudo apt-get install -y build-essential pkg-config cmake \
+    libxkbcommon-dev libwayland-dev
+  ```
+
+  No OpenSSL headers are required — all TLS goes through rustls.
 
 ## Install
 

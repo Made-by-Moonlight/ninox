@@ -42,6 +42,58 @@ jobs:
       - name: Test
         run: tmux start-server && cargo test --workspace
 
+  # Deliberately a bare ubuntu:22.04 container, NOT the ubuntu-22.04 runner
+  # image: GitHub runner images preinstall libssl-dev and a newer GCC, which
+  # is exactly what let two Ubuntu 22.04 install breakages ship unnoticed
+  # (openssl-sys pulled in via fastembed's native-tls defaults, and the
+  # GCC 13+ `__cxa_call_terminate` reference in ort-sys's prebuilt ONNX
+  # Runtime). This job proves a stock Ubuntu 22.04 — glibc 2.35, GCC 11, no
+  # OpenSSL headers — can still build the app binary end to end, keeping
+  # `cargo install ninox` working on the oldest supported systems.
+  build-oldest-linux:
+    name: Build on stock Ubuntu 22.04
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update -q
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            curl ca-certificates build-essential pkg-config git cmake \
+            libxkbcommon-dev libwayland-dev
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Cache Rust
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/ninox
+            target
+          key: ubuntu2204-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ubuntu2204-cargo-
+      # A dev-profile build is enough: the guarded compile/link failure
+      # modes (a -sys crate demanding missing system headers, unresolvable
+      # symbols in the prebuilt static ONNX Runtime) surface regardless of
+      # profile, and dev links the same native libraries `cargo install`'s
+      # release build does.
+      - name: Build
+        run: cargo build --locked -p ninox
+      # Link success isn't enough: toolchain mismatches can also break at
+      # runtime (e.g. ONNX Runtime static constructors segfaulting on a
+      # never-initialized std::cout under pre-GCC-13.3 libstdc++). Starting
+      # the binary covers static init; the ignored embedder tests download
+      # the real model (cached above under ~/.cache/ninox) and run actual
+      # inference through the prebuilt runtime.
+      - name: Run binary and real-inference embedder tests
+        run: |
+          ./target/debug/ninox --help > /dev/null
+          cargo test --locked -p ninox-core -- --ignored
+
   bundle-macos:
     name: macOS App Bundle
     runs-on: macos-latest

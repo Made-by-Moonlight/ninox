@@ -78,6 +78,14 @@ impl FastEmbedEmbedder {
     /// `{cache_dir}/ninox/fastembed` on first use. Every call after the
     /// first (across process restarts) is fully offline.
     pub fn try_new() -> Result<Self> {
+        // No-op call that anchors the ort_link_compat C++ object (and its
+        // iostream initializer) into any binary that links the embedder —
+        // see the ort_link_compat module docs.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        unsafe {
+            ort_link_compat::ninox_ort_link_compat_anchor()
+        };
+
         let cache_dir = fastembed_cache_dir();
         let model = TextEmbedding::try_new(
             TextInitOptions::new(EmbeddingModel::SnowflakeArcticEmbedXS)
@@ -85,6 +93,78 @@ impl FastEmbedEmbedder {
                 .with_show_download_progress(true),
         )?;
         Ok(Self { model: Mutex::new(model) })
+    }
+}
+
+/// Link-compat shims for the prebuilt ONNX Runtime static libraries that
+/// `ort-sys` (via `fastembed`) downloads. Those binaries are compiled with a
+/// GCC 13+/glibc 2.38+ toolchain, so their objects reference symbols that
+/// only exist in newer runtimes; on distros with an older toolchain (e.g.
+/// Ubuntu 22.04: GCC 11, glibc 2.35) the final link fails with "undefined
+/// reference" errors without these definitions. On newer systems our
+/// definitions simply take precedence over the identical ones in
+/// libstdc++.so / libc.so — behavior is unchanged either way. The
+/// `build-oldest-linux` CI job (bare ubuntu:22.04 container) proves this set
+/// stays sufficient whenever the ort binaries move to a newer toolchain.
+///
+/// The fourth compatibility piece lives in `ort_link_compat.cpp` (compiled
+/// by build.rs): forcing iostream initialization before ONNX Runtime's
+/// static constructors, which otherwise segfault writing to a
+/// never-constructed `std::cout` on pre-GCC-13.3 libstdc++.
+mod ort_link_compat {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    extern "C" {
+        /// Defined in `ort_link_compat.cpp`; referencing (and calling) it
+        /// forces the linker to pull that object — and the iostream
+        /// initializer it carries — into the final binary.
+        pub fn ninox_ort_link_compat_anchor();
+    }
+    /// libstdc++ >= GCC 13 EH symbol. The C++ runtime calls it in exactly
+    /// one situation: an exception escaped a `noexcept` frame during
+    /// unwinding, at which point the process must die — so aborting matches
+    /// the ABI contract (we only lose custom `std::set_terminate` handler
+    /// dispatch, which nothing in onnxruntime relies on).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[no_mangle]
+    pub extern "C" fn __cxa_call_terminate(_exception_header: *mut std::ffi::c_void) {
+        std::process::abort();
+    }
+
+    /// glibc >= 2.38 C23 redirects of the `strto*` family (`strtol` compiled
+    /// against a new glibc becomes a call to `__isoc23_strtol`, etc.). The
+    /// C23 versions differ from the classic ones only in accepting binary
+    /// integer literals ("0b1010"), which nothing in onnxruntime's parsing
+    /// feeds them — forwarding to the classic functions is safe.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    mod isoc23 {
+        use libc::{c_char, c_int, c_long, c_longlong, c_ulonglong};
+
+        #[no_mangle]
+        pub unsafe extern "C" fn __isoc23_strtol(
+            s: *const c_char,
+            endp: *mut *mut c_char,
+            base: c_int,
+        ) -> c_long {
+            unsafe { libc::strtol(s, endp, base) }
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn __isoc23_strtoll(
+            s: *const c_char,
+            endp: *mut *mut c_char,
+            base: c_int,
+        ) -> c_longlong {
+            unsafe { libc::strtoll(s, endp, base) }
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn __isoc23_strtoull(
+            s: *const c_char,
+            endp: *mut *mut c_char,
+            base: c_int,
+        ) -> c_ulonglong {
+            unsafe { libc::strtoull(s, endp, base) }
+        }
     }
 }
 

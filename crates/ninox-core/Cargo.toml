@@ -32,6 +32,12 @@ time       = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 
+[build-dependencies]
+# Compiles src/ort_link_compat.cpp on gnu-Linux targets only — the iostream
+# init half of the prebuilt-ONNX-Runtime toolchain compatibility shims (see
+# the ort_link_compat module in src/embeddings.rs).
+cc = "1"
+
 [dev-dependencies]
 tempfile           = "3"
 tokio-test         = "0.4"
