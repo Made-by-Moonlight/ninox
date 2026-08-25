@@ -92,11 +92,13 @@ jobs:
       # The filter pins this to the embedder tests: a bare `-- --ignored`
       # would also sweep in unrelated ignored tests (e.g. the 5000-file
       # brain rebuild benchmark) and silently adopt any future ignored test
-      # whose requirements this container doesn't meet.
+      # whose requirements this container doesn't meet. Single-threaded so
+      # the two tests can't race the fresh model download into the shared
+      # fastembed cache on a cold runner.
       - name: Run binary and real-inference embedder tests
         run: |
           ./target/debug/ninox --help > /dev/null
-          cargo test --locked -p ninox-core -- --ignored fast_embed_embedder
+          cargo test --locked -p ninox-core -- --ignored fast_embed_embedder --test-threads=1
 
   bundle-macos:
     name: macOS App Bundle
