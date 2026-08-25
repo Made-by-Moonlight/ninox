@@ -316,6 +316,11 @@ pub struct App {
     pub prs:             HashMap<PrId, PR>,
     pub ci_status:       HashMap<PrId, CIStatus>,
     pub review_threads:  HashMap<PrId, Vec<Comment>>,
+    /// Read-only `text_editor` buffer per comment id, so Marginalia comment
+    /// bodies can be selected and copied. Populated alongside
+    /// `review_threads`; iced needs the buffer to outlive the view, so it
+    /// cannot be built on the fly while rendering.
+    pub comment_editors: HashMap<i64, iced::widget::text_editor::Content>,
     /// On-demand `git diff` text per session's workspace (`ensure_diff`).
     /// Absent = not fetched yet (render "Loading…"); `Some(None)` = fetched,
     /// no diff (no workspace recorded, or a clean working tree).
@@ -460,6 +465,10 @@ pub enum Message {
     MouseMoved(iced::Point),
     MouseReleased,
     CopyToClipboard(String),
+    /// A `text_editor` interaction inside a Marginalia comment card, keyed by
+    /// `Comment::id`. Selection/scroll actions are applied; edit actions are
+    /// dropped, which is what keeps the comment bodies read-only.
+    CommentAction(i64, iced::widget::text_editor::Action),
     PollSessions,
     NavigatePrList,
     NavigateBrain,
@@ -755,6 +764,77 @@ async fn reconcile_live_sessions_at_startup_with<F, Fut>(
             reconciled_status_for_dead_session(&session.claude_session_id, has_resume_args);
         let _ = engine.store.upsert_session(&dead);
         engine.emit(CoreEvent::SessionUpdated(dead, SessionFields::STATUS));
+    }
+}
+
+/// Apply a `text_editor` action to a Marginalia comment buffer while keeping
+/// it read-only: selection, navigation and scrolling are applied, edits are
+/// dropped. Copy is handled inside the widget itself (it writes the clipboard
+/// directly and emits no action), so filtering edits here does not break
+/// Cmd+C — which is the whole point of rendering comments as editors.
+fn apply_comment_action(
+    content: &mut iced::widget::text_editor::Content,
+    action: iced::widget::text_editor::Action,
+) {
+    if !action.is_edit() {
+        content.perform(action);
+    }
+}
+
+#[cfg(test)]
+mod comment_editor_tests {
+    use iced::widget::text_editor::{Action, Content, Edit, Motion};
+
+    use super::apply_comment_action;
+
+    #[test]
+    fn edits_never_mutate_a_comment_buffer() {
+        let mut content = Content::with_text("hello");
+        for edit in [
+            Edit::Insert('x'),
+            Edit::Backspace,
+            Edit::Delete,
+            Edit::Enter,
+            Edit::Paste(std::sync::Arc::new("pasted".to_string())),
+        ] {
+            apply_comment_action(&mut content, Action::Edit(edit));
+        }
+        // `Content::text()` always terminates with a newline.
+        assert_eq!(
+            content.text(),
+            "hello\n",
+            "comment cards are read-only; no edit action may change the body"
+        );
+    }
+
+    #[test]
+    fn selection_actions_are_applied() {
+        let mut content = Content::with_text("hello");
+        assert!(content.selection().is_none(), "nothing selected initially");
+
+        apply_comment_action(&mut content, Action::SelectAll);
+        assert_eq!(
+            content.selection().as_deref(),
+            Some("hello"),
+            "select-all must reach the buffer, otherwise text isn't selectable"
+        );
+
+        // Selecting must not have altered the text itself.
+        assert_eq!(content.text(), "hello\n");
+    }
+
+    #[test]
+    fn navigation_is_applied_and_clears_selection() {
+        let mut content = Content::with_text("hello");
+        apply_comment_action(&mut content, Action::SelectAll);
+        assert!(content.selection().is_some());
+
+        apply_comment_action(&mut content, Action::Move(Motion::DocumentEnd));
+        assert!(
+            content.selection().is_none(),
+            "a plain move collapses the selection"
+        );
+        assert_eq!(content.text(), "hello\n");
     }
 }
 
@@ -1112,7 +1192,12 @@ impl App {
         // `list_comments` already orders by `created_at`, so each group's
         // insertion order is already the display order.
         let mut review_threads: HashMap<PrId, Vec<Comment>> = HashMap::new();
+        let mut comment_editors: HashMap<i64, iced::widget::text_editor::Content> = HashMap::new();
         for comment in engine.store.list_comments().unwrap_or_default() {
+            comment_editors.insert(
+                comment.id,
+                iced::widget::text_editor::Content::with_text(&comment.body),
+            );
             review_threads.entry(comment.pr_id).or_default().push(comment);
         }
 
@@ -1164,6 +1249,7 @@ impl App {
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads,
+            comment_editors,
             diffs:          HashMap::new(),
             notifications:  VecDeque::new(),
             update_in_progress: false,
@@ -3200,6 +3286,15 @@ impl App {
                 Task::none()
             }
 
+            // See `apply_comment_action`: edits are dropped so the cards stay
+            // read-only while still being selectable and copyable.
+            Message::CommentAction(comment_id, action) => {
+                if let Some(content) = state.comment_editors.get_mut(&comment_id) {
+                    apply_comment_action(content, action);
+                }
+                Task::none()
+            }
+
             Message::PollSessions => {
                 let db_sessions   = state.engine.store.list_sessions().unwrap_or_default();
                 let db_orchestrators = state.engine.store.list_orchestrators().unwrap_or_default();
@@ -4016,6 +4111,10 @@ impl App {
                 // guard here too so a repeated emit doesn't duplicate the
                 // in-memory feed the way it would upsert-replace the DB row.
                 if !thread.iter().any(|c| c.id == comment.id) {
+                    state.comment_editors.insert(
+                        comment.id,
+                        iced::widget::text_editor::Content::with_text(&comment.body),
+                    );
                     thread.push(comment);
                     thread.sort_by_key(|c| c.created_at);
                 }
@@ -5333,6 +5432,7 @@ mod tests {
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
+            comment_editors: HashMap::new(),
             diffs:          HashMap::new(),
             notifications:  VecDeque::new(),
             update_in_progress: false,

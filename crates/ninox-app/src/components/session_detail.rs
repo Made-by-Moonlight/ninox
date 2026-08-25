@@ -657,7 +657,7 @@ pub fn session_detail<'a>(
     // ── Info pane ─────────────────────────────────────────────────────────────
     let info_width = app.info_width;
     let info_pane: Element<Message> = container(
-        info_panel(session, pr, ci, comments, s),
+        info_panel(session, pr, ci, comments, &app.comment_editors, s),
     )
     .width(Length::Fixed(info_width))
     .height(Length::Fill)
