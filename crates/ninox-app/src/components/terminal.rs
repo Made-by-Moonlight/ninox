@@ -25,6 +25,7 @@ pub const TERM_FONT: iced::Font = iced::Font {
 };
 
 const CONTEXTUAL_FONT_ANCHOR: char = '\u{feff}';
+const LTR_FONT_ANCHOR: char = '.';
 
 fn term_font_has_glyph(character: char) -> bool {
     use std::sync::OnceLock;
@@ -80,18 +81,22 @@ fn font_for_cell(character: char, flags: Flags) -> iced::Font {
     }
 }
 
-fn draw_contextual_glyph(
+fn draw_advanced_cell_glyph(
     frame: &mut Frame,
     character: char,
     mut text: iced::widget::canvas::Text,
+    cell_width: f32,
+    target_width: f32,
+    cell_height: f32,
 ) {
-    // Advanced shaping is reliable when the requested font is already
-    // established by an adjacent bundled glyph. JetBrains Mono's U+FEFF glyph
-    // has no outline or advance, so it anchors font selection without
-    // painting or shifting the terminal cell.
-    text.content = format!("{CONTEXTUAL_FONT_ANCHOR}{character}");
+    // Seed both shaping and the cold glyph atlas with a real bundled glyph.
+    // Clip it outside the cell, then place the requested glyph at the cell
+    // origin by compensating for JetBrains Mono's one-cell advance.
+    let clip = Rectangle::new(text.position, Size::new(target_width, cell_height));
+    text.content = format!("{LTR_FONT_ANCHOR}{character}");
+    text.position.x -= cell_width;
     text.shaping = iced::widget::text::Shaping::Advanced;
-    frame.fill_text(text);
+    frame.with_clip(clip, |frame| frame.fill_text(text));
 }
 
 /// The single source of truth for the terminal's font size — every layout
@@ -1701,7 +1706,7 @@ fn draw_cell(
 
         let font = font_for_cell(c, flags);
         let rendering = glyph_rendering(c);
-        let mut text = iced::widget::canvas::Text {
+        let text = iced::widget::canvas::Text {
             content: c.to_string(),
             position: iced::Point::new(x, y),
             color: glyph_fg,
@@ -1712,13 +1717,15 @@ fn draw_cell(
             line_height: iced::widget::text::LineHeight::Relative(cell_h / font_size),
             shaping: iced::widget::text::Shaping::Basic,
         };
-        if rendering == GlyphRendering::Contextual {
-            draw_contextual_glyph(frame, c, text);
-        } else {
-            if rendering == GlyphRendering::Fallback {
-                text.shaping = iced::widget::text::Shaping::Advanced;
-            }
+        if rendering == GlyphRendering::Basic {
             frame.fill_text(text);
+        } else {
+            let target_width = if flags.contains(Flags::WIDE_CHAR) {
+                2.0 * cell_w
+            } else {
+                cell_w
+            };
+            draw_advanced_cell_glyph(frame, c, text, cell_w, target_width, cell_h);
         }
     }
 
@@ -2075,7 +2082,7 @@ mod tests {
     #[test]
     fn terminal_font_and_parser_preserve_common_unicode_punctuation() {
         let face = ttf_parser::Face::parse(TERM_FONT_BYTES, 0).unwrap();
-        for character in ['\'', '’', '“', '”', '→'] {
+        for character in ['\'', '’', '‘', '“', '”', '—', '→', '✓'] {
             assert!(
                 face.glyph_index(character).is_some(),
                 "terminal font is missing {character:?}"
@@ -2083,12 +2090,13 @@ mod tests {
         }
 
         let mut state = TerminalState::new(80, 24, None);
-        state.process("don’t “quote” →".as_bytes());
+        let sample = "→ don’t ‘lose’ “quotes” — ✓ \u{e0b0}\u{e0b2} ⠘⠣";
+        state.process(sample.as_bytes());
         use alacritty_terminal::index::{Column, Line};
-        let rendered: String = (0..15)
+        let rendered: String = (0..sample.chars().count())
             .map(|column| state.term.grid()[Line(0)][Column(column)].c)
             .collect();
-        assert_eq!(rendered, "don’t “quote” →");
+        assert_eq!(rendered, sample);
     }
 
     #[test]
@@ -2096,10 +2104,10 @@ mod tests {
         assert!(term_font_has_glyph(CONTEXTUAL_FONT_ANCHOR));
         assert_eq!(glyph_rendering('\''), GlyphRendering::Basic);
         assert_eq!(glyph_rendering('\u{e0b0}'), GlyphRendering::Basic);
-        for character in ['’', '“', '”', '→'] {
+        for character in ['’', '‘', '“', '”', '—', '→', '✓'] {
             assert_eq!(glyph_rendering(character), GlyphRendering::Contextual);
         }
-        for character in ['⠰', '⠳'] {
+        for character in ['⠘', '⠣', '⠰', '⠳'] {
             assert_eq!(glyph_rendering(character), GlyphRendering::Fallback);
         }
 
@@ -2143,6 +2151,85 @@ mod tests {
             .unwrap();
         assert_eq!(visible.x, 0.0);
         assert_ne!(visible.glyph_id, 0);
+    }
+
+    #[test]
+    fn cold_renderer_rasterizes_ltr_anchor_and_places_special_glyphs_at_cell_origin() {
+        use iced::advanced::graphics::text::cosmic_text;
+
+        let mut db = cosmic_text::fontdb::Database::new();
+        db.load_font_data(TERM_FONT_BYTES.to_vec());
+        let mut fonts = cosmic_text::FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let attrs =
+            cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrains Mono"));
+        let mut rasterizer = cosmic_text::SwashCache::new();
+        let cell_width = cell_size(FONT_SIZE).0;
+
+        for character in ['→', '’', '‘', '“', '”', '—', '✓'] {
+            let mut buffer =
+                cosmic_text::Buffer::new(&mut fonts, cosmic_text::Metrics::new(13.0, 18.0));
+            let content = format!("{LTR_FONT_ANCHOR}{character}");
+            buffer.set_text(&mut fonts, &content, attrs, cosmic_text::Shaping::Advanced);
+            let glyphs = buffer.layout_runs().next().unwrap().glyphs;
+            let anchor = glyphs[0].clone();
+            let visible = glyphs
+                .iter()
+                .find(|glyph| glyph.start >= LTR_FONT_ANCHOR.len_utf8())
+                .unwrap()
+                .clone();
+
+            let anchor_image = rasterizer
+                .get_image(&mut fonts, anchor.physical((0.0, 0.0), 1.0).cache_key)
+                .as_ref()
+                .unwrap();
+            assert!(anchor_image.placement.width > 0);
+            assert!(anchor_image.placement.height > 0);
+            assert!(!anchor_image.data.is_empty());
+            assert!((visible.x - cell_width).abs() < 0.01);
+            assert_ne!(visible.glyph_id, 0);
+        }
+    }
+
+    #[test]
+    fn cold_renderer_resolves_spinner_fallback_and_powerline_glyphs() {
+        use iced::advanced::graphics::text::cosmic_text;
+
+        let nerd_face = ttf_parser::Face::parse(
+            include_bytes!("../../assets/fonts/SymbolsNerdFontMono-Regular.ttf"),
+            0,
+        )
+        .unwrap();
+        for character in ['\u{e0b0}', '\u{e0b2}'] {
+            assert!(nerd_face.glyph_index(character).is_some());
+        }
+
+        let mut fonts = cosmic_text::FontSystem::new();
+        fonts.db_mut().load_font_data(TERM_FONT_BYTES.to_vec());
+        let attrs =
+            cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrains Mono"));
+        let mut rasterizer = cosmic_text::SwashCache::new();
+        for character in ['⠘', '⠣'] {
+            let mut buffer =
+                cosmic_text::Buffer::new(&mut fonts, cosmic_text::Metrics::new(13.0, 18.0));
+            let content = format!("{LTR_FONT_ANCHOR}{character}");
+            buffer.set_text(&mut fonts, &content, attrs, cosmic_text::Shaping::Advanced);
+            let visible = buffer
+                .layout_runs()
+                .next()
+                .unwrap()
+                .glyphs
+                .iter()
+                .find(|glyph| glyph.start >= LTR_FONT_ANCHOR.len_utf8())
+                .unwrap()
+                .clone();
+            let image = rasterizer
+                .get_image(&mut fonts, visible.physical((0.0, 0.0), 1.0).cache_key)
+                .as_ref()
+                .unwrap();
+            assert!(image.placement.width > 0);
+            assert!(image.placement.height > 0);
+            assert!(!image.data.is_empty());
+        }
     }
 
     fn shaped_glyphs_by_character(text: &str, per_cell: bool) -> Vec<u16> {
