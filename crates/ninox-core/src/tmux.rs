@@ -64,8 +64,11 @@ fn supports_extended_keys_format((major, minor): (u32, u32)) -> bool {
 /// tmux to parse a directive it doesn't understand.
 fn server_config_for_version(version: (u32, u32)) -> String {
     let mut cfg = String::from("# Managed by ninox — rewritten on every app start. Do not edit.\n");
+    // Launcher automation policy must not leak into Ninox's interactive processes.
+    cfg.push_str("set-environment -gu NO_COLOR\n");
+    cfg.push_str("set-environment -gu FORCE_COLOR\n");
     cfg.push_str("set -g  default-terminal \"tmux-256color\"\n");
-    cfg.push_str("set -as terminal-features \"xterm*:RGB:usstyle:extkeys:hyperlinks\"\n");
+    cfg.push_str("set -as terminal-features \"xterm*:RGB:usstyle:extkeys:hyperlinks:sync\"\n");
     cfg.push_str("set -s  extended-keys always\n");
     if supports_extended_keys_format(version) {
         cfg.push_str("set -s  extended-keys-format csi-u\n");
@@ -620,6 +623,109 @@ mod tests {
     use super::*;
     use tokio::time::{sleep, Duration};
 
+    struct IsolatedTmuxServer {
+        socket: String,
+        tmpdir: tempfile::TempDir,
+    }
+
+    impl IsolatedTmuxServer {
+        fn new() -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self {
+                socket: format!("nx-color-{}-{n}", std::process::id()),
+                tmpdir: tempfile::Builder::new().prefix("nx").tempdir_in("/tmp").unwrap(),
+            }
+        }
+
+        fn command(&self) -> std::process::Command {
+            let mut command = std::process::Command::new("tmux");
+            command
+                .args(["-L", &self.socket])
+                .env("TMUX_TMPDIR", self.tmpdir.path())
+                .env("NO_COLOR", "1")
+                .env("FORCE_COLOR", "0")
+                .env("COLORTERM", "truecolor");
+            command
+        }
+
+        fn config_path(&self) -> std::path::PathBuf {
+            self.tmpdir.path().join("tmux.conf")
+        }
+
+        fn write_config(&self, config: &str) {
+            std::fs::write(self.config_path(), config).unwrap();
+        }
+
+        fn start(&self) {
+            let output = self
+                .command()
+                .args(["-f", self.config_path().to_str().unwrap(), "start-server"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "failed to start isolated tmux server: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn run(&self, args: &[&str]) -> String {
+            let output = self.command().args(args).output().unwrap();
+            assert!(
+                output.status.success(),
+                "tmux {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim_end().to_string()
+        }
+
+        fn assert_color_capable_environment(&self) {
+            let global_environment = self.run(&["show-environment", "-g"]);
+            for key in ["NO_COLOR", "FORCE_COLOR"] {
+                assert!(
+                    !global_environment
+                        .lines()
+                        .any(|variable| variable.starts_with(&format!("{key}="))),
+                    "{key} must be removed from the private server environment"
+                );
+            }
+            assert_eq!(
+                self.run(&["show-options", "-gv", "default-terminal"]),
+                "tmux-256color"
+            );
+            assert!(
+                self.run(&["show-options", "-gsv", "terminal-features"]).contains("RGB"),
+                "RGB terminal capability must remain enabled"
+            );
+
+            let pane_env = self.tmpdir.path().join("pane.env");
+            let command = format!(
+                "printf '%s\\n' \"${{NO_COLOR-unset}}\" \"${{FORCE_COLOR-unset}}\" \
+                 \"$TERM\" \"${{COLORTERM-unset}}\" > {}; sleep 30",
+                pane_env.display()
+            );
+            self.run(&["new-session", "-d", "-s", "color-env", &command]);
+            for _ in 0..50 {
+                if pane_env.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let pane_env = std::fs::read_to_string(&pane_env).unwrap();
+            assert_eq!(
+                pane_env.lines().collect::<Vec<_>>(),
+                ["unset", "unset", "tmux-256color", "truecolor"]
+            );
+        }
+    }
+
+    impl Drop for IsolatedTmuxServer {
+        fn drop(&mut self) {
+            let _ = self.command().arg("kill-server").status();
+        }
+    }
+
     fn tmux_available() -> bool {
         std::process::Command::new("tmux")
             .args(["-V"])
@@ -654,6 +760,36 @@ mod tests {
         assert!(is_test_binary(), "the test binary itself must be detected as a test binary");
         assert_eq!(socket(), "ninox-test");
         assert_ne!(socket(), "ninox");
+    }
+
+    #[test]
+    fn fresh_private_server_drops_automation_color_suppression() {
+        if !tmux_available() { return; }
+        let server = IsolatedTmuxServer::new();
+        server.write_config(&server_config_for_version(detected_version_sync()));
+
+        server.start();
+
+        server.assert_color_capable_environment();
+    }
+
+    #[test]
+    fn running_private_server_reconciliation_drops_automation_color_suppression() {
+        if !tmux_available() { return; }
+        let server = IsolatedTmuxServer::new();
+        server.write_config(
+            "set -g default-terminal \"tmux-256color\"\n\
+             set -as terminal-features \"xterm*:RGB\"\n\
+             set -g exit-empty off\n",
+        );
+        server.start();
+        assert_eq!(server.run(&["show-environment", "-g", "NO_COLOR"]), "NO_COLOR=1");
+        assert_eq!(server.run(&["show-environment", "-g", "FORCE_COLOR"]), "FORCE_COLOR=0");
+
+        server.write_config(&server_config_for_version(detected_version_sync()));
+        server.run(&["source-file", server.config_path().to_str().unwrap()]);
+
+        server.assert_color_capable_environment();
     }
 
     #[tokio::test]
@@ -1024,6 +1160,7 @@ mod tests {
         let body = std::fs::read_to_string(&path).unwrap();
         for required in [
             "default-terminal \"tmux-256color\"",
+            "xterm*:RGB:usstyle:extkeys:hyperlinks:sync",
             "extended-keys always",
             "history-limit 100000",
             "status off",

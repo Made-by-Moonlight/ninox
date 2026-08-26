@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, VecDeque}, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, VecDeque}, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use ninox_core::{
     config::{AppConfig, ThemeVariant},
@@ -19,6 +19,8 @@ use crate::{
 };
 
 const MAX_NOTIFICATIONS: usize = 50;
+const CLIENT_OUTPUT_QUIET_INTERVAL: Duration = Duration::from_millis(3);
+const CLIENT_OUTPUT_MAX_COALESCE_INTERVAL: Duration = Duration::from_millis(8);
 
 /// The running binary's own version — shown in Settings and used as the
 /// baseline for `ensure_version_check`. This crate's `CARGO_PKG_VERSION`,
@@ -2683,12 +2685,12 @@ impl App {
     }
 }
 
-/// Pull one `Event` off `rx`, merging any `ClientOutput` chunks already
-/// sitting in the channel for the same client generation into it.
-/// `pending` carries a lookahead event across calls: a `try_recv` that
-/// turns out not to match can't be put back on the channel, so it's
-/// stashed here and returned as-is on the following call instead of being
-/// dropped or clobbering the event already in hand.
+/// Pull one `Event` off `rx`, merging adjacent `ClientOutput` chunks for the
+/// same client generation into it.
+/// `pending` carries a lookahead event across calls: an event that turns out
+/// not to match can't be put back on the channel, so it's stashed here and
+/// returned as-is on the following call instead of being dropped or
+/// clobbering the event already in hand.
 ///
 /// The PTY reader thread (`AttachedClient::spawn`) emits one `ClientOutput`
 /// per raw `read()`, capped at 8KB — a single full-screen repaint (a tmux
@@ -2696,12 +2698,12 @@ impl App {
 /// back-to-back. Rendering each as its own frame is what surfaces as a
 /// flickering, "darting" cursor mid-repaint: the view briefly shows the
 /// cursor at each intermediate position the repaint passes through instead
-/// of settling directly on the final one. This only merges chunks that are
-/// already buffered by the time we look — it never waits for more to
-/// arrive, so it adds no latency to genuinely paced output (e.g. a spinner).
-/// Chunks from a different generation are never merged together, matching
-/// the same stale-vs-current-client distinction `ClientOutput`'s handler
-/// already relies on elsewhere.
+/// of settling directly on the final one. A short quiet interval catches
+/// repaint fragments split across adjacent event-loop ticks, while a hard
+/// total interval keeps continuous output from starving rendering or input.
+/// Chunks from a different session or generation are never merged together,
+/// matching the same stale-vs-current-client distinction `ClientOutput`'s
+/// handler already relies on elsewhere.
 async fn next_coalesced_event(
     rx: &mut broadcast::Receiver<Event>,
     pending: &mut Option<Event>,
@@ -2725,18 +2727,32 @@ async fn next_coalesced_event(
     let Event::ClientOutput { session_id, generation, mut bytes } = event else {
         return Some(event);
     };
+    let started = tokio::time::Instant::now();
+    let hard_deadline = started + CLIENT_OUTPUT_MAX_COALESCE_INTERVAL;
+    let mut quiet_deadline = started + CLIENT_OUTPUT_QUIET_INTERVAL;
+
     loop {
-        match rx.try_recv() {
-            Ok(Event::ClientOutput { session_id: sid2, generation: gen2, bytes: more })
+        if tokio::time::Instant::now() >= hard_deadline {
+            break;
+        }
+
+        let deadline = quiet_deadline.min(hard_deadline);
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Ok(Event::ClientOutput { session_id: sid2, generation: gen2, bytes: more }))
                 if sid2 == session_id && gen2 == generation =>
             {
                 bytes.extend(more);
+                quiet_deadline =
+                    tokio::time::Instant::now() + CLIENT_OUTPUT_QUIET_INTERVAL;
             }
-            Ok(other) => {
+            Ok(Ok(other)) => {
                 *pending = Some(other);
                 break;
             }
-            Err(_) => break,
+            Ok(Err(
+                broadcast::error::RecvError::Lagged(_) | broadcast::error::RecvError::Closed,
+            ))
+            | Err(_) => break,
         }
     }
 
@@ -3173,6 +3189,109 @@ mod tests {
 
         drop(tx);
         assert!(next_coalesced_event(&mut rx, &mut pending).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn coalesces_client_output_that_arrives_after_polling_begins() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut pending = None;
+        tx.send(Event::ClientOutput {
+            session_id: "s1".into(),
+            generation: 1,
+            bytes: b"foo".to_vec(),
+        }).unwrap();
+
+        let event = next_coalesced_event(&mut rx, &mut pending);
+        tokio::pin!(event);
+        assert!(matches!(
+            futures::poll!(event.as_mut()),
+            std::task::Poll::Pending
+        ));
+
+        tx.send(Event::ClientOutput {
+            session_id: "s1".into(),
+            generation: 1,
+            bytes: b"bar".to_vec(),
+        }).unwrap();
+
+        assert!(
+            matches!(event.await, Some(Event::ClientOutput { bytes, .. }) if bytes == b"foobar")
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_event_ends_coalescing_and_keeps_its_order() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut pending = None;
+        tx.send(Event::ClientOutput {
+            session_id: "s1".into(),
+            generation: 1,
+            bytes: b"output".to_vec(),
+        }).unwrap();
+
+        let first = {
+            let event = next_coalesced_event(&mut rx, &mut pending);
+            tokio::pin!(event);
+            assert!(matches!(
+                futures::poll!(event.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            tx.send(Event::ClientClosed {
+                session_id: "s1".into(),
+                generation: 1,
+            }).unwrap();
+
+            match futures::poll!(event.as_mut()) {
+                std::task::Poll::Ready(event) => event,
+                std::task::Poll::Pending => panic!("foreign event did not end coalescing"),
+            }
+        };
+        assert!(
+            matches!(first, Some(Event::ClientOutput { bytes, .. }) if bytes == b"output")
+        );
+
+        assert!(matches!(
+            next_coalesced_event(&mut rx, &mut pending).await,
+            Some(Event::ClientClosed {
+                session_id,
+                generation: 1
+            }) if session_id == "s1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn continuous_client_output_does_not_starve_delivery() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut pending = None;
+        tx.send(Event::ClientOutput {
+            session_id: "s1".into(),
+            generation: 1,
+            bytes: vec![b'a'],
+        }).unwrap();
+
+        let producer = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                if tx.send(Event::ClientOutput {
+                    session_id: "s1".into(),
+                    generation: 1,
+                    bytes: vec![b'b'],
+                }).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let event = tokio::time::timeout(
+            Duration::from_millis(100),
+            next_coalesced_event(&mut rx, &mut pending),
+        )
+        .await
+        .expect("continuous output exceeded the hard coalescing bound");
+        producer.abort();
+
+        assert!(matches!(event, Some(Event::ClientOutput { .. })));
     }
 
     #[tokio::test]
