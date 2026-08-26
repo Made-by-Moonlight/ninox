@@ -142,6 +142,7 @@ impl Poller {
                         .unwrap_or_default()
                         .session_retention;
                     self.sweep_retired_sessions(&retention).await;
+                    self.deliver_worker_completions().await;
                 }
                 _ = usage_interval.tick()  => self.poll_usage().await,
                 _ = update_interval.tick() => self.poll_update_check().await,
@@ -153,6 +154,53 @@ impl Poller {
                     self.poll_github().await;
                 }
             }
+        }
+    }
+
+    async fn deliver_worker_completions(&self) {
+        const RETRY_AFTER_MS: i64 = 30_000;
+        let now = now_millis();
+        let delivery = match self
+            .engine
+            .store
+            .claim_worker_completion_delivery(now, RETRY_AFTER_MS)
+        {
+            Ok(Some(delivery)) => delivery,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!("claim worker completion delivery: {error}");
+                return;
+            }
+        };
+        let message = format!(
+            "Ninox recorded completion for worker `{}`. Receive its canonical final \
+             handoff exactly once:\n\n`ninox receive-completion {}`",
+            delivery.completion.session_id, delivery.completion.completion_id,
+        );
+        let error = self
+            .engine
+            .send_to_session(&delivery.completion.orchestrator_id, &message)
+            .await
+            .err()
+            .map(|error| error.to_string());
+        if let Err(record_error) = self.engine.store.finish_worker_completion_delivery_attempt(
+            &delivery.completion.completion_id,
+            &delivery.attempt_id,
+            now_millis(),
+            error.as_deref(),
+        ) {
+            tracing::warn!(
+                "record worker completion delivery {} attempt {}: {record_error}",
+                delivery.completion.completion_id,
+                delivery.attempt,
+            );
+        }
+        if let Some(error) = error {
+            tracing::warn!(
+                "deliver worker completion {} to orchestrator {}: {error}",
+                delivery.completion.completion_id,
+                delivery.completion.orchestrator_id,
+            );
         }
     }
 
@@ -1382,6 +1430,68 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None,
         }
+    }
+
+    #[tokio::test]
+    async fn completion_delivery_attempts_at_most_one_item_per_tick() {
+        use crate::{
+            store::Store,
+            types::{Orchestrator, WorkerCompletionIntent},
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(root.path().join("t.db")).unwrap());
+        store
+            .upsert_orchestrator(&Orchestrator {
+                id: "orch".into(),
+                name: "orch".into(),
+                created_at: 1,
+            })
+            .unwrap();
+        let completed_at = now_millis() - 1_000;
+        let mut completion_ids = Vec::new();
+        for (offset, id) in ["worker-1", "worker-2"].into_iter().enumerate() {
+            let mut session = test_session(id, "/ws");
+            session.orchestrator_id = Some("orch".into());
+            session.started_at = i64::try_from(offset + 1).unwrap();
+            store.upsert_session(&session).unwrap();
+            let worker = store
+                .prepare_worker_incarnation(
+                    id,
+                    Some("orch"),
+                    session.started_at,
+                    "/ws",
+                    false,
+                    3,
+                )
+                .unwrap();
+            assert!(store
+                .bind_worker_incarnation(id, &worker.incarnation_id, "/ws", "/ws", None)
+                .unwrap());
+            let WorkerCompletionIntent::Completed(completion) = store
+                .complete_worker_incarnation(
+                    id,
+                    &worker.incarnation_id,
+                    "orch",
+                    "canonical summary",
+                    completed_at + i64::try_from(offset).unwrap(),
+                )
+                .unwrap()
+            else {
+                panic!("first completion must commit");
+            };
+            completion_ids.push(completion.completion_id);
+        }
+        let poller = Poller::new(Engine::new(store.clone()));
+
+        poller.deliver_worker_completions().await;
+
+        let still_pending = store
+            .claim_worker_completion_delivery(now_millis(), 30_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_pending.completion.completion_id, completion_ids[1]);
+        assert_eq!(still_pending.attempt, 1);
     }
 
     #[tokio::test]

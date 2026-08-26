@@ -139,7 +139,12 @@ fn create_legacy_runtime_table(conn: &Connection) -> Result<()> {
 fn migrate_legacy_worker_incarnations(conn: &mut Connection) -> Result<()> {
     let columns = table_columns(conn, "worker_incarnations")?;
     let names = columns.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
-    if names == CURRENT_WORKER_INCARNATION_COLUMNS
+    let current_with_repository_key = CURRENT_WORKER_INCARNATION_COLUMNS
+        .iter()
+        .copied()
+        .chain(["repository_key"])
+        .collect::<Vec<_>>();
+    if (names == CURRENT_WORKER_INCARNATION_COLUMNS || names == current_with_repository_key)
         && columns.first().is_some_and(|(_, pk)| *pk == 1)
         && columns.get(1).is_some_and(|(_, pk)| *pk == 0)
     {
@@ -465,6 +470,21 @@ pub struct Store {
     runtime_claim_locks: Mutex<HashMap<String, File>>,
 }
 
+/// UI-facing terminal identity: state stays keyed by the logical session while
+/// tmux operations target the persisted physical runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalRuntimeTarget {
+    pub logical_session_id: SessionId,
+    pub tmux_session_id:    String,
+}
+
+pub(crate) struct WorkerCleanupSnapshotClaim {
+    pub worker:                        WorkerIncarnation,
+    pub restore_state:                  Option<WorkerIncarnationState>,
+    pub snapshot_started_at:            i64,
+    pub require_legacy_runtime_absence: bool,
+}
+
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -567,6 +587,35 @@ impl Store {
                 claimed_at INTEGER NOT NULL,
                 finalized_at INTEGER
             );
+            CREATE TABLE IF NOT EXISTS worker_completions (
+                completion_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                incarnation_id TEXT NOT NULL,
+                orchestrator_id TEXT NOT NULL,
+                summary TEXT NOT NULL CHECK(length(summary)>0),
+                completed_at INTEGER NOT NULL,
+                UNIQUE(session_id,incarnation_id)
+            );
+            CREATE TABLE IF NOT EXISTS worker_completion_outbox (
+                completion_id TEXT PRIMARY KEY,
+                next_attempt_at INTEGER NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count>=0),
+                acknowledged_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS worker_completion_delivery_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                completion_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL CHECK(attempt>0),
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                outcome TEXT CHECK(outcome IN ('sent','failed')),
+                detail TEXT,
+                UNIQUE(completion_id,attempt)
+            );
+            CREATE INDEX IF NOT EXISTS worker_completion_outbox_pending
+                ON worker_completion_outbox(acknowledged_at,next_attempt_at);
+            CREATE INDEX IF NOT EXISTS worker_completion_attempts_completion
+                ON worker_completion_delivery_attempts(completion_id,attempt);
         ")?;
         migrate_legacy_worker_incarnations(&mut conn)?;
         // Migrations for columns added after initial release — idempotent so
@@ -608,6 +657,17 @@ impl Store {
                 [],
             )?;
         }
+        if !Self::column_exists(&conn, "worker_incarnations", "repository_key")? {
+            conn.execute(
+                "ALTER TABLE worker_incarnations ADD COLUMN repository_key TEXT",
+                [],
+            )?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS worker_incarnations_repository_capacity
+             ON worker_incarnations(repository_key,state)",
+            [],
+        )?;
         conn.execute(
             "UPDATE pooled_checkouts
              SET owner_incarnation_id=session_id
@@ -631,6 +691,23 @@ impl Store {
                AND p.lease_id IS NOT NULL",
             [],
         )?;
+        conn.execute(
+            "UPDATE worker_incarnations
+             SET repository_key=COALESCE(
+                 (
+                     SELECT p.common_git_dir
+                     FROM pooled_checkouts p
+                     WHERE p.session_id=worker_incarnations.session_id
+                       AND p.owner_incarnation_id=worker_incarnations.incarnation_id
+                       AND p.lease_id IS worker_incarnations.lease_id
+                     LIMIT 1
+                 ),
+                 source_workspace
+             )
+             WHERE checkout_backed=1 AND repository_key IS NULL",
+            [],
+        )?;
+        Self::normalize_worker_repository_keys(&conn)?;
         Self::reconcile_pooled_checkout_paths(&mut conn)?;
         Self::reclaim_dead_allocations(&mut conn, &allocator_lock_dir)?;
         Self::reclaim_dead_runtime_claims(&mut conn, &allocator_lock_dir)?;
@@ -651,6 +728,46 @@ impl Store {
             .filter_map(|r| r.ok())
             .any(|c| c == column);
         Ok(exists)
+    }
+
+    fn normalize_worker_repository_keys(conn: &Connection) -> Result<()> {
+        let candidates = {
+            let mut stmt = conn.prepare(
+                "SELECT session_id,source_workspace,workspace_path,repository_key
+                 FROM worker_incarnations
+                 WHERE checkout_backed=1 AND repository_key=source_workspace",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (session_id, source_workspace, workspace_path, stale_key) in candidates {
+            let identity = crate::worktree::RepositoryIdentity::resolve(Path::new(
+                &source_workspace,
+            ))
+            .or_else(|_| {
+                crate::worktree::RepositoryIdentity::resolve(Path::new(&workspace_path))
+            });
+            let Ok(identity) = identity else {
+                continue;
+            };
+            conn.execute(
+                "UPDATE worker_incarnations SET repository_key=?3
+                 WHERE session_id=?1 AND repository_key=?2",
+                params![
+                    session_id,
+                    stale_key,
+                    path_text(&identity.common_git_dir)?
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     fn reconcile_pooled_checkout_paths(conn: &mut Connection) -> Result<()> {
@@ -852,12 +969,22 @@ impl Store {
                     }
                 };
             let state = if status == "done" { "retained" } else { "active" };
+            let repository_key = metadata
+                .common_git_dir
+                .as_deref()
+                .map(canonical_db_path)
+                .transpose()?
+                .or_else(|| {
+                    checkout_repository_identity(&metadata.source_repo)
+                        .ok()
+                        .map(|(key, _)| key)
+                });
             conn.execute(
                 "INSERT OR IGNORE INTO worker_incarnations(
                     session_id,incarnation_id,orchestrator_id,started_at,
-                    source_workspace,workspace_path,lease_id,allocator_pid,
-                    checkout_backed,state
-                 ) VALUES(?1,?2,?3,?4,?5,?6,NULL,NULL,1,?7)",
+                    source_workspace,workspace_path,repository_key,lease_id,
+                    allocator_pid,checkout_backed,state
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,1,?8)",
                 params![
                     session_id,
                     uuid::Uuid::new_v4().to_string(),
@@ -865,6 +992,7 @@ impl Store {
                     started_at,
                     metadata.source_repo.to_string_lossy(),
                     workspace,
+                    repository_key,
                     state,
                 ],
             )?;
@@ -1385,6 +1513,21 @@ impl Store {
     pub fn delete_session(&self, id: &str) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM worker_completion_delivery_attempts
+             WHERE completion_id IN (
+                SELECT completion_id FROM worker_completions WHERE session_id=?1
+             )",
+            [id],
+        )?;
+        tx.execute(
+            "DELETE FROM worker_completion_outbox
+             WHERE completion_id IN (
+                SELECT completion_id FROM worker_completions WHERE session_id=?1
+             )",
+            [id],
+        )?;
+        tx.execute("DELETE FROM worker_completions WHERE session_id=?1", [id])?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         tx.execute("DELETE FROM worker_finalizations WHERE session_id=?1", [id])?;
         tx.execute(
@@ -1503,25 +1646,10 @@ impl Store {
         checkout_cap: usize,
     ) -> Result<WorkerIncarnation> {
         anyhow::ensure!(!session_id.is_empty(), "session id cannot be empty");
-        anyhow::ensure!(
-            (1..=3).contains(&checkout_cap),
-            "worker checkout cap must be between 1 and 3"
-        );
-        let incarnation_id = uuid::Uuid::new_v4().to_string();
-        let allocator_token = uuid::Uuid::new_v4().to_string();
-        let allocator_path = allocation_lock_path(&self.allocator_lock_dir, &incarnation_id);
-        let mut allocator_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&allocator_path)?;
-        allocator_file.write_all(allocator_token.as_bytes())?;
-        allocator_file.sync_all()?;
-        allocator_file.lock()?;
-        let allocator_lock = PendingAllocationLock {
-            path: allocator_path,
-            file: Some(allocator_file),
-        };
+        anyhow::ensure!(checkout_cap > 0, "worker checkout cap must be greater than zero");
+        let mut repository = checkout_backed
+            .then(|| checkout_repository_identity(Path::new(source_workspace)))
+            .transpose()?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let runtime_claimed: bool = tx.query_row(
@@ -1557,19 +1685,43 @@ impl Store {
                 ),
                 "worker {session_id} has an in-progress resource claim"
             );
+            if checkout_backed && previous.checkout_backed {
+                if let Some(repository_key) = &previous.repository_key {
+                    let repository_label = repository
+                        .as_ref()
+                        .map_or(source_workspace, |(_, label)| label.as_str());
+                    repository = Some((repository_key.clone(), repository_label.to_string()));
+                }
+            }
         }
-        if checkout_backed {
+        if let Some((repository_key, repository_label)) = &repository {
             let used: usize = tx.query_row(
                 "SELECT COUNT(*) FROM worker_incarnations
-                 WHERE session_id<>?1 AND checkout_backed=1 AND state<>'released'",
-                [session_id],
+                 WHERE session_id<>?1 AND checkout_backed=1
+                   AND repository_key IN (?2,?3) AND state<>'released'",
+                params![session_id, repository_key, repository_label],
                 |row| row.get(0),
             )?;
             anyhow::ensure!(
                 used < checkout_cap,
-                "checkout-backed worker cap reached ({used}/{checkout_cap})"
+                "repository checkout pool saturated for {repository_label} ({used}/{checkout_cap})"
             );
         }
+        let incarnation_id = uuid::Uuid::new_v4().to_string();
+        let allocator_token = uuid::Uuid::new_v4().to_string();
+        let allocator_path = allocation_lock_path(&self.allocator_lock_dir, &incarnation_id);
+        let mut allocator_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&allocator_path)?;
+        allocator_file.write_all(allocator_token.as_bytes())?;
+        allocator_file.sync_all()?;
+        allocator_file.lock()?;
+        let allocator_lock = PendingAllocationLock {
+            path: allocator_path,
+            file: Some(allocator_file),
+        };
         let workspace_path = previous
             .as_ref()
             .map_or(source_workspace, |worker| worker.workspace_path.as_str());
@@ -1611,15 +1763,16 @@ impl Store {
         tx.execute(
             "INSERT INTO worker_incarnations(
                 session_id,incarnation_id,orchestrator_id,started_at,
-                source_workspace,workspace_path,lease_id,allocator_pid,allocator_token,
-                checkout_backed,state
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'allocating')
+                source_workspace,workspace_path,repository_key,lease_id,allocator_pid,
+                allocator_token,checkout_backed,state
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'allocating')
              ON CONFLICT(session_id) DO UPDATE SET
                 incarnation_id=excluded.incarnation_id,
                 orchestrator_id=excluded.orchestrator_id,
                 started_at=excluded.started_at,
                 source_workspace=excluded.source_workspace,
                 workspace_path=excluded.workspace_path,
+                repository_key=excluded.repository_key,
                 lease_id=excluded.lease_id,
                 allocator_pid=excluded.allocator_pid,
                 allocator_token=excluded.allocator_token,
@@ -1632,6 +1785,7 @@ impl Store {
                 started_at,
                 source_workspace,
                 workspace_path,
+                repository.as_ref().map(|(key, _)| key),
                 lease_id,
                 std::process::id(),
                 allocator_token,
@@ -1659,6 +1813,7 @@ impl Store {
             started_at,
             source_workspace: source_workspace.to_string(),
             workspace_path: workspace_path.to_string(),
+            repository_key: repository.map(|(key, _)| key),
             lease_id: lease_id.map(str::to_string),
             checkout_backed,
             state: WorkerIncarnationState::Allocating,
@@ -1720,6 +1875,63 @@ impl Store {
         .transpose()
     }
 
+    pub(crate) fn released_worker_for_cleanup_snapshot(
+        &self,
+        session_id: &str,
+        started_at: i64,
+    ) -> Result<Option<WorkerIncarnation>> {
+        let conn = self.conn.lock().unwrap();
+        let exact = conn
+            .query_row(
+                &format!(
+                    "{WORKER_INCARNATION_COLUMNS}
+                     WHERE session_id=?1 AND started_at=?2 AND state='released'"
+                ),
+                params![session_id, started_at],
+                worker_incarnation_row,
+            )
+            .optional()?
+            .map(raw_worker_incarnation)
+            .transpose()?;
+        if exact.is_some() || !Self::column_exists(&conn, "sessions", "current_incarnation_id")? {
+            return Ok(exact);
+        }
+        conn.query_row(
+            &format!(
+                "{WORKER_INCARNATION_COLUMNS}
+                 WHERE session_id=?1 AND state='released'
+                   AND checkout_backed=0 AND lease_id IS NULL
+                   AND EXISTS(
+                     SELECT 1 FROM sessions s
+                     WHERE s.id=?1 AND s.started_at=?2
+                       AND s.status IN ('done','terminated')
+                       AND s.orchestrator_id IS NOT NULL
+                       AND s.orchestrator_id=worker_incarnations.orchestrator_id
+                       AND s.current_incarnation_id=worker_incarnations.incarnation_id
+                   )
+                   AND NOT EXISTS(
+                     SELECT 1 FROM worker_runtime_claims r WHERE r.session_id=?1
+                   )
+                   AND NOT EXISTS(
+                     SELECT 1 FROM worker_finalizations f WHERE f.session_id=?1
+                   )
+                   AND NOT EXISTS(
+                     SELECT 1 FROM legacy_worker_runtimes r WHERE r.session_id=?1
+                   )
+                   AND NOT EXISTS(
+                     SELECT 1 FROM pooled_checkouts p
+                     WHERE p.session_id=?1 AND p.state IN ('provisioning','leased')
+                   )"
+            ),
+            params![session_id, started_at],
+            worker_incarnation_row,
+        )
+        .optional()?
+        .map(raw_worker_incarnation)
+        .transpose()
+    }
+
+
     pub fn current_worker_incarnation(
         &self,
         session_id: &str,
@@ -1733,6 +1945,289 @@ impl Store {
         .optional()?
         .map(raw_worker_incarnation)
         .transpose()
+    }
+
+    pub fn complete_worker_incarnation(
+        &self,
+        session_id: &str,
+        incarnation_id: &str,
+        orchestrator_id: &str,
+        summary: &str,
+        completed_at: i64,
+    ) -> Result<WorkerCompletionIntent> {
+        anyhow::ensure!(!session_id.is_empty(), "worker session id is not set");
+        anyhow::ensure!(
+            !incarnation_id.is_empty(),
+            "worker incarnation id is not set"
+        );
+        anyhow::ensure!(!orchestrator_id.is_empty(), "worker owner is not set");
+        anyhow::ensure!(
+            !summary.trim().is_empty(),
+            "completion summary cannot be empty"
+        );
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let worker = tx
+            .query_row(
+                &format!("{WORKER_INCARNATION_COLUMNS} WHERE session_id=?1"),
+                [session_id],
+                worker_incarnation_row,
+            )
+            .optional()?
+            .map(raw_worker_incarnation)
+            .transpose()?
+            .with_context(|| format!("worker {session_id:?} not found"))?;
+        anyhow::ensure!(
+            worker.incarnation_id == incarnation_id,
+            "worker completion is stale; the current incarnation changed"
+        );
+        anyhow::ensure!(
+            worker.orchestrator_id.as_deref() == Some(orchestrator_id),
+            "worker completion owner does not match its exact incarnation"
+        );
+
+        let (session_owner, owner_exists, caller_is_orchestrator) = tx
+            .query_row(
+                "SELECT s.orchestrator_id,
+                        EXISTS(SELECT 1 FROM orchestrators o WHERE o.id=?2),
+                        EXISTS(SELECT 1 FROM orchestrators o WHERE o.id=s.id)
+                 FROM sessions s WHERE s.id=?1",
+                params![session_id, orchestrator_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .with_context(|| format!("worker {session_id:?} not found"))?;
+        anyhow::ensure!(
+            session_owner.as_deref() == Some(orchestrator_id),
+            "worker completion owner does not match its session owner"
+        );
+        anyhow::ensure!(
+            owner_exists,
+            "worker completion owner is not an orchestrator"
+        );
+        anyhow::ensure!(
+            !caller_is_orchestrator && session_id != orchestrator_id,
+            "orchestrators cannot complete themselves as workers"
+        );
+
+        let existing = tx
+            .query_row(
+                &format!(
+                    "{WORKER_COMPLETION_COLUMNS}
+                     WHERE session_id=?1 AND incarnation_id=?2"
+                ),
+                params![session_id, incarnation_id],
+                worker_completion_row,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            anyhow::ensure!(
+                existing.orchestrator_id == orchestrator_id && existing.summary == summary,
+                "completion result conflicts with the canonical result already recorded"
+            );
+            tx.commit()?;
+            return Ok(WorkerCompletionIntent::AlreadyCompleted(existing));
+        }
+
+        anyhow::ensure!(
+            matches!(
+                worker.state,
+                WorkerIncarnationState::Active | WorkerIncarnationState::Retained
+            ),
+            "worker completion requires the exact live or retained incarnation"
+        );
+        let blocked: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM worker_runtime_claims
+                WHERE session_id=?1 AND incarnation_id=?2
+                UNION ALL
+                SELECT 1 FROM worker_finalizations
+                WHERE session_id=?1 AND incarnation_id=?2
+                  AND finalized_at IS NULL
+            )",
+            params![session_id, incarnation_id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            !blocked,
+            "worker completion conflicts with an active lifecycle claim"
+        );
+
+        let completion = WorkerCompletion {
+            completion_id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            incarnation_id: incarnation_id.to_string(),
+            orchestrator_id: orchestrator_id.to_string(),
+            summary: summary.to_string(),
+            completed_at,
+        };
+        tx.execute(
+            "INSERT INTO worker_completions(
+                completion_id,session_id,incarnation_id,orchestrator_id,summary,completed_at
+             ) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                completion.completion_id,
+                completion.session_id,
+                completion.incarnation_id,
+                completion.orchestrator_id,
+                completion.summary,
+                completion.completed_at,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO worker_completion_outbox(
+                completion_id,next_attempt_at,attempt_count,acknowledged_at
+             ) VALUES(?1,?2,0,NULL)",
+            params![completion.completion_id, completed_at],
+        )?;
+        let changed = tx.execute(
+            "UPDATE worker_incarnations
+             SET state='retained',allocator_pid=NULL,allocator_token=NULL
+             WHERE session_id=?1 AND incarnation_id=?2 AND orchestrator_id=?3
+               AND state IN ('active','retained')
+               AND NOT EXISTS(
+                    SELECT 1 FROM worker_runtime_claims r
+                    WHERE r.session_id=?1 AND r.incarnation_id=?2
+               )
+               AND NOT EXISTS(
+                    SELECT 1 FROM worker_finalizations f
+                    WHERE f.session_id=?1 AND f.incarnation_id=?2
+                      AND f.finalized_at IS NULL
+               )",
+            params![session_id, incarnation_id, orchestrator_id],
+        )?;
+        anyhow::ensure!(changed == 1, "worker completion became stale before commit");
+        tx.commit()?;
+        self.release_allocator_lock(incarnation_id);
+        Ok(WorkerCompletionIntent::Completed(completion))
+    }
+
+    pub fn claim_worker_completion_delivery(
+        &self,
+        now: i64,
+        retry_after_ms: i64,
+    ) -> Result<Option<WorkerCompletionDelivery>> {
+        anyhow::ensure!(
+            retry_after_ms > 0,
+            "completion retry delay must be positive"
+        );
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pending = tx
+            .query_row(
+                "SELECT c.completion_id,c.session_id,c.incarnation_id,c.orchestrator_id,
+                        c.summary,c.completed_at,o.attempt_count
+                 FROM worker_completions c
+                 JOIN worker_completion_outbox o ON o.completion_id=c.completion_id
+                 WHERE o.acknowledged_at IS NULL AND o.next_attempt_at<=?1
+                 ORDER BY o.next_attempt_at,c.completed_at,c.completion_id
+                 LIMIT 1",
+                [now],
+                |row| Ok((worker_completion_row(row)?, row.get::<_, i64>(6)?)),
+            )
+            .optional()?;
+        let Some((completion, attempts)) = pending else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let attempt = attempts
+            .checked_add(1)
+            .context("completion delivery attempt counter overflowed")?;
+        let next_attempt_at = now.saturating_add(retry_after_ms);
+        let changed = tx.execute(
+            "UPDATE worker_completion_outbox
+             SET attempt_count=?2,next_attempt_at=?3
+             WHERE completion_id=?1 AND attempt_count=?4
+               AND acknowledged_at IS NULL AND next_attempt_at<=?5",
+            params![
+                completion.completion_id,
+                attempt,
+                next_attempt_at,
+                attempts,
+                now,
+            ],
+        )?;
+        if changed != 1 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO worker_completion_delivery_attempts(
+                attempt_id,completion_id,attempt,started_at,finished_at,outcome,detail
+             ) VALUES(?1,?2,?3,?4,NULL,NULL,NULL)",
+            params![attempt_id, completion.completion_id, attempt, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(WorkerCompletionDelivery {
+            completion,
+            attempt_id,
+            attempt: u64::try_from(attempt).context("negative completion delivery attempt")?,
+        }))
+    }
+
+    pub fn finish_worker_completion_delivery_attempt(
+        &self,
+        completion_id: &str,
+        attempt_id: &str,
+        finished_at: i64,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let outcome = if error.is_some() { "failed" } else { "sent" };
+        let changed = conn.execute(
+            "UPDATE worker_completion_delivery_attempts
+             SET finished_at=?3,outcome=?4,detail=?5
+             WHERE attempt_id=?1 AND completion_id=?2 AND finished_at IS NULL",
+            params![attempt_id, completion_id, finished_at, outcome, error],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn acknowledge_worker_completion(
+        &self,
+        orchestrator_id: &str,
+        completion_id: &str,
+        acknowledged_at: i64,
+    ) -> Result<WorkerCompletionReceipt> {
+        anyhow::ensure!(!orchestrator_id.is_empty(), "orchestrator id is not set");
+        anyhow::ensure!(!completion_id.is_empty(), "completion id is not set");
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let completion = tx
+            .query_row(
+                "SELECT c.completion_id,c.session_id,c.incarnation_id,c.orchestrator_id,
+                        c.summary,c.completed_at,o.acknowledged_at
+                 FROM worker_completions c
+                 JOIN worker_completion_outbox o ON o.completion_id=c.completion_id
+                 WHERE c.completion_id=?1 AND c.orchestrator_id=?2",
+                params![completion_id, orchestrator_id],
+                |row| Ok((worker_completion_row(row)?, row.get::<_, Option<i64>>(6)?)),
+            )
+            .optional()?
+            .with_context(|| format!("completion {completion_id:?} not found"))?;
+        if completion.1.is_some() {
+            tx.commit()?;
+            return Ok(WorkerCompletionReceipt::AlreadyAcknowledged);
+        }
+        let changed = tx.execute(
+            "UPDATE worker_completion_outbox SET acknowledged_at=?2
+             WHERE completion_id=?1 AND acknowledged_at IS NULL",
+            params![completion_id, acknowledged_at],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "completion acknowledgment changed concurrently"
+        );
+        tx.commit()?;
+        Ok(WorkerCompletionReceipt::Delivered(completion.0))
     }
 
     pub fn worker_finalization(
@@ -1798,7 +2293,7 @@ impl Store {
         if worker.is_none() {
             let pool = tx
                 .query_row(
-                    "SELECT owner_incarnation_id,lease_id,source_repo,path
+                    "SELECT owner_incarnation_id,lease_id,source_repo,path,common_git_dir
                      FROM pooled_checkouts
                      WHERE session_id=?1 AND state IN ('provisioning','leased')",
                     [session_id],
@@ -1808,6 +2303,7 @@ impl Store {
                             row.get::<_, Option<String>>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
                         ))
                     },
                 )
@@ -1822,6 +2318,7 @@ impl Store {
             let workspace_path =
                 pool.as_ref().map_or_else(|| workspace, |pool| pool.3.clone());
             let lease_id = pool.as_ref().and_then(|pool| pool.1.clone());
+            let repository_key = pool.as_ref().map(|pool| pool.4.clone());
             let state = if session.3 == "spawning" {
                 "allocating"
             } else if session.3 == "done" {
@@ -1832,8 +2329,8 @@ impl Store {
             tx.execute(
                 "INSERT INTO worker_incarnations(
                     session_id,incarnation_id,orchestrator_id,started_at,
-                    source_workspace,workspace_path,lease_id,checkout_backed,state
-                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    source_workspace,workspace_path,repository_key,lease_id,checkout_backed,state
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![
                     session_id,
                     incarnation_id,
@@ -1841,6 +2338,7 @@ impl Store {
                     session.1,
                     source_workspace,
                     workspace_path,
+                    repository_key,
                     lease_id,
                     pool.is_some() as i64,
                     state,
@@ -1853,6 +2351,7 @@ impl Store {
                 started_at: session.1,
                 source_workspace,
                 workspace_path,
+                repository_key,
                 lease_id,
                 checkout_backed: pool.is_some(),
                 state: parse_worker_state(state)?,
@@ -2005,7 +2504,9 @@ impl Store {
              JOIN worker_incarnations w
                ON w.session_id=r.session_id
               AND w.incarnation_id=r.incarnation_id
-              AND w.state='active'
+              AND w.state IN (
+                  'active','retained','cleanup_claimed','release_claimed','released'
+              )
              WHERE r.session_id=?1",
             [session_id],
             |row| {
@@ -2028,6 +2529,17 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Resolve a terminal target without probing or mutating runtime state.
+    pub fn terminal_runtime_target(&self, logical_session_id: &str) -> Result<TerminalRuntimeTarget> {
+        let tmux_session_id = self
+            .legacy_worker_runtime(logical_session_id)?
+            .map_or_else(|| logical_session_id.to_owned(), |runtime| runtime.physical_tmux_name);
+        Ok(TerminalRuntimeTarget {
+            logical_session_id: logical_session_id.to_owned(),
+            tmux_session_id,
+        })
     }
 
     pub fn worker_runtime_claimed(&self, session_id: &str) -> Result<bool> {
@@ -2285,6 +2797,16 @@ impl Store {
         session_id: &str,
         started_at: i64,
     ) -> Result<Option<WorkerIncarnation>> {
+        Ok(self
+            .claim_worker_cleanup_snapshot_recoverable(session_id, started_at)?
+            .map(|claim| claim.worker))
+    }
+
+    pub(crate) fn claim_worker_cleanup_snapshot_recoverable(
+        &self,
+        session_id: &str,
+        started_at: i64,
+    ) -> Result<Option<WorkerCleanupSnapshotClaim>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let runtime_claimed: bool = tx.query_row(
@@ -2313,6 +2835,7 @@ impl Store {
             .optional()?
         {
             let mut worker = raw_worker_incarnation(raw)?;
+            let restore_state = worker.state;
             if !matches!(
                 worker.state,
                 WorkerIncarnationState::Allocating
@@ -2354,7 +2877,101 @@ impl Store {
             }
             tx.commit()?;
             worker.state = WorkerIncarnationState::CleanupClaimed;
-            return Ok(Some(worker));
+            return Ok(Some(WorkerCleanupSnapshotClaim {
+                worker,
+                restore_state: Some(restore_state),
+                snapshot_started_at: started_at,
+                require_legacy_runtime_absence: false,
+            }));
+        }
+
+        // A pre-current-schema terminal snapshot can legitimately be newer
+        // than the authoritative migrated incarnation. Adopt that identity
+        // only while every durable ownership capability still agrees; the
+        // caller separately proves the persisted physical runtime is absent.
+        if let Some(raw) = tx
+            .query_row(
+                &format!("{WORKER_INCARNATION_COLUMNS} WHERE session_id=?1"),
+                [session_id],
+                worker_incarnation_row,
+            )
+            .optional()?
+        {
+            let mut worker = raw_worker_incarnation(raw)?;
+            let session = if Self::column_exists(&tx, "sessions", "current_incarnation_id")? {
+                tx.query_row(
+                    "SELECT orchestrator_id,status,current_incarnation_id
+                     FROM sessions WHERE id=?1 AND started_at=?2",
+                    params![session_id, started_at],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+            } else {
+                None
+            };
+            let exact_legacy_runtime: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM legacy_worker_runtimes
+                 WHERE session_id=?1 AND incarnation_id=?2",
+                params![session_id, worker.incarnation_id],
+                |row| row.get(0),
+            )?;
+            let legacy_runtimes: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM legacy_worker_runtimes WHERE session_id=?1",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            let active_pool_leases: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM pooled_checkouts
+                 WHERE session_id=?1 AND state IN ('provisioning','leased')",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            let finalizations: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM worker_finalizations WHERE session_id=?1",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            let adoptable = session.is_some_and(|(owner, status, current_incarnation_id)| {
+                owner.is_some()
+                    && owner == worker.orchestrator_id
+                    && matches!(status.as_str(), "done" | "terminated")
+                    && current_incarnation_id.as_deref() == Some(worker.incarnation_id.as_str())
+            }) && matches!(worker.state, WorkerIncarnationState::Active)
+                && !worker.checkout_backed
+                && worker.lease_id.is_none()
+                && exact_legacy_runtime == 1
+                && legacy_runtimes == 1
+                && active_pool_leases == 0
+                && finalizations == 0;
+            if !adoptable {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let restore_state = worker.state;
+            let changed = tx.execute(
+                "UPDATE worker_incarnations SET state='cleanup_claimed'
+                 WHERE session_id=?1 AND incarnation_id=?2 AND started_at=?3
+                   AND state='active' AND checkout_backed=0 AND lease_id IS NULL",
+                params![session_id, worker.incarnation_id, worker.started_at],
+            )?;
+            if changed != 1 {
+                tx.commit()?;
+                return Ok(None);
+            }
+            tx.commit()?;
+            worker.state = WorkerIncarnationState::CleanupClaimed;
+            return Ok(Some(WorkerCleanupSnapshotClaim {
+                worker,
+                restore_state: Some(restore_state),
+                snapshot_started_at: started_at,
+                require_legacy_runtime_absence: true,
+            }));
         }
 
         let legacy = tx
@@ -2371,7 +2988,7 @@ impl Store {
         };
         let pool = tx
             .query_row(
-                "SELECT owner_incarnation_id,lease_id,source_repo,path
+                "SELECT owner_incarnation_id,lease_id,source_repo,path,common_git_dir
                  FROM pooled_checkouts
                  WHERE session_id=?1 AND state IN ('provisioning','leased')",
                 [session_id],
@@ -2381,6 +2998,7 @@ impl Store {
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
@@ -2390,6 +3008,7 @@ impl Store {
             .and_then(|pool| pool.0.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let lease_id = pool.as_ref().and_then(|pool| pool.1.clone());
+        let repository_key = pool.as_ref().map(|pool| pool.4.clone());
         let source_workspace = pool
             .as_ref()
             .map_or_else(|| workspace_path.clone().unwrap_or_default(), |pool| pool.2.clone());
@@ -2399,8 +3018,8 @@ impl Store {
         tx.execute(
             "INSERT INTO worker_incarnations(
                 session_id,incarnation_id,orchestrator_id,started_at,
-                source_workspace,workspace_path,lease_id,checkout_backed,state
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'cleanup_claimed')",
+                source_workspace,workspace_path,repository_key,lease_id,checkout_backed,state
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'cleanup_claimed')",
             params![
                 session_id,
                 incarnation_id,
@@ -2408,22 +3027,95 @@ impl Store {
                 started_at,
                 source_workspace,
                 workspace_path,
+                repository_key,
                 lease_id,
                 pool.is_some() as i64,
             ],
         )?;
         tx.commit()?;
-        Ok(Some(WorkerIncarnation {
-            session_id: session_id.to_string(),
-            incarnation_id,
-            orchestrator_id,
-            started_at,
-            source_workspace,
-            workspace_path,
-            lease_id,
-            checkout_backed: pool.is_some(),
-            state: WorkerIncarnationState::CleanupClaimed,
+        Ok(Some(WorkerCleanupSnapshotClaim {
+            worker: WorkerIncarnation {
+                session_id: session_id.to_string(),
+                incarnation_id,
+                orchestrator_id,
+                started_at,
+                source_workspace,
+                workspace_path,
+                repository_key,
+                lease_id,
+                checkout_backed: pool.is_some(),
+                state: WorkerIncarnationState::CleanupClaimed,
+            },
+            restore_state: None,
+            snapshot_started_at: started_at,
+            require_legacy_runtime_absence: false,
         }))
+    }
+
+    pub(crate) fn abort_worker_cleanup_snapshot(
+        &self,
+        claim: &WorkerCleanupSnapshotClaim,
+    ) -> Result<bool> {
+        let worker = &claim.worker;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = if let Some(restore_state) = claim.restore_state {
+            anyhow::ensure!(
+                matches!(
+                    restore_state,
+                    WorkerIncarnationState::Allocating
+                        | WorkerIncarnationState::Active
+                        | WorkerIncarnationState::Retained
+                ),
+                "invalid worker cleanup restore state"
+            );
+            tx.execute(
+                "UPDATE worker_incarnations SET state=?6
+                 WHERE session_id=?1 AND incarnation_id=?2 AND started_at=?3
+                   AND orchestrator_id IS ?4 AND state='cleanup_claimed'
+                   AND EXISTS(
+                     SELECT 1 FROM sessions s
+                     WHERE s.id=?1 AND s.started_at=?5
+                       AND s.orchestrator_id IS ?4
+                   )",
+                params![
+                    worker.session_id,
+                    worker.incarnation_id,
+                    worker.started_at,
+                    worker.orchestrator_id,
+                    claim.snapshot_started_at,
+                    worker_state_name(restore_state),
+                ],
+            )?
+        } else {
+            tx.execute(
+                "DELETE FROM worker_incarnations
+                 WHERE session_id=?1 AND incarnation_id=?2 AND started_at=?3
+                   AND orchestrator_id IS ?4 AND state='cleanup_claimed'
+                   AND EXISTS(
+                     SELECT 1 FROM sessions s
+                     WHERE s.id=?1 AND s.started_at=?5
+                       AND s.orchestrator_id IS ?4
+                   )
+                   AND NOT EXISTS(
+                     SELECT 1 FROM worker_runtime_claims r
+                     WHERE r.session_id=?1
+                   )
+                   AND NOT EXISTS(
+                     SELECT 1 FROM worker_finalizations f
+                     WHERE f.session_id=?1 AND f.finalized_at IS NULL
+                   )",
+                params![
+                    worker.session_id,
+                    worker.incarnation_id,
+                    worker.started_at,
+                    worker.orchestrator_id,
+                    claim.snapshot_started_at,
+                ],
+            )?
+        };
+        tx.commit()?;
+        Ok(changed == 1)
     }
 
     pub fn claim_worker_release(
@@ -2540,13 +3232,22 @@ impl Store {
         incarnation_id: &str,
         claimed_state: WorkerIncarnationState,
     ) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let changed = conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
             "UPDATE worker_incarnations
              SET state='released',allocator_pid=NULL,allocator_token=NULL
              WHERE session_id=?1 AND incarnation_id=?2 AND state=?3",
             params![session_id, incarnation_id, worker_state_name(claimed_state)],
         )?;
+        if changed == 1 {
+            tx.execute(
+                "DELETE FROM legacy_worker_runtimes
+                 WHERE session_id=?1 AND incarnation_id=?2",
+                params![session_id, incarnation_id],
+            )?;
+        }
+        tx.commit()?;
         drop(conn);
         if changed == 1 {
             self.release_allocator_lock(incarnation_id);
@@ -2564,16 +3265,34 @@ impl Store {
     ) -> Result<Option<Session>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prior_state = tx
+            .query_row(
+                "SELECT state FROM worker_incarnations
+                 WHERE session_id=?1 AND incarnation_id=?2 AND started_at=?3
+                   AND state IN ('active','retained')
+                   AND NOT EXISTS(
+                       SELECT 1 FROM worker_runtime_claims r
+                       WHERE r.session_id=worker_incarnations.session_id
+                         AND r.incarnation_id=worker_incarnations.incarnation_id
+                   )",
+                params![session_id, incarnation_id, started_at],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(prior_state) = prior_state else {
+            tx.commit()?;
+            return Ok(None);
+        };
         let changed = tx.execute(
             "UPDATE worker_incarnations SET state='retained'
              WHERE session_id=?1 AND incarnation_id=?2 AND started_at=?3
-               AND state='active'
+               AND state=?4
                AND NOT EXISTS(
                    SELECT 1 FROM worker_runtime_claims r
                    WHERE r.session_id=worker_incarnations.session_id
                      AND r.incarnation_id=worker_incarnations.incarnation_id
                )",
-            params![session_id, incarnation_id, started_at],
+            params![session_id, incarnation_id, started_at, prior_state],
         )?;
         if changed != 1 {
             tx.commit()?;
@@ -2582,14 +3301,14 @@ impl Store {
         let status = "done";
         let changed = tx.execute(
             "UPDATE sessions SET status=?4,terminal_at=?5
-             WHERE id=?1 AND started_at=?2 AND pr_number=?3",
+             WHERE id=?1 AND started_at=?2 AND pr_number=?3 AND status<>'done'",
             params![session_id, started_at, pr_number, status, terminal_at],
         )?;
         if changed != 1 {
             tx.execute(
-                "UPDATE worker_incarnations SET state='active'
+                "UPDATE worker_incarnations SET state=?3
                  WHERE session_id=?1 AND incarnation_id=?2 AND state='retained'",
-                params![session_id, incarnation_id],
+                params![session_id, incarnation_id, prior_state],
             )?;
             tx.commit()?;
             return Ok(None);
@@ -2626,17 +3345,22 @@ impl Store {
         rows.map(|row| raw_worker_incarnation(row?)).collect()
     }
 
-    pub fn checkout_worker_candidates(
+    pub fn checkout_worker_candidates_for_repository(
         &self,
-        _orchestrator_id: Option<&str>,
+        source_workspace: &str,
     ) -> Result<Vec<WorkerIncarnation>> {
+        let (repository_key, repository_label) =
+            checkout_repository_identity(Path::new(source_workspace))?;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "{WORKER_INCARNATION_COLUMNS}
-             WHERE checkout_backed=1 AND state<>'released'
+             WHERE checkout_backed=1 AND repository_key IN (?1,?2) AND state<>'released'
              ORDER BY CASE state WHEN 'retained' THEN 0 ELSE 1 END, started_at ASC"
         ))?;
-        let rows = stmt.query_map([], worker_incarnation_row)?;
+        let rows = stmt.query_map(
+            params![repository_key, repository_label],
+            worker_incarnation_row,
+        )?;
         rows.map(|row| raw_worker_incarnation(row?)).collect()
     }
 
@@ -3375,8 +4099,23 @@ impl Store {
 
 const WORKER_INCARNATION_COLUMNS: &str =
     "SELECT session_id,incarnation_id,orchestrator_id,started_at,
-            source_workspace,workspace_path,lease_id,checkout_backed,state
+            source_workspace,workspace_path,repository_key,lease_id,checkout_backed,state
      FROM worker_incarnations";
+
+const WORKER_COMPLETION_COLUMNS: &str =
+    "SELECT completion_id,session_id,incarnation_id,orchestrator_id,summary,completed_at
+     FROM worker_completions";
+
+fn worker_completion_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerCompletion> {
+    Ok(WorkerCompletion {
+        completion_id: row.get(0)?,
+        session_id: row.get(1)?,
+        incarnation_id: row.get(2)?,
+        orchestrator_id: row.get(3)?,
+        summary: row.get(4)?,
+        completed_at: row.get(5)?,
+    })
+}
 
 type RawWorkerIncarnation = (
     String,
@@ -3385,6 +4124,7 @@ type RawWorkerIncarnation = (
     i64,
     String,
     String,
+    Option<String>,
     Option<String>,
     bool,
     String,
@@ -3401,6 +4141,7 @@ fn worker_incarnation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawWorker
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
     ))
 }
 
@@ -3412,9 +4153,10 @@ fn raw_worker_incarnation(raw: RawWorkerIncarnation) -> Result<WorkerIncarnation
         started_at: raw.3,
         source_workspace: raw.4,
         workspace_path: raw.5,
-        lease_id: raw.6,
-        checkout_backed: raw.7,
-        state: parse_worker_state(&raw.8)?,
+        repository_key: raw.6,
+        lease_id: raw.7,
+        checkout_backed: raw.8,
+        state: parse_worker_state(&raw.9)?,
     })
 }
 
@@ -3607,6 +4349,25 @@ fn absolute_db_path(path: &Path) -> Result<String> {
     path_text(&path)
 }
 
+fn checkout_repository_identity(path: &Path) -> Result<(String, String)> {
+    match crate::worktree::RepositoryIdentity::resolve(path) {
+        Ok(repository) => Ok((
+            path_text(&repository.common_git_dir)?,
+            path_text(&repository.top_level)?,
+        )),
+        Err(_) => {
+            let label = absolute_db_path(path)?;
+            let git_dir = path.join(".git");
+            let key = if git_dir.exists() {
+                canonical_db_path(&git_dir)?
+            } else {
+                label.clone()
+            };
+            Ok((key, label))
+        }
+    }
+}
+
 fn path_text(path: &Path) -> Result<String> {
     path.to_str()
         .map(str::to_owned)
@@ -3777,6 +4538,56 @@ mod tests {
     }
 
     #[test]
+    fn terminal_runtime_target_preserves_logical_id_and_resolves_physical_name() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("production.db");
+        production_legacy_worker_fixture(&db, false);
+        let store = Store::open(&db).unwrap();
+
+        let migrated = store.terminal_runtime_target("live-pooled").unwrap();
+        assert_eq!(migrated.logical_session_id, "live-pooled");
+        assert_eq!(migrated.tmux_session_id, "nxw-live-inc");
+
+        let ordinary = store.terminal_runtime_target("ordinary").unwrap();
+        assert_eq!(ordinary.logical_session_id, "ordinary");
+        assert_eq!(ordinary.tmux_session_id, "ordinary");
+    }
+
+    #[test]
+    fn completing_migrated_cleanup_removes_exact_legacy_runtime_metadata() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("production.db");
+        production_legacy_worker_fixture(&db, false);
+        let store = Store::open(&db).unwrap();
+
+        let claim = store
+            .claim_worker_cleanup_snapshot("live-pooled", 200)
+            .unwrap()
+            .unwrap();
+        let runtime = store.legacy_worker_runtime("live-pooled").unwrap().unwrap();
+        assert_eq!(runtime.incarnation_id, claim.incarnation_id);
+        assert!(store
+            .complete_worker_claim(
+                "live-pooled",
+                &claim.incarnation_id,
+                WorkerIncarnationState::CleanupClaimed,
+            )
+            .unwrap());
+        drop(store);
+
+        let conn = Connection::open(db).unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM legacy_worker_runtimes
+                 WHERE session_id='live-pooled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
     fn opens_authentic_composite_worker_schema_and_keeps_authoritative_rows() {
         let root = tempdir().unwrap();
         let db = root.path().join("production.db");
@@ -3819,12 +4630,23 @@ mod tests {
                 ("allocator_token".into(), 0),
                 ("checkout_backed".into(), 0),
                 ("state".into(), 0),
+                ("repository_key".into(), 0),
             ]
         );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM worker_incarnations", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             3
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT repository_key FROM worker_incarnations
+                 WHERE session_id='live-pooled'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "/repo/.git"
         );
         assert_eq!(
             conn.query_row(
@@ -4509,7 +5331,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_worker_preparation_hard_caps_checkout_backed_slots() {
+    fn concurrent_orchestrators_share_one_repository_pool_cap() {
         let root = tempdir().unwrap().keep();
         let db = root.join("cap.db");
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
@@ -4523,7 +5345,7 @@ mod tests {
                 barrier.wait();
                 store.prepare_worker_incarnation(
                     &format!("worker-{index}"),
-                    Some("orch"),
+                    Some(&format!("orch-{index}")),
                     index as i64,
                     "/repo",
                     true,
@@ -4548,7 +5370,34 @@ mod tests {
     }
 
     #[test]
-    fn checkout_cap_is_local_across_orchestrators() {
+    fn separate_repository_pools_allocate_independently_past_old_global_total() {
+        let store = test_store();
+        for index in 0..5 {
+            store
+                .prepare_worker_incarnation(
+                    &format!("alpha-{index}"),
+                    Some("orch-alpha"),
+                    index,
+                    "/repos/alpha",
+                    true,
+                    5,
+                )
+                .unwrap();
+            store
+                .prepare_worker_incarnation(
+                    &format!("beta-{index}"),
+                    Some("orch-beta"),
+                    index,
+                    "/repos/beta",
+                    true,
+                    5,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn checkout_cap_is_shared_by_repository_across_orchestrators() {
         let store = test_store();
         for index in 0..3 {
             store
@@ -4565,6 +5414,164 @@ mod tests {
         assert!(store
             .prepare_worker_incarnation("worker-3", Some("orch-3"), 3, "/repo", true, 3)
             .is_err());
+    }
+
+    #[test]
+    fn repository_pool_capacity_cannot_be_bypassed_by_path_alias() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&repository, &alias).unwrap();
+        let store = test_store();
+
+        store
+            .prepare_worker_incarnation(
+                "canonical",
+                Some("orch-a"),
+                1,
+                repository.to_str().unwrap(),
+                true,
+                1,
+            )
+            .unwrap();
+        assert!(store
+            .prepare_worker_incarnation(
+                "alias",
+                Some("orch-b"),
+                2,
+                alias.to_str().unwrap(),
+                true,
+                1,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains(repository.to_str().unwrap()));
+    }
+
+    #[test]
+    fn startup_normalizes_non_pooled_legacy_repository_keys() {
+        let root = tempdir().unwrap().keep();
+        let repository = root.join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let db = root.join("legacy-key.db");
+        let store = Store::open(&db).unwrap();
+        store
+            .prepare_worker_incarnation(
+                "legacy",
+                None,
+                1,
+                repository.to_str().unwrap(),
+                true,
+                1,
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE worker_incarnations
+                 SET repository_key=source_workspace,state='retained',
+                     allocator_pid=NULL,allocator_token=NULL
+                 WHERE session_id='legacy'",
+                [],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(db).unwrap();
+        assert!(reopened
+            .prepare_worker_incarnation(
+                "denied",
+                None,
+                2,
+                repository.to_str().unwrap(),
+                true,
+                1,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn repository_capacity_counts_retained_but_not_released_workers() {
+        let store = test_store();
+        let retained = store
+            .prepare_worker_incarnation("retained", None, 1, "/repo", true, 1)
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE worker_incarnations SET state='retained' WHERE session_id='retained'",
+                [],
+            )
+            .unwrap();
+        assert!(store
+            .prepare_worker_incarnation("denied", None, 2, "/repo", true, 1)
+            .is_err());
+        assert!(store
+            .claim_worker_release("retained", &retained.incarnation_id)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .complete_worker_claim(
+                "retained",
+                &retained.incarnation_id,
+                WorkerIncarnationState::ReleaseClaimed,
+            )
+            .unwrap());
+        store
+            .prepare_worker_incarnation("admitted", None, 3, "/repo", true, 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn cap_denial_has_no_incarnation_or_allocator_side_effects_and_scopes_candidates() {
+        let store = test_store();
+        store
+            .prepare_worker_incarnation("alpha", None, 1, "/repos/alpha", true, 1)
+            .unwrap();
+        store
+            .prepare_worker_incarnation("beta", None, 2, "/repos/beta", true, 1)
+            .unwrap();
+        let locks_before = std::fs::read_dir(&store.allocator_lock_dir).unwrap().count();
+
+        let error = store
+            .prepare_worker_incarnation("denied", None, 3, "/repos/alpha", true, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("/repos/alpha"));
+        assert!(!error.contains("/repos/beta"));
+        assert!(store.current_worker_incarnation("denied").unwrap().is_none());
+        assert_eq!(
+            std::fs::read_dir(&store.allocator_lock_dir).unwrap().count(),
+            locks_before
+        );
+        assert_eq!(
+            store
+                .checkout_worker_candidates_for_repository("/repos/alpha")
+                .unwrap()
+                .iter()
+                .map(|worker| worker.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha"]
+        );
     }
 
     #[test]
@@ -4833,14 +5840,21 @@ mod tests {
                     &format!("new-{index}"),
                     None,
                     index + 2,
-                    "/repo",
+                    repo.to_str().unwrap(),
                     true,
                     3,
                 )
                 .unwrap();
         }
         assert!(reopened
-            .prepare_worker_incarnation("over-cap", None, 4, "/repo", true, 3)
+            .prepare_worker_incarnation(
+                "over-cap",
+                None,
+                4,
+                repo.to_str().unwrap(),
+                true,
+                3,
+            )
             .is_err());
     }
 
@@ -5364,7 +6378,14 @@ mod tests {
         assert_eq!(pool.state, PooledCheckoutState::Quarantined);
         assert_eq!(pool.kind, PooledCheckoutKind::UnsafeLegacy);
         assert!(reopened
-            .prepare_worker_incarnation("replacement-1", None, 2, "/repo", true, 1)
+            .prepare_worker_incarnation(
+                "replacement-1",
+                None,
+                2,
+                source.to_str().unwrap(),
+                true,
+                1,
+            )
             .is_err());
     }
 
@@ -5449,5 +6470,638 @@ mod tests {
             store.get_session("legacy").unwrap().unwrap().status,
             SessionStatus::Working
         ));
+    }
+
+    fn completion_fixture(store: &Store, session_id: &str) -> WorkerIncarnation {
+        store
+            .upsert_orchestrator(&Orchestrator {
+                id: "orch".into(),
+                name: "orchestrator".into(),
+                created_at: 1,
+            })
+            .unwrap();
+        let mut session = spawning_session(session_id, 10);
+        session.orchestrator_id = Some("orch".into());
+        session.status = SessionStatus::PrOpen;
+        store.upsert_session(&session).unwrap();
+        let worker = store
+            .prepare_worker_incarnation(session_id, Some("orch"), 10, "/repo", false, 3)
+            .unwrap();
+        assert!(store
+            .bind_worker_incarnation(session_id, &worker.incarnation_id, "/repo", "/repo", None,)
+            .unwrap());
+        store
+            .current_worker_incarnation(session_id)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn worker_completion_and_outbox_intent_commit_atomically() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_completion_outbox
+                 BEFORE INSERT ON worker_completion_outbox
+                 BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END;",
+            )
+            .unwrap();
+
+        assert!(store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "canonical summary",
+                100,
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .current_worker_incarnation("worker")
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkerIncarnationState::Active,
+        );
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM worker_completions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0,
+        );
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_completion_outbox")
+            .unwrap();
+        let WorkerCompletionIntent::Completed(completion) = store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "canonical summary",
+                100,
+            )
+            .unwrap()
+        else {
+            panic!("first completion must commit");
+        };
+        assert_eq!(completion.summary, "canonical summary");
+        assert_eq!(
+            store
+                .current_worker_incarnation("worker")
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkerIncarnationState::Retained,
+        );
+        assert!(matches!(
+            store.get_session("worker").unwrap().unwrap().status,
+            SessionStatus::PrOpen,
+        ));
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM worker_completion_outbox
+                     WHERE completion_id=?1 AND acknowledged_at IS NULL",
+                    [&completion.completion_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+        );
+    }
+
+    #[test]
+    fn committed_completion_survives_restart_before_delivery() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("completion.db");
+        let completion = {
+            let store = Store::open(&db).unwrap();
+            let worker = completion_fixture(&store, "worker");
+            let WorkerCompletionIntent::Completed(completion) = store
+                .complete_worker_incarnation(
+                    "worker",
+                    &worker.incarnation_id,
+                    "orch",
+                    "survives restart",
+                    100,
+                )
+                .unwrap()
+            else {
+                panic!("first completion must commit");
+            };
+            completion
+        };
+
+        let reopened = Store::open(&db).unwrap();
+        let delivery = reopened
+            .claim_worker_completion_delivery(101, 30_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.completion, completion);
+        assert_eq!(delivery.attempt, 1);
+    }
+
+    #[test]
+    fn unacknowledged_delivery_retries_after_restart() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("completion.db");
+        let completion_id = {
+            let store = Store::open(&db).unwrap();
+            let worker = completion_fixture(&store, "worker");
+            let WorkerCompletionIntent::Completed(completion) = store
+                .complete_worker_incarnation(
+                    "worker",
+                    &worker.incarnation_id,
+                    "orch",
+                    "retry me",
+                    100,
+                )
+                .unwrap()
+            else {
+                panic!("first completion must commit");
+            };
+            let first = store
+                .claim_worker_completion_delivery(101, 30_000)
+                .unwrap()
+                .unwrap();
+            assert_eq!(first.attempt, 1);
+            completion.completion_id
+        };
+
+        let reopened = Store::open(&db).unwrap();
+        assert!(reopened
+            .claim_worker_completion_delivery(30_100, 30_000)
+            .unwrap()
+            .is_none());
+        let retry = reopened
+            .claim_worker_completion_delivery(30_101, 30_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.completion.completion_id, completion_id);
+        assert_eq!(retry.attempt, 2);
+    }
+
+    #[test]
+    fn delivery_attempt_diagnostics_survive_acknowledgment() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        let WorkerCompletionIntent::Completed(completion) = store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "diagnose delivery",
+                100,
+            )
+            .unwrap()
+        else {
+            panic!("first completion must commit");
+        };
+        let failed = store
+            .claim_worker_completion_delivery(101, 30_000)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .finish_worker_completion_delivery_attempt(
+                &completion.completion_id,
+                &failed.attempt_id,
+                102,
+                Some("orchestrator unavailable"),
+            )
+            .unwrap());
+        let sent = store
+            .claim_worker_completion_delivery(30_101, 30_000)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .finish_worker_completion_delivery_attempt(
+                &completion.completion_id,
+                &sent.attempt_id,
+                30_102,
+                None,
+            )
+            .unwrap());
+        store
+            .acknowledge_worker_completion("orch", &completion.completion_id, 30_103)
+            .unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT attempt,outcome,detail
+                 FROM worker_completion_delivery_attempts
+                 WHERE completion_id=?1 ORDER BY attempt",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([&completion.completion_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    1,
+                    "failed".to_string(),
+                    Some("orchestrator unavailable".to_string()),
+                ),
+                (2, "sent".to_string(), None),
+            ],
+        );
+    }
+
+    #[test]
+    fn deleting_completed_session_stops_outbox_retries() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        let WorkerCompletionIntent::Completed(completion) = store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "remove delivery",
+                100,
+            )
+            .unwrap()
+        else {
+            panic!("first completion must commit");
+        };
+        let attempt = store
+            .claim_worker_completion_delivery(101, 30_000)
+            .unwrap()
+            .unwrap();
+        store
+            .finish_worker_completion_delivery_attempt(
+                &completion.completion_id,
+                &attempt.attempt_id,
+                102,
+                Some("orchestrator unavailable"),
+            )
+            .unwrap();
+
+        store.delete_session("worker").unwrap();
+
+        assert!(store
+            .claim_worker_completion_delivery(1_000_000, 30_000)
+            .unwrap()
+            .is_none());
+        let conn = store.conn.lock().unwrap();
+        for table in [
+            "worker_completions",
+            "worker_completion_outbox",
+            "worker_completion_delivery_attempts",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0,
+                "{table} must not outlive its deleted worker",
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_completion_and_ack_surface_one_canonical_result() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        let WorkerCompletionIntent::Completed(completion) = store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "one result",
+                100,
+            )
+            .unwrap()
+        else {
+            panic!("first completion must commit");
+        };
+        assert!(matches!(
+            store
+                .complete_worker_incarnation(
+                    "worker",
+                    &worker.incarnation_id,
+                    "orch",
+                    "one result",
+                    101,
+                )
+                .unwrap(),
+            WorkerCompletionIntent::AlreadyCompleted(ref same)
+                if same.completion_id == completion.completion_id
+        ));
+        assert!(store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "changed result",
+                102,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts"));
+
+        let WorkerCompletionReceipt::Delivered(delivered) = store
+            .acknowledge_worker_completion("orch", &completion.completion_id, 200)
+            .unwrap()
+        else {
+            panic!("first acknowledgment must surface the result");
+        };
+        assert_eq!(delivered.summary, "one result");
+        assert!(matches!(
+            store
+                .acknowledge_worker_completion("orch", &completion.completion_id, 201)
+                .unwrap(),
+            WorkerCompletionReceipt::AlreadyAcknowledged,
+        ));
+        assert!(store
+            .claim_worker_completion_delivery(1_000_000, 30_000)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn explicitly_completed_worker_still_emits_one_later_merge_transition() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        let mut session = store.get_session("worker").unwrap().unwrap();
+        session.status = SessionStatus::Mergeable;
+        session.pr_number = Some(46);
+        session.pr_id = Some(46);
+        store.upsert_session(&session).unwrap();
+        store
+            .complete_worker_incarnation("worker", &worker.incarnation_id, "orch", "PR ready", 100)
+            .unwrap();
+
+        let merged = store
+            .retain_worker_after_merge("worker", &worker.incarnation_id, worker.started_at, 46, 200)
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(merged.status, SessionStatus::Done));
+        assert_eq!(
+            store
+                .current_worker_incarnation("worker")
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkerIncarnationState::Retained,
+        );
+        assert!(
+            store
+                .retain_worker_after_merge(
+                    "worker",
+                    &worker.incarnation_id,
+                    worker.started_at,
+                    46,
+                    201,
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn merged_worker_can_still_submit_its_canonical_completion() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        let mut session = store.get_session("worker").unwrap().unwrap();
+        session.status = SessionStatus::Mergeable;
+        session.pr_number = Some(46);
+        session.pr_id = Some(46);
+        store.upsert_session(&session).unwrap();
+        store
+            .retain_worker_after_merge("worker", &worker.incarnation_id, worker.started_at, 46, 100)
+            .unwrap()
+            .unwrap();
+
+        let WorkerCompletionIntent::Completed(completion) = store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "merged canonical summary",
+                101,
+            )
+            .unwrap()
+        else {
+            panic!("merged worker must still record its explicit completion");
+        };
+
+        assert_eq!(completion.summary, "merged canonical summary");
+        assert_eq!(
+            store
+                .claim_worker_completion_delivery(102, 30_000)
+                .unwrap()
+                .unwrap()
+                .completion,
+            completion,
+        );
+    }
+
+    #[test]
+    fn merged_legacy_worker_keeps_its_exact_runtime_capability() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO legacy_worker_runtimes(
+                    session_id,incarnation_id,physical_tmux_name,pane_id,pane_pid
+                 ) VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    "worker",
+                    worker.incarnation_id,
+                    "ninox-worker-worker-legacy",
+                    "%legacy",
+                    42,
+                ],
+            )
+            .unwrap();
+        let mut session = store.get_session("worker").unwrap().unwrap();
+        session.status = SessionStatus::Mergeable;
+        session.pr_number = Some(46);
+        session.pr_id = Some(46);
+        store.upsert_session(&session).unwrap();
+        store
+            .retain_worker_after_merge("worker", &worker.incarnation_id, worker.started_at, 46, 100)
+            .unwrap()
+            .unwrap();
+
+        let runtime = store.legacy_worker_runtime("worker").unwrap().unwrap();
+        assert_eq!(runtime.incarnation_id, worker.incarnation_id);
+        assert_eq!(runtime.physical_tmux_name, "ninox-worker-worker-legacy");
+    }
+
+    #[test]
+    fn stale_refiled_incarnation_and_wrong_owner_fail_closed() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        let WorkerCompletionIntent::Completed(completion) = store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "old incarnation",
+                100,
+            )
+            .unwrap()
+        else {
+            panic!("first completion must commit");
+        };
+        let successor = store
+            .prepare_worker_incarnation("worker", Some("orch"), 20, "/repo", false, 3)
+            .unwrap();
+
+        assert!(store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "old incarnation",
+                101,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("stale"));
+        assert!(store
+            .complete_worker_incarnation(
+                "worker",
+                &successor.incarnation_id,
+                "other",
+                "wrong owner",
+                102,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("owner"));
+        assert!(store
+            .acknowledge_worker_completion("other", &completion.completion_id, 200)
+            .unwrap_err()
+            .to_string()
+            .contains("not found"));
+    }
+
+    #[test]
+    fn concurrent_acknowledgments_return_the_summary_once() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("completion.db");
+        let store = Store::open(&db).unwrap();
+        let worker = completion_fixture(&store, "worker");
+        let WorkerCompletionIntent::Completed(completion) = store
+            .complete_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                "orch",
+                "exactly once",
+                100,
+            )
+            .unwrap()
+        else {
+            panic!("first completion must commit");
+        };
+        drop(store);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut threads = Vec::new();
+        for now in [200, 201] {
+            let db = db.clone();
+            let completion_id = completion.completion_id.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                let store = Store::open(db).unwrap();
+                barrier.wait();
+                store
+                    .acknowledge_worker_completion("orch", &completion_id, now)
+                    .unwrap()
+            }));
+        }
+        let receipts = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| matches!(receipt, WorkerCompletionReceipt::Delivered(_)))
+                .count(),
+            1,
+        );
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| {
+                    matches!(receipt, WorkerCompletionReceipt::AlreadyAcknowledged)
+                })
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn production_schema_migrates_completion_outbox_without_losing_workers() {
+        let root = tempdir().unwrap();
+        let db = root.path().join("production.db");
+        production_legacy_worker_fixture(&db, false);
+
+        let store = Store::open(&db).unwrap();
+
+        for table in [
+            "worker_completions",
+            "worker_completion_outbox",
+            "worker_completion_delivery_attempts",
+        ] {
+            assert_eq!(
+                store
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master
+                         WHERE type='table' AND name=?1",
+                        [table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "{table} must be added to the production schema",
+            );
+        }
+        assert_eq!(
+            store
+                .current_worker_incarnation("live-pooled")
+                .unwrap()
+                .unwrap()
+                .incarnation_id,
+            "inc-live",
+        );
     }
 }

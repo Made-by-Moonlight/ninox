@@ -3,7 +3,7 @@
 //! the footer); harness registry toggles and the worker default follow in
 //! their own cards.
 
-use ninox_core::config::ThemeVariant;
+use ninox_core::config::{AppConfig, ThemeVariant};
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
     Alignment, Background, Border, Element, Length,
@@ -19,6 +19,23 @@ use crate::{
 pub struct SettingsState {
     /// `Some` while the Workers model picker is in `custom…` mode.
     pub worker_custom: Option<String>,
+    pub rust_cache_executable: String,
+    pub rust_cache_dir: String,
+    pub rust_cache_size_gib: String,
+    pub rust_cache_error: Option<String>,
+}
+
+impl SettingsState {
+    pub fn from_config(config: &AppConfig) -> Self {
+        Self {
+            rust_cache_executable: config.rust_cache.executable.to_string_lossy().into_owned(),
+            rust_cache_dir: config.rust_cache.cache_dir.as_deref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            rust_cache_size_gib: config.rust_cache.cache_size_gib.to_string(),
+            ..Self::default()
+        }
+    }
 }
 
 /// Column width — "a single narrow column (~720px) of cards".
@@ -44,6 +61,7 @@ pub fn settings_panel(app: &App) -> Element<'_, Message> {
         theme_card(app),
         harnesses_card(app),
         workers_card(app),
+        rust_cache_card(app),
         messaging_card(app),
         version_card(app),
     ]
@@ -253,6 +271,103 @@ fn workers_card(app: &App) -> Element<'_, Message> {
         );
     }
     card(app, "Workers", body.into())
+}
+
+fn rust_cache_card(app: &App) -> Element<'_, Message> {
+    use iced::widget::text_input;
+    let s = &app.scheme;
+    let enabled = app.config.rust_cache.enabled;
+    let prune = app.config.rust_cache.prune_on_release;
+    let cache_dir = app.config.resolved_rust_cache_dir().display().to_string();
+    let error: Element<'_, Message> = app.settings.rust_cache_error.as_ref().map_or_else(
+        || Space::new(0, 0).into(),
+        |error| text(error).size(10).font(MONO).color(s.status_ci_failed).into(),
+    );
+
+    card(app, "Rust builds", column![
+        row![
+            settings_toggle(enabled, Message::SettingsToggleRustCache, s),
+            Space::new(12, 0),
+            text("Shared worker sccache").size(14).font(SERIF)
+                .color(if enabled { s.ink } else { s.ink_2 }),
+            Space::new(Length::Fill, 0),
+            text(if enabled { "on" } else { "off" }).size(10).font(MONO).color(s.faint),
+        ]
+        .align_y(Alignment::Center),
+        Space::new(0, 10),
+        text(
+            "Opt-in. Rust worker checkouts keep separate Cargo target directories while sharing \
+             one bounded sccache. Explicit RUSTC_WRAPPER, CARGO_INCREMENTAL, or SCCACHE_* policy \
+             wins; unavailable sccache is reported and the worker launches unchanged."
+        )
+        .size(10).font(MONO).color(s.faint),
+        Space::new(0, 14),
+        micro_label("sccache executable or path", s.faint),
+        Space::new(0, 6),
+        text_input("sccache", &app.settings.rust_cache_executable)
+            .on_input(Message::SettingsRustCacheExecutable)
+            .font(MONO).size(12).padding([6, 2])
+            .style(crate::style::underlined_input_style(s)),
+        Space::new(0, 12),
+        micro_label("Cache directory (blank = platform default)", s.faint),
+        Space::new(0, 6),
+        text_input("platform default", &app.settings.rust_cache_dir)
+            .on_input(Message::SettingsRustCacheDir)
+            .font(MONO).size(12).padding([6, 2])
+            .style(crate::style::underlined_input_style(s)),
+        Space::new(0, 6),
+        text(format!("Effective: {cache_dir}")).size(10).font(MONO).color(s.faint),
+        Space::new(0, 12),
+        micro_label("Maximum cache size (GiB)", s.faint),
+        Space::new(0, 6),
+        text_input("10", &app.settings.rust_cache_size_gib)
+            .on_input(Message::SettingsRustCacheSize)
+            .font(MONO).size(12).padding([6, 2])
+            .style(crate::style::underlined_input_style(s)),
+        Space::new(0, 14),
+        row![
+            settings_toggle(prune, Message::SettingsToggleRustCachePrune, s),
+            Space::new(12, 0),
+            text("Prune known Cargo outputs on safe release").size(14).font(SERIF)
+                .color(if prune { s.ink } else { s.ink_2 }),
+            Space::new(Length::Fill, 0),
+            text(if prune { "on" } else { "off" }).size(10).font(MONO).color(s.faint),
+        ]
+        .align_y(Alignment::Center),
+        Space::new(0, 8),
+        text(
+            "Removes only target/debug, target/release, and Cargo metadata after exact runtime, \
+             lease, identity, and cleanliness checks. Other target evidence remains."
+        )
+        .size(10).font(MONO).color(s.faint),
+        Space::new(0, 8),
+        error,
+    ]
+    .spacing(0)
+    .into())
+}
+
+fn settings_toggle<'a>(
+    enabled: bool,
+    message: Message,
+    s: &'a crate::theme::ColorScheme,
+) -> Element<'a, Message> {
+    button(Space::new(0, 0))
+        .on_press(message)
+        .width(Length::Fixed(30.0))
+        .height(Length::Fixed(16.0))
+        .padding(0)
+        .style(move |_theme, status| button::Style {
+            background: enabled.then_some(Background::Color(s.ink)),
+            text_color: s.ink,
+            border: Border {
+                color: if matches!(status, button::Status::Hovered) { s.accent } else { s.ink },
+                width: 1.5,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
 }
 
 /// Messaging card: the opt-in file-based inbox toggle

@@ -39,7 +39,7 @@ fn emit_checkout_unavailable(
     session_name: &str,
     error: &dyn std::fmt::Display,
 ) {
-    let body = checkout_error_with_candidates(engine, error);
+    let body = checkout_error_with_candidates(engine, error, None);
     engine.emit(Event::Notification(Notification {
         id: format!("checkout-unavailable-{session_id}"),
         kind: NotificationKind::CheckoutUnavailable,
@@ -50,14 +50,39 @@ fn emit_checkout_unavailable(
     }));
 }
 
-fn checkout_error_with_candidates(engine: &Engine, error: &dyn std::fmt::Display) -> String {
+fn emit_repository_checkout_unavailable(
+    engine: &Engine,
+    session_id: &str,
+    session_name: &str,
+    source_workspace: &str,
+    error: &dyn std::fmt::Display,
+) {
+    let body = checkout_error_with_candidates(engine, error, Some(source_workspace));
+    engine.emit(Event::Notification(Notification {
+        id: format!("checkout-unavailable-{session_id}"),
+        kind: NotificationKind::CheckoutUnavailable,
+        title: format!("Checkout unavailable — {session_name}"),
+        body,
+        session_id: Some(session_id.to_string()),
+        created_at: ninox_core::lifecycle::poller::now_millis(),
+    }));
+}
+
+fn checkout_error_with_candidates(
+    engine: &Engine,
+    error: &dyn std::fmt::Display,
+    source_workspace: Option<&str>,
+) -> String {
     let error = error.to_string();
-    if !error.contains("checkout-backed worker cap reached") {
+    if !error.contains("repository checkout pool saturated") {
         return error;
     }
+    let Some(source_workspace) = source_workspace else {
+        return error;
+    };
     let candidates = engine
         .store
-        .checkout_worker_candidates(None)
+        .checkout_worker_candidates_for_repository(source_workspace)
         .unwrap_or_default()
         .into_iter()
         .map(|worker| format!("{} ({:?}, {})", worker.session_id, worker.state, worker.workspace_path))
@@ -67,6 +92,42 @@ fn checkout_error_with_candidates(engine: &Engine, error: &dyn std::fmt::Display
     } else {
         format!("{error}; finish, release, or reap one of: {}", candidates.join(", "))
     }
+}
+
+fn checkout_capacity(
+    config: &AppConfig,
+    workspace: &str,
+) -> anyhow::Result<(bool, usize, String)> {
+    match ninox_core::worktree::RepositoryIdentity::resolve(std::path::Path::new(workspace)) {
+        Ok(repository) => Ok((
+            true,
+            config.validated_worker_checkout_cap_for_repository(&repository.top_level)?,
+            repository.top_level.to_string_lossy().into_owned(),
+        )),
+        Err(_) => Ok((
+            false,
+            config.validated_worker_checkout_default_cap()?,
+            workspace.to_string(),
+        )),
+    }
+}
+
+fn checkout_capacity_for_worker(
+    config: &AppConfig,
+    workspace: &str,
+    current_worker: Option<&ninox_core::types::WorkerIncarnation>,
+) -> anyhow::Result<(bool, usize, String)> {
+    if let Some(worker) = current_worker.filter(|worker| worker.checkout_backed) {
+        return Ok((
+            true,
+            config.validated_worker_checkout_cap_for_stored_repository(
+                std::path::Path::new(&worker.source_workspace),
+                worker.repository_key.as_deref(),
+            )?,
+            worker.source_workspace.clone(),
+        ));
+    }
+    checkout_capacity(config, workspace)
 }
 
 struct RuntimeStartGuard {
@@ -395,6 +456,11 @@ pub enum Message {
     /// Flip the opt-in file-based inbox toggle (`[inbox_messaging].enabled`,
     /// default off — see `ninox_core::config::InboxMessagingConfig`).
     SettingsToggleInboxMessaging,
+    SettingsToggleRustCache,
+    SettingsRustCacheExecutable(String),
+    SettingsRustCacheDir(String),
+    SettingsRustCacheSize(String),
+    SettingsToggleRustCachePrune,
     BrainSelectEntry(String),
     /// The pinboard canvas's hovered node changed (including to/from `None`)
     /// — emitted only on change, never on every mouse move.
@@ -825,11 +891,18 @@ pub fn refile_plan(
         .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
     let extra_env = if is_orchestrator {
         vec![
+            (
+                crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+                crate::spawn_util::ORCHESTRATOR_EXECUTION_ROLE.to_string(),
+            ),
             ("NINOX_ORCHESTRATOR_ID".to_string(), session.id.clone()),
             ("NINOX_CALLER_TYPE".to_string(),     "orchestrator".to_string()),
         ]
     } else {
-        Vec::new()
+        vec![(
+            crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+            crate::spawn_util::WORKER_EXECUTION_ROLE.to_string(),
+        )]
     };
     Some(RefilePlan { agent, base_cmd, workspace, catalogue_path, extra_env })
 }
@@ -855,11 +928,18 @@ pub fn resume_plan(
         .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
     let extra_env = if is_orchestrator {
         vec![
+            (
+                crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+                crate::spawn_util::ORCHESTRATOR_EXECUTION_ROLE.to_string(),
+            ),
             ("NINOX_ORCHESTRATOR_ID".to_string(), session.id.clone()),
             ("NINOX_CALLER_TYPE".to_string(),     "orchestrator".to_string()),
         ]
     } else {
-        Vec::new()
+        vec![(
+            crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+            crate::spawn_util::WORKER_EXECUTION_ROLE.to_string(),
+        )]
     };
     Some(RefilePlan { agent, base_cmd, workspace, catalogue_path, extra_env })
 }
@@ -944,6 +1024,7 @@ impl App {
         let scheme = themes.scheme(config.theme);
         let active_variant = config.theme;
         let catalogues = config.catalogue_options();
+        let settings = crate::components::settings_panel::SettingsState::from_config(&config);
 
         let mut app = Self {
             engine:             engine.clone(),
@@ -974,7 +1055,7 @@ impl App {
             reattach_attempted: std::collections::HashSet::new(),
             next_client_generation: 0,
             model_lists:    HashMap::new(),
-            settings:       Default::default(),
+            settings,
             spawn_modal:    None,
             catalogue_modal: None,
             // Placeholders — corrected below by resize_terminals() using the
@@ -1730,7 +1811,12 @@ impl App {
                             match repo_root {
                                 Some(root) => {
                                     let source = root.to_string_lossy().into_owned();
-                                    let cap = match state.config.validated_worker_checkout_cap() {
+                                    let cap = match state
+                                        .config
+                                        .validated_worker_checkout_cap_for_repository(
+                                            std::path::Path::new(&source),
+                                        )
+                                    {
                                         Ok(cap) => cap,
                                         Err(error) => {
                                             let _ = state.engine.store.delete_spawning_session_snapshot(
@@ -1742,6 +1828,7 @@ impl App {
                                                 f.error = Some(checkout_error_with_candidates(
                                                     &state.engine,
                                                     &error,
+                                                    Some(&source),
                                                 ));
                                             }
                                             return Task::none();
@@ -1762,6 +1849,7 @@ impl App {
                                                     f.error = Some(checkout_error_with_candidates(
                                                         &state.engine,
                                                         &error,
+                                                        Some(&source),
                                                     ));
                                                 }
                                                 return Task::none();
@@ -1859,46 +1947,47 @@ impl App {
                             let source_workspace = exact_worktree_source
                                 .as_deref()
                                 .unwrap_or(workspace.as_str());
-                            let checkout_backed = exact_worktree_path
-                                || ninox_core::worktree::RepositoryIdentity::resolve(
-                                    std::path::Path::new(&workspace),
-                                )
-                                .is_ok();
+                            let (checkout_backed, checkout_cap, capacity_workspace) =
+                                match checkout_capacity(&config, source_workspace) {
+                                    Ok(capacity) => capacity,
+                                    Err(error) => {
+                                        emit_checkout_unavailable(&engine, &sid, &nm, &error);
+                                        let deleted = engine
+                                            .store
+                                            .delete_spawning_session_snapshot(
+                                                &sid, ts_i64, None,
+                                            )
+                                            .unwrap_or(false);
+                                        return if deleted {
+                                            Message::DiscardFailedSpawn {
+                                                session_id: sid,
+                                                started_at: ts_i64,
+                                            }
+                                        } else {
+                                            Message::Noop
+                                        };
+                                    }
+                                };
                             let incarnation = match prepared_incarnation {
                                 Some(incarnation) => incarnation,
                                 None => {
-                                    let checkout_cap = match config.validated_worker_checkout_cap()
-                                    {
-                                        Ok(cap) => cap,
-                                        Err(error) => {
-                                            emit_checkout_unavailable(&engine, &sid, &nm, &error);
-                                            let deleted = engine
-                                                .store
-                                                .delete_spawning_session_snapshot(
-                                                    &sid, ts_i64, None,
-                                                )
-                                                .unwrap_or(false);
-                                            return if deleted {
-                                                Message::DiscardFailedSpawn {
-                                                    session_id: sid,
-                                                    started_at: ts_i64,
-                                                }
-                                            } else {
-                                                Message::Noop
-                                            };
-                                        }
-                                    };
                                     match engine.store.prepare_worker_incarnation(
                                         &sid,
                                         None,
                                         ts_i64,
-                                        source_workspace,
+                                        &capacity_workspace,
                                         checkout_backed,
                                         checkout_cap,
                                     ) {
                                         Ok(incarnation) => incarnation,
                                         Err(error) => {
-                                            emit_checkout_unavailable(&engine, &sid, &nm, &error);
+                                            emit_repository_checkout_unavailable(
+                                                &engine,
+                                                &sid,
+                                                &nm,
+                                                &capacity_workspace,
+                                                &error,
+                                            );
                                             let deleted = engine
                                                 .store
                                                 .delete_spawning_session_snapshot(
@@ -2023,8 +2112,8 @@ impl App {
                             let repo = crate::spawn_util::repo_from_workspace(&workspace)
                                 .unwrap_or_default();
 
-                            // No NINOX_ORCHESTRATOR_ID and no caller-type vars:
-                            // this session is unattached and reports to no one.
+                            // No NINOX_ORCHESTRATOR_ID: this worker is unattached
+                            // and reports to no one, but still carries its role.
                             let attach_sid = sid.clone();
                             let attach = crate::spawn_util::spawn_interactive_session(
                                 engine.clone(),
@@ -2037,10 +2126,16 @@ impl App {
                                     agent,
                                     base_cmd,
                                     catalogue_path,
-                                    extra_env: vec![(
-                                        "NINOX_WORKER_INCARNATION".to_string(),
-                                        incarnation.incarnation_id.clone(),
-                                    )],
+                                    extra_env: vec![
+                                        (
+                                            crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+                                            crate::spawn_util::WORKER_EXECUTION_ROLE.to_string(),
+                                        ),
+                                        (
+                                            "NINOX_WORKER_INCARNATION".to_string(),
+                                            incarnation.incarnation_id.clone(),
+                                        ),
+                                    ],
                                     started_at: ts_i64,
                                     claude_session_id,
                                     failure_status:  ninox_core::SessionStatus::Terminated,
@@ -2184,10 +2279,14 @@ impl App {
                                 tracing::error!("mkdir orchestrator workspace {ws}: {e}");
                             }
 
-                            // Orchestrator sessions get the caller-type vars and
-                            // their own id so spawned workers can report back.
+                            // Orchestrator sessions get an explicit execution role
+                            // and their own id so spawned workers can report back.
                             let extra_env = vec![
                                 ("NINOX_ORCHESTRATOR_ID".to_string(), sid.clone()),
+                                (
+                                    crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+                                    crate::spawn_util::ORCHESTRATOR_EXECUTION_ROLE.to_string(),
+                                ),
                                 ("NINOX_CALLER_TYPE".to_string(),     "orchestrator".to_string()),
                             ];
 
@@ -2358,28 +2457,40 @@ impl App {
                         emit_checkout_unavailable(&engine, &id, &name, &error);
                         return Message::Noop;
                     }
-                    let checkout_backed = !is_orch
-                        && (current_worker.is_some_and(|worker| worker.checkout_backed)
-                            || ninox_core::worktree::RepositoryIdentity::resolve(
-                                std::path::Path::new(&plan.workspace),
-                            )
-                            .is_ok());
+                    let capacity_source = current_worker
+                        .as_ref()
+                        .map_or(plan.workspace.as_str(), |worker| {
+                            worker.source_workspace.as_str()
+                        });
                     let incarnation = if is_orch {
                         None
                     } else {
-                        match config.validated_worker_checkout_cap().and_then(|cap| {
-                            engine.store.prepare_worker_incarnation(
-                                &id,
-                                orch_id.as_deref(),
-                                ts,
-                                &plan.workspace,
-                                checkout_backed,
-                                cap,
-                            )
-                        }) {
+                        match checkout_capacity_for_worker(
+                            &config,
+                            capacity_source,
+                            current_worker.as_ref(),
+                        )
+                        .and_then(
+                            |(checkout_backed, cap, capacity_workspace)| {
+                                engine.store.prepare_worker_incarnation(
+                                    &id,
+                                    orch_id.as_deref(),
+                                    ts,
+                                    &capacity_workspace,
+                                    checkout_backed,
+                                    cap,
+                                )
+                            },
+                        ) {
                             Ok(incarnation) => Some(incarnation),
                             Err(error) => {
-                                emit_checkout_unavailable(&engine, &id, &name, &error);
+                                emit_repository_checkout_unavailable(
+                                    &engine,
+                                    &id,
+                                    &name,
+                                    capacity_source,
+                                    &error,
+                                );
                                 return Message::Noop;
                             }
                         }
@@ -3057,6 +3168,91 @@ impl App {
                 state.config.inbox_messaging.enabled = !state.config.inbox_messaging.enabled;
                 if let Err(e) = state.config.save() {
                     tracing::warn!("failed to save config after toggling inbox messaging: {e}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsToggleRustCache => {
+                let enabled = !state.config.rust_cache.enabled;
+                if enabled {
+                    if let Err(error) = state.config.rust_cache.validate() {
+                        state.settings.rust_cache_error = Some(error.to_string());
+                        return Task::none();
+                    }
+                }
+                state.config.rust_cache.enabled = enabled;
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save shared Rust cache toggle: {error}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsRustCacheExecutable(value) => {
+                state.settings.rust_cache_executable = value;
+                let executable = state.settings.rust_cache_executable.trim();
+                if executable.is_empty() {
+                    state.settings.rust_cache_error =
+                        Some("sccache executable must not be empty".to_string());
+                    return Task::none();
+                }
+                state.config.rust_cache.executable = std::path::PathBuf::from(executable);
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save sccache executable: {error}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsRustCacheDir(value) => {
+                state.settings.rust_cache_dir = value;
+                let cache_dir = state.settings.rust_cache_dir.trim();
+                state.config.rust_cache.cache_dir =
+                    (!cache_dir.is_empty()).then(|| std::path::PathBuf::from(cache_dir));
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save shared Rust cache directory: {error}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsRustCacheSize(value) => {
+                state.settings.rust_cache_size_gib = value;
+                let parsed = state
+                    .settings
+                    .rust_cache_size_gib
+                    .trim()
+                    .parse::<u16>();
+                let Ok(size) = parsed else {
+                    state.settings.rust_cache_error =
+                        Some("cache size must be a whole number of GiB".to_string());
+                    return Task::none();
+                };
+                let prior = state.config.rust_cache.cache_size_gib;
+                state.config.rust_cache.cache_size_gib = size;
+                if let Err(error) = state.config.rust_cache.validate() {
+                    state.config.rust_cache.cache_size_gib = prior;
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    return Task::none();
+                }
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save shared Rust cache size: {error}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsToggleRustCachePrune => {
+                state.config.rust_cache.prune_on_release =
+                    !state.config.rust_cache.prune_on_release;
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save Cargo release-pruning toggle: {error}");
                 }
                 Task::none()
             }
@@ -4903,7 +5099,10 @@ mod tests {
         assert_eq!(plan.base_cmd, "claude-nightly --model 'claude-opus-4-8'");
         assert_eq!(plan.workspace, "/tmp/ws");
         assert_eq!(plan.catalogue_path, "/brains/b");
-        assert!(plan.extra_env.is_empty());
+        assert!(plan.extra_env.iter().any(|(key, value)| {
+            key == crate::spawn_util::EXECUTION_ROLE_ENV
+                && value == crate::spawn_util::WORKER_EXECUTION_ROLE
+        }));
         assert_eq!(plan.agent.harness, "claude-code");
         assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
     }
@@ -4915,6 +5114,10 @@ mod tests {
         session.catalogue_path = None;
         let plan = refile_plan(&session, true, &cfg, "fresh-uuid").expect("plan");
         assert!(plan.extra_env.iter().any(|(k, v)| k == "NINOX_ORCHESTRATOR_ID" && v == "o1"));
+        assert!(plan.extra_env.iter().any(|(key, value)| {
+            key == crate::spawn_util::EXECUTION_ROLE_ENV
+                && value == crate::spawn_util::ORCHESTRATOR_EXECUTION_ROLE
+        }));
         assert!(plan.extra_env.iter().any(|(k, _)| k == "NINOX_CALLER_TYPE"));
         // The legacy ATHENE_/AO_ transition names are gone.
         assert!(!plan.extra_env.iter().any(|(k, _)| k == "ATHENE_CALLER_TYPE" || k == "AO_CALLER_TYPE"));
@@ -5008,6 +5211,10 @@ mod tests {
         assert!(plan.base_cmd.contains("--resume"));
         assert!(plan.base_cmd.contains("stored-uuid"));
         assert_eq!(plan.workspace, "/tmp/ws");
+        assert!(plan.extra_env.iter().any(|(key, value)| {
+            key == crate::spawn_util::EXECUTION_ROLE_ENV
+                && value == crate::spawn_util::WORKER_EXECUTION_ROLE
+        }));
     }
 
     #[test]
@@ -6795,6 +7002,72 @@ mod tests {
             assert!(m.config.registry().enabled_names().contains(&"claude-code".to_string()));
             assert!(m.config.harnesses.is_empty(), "inert toggle must not write config");
         });
+    }
+
+    #[test]
+    fn rust_cache_settings_validate_and_persist_policy() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("rust_cache_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            AppConfig::default().save().unwrap();
+            let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
+            let (app, _) = App::new(
+                test_engine(),
+                std::path::PathBuf::from("/tmp"),
+                ninox_core::config::AgentConfig::default(),
+                brain,
+            );
+
+            let (app, _) = app.update(Message::SettingsToggleRustCache);
+            assert!(app.config.rust_cache.enabled);
+            let prior_size = app.config.rust_cache.cache_size_gib;
+
+            let (app, _) = app.update(Message::SettingsRustCacheSize("0".into()));
+            assert_eq!(app.config.rust_cache.cache_size_gib, prior_size);
+            assert!(app.settings.rust_cache_error.is_some());
+
+            let (app, _) = app.update(Message::SettingsRustCacheSize("20".into()));
+            let (app, _) = app.update(Message::SettingsRustCacheDir("shared/rust-cache".into()));
+            let (app, _) = app.update(Message::SettingsToggleRustCachePrune);
+            assert_eq!(app.config.rust_cache.cache_size_gib, 20);
+            assert!(app.config.rust_cache.prune_on_release);
+            assert!(app.settings.rust_cache_error.is_none());
+
+            let saved = AppConfig::load().unwrap();
+            assert!(saved.rust_cache.enabled);
+            assert_eq!(saved.rust_cache.cache_size_gib, 20);
+            assert_eq!(
+                saved.rust_cache.cache_dir.as_deref(),
+                Some(std::path::Path::new("shared/rust-cache"))
+            );
+            assert!(saved.rust_cache.prune_on_release);
+        });
+    }
+
+    #[test]
+    fn refile_preserves_checkout_capacity_when_source_is_offline() {
+        let worker = ninox_core::types::WorkerIncarnation {
+            session_id: "worker".into(),
+            incarnation_id: "incarnation".into(),
+            orchestrator_id: Some("orch".into()),
+            started_at: 1,
+            source_workspace: "/offline/repository".into(),
+            workspace_path: "/offline/repository-w1".into(),
+            repository_key: Some("/offline/repository/.git".into()),
+            lease_id: Some("lease".into()),
+            checkout_backed: true,
+            state: ninox_core::types::WorkerIncarnationState::Retained,
+        };
+
+        let (checkout_backed, cap, source) = checkout_capacity_for_worker(
+            &AppConfig::default(),
+            &worker.source_workspace,
+            Some(&worker),
+        )
+        .unwrap();
+        assert!(checkout_backed);
+        assert_eq!(cap, 5);
+        assert_eq!(source, worker.source_workspace);
     }
 
     #[test]

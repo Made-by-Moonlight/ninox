@@ -147,21 +147,41 @@ pub async fn register_live_orchestrator_runtime(
     })
 }
 
+fn require_execution_role(
+    execution_role: Option<&str>,
+    legacy_caller_type: Option<&str>,
+    required_role: &str,
+    denial: &str,
+) -> Result<()> {
+    let role = execution_role.or(legacy_caller_type);
+    if let Some(role) = role {
+        anyhow::ensure!(
+            matches!(role, "worker" | "orchestrator"),
+            "unrecognized NINOX_EXECUTION_ROLE={role:?}"
+        );
+    }
+    anyhow::ensure!(role == Some(required_role), "{denial}");
+    Ok(())
+}
+
 /// Environment values identify the claimed orchestrator; immutable tmux and
 /// OS process identities prove the caller actually runs under that runtime.
 pub fn authorize_orchestrator(
     store: &Store,
     orchestrator_id: Option<&str>,
-    caller_type: Option<&str>,
+    execution_role: Option<&str>,
+    legacy_caller_type: Option<&str>,
     runtime: Option<&tmux::TmuxPaneIdentity>,
 ) -> Result<String> {
     let orchestrator_id = orchestrator_id
         .filter(|id| !id.is_empty())
         .context("NINOX_ORCHESTRATOR_ID is not set")?;
-    anyhow::ensure!(
-        caller_type == Some("orchestrator"),
-        "worker inspection is only available inside the owning orchestrator session"
-    );
+    require_execution_role(
+        execution_role,
+        legacy_caller_type,
+        "orchestrator",
+        "worker inspection is only available inside the owning orchestrator session",
+    )?;
     let runtime = runtime.context("caller is not running inside a private Ninox pane")?;
     anyhow::ensure!(
         store.is_orchestrator(orchestrator_id)?,
@@ -201,6 +221,78 @@ pub fn authorize_orchestrator(
         "caller is not running under the immutable orchestrator runtime"
     );
     Ok(orchestrator_id.to_string())
+}
+
+pub fn authorize_worker_completion(
+    store: &Store,
+    session_id: Option<&str>,
+    incarnation_id: Option<&str>,
+    orchestrator_id: Option<&str>,
+    caller_roles: (Option<&str>, Option<&str>),
+    runtime: Option<&tmux::TmuxPaneIdentity>,
+    runtime_incarnation: Option<&str>,
+) -> Result<WorkerIncarnation> {
+    require_execution_role(
+        caller_roles.0,
+        caller_roles.1,
+        "worker",
+        "completion is only available inside the current worker runtime",
+    )?;
+    let session_id = session_id
+        .filter(|value| !value.is_empty())
+        .context("NINOX_SESSION is not set")?;
+    let incarnation_id = incarnation_id
+        .filter(|value| !value.is_empty())
+        .context("NINOX_WORKER_INCARNATION is not set")?;
+    let orchestrator_id = orchestrator_id
+        .filter(|value| !value.is_empty())
+        .context("NINOX_ORCHESTRATOR_ID is not set")?;
+    anyhow::ensure!(
+        session_id != orchestrator_id && !store.is_orchestrator(session_id)?,
+        "orchestrators cannot complete themselves as workers"
+    );
+    anyhow::ensure!(
+        store.is_orchestrator(orchestrator_id)?,
+        "worker owner is not a persisted orchestrator"
+    );
+    let session = store
+        .get_session(session_id)?
+        .with_context(|| format!("worker {session_id:?} not found"))?;
+    anyhow::ensure!(
+        session.orchestrator_id.as_deref() == Some(orchestrator_id),
+        "worker completion owner does not match its session owner"
+    );
+    let worker = store
+        .current_worker_incarnation(session_id)?
+        .context("worker has no current incarnation")?;
+    anyhow::ensure!(
+        worker.incarnation_id == incarnation_id,
+        "worker completion is stale; the current incarnation changed"
+    );
+    anyhow::ensure!(
+        worker.orchestrator_id.as_deref() == Some(orchestrator_id),
+        "worker completion owner does not match its exact incarnation"
+    );
+    let runtime = runtime.context("caller is not running inside a private Ninox pane")?;
+    anyhow::ensure!(
+        tmux::caller_descends_from(runtime.pane_pid),
+        "caller is not running under the current worker runtime"
+    );
+    if let Some(legacy) = store.legacy_worker_runtime(session_id)? {
+        anyhow::ensure!(
+            legacy.incarnation_id == incarnation_id
+                && legacy.physical_tmux_name == runtime.physical_tmux_name
+                && legacy.pane_id == runtime.pane_id
+                && legacy.pane_pid == runtime.pane_pid,
+            "worker runtime was replaced; refusing stale completion"
+        );
+    } else {
+        anyhow::ensure!(
+            runtime.physical_tmux_name == session_id && runtime_incarnation == Some(incarnation_id),
+            "worker runtime was replaced; refusing stale completion"
+        );
+    }
+    Ok(worker)
 }
 
 pub async fn list_owned_workers(
@@ -252,7 +344,7 @@ pub async fn finalize_owned_worker(
     })
 }
 
-async fn stop_exact_runtime(store: &Store, worker: &WorkerIncarnation) -> Result<()> {
+pub(crate) async fn stop_exact_runtime(store: &Store, worker: &WorkerIncarnation) -> Result<()> {
     if let Some(legacy) = store.legacy_worker_runtime(&worker.session_id)? {
         anyhow::ensure!(
             legacy.incarnation_id == worker.incarnation_id,
@@ -549,6 +641,82 @@ mod tests {
             })
             .unwrap();
         store
+    }
+
+    #[test]
+    fn worker_completion_authorization_rejects_wrong_role_and_replaced_runtime() {
+        let root = tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let store = store(&root.path().join("ninox.db"));
+        store
+            .upsert_session(&session("worker", "orch", &workspace))
+            .unwrap();
+        let worker = store
+            .prepare_worker_incarnation(
+                "worker",
+                Some("orch"),
+                1,
+                workspace.to_str().unwrap(),
+                false,
+                3,
+            )
+            .unwrap();
+        assert!(store
+            .bind_worker_incarnation(
+                "worker",
+                &worker.incarnation_id,
+                workspace.to_str().unwrap(),
+                workspace.to_str().unwrap(),
+                None,
+            )
+            .unwrap());
+        let runtime = tmux::TmuxPaneIdentity {
+            physical_tmux_name: "worker".into(),
+            pane_id: "%1".into(),
+            pane_pid: std::process::id(),
+            pane_created_at: 1,
+            server_epoch: "test".into(),
+        };
+
+        assert!(authorize_worker_completion(
+            &store,
+            Some("worker"),
+            Some(&worker.incarnation_id),
+            Some("orch"),
+            (Some("orchestrator"), Some("worker")),
+            Some(&runtime),
+            Some(&worker.incarnation_id),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("only available"));
+        assert!(authorize_worker_completion(
+            &store,
+            Some("worker"),
+            Some(&worker.incarnation_id),
+            Some("orch"),
+            (Some("worker"), Some("orchestrator")),
+            Some(&runtime),
+            Some("replacement"),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("replaced"));
+        assert_eq!(
+            authorize_worker_completion(
+                &store,
+                Some("worker"),
+                Some(&worker.incarnation_id),
+                Some("orch"),
+                (None, Some("worker")),
+                Some(&runtime),
+                Some(&worker.incarnation_id),
+            )
+            .unwrap()
+            .incarnation_id,
+            worker.incarnation_id,
+        );
     }
 
     #[tokio::test]

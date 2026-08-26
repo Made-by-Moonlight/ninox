@@ -78,6 +78,8 @@ pub struct WorkerIncarnation {
     pub started_at: i64,
     pub source_workspace: String,
     pub workspace_path: String,
+    /// Stable canonical Git identity shared by every checkout of one repository.
+    pub repository_key: Option<String>,
     pub lease_id: Option<String>,
     pub checkout_backed: bool,
     pub state: WorkerIncarnationState,
@@ -123,6 +125,35 @@ pub struct WorkerFinalization {
 pub enum WorkerFinalizationIntent {
     Apply(WorkerIncarnation),
     AlreadyFinalized(WorkerIncarnation),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerCompletion {
+    pub completion_id: String,
+    pub session_id: String,
+    pub incarnation_id: String,
+    pub orchestrator_id: String,
+    pub summary: String,
+    pub completed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerCompletionIntent {
+    Completed(WorkerCompletion),
+    AlreadyCompleted(WorkerCompletion),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerCompletionDelivery {
+    pub completion: WorkerCompletion,
+    pub attempt_id: String,
+    pub attempt: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerCompletionReceipt {
+    Delivered(WorkerCompletion),
+    AlreadyAcknowledged,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
