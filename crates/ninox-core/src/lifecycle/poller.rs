@@ -30,7 +30,7 @@ type ContextSnapshot = (f64, Option<f64>, Option<u64>);
 /// Unix epoch milliseconds "now" — used to stamp `Notification::created_at`
 /// and `Session::terminal_at`. `pub(crate)` so `events::cleanup_session` can
 /// stamp the same clock when it marks a session `Done`.
-pub(crate) fn now_millis() -> i64 {
+pub fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -142,6 +142,7 @@ impl Poller {
                         .unwrap_or_default()
                         .session_retention;
                     self.sweep_retired_sessions(&retention).await;
+                    self.deliver_worker_completions().await;
                 }
                 _ = usage_interval.tick()  => self.poll_usage().await,
                 _ = update_interval.tick() => self.poll_update_check().await,
@@ -153,6 +154,53 @@ impl Poller {
                     self.poll_github().await;
                 }
             }
+        }
+    }
+
+    async fn deliver_worker_completions(&self) {
+        const RETRY_AFTER_MS: i64 = 30_000;
+        let now = now_millis();
+        let delivery = match self
+            .engine
+            .store
+            .claim_worker_completion_delivery(now, RETRY_AFTER_MS)
+        {
+            Ok(Some(delivery)) => delivery,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!("claim worker completion delivery: {error}");
+                return;
+            }
+        };
+        let message = format!(
+            "Ninox recorded completion for worker `{}`. Receive its canonical final \
+             handoff exactly once:\n\n`ninox receive-completion {}`",
+            delivery.completion.session_id, delivery.completion.completion_id,
+        );
+        let error = self
+            .engine
+            .send_to_session(&delivery.completion.orchestrator_id, &message)
+            .await
+            .err()
+            .map(|error| error.to_string());
+        if let Err(record_error) = self.engine.store.finish_worker_completion_delivery_attempt(
+            &delivery.completion.completion_id,
+            &delivery.attempt_id,
+            now_millis(),
+            error.as_deref(),
+        ) {
+            tracing::warn!(
+                "record worker completion delivery {} attempt {}: {record_error}",
+                delivery.completion.completion_id,
+                delivery.attempt,
+            );
+        }
+        if let Some(error) = error {
+            tracing::warn!(
+                "deliver worker completion {} to orchestrator {}: {error}",
+                delivery.completion.completion_id,
+                delivery.completion.orchestrator_id,
+            );
         }
     }
 
@@ -597,6 +645,25 @@ impl Poller {
                 self.notify_github_lookup_failed(&session);
                 continue;
             };
+            // The GitHub round-trips above can outlive this session's
+            // incarnation (a Resume/Re-file replaces it mid-tick) — self-
+            // healing or merge-detecting against the stale snapshot below
+            // would apply this tick's findings to a successor session that
+            // never asked for them. Bail if the live row no longer matches
+            // the tick-start snapshot's started_at/pr_number.
+            if !self
+                .engine
+                .store
+                .get_session(&session.id)
+                .ok()
+                .flatten()
+                .is_some_and(|current| {
+                    current.started_at == session.started_at
+                        && current.pr_number == session.pr_number
+                })
+            {
+                continue;
+            }
             self.clear_github_lookup_failed(&session.id);
 
             let pr_id: PrId = pr_number as i64;
@@ -950,6 +1017,36 @@ impl Poller {
         if !pr_merged || matches!(session.status, SessionStatus::Done) {
             return false;
         }
+        let worker = match self
+            .engine
+            .store
+            .worker_incarnation_for_snapshot(&session.id, session.started_at)
+        {
+            Ok(worker) => worker,
+            Err(error) => {
+                tracing::warn!("resolve merge capability for {}: {error}", session.id);
+                return false;
+            }
+        };
+        if let Some(worker) = worker {
+            match self.engine.store.retain_worker_after_merge(
+                &session.id,
+                &worker.incarnation_id,
+                session.started_at,
+                pr_number,
+                now_millis(),
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) => return false,
+                Err(error) => {
+                    tracing::warn!("retain merged worker {}: {error}", session.id);
+                    return false;
+                }
+            }
+        } else if let Err(e) = self.engine.cleanup_session(&session.id).await {
+            tracing::warn!("cleanup_session {}: {e}", session.id);
+            return false;
+        }
         self.engine.emit(Event::Notification(Notification {
             id:         format!("merged-{}", session.id),
             kind:       NotificationKind::WorkerDone,
@@ -965,9 +1062,6 @@ impl Poller {
             if let Err(e) = self.engine.send_to_session(&orch, &msg).await {
                 tracing::warn!("send worker-done reaction to orchestrator {orch}: {e}");
             }
-        }
-        if let Err(e) = self.engine.cleanup_session(&session.id).await {
-            tracing::warn!("cleanup_session {}: {e}", session.id);
         }
         // Remove enrichment state for this session — it's done
         {
@@ -1003,6 +1097,9 @@ impl Poller {
                 continue;
             }
             if orch_ids.contains(session.id.as_str()) {
+                continue;
+            }
+            if self.engine.store.is_worker_retained(&session.id).unwrap_or(false) {
                 continue;
             }
             let expired = match session.terminal_at {
@@ -1333,6 +1430,68 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None,
         }
+    }
+
+    #[tokio::test]
+    async fn completion_delivery_attempts_at_most_one_item_per_tick() {
+        use crate::{
+            store::Store,
+            types::{Orchestrator, WorkerCompletionIntent},
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(root.path().join("t.db")).unwrap());
+        store
+            .upsert_orchestrator(&Orchestrator {
+                id: "orch".into(),
+                name: "orch".into(),
+                created_at: 1,
+            })
+            .unwrap();
+        let completed_at = now_millis() - 1_000;
+        let mut completion_ids = Vec::new();
+        for (offset, id) in ["worker-1", "worker-2"].into_iter().enumerate() {
+            let mut session = test_session(id, "/ws");
+            session.orchestrator_id = Some("orch".into());
+            session.started_at = i64::try_from(offset + 1).unwrap();
+            store.upsert_session(&session).unwrap();
+            let worker = store
+                .prepare_worker_incarnation(
+                    id,
+                    Some("orch"),
+                    session.started_at,
+                    "/ws",
+                    false,
+                    3,
+                )
+                .unwrap();
+            assert!(store
+                .bind_worker_incarnation(id, &worker.incarnation_id, "/ws", "/ws", None)
+                .unwrap());
+            let WorkerCompletionIntent::Completed(completion) = store
+                .complete_worker_incarnation(
+                    id,
+                    &worker.incarnation_id,
+                    "orch",
+                    "canonical summary",
+                    completed_at + i64::try_from(offset).unwrap(),
+                )
+                .unwrap()
+            else {
+                panic!("first completion must commit");
+            };
+            completion_ids.push(completion.completion_id);
+        }
+        let poller = Poller::new(Engine::new(store.clone()));
+
+        poller.deliver_worker_completions().await;
+
+        let still_pending = store
+            .claim_worker_completion_delivery(now_millis(), 30_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_pending.completion.completion_id, completion_ids[1]);
+        assert_eq!(still_pending.attempt, 1);
     }
 
     #[tokio::test]
@@ -2323,6 +2482,60 @@ mod tests {
             "the self-heal write must not revert cost_usd written mid-poll by the statusline process",
         );
         assert_eq!(updated.context_used_pct, Some(55.0), "mid-poll context fields must survive too");
+    }
+
+    /// A Resume/Re-file mid-poll (a new incarnation of the same session id,
+    /// stamped with a later `started_at`) must not have this tick's
+    /// findings — self-heal, merge detection — applied against it: they
+    /// were fetched for the incarnation that has since been replaced. The
+    /// fake's `get_pr_status` plays the Resume/Re-file here, the same await
+    /// window the statusline race above uses.
+    #[tokio::test]
+    async fn poll_github_skips_self_heal_for_a_session_refiled_mid_poll() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".to_string(), "repo".to_string(), 50),
+            crate::github::PrStatus {
+                merged: true, state: "closed".into(), mergeable: Some(true),
+                title: "t".into(), number: 50, head_sha: "abc".into(),
+            },
+        );
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.repo = "Owner/repo".into();
+        session.pr_number = Some(50);
+        session.pr_id = None;
+        store.upsert_session(&session).unwrap();
+
+        // The refiled successor: same id, later started_at, no PR yet.
+        let mut refiled = session.clone();
+        refiled.started_at += 1;
+        refiled.pr_number = None;
+        refiled.pr_id = None;
+        *fake.mid_pr_status_upsert.lock().unwrap() = Some((store.clone(), refiled));
+
+        let engine = github_engine(store.clone(), fake);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github().await;
+
+        let updated = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(updated.started_at, session.started_at + 1, "the refiled row must survive untouched");
+        assert_eq!(updated.pr_id, None, "the stale tick's PR must not be adopted onto the successor");
+        assert!(!matches!(updated.status, SessionStatus::Done), "the merged-PR tick must not finish the successor");
+        assert!(
+            drain_events(&mut rx).iter().all(|e| !matches!(
+                e, Event::SessionUpdated(_, _) | Event::Notification(_),
+            )),
+            "a stale tick must not emit against the refiled successor",
+        );
     }
 
     /// A session deleted between the tick-start snapshot and the

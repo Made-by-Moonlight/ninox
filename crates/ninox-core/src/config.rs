@@ -1,8 +1,13 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Component, Path, PathBuf},
+};
 
 use crate::harness::{HarnessRegistry, HarnessSpec};
+use crate::worktree::RepositoryIdentity;
 
 // ---------------------------------------------------------------------------
 // Theme
@@ -174,8 +179,102 @@ impl SessionRetentionConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Shared Rust compilation cache
+// ---------------------------------------------------------------------------
+
+pub const DEFAULT_RUST_CACHE_SIZE_GIB: u16 = 10;
+pub const MAX_RUST_CACHE_SIZE_GIB: u16 = 1024;
+
+/// Opt-in worker-only sccache policy. Cargo target directories remain
+/// checkout-local; only sccache's content-addressed cache is shared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustCacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_sccache_executable")]
+    pub executable: PathBuf,
+    /// Omit for the platform cache directory (`<cache>/ninox/sccache`).
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    #[serde(default = "default_rust_cache_size_gib")]
+    pub cache_size_gib: u16,
+    #[serde(default)]
+    pub prune_on_release: bool,
+}
+
+fn default_sccache_executable() -> PathBuf { PathBuf::from("sccache") }
+fn default_rust_cache_size_gib() -> u16 { DEFAULT_RUST_CACHE_SIZE_GIB }
+
+impl Default for RustCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            executable: default_sccache_executable(),
+            cache_dir: None,
+            cache_size_gib: default_rust_cache_size_gib(),
+            prune_on_release: false,
+        }
+    }
+}
+
+impl RustCacheConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.executable.as_os_str().is_empty(),
+            "rust_cache.executable must not be empty"
+        );
+        anyhow::ensure!(
+            (1..=MAX_RUST_CACHE_SIZE_GIB).contains(&self.cache_size_gib),
+            "rust_cache.cache_size_gib must be between 1 and {MAX_RUST_CACHE_SIZE_GIB}"
+        );
+        Ok(())
+    }
+
+    pub fn resolved_cache_dir(&self) -> PathBuf {
+        self.cache_dir.clone().map_or_else(
+            || {
+                dirs::cache_dir()
+                    .or_else(dirs::config_dir)
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("ninox")
+                    .join("sccache")
+            },
+            AppConfig::resolve_root_path,
+        )
+    }
+
+    pub fn resolved_executable(&self) -> PathBuf {
+        if self.executable.components().count() == 1 {
+            self.executable.clone()
+        } else {
+            AppConfig::resolve_root_path(self.executable.clone())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App configuration
 // ---------------------------------------------------------------------------
+
+fn default_worker_checkout_cap() -> u32 { 5 }
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if normalized.file_name().is_some() => {
+                normalized.pop();
+            }
+            Component::ParentDir => normalized.push(component),
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component);
+            }
+        }
+    }
+    normalized
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -187,6 +286,21 @@ pub struct AppConfig {
     /// Defaults to `~/.config/ninox/orchestrator`.
     #[serde(default)]
     pub orchestrator_root: Option<PathBuf>,
+    /// Root for Ninox-managed worker worktrees.
+    #[serde(default)]
+    pub worktree_root: Option<PathBuf>,
+    /// Root containing repositories eligible for pooled worker checkouts.
+    /// Pooling remains disabled when unset.
+    #[serde(default)]
+    pub repositories_root: Option<PathBuf>,
+    /// Default maximum retained or active checkout-backed workers per
+    /// canonical repository pool.
+    #[serde(default = "default_worker_checkout_cap", alias = "worker_checkout_cap")]
+    pub worker_checkout_default_cap: u32,
+    /// Per-repository pool limits. Keys are user-facing repository paths;
+    /// online aliases are matched through their canonical Git identity.
+    #[serde(default)]
+    pub worker_checkout_repository_caps: BTreeMap<String, u32>,
     /// Agent harness and model for orchestrator sessions.
     #[serde(default)]
     pub orchestrator: AgentConfig,
@@ -211,6 +325,9 @@ pub struct AppConfig {
     /// default off — see `InboxMessagingConfig`.
     #[serde(default)]
     pub inbox_messaging: InboxMessagingConfig,
+    /// Bounded worker-only shared sccache and release-pruning policy.
+    #[serde(default)]
+    pub rust_cache: RustCacheConfig,
     /// Theme file name (resolves to `~/.config/ninox/themes/<name>.toml`) or
     /// an absolute/`~`-relative path. `None` uses `themes/field-notes.toml`
     /// if present, else the built-in Field Notes palettes.
@@ -231,6 +348,10 @@ impl Default for AppConfig {
             font_size:        13.0,
             theme:            ThemeVariant::Dark,
             orchestrator_root: None,
+            worktree_root:    None,
+            repositories_root: None,
+            worker_checkout_default_cap: default_worker_checkout_cap(),
+            worker_checkout_repository_caps: BTreeMap::new(),
             orchestrator:     AgentConfig::default(),
             worker:           AgentConfig::default(),
             github_token:     None,
@@ -240,11 +361,119 @@ impl Default for AppConfig {
             theme_file:       None,
             harnesses:        BTreeMap::new(),
             inbox_messaging:  InboxMessagingConfig::default(),
+            rust_cache:       RustCacheConfig::default(),
         }
     }
 }
 
 impl AppConfig {
+    pub fn validated_worker_checkout_default_cap(&self) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            self.worker_checkout_default_cap > 0,
+            "worker_checkout_default_cap must be greater than zero"
+        );
+        Ok(self.worker_checkout_default_cap as usize)
+    }
+
+    pub fn validated_worker_checkout_cap_for_repository(
+        &self,
+        repository: &Path,
+    ) -> anyhow::Result<usize> {
+        let identity = RepositoryIdentity::resolve(repository)?;
+        self.validated_worker_checkout_cap_for_identity(
+            &identity.top_level,
+            Some(identity.common_git_dir.to_string_lossy().as_ref()),
+        )
+    }
+
+    pub fn validated_worker_checkout_cap_for_stored_repository(
+        &self,
+        repository: &Path,
+        repository_key: Option<&str>,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            repository_key.is_some_and(|key| !key.is_empty()),
+            "checkout-backed worker has no canonical repository identity"
+        );
+        self.validated_worker_checkout_cap_for_identity(repository, repository_key)
+    }
+
+    fn validated_worker_checkout_cap_for_identity(
+        &self,
+        repository: &Path,
+        repository_key: Option<&str>,
+    ) -> anyhow::Result<usize> {
+        let default = self.validated_worker_checkout_default_cap()?;
+        let online_identity = RepositoryIdentity::resolve(repository).ok();
+        let target_path = online_identity
+            .as_ref()
+            .map_or_else(|| lexical_normalize(repository), |identity| identity.top_level.clone());
+        let target_key = online_identity
+            .as_ref()
+            .map(|identity| identity.common_git_dir.to_string_lossy())
+            .or_else(|| repository_key.map(std::borrow::Cow::Borrowed));
+        let mut matched = None;
+        for (configured, limit) in &self.worker_checkout_repository_caps {
+            anyhow::ensure!(
+                *limit > 0,
+                "worker checkout limit for {configured} must be greater than zero"
+            );
+            let configured_path =
+                lexical_normalize(&Self::resolve_root_path(PathBuf::from(configured)));
+            let configured_identity = RepositoryIdentity::resolve(&configured_path).ok();
+            let is_match = configured_identity.as_ref().is_some_and(|identity| {
+                target_key
+                    .as_deref()
+                    .is_some_and(|key| identity.common_git_dir.to_string_lossy() == key)
+            }) || configured_path == target_path;
+            if is_match {
+                if let Some(previous) = matched {
+                    anyhow::ensure!(
+                        previous == *limit,
+                        "conflicting worker checkout limits resolve to repository {}",
+                        target_path.display()
+                    );
+                }
+                matched = Some(*limit);
+            }
+        }
+        Ok(matched.map_or(default, |limit| {
+            limit.try_into().expect("u32 always fits usize on supported platforms")
+        }))
+    }
+
+    pub fn set_worker_checkout_repository_cap(
+        &mut self,
+        repository: PathBuf,
+        limit: u32,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(limit > 0, "repository worker checkout limit must be greater than zero");
+        let resolved = lexical_normalize(&Self::resolve_root_path(repository));
+        let identity = RepositoryIdentity::resolve(&resolved).ok();
+        let normalized = identity
+            .as_ref()
+            .map_or_else(|| resolved.clone(), |repository| repository.top_level.clone());
+        let aliases = self
+            .worker_checkout_repository_caps
+            .keys()
+            .filter(|configured| {
+                let configured =
+                    lexical_normalize(&Self::resolve_root_path(PathBuf::from(configured)));
+                identity.as_ref().is_some_and(|target| {
+                    RepositoryIdentity::resolve(&configured)
+                        .is_ok_and(|candidate| candidate.common_git_dir == target.common_git_dir)
+                }) || configured == normalized
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for alias in aliases {
+            self.worker_checkout_repository_caps.remove(&alias);
+        }
+        let key = normalized.to_string_lossy().into_owned();
+        self.worker_checkout_repository_caps.insert(key.clone(), limit);
+        Ok(key)
+    }
+
     /// The effective harness registry: builtin specs overlaid by this
     /// config's `[harnesses.*]` entries.
     pub fn registry(&self) -> HarnessRegistry {
@@ -330,6 +559,49 @@ impl AppConfig {
                 .join("ninox")
                 .join("orchestrator")
         })
+    }
+
+    pub fn resolved_worktree_root(&self) -> PathBuf {
+        let path = self.worktree_root.clone().unwrap_or_else(|| {
+            dirs::data_dir()
+                .or_else(dirs::config_dir)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("ninox")
+                .join("worktrees")
+        });
+        Self::resolve_root_path(path)
+    }
+
+    pub fn resolved_repositories_root(&self) -> Option<PathBuf> {
+        self.repositories_root.clone().map(Self::resolve_root_path)
+    }
+
+    pub fn resolved_rust_cache_dir(&self) -> PathBuf {
+        self.rust_cache.resolved_cache_dir()
+    }
+
+    fn resolve_root_path(path: PathBuf) -> PathBuf {
+        if path == std::path::Path::new("~") {
+            return dirs::home_dir().unwrap_or(path);
+        }
+        if let Ok(rest) = path.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                return home.join(rest);
+            }
+        }
+        if path.is_absolute() {
+            return path;
+        }
+        Self::config_path()
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.join(&path))
+            .unwrap_or_else(|| {
+                dirs::config_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("ninox")
+                    .join(path)
+            })
     }
 
     /// Path to the `config.toml` file.
@@ -479,6 +751,185 @@ mod tests {
     fn resolved_orchestrator_root_default() {
         let cfg = AppConfig::default();
         assert!(cfg.resolved_orchestrator_root().ends_with("ninox/orchestrator"));
+    }
+
+    #[test]
+    fn worker_workspace_roots_default_compatibly() {
+        let cfg = AppConfig::default();
+        assert!(cfg.repositories_root.is_none());
+        assert!(cfg.resolved_repositories_root().is_none());
+        assert_eq!(
+            cfg.resolved_worktree_root(),
+            dirs::data_dir()
+                .or_else(dirs::config_dir)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("ninox")
+                .join("worktrees")
+        );
+
+        let old: AppConfig =
+            toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert!(old.worktree_root.is_none());
+        assert!(old.repositories_root.is_none());
+    }
+
+    #[test]
+    fn worker_checkout_limits_default_to_five_and_preserve_legacy_scalar() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.validated_worker_checkout_default_cap().unwrap(), 5);
+
+        let legacy: AppConfig =
+            toml::from_str("port = 8080\nfont_size = 13.0\nworker_checkout_cap = 7\n").unwrap();
+        assert_eq!(legacy.validated_worker_checkout_default_cap().unwrap(), 7);
+        assert!(toml::to_string(&legacy)
+            .unwrap()
+            .contains("worker_checkout_default_cap = 7"));
+
+        config.worker_checkout_default_cap = 0;
+        assert!(config.validated_worker_checkout_default_cap().is_err());
+        config.worker_checkout_default_cap = 4;
+        assert_eq!(config.validated_worker_checkout_default_cap().unwrap(), 4);
+    }
+
+    #[test]
+    fn repository_worker_checkout_limits_support_aliases_and_preserve_offline_entries() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        };
+        run(&["init", "-q"]);
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&repository, &alias).unwrap();
+        let offline = root.path().join("offline");
+        let mut config = AppConfig {
+            worker_checkout_repository_caps: BTreeMap::from([
+                (alias.to_string_lossy().into_owned(), 9),
+                (offline.to_string_lossy().into_owned(), 2),
+            ]),
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            config
+                .validated_worker_checkout_cap_for_repository(&repository)
+                .unwrap(),
+            9
+        );
+        assert_eq!(config.worker_checkout_repository_caps.len(), 2);
+        config
+            .set_worker_checkout_repository_cap(repository.clone(), 6)
+            .unwrap();
+        assert_eq!(
+            config
+                .validated_worker_checkout_cap_for_repository(&alias)
+                .unwrap(),
+            6
+        );
+        assert!(config.worker_checkout_repository_caps.contains_key(
+            repository.canonicalize().unwrap().to_string_lossy().as_ref()
+        ));
+        assert!(config
+            .worker_checkout_repository_caps
+            .contains_key(offline.to_string_lossy().as_ref()));
+        assert!(config
+            .set_worker_checkout_repository_cap(repository, 0)
+            .is_err());
+    }
+
+    #[test]
+    fn rust_cache_defaults_are_conservative_and_bounded() {
+        let config = AppConfig::default();
+        assert!(!config.rust_cache.enabled);
+        assert!(!config.rust_cache.prune_on_release);
+        assert_eq!(config.rust_cache.executable, PathBuf::from("sccache"));
+        assert_eq!(config.rust_cache.cache_size_gib, DEFAULT_RUST_CACHE_SIZE_GIB);
+        config.rust_cache.validate().unwrap();
+    }
+
+    #[test]
+    fn rust_cache_validation_rejects_unbounded_or_unusable_config() {
+        assert!(RustCacheConfig {
+            cache_size_gib: 0,
+            ..RustCacheConfig::default()
+        }
+        .validate()
+        .is_err());
+        assert!(RustCacheConfig {
+            cache_size_gib: MAX_RUST_CACHE_SIZE_GIB + 1,
+            ..RustCacheConfig::default()
+        }
+        .validate()
+        .is_err());
+        assert!(RustCacheConfig {
+            executable: PathBuf::new(),
+            ..RustCacheConfig::default()
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn rust_cache_policy_round_trips_and_anchors_relative_cache_dir() {
+        let config_dir = tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let config = AppConfig {
+                rust_cache: RustCacheConfig {
+                    enabled: true,
+                    executable: PathBuf::from("/opt/bin/sccache"),
+                    cache_dir: Some(PathBuf::from("cache/rust")),
+                    cache_size_gib: 24,
+                    prune_on_release: true,
+                },
+                ..AppConfig::default()
+            };
+            let encoded = toml::to_string(&config).unwrap();
+            let decoded: AppConfig = toml::from_str(&encoded).unwrap();
+            assert_eq!(decoded.rust_cache, config.rust_cache);
+            assert_eq!(
+                decoded.resolved_rust_cache_dir(),
+                config_dir.path().join("cache/rust")
+            );
+        });
+    }
+
+    #[test]
+    fn worker_workspace_roots_expand_home_and_anchor_relative_paths() {
+        let config_dir = tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let cfg = AppConfig {
+                worktree_root: Some(PathBuf::from("~/managed")),
+                repositories_root: Some(PathBuf::from("repositories")),
+                ..AppConfig::default()
+            };
+            assert_eq!(
+                cfg.resolved_worktree_root(),
+                dirs::home_dir().unwrap().join("managed")
+            );
+            assert_eq!(
+                cfg.resolved_repositories_root(),
+                Some(config_dir.path().join("repositories"))
+            );
+        });
+    }
+
+    #[test]
+    fn worker_workspace_roots_are_top_level_toml_keys() {
+        let cfg: AppConfig = toml::from_str(
+            "port = 8080\nfont_size = 13.0\nworktree_root = \"/tmp/wt\"\nrepositories_root = \"/tmp/repos\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.worktree_root, Some(PathBuf::from("/tmp/wt")));
+        assert_eq!(cfg.repositories_root, Some(PathBuf::from("/tmp/repos")));
     }
 
     #[test]

@@ -33,6 +33,153 @@ const TERMINAL_OUTPUT_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 /// the more literally correct source for a user-facing version display).
 pub const NINOX_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn emit_checkout_unavailable(
+    engine: &Engine,
+    session_id: &str,
+    session_name: &str,
+    error: &dyn std::fmt::Display,
+) {
+    let body = checkout_error_with_candidates(engine, error, None);
+    engine.emit(Event::Notification(Notification {
+        id: format!("checkout-unavailable-{session_id}"),
+        kind: NotificationKind::CheckoutUnavailable,
+        title: format!("Checkout unavailable — {session_name}"),
+        body,
+        session_id: Some(session_id.to_string()),
+        created_at: ninox_core::lifecycle::poller::now_millis(),
+    }));
+}
+
+fn emit_repository_checkout_unavailable(
+    engine: &Engine,
+    session_id: &str,
+    session_name: &str,
+    source_workspace: &str,
+    error: &dyn std::fmt::Display,
+) {
+    let body = checkout_error_with_candidates(engine, error, Some(source_workspace));
+    engine.emit(Event::Notification(Notification {
+        id: format!("checkout-unavailable-{session_id}"),
+        kind: NotificationKind::CheckoutUnavailable,
+        title: format!("Checkout unavailable — {session_name}"),
+        body,
+        session_id: Some(session_id.to_string()),
+        created_at: ninox_core::lifecycle::poller::now_millis(),
+    }));
+}
+
+fn checkout_error_with_candidates(
+    engine: &Engine,
+    error: &dyn std::fmt::Display,
+    source_workspace: Option<&str>,
+) -> String {
+    let error = error.to_string();
+    if !error.contains("repository checkout pool saturated") {
+        return error;
+    }
+    let Some(source_workspace) = source_workspace else {
+        return error;
+    };
+    let candidates = engine
+        .store
+        .checkout_worker_candidates_for_repository(source_workspace)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|worker| format!("{} ({:?}, {})", worker.session_id, worker.state, worker.workspace_path))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        error
+    } else {
+        format!("{error}; finish, release, or reap one of: {}", candidates.join(", "))
+    }
+}
+
+fn checkout_capacity(
+    config: &AppConfig,
+    workspace: &str,
+) -> anyhow::Result<(bool, usize, String)> {
+    match ninox_core::worktree::RepositoryIdentity::resolve(std::path::Path::new(workspace)) {
+        Ok(repository) => Ok((
+            true,
+            config.validated_worker_checkout_cap_for_repository(&repository.top_level)?,
+            repository.top_level.to_string_lossy().into_owned(),
+        )),
+        Err(_) => Ok((
+            false,
+            config.validated_worker_checkout_default_cap()?,
+            workspace.to_string(),
+        )),
+    }
+}
+
+fn checkout_capacity_for_worker(
+    config: &AppConfig,
+    workspace: &str,
+    current_worker: Option<&ninox_core::types::WorkerIncarnation>,
+) -> anyhow::Result<(bool, usize, String)> {
+    if let Some(worker) = current_worker.filter(|worker| worker.checkout_backed) {
+        return Ok((
+            true,
+            config.validated_worker_checkout_cap_for_stored_repository(
+                std::path::Path::new(&worker.source_workspace),
+                worker.repository_key.as_deref(),
+            )?,
+            worker.source_workspace.clone(),
+        ));
+    }
+    checkout_capacity(config, workspace)
+}
+
+struct RuntimeStartGuard {
+    store: Arc<ninox_core::store::Store>,
+    claim: Option<ninox_core::types::WorkerRuntimeClaim>,
+}
+
+impl RuntimeStartGuard {
+    fn new(
+        store: Arc<ninox_core::store::Store>,
+        claim: ninox_core::types::WorkerRuntimeClaim,
+    ) -> Self {
+        Self {
+            store,
+            claim: Some(claim),
+        }
+    }
+
+    fn claim(&self) -> &ninox_core::types::WorkerRuntimeClaim {
+        self.claim
+            .as_ref()
+            .expect("runtime start guard is incomplete")
+    }
+
+    fn complete(&mut self) -> anyhow::Result<bool> {
+        let Some(claim) = self.claim.as_ref() else {
+            return Ok(false);
+        };
+        let completed = self.store.complete_worker_runtime_start(
+            &claim.worker.session_id,
+            &claim.worker.incarnation_id,
+            &claim.claim_id,
+        )?;
+        if completed {
+            self.claim = None;
+        }
+        Ok(completed)
+    }
+}
+
+impl Drop for RuntimeStartGuard {
+    fn drop(&mut self) {
+        if let Some(claim) = self.claim.take() {
+            let _ = self.store.abort_worker_runtime_start(
+                &claim.worker.session_id,
+                &claim.worker.incarnation_id,
+                &claim.claim_id,
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // View state
 // ---------------------------------------------------------------------------
@@ -309,6 +456,11 @@ pub enum Message {
     /// Flip the opt-in file-based inbox toggle (`[inbox_messaging].enabled`,
     /// default off — see `ninox_core::config::InboxMessagingConfig`).
     SettingsToggleInboxMessaging,
+    SettingsToggleRustCache,
+    SettingsRustCacheExecutable(String),
+    SettingsRustCacheDir(String),
+    SettingsRustCacheSize(String),
+    SettingsToggleRustCachePrune,
     BrainSelectEntry(String),
     /// The pinboard canvas's hovered node changed (including to/from `None`)
     /// — emitted only on change, never on every mouse move.
@@ -374,7 +526,14 @@ pub enum Message {
     /// An on-demand `git diff` fetch (`ensure_diff`) resolved for a
     /// session's workspace — `diff: None` means no workspace recorded, or a
     /// clean diff against the default branch, not an error.
-    DiffFetched { session_id: SessionId, diff: Option<String> },
+    DiffFetched {
+        session_id: SessionId,
+        diff: Option<String>,
+    },
+    DiscardFailedSpawn {
+        session_id: SessionId,
+        started_at: i64,
+    },
     Noop,
 }
 
@@ -477,9 +636,216 @@ fn reconciled_status_for_dead_session(
     }
 }
 
+async fn reconcile_live_sessions_at_startup_with<F, Fut>(
+    engine: &Engine,
+    registry: &ninox_core::harness::HarnessRegistry,
+    exact_legacy_lookup: F,
+) where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<
+        Output = anyhow::Result<Option<ninox_core::tmux::ExactTmuxSession>>,
+    >,
+{
+    use ninox_core::{tmux, Event as CoreEvent};
+
+    let sessions = match engine.store.list_sessions() {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::error!("restore: list_sessions: {error}");
+            return;
+        }
+    };
+    for session in sessions {
+        if matches!(
+            session.status,
+            SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted
+        ) {
+            continue;
+        }
+
+        let runtime_alive = match engine.store.legacy_worker_runtime(&session.id) {
+            Ok(Some(capability)) => {
+                if session.pid != Some(capability.pane_pid) {
+                    continue;
+                }
+                match exact_legacy_lookup(capability.physical_tmux_name.clone()).await {
+                    Ok(Some(runtime))
+                        if runtime.physical_tmux_name == capability.physical_tmux_name
+                            && runtime.pane_id == capability.pane_id
+                            && runtime.pane_pid == capability.pane_pid =>
+                    {
+                        true
+                    }
+                    Ok(None) => false,
+                    // A live but mismatched runtime, multiple panes, or lookup
+                    // failure is uncertain. Never bless it or mutate status.
+                    Ok(Some(_)) | Err(_) => continue,
+                }
+            }
+            Ok(None) => tmux::has_session(&session.id).await,
+            Err(_) => continue,
+        };
+        if runtime_alive {
+            continue;
+        }
+
+        let agent = ninox_core::config::AgentConfig {
+            harness: session.agent_type.clone(),
+            model: session.model.clone(),
+        };
+        let has_resume_args = registry.resume_cmd(&agent, "placeholder").is_some();
+        let mut dead = session.clone();
+        dead.status =
+            reconciled_status_for_dead_session(&session.claude_session_id, has_resume_args);
+        let _ = engine.store.upsert_session(&dead);
+        engine.emit(CoreEvent::SessionUpdated(dead, SessionFields::STATUS));
+    }
+}
+
 #[cfg(test)]
 mod reconciliation_tests {
     use super::*;
+
+    fn migrated_live_legacy_worker() -> (tempfile::TempDir, Arc<Engine>) {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("legacy.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, orchestrator_id TEXT,
+                name TEXT NOT NULL, repo TEXT NOT NULL,
+                status TEXT NOT NULL, agent_type TEXT NOT NULL,
+                cost_usd REAL NOT NULL DEFAULT 0, started_at INTEGER NOT NULL,
+                pr_number INTEGER, pr_id INTEGER, workspace_path TEXT, pid INTEGER,
+                model TEXT, context_tokens INTEGER, current_incarnation_id TEXT,
+                incarnation TEXT NOT NULL DEFAULT ''
+            );
+            INSERT INTO sessions(
+                id,orchestrator_id,name,repo,status,agent_type,started_at,
+                workspace_path,pid,current_incarnation_id,incarnation
+            ) VALUES (
+                'legacy-live','orch','legacy-live','org/repo','working','cursor-agent',
+                100,'/repo-w1',4242,'inc-live','inc-live'
+            );
+            CREATE TABLE pooled_checkouts (
+                path TEXT PRIMARY KEY, source_repo TEXT NOT NULL,
+                common_git_dir TEXT NOT NULL, slot INTEGER NOT NULL,
+                path_kind TEXT NOT NULL, worktree_git_dir TEXT,
+                worktree_identity TEXT, state TEXT NOT NULL, session_id TEXT,
+                owner_incarnation_id TEXT, lease_id TEXT, branch TEXT,
+                quarantine_reason TEXT
+            );
+            INSERT INTO pooled_checkouts(
+                path,source_repo,common_git_dir,slot,path_kind,state,session_id,
+                owner_incarnation_id,lease_id,branch
+            ) VALUES (
+                '/repo-w1','/repo','/repo/.git',0,'explicit','leased',
+                'legacy-live','inc-live','lease-live','worker-branch'
+            );
+            CREATE TABLE worker_retention (
+                session_id TEXT NOT NULL, orchestrator_id TEXT NOT NULL,
+                incarnation TEXT NOT NULL, retained_at INTEGER NOT NULL,
+                finalized_at INTEGER,
+                PRIMARY KEY(session_id,incarnation)
+            );
+            CREATE TABLE worker_incarnations (
+                session_id TEXT NOT NULL, incarnation_id TEXT NOT NULL,
+                phase TEXT NOT NULL, ui_outcome TEXT,
+                physical_tmux_name TEXT NOT NULL, pane_id TEXT, pane_pid INTEGER,
+                workspace_path TEXT, pool_path TEXT, lease_id TEXT,
+                worktree_identity TEXT, artifact_dir TEXT NOT NULL,
+                started_at INTEGER NOT NULL, terminal_at INTEGER,
+                migration_hold INTEGER NOT NULL DEFAULT 0,
+                allocator_pid INTEGER, allocator_token TEXT,
+                orchestrator_id TEXT, source_workspace TEXT,
+                checkout_backed INTEGER, state TEXT,
+                PRIMARY KEY(session_id,incarnation_id),
+                UNIQUE(physical_tmux_name)
+            );
+            INSERT INTO worker_incarnations VALUES (
+                'legacy-live','inc-live','running',NULL,'nxw-live-inc','%42',4242,
+                '/repo-w1','/repo-w1','lease-live','identity','/sessions/inc-live',
+                100,NULL,0,NULL,NULL,'orch','/repo',1,'active'
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+        let store = Arc::new(ninox_core::store::Store::open(&db).unwrap());
+        (root, Engine::new(store))
+    }
+
+    #[tokio::test]
+    async fn startup_preserves_working_for_exact_live_legacy_runtime() {
+        let (_root, engine) = migrated_live_legacy_worker();
+        let registry = AppConfig::default().registry();
+
+        reconcile_live_sessions_at_startup_with(&engine, &registry, |physical| async move {
+            assert_eq!(physical, "nxw-live-inc");
+            Ok(Some(ninox_core::tmux::ExactTmuxSession {
+                physical_tmux_name: physical,
+                pane_id: "%42".into(),
+                pane_pid: 4242,
+            }))
+        })
+        .await;
+
+        let session = engine.store.get_session("legacy-live").unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::Working);
+        assert_eq!(session.pid, Some(4242));
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_adopt_ambiguous_legacy_runtime() {
+        let (_root, engine) = migrated_live_legacy_worker();
+        let registry = AppConfig::default().registry();
+
+        reconcile_live_sessions_at_startup_with(&engine, &registry, |_physical| async move {
+            anyhow::bail!("exact physical runtime has multiple panes")
+        })
+        .await;
+
+        assert_eq!(
+            engine.store.get_session("legacy-live").unwrap().unwrap().status,
+            SessionStatus::Working
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_fall_back_when_legacy_pid_capability_mismatches() {
+        let (_root, engine) = migrated_live_legacy_worker();
+        let registry = AppConfig::default().registry();
+        let mut session = engine.store.get_session("legacy-live").unwrap().unwrap();
+        session.pid = Some(9999);
+        engine.store.upsert_session(&session).unwrap();
+
+        reconcile_live_sessions_at_startup_with(&engine, &registry, |_physical| async move {
+            panic!("mismatched DB capability must not probe or fall back");
+        })
+        .await;
+
+        assert_eq!(
+            engine.store.get_session("legacy-live").unwrap().unwrap().status,
+            SessionStatus::Working
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_interrupts_confirmed_missing_legacy_runtime() {
+        let (_root, engine) = migrated_live_legacy_worker();
+        let registry = AppConfig::default().registry();
+
+        reconcile_live_sessions_at_startup_with(&engine, &registry, |_physical| async move {
+            Ok(None)
+        })
+        .await;
+
+        assert_ne!(
+            engine.store.get_session("legacy-live").unwrap().unwrap().status,
+            SessionStatus::Working
+        );
+    }
 
     #[test]
     fn session_with_id_and_resumable_harness_becomes_interrupted() {
@@ -525,11 +891,18 @@ pub fn refile_plan(
         .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
     let extra_env = if is_orchestrator {
         vec![
+            (
+                crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+                crate::spawn_util::ORCHESTRATOR_EXECUTION_ROLE.to_string(),
+            ),
             ("NINOX_ORCHESTRATOR_ID".to_string(), session.id.clone()),
             ("NINOX_CALLER_TYPE".to_string(),     "orchestrator".to_string()),
         ]
     } else {
-        Vec::new()
+        vec![(
+            crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+            crate::spawn_util::WORKER_EXECUTION_ROLE.to_string(),
+        )]
     };
     Some(RefilePlan { agent, base_cmd, workspace, catalogue_path, extra_env })
 }
@@ -555,11 +928,18 @@ pub fn resume_plan(
         .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
     let extra_env = if is_orchestrator {
         vec![
+            (
+                crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+                crate::spawn_util::ORCHESTRATOR_EXECUTION_ROLE.to_string(),
+            ),
             ("NINOX_ORCHESTRATOR_ID".to_string(), session.id.clone()),
             ("NINOX_CALLER_TYPE".to_string(),     "orchestrator".to_string()),
         ]
     } else {
-        Vec::new()
+        vec![(
+            crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+            crate::spawn_util::WORKER_EXECUTION_ROLE.to_string(),
+        )]
     };
     Some(RefilePlan { agent, base_cmd, workspace, catalogue_path, extra_env })
 }
@@ -644,6 +1024,7 @@ impl App {
         let scheme = themes.scheme(config.theme);
         let active_variant = config.theme;
         let catalogues = config.catalogue_options();
+        let settings = crate::components::settings_panel::SettingsState::from_config(&config);
 
         let mut app = Self {
             engine:             engine.clone(),
@@ -674,7 +1055,7 @@ impl App {
             reattach_attempted: std::collections::HashSet::new(),
             next_client_generation: 0,
             model_lists:    HashMap::new(),
-            settings:       Default::default(),
+            settings,
             spawn_modal:    None,
             catalogue_modal: None,
             // Placeholders — corrected below by resize_terminals() using the
@@ -699,40 +1080,11 @@ impl App {
         // that race with NavigateSession and re-populate state.terminals with
         // wrong-dimension content, causing the garbled-terminal bug.
         let task = Task::future(async move {
-            use ninox_core::{tmux, Event as CoreEvent, SessionStatus};
-
-            let sessions = match engine.store.list_sessions() {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("restore: list_sessions: {e}");
-                    return Message::Noop;
-                }
-            };
-
             let registry = AppConfig::load().unwrap_or_default().registry();
-
-            for session in sessions {
-                if matches!(
-                    session.status,
-                    SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted
-                ) {
-                    continue;
-                }
-
-                if !tmux::has_session(&session.id).await {
-                    let agent = ninox_core::config::AgentConfig {
-                        harness: session.agent_type.clone(),
-                        model:   session.model.clone(),
-                    };
-                    let has_resume_args = registry.resume_cmd(&agent, "placeholder").is_some();
-                    let mut dead = session.clone();
-                    dead.status = reconciled_status_for_dead_session(
-                        &session.claude_session_id, has_resume_args,
-                    );
-                    let _ = engine.store.upsert_session(&dead);
-                    engine.emit(CoreEvent::SessionUpdated(dead, SessionFields::STATUS));
-                }
-            }
+            reconcile_live_sessions_at_startup_with(&engine, &registry, |physical| async move {
+                ninox_core::tmux::exact_private_session(&physical).await
+            })
+            .await;
 
             Message::Noop
         });
@@ -1392,7 +1744,61 @@ impl App {
                             return Task::none();
                         }
 
-                        let mut workspace = crate::spawn_util::expand_tilde(&workspace_input);
+                        let workspace = crate::spawn_util::expand_tilde(&workspace_input);
+                        let ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        let slug = slugify(&name);
+                        let sid = if slug.is_empty() { format!("session-{ts}") } else { slug };
+                        if state.sessions.contains_key(&sid) {
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!(
+                                    "a session named {sid} already exists — pick another name"
+                                ));
+                            }
+                            return Task::none();
+                        }
+                        let session = Session {
+                            id:              sid.clone(),
+                            orchestrator_id: None,
+                            name:            name.clone(),
+                            repo:            String::new(),
+                            status:          SessionStatus::Spawning,
+                            agent_type:      agent.harness.clone(),
+                            cost_usd:        0.0,
+                            started_at:      ts as i64,
+                            pr_number:       None,
+                            pr_id:           None,
+                            workspace_path:  Some(workspace.clone()),
+                            pid:             None,
+                            model:           agent.model.clone(),
+                            context_tokens:  None,
+                            catalogue_path:  Some(catalogue_path.clone()),
+                            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+                            claude_session_id: Some(claude_session_id.clone()),
+                            summary:         None,
+                            terminal_at:         None, gate_status: None,
+                        };
+                        match state.engine.store.insert_spawning_session(&session) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                if let Some(f) = &mut state.spawn_modal {
+                                    f.error = Some(format!("session {sid} already exists"));
+                                }
+                                return Task::none();
+                            }
+                            Err(error) => {
+                                if let Some(f) = &mut state.spawn_modal {
+                                    f.error = Some(error.to_string());
+                                }
+                                return Task::none();
+                            }
+                        }
+                        let exact_worktree_path = !std::path::Path::new(&workspace).exists();
+                        let mut exact_worktree_source = None;
+                        let mut prepared_incarnation = None;
+                        let mut preallocated_checkout = None;
                         if !std::path::Path::new(&workspace).exists() {
                             // The path doesn't exist yet — if it's nested
                             // under a git repo (e.g. this project's own
@@ -1404,19 +1810,83 @@ impl App {
 
                             match repo_root {
                                 Some(root) => {
-                                    let branch = ws_path
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or(&workspace)
-                                        .to_string();
-                                    match crate::spawn_util::create_worktree_at(
-                                        &root, &ws_path, &branch, state.config.inbox_messaging.enabled,
-                                    ) {
-                                        Ok(created) => workspace = created,
-                                        Err(e) => {
+                                    let source = root.to_string_lossy().into_owned();
+                                    let cap = match state
+                                        .config
+                                        .validated_worker_checkout_cap_for_repository(
+                                            std::path::Path::new(&source),
+                                        )
+                                    {
+                                        Ok(cap) => cap,
+                                        Err(error) => {
+                                            let _ = state.engine.store.delete_spawning_session_snapshot(
+                                                &sid,
+                                                ts as i64,
+                                                None,
+                                            );
+                                            if let Some(f) = &mut state.spawn_modal {
+                                                f.error = Some(checkout_error_with_candidates(
+                                                    &state.engine,
+                                                    &error,
+                                                    Some(&source),
+                                                ));
+                                            }
+                                            return Task::none();
+                                        }
+                                    };
+                                    let incarnation =
+                                        match state.engine.store.prepare_worker_incarnation(
+                                            &sid, None, ts as i64, &source, true, cap,
+                                        ) {
+                                            Ok(incarnation) => incarnation,
+                                            Err(error) => {
+                                                let _ = state.engine.store.delete_spawning_session_snapshot(
+                                                    &sid,
+                                                    ts as i64,
+                                                    None,
+                                                );
+                                                if let Some(f) = &mut state.spawn_modal {
+                                                    f.error = Some(checkout_error_with_candidates(
+                                                        &state.engine,
+                                                        &error,
+                                                        Some(&source),
+                                                    ));
+                                                }
+                                                return Task::none();
+                                            }
+                                    };
+                                    match crate::spawn_util::
+                                        acquire_worker_checkout_at_for_incarnation_blocking(
+                                            &state.engine.store,
+                                            &source,
+                                            &ws_path,
+                                            &sid,
+                                            &incarnation.incarnation_id,
+                                            state.config.inbox_messaging.enabled,
+                                        )
+                                    {
+                                        Ok(checkout) => {
+                                            exact_worktree_source = Some(source);
+                                            prepared_incarnation = Some(incarnation);
+                                            preallocated_checkout = Some(checkout);
+                                        }
+                                        Err(error) => {
+                                            let rolled_back = crate::spawn_util::
+                                                release_unbound_worker_incarnation_blocking(
+                                                    &state.engine.store,
+                                                    &sid,
+                                                    &incarnation.incarnation_id,
+                                                );
+                                            if rolled_back {
+                                                let _ = state.engine.store.delete_spawning_session_snapshot(
+                                                    &sid,
+                                                    ts as i64,
+                                                    Some(&incarnation.incarnation_id),
+                                                );
+                                            }
                                             if let Some(f) = &mut state.spawn_modal {
                                                 f.error = Some(format!(
-                                                    "failed to create worktree at {workspace}: {e}"
+                                                    "failed to create worktree at {workspace}: {error}"
                                                 ));
                                             }
                                             return Task::none();
@@ -1431,31 +1901,14 @@ impl App {
                                     if let Some(f) = &mut state.spawn_modal {
                                         f.error = Some(format!("workspace {workspace} does not exist"));
                                     }
+                                    let _ = state.engine.store.delete_spawning_session_snapshot(
+                                        &sid,
+                                        ts as i64,
+                                        None,
+                                    );
                                     return Task::none();
                                 }
                             }
-                        }
-
-                        let ts = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis();
-                        let slug = slugify(&name);
-                        let sid = if slug.is_empty() { format!("session-{ts}") } else { slug };
-
-                        if state.sessions.contains_key(&sid) {
-                            // Slugified name collides with an existing session
-                            // id — upserting would silently overwrite that
-                            // session's stored record, and the subsequent
-                            // tmux-create (same session name) would then fail
-                            // and mark the *hijacked* record Terminated. Keep
-                            // the modal open so the user can rename instead.
-                            if let Some(f) = &mut state.spawn_modal {
-                                f.error = Some(format!(
-                                    "a session named {sid} already exists — pick another name"
-                                ));
-                            }
-                            return Task::none();
                         }
                         state.spawn_modal = None;
 
@@ -1474,28 +1927,6 @@ impl App {
                             }
                         }
 
-                        let session = Session {
-                            id:              sid.clone(),
-                            orchestrator_id: None,
-                            name:            name.clone(),
-                            repo:            String::new(),
-                            status:          SessionStatus::Working,
-                            agent_type:      agent.harness.clone(),
-                            cost_usd:        0.0,
-                            started_at:      ts as i64,
-                            pr_number:       None,
-                            pr_id:           None,
-                            workspace_path:  Some(workspace.clone()),
-                            pid:             None,
-                            model:           agent.model.clone(),
-                            context_tokens:  None,
-                            catalogue_path:  Some(catalogue_path.clone()),
-                            context_used_pct: None, context_total_tokens: None, context_window_size: None,
-                            claude_session_id: Some(claude_session_id.clone()),
-                            summary:         None,
-                            terminal_at:         None, gate_status: None,
-                        };
-                        let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
                         state.engine.emit(Event::SessionSpawned(session));
 
@@ -1507,22 +1938,171 @@ impl App {
                         let engine = state.engine.clone();
                         let nm     = name;
                         let ts_i64 = ts as i64;
+                        let config = state.config.clone();
                         let inbox_enabled = state.config.inbox_messaging.enabled;
+                        let repositories_root = state.config.resolved_repositories_root();
+                        let worktree_root = state.config.resolved_worktree_root();
 
                         Task::future(async move {
-                            // Isolate the session on its own branch/worktree when
-                            // the workspace is a git repo; otherwise work in the
-                            // directory itself (same fallback as run_spawn).
-                            let effective_ws =
-                                match crate::spawn_util::create_worker_worktree(&workspace, &sid, inbox_enabled).await {
-                                    Ok(path) => path,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "worktree creation failed for {sid}, using shared workspace: {e}"
-                                        );
-                                        workspace.clone()
+                            let source_workspace = exact_worktree_source
+                                .as_deref()
+                                .unwrap_or(workspace.as_str());
+                            let (checkout_backed, checkout_cap, capacity_workspace) =
+                                match checkout_capacity(&config, source_workspace) {
+                                    Ok(capacity) => capacity,
+                                    Err(error) => {
+                                        emit_checkout_unavailable(&engine, &sid, &nm, &error);
+                                        let deleted = engine
+                                            .store
+                                            .delete_spawning_session_snapshot(
+                                                &sid, ts_i64, None,
+                                            )
+                                            .unwrap_or(false);
+                                        return if deleted {
+                                            Message::DiscardFailedSpawn {
+                                                session_id: sid,
+                                                started_at: ts_i64,
+                                            }
+                                        } else {
+                                            Message::Noop
+                                        };
                                     }
                                 };
+                            let incarnation = match prepared_incarnation {
+                                Some(incarnation) => incarnation,
+                                None => {
+                                    match engine.store.prepare_worker_incarnation(
+                                        &sid,
+                                        None,
+                                        ts_i64,
+                                        &capacity_workspace,
+                                        checkout_backed,
+                                        checkout_cap,
+                                    ) {
+                                        Ok(incarnation) => incarnation,
+                                        Err(error) => {
+                                            emit_repository_checkout_unavailable(
+                                                &engine,
+                                                &sid,
+                                                &nm,
+                                                &capacity_workspace,
+                                                &error,
+                                            );
+                                            let deleted = engine
+                                                .store
+                                                .delete_spawning_session_snapshot(
+                                                    &sid, ts_i64, None,
+                                                )
+                                                .unwrap_or(false);
+                                            return if deleted {
+                                                Message::DiscardFailedSpawn {
+                                                    session_id: sid,
+                                                    started_at: ts_i64,
+                                                }
+                                            } else {
+                                                Message::Noop
+                                            };
+                                        }
+                                    }
+                                }
+                            };
+                            let checkout_result = if let Some(checkout) = preallocated_checkout {
+                                Ok(checkout)
+                            } else if exact_worktree_path {
+                                crate::spawn_util::acquire_worker_checkout_at_for_incarnation(
+                                    engine.store.clone(),
+                                    source_workspace,
+                                    std::path::Path::new(&workspace),
+                                    &sid,
+                                    &incarnation.incarnation_id,
+                                    inbox_enabled,
+                                )
+                                .await
+                            } else {
+                                crate::spawn_util::acquire_worker_checkout_for_incarnation(
+                                    engine.store.clone(),
+                                    &workspace,
+                                    &sid,
+                                    &incarnation.incarnation_id,
+                                    repositories_root.as_deref(),
+                                    &worktree_root,
+                                    inbox_enabled,
+                                )
+                                .await
+                            };
+                            let checkout = match checkout_result {
+                                Ok(checkout) => checkout,
+                                Err(error) => {
+                                    tracing::error!("allocate worker checkout for {sid}: {error}");
+                                    emit_checkout_unavailable(&engine, &sid, &nm, &error);
+                                    let rolled_back =
+                                        crate::spawn_util::rollback_worker_incarnation_checkout(
+                                            engine.store.clone(),
+                                            &sid,
+                                            &incarnation.incarnation_id,
+                                            None,
+                                        )
+                                        .await;
+                                    let deleted = rolled_back
+                                        && engine
+                                            .store
+                                            .delete_spawning_session_snapshot(
+                                                &sid,
+                                                ts_i64,
+                                                Some(&incarnation.incarnation_id),
+                                            )
+                                            .unwrap_or(false);
+                                    return if deleted {
+                                        Message::DiscardFailedSpawn {
+                                            session_id: sid,
+                                            started_at: ts_i64,
+                                        }
+                                    } else {
+                                        Message::Noop
+                                    };
+                                }
+                            };
+                            let effective_ws = checkout.workspace.clone();
+                            if !engine.store.bind_worker_incarnation(
+                                &sid,
+                                &incarnation.incarnation_id,
+                                &checkout.source_workspace,
+                                &effective_ws,
+                                checkout
+                                    .pooled_lease
+                                    .as_ref()
+                                    .map(|lease| lease.lease_id.as_str()),
+                            ).unwrap_or(false) {
+                                let error = anyhow::anyhow!(
+                                    "worker incarnation changed before checkout binding"
+                                );
+                                emit_checkout_unavailable(&engine, &sid, &nm, &error);
+                                let rolled_back =
+                                    crate::spawn_util::rollback_worker_incarnation_checkout(
+                                        engine.store.clone(),
+                                        &sid,
+                                        &incarnation.incarnation_id,
+                                        Some(&checkout),
+                                    )
+                                    .await;
+                                let deleted = rolled_back
+                                    && engine
+                                        .store
+                                        .delete_spawning_session_snapshot(
+                                            &sid,
+                                            ts_i64,
+                                            Some(&incarnation.incarnation_id),
+                                        )
+                                        .unwrap_or(false);
+                                return if deleted {
+                                    Message::DiscardFailedSpawn {
+                                        session_id: sid,
+                                        started_at: ts_i64,
+                                    }
+                                } else {
+                                    Message::Noop
+                                };
+                            }
                             if let Err(e) = crate::spawn_util::seed_worker_brain_skill(&effective_ws).await {
                                 tracing::warn!("failed to seed brain skill for {sid}: {e}");
                             }
@@ -1532,11 +2112,11 @@ impl App {
                             let repo = crate::spawn_util::repo_from_workspace(&workspace)
                                 .unwrap_or_default();
 
-                            // No NINOX_ORCHESTRATOR_ID and no caller-type vars:
-                            // this session is unattached and reports to no one.
+                            // No NINOX_ORCHESTRATOR_ID: this worker is unattached
+                            // and reports to no one, but still carries its role.
                             let attach_sid = sid.clone();
                             let attach = crate::spawn_util::spawn_interactive_session(
-                                engine,
+                                engine.clone(),
                                 crate::spawn_util::InteractiveSpawnParams {
                                     session_id:      sid,
                                     name:            nm,
@@ -1546,8 +2126,17 @@ impl App {
                                     agent,
                                     base_cmd,
                                     catalogue_path,
-                                    extra_env:       Vec::new(),
-                                    started_at:      ts_i64,
+                                    extra_env: vec![
+                                        (
+                                            crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+                                            crate::spawn_util::WORKER_EXECUTION_ROLE.to_string(),
+                                        ),
+                                        (
+                                            "NINOX_WORKER_INCARNATION".to_string(),
+                                            incarnation.incarnation_id.clone(),
+                                        ),
+                                    ],
+                                    started_at: ts_i64,
                                     claude_session_id,
                                     failure_status:  ninox_core::SessionStatus::Terminated,
                                     summary:         None,
@@ -1560,7 +2149,33 @@ impl App {
                                     argv,
                                     initial_tail: None,
                                 },
-                                None => Message::Noop,
+                                None => {
+                                    let rolled_back =
+                                        crate::spawn_util::rollback_worker_incarnation_checkout(
+                                            engine.store.clone(),
+                                            &attach_sid,
+                                            &incarnation.incarnation_id,
+                                            Some(&checkout),
+                                        )
+                                        .await;
+                                    let deleted = rolled_back
+                                        && engine
+                                            .store
+                                            .delete_spawning_session_snapshot(
+                                                &attach_sid,
+                                                ts_i64,
+                                                Some(&incarnation.incarnation_id),
+                                            )
+                                            .unwrap_or(false);
+                                    if deleted {
+                                        Message::DiscardFailedSpawn {
+                                            session_id: attach_sid,
+                                            started_at: ts_i64,
+                                        }
+                                    } else {
+                                        Message::Noop
+                                    }
+                                }
                             }
                         })
                     }
@@ -1664,10 +2279,14 @@ impl App {
                                 tracing::error!("mkdir orchestrator workspace {ws}: {e}");
                             }
 
-                            // Orchestrator sessions get the caller-type vars and
-                            // their own id so spawned workers can report back.
+                            // Orchestrator sessions get an explicit execution role
+                            // and their own id so spawned workers can report back.
                             let extra_env = vec![
                                 ("NINOX_ORCHESTRATOR_ID".to_string(), sid.clone()),
+                                (
+                                    crate::spawn_util::EXECUTION_ROLE_ENV.to_string(),
+                                    crate::spawn_util::ORCHESTRATOR_EXECUTION_ROLE.to_string(),
+                                ),
                                 ("NINOX_CALLER_TYPE".to_string(),     "orchestrator".to_string()),
                             ];
 
@@ -1774,10 +2393,16 @@ impl App {
             }
 
             Message::RefileSession(id) => {
-                let Some(session) = state.sessions.get(&id).cloned() else { return Task::none(); };
+                let Some(session) = state.sessions.get(&id).cloned() else {
+                    return Task::none();
+                };
+                if matches!(session.status, SessionStatus::Spawning) {
+                    tracing::warn!("refile {id}: worker is still preparing");
+                    return Task::none();
+                }
                 let is_orch = state.orchestrators.iter().any(|o| o.id == id);
                 let claude_session_id = ninox_core::harness::new_claude_session_id();
-                let Some(plan) = refile_plan(&session, is_orch, &state.config, &claude_session_id) else {
+                let Some(mut plan) = refile_plan(&session, is_orch, &state.config, &claude_session_id) else {
                     tracing::warn!("refile {id}: no workspace recorded, cannot respawn");
                     return Task::none();
                 };
@@ -1799,23 +2424,219 @@ impl App {
                 let repo    = session.repo.clone();
                 let orch_id = session.orchestrator_id.clone();
                 let summary = session.summary.clone();
+                let config = state.config.clone();
                 let inbox_enabled = state.config.inbox_messaging.enabled;
+                let repositories_root = state.config.resolved_repositories_root();
+                let worktree_root = state.config.resolved_worktree_root();
                 Task::future(async move {
-                    // Ignore kill errors — a Terminated husk has no tmux
-                    // session, and Re-file on one "just spawns". The
-                    // respawn upserts the record back to Working, carrying
-                    // forward accumulated cost/context; the usage poller
-                    // keeps re-ingesting absolute spend from the workspace
-                    // transcript either way.
-                    let _ = ninox_core::tmux::kill_session(&id).await;
+                    let current_worker = if is_orch {
+                        None
+                    } else {
+                        engine.store.current_worker_incarnation(&id).ok().flatten()
+                    };
+                    if let Some(worker) = &current_worker {
+                        if let Err(error) = crate::spawn_util::stop_exact_worker_runtime(
+                            &id,
+                            &worker.incarnation_id,
+                            None,
+                        )
+                        .await
+                        {
+                            emit_checkout_unavailable(&engine, &id, &name, &error);
+                            return Message::Noop;
+                        }
+                    } else if is_orch {
+                        if let Err(error) = ninox_core::tmux::kill_session(&id).await {
+                            emit_checkout_unavailable(&engine, &id, &name, &error);
+                            return Message::Noop;
+                        }
+                    } else if ninox_core::tmux::has_session(&id).await {
+                        let error = anyhow::anyhow!(
+                            "cannot verify legacy worker runtime capability before Re-file"
+                        );
+                        emit_checkout_unavailable(&engine, &id, &name, &error);
+                        return Message::Noop;
+                    }
+                    let capacity_source = current_worker
+                        .as_ref()
+                        .map_or(plan.workspace.as_str(), |worker| {
+                            worker.source_workspace.as_str()
+                        });
+                    let incarnation = if is_orch {
+                        None
+                    } else {
+                        match checkout_capacity_for_worker(
+                            &config,
+                            capacity_source,
+                            current_worker.as_ref(),
+                        )
+                        .and_then(
+                            |(checkout_backed, cap, capacity_workspace)| {
+                                engine.store.prepare_worker_incarnation(
+                                    &id,
+                                    orch_id.as_deref(),
+                                    ts,
+                                    &capacity_workspace,
+                                    checkout_backed,
+                                    cap,
+                                )
+                            },
+                        ) {
+                            Ok(incarnation) => Some(incarnation),
+                            Err(error) => {
+                                emit_repository_checkout_unavailable(
+                                    &engine,
+                                    &id,
+                                    &name,
+                                    capacity_source,
+                                    &error,
+                                );
+                                return Message::Noop;
+                            }
+                        }
+                    };
+                    let mut reacquired_checkout = None;
+                    if !is_orch
+                        && engine
+                            .store
+                            .pooled_checkout_by_session(&id)
+                            .ok()
+                            .flatten()
+                            .is_none()
+                    {
+                        if let Some(prior_pool) = engine
+                            .store
+                            .pooled_checkout_by_path(
+                                std::path::Path::new(&plan.workspace),
+                            )
+                            .ok()
+                            .flatten()
+                        {
+                            let source_repo =
+                                prior_pool.source_repo.to_string_lossy().to_string();
+                            let Some(worker_incarnation) = incarnation.as_ref() else {
+                                tracing::error!("re-file {id}: worker incarnation was not prepared");
+                                return Message::Noop;
+                            };
+                            match crate::spawn_util::acquire_worker_checkout_for_incarnation(
+                                engine.store.clone(),
+                                &source_repo,
+                                &id,
+                                &worker_incarnation.incarnation_id,
+                                repositories_root.as_deref(),
+                                &worktree_root,
+                                inbox_enabled,
+                            )
+                            .await
+                            {
+                                Ok(checkout) => {
+                                    plan.workspace = checkout.workspace.clone();
+                                    if let Ok(Some(mut persisted)) =
+                                        engine.store.get_session(&id)
+                                    {
+                                        persisted.workspace_path =
+                                            Some(plan.workspace.clone());
+                                        let _ =
+                                            engine.store.upsert_session(&persisted);
+                                        engine.emit(Event::SessionUpdated(
+                                            persisted,
+                                            SessionFields::WORKSPACE,
+                                        ));
+                                    }
+                                    reacquired_checkout = Some(checkout);
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "re-file {id}: cannot reacquire pooled checkout: {error}"
+                                    );
+                                    emit_checkout_unavailable(
+                                        &engine,
+                                        &id,
+                                        &name,
+                                        &error,
+                                    );
+                                    let _ = crate::spawn_util::
+                                        rollback_worker_incarnation_checkout(
+                                            engine.store.clone(),
+                                            &id,
+                                            &worker_incarnation.incarnation_id,
+                                            None,
+                                        )
+                                        .await;
+                                    return Message::Noop;
+                                }
+                            }
+                        }
+                    }
                     // Same workspace-restoration guard as Resume below —
                     // without it a torn-down worktree makes tmux silently
                     // start the fresh agent in $HOME.
-                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id, is_orch, inbox_enabled).await {
+                    if let Err(e) = crate::spawn_util::ensure_session_workspace_with_store(
+                        &engine.store,
+                        &plan.workspace,
+                        &id,
+                        is_orch,
+                        inbox_enabled,
+                    ).await {
                         tracing::warn!("re-file {id}: cannot restore workspace: {e}");
+                        emit_checkout_unavailable(&engine, &id, &name, &e);
+                        if let Some(incarnation) = &incarnation {
+                            let _ = crate::spawn_util::
+                                rollback_worker_incarnation_checkout(
+                                    engine.store.clone(),
+                                    &id,
+                                    &incarnation.incarnation_id,
+                                    reacquired_checkout.as_ref(),
+                                )
+                                .await;
+                        }
+                        return Message::Noop;
+                    }
+                    if let Some(incarnation) = &incarnation {
+                        let source_workspace = reacquired_checkout
+                            .as_ref()
+                            .map_or(incarnation.source_workspace.as_str(), |checkout| {
+                                checkout.source_workspace.as_str()
+                            });
+                        let lease_id = reacquired_checkout
+                            .as_ref()
+                            .and_then(|checkout| checkout.pooled_lease.as_ref())
+                            .map(|lease| lease.lease_id.as_str())
+                            .or(incarnation.lease_id.as_deref());
+                        if !engine
+                            .store
+                            .bind_worker_incarnation(
+                                &id,
+                                &incarnation.incarnation_id,
+                                source_workspace,
+                                &plan.workspace,
+                                lease_id,
+                            )
+                            .unwrap_or(false)
+                        {
+                            let error = anyhow::anyhow!(
+                                "worker incarnation changed before Re-file binding"
+                            );
+                            emit_checkout_unavailable(&engine, &id, &name, &error);
+                            let _ = crate::spawn_util::
+                                rollback_worker_incarnation_checkout(
+                                    engine.store.clone(),
+                                    &id,
+                                    &incarnation.incarnation_id,
+                                    reacquired_checkout.as_ref(),
+                                )
+                                .await;
+                            return Message::Noop;
+                        }
+                    }
+                    if let Some(incarnation) = &incarnation {
+                        plan.extra_env.push((
+                            "NINOX_WORKER_INCARNATION".to_string(),
+                            incarnation.incarnation_id.clone(),
+                        ));
                     }
                     let attach = crate::spawn_util::spawn_interactive_session(
-                        engine,
+                        engine.clone(),
                         crate::spawn_util::InteractiveSpawnParams {
                             session_id:      id.clone(),
                             name,
@@ -1839,7 +2660,36 @@ impl App {
                             argv,
                             initial_tail: None,
                         },
-                        None       => Message::Noop,
+                        None => {
+                            if let Some(incarnation) = &incarnation {
+                                if let Ok(Some(claim)) = engine.store.claim_worker_cleanup(
+                                    &id,
+                                    &incarnation.incarnation_id,
+                                ) {
+                                    if let Some(checkout) = &reacquired_checkout {
+                                        let _ = crate::spawn_util::rollback_worker_checkout(
+                                            engine.store.clone(),
+                                            checkout,
+                                            &id,
+                                        )
+                                        .await;
+                                        let _ = engine.store.complete_worker_claim(
+                                            &id,
+                                            &claim.incarnation_id,
+                                            ninox_core::types::WorkerIncarnationState::CleanupClaimed,
+                                        );
+                                    } else {
+                                        let _ = engine.store.abort_worker_claim(
+                                            &id,
+                                            &claim.incarnation_id,
+                                            ninox_core::types::WorkerIncarnationState::CleanupClaimed,
+                                            ninox_core::types::WorkerIncarnationState::Retained,
+                                        );
+                                    }
+                                }
+                            }
+                            Message::Noop
+                        }
                     }
                 })
             }
@@ -1847,9 +2697,48 @@ impl App {
             Message::ResumeSession(id) => {
                 let Some(session) = state.sessions.get(&id).cloned() else { return Task::none(); };
                 let is_orch = state.orchestrators.iter().any(|o| o.id == id);
-                let Some(plan) = resume_plan(&session, is_orch, &state.config) else {
+                let Some(mut plan) = resume_plan(&session, is_orch, &state.config) else {
                     tracing::warn!("resume {id}: no workspace/claude_session_id/resume-capable harness, cannot resume");
                     return Task::none();
+                };
+                let runtime_claim = if is_orch {
+                    None
+                } else {
+                    match state.engine.store.current_worker_incarnation(&id) {
+                        Ok(Some(worker)) => {
+                            match state
+                                .engine
+                                .store
+                                .claim_worker_runtime_start(&id, &worker.incarnation_id)
+                            {
+                                Ok(Some(claim)) => {
+                                    plan.extra_env.push((
+                                        "NINOX_WORKER_INCARNATION".to_string(),
+                                        claim.worker.incarnation_id.clone(),
+                                    ));
+                                    Some(RuntimeStartGuard::new(
+                                        state.engine.store.clone(),
+                                        claim,
+                                    ))
+                                }
+                                Ok(None) => {
+                                    tracing::warn!(
+                                        "resume {id}: worker lifecycle is already claimed"
+                                    );
+                                    return Task::none();
+                                }
+                                Err(error) => {
+                                    tracing::warn!("resume {id}: cannot claim runtime: {error}");
+                                    return Task::none();
+                                }
+                            }
+                        }
+                        Ok(None) => None,
+                        Err(error) => {
+                            tracing::warn!("resume {id}: cannot load worker: {error}");
+                            return Task::none();
+                        }
+                    }
                 };
                 let Some(claude_session_id) = session.claude_session_id.clone() else {
                     return Task::none(); // unreachable: resume_plan already required this
@@ -1872,7 +2761,11 @@ impl App {
                 let summary = session.summary.clone();
                 let inbox_enabled = state.config.inbox_messaging.enabled;
                 Task::future(async move {
-                    let _ = ninox_core::tmux::kill_session(&id).await;
+                    let mut runtime_claim = runtime_claim;
+                    if let Err(error) = ninox_core::tmux::kill_session(&id).await {
+                        tracing::warn!("resume {id}: cannot stop prior runtime: {error}");
+                        return Message::Noop;
+                    }
                     // The worktree may have been torn down since the session
                     // ran (merge cleanup, manual prune). Recreate it at the
                     // same path — claude-code keys the conversation to that
@@ -1881,11 +2774,19 @@ impl App {
                     // rejects a missing workspace, so the spawn fails
                     // visibly into `failure_status` instead of the agent
                     // silently starting in $HOME.
-                    if let Err(e) = crate::spawn_util::ensure_session_workspace(&plan.workspace, &id, is_orch, inbox_enabled).await {
+                    if let Err(e) = crate::spawn_util::ensure_session_workspace_with_store(
+                        &engine.store,
+                        &plan.workspace,
+                        &id,
+                        is_orch,
+                        inbox_enabled,
+                    ).await {
                         tracing::warn!("resume {id}: cannot restore workspace: {e}");
+                        emit_checkout_unavailable(&engine, &id, &name, &e);
+                        return Message::Noop;
                     }
                     let attach = crate::spawn_util::spawn_interactive_session(
-                        engine,
+                        engine.clone(),
                         crate::spawn_util::InteractiveSpawnParams {
                             session_id:      id.clone(),
                             name,
@@ -1904,12 +2805,32 @@ impl App {
                     )
                     .await;
                     match attach {
-                        Some(argv) => Message::ClientAttach {
-                            session_id: id,
-                            argv,
-                            initial_tail: None,
-                        },
-                        None       => Message::Noop,
+                        Some(argv) => {
+                            if let Some(claim) = &runtime_claim {
+                                let incarnation_id =
+                                    claim.claim().worker.incarnation_id.clone();
+                                if !runtime_claim
+                                    .as_mut()
+                                    .is_some_and(|claim| claim.complete().unwrap_or(false))
+                                {
+                                    let _ = crate::spawn_util::stop_exact_worker_runtime(
+                                        &id,
+                                        &incarnation_id,
+                                        None,
+                                    )
+                                    .await;
+                                    return Message::Noop;
+                                }
+                            }
+                            Message::ClientAttach {
+                                session_id: id,
+                                argv,
+                                initial_tail: None,
+                            }
+                        }
+                        None => {
+                            Message::Noop
+                        }
                     }
                 })
             }
@@ -2247,6 +3168,91 @@ impl App {
                 state.config.inbox_messaging.enabled = !state.config.inbox_messaging.enabled;
                 if let Err(e) = state.config.save() {
                     tracing::warn!("failed to save config after toggling inbox messaging: {e}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsToggleRustCache => {
+                let enabled = !state.config.rust_cache.enabled;
+                if enabled {
+                    if let Err(error) = state.config.rust_cache.validate() {
+                        state.settings.rust_cache_error = Some(error.to_string());
+                        return Task::none();
+                    }
+                }
+                state.config.rust_cache.enabled = enabled;
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save shared Rust cache toggle: {error}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsRustCacheExecutable(value) => {
+                state.settings.rust_cache_executable = value;
+                let executable = state.settings.rust_cache_executable.trim();
+                if executable.is_empty() {
+                    state.settings.rust_cache_error =
+                        Some("sccache executable must not be empty".to_string());
+                    return Task::none();
+                }
+                state.config.rust_cache.executable = std::path::PathBuf::from(executable);
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save sccache executable: {error}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsRustCacheDir(value) => {
+                state.settings.rust_cache_dir = value;
+                let cache_dir = state.settings.rust_cache_dir.trim();
+                state.config.rust_cache.cache_dir =
+                    (!cache_dir.is_empty()).then(|| std::path::PathBuf::from(cache_dir));
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save shared Rust cache directory: {error}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsRustCacheSize(value) => {
+                state.settings.rust_cache_size_gib = value;
+                let parsed = state
+                    .settings
+                    .rust_cache_size_gib
+                    .trim()
+                    .parse::<u16>();
+                let Ok(size) = parsed else {
+                    state.settings.rust_cache_error =
+                        Some("cache size must be a whole number of GiB".to_string());
+                    return Task::none();
+                };
+                let prior = state.config.rust_cache.cache_size_gib;
+                state.config.rust_cache.cache_size_gib = size;
+                if let Err(error) = state.config.rust_cache.validate() {
+                    state.config.rust_cache.cache_size_gib = prior;
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    return Task::none();
+                }
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save shared Rust cache size: {error}");
+                }
+                Task::none()
+            }
+
+            Message::SettingsToggleRustCachePrune => {
+                state.config.rust_cache.prune_on_release =
+                    !state.config.rust_cache.prune_on_release;
+                state.settings.rust_cache_error = None;
+                if let Err(error) = state.config.save() {
+                    state.settings.rust_cache_error = Some(error.to_string());
+                    tracing::warn!("failed to save Cargo release-pruning toggle: {error}");
                 }
                 Task::none()
             }
@@ -2596,6 +3602,23 @@ impl App {
 
             Message::DiffFetched { session_id, diff } => {
                 state.diffs.insert(session_id, diff);
+                Task::none()
+            }
+
+            Message::DiscardFailedSpawn {
+                session_id,
+                started_at,
+            } => {
+                if state
+                    .sessions
+                    .get(&session_id)
+                    .is_some_and(|session| session.started_at == started_at)
+                {
+                    state.sessions.remove(&session_id);
+                    state.terminals.remove(&session_id);
+                    state.clients.remove(&session_id);
+                    state.diffs.remove(&session_id);
+                }
                 Task::none()
             }
 
@@ -3129,7 +4152,8 @@ pub fn pr_url_for_session(
 /// and the subagent-blocker PreToolUse hook.
 ///
 /// AGENTS.md and settings.json are skipped if already present (user-editable).
-/// Skill files and the blocker are always overwritten to stay in sync.
+/// Generated skills are refreshed while untouched; user-modified skills and
+/// unrelated files are preserved. The blocker is always overwritten.
 pub async fn setup_orchestrator_root(
     root: &std::path::Path,
     ninox_bin: &str,
@@ -3203,7 +4227,8 @@ Name workers after the ticket or task so they are easy to reference:
 {ninox_bin} spawn \
   --name "ath-123-auth-fix" \
   --prompt "Complete task description with acceptance criteria, repo path, and branch" \
-  --workspace /absolute/path/to/repo
+  --workspace /absolute/path/to/repo \
+  --delivery pr
 ```
 
 `--name` becomes the session ID. Names are slugified automatically (`"ATH-123 auth"` → `"ath-123-auth"`).
@@ -3211,6 +4236,27 @@ Omitting `--name` generates a timestamp ID (`worker-…`).
 
 `NINOX_ORCHESTRATOR_ID` is set in your environment and picked up automatically.
 Each spawn prints the session ID (`spawned ath-123-auth-fix`) — use it to send follow-ups.
+
+## Choosing Delivery
+
+Choose the contract explicitly:
+
+- `--delivery pr` — code changes that must be delivered through a branch,
+  commit, push, and pull request.
+- `--delivery direct` — research, operational tasks, direct-file/artifact
+  work, and all non-Git workspaces. The worker validates its artifacts or
+  direct changes and reports either a blocker or completion; it does not
+  create branches, remotes, commits, or PRs.
+
+When `--delivery` is omitted, Ninox preserves PR delivery for Git repositories
+and selects direct delivery for non-Git workspaces. Prefer an explicit choice
+so the worker contract reflects the task rather than only the workspace type.
+
+For PR delivery, always pass the primary repository checkout to `--workspace`.
+When that checkout is directly under Ninox's configured repositories root,
+Ninox leases a warm sibling checkout (`<repo>-w1`, `<repo>-w2`, …). Ninox
+chooses and manages the pool slot; never pass a `-wN` path yourself. The
+primary checkout remains untouched.
 
 ## Messaging Workers (Orchestrator → Worker)
 
@@ -3222,16 +4268,17 @@ Send instructions or follow-ups to a worker using its session ID:
 
 ## Work Requests (Worker → Orchestrator)
 
-Workers are scoped to one task and one PR. When a worker discovers additional
-work, it runs `{ninox_bin} request-work "<description>"` and Ninox forwards
-the request to you as a `[Ninox] Worker … requested additional work` message.
+Workers are scoped to one task and one delivery. When a worker discovers
+additional work, it runs `{ninox_bin} request-work "<description>"` and
+Ninox forwards the request to you as a
+`[Ninox] Worker … requested additional work` message.
 
 When one arrives: decide whether the work is worth doing, and if so
 spawn a new worker for it with `{ninox_bin} spawn`. **Never** tell a worker to widen
-its own task or PR — extra scope always gets its own worker. Ninox will also
-warn you (`[Ninox] Worker … opened N PRs beyond its tracked PR`) if a worker
-opens extra PRs anyway; review each extra PR and either close it or hand it
-to a dedicated worker.
+its own task or delivery — extra scope always gets its own worker. For PR
+delivery, Ninox will also warn you (`[Ninox] Worker … opened N PRs beyond its
+tracked PR`) if a worker opens extra PRs anyway; review each extra PR and
+either close it or hand it to a dedicated worker.
 
 ## The Rule
 
@@ -4052,7 +5099,10 @@ mod tests {
         assert_eq!(plan.base_cmd, "claude-nightly --model 'claude-opus-4-8'");
         assert_eq!(plan.workspace, "/tmp/ws");
         assert_eq!(plan.catalogue_path, "/brains/b");
-        assert!(plan.extra_env.is_empty());
+        assert!(plan.extra_env.iter().any(|(key, value)| {
+            key == crate::spawn_util::EXECUTION_ROLE_ENV
+                && value == crate::spawn_util::WORKER_EXECUTION_ROLE
+        }));
         assert_eq!(plan.agent.harness, "claude-code");
         assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
     }
@@ -4064,6 +5114,10 @@ mod tests {
         session.catalogue_path = None;
         let plan = refile_plan(&session, true, &cfg, "fresh-uuid").expect("plan");
         assert!(plan.extra_env.iter().any(|(k, v)| k == "NINOX_ORCHESTRATOR_ID" && v == "o1"));
+        assert!(plan.extra_env.iter().any(|(key, value)| {
+            key == crate::spawn_util::EXECUTION_ROLE_ENV
+                && value == crate::spawn_util::ORCHESTRATOR_EXECUTION_ROLE
+        }));
         assert!(plan.extra_env.iter().any(|(k, _)| k == "NINOX_CALLER_TYPE"));
         // The legacy ATHENE_/AO_ transition names are gone.
         assert!(!plan.extra_env.iter().any(|(k, _)| k == "ATHENE_CALLER_TYPE" || k == "AO_CALLER_TYPE"));
@@ -4110,6 +5164,45 @@ mod tests {
     }
 
     #[test]
+    fn spawning_worker_cannot_be_refiled() {
+        let e = test_engine();
+        let mut m = base(e);
+        let mut session = refile_session("s1");
+        session.status = SessionStatus::Spawning;
+        m.sessions.insert("s1".into(), session);
+        m.terminals
+            .insert("s1".into(), TerminalState::new(80, 24, None));
+        m.diffs.insert("s1".into(), Some("pending".into()));
+
+        let (m, _) = m.update(Message::RefileSession("s1".into()));
+
+        assert!(m.terminals.contains_key("s1"));
+        assert!(m.diffs.contains_key("s1"));
+    }
+
+    #[test]
+    fn failed_spawn_cleanup_removes_only_its_exact_ui_snapshot() {
+        let e = test_engine();
+        let mut m = base(e);
+        let mut successor = refile_session("s1");
+        successor.status = SessionStatus::Spawning;
+        successor.started_at = 2;
+        m.sessions.insert("s1".into(), successor);
+
+        let (m, _) = m.update(Message::DiscardFailedSpawn {
+            session_id: "s1".into(),
+            started_at: 1,
+        });
+        assert_eq!(m.sessions["s1"].started_at, 2);
+
+        let (m, _) = m.update(Message::DiscardFailedSpawn {
+            session_id: "s1".into(),
+            started_at: 2,
+        });
+        assert!(!m.sessions.contains_key("s1"));
+    }
+
+    #[test]
     fn resume_plan_builds_a_resume_command_from_the_stored_id() {
         let cfg = ninox_core::config::AppConfig::default();
         let mut session = refile_session("s1");
@@ -4118,6 +5211,10 @@ mod tests {
         assert!(plan.base_cmd.contains("--resume"));
         assert!(plan.base_cmd.contains("stored-uuid"));
         assert_eq!(plan.workspace, "/tmp/ws");
+        assert!(plan.extra_env.iter().any(|(key, value)| {
+            key == crate::spawn_util::EXECUTION_ROLE_ENV
+                && value == crate::spawn_util::WORKER_EXECUTION_ROLE
+        }));
     }
 
     #[test]
@@ -4162,6 +5259,63 @@ mod tests {
         m.diffs.insert("s1".into(), Some("stale diff text".into()));
         let (m, _) = m.update(Message::ResumeSession("s1".into()));
         assert!(!m.diffs.contains_key("s1"), "resume must not leave the pre-resume diff cached");
+    }
+
+    #[test]
+    fn resume_message_cannot_cross_an_exact_release_claim() {
+        let e = test_engine();
+        let mut m = base(e);
+        let mut session = refile_session("s1");
+        session.status = SessionStatus::Done;
+        session.claude_session_id = Some("stored-uuid".into());
+        m.engine.store.upsert_session(&session).unwrap();
+        let worker = m
+            .engine
+            .store
+            .prepare_worker_incarnation("s1", None, session.started_at, "/tmp/ws", false, 3)
+            .unwrap();
+        assert!(m
+            .engine
+            .store
+            .bind_worker_incarnation(
+                "s1",
+                &worker.incarnation_id,
+                "/tmp/ws",
+                "/tmp/ws",
+                None,
+            )
+            .unwrap());
+        let cleanup = m
+            .engine
+            .store
+            .claim_worker_cleanup("s1", &worker.incarnation_id)
+            .unwrap()
+            .unwrap();
+        assert!(m
+            .engine
+            .store
+            .abort_worker_claim(
+                "s1",
+                &cleanup.incarnation_id,
+                WorkerIncarnationState::CleanupClaimed,
+                WorkerIncarnationState::Retained,
+            )
+            .unwrap());
+        assert!(m
+            .engine
+            .store
+            .claim_worker_release("s1", &worker.incarnation_id)
+            .unwrap()
+            .is_some());
+        m.sessions.insert("s1".into(), session);
+        m.terminals
+            .insert("s1".into(), TerminalState::new(80, 24, None));
+        m.diffs.insert("s1".into(), Some("preserve".into()));
+
+        let (m, _) = m.update(Message::ResumeSession("s1".into()));
+
+        assert!(m.terminals.contains_key("s1"));
+        assert!(m.diffs.contains_key("s1"));
     }
 
     #[tokio::test]
@@ -5851,6 +7005,72 @@ mod tests {
     }
 
     #[test]
+    fn rust_cache_settings_validate_and_persist_policy() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("rust_cache_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            AppConfig::default().save().unwrap();
+            let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
+            let (app, _) = App::new(
+                test_engine(),
+                std::path::PathBuf::from("/tmp"),
+                ninox_core::config::AgentConfig::default(),
+                brain,
+            );
+
+            let (app, _) = app.update(Message::SettingsToggleRustCache);
+            assert!(app.config.rust_cache.enabled);
+            let prior_size = app.config.rust_cache.cache_size_gib;
+
+            let (app, _) = app.update(Message::SettingsRustCacheSize("0".into()));
+            assert_eq!(app.config.rust_cache.cache_size_gib, prior_size);
+            assert!(app.settings.rust_cache_error.is_some());
+
+            let (app, _) = app.update(Message::SettingsRustCacheSize("20".into()));
+            let (app, _) = app.update(Message::SettingsRustCacheDir("shared/rust-cache".into()));
+            let (app, _) = app.update(Message::SettingsToggleRustCachePrune);
+            assert_eq!(app.config.rust_cache.cache_size_gib, 20);
+            assert!(app.config.rust_cache.prune_on_release);
+            assert!(app.settings.rust_cache_error.is_none());
+
+            let saved = AppConfig::load().unwrap();
+            assert!(saved.rust_cache.enabled);
+            assert_eq!(saved.rust_cache.cache_size_gib, 20);
+            assert_eq!(
+                saved.rust_cache.cache_dir.as_deref(),
+                Some(std::path::Path::new("shared/rust-cache"))
+            );
+            assert!(saved.rust_cache.prune_on_release);
+        });
+    }
+
+    #[test]
+    fn refile_preserves_checkout_capacity_when_source_is_offline() {
+        let worker = ninox_core::types::WorkerIncarnation {
+            session_id: "worker".into(),
+            incarnation_id: "incarnation".into(),
+            orchestrator_id: Some("orch".into()),
+            started_at: 1,
+            source_workspace: "/offline/repository".into(),
+            workspace_path: "/offline/repository-w1".into(),
+            repository_key: Some("/offline/repository/.git".into()),
+            lease_id: Some("lease".into()),
+            checkout_backed: true,
+            state: ninox_core::types::WorkerIncarnationState::Retained,
+        };
+
+        let (checkout_backed, cap, source) = checkout_capacity_for_worker(
+            &AppConfig::default(),
+            &worker.source_workspace,
+            Some(&worker),
+        )
+        .unwrap();
+        assert!(checkout_backed);
+        assert_eq!(cap, 5);
+        assert_eq!(source, worker.source_workspace);
+    }
+
+    #[test]
     fn worker_harness_change_persists_and_clears_model() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("worker_harness_config.toml");
@@ -6563,6 +7783,10 @@ mod tests {
         assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
         assert!(skill.contains("name: spawn-worker"));
         assert!(skill.contains("description:"));
+        assert!(skill.contains("--delivery pr"));
+        assert!(skill.contains("--delivery direct"));
+        assert!(skill.contains("primary repository checkout"));
+        assert!(skill.contains("<repo>-w1"));
         assert!(
             skill.contains("request-work"),
             "skill must explain the worker→orchestrator work-request channel"

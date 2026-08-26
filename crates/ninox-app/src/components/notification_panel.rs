@@ -27,6 +27,7 @@ fn kind_label(kind: &NotificationKind) -> &'static str {
         NotificationKind::UpdateAvailable => "Update",
         NotificationKind::UpdateInstalled => "Update",
         NotificationKind::UpdateFailed    => "Update",
+        NotificationKind::CheckoutUnavailable => "Checkout",
     }
 }
 
@@ -44,6 +45,7 @@ fn kind_color(kind: &NotificationKind, s: &ColorScheme) -> Color {
         NotificationKind::UpdateAvailable => s.status_done,
         NotificationKind::UpdateInstalled => s.status_done,
         NotificationKind::UpdateFailed    => s.status_ci_failed,
+        NotificationKind::CheckoutUnavailable => s.status_ci_failed,
     }
 }
 

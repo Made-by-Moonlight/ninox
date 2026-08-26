@@ -125,29 +125,183 @@ impl Engine {
     pub async fn remove_orchestrator(&self, orchestrator_id: &str) -> anyhow::Result<()> {
         let workers = self.store.sessions_by_orchestrator(orchestrator_id)?;
         let sessions_dir = crate::config::AppConfig::sessions_dir();
+        let mut claims = Vec::with_capacity(workers.len());
         for session in &workers {
-            let _ = crate::tmux::kill_session(&session.id).await;
-            remove_worktree_and_artifacts(&session.id, session.workspace_path.as_deref(), &sessions_dir).await;
+            let claim = match self
+                .store
+                .claim_worker_cleanup_snapshot_recoverable(&session.id, session.started_at)
+            {
+                Ok(claim) => claim,
+                Err(error) => {
+                    self.abort_recoverable_cleanup_claims(&claims);
+                    return Err(error);
+                }
+            };
+            if claim.is_none() {
+                let already_released = match self
+                    .store
+                    .released_worker_for_cleanup_snapshot(&session.id, session.started_at)
+                {
+                    Ok(worker) => worker.is_some(),
+                    Err(error) => {
+                        self.abort_recoverable_cleanup_claims(&claims);
+                        return Err(error);
+                    }
+                };
+                if !already_released {
+                    self.abort_recoverable_cleanup_claims(&claims);
+                    anyhow::bail!(
+                        "orchestrator worker {} changed while cleanup was being claimed",
+                        session.id
+                    );
+                }
+            }
+            claims.push(claim);
+        }
+        for claim in claims.iter().flatten() {
+            if let Err(error) = self.stop_recoverable_cleanup_claim(claim).await {
+                self.abort_recoverable_cleanup_claims(&claims);
+                return Err(error);
+            }
+        }
+        for (index, (session, cleanup_claim)) in workers.iter().zip(&claims).enumerate() {
+            if let Some(claim) = cleanup_claim.as_ref().map(|claim| &claim.worker) {
+                remove_worktree_and_artifacts(
+                    &self.store,
+                    &session.id,
+                    session.workspace_path.as_deref(),
+                    &sessions_dir,
+                    RecoveryMetadata::Remove,
+                    Some(claim),
+                )
+                .await;
+            }
+            if let Err(error) = self.store.delete_session(&session.id) {
+                if let Some(cleanup_claim) = cleanup_claim {
+                    let claim = &cleanup_claim.worker;
+                    let completed = self.store.complete_worker_claim(
+                        &session.id,
+                        &claim.incarnation_id,
+                        crate::types::WorkerIncarnationState::CleanupClaimed,
+                    );
+                    if !matches!(completed, Ok(true)) {
+                        let _ = self.store.abort_worker_cleanup_snapshot(cleanup_claim);
+                    }
+                }
+                self.abort_recoverable_cleanup_claims(&claims[index + 1..]);
+                return Err(error);
+            }
+            if let Some(claim) = cleanup_claim.as_ref().map(|claim| &claim.worker) {
+                let _ = self.store.complete_worker_claim(
+                    &session.id,
+                    &claim.incarnation_id,
+                    crate::types::WorkerIncarnationState::CleanupClaimed,
+                );
+            }
+            self.emit(Event::SessionDone(session.id.clone()));
         }
         // Also kill the orchestrator's own tmux session (same id as orchestrator).
         let _ = crate::tmux::kill_session(orchestrator_id).await;
         self.store.delete_orchestrator(orchestrator_id)?;
-        for session in workers {
-            self.emit(Event::SessionDone(session.id));
-        }
         self.emit(Event::OrchestratorRemoved(orchestrator_id.to_string()));
         Ok(())
     }
 
+    fn abort_recoverable_cleanup_claims(
+        &self,
+        claims: &[Option<crate::store::WorkerCleanupSnapshotClaim>],
+    ) {
+        for claim in claims.iter().flatten() {
+            match self.store.abort_worker_cleanup_snapshot(claim) {
+                Ok(true) => {}
+                Ok(false) => tracing::error!(
+                    "cleanup {}: exact claim changed before abort",
+                    claim.worker.session_id
+                ),
+                Err(error) => tracing::error!(
+                    "cleanup {}: exact claim abort failed: {error}",
+                    claim.worker.session_id
+                ),
+            }
+        }
+    }
+
+    async fn stop_recoverable_cleanup_claim(
+        &self,
+        claim: &crate::store::WorkerCleanupSnapshotClaim,
+    ) -> anyhow::Result<()> {
+        let stop_result = if claim.require_legacy_runtime_absence {
+            async {
+                let runtime = self
+                    .store
+                    .legacy_worker_runtime(&claim.worker.session_id)?
+                    .ok_or_else(|| anyhow::anyhow!("adopted legacy runtime metadata changed"))?;
+                anyhow::ensure!(
+                    runtime.incarnation_id == claim.worker.incarnation_id,
+                    "adopted legacy runtime belongs to another worker incarnation"
+                );
+                anyhow::ensure!(
+                    crate::tmux::exact_private_session(&runtime.physical_tmux_name)
+                        .await?
+                        .is_none(),
+                    "adopted legacy worker runtime is still live"
+                );
+                Ok(())
+            }
+            .await
+        } else {
+            crate::workers::stop_exact_runtime(&self.store, &claim.worker).await
+        };
+        let Err(stop_error) = stop_result else {
+            return Ok(());
+        };
+        match self.store.abort_worker_cleanup_snapshot(claim) {
+            Ok(true) => Err(stop_error),
+            Ok(false) => Err(anyhow::anyhow!(
+                "{stop_error}; exact cleanup claim changed before abort"
+            )),
+            Err(abort_error) => Err(anyhow::anyhow!(
+                "{stop_error}; exact cleanup claim abort failed: {abort_error}"
+            )),
+        }
+    }
+
     /// Kill the tmux session and delete it from the DB entirely.
     pub async fn remove_session(&self, session_id: &str) -> anyhow::Result<()> {
-        let _ = crate::tmux::kill_session(session_id).await;
-        let workspace_path = self.store.get_session(session_id).ok().flatten()
-            .and_then(|s| s.workspace_path);
+        let Some(session) = self.store.get_session(session_id)? else {
+            return Ok(());
+        };
+        let claim = self
+            .store
+            .claim_worker_cleanup_snapshot_recoverable(session_id, session.started_at)?;
+        let Some(claim) = claim else {
+            let already_released = self
+                .store
+                .released_worker_for_cleanup_snapshot(session_id, session.started_at)?
+                .is_some();
+            if already_released {
+                self.store.delete_session(session_id)?;
+                self.emit(Event::SessionDone(session_id.to_string()));
+            }
+            return Ok(());
+        };
+        self.stop_recoverable_cleanup_claim(&claim).await?;
+        let claim = &claim.worker;
         remove_worktree_and_artifacts(
-            session_id, workspace_path.as_deref(), &crate::config::AppConfig::sessions_dir(),
-        ).await;
+            &self.store,
+            session_id,
+            session.workspace_path.as_deref(),
+            &crate::config::AppConfig::sessions_dir(),
+            RecoveryMetadata::Remove,
+            Some(claim),
+        )
+        .await;
         self.store.delete_session(session_id)?;
+        let _ = self.store.complete_worker_claim(
+            session_id,
+            &claim.incarnation_id,
+            crate::types::WorkerIncarnationState::CleanupClaimed,
+        );
         self.emit(Event::SessionDone(session_id.to_string()));
         Ok(())
     }
@@ -225,18 +379,50 @@ impl Engine {
         session_id:   &str,
         sessions_dir: &std::path::Path,
     ) -> anyhow::Result<()> {
-        // Best-effort tmux kill — session may already be dead.
-        let _ = crate::tmux::kill_session(session_id).await;
+        let Some(mut session) = self.store.get_session(session_id)? else {
+            return Ok(());
+        };
+        let Some(claim) = self
+            .store
+            .claim_worker_cleanup_snapshot_recoverable(session_id, session.started_at)?
+        else {
+            return Ok(());
+        };
+        self.stop_recoverable_cleanup_claim(&claim).await?;
+        let claim = &claim.worker;
 
-        if let Some(mut session) = self.store.get_session(session_id)? {
-            remove_worktree_and_artifacts(session_id, session.workspace_path.as_deref(), sessions_dir).await;
-            session.status = crate::types::SessionStatus::Done;
-            session.terminal_at = Some(crate::lifecycle::poller::now_millis());
-            self.store.upsert_session(&session)?;
-            self.emit(Event::SessionUpdated(session, SessionFields::STATUS | SessionFields::TERMINAL_AT));
+        remove_worktree_and_artifacts(
+            &self.store,
+            session_id,
+            session.workspace_path.as_deref(),
+            sessions_dir,
+            RecoveryMetadata::Retain,
+            Some(claim),
+        )
+        .await;
+        session.status = crate::types::SessionStatus::Done;
+        session.terminal_at = Some(crate::lifecycle::poller::now_millis());
+        let update = self.store.upsert_session(&session);
+        if update.is_ok() {
+            self.emit(Event::SessionUpdated(
+                session,
+                SessionFields::STATUS | SessionFields::TERMINAL_AT,
+            ));
         }
+        let _ = self.store.complete_worker_claim(
+            session_id,
+            &claim.incarnation_id,
+            crate::types::WorkerIncarnationState::CleanupClaimed,
+        );
+        update?;
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryMetadata {
+    Retain,
+    Remove,
 }
 
 /// Remove a session's worktree (if any) and hook artifacts — the shared
@@ -244,21 +430,118 @@ impl Engine {
 /// `cleanup_session`, so none of them leak a checked-out worktree or
 /// per-session hook files.
 async fn remove_worktree_and_artifacts(
+    store:          &crate::store::Store,
     session_id:     &str,
     workspace_path: Option<&str>,
     sessions_dir:   &std::path::Path,
+    recovery_metadata: RecoveryMetadata,
+    worker: Option<&crate::types::WorkerIncarnation>,
 ) {
-    if let Some(wp) = workspace_path {
-        remove_worker_worktree(wp, session_id).await;
+    let pooled = release_pooled_checkout(store, session_id, worker).await;
+    if !pooled {
+        if let Some(wp) = workspace_path {
+            remove_worker_worktree(wp, session_id, recovery_metadata).await;
+        }
     }
     crate::hooks::remove_session_artifacts(sessions_dir, session_id);
 }
 
+/// Release only the exact lease currently owned by `session_id`. A dirty or
+/// replaced checkout is quarantined and left untouched for manual recovery.
+async fn release_pooled_checkout(
+    store: &crate::store::Store,
+    session_id: &str,
+    worker: Option<&crate::types::WorkerIncarnation>,
+) -> bool {
+    let Ok(Some(record)) = store.pooled_checkout_by_session(session_id) else {
+        return false;
+    };
+    let (Some(owner_incarnation_id), Some(lease_id), Some(branch)) = (
+        record.owner_incarnation_id.clone(),
+        record.lease_id.clone(),
+        record.branch.clone(),
+    ) else {
+        let _ = store.quarantine_pooled_checkout(
+            &record.path,
+            "active pooled checkout is missing lease metadata",
+        );
+        return true;
+    };
+    if let Some(worker) = worker {
+        if owner_incarnation_id != worker.incarnation_id
+            || worker.lease_id.as_deref() != Some(lease_id.as_str())
+        {
+            return true;
+        }
+    }
+    let lease = crate::types::PooledCheckoutLease {
+        path: record.path,
+        source_repo: record.source_repo,
+        common_git_dir: record.common_git_dir,
+        slot: record.slot,
+        kind: record.kind,
+        worktree_git_dir: record.worktree_git_dir,
+        worktree_identity: record.worktree_identity,
+        session_id: session_id.to_string(),
+        owner_incarnation_id,
+        lease_id,
+        branch,
+    };
+    let store_result = tokio::task::spawn_blocking({
+        let lease = lease.clone();
+        move || crate::worktree::PooledWorktree::from_lease(&lease)?.release_clean()
+    })
+    .await;
+    match store_result {
+        Ok(Ok(_)) => {
+            let _ = store.release_pooled_checkout_for_incarnation(
+                &lease.path,
+                &lease.session_id,
+                &lease.owner_incarnation_id,
+                &lease.lease_id,
+            );
+        }
+        Ok(Err(error)) => {
+            let _ = store.quarantine_pooled_checkout_lease_for_incarnation(
+                &lease.path,
+                &lease.session_id,
+                &lease.owner_incarnation_id,
+                &lease.lease_id,
+                &error.to_string(),
+            );
+        }
+        Err(error) => {
+            let _ = store.quarantine_pooled_checkout_lease(
+                &lease.path,
+                &lease.session_id,
+                &lease.lease_id,
+                &format!("pooled checkout release task failed: {error}"),
+            );
+        }
+    }
+    true
+}
+
 /// Remove a Ninox-managed git worktree (best-effort, never propagates errors).
 ///
-/// Only acts on paths that match the `.claude/worktrees/{session_id}` pattern
-/// so it never touches unrelated directories.
-async fn remove_worker_worktree(workspace_path: &str, session_id: &str) {
+/// Managed-root worktrees require matching sidecar metadata. Legacy nested
+/// worktrees retain their strict path-shape check.
+async fn remove_worker_worktree(
+    workspace_path: &str,
+    session_id: &str,
+    recovery_metadata: RecoveryMetadata,
+) {
+    if let Ok(Some(metadata)) = crate::worktree::ManagedWorktree::load_for_workspace(
+        std::path::Path::new(workspace_path),
+        session_id,
+    ) {
+        let remove_metadata = matches!(recovery_metadata, RecoveryMetadata::Remove);
+        let _ = tokio::task::spawn_blocking(move || {
+            metadata.remove_checkout_if_matches_with_metadata(remove_metadata)
+        })
+        .await;
+        return;
+    }
     let suffix = format!("/.claude/worktrees/{session_id}");
     if !workspace_path.ends_with(&suffix) {
         return; // Not a Ninox worktree — leave it alone.
@@ -448,12 +731,292 @@ mod tests {
         assert!(matches!(after.status, crate::types::SessionStatus::Done));
     }
 
+
+    #[tokio::test]
+    async fn cleanup_session_releases_pooled_checkout_without_removing_warm_cache() {
+        let root = tempdir().unwrap();
+        let repo = root.path().join("widgets");
+        std::fs::create_dir(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        run(&["add", ".gitignore"]);
+        run(&[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+
+        let store = Arc::new(Store::open(root.path().join("ninox.db")).unwrap());
+        let identity = crate::worktree::RepositoryIdentity::resolve(&repo).unwrap();
+        let lease = store
+            .reserve_pooled_checkout(
+                &identity.top_level,
+                &identity.common_git_dir,
+                "pooled-done",
+                "pooled-done",
+            )
+            .unwrap();
+        let pooled = crate::worktree::PooledWorktree::create(&lease).unwrap();
+        assert!(store
+            .finalize_pooled_checkout(
+                &lease.path,
+                &lease.session_id,
+                &lease.lease_id,
+                &pooled.worktree_git_dir,
+                &pooled.worktree_identity,
+            )
+            .unwrap());
+        let cache = pooled.path.join("target/cache.bin");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, "warm").unwrap();
+
+        store
+            .upsert_session(&crate::types::Session {
+                id: "pooled-done".into(),
+                orchestrator_id: None,
+                name: "worker".into(),
+                repo: "Owner/widgets".into(),
+                status: crate::types::SessionStatus::PrOpen,
+                agent_type: "c".into(),
+                cost_usd: 0.0,
+                started_at: 0,
+                pr_number: Some(1),
+                pr_id: Some(1),
+                workspace_path: Some(pooled.path.to_string_lossy().to_string()),
+                pid: None,
+                model: None,
+                context_tokens: None,
+                catalogue_path: None,
+                context_used_pct: None,
+                context_total_tokens: None,
+                context_window_size: None,
+                claude_session_id: None,
+                summary: None,
+                terminal_at: None,
+                gate_status: None,
+            })
+            .unwrap();
+        let engine = Engine::new(store.clone());
+        let sessions_dir = tempdir().unwrap();
+
+        engine
+            .cleanup_session_in("pooled-done", sessions_dir.path())
+            .await
+            .unwrap();
+
+        assert!(pooled.path.is_dir());
+        assert_eq!(std::fs::read_to_string(cache).unwrap(), "warm");
+        let record = store
+            .pooled_checkout_by_path(&pooled.path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, crate::types::PooledCheckoutState::Free);
+        assert!(record.session_id.is_none());
+    }
+
+    // ── Orchestrator removal cleanup claims ───────────────────────────────────
+
+    fn worker(id: &str, orchestrator: &str, status: crate::types::SessionStatus) -> Session {
+        Session {
+            id: id.into(), orchestrator_id: Some(orchestrator.into()), name: id.into(),
+            repo: "r".into(), status, agent_type: "claude-code".into(),
+            cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None,
+            workspace_path: None, pid: None, model: None, context_tokens: None,
+            catalogue_path: None, context_used_pct: None, context_total_tokens: None,
+            context_window_size: None, claude_session_id: None, summary: None,
+            terminal_at: None, gate_status: None,
+        }
+    }
+
+    /// Store + engine seeded with `workers`.
+    fn worker_fixture(workers: &[Session]) -> (Arc<Store>, Arc<Engine>) {
+        let store = Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
+        for w in workers {
+            store.upsert_session(w).unwrap();
+        }
+        let engine = Engine::new(Arc::clone(&store));
+        (store, engine)
+    }
+
+    #[tokio::test]
+    async fn remove_orchestrator_does_not_delete_workers_before_all_exact_stops_succeed() {
+        use crate::types::{Orchestrator, SessionStatus::Terminated, WorkerIncarnationState};
+
+        let root = tempdir().unwrap();
+        let safe_id = format!("remove-orch-safe-{}", uuid::Uuid::new_v4());
+        let refused_id = format!("remove-orch-refused-{}", uuid::Uuid::new_v4());
+        let mut safe = worker(&safe_id, "orch-1", Terminated);
+        safe.started_at = 20;
+        safe.workspace_path = Some(root.path().to_string_lossy().into_owned());
+        let mut refused = worker(&refused_id, "orch-1", Terminated);
+        refused.started_at = 10;
+        refused.workspace_path = Some(root.path().to_string_lossy().into_owned());
+        let (store, engine) = worker_fixture(&[safe, refused]);
+        store
+            .upsert_orchestrator(&Orchestrator {
+                id: "orch-1".into(), name: "orchestrator".into(), created_at: 0,
+            })
+            .unwrap();
+        for (session_id, started_at) in [(&safe_id, 20), (&refused_id, 10)] {
+            let worker = store
+                .prepare_worker_incarnation(
+                    session_id,
+                    Some("orch-1"),
+                    started_at,
+                    root.path().to_str().unwrap(),
+                    false,
+                    3,
+                )
+                .unwrap();
+            assert!(store
+                .bind_worker_incarnation(
+                    session_id,
+                    &worker.incarnation_id,
+                    root.path().to_str().unwrap(),
+                    root.path().to_str().unwrap(),
+                    None,
+                )
+                .unwrap());
+        }
+        crate::tmux::create_session(
+            &refused_id,
+            root.path().to_str().unwrap(),
+            "sleep 30",
+            &[("NINOX_WORKER_INCARNATION", "successor")],
+        )
+        .await
+        .unwrap();
+        let mut events = engine.subscribe();
+
+        let result = engine.remove_orchestrator("orch-1").await;
+        let runtime_survived = crate::tmux::has_session(&refused_id).await;
+        let sessions_survived = [safe_id.as_str(), refused_id.as_str()]
+            .into_iter()
+            .all(|id| store.get_session(id).unwrap().is_some());
+        let claims_aborted = [safe_id.as_str(), refused_id.as_str()]
+            .into_iter()
+            .all(|id| {
+                store
+                    .current_worker_incarnation(id)
+                    .unwrap()
+                    .is_some_and(|worker| matches!(worker.state, WorkerIncarnationState::Active))
+            });
+        let orchestrator_survived =
+            store.list_orchestrators().unwrap().iter().any(|orchestrator| orchestrator.id == "orch-1");
+        crate::tmux::kill_private_session(&refused_id).await.unwrap();
+
+        assert!(result.is_err());
+        assert!(runtime_survived, "a mismatched runtime must never be killed");
+        assert!(sessions_survived, "no records may be deleted before all stops succeed");
+        assert!(claims_aborted, "every preclaimed worker must remain retryable");
+        assert!(orchestrator_survived);
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_orchestrator_aborts_remaining_claims_after_delete_failure() {
+        use crate::types::{Orchestrator, SessionStatus::Terminated, WorkerIncarnationState};
+
+        let root = tempdir().unwrap();
+        let db = root.path().join("t.db");
+        let store = Arc::new(Store::open(&db).unwrap());
+        let removed_id = format!("remove-orch-first-{}", uuid::Uuid::new_v4());
+        let failed_id = format!("remove-orch-failed-{}", uuid::Uuid::new_v4());
+        for (session_id, started_at) in [(&removed_id, 20), (&failed_id, 10)] {
+            let mut session = worker(session_id, "orch-1", Terminated);
+            session.started_at = started_at;
+            session.workspace_path = Some(root.path().to_string_lossy().into_owned());
+            store.upsert_session(&session).unwrap();
+            let worker = store
+                .prepare_worker_incarnation(
+                    session_id,
+                    Some("orch-1"),
+                    started_at,
+                    root.path().to_str().unwrap(),
+                    false,
+                    3,
+                )
+                .unwrap();
+            assert!(store
+                .bind_worker_incarnation(
+                    session_id,
+                    &worker.incarnation_id,
+                    root.path().to_str().unwrap(),
+                    root.path().to_str().unwrap(),
+                    None,
+                )
+                .unwrap());
+        }
+        store
+            .upsert_orchestrator(&Orchestrator {
+                id: "orch-1".into(), name: "orchestrator".into(), created_at: 0,
+            })
+            .unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER refuse_session_delete
+             BEFORE DELETE ON sessions WHEN OLD.id='{}'
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            failed_id.replace('\'', "''"),
+        ))
+        .unwrap();
+        drop(conn);
+        let engine = Engine::new(store.clone());
+        let mut events = engine.subscribe();
+
+        let result = engine.remove_orchestrator("orch-1").await;
+
+        assert!(result.is_err());
+        assert!(store.get_session(&removed_id).unwrap().is_none());
+        assert!(store.get_session(&failed_id).unwrap().is_some());
+        assert!(store
+            .current_worker_incarnation(&failed_id)
+            .unwrap()
+            .is_some_and(|worker| matches!(worker.state, WorkerIncarnationState::Released)));
+        assert!(store.list_orchestrators().unwrap().iter().any(|orchestrator| orchestrator.id == "orch-1"));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::SessionDone(session_id)) if session_id == removed_id
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
     #[tokio::test]
     async fn remove_worker_worktree_ignores_non_ninox_paths() {
         // Should be a no-op for paths that don't match .claude/worktrees/{id}.
         // We just verify it doesn't panic or error.
-        remove_worker_worktree("/some/random/path", "s1").await;
-        remove_worker_worktree("/repo/.claude/worktrees/other-id", "s1").await;
-        remove_worker_worktree("", "s1").await;
+        remove_worker_worktree(
+            "/some/random/path",
+            "s1",
+            RecoveryMetadata::Remove,
+        )
+        .await;
+        remove_worker_worktree(
+            "/repo/.claude/worktrees/other-id",
+            "s1",
+            RecoveryMetadata::Remove,
+        )
+        .await;
+        remove_worker_worktree("", "s1", RecoveryMetadata::Remove).await;
     }
 }

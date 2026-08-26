@@ -13,9 +13,12 @@ pub mod lifecycle;
 pub mod messaging;
 pub mod plugin;
 pub mod pty;
+pub mod rust_cache;
 pub mod store;
 pub mod tmux;
 pub mod types;
+pub mod workers;
+pub mod worktree;
 
 pub use brain::{BrainEntry, BrainIndex, QueryFilters};
 pub use config::{AppConfig, ThemeVariant};
