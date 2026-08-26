@@ -103,6 +103,110 @@ iconutil -c icns Ninox.iconset -o Ninox.icns
 rm -rf Ninox.iconset
 ```
 
+## Installation
+
+This is the private mirror of ninox — the sections above cover the public
+build/install paths (crates.io, the public repo's GitHub Releases). Internal
+engineers have two additional options: building from source against this
+repo's history, and pulling prebuilt crates from Synthesia's private Cargo
+registry.
+
+### Build from source
+
+MSRV is rustc **1.94.0** (pinned in `Cargo.toml` — a transitive `aws-config`
+dependency bump requires 1.94.1+, so the workspace stays on 1.94.0 until the
+toolchain catches up). Install it and build as in [Build and
+run](#build-and-run) above:
+
+```bash
+rustup install 1.94.0
+cargo +1.94.0 build --release -p ninox
+```
+
+### Prebuilt macOS bundle (private mirror)
+
+This repo publishes its own GitHub Releases too — the `release` job in
+[`.github/workflows/publish-codeartifact.yml`](.github/workflows/publish-codeartifact.yml)
+builds, ad-hoc signs, and attaches `Ninox.app.zip` to a release on *this*
+repo for every version tag, so internal engineers don't need to go to the
+public repo for it. Same install steps as [macOS app bundle](#macos-app-bundle)
+above, just from this repo's Releases page instead.
+
+### Installing from Synthesia's private Cargo registry
+
+Internal-only commits (merged directly to this repo, not yet synced to the
+public one) get published to `ninox` / `ninox-core` / `ninox-server` crates
+on Synthesia's CodeArtifact Cargo registry (`synthesia-cargo`, in the
+`synthesia-build` domain) before they ever reach crates.io. To pull from it
+instead of building from source, you first need an AWS SSO profile with
+access to the account that owns that domain — ask your team if you don't
+have one already, and run `aws sso login --profile <your-build-profile>` if
+your session has expired.
+
+If you already have Synthesia's `ca-keyring` dev-tooling script, it sets
+all of this up in one command (defaults already point at
+`synthesia-build`/`synthesia-cargo`):
+
+```bash
+ca-keyring -C
+```
+
+Otherwise, configure Cargo by hand — add a registry entry to
+`~/.cargo/config.toml` that points at the repository's sparse index and
+mints a fresh CodeArtifact token on demand via a `cargo:token-from-stdout`
+credential provider, so nothing is ever written to disk and there's no
+token to accidentally commit:
+
+```toml
+[registries.synthesia-cargo]
+index = "sparse+https://synthesia-build-<domain-owner-account-id>.d.codeartifact.eu-west-1.amazonaws.com/cargo/synthesia-cargo/"
+credential-provider = "cargo:token-from-stdout aws codeartifact get-authorization-token --domain synthesia-build --domain-owner <domain-owner-account-id> --region eu-west-1 --profile <your-build-profile> --query authorizationToken --output text"
+```
+
+Get `<domain-owner-account-id>` and the index URL at setup time instead of
+hardcoding them — they're derivable from your own credentials, not a secret
+worth pasting around:
+
+```bash
+DOMAIN_OWNER=$(aws sts get-caller-identity --profile <your-build-profile> --query Account --output text)
+aws codeartifact get-repository-endpoint \
+  --domain synthesia-build --domain-owner "$DOMAIN_OWNER" \
+  --repository synthesia-cargo --format cargo \
+  --profile <your-build-profile> --query repositoryEndpoint --output text
+```
+
+Then install:
+
+```bash
+cargo install --registry synthesia-cargo ninox
+```
+
+Cargo sends the CodeArtifact token verbatim in the `Authorization` header
+with no `Bearer` prefix — the credential provider above already does this
+correctly, but if you're scripting the token fetch by hand, don't add one.
+
+If you'd rather use a static token instead of the on-demand provider (e.g.
+for a one-off `cargo add`), swap the registry's credential provider to plain
+`cargo:token` — the `token-from-stdout` provider used above doesn't support
+`cargo login` at all, it only mints tokens for cargo's own requests:
+
+```toml
+[registries.synthesia-cargo]
+index = "sparse+https://synthesia-build-<domain-owner-account-id>.d.codeartifact.eu-west-1.amazonaws.com/cargo/synthesia-cargo/"
+credential-provider = "cargo:token"
+```
+
+Then pipe in a freshly fetched token — `cargo login` reads it from stdin, no
+positional argument needed. Expect to redo this whenever it expires
+(CodeArtifact tokens are short-lived, typically ~12 hours):
+
+```bash
+aws codeartifact get-authorization-token \
+  --domain synthesia-build --domain-owner "$DOMAIN_OWNER" \
+  --profile <your-build-profile> --query authorizationToken --output text \
+  | cargo login --registry synthesia-cargo
+```
+
 ## Configuration
 
 App config lives in the platform config directory — `~/Library/Application Support/ninox/config.toml` on macOS, `~/.config/ninox/config.toml` on Linux (override with `NINOX_CONFIG`):
