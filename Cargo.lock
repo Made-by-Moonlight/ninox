@@ -4119,6 +4119,7 @@ dependencies = [
  "ninox-core",
  "ninox-server",
  "notify-rust",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tokio",

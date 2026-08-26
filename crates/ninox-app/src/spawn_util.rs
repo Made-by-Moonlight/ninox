@@ -5,7 +5,11 @@
 
 use std::sync::Arc;
 
-use ninox_core::{events::Engine, pty, tmux, Event, Session, SessionFields, SessionStatus};
+use anyhow::Context as _;
+use ninox_core::{
+    events::Engine, pty, tmux, Event, PooledCheckoutLease, PooledCheckoutState, Session,
+    SessionFields, SessionStatus, Store,
+};
 
 /// The per-kind differences between the spawn-modal launch paths
 /// (standalone vs orchestrator). Everything else — env resolution,
@@ -67,6 +71,10 @@ pub async fn spawn_interactive_session(
     p: InteractiveSpawnParams,
 ) -> Option<Vec<String>> {
     let sid = p.session_id;
+    let is_orchestrator = p
+        .extra_env
+        .iter()
+        .any(|(key, value)| key == "NINOX_CALLER_TYPE" && value == "orchestrator");
 
     let ninox_bin = std::env::current_exe()
         .ok()
@@ -100,12 +108,28 @@ pub async fn spawn_interactive_session(
         tracing::error!("tmux create failed for {sid}: {e}");
         // Surface the failure: without this the optimistically inserted
         // session would sit in Working forever.
-        if let Ok(Some(mut s)) = engine.store.get_session(&sid) {
-            s.status = p.failure_status;
-            let _ = engine.store.upsert_session(&s);
-            engine.emit(Event::SessionUpdated(s, SessionFields::STATUS));
+        if engine
+            .store
+            .update_session_status_snapshot(&sid, p.started_at, p.failure_status)
+            .unwrap_or(false)
+        {
+            if let Ok(Some(s)) = engine.store.get_session(&sid) {
+                engine.emit(Event::SessionUpdated(s, SessionFields::STATUS));
+            }
         }
         return None;
+    }
+    if is_orchestrator {
+        if let Err(error) =
+            ninox_core::workers::register_live_orchestrator_runtime(&engine.store, &sid).await
+        {
+            tracing::error!("orchestrator runtime registration failed for {sid}: {error}");
+            let _ = tmux::kill_private_session(&sid).await;
+            let _ = engine
+                .store
+                .update_session_status_snapshot(&sid, p.started_at, p.failure_status);
+            return None;
+        }
     }
 
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
@@ -227,6 +251,619 @@ pub fn repo_from_workspace(workspace: &str) -> Option<String> {
     ninox_core::github::split_repo(&url).map(|(o, r)| format!("{o}/{r}"))
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkerCheckout {
+    pub workspace: String,
+    /// Canonical repository root used to derive `workspace`. For non-Git
+    /// directories this is the supplied workspace.
+    pub source_workspace: String,
+    pub pooled_lease: Option<PooledCheckoutLease>,
+}
+
+impl WorkerCheckout {
+    pub fn shared(workspace: String) -> Self {
+        Self {
+            source_workspace: workspace.clone(),
+            workspace,
+            pooled_lease: None,
+        }
+    }
+}
+
+/// Allocate a durable worker workspace.
+///
+/// Direct children of `repositories_root` use reusable sibling checkouts.
+/// Other Git repositories use the managed-worktree root. Non-Git directories
+/// retain their supplied path.
+pub async fn acquire_worker_checkout_for_incarnation(
+    store: Arc<Store>,
+    workspace: &str,
+    session_id: &str,
+    incarnation_id: &str,
+    repositories_root: Option<&std::path::Path>,
+    worktree_root: &std::path::Path,
+    inbox_enabled: bool,
+) -> anyhow::Result<WorkerCheckout> {
+    use anyhow::Context as _;
+
+    let workspace = workspace.to_string();
+    let session_id = session_id.to_string();
+    let incarnation_id = incarnation_id.to_string();
+    let repositories_root = repositories_root.map(std::path::Path::to_path_buf);
+    let worktree_root = worktree_root.to_path_buf();
+    let remote_repo = repo_from_workspace(&workspace);
+
+    tokio::task::spawn_blocking(move || {
+        let source_path = std::path::Path::new(&workspace);
+        let identity = match ninox_core::worktree::RepositoryIdentity::resolve(source_path) {
+            Ok(identity) => identity,
+            Err(error) if source_path.is_dir() => {
+                tracing::debug!(
+                    "workspace {} is not a Git checkout; using it directly: {error}",
+                    source_path.display()
+                );
+                return Ok(WorkerCheckout::shared(workspace));
+            }
+            Err(error) => return Err(error),
+        };
+
+        let canonical_repositories_root = repositories_root
+            .as_deref()
+            .and_then(|root| root.canonicalize().ok());
+        if !identity.is_primary_checkout() {
+            return Ok(WorkerCheckout::shared(
+                identity.top_level.to_string_lossy().to_string(),
+            ));
+        }
+        if ninox_core::worktree::is_pooling_eligible(
+            &identity,
+            canonical_repositories_root.as_deref(),
+        ) {
+            let lease = acquire_pooled_checkout(
+                &store,
+                &identity,
+                PoolAcquireRequest {
+                    session_id: &session_id,
+                    incarnation_id: &incarnation_id,
+                    branch: &session_id,
+                    target: PoolAcquireTarget::Sibling,
+                    inbox_enabled,
+                },
+            )?;
+            return Ok(WorkerCheckout {
+                workspace: lease.path.to_string_lossy().to_string(),
+                source_workspace: identity.top_level.to_string_lossy().to_string(),
+                pooled_lease: Some(lease),
+            });
+        }
+
+        let managed_root = ninox_core::worktree::ManagedWorktree::pool_root(
+            &identity.top_level,
+            remote_repo.as_deref(),
+            &worktree_root,
+        )?;
+        let lease = acquire_pooled_checkout(
+            &store,
+            &identity,
+            PoolAcquireRequest {
+                session_id: &session_id,
+                incarnation_id: &incarnation_id,
+                branch: &session_id,
+                target: PoolAcquireTarget::Managed(managed_root),
+                inbox_enabled,
+            },
+        )?;
+        Ok(WorkerCheckout {
+            workspace: lease.path.to_string_lossy().to_string(),
+            source_workspace: identity.top_level.to_string_lossy().to_string(),
+            pooled_lease: Some(lease),
+        })
+    })
+    .await
+    .context("worker checkout allocation task panicked")?
+}
+
+#[cfg(test)]
+pub async fn acquire_worker_checkout(
+    store: Arc<Store>,
+    workspace: &str,
+    session_id: &str,
+    repositories_root: Option<&std::path::Path>,
+    worktree_root: &std::path::Path,
+    inbox_enabled: bool,
+) -> anyhow::Result<WorkerCheckout> {
+    acquire_worker_checkout_for_incarnation(
+        store,
+        workspace,
+        session_id,
+        session_id,
+        repositories_root,
+        worktree_root,
+        inbox_enabled,
+    )
+    .await
+}
+
+pub async fn acquire_worker_checkout_at_for_incarnation(
+    store: Arc<Store>,
+    source_workspace: &str,
+    target: &std::path::Path,
+    session_id: &str,
+    incarnation_id: &str,
+    inbox_enabled: bool,
+) -> anyhow::Result<WorkerCheckout> {
+    use anyhow::Context as _;
+
+    let source_workspace = source_workspace.to_string();
+    let target = target.to_path_buf();
+    let session_id = session_id.to_string();
+    let incarnation_id = incarnation_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        acquire_worker_checkout_at_for_incarnation_blocking(
+            &store,
+            &source_workspace,
+            &target,
+            &session_id,
+            &incarnation_id,
+            inbox_enabled,
+        )
+    })
+    .await
+    .context("explicit worker checkout allocation task panicked")?
+}
+
+pub fn acquire_worker_checkout_at_for_incarnation_blocking(
+    store: &Store,
+    source_workspace: &str,
+    target: &std::path::Path,
+    session_id: &str,
+    incarnation_id: &str,
+    inbox_enabled: bool,
+) -> anyhow::Result<WorkerCheckout> {
+    use anyhow::Context as _;
+
+    let identity =
+        ninox_core::worktree::RepositoryIdentity::resolve(std::path::Path::new(source_workspace))?;
+    target
+        .parent()
+        .context("explicit worker checkout path has no parent")?;
+    let branch = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("explicit worker checkout path has no UTF-8 branch name")?;
+    let lease = acquire_pooled_checkout(
+        store,
+        &identity,
+        PoolAcquireRequest {
+            session_id,
+            incarnation_id,
+            branch,
+            target: PoolAcquireTarget::Explicit(target.to_path_buf()),
+            inbox_enabled,
+        },
+    )?;
+    Ok(WorkerCheckout {
+        workspace: lease.path.to_string_lossy().to_string(),
+        source_workspace: identity.top_level.to_string_lossy().to_string(),
+        pooled_lease: Some(lease),
+    })
+}
+
+struct PoolAcquireRequest<'a> {
+    session_id: &'a str,
+    incarnation_id: &'a str,
+    branch: &'a str,
+    target: PoolAcquireTarget,
+    inbox_enabled: bool,
+}
+
+enum PoolAcquireTarget {
+    Sibling,
+    Managed(std::path::PathBuf),
+    Explicit(std::path::PathBuf),
+}
+
+fn acquire_pooled_checkout(
+    store: &Store,
+    identity: &ninox_core::worktree::RepositoryIdentity,
+    request: PoolAcquireRequest<'_>,
+) -> anyhow::Result<PooledCheckoutLease> {
+    let PoolAcquireRequest {
+        session_id,
+        incarnation_id,
+        branch,
+        target,
+        inbox_enabled,
+    } = request;
+    for mut record in store.pooled_checkouts_by_common_git_dir(&identity.common_git_dir)? {
+        if matches!(record.state, PooledCheckoutState::Provisioning) {
+            let stale = match (
+                record.session_id.as_deref(),
+                record.owner_incarnation_id.as_deref(),
+                record.lease_id.as_deref(),
+            ) {
+                (Some(session_id), Some(incarnation_id), Some(lease_id)) => {
+                    let worker = store.current_worker_incarnation(session_id)?;
+                    let session_terminal = store
+                        .get_session(session_id)?
+                        .is_some_and(|session| session.status.is_terminal());
+                    let stale = worker.as_ref().is_none_or(|worker| {
+                        worker.incarnation_id != incarnation_id
+                            || matches!(
+                                worker.state,
+                                ninox_core::types::WorkerIncarnationState::Released
+                            )
+                    }) || session_terminal;
+                    if stale {
+                        let _ = store.quarantine_pooled_checkout_lease_for_incarnation(
+                            &record.path,
+                            session_id,
+                            incarnation_id,
+                            lease_id,
+                            "recovering stale provisioning reservation",
+                        );
+                    }
+                    stale
+                }
+                _ => false,
+            };
+            if stale {
+                record = store
+                    .pooled_checkout_by_path(&record.path)?
+                    .context("stale provisioning record disappeared during recovery")?;
+            }
+        }
+        if !matches!(record.state, PooledCheckoutState::Quarantined)
+            || matches!(
+                record.kind,
+                ninox_core::types::PooledCheckoutKind::UnsafeLegacy
+            )
+        {
+            continue;
+        }
+        if !record.path.exists() {
+            let _ = store.remove_missing_quarantined_pooled_checkout(&record.path);
+            continue;
+        }
+        let pooled = ninox_core::worktree::PooledWorktree::from_record(&record)
+            .and_then(|pooled| {
+                anyhow::ensure!(
+                    pooled.matches_identity()?,
+                    "quarantined checkout identity needs recovery"
+                );
+                Ok(pooled)
+            })
+            .or_else(|_| {
+                ninox_core::worktree::PooledWorktree::recover_quarantined_creation(&record)
+            });
+        let Ok(pooled) = pooled else { continue };
+        if pooled.detach_if_needed().is_ok() {
+            let _ = store.recover_quarantined_pooled_checkout(
+                &record.path,
+                &pooled.worktree_git_dir,
+                &pooled.worktree_identity,
+            );
+        }
+    }
+
+    {
+        let claimed = if let PoolAcquireTarget::Explicit(path) = &target {
+            match store.pooled_checkout_by_path(path)? {
+                Some(record) => {
+                    anyhow::ensure!(
+                        record.common_git_dir == identity.common_git_dir,
+                        "requested checkout path belongs to a different repository"
+                    );
+                    anyhow::ensure!(
+                        matches!(record.state, PooledCheckoutState::Free),
+                        "requested checkout path is unavailable: {}",
+                        path.display()
+                    );
+                    store.claim_free_pooled_checkout_at_for_incarnation(
+                        path,
+                        &identity.common_git_dir,
+                        session_id,
+                        incarnation_id,
+                        branch,
+                    )?
+                }
+                None => None,
+            }
+        } else {
+            let kind = match &target {
+                PoolAcquireTarget::Sibling => ninox_core::types::PooledCheckoutKind::Sibling,
+                PoolAcquireTarget::Managed(_) => ninox_core::types::PooledCheckoutKind::Managed,
+                PoolAcquireTarget::Explicit(_) => {
+                    anyhow::bail!("explicit checkout target reached automatic claim path")
+                }
+            };
+            store.claim_lowest_free_pooled_checkout_of_kind_for_incarnation(
+                &identity.common_git_dir,
+                kind,
+                session_id,
+                incarnation_id,
+                branch,
+            )?
+        };
+        if let Some(lease) = claimed {
+            match ninox_core::worktree::PooledWorktree::prepare_for_lease(&lease) {
+                Ok(pooled) => {
+                    let finalized = store.finalize_pooled_checkout_for_incarnation(
+                        &lease.path,
+                        session_id,
+                        incarnation_id,
+                        &lease.lease_id,
+                        &pooled.worktree_git_dir,
+                        &pooled.worktree_identity,
+                    );
+                    match finalized {
+                        Ok(true) => {}
+                        Ok(false) => anyhow::bail!(
+                            "pooled checkout lease changed while preparing {}",
+                            lease.path.display()
+                        ),
+                        Err(error) => {
+                            let _ = store.quarantine_pooled_checkout_lease_for_incarnation(
+                                &lease.path,
+                                session_id,
+                                incarnation_id,
+                                &lease.lease_id,
+                                &error.to_string(),
+                            );
+                            return Err(error);
+                        }
+                    }
+                    ensure_statusline_settings(&lease.path, inbox_enabled);
+                    return Ok(PooledCheckoutLease {
+                        worktree_git_dir: Some(pooled.worktree_git_dir),
+                        worktree_identity: Some(pooled.worktree_identity),
+                        ..lease
+                    });
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    let _ = store.quarantine_pooled_checkout_lease_for_incarnation(
+                        &lease.path,
+                        session_id,
+                        incarnation_id,
+                        &lease.lease_id,
+                        &reason,
+                    );
+                    tracing::warn!(
+                        "quarantined pooled checkout {}: {reason}",
+                        lease.path.display()
+                    );
+                    return Err(error);
+                }
+            }
+        }
+
+        let lease = match &target {
+            PoolAcquireTarget::Explicit(path) => store.reserve_pooled_checkout_at_for_incarnation(
+                &identity.top_level,
+                &identity.common_git_dir,
+                path,
+                session_id,
+                incarnation_id,
+                branch,
+            )?,
+            PoolAcquireTarget::Managed(root) => store
+                .reserve_managed_pooled_checkout_for_incarnation(
+                    &identity.top_level,
+                    &identity.common_git_dir,
+                    root,
+                    session_id,
+                    incarnation_id,
+                    branch,
+                )?,
+            PoolAcquireTarget::Sibling => store.reserve_pooled_checkout_for_incarnation(
+                &identity.top_level,
+                &identity.common_git_dir,
+                session_id,
+                incarnation_id,
+                branch,
+            )?,
+        };
+        match ninox_core::worktree::PooledWorktree::create(&lease) {
+            Ok(pooled) => {
+                let finalized = store.finalize_pooled_checkout_for_incarnation(
+                    &lease.path,
+                    session_id,
+                    incarnation_id,
+                    &lease.lease_id,
+                    &pooled.worktree_git_dir,
+                    &pooled.worktree_identity,
+                );
+                match finalized {
+                    Ok(true) => {}
+                    Ok(false) => anyhow::bail!(
+                        "pooled checkout reservation changed while creating {}",
+                        lease.path.display()
+                    ),
+                    Err(error) => {
+                        let _ = store.quarantine_pooled_checkout_lease_for_incarnation(
+                            &lease.path,
+                            session_id,
+                            incarnation_id,
+                            &lease.lease_id,
+                            &error.to_string(),
+                        );
+                        return Err(error);
+                    }
+                }
+                ensure_statusline_settings(&lease.path, inbox_enabled);
+                Ok(PooledCheckoutLease {
+                    worktree_git_dir: Some(pooled.worktree_git_dir),
+                    worktree_identity: Some(pooled.worktree_identity),
+                    ..lease
+                })
+            }
+            Err(error) => {
+                if lease.path.exists() {
+                    let _ = store.quarantine_pooled_checkout_lease_for_incarnation(
+                        &lease.path,
+                        session_id,
+                        incarnation_id,
+                        &lease.lease_id,
+                        &error.to_string(),
+                    );
+                    tracing::warn!(
+                        "quarantined unusable pooled checkout path {}: {error}",
+                        lease.path.display()
+                    );
+                    return Err(error);
+                }
+                let _ = store.remove_failed_pooled_checkout_for_incarnation(
+                    &lease.path,
+                    session_id,
+                    incarnation_id,
+                    &lease.lease_id,
+                );
+                Err(error)
+            }
+        }
+    }
+}
+
+pub async fn release_pooled_checkout_lease(
+    store: Arc<Store>,
+    lease: PooledCheckoutLease,
+) -> anyhow::Result<bool> {
+    tokio::task::spawn_blocking(move || {
+        let pooled = ninox_core::worktree::PooledWorktree::from_lease(&lease)?;
+        match pooled.release_clean() {
+            Ok(_) => store.release_pooled_checkout_for_incarnation(
+                &lease.path,
+                &lease.session_id,
+                &lease.owner_incarnation_id,
+                &lease.lease_id,
+            ),
+            Err(error) => {
+                let reason = error.to_string();
+                let quarantined = store.quarantine_pooled_checkout_lease_for_incarnation(
+                    &lease.path,
+                    &lease.session_id,
+                    &lease.owner_incarnation_id,
+                    &lease.lease_id,
+                    &reason,
+                )?;
+                if quarantined {
+                    tracing::warn!(
+                        "quarantined pooled checkout {}: {reason}",
+                        lease.path.display()
+                    );
+                }
+                Ok(quarantined)
+            }
+        }
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("pooled checkout release task panicked: {error}"))?
+}
+
+pub async fn rollback_managed_worktree(
+    workspace: &str,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    let Some(metadata) = ninox_core::worktree::ManagedWorktree::load_for_workspace(
+        std::path::Path::new(workspace),
+        session_id,
+    )? else {
+        return Ok(false);
+    };
+    tokio::task::spawn_blocking(move || metadata.remove_checkout_if_matches())
+        .await
+        .map_err(|error| anyhow::anyhow!("managed worktree rollback task panicked: {error}"))?
+}
+
+pub async fn rollback_worker_checkout(
+    store: Arc<Store>,
+    checkout: &WorkerCheckout,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    if let Some(lease) = checkout.pooled_lease.clone() {
+        return release_pooled_checkout_lease(store, lease).await;
+    }
+    rollback_managed_worktree(&checkout.workspace, session_id).await
+}
+
+pub fn release_unbound_worker_incarnation_blocking(
+    store: &Store,
+    session_id: &str,
+    incarnation_id: &str,
+) -> bool {
+    let Ok(Some(claim)) = store.claim_worker_cleanup(session_id, incarnation_id) else {
+        return false;
+    };
+    store
+        .complete_worker_claim(
+            session_id,
+            &claim.incarnation_id,
+            ninox_core::types::WorkerIncarnationState::CleanupClaimed,
+        )
+        .unwrap_or(false)
+}
+
+pub async fn rollback_worker_incarnation_checkout(
+    store: Arc<Store>,
+    session_id: &str,
+    incarnation_id: &str,
+    checkout: Option<&WorkerCheckout>,
+) -> bool {
+    let claim = checkout
+        .and_then(|checkout| checkout.pooled_lease.as_ref())
+        .map_or_else(
+            || store.claim_worker_cleanup(session_id, incarnation_id),
+            |lease| {
+                store.claim_worker_cleanup_with_lease(
+                    session_id,
+                    incarnation_id,
+                    &lease.lease_id,
+                )
+            },
+        );
+    let Ok(Some(claim)) = claim else {
+        return false;
+    };
+    if let Some(checkout) = checkout {
+        let _ = rollback_worker_checkout(store.clone(), checkout, session_id).await;
+    }
+    store
+        .complete_worker_claim(
+            session_id,
+            &claim.incarnation_id,
+            ninox_core::types::WorkerIncarnationState::CleanupClaimed,
+        )
+        .unwrap_or(false)
+}
+
+pub async fn stop_exact_worker_runtime(
+    session_id: &str,
+    incarnation_id: &str,
+    caller_session: Option<&str>,
+) -> anyhow::Result<()> {
+    let runtime = ninox_core::tmux::session_env(session_id, "NINOX_WORKER_INCARNATION").await?;
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        runtime == incarnation_id,
+        "worker runtime changed; refusing to stop a successor"
+    );
+    anyhow::ensure!(
+        caller_session != Some(session_id),
+        "worker {session_id} cannot release its checkout while its own runtime is active"
+    );
+    ninox_core::tmux::kill_session(session_id).await?;
+    anyhow::ensure!(
+        ninox_core::tmux::session_env(session_id, "NINOX_WORKER_INCARNATION")
+            .await?
+            .is_none(),
+        "worker runtime absence could not be confirmed after stop"
+    );
+    Ok(())
+}
+
 /// Create an isolated git worktree for a session at
 /// `{repo}/.claude/worktrees/{session_id}` on a new branch `{session_id}`.
 ///
@@ -246,6 +883,7 @@ pub fn repo_from_workspace(workspace: &str) -> Option<String> {
 /// `AppConfig::load()`) so callers control it and tests can exercise both
 /// states without touching the real user config file. See
 /// `ensure_statusline_settings`.
+#[cfg(test)]
 pub async fn create_worker_worktree(
     repo: &str, session_id: &str, inbox_enabled: bool,
 ) -> anyhow::Result<String> {
@@ -294,11 +932,30 @@ pub async fn ensure_session_workspace(
     is_orchestrator: bool,
     inbox_enabled:   bool,
 ) -> anyhow::Result<()> {
-    if std::path::Path::new(workspace).is_dir() {
-        return Ok(());
-    }
     if is_orchestrator {
         std::fs::create_dir_all(workspace)?;
+        return Ok(());
+    }
+    if std::path::Path::new(workspace).is_dir() {
+        ensure_statusline_settings(std::path::Path::new(workspace), inbox_enabled);
+        if let Err(e) = seed_worker_brain_skill(workspace).await {
+            tracing::warn!("failed to re-seed brain skill for {session_id}: {e}");
+        }
+        return Ok(());
+    }
+    if let Some(mut managed) = ninox_core::worktree::ManagedWorktree::load_for_workspace(
+        std::path::Path::new(workspace),
+        session_id,
+    )? {
+        managed.add_checkout()?;
+        ensure_statusline_settings(&managed.worktree_path, inbox_enabled);
+        if let Err(error) = managed.persist() {
+            let _ = managed.remove_checkout_if_matches_with_metadata(false);
+            return Err(error);
+        }
+        if let Err(e) = seed_worker_brain_skill(workspace).await {
+            tracing::warn!("failed to re-seed brain skill for {session_id}: {e}");
+        }
         return Ok(());
     }
     let suffix = format!("/.claude/worktrees/{session_id}");
@@ -311,11 +968,92 @@ pub async fn ensure_session_workspace(
         std::path::Path::new(repo_root).is_dir(),
         "workspace {workspace} is gone and its repo root {repo_root} no longer exists"
     );
-    create_worker_worktree(repo_root, session_id, inbox_enabled).await?;
+    create_worktree_at(
+        std::path::Path::new(repo_root),
+        std::path::Path::new(workspace),
+        session_id,
+        inbox_enabled,
+    )?;
     if let Err(e) = seed_worker_brain_skill(workspace).await {
         tracing::warn!("failed to re-seed brain skill for {session_id}: {e}");
     }
     Ok(())
+}
+
+pub async fn ensure_session_workspace_with_store(
+    store: &Store,
+    workspace: &str,
+    session_id: &str,
+    is_orchestrator: bool,
+    inbox_enabled: bool,
+) -> anyhow::Result<()> {
+    if !is_orchestrator {
+        if let Some(mut record) = store.pooled_checkout_by_session(session_id)? {
+            if matches!(record.state, PooledCheckoutState::Provisioning) {
+                let lease_id = record
+                    .lease_id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("provisioning checkout has no lease id"))?;
+                if !record.path.exists() {
+                    let _ = store.remove_failed_pooled_checkout(
+                        &record.path,
+                        session_id,
+                        &lease_id,
+                    );
+                    anyhow::bail!(
+                        "crash-interrupted pooled checkout {} was not created; re-file again to allocate a replacement",
+                        record.path.display()
+                    );
+                }
+                let recovered =
+                    ninox_core::worktree::PooledWorktree::recover_provisioning(&record)?;
+                anyhow::ensure!(
+                    store.finalize_pooled_checkout(
+                        &record.path,
+                        session_id,
+                        &lease_id,
+                        &recovered.worktree_git_dir,
+                        &recovered.worktree_identity,
+                    )?,
+                    "pooled checkout lease changed during crash recovery"
+                );
+                record = store
+                    .pooled_checkout_by_session(session_id)?
+                    .ok_or_else(|| anyhow::anyhow!("recovered pooled checkout disappeared"))?;
+            }
+            anyhow::ensure!(
+                record.path == std::path::Path::new(workspace),
+                "session {session_id} owns pooled checkout {}, not {workspace}",
+                record.path.display()
+            );
+            anyhow::ensure!(
+                matches!(record.state, PooledCheckoutState::Leased),
+                "pooled checkout {} is not ready",
+                record.path.display()
+            );
+            let pooled = ninox_core::worktree::PooledWorktree::from_record(&record)?;
+            anyhow::ensure!(
+                pooled.matches_identity()?,
+                "pooled checkout {} no longer matches its Ninox identity",
+                record.path.display()
+            );
+            ensure_statusline_settings(&record.path, inbox_enabled);
+            if let Err(e) = seed_worker_brain_skill(workspace).await {
+                tracing::warn!("failed to re-seed brain skill for {session_id}: {e}");
+            }
+            return Ok(());
+        }
+        if let Some(record) =
+            store.pooled_checkout_by_path(std::path::Path::new(workspace))?
+        {
+            anyhow::bail!(
+                "pooled checkout {} is {:?} and is no longer leased to session {session_id}",
+                record.path.display(),
+                record.state
+            );
+        }
+    }
+    ensure_session_workspace(workspace, session_id, is_orchestrator, inbox_enabled).await
 }
 
 /// Walk up from `start` (inclusive) looking for the nearest ancestor
@@ -416,7 +1154,20 @@ pub fn create_worktree_at(
 fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bool) {
     let claude_dir = worktree_path.join(".claude");
     let settings_path = claude_dir.join("settings.json");
-    if settings_path.exists() {
+    if git_path_is_tracked(worktree_path, ".claude/settings.json") {
+        return;
+    }
+    if settings_path.exists()
+        && !std::fs::read_to_string(&settings_path)
+            .ok()
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+            .and_then(|settings| {
+                settings
+                    .get("ninoxManaged")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false)
+    {
         return;
     }
     let ninox_bin = ninox_core::config::AppConfig::ninox_bin_dir().join("ninox").display().to_string();
@@ -427,6 +1178,7 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
     // that ultimately runs this command and never resolve to the binary.
     let ninox_bin_quoted = format!("'{}'", ninox_bin.replace('\'', "'\\''"));
     let mut settings = serde_json::json!({
+        "ninoxManaged": true,
         "statusLine": {
             "type": "command",
             "command": format!("{ninox_bin_quoted} statusline"),
@@ -456,7 +1208,9 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
     }
     if std::fs::create_dir_all(&claude_dir).is_ok() {
         if let Ok(body) = serde_json::to_string_pretty(&settings) {
-            let _ = std::fs::write(&settings_path, body);
+            if std::fs::write(&settings_path, body).is_ok() {
+                exclude_generated_provider_file(worktree_path, ".claude/settings.json");
+            }
         }
     }
 }
@@ -534,6 +1288,62 @@ canonical entry and delete the copy when you're confident.
 **Query before touching unfamiliar code. Write down what you found before
 you're done.** A stale or empty brain is no better than no brain at all.
 "#;
+
+/// Writes a worker-flavored brain skill into `workspace` so a spawned
+/// worker/standalone session sees "brain" as a real Claude Code skill from
+/// the moment it starts, and makes sure the file can never end up in a
+/// commit. Best-effort: any failure here should be logged and swallowed by
+/// the caller, not treated as fatal to the spawn (mirrors how
+/// `setup_orchestrator_root`'s own failures are handled in `main.rs`).
+fn git_path_is_tracked(workspace: &std::path::Path, relative_path: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["ls-files", "--error-unmatch", relative_path])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn exclude_generated_provider_file(workspace: &std::path::Path, relative_path: &str) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "--git-common-dir"])
+        .output();
+    let Ok(output) = output else { return };
+    if !output.status.success() {
+        return;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let common_dir = if std::path::Path::new(&raw).is_absolute() {
+        std::path::PathBuf::from(raw)
+    } else {
+        workspace.join(raw)
+    };
+    let exclude_path = common_dir.join("info").join("exclude");
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == relative_path) {
+        return;
+    }
+    let Some(parent) = exclude_path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(exclude_path)
+    else {
+        return;
+    };
+    use std::io::Write as _;
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        let _ = file.write_all(b"\n");
+    }
+    let _ = writeln!(file, "{relative_path}");
+}
 
 /// Writes a worker-flavored brain skill into `workspace` so a spawned
 /// worker/standalone session sees "brain" as a real Claude Code skill from
@@ -647,6 +1457,542 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_child_repository_reuses_warm_sibling_pool_slots() {
+        let root = tempdir().unwrap();
+        let repo = root.path().join("widgets");
+        std::fs::create_dir(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(repo.join("README.md"), "pool\n").unwrap();
+        run(&["add", "."]);
+        run(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        let canonical_root = root.path().canonicalize().unwrap();
+        let store = Arc::new(Store::open(root.path().join("ninox.db")).unwrap());
+        let fallback = root.path().join("fallback");
+
+        let first = acquire_worker_checkout(
+            store.clone(),
+            repo.to_str().unwrap(),
+            "worker-one",
+            Some(&canonical_root),
+            &fallback,
+            false,
+        )
+        .await
+        .unwrap();
+        let second = acquire_worker_checkout(
+            store.clone(),
+            repo.to_str().unwrap(),
+            "worker-two",
+            Some(&canonical_root),
+            &fallback,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::path::Path::new(&first.workspace),
+            canonical_root.join("widgets-w1")
+        );
+        assert_eq!(
+            std::path::Path::new(&second.workspace),
+            canonical_root.join("widgets-w2")
+        );
+
+        let cache = std::path::Path::new(&first.workspace).join("target/cache.bin");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, "warm").unwrap();
+        assert!(release_pooled_checkout_lease(
+            store.clone(),
+            first.pooled_lease.clone().unwrap(),
+        )
+        .await
+        .unwrap());
+
+        let reused = acquire_worker_checkout(
+            store.clone(),
+            repo.to_str().unwrap(),
+            "worker-three",
+            Some(&canonical_root),
+            &fallback,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reused.workspace, first.workspace);
+        assert_eq!(std::fs::read_to_string(cache).unwrap(), "warm");
+
+        for checkout in [second, reused] {
+            assert!(release_pooled_checkout_lease(
+                store.clone(),
+                checkout.pooled_lease.unwrap(),
+            )
+            .await
+            .unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_root_equal_to_repo_still_allocates_a_sibling() {
+        let repo = init_git_repo();
+        let state = tempdir().unwrap();
+        let store = Arc::new(Store::open(state.path().join("ninox.db")).unwrap());
+        let canonical_repo = repo.canonicalize().unwrap();
+
+        let checkout = acquire_worker_checkout(
+            store.clone(),
+            repo.to_str().unwrap(),
+            "worker",
+            Some(&canonical_repo),
+            state.path(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let expected = canonical_repo.parent().unwrap().join(format!(
+            "{}-w1",
+            canonical_repo.file_name().unwrap().to_string_lossy()
+        ));
+        assert_eq!(std::path::Path::new(&checkout.workspace), expected);
+        assert!(!std::path::Path::new(&checkout.workspace).starts_with(&canonical_repo));
+    }
+
+    #[tokio::test]
+    async fn dirty_free_checkout_is_quarantined_and_preserved() {
+        let root = tempdir().unwrap();
+        let repo = root.path().join("widgets");
+        std::fs::create_dir(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        let canonical_root = root.path().canonicalize().unwrap();
+        let store = Arc::new(Store::open(root.path().join("ninox.db")).unwrap());
+        let fallback = root.path().join("fallback");
+        let first = acquire_worker_checkout(
+            store.clone(),
+            repo.to_str().unwrap(),
+            "worker-one",
+            Some(&canonical_root),
+            &fallback,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(release_pooled_checkout_lease(
+            store.clone(),
+            first.pooled_lease.clone().unwrap(),
+        )
+        .await
+        .unwrap());
+
+        let dirty = std::path::Path::new(&first.workspace).join("important.txt");
+        std::fs::write(&dirty, "preserve me").unwrap();
+        let failure = acquire_worker_checkout(
+            store.clone(),
+            repo.to_str().unwrap(),
+            "worker-two",
+            Some(&canonical_root),
+            &fallback,
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(failure.to_string().contains("dirty"), "{failure:#}");
+        assert_eq!(std::fs::read_to_string(&dirty).unwrap(), "preserve me");
+        let quarantined = store
+            .pooled_checkout_by_path(std::path::Path::new(&first.workspace))
+            .unwrap()
+            .unwrap();
+        assert_eq!(quarantined.state, PooledCheckoutState::Quarantined);
+        assert!(quarantined.quarantine_reason.is_some());
+
+        std::fs::remove_file(&dirty).unwrap();
+        let recovered = acquire_worker_checkout(
+            store.clone(),
+            repo.to_str().unwrap(),
+            "worker-three",
+            Some(&canonical_root),
+            &fallback,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.workspace, first.workspace);
+        assert_eq!(store.pooled_checkouts_by_repo(&repo).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_target_never_claims_an_arbitrary_free_slot() {
+        let repo = init_git_repo();
+        let root = tempdir().unwrap();
+        let store = Arc::new(Store::open(root.path().join("ninox.db")).unwrap());
+        let free = acquire_worker_checkout(
+            store.clone(),
+            repo.to_str().unwrap(),
+            "free-worker",
+            None,
+            root.path(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(release_pooled_checkout_lease(
+            store.clone(),
+            free.pooled_lease.unwrap(),
+        )
+        .await
+        .unwrap());
+        let requested = root.path().join("explicit-target");
+
+        let checkout = acquire_worker_checkout_at_for_incarnation(
+            store,
+            repo.to_str().unwrap(),
+            &requested,
+            "explicit-worker",
+            "explicit-incarnation",
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(checkout.workspace, requested.to_string_lossy());
+        assert_ne!(checkout.workspace, free.workspace);
+    }
+
+    #[tokio::test]
+    async fn ui_failed_bind_rollback_leaves_refile_successor_checkout_untouched() {
+        let repo = init_git_repo();
+        let root = tempdir().unwrap();
+        let store = Arc::new(Store::open(root.path().join("ninox.db")).unwrap());
+        let old = store
+            .prepare_worker_incarnation(
+                "worker",
+                None,
+                1,
+                repo.to_str().unwrap(),
+                true,
+                3,
+            )
+            .unwrap();
+        let checkout = acquire_worker_checkout_for_incarnation(
+            store.clone(),
+            repo.to_str().unwrap(),
+            "worker",
+            &old.incarnation_id,
+            None,
+            root.path(),
+            false,
+        )
+        .await
+        .unwrap();
+        let lease = checkout.pooled_lease.as_ref().unwrap().clone();
+        assert!(store
+            .bind_worker_incarnation(
+                "worker",
+                &old.incarnation_id,
+                &checkout.source_workspace,
+                &checkout.workspace,
+                Some(&lease.lease_id),
+            )
+            .unwrap());
+        let successor = store
+            .prepare_worker_incarnation(
+                "worker",
+                None,
+                2,
+                repo.to_str().unwrap(),
+                true,
+                3,
+            )
+            .unwrap();
+
+        assert!(
+            !rollback_worker_incarnation_checkout(
+                store.clone(),
+                "worker",
+                &old.incarnation_id,
+                Some(&checkout),
+            )
+            .await
+        );
+        assert!(std::path::Path::new(&checkout.workspace).is_dir());
+        let record = store.pooled_checkout_by_path(&lease.path).unwrap().unwrap();
+        assert_eq!(
+            record.owner_incarnation_id.as_deref(),
+            Some(successor.incarnation_id.as_str())
+        );
+        assert_eq!(record.lease_id.as_deref(), Some(lease.lease_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn partial_quarantined_slot_recovers_in_place_without_suffix_growth() {
+        let root = tempdir().unwrap();
+        let repo = root.path().join("widgets");
+        std::fs::create_dir(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        let canonical_root = root.path().canonicalize().unwrap();
+        let store = Arc::new(Store::open(root.path().join("ninox.db")).unwrap());
+        let fallback = root.path().join("fallback");
+        let first = acquire_worker_checkout(
+            store.clone(),
+            repo.to_str().unwrap(),
+            "worker-one",
+            Some(&canonical_root),
+            &fallback,
+            false,
+        )
+        .await
+        .unwrap();
+        let lease = first.pooled_lease.unwrap();
+        std::fs::write(
+            lease.worktree_git_dir.as_ref().unwrap().join("ninox-identity"),
+            "",
+        )
+        .unwrap();
+        assert!(store
+            .quarantine_pooled_checkout_lease_for_incarnation(
+                &lease.path,
+                &lease.session_id,
+                &lease.owner_incarnation_id,
+                &lease.lease_id,
+                "simulated marker publication crash",
+            )
+            .unwrap());
+
+        let recovered = acquire_worker_checkout(
+            store.clone(),
+            repo.to_str().unwrap(),
+            "worker-two",
+            Some(&canonical_root),
+            &fallback,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(recovered.workspace, first.workspace);
+        assert_eq!(store.pooled_checkouts_by_repo(&repo).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_finalization_reservation_recovers_without_allocating_a_new_slot() {
+        let root = tempdir().unwrap();
+        let repo = root.path().join("widgets");
+        std::fs::create_dir(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        let canonical_root = root.path().canonicalize().unwrap();
+        let identity = ninox_core::worktree::RepositoryIdentity::resolve(&repo).unwrap();
+        let store = Arc::new(Store::open(root.path().join("ninox.db")).unwrap());
+        let stale = store
+            .prepare_worker_incarnation("stale", None, 1, repo.to_str().unwrap(), true, 3)
+            .unwrap();
+        let lease = store
+            .reserve_pooled_checkout_for_incarnation(
+                &identity.top_level,
+                &identity.common_git_dir,
+                "stale",
+                &stale.incarnation_id,
+                "stale",
+            )
+            .unwrap();
+        ninox_core::worktree::PooledWorktree::create(&lease).unwrap();
+        let claim = store
+            .claim_worker_cleanup("stale", &stale.incarnation_id)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .complete_worker_claim(
+                "stale",
+                &claim.incarnation_id,
+                ninox_core::types::WorkerIncarnationState::CleanupClaimed,
+            )
+            .unwrap());
+
+        let recovered = acquire_worker_checkout(
+            store.clone(),
+            repo.to_str().unwrap(),
+            "replacement",
+            Some(&canonical_root),
+            &root.path().join("fallback"),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(recovered.workspace, lease.path.to_string_lossy());
+        assert_eq!(store.pooled_checkouts_by_repo(&repo).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn git_workspace_outside_configured_pool_uses_recyclable_managed_root_slot() {
+        let repo = init_git_repo();
+        let managed_root = tempdir().unwrap();
+        let store = Arc::new(
+            Store::open(tempdir().unwrap().keep().join("ninox.db")).unwrap(),
+        );
+
+        let checkout = acquire_worker_checkout(
+            store.clone(),
+            repo.to_str().unwrap(),
+            "managed-worker",
+            None,
+            managed_root.path(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(std::path::Path::new(&checkout.workspace).starts_with(managed_root.path()));
+        let lease = checkout.pooled_lease.expect("recyclable checkout lease");
+        assert!(ninox_core::worktree::PooledWorktree::from_lease(&lease)
+            .unwrap()
+            .matches_identity()
+            .unwrap());
+        let exclude = repo.join(".git/info/exclude");
+        let mut rules = std::fs::read_to_string(&exclude).unwrap_or_default();
+        rules.push_str("cache/\n");
+        std::fs::write(exclude, rules).unwrap();
+        let cache = std::path::Path::new(&checkout.workspace).join("cache/artifact");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, "warm").unwrap();
+        assert!(release_pooled_checkout_lease(store.clone(), lease)
+            .await
+            .unwrap());
+        let released = store
+            .pooled_checkout_by_path(std::path::Path::new(&checkout.workspace))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            released.kind,
+            ninox_core::types::PooledCheckoutKind::Managed
+        );
+        assert_eq!(
+            released.state,
+            PooledCheckoutState::Free,
+            "{:?}",
+            released.quarantine_reason
+        );
+
+        let reused = acquire_worker_checkout(
+            store,
+            repo.to_str().unwrap(),
+            "managed-worker-two",
+            None,
+            managed_root.path(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reused.workspace, checkout.workspace);
+        assert_eq!(std::fs::read_to_string(cache).unwrap(), "warm");
+    }
+
+    #[tokio::test]
+    async fn acquired_checkout_seeds_brain_skill_verbatim() {
+        let repo = init_git_repo();
+        let managed_root = tempdir().unwrap();
+        let store = Arc::new(
+            Store::open(tempdir().unwrap().keep().join("ninox.db")).unwrap(),
+        );
+        let checkout = acquire_worker_checkout(
+            store,
+            repo.to_str().unwrap(),
+            "seeded-worker",
+            None,
+            managed_root.path(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        seed_worker_brain_skill(&checkout.workspace).await.unwrap();
+        let seeded = std::fs::read_to_string(
+            std::path::Path::new(&checkout.workspace)
+                .join(".claude/skills/brain/SKILL.md"),
+        )
+        .unwrap();
+        assert_eq!(seeded.as_bytes(), WORKER_BRAIN_SKILL.as_bytes());
+    }
+
+    #[tokio::test]
     async fn create_worker_worktree_writes_statusline_settings() {
         let repo = init_git_repo();
         let worktree = create_worker_worktree(repo.to_str().unwrap(), "test-session-1", false).await.unwrap();
@@ -712,14 +2058,16 @@ mod tests {
         let first = create_worker_worktree(repo.to_str().unwrap(), "test-session-2", false).await.unwrap();
         let settings_path = std::path::Path::new(&first).join(".claude").join("settings.json");
         std::fs::write(&settings_path, r#"{"userCustom": true}"#).unwrap();
-        std::process::Command::new("git")
-            .args(["-C", &first, "add", ".claude/settings.json"])
-            .output()
+        let status = std::process::Command::new("git")
+            .args(["-C", &first, "add", "-f", ".claude/settings.json"])
+            .status()
             .unwrap();
-        std::process::Command::new("git")
+        assert!(status.success());
+        let status = std::process::Command::new("git")
             .args(["-C", &first, "commit", "-q", "-m", "custom settings"])
-            .output()
+            .status()
             .unwrap();
+        assert!(status.success());
 
         std::process::Command::new("git")
             .args(["-C", repo.to_str().unwrap(), "worktree", "remove", "--force", &first])

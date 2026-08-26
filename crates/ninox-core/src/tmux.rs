@@ -177,6 +177,7 @@ fn is_missing_session(e: &anyhow::Error) -> bool {
     let msg = e.to_string();
     msg.contains("can't find session")
         || msg.contains("session not found")
+        || msg.contains("no such session")
         || msg.contains("no server running")
         || msg.contains("no sessions")
         // tmux's message for a session-targeted command (has-session,
@@ -195,6 +196,22 @@ pub struct TmuxSession {
     pub created_ms: i64,
     pub pid:        Option<u32>,
     pub tty:        Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactTmuxSession {
+    pub physical_tmux_name: String,
+    pub pane_id: String,
+    pub pane_pid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxPaneIdentity {
+    pub physical_tmux_name: String,
+    pub pane_id: String,
+    pub pane_pid: u32,
+    pub pane_created_at: i64,
+    pub server_epoch: String,
 }
 
 /// Run a tmux subcommand against the ninox server and return trimmed stdout.
@@ -333,9 +350,237 @@ pub async fn kill_session(id: &str) -> Result<()> {
     }
 }
 
+/// Kill one exact session on Ninox's private server only.
+pub async fn kill_private_session(id: &str) -> Result<()> {
+    let exact = format!("={id}");
+    match run(&["kill-session", "-t", &exact]).await {
+        Ok(_) => Ok(()),
+        Err(error) if is_missing_session(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Returns `true` if a tmux session with this name is currently running.
 pub async fn has_session(id: &str) -> bool {
     run_session_scoped(&["has-session", "-t", id]).await.is_ok()
+}
+
+/// Resolve one immutable physical runtime on the private server only.
+///
+/// Exact selectors avoid tmux prefix matching. Multiple panes are ambiguous
+/// and therefore never accepted as a worker runtime capability.
+pub async fn exact_private_session(id: &str) -> Result<Option<ExactTmuxSession>> {
+    let selector = format!("={id}:");
+    let output = match run(&[
+        "list-panes",
+        "-t",
+        &selector,
+        "-F",
+        "#{session_name}|#{pane_id}|#{pane_pid}|#{pane_dead}",
+    ])
+    .await
+    {
+        Ok(output) => output,
+        Err(error) if is_missing_session(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let panes = output.lines().filter(|line| !line.is_empty()).collect::<Vec<_>>();
+    anyhow::ensure!(
+        panes.len() == 1,
+        "exact physical runtime has {} panes",
+        panes.len()
+    );
+    let mut fields = panes[0].splitn(4, '|');
+    let physical_tmux_name = fields.next().unwrap_or_default();
+    let pane_id = fields.next().unwrap_or_default();
+    let pane_pid = fields.next().unwrap_or_default();
+    let pane_dead = fields.next().unwrap_or_default();
+    anyhow::ensure!(
+        physical_tmux_name == id && pane_id.starts_with('%'),
+        "exact physical runtime identity is malformed"
+    );
+    if pane_dead == "1" {
+        return Ok(None);
+    }
+    let pane_pid = pane_pid
+        .parse::<u32>()
+        .context("exact physical runtime has invalid pane PID")?;
+    Ok(Some(ExactTmuxSession {
+        physical_tmux_name: physical_tmux_name.to_string(),
+        pane_id: pane_id.to_string(),
+        pane_pid,
+    }))
+}
+
+pub async fn private_session_env(id: &str, key: &str) -> Result<Option<String>> {
+    anyhow::ensure!(
+        !key.is_empty() && !key.contains('='),
+        "invalid tmux environment key"
+    );
+    let exact = format!("={id}");
+    match run(&["show-environment", "-t", &exact, key]).await {
+        Ok(value) => {
+            let prefix = format!("{key}=");
+            value
+                .strip_prefix(&prefix)
+                .map(|value| Some(value.to_string()))
+                .context("live tmux session is missing its runtime capability")
+        }
+        Err(error) if is_missing_session(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Resolve the exact private pane that owns the calling process.
+pub async fn current_private_pane_identity() -> Result<Option<TmuxPaneIdentity>> {
+    let ancestors = process_ancestor_pids();
+    let raw = match run(&[
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name}|#{pane_id}|#{pane_pid}|#{pid}|#{session_created}",
+    ])
+    .await
+    {
+        Ok(raw) => raw,
+        Err(error) if is_missing_session(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(raw.lines().find_map(|line| {
+        let mut columns = line.splitn(5, '|');
+        let physical_tmux_name = columns.next()?.to_string();
+        let pane_id = columns.next()?.to_string();
+        let pane_pid = columns.next()?.parse::<u32>().ok()?;
+        let server_pid = columns.next()?.parse::<u32>().ok()?;
+        let server_created = columns.next()?.parse::<i64>().ok()?;
+        ancestors
+            .contains(&pane_pid)
+            .then(|| TmuxPaneIdentity {
+                physical_tmux_name,
+                pane_id,
+                pane_pid,
+                pane_created_at: process_started_at(pane_pid),
+                server_epoch: format!("{server_pid}:{server_created}"),
+            })
+    }))
+}
+
+pub async fn private_pane_identity(
+    physical_tmux_name: &str,
+) -> Result<Option<TmuxPaneIdentity>> {
+    let exact = format!("={physical_tmux_name}:");
+    let raw = match run(&[
+        "list-panes",
+        "-t",
+        &exact,
+        "-F",
+        "#{session_name}|#{pane_id}|#{pane_pid}|#{pid}|#{session_created}",
+    ])
+    .await
+    {
+        Ok(raw) => raw,
+        Err(error) if is_missing_session(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let panes = raw
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.splitn(5, '|');
+            let physical_tmux_name = columns.next()?.to_string();
+            let pane_id = columns.next()?.to_string();
+            let pane_pid = columns.next()?.parse::<u32>().ok()?;
+            let server_pid = columns.next()?.parse::<u32>().ok()?;
+            let server_created = columns.next()?.parse::<i64>().ok()?;
+            Some(TmuxPaneIdentity {
+                physical_tmux_name,
+                pane_id,
+                pane_pid,
+                pane_created_at: process_started_at(pane_pid),
+                server_epoch: format!("{server_pid}:{server_created}"),
+            })
+        })
+        .collect::<Vec<_>>();
+    match panes.as_slice() {
+        [] => Ok(None),
+        [pane] => Ok(Some(pane.clone())),
+        _ => anyhow::bail!("exact physical runtime has {} panes", panes.len()),
+    }
+}
+
+pub fn caller_descends_from(root_pid: u32) -> bool {
+    process_ancestor_pids().contains(&root_pid)
+}
+
+fn process_ancestor_pids() -> Vec<u32> {
+    let mut ancestors = Vec::new();
+    let mut pid = std::process::id();
+    while pid > 1 && !ancestors.contains(&pid) {
+        ancestors.push(pid);
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-o", "ppid=", "-p", &pid.to_string()])
+            .output();
+        let Some(parent) = output
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|output| output.trim().parse::<u32>().ok())
+        else {
+            break;
+        };
+        pid = parent;
+    }
+    ancestors
+}
+
+fn process_started_at(pid: u32) -> i64 {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "etime=", "-p", &pid.to_string()])
+        .output();
+    let elapsed = output
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|value| parse_elapsed_seconds(value.trim()))
+        .unwrap_or(0);
+    crate::lifecycle::poller::now_millis() - elapsed.saturating_mul(1000)
+}
+
+fn parse_elapsed_seconds(value: &str) -> Option<i64> {
+    let (days, clock) = match value.split_once('-') {
+        Some((days, clock)) => (days.parse().ok()?, clock),
+        None => (0, value),
+    };
+    let parts = clock
+        .split(':')
+        .map(str::parse::<i64>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    let seconds = match parts.as_slice() {
+        [minutes, seconds] => minutes * 60 + seconds,
+        [hours, minutes, seconds] => hours * 3600 + minutes * 60 + seconds,
+        _ => return None,
+    };
+    Some(days * 86_400 + seconds)
+}
+
+/// Read one variable from an exact tmux session. `None` means the session is
+/// absent; a live session without the requested capability is an error.
+pub async fn session_env(id: &str, key: &str) -> Result<Option<String>> {
+    anyhow::ensure!(
+        !key.is_empty() && !key.contains('='),
+        "invalid tmux environment key"
+    );
+    match run_session_scoped(&["show-environment", "-t", id, key]).await {
+        Ok(value) => {
+            let prefix = format!("{key}=");
+            value
+                .strip_prefix(&prefix)
+                .map(|value| Some(value.to_string()))
+                .context("live tmux session is missing its runtime capability")
+        }
+        Err(error) if is_missing_session(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// List every live tmux session.  Sessions on the ninox server are listed

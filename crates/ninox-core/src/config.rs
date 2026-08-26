@@ -177,6 +177,9 @@ impl SessionRetentionConfig {
 // App configuration
 // ---------------------------------------------------------------------------
 
+fn default_worker_checkout_cap() -> u8 { 3 }
+
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub port:      u16,
@@ -187,6 +190,17 @@ pub struct AppConfig {
     /// Defaults to `~/.config/ninox/orchestrator`.
     #[serde(default)]
     pub orchestrator_root: Option<PathBuf>,
+    /// Root for Ninox-managed worker worktrees.
+    #[serde(default)]
+    pub worktree_root: Option<PathBuf>,
+    /// Root containing repositories eligible for pooled worker checkouts.
+    /// Pooling remains disabled when unset.
+    #[serde(default)]
+    pub repositories_root: Option<PathBuf>,
+    /// Maximum checkout-backed workers owned by one orchestrator. Local
+    /// delivery is deliberately bounded to three retained or active slots.
+    #[serde(default = "default_worker_checkout_cap")]
+    pub worker_checkout_cap: u8,
     /// Agent harness and model for orchestrator sessions.
     #[serde(default)]
     pub orchestrator: AgentConfig,
@@ -231,6 +245,9 @@ impl Default for AppConfig {
             font_size:        13.0,
             theme:            ThemeVariant::Dark,
             orchestrator_root: None,
+            worktree_root:    None,
+            repositories_root: None,
+            worker_checkout_cap: default_worker_checkout_cap(),
             orchestrator:     AgentConfig::default(),
             worker:           AgentConfig::default(),
             github_token:     None,
@@ -245,6 +262,14 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    pub fn validated_worker_checkout_cap(&self) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            (1..=3).contains(&self.worker_checkout_cap),
+            "worker_checkout_cap must be between 1 and 3"
+        );
+        Ok(self.worker_checkout_cap as usize)
+    }
+
     /// The effective harness registry: builtin specs overlaid by this
     /// config's `[harnesses.*]` entries.
     pub fn registry(&self) -> HarnessRegistry {
@@ -330,6 +355,45 @@ impl AppConfig {
                 .join("ninox")
                 .join("orchestrator")
         })
+    }
+
+    pub fn resolved_worktree_root(&self) -> PathBuf {
+        let path = self.worktree_root.clone().unwrap_or_else(|| {
+            dirs::data_dir()
+                .or_else(dirs::config_dir)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("ninox")
+                .join("worktrees")
+        });
+        Self::resolve_root_path(path)
+    }
+
+    pub fn resolved_repositories_root(&self) -> Option<PathBuf> {
+        self.repositories_root.clone().map(Self::resolve_root_path)
+    }
+
+    fn resolve_root_path(path: PathBuf) -> PathBuf {
+        if path == std::path::Path::new("~") {
+            return dirs::home_dir().unwrap_or(path);
+        }
+        if let Ok(rest) = path.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                return home.join(rest);
+            }
+        }
+        if path.is_absolute() {
+            return path;
+        }
+        Self::config_path()
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.join(&path))
+            .unwrap_or_else(|| {
+                dirs::config_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("ninox")
+                    .join(path)
+            })
     }
 
     /// Path to the `config.toml` file.
@@ -479,6 +543,67 @@ mod tests {
     fn resolved_orchestrator_root_default() {
         let cfg = AppConfig::default();
         assert!(cfg.resolved_orchestrator_root().ends_with("ninox/orchestrator"));
+    }
+
+    #[test]
+    fn worker_workspace_roots_default_compatibly() {
+        let cfg = AppConfig::default();
+        assert!(cfg.repositories_root.is_none());
+        assert!(cfg.resolved_repositories_root().is_none());
+        assert_eq!(
+            cfg.resolved_worktree_root(),
+            dirs::data_dir()
+                .or_else(dirs::config_dir)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("ninox")
+                .join("worktrees")
+        );
+
+        let old: AppConfig =
+            toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert!(old.worktree_root.is_none());
+        assert!(old.repositories_root.is_none());
+    }
+
+    #[test]
+    fn worker_checkout_cap_defaults_to_three_and_rejects_out_of_range_values() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.validated_worker_checkout_cap().unwrap(), 3);
+        config.worker_checkout_cap = 0;
+        assert!(config.validated_worker_checkout_cap().is_err());
+        config.worker_checkout_cap = 4;
+        assert!(config.validated_worker_checkout_cap().is_err());
+    }
+
+    #[test]
+    fn worker_workspace_roots_expand_home_and_anchor_relative_paths() {
+        let config_dir = tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let cfg = AppConfig {
+                worktree_root: Some(PathBuf::from("~/managed")),
+                repositories_root: Some(PathBuf::from("repositories")),
+                ..AppConfig::default()
+            };
+            assert_eq!(
+                cfg.resolved_worktree_root(),
+                dirs::home_dir().unwrap().join("managed")
+            );
+            assert_eq!(
+                cfg.resolved_repositories_root(),
+                Some(config_dir.path().join("repositories"))
+            );
+        });
+    }
+
+    #[test]
+    fn worker_workspace_roots_are_top_level_toml_keys() {
+        let cfg: AppConfig = toml::from_str(
+            "port = 8080\nfont_size = 13.0\nworktree_root = \"/tmp/wt\"\nrepositories_root = \"/tmp/repos\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.worktree_root, Some(PathBuf::from("/tmp/wt")));
+        assert_eq!(cfg.repositories_root, Some(PathBuf::from("/tmp/repos")));
     }
 
     #[test]

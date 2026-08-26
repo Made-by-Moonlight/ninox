@@ -16,6 +16,8 @@ pub mod pty;
 pub mod store;
 pub mod tmux;
 pub mod types;
+pub mod workers;
+pub mod worktree;
 
 pub use brain::{BrainEntry, BrainIndex, QueryFilters};
 pub use config::{AppConfig, ThemeVariant};
