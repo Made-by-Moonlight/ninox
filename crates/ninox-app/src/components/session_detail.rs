@@ -14,14 +14,9 @@ fn repo_short(repo: &str) -> &str {
     repo.rsplit('/').next().unwrap_or(repo)
 }
 
-/// Whether Resume should be offered for `session` — driven entirely by what's
-/// stored (a `claude_session_id`, a `workspace_path`, a resume-capable
-/// harness), never by the session's current status. A Terminated session
-/// with a recorded id is just as resumable as an Interrupted one; status
-/// only affects how the fleet board *displays* a dead session, not whether
-/// its conversation can be continued. Delegates to `resume_plan` itself
-/// (rather than re-deriving the same checks) so the button can never drift
-/// from what actually happens on click.
+/// Resume/Restart remains status-agnostic, but worker lifecycle claims can
+/// temporarily suppress it while release or another runtime start owns the
+/// exact incarnation.
 /// "Resume" and "Restart" are the exact same action on the exact same
 /// button (kill the pane if one exists, relaunch with the session's stored
 /// `claude_session_id` so the conversation continues) — only the label
@@ -39,8 +34,14 @@ fn resume_label(status: &ninox_core::types::SessionStatus) -> &'static str {
     }
 }
 
-fn can_resume(session: &Session, is_orchestrator: bool, config: &AppConfig) -> bool {
-    crate::app::resume_plan(session, is_orchestrator, config).is_some()
+fn can_resume(
+    session: &Session,
+    is_orchestrator: bool,
+    config: &AppConfig,
+    worker_lifecycle_available: bool,
+) -> bool {
+    (is_orchestrator || worker_lifecycle_available)
+        && crate::app::resume_plan(session, is_orchestrator, config).is_some()
 }
 
 // ── Terminal chrome budget ───────────────────────────────────────────────────
@@ -327,6 +328,34 @@ pub fn session_detail<'a>(
     if let Some(name) = orch_name {
         subline_parts.push(format!("worker of {name}"));
     }
+    let pooled_checkout = app
+        .engine
+        .store
+        .pooled_checkout_by_session(session_id)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            session.workspace_path.as_deref().and_then(|workspace| {
+                app.engine
+                    .store
+                    .pooled_checkout_by_path(std::path::Path::new(workspace))
+                    .ok()
+                    .flatten()
+            })
+        });
+    if let Some(checkout) = pooled_checkout {
+        let slot = checkout
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("pooled checkout");
+        let state = match checkout.state {
+            ninox_core::PooledCheckoutState::Quarantined => "pooled checkout quarantined",
+            ninox_core::PooledCheckoutState::Free => "pooled checkout released",
+            _ => "pooled checkout",
+        };
+        subline_parts.push(format!("{state} · {slot}"));
+    }
     let subline = subline_parts.join(" · ");
 
     let identity = column![
@@ -386,7 +415,55 @@ pub fn session_detail<'a>(
             .into()
     };
 
-    let resume_btn: Element<Message> = if can_resume(session, is_orchestrator, &app.config) {
+    let released_pool = !is_orchestrator
+        && session
+            .workspace_path
+            .as_deref()
+            .and_then(|workspace| {
+                app.engine
+                    .store
+                    .pooled_checkout_by_path(std::path::Path::new(workspace))
+                    .ok()
+                    .flatten()
+            })
+            .is_some()
+        && app
+            .engine
+            .store
+            .pooled_checkout_by_session(&session.id)
+            .ok()
+            .flatten()
+            .is_none();
+    let worker_lifecycle_available = if is_orchestrator {
+        true
+    } else {
+        let worker = app
+            .engine
+            .store
+            .current_worker_incarnation(&session.id)
+            .ok()
+            .flatten();
+        let claimed = app
+            .engine
+            .store
+            .worker_runtime_claimed(&session.id)
+            .unwrap_or(true);
+        !claimed
+            && worker.as_ref().is_none_or(|worker| {
+                matches!(
+                    worker.state,
+                    ninox_core::types::WorkerIncarnationState::Active
+                        | ninox_core::types::WorkerIncarnationState::Retained
+                )
+            })
+    };
+    let resume_btn: Element<Message> =
+        if can_resume(
+            session,
+            is_orchestrator,
+            &app.config,
+            worker_lifecycle_available,
+        ) && !released_pool {
         let sid = session_id.to_string();
         button(crate::style::micro_label(resume_label(&session.status), s.status_review).size(10.0))
             .on_press(Message::ResumeSession(sid))
@@ -624,7 +701,7 @@ mod tests {
         ] {
             let s = session_with(status, Some("uuid-1"), Some("/tmp/ws"));
             assert!(
-                can_resume(&s, false, &cfg),
+                can_resume(&s, false, &cfg, true),
                 "expected resumable regardless of status when an id is stored",
             );
         }
@@ -645,14 +722,14 @@ mod tests {
     fn resume_unavailable_without_a_stored_claude_session_id() {
         let cfg = AppConfig::default();
         let s = session_with(SessionStatus::Terminated, None, Some("/tmp/ws"));
-        assert!(!can_resume(&s, false, &cfg));
+        assert!(!can_resume(&s, false, &cfg, true));
     }
 
     #[test]
     fn resume_unavailable_without_a_workspace() {
         let cfg = AppConfig::default();
         let s = session_with(SessionStatus::Terminated, Some("uuid-1"), None);
-        assert!(!can_resume(&s, false, &cfg));
+        assert!(!can_resume(&s, false, &cfg, true));
     }
 
     #[test]
@@ -660,6 +737,14 @@ mod tests {
         let cfg = AppConfig::default();
         let mut s = session_with(SessionStatus::Terminated, Some("uuid-1"), Some("/tmp/ws"));
         s.agent_type = "codex".into();
-        assert!(!can_resume(&s, false, &cfg));
+        assert!(!can_resume(&s, false, &cfg, true));
+    }
+
+    #[test]
+    fn resume_unavailable_while_worker_lifecycle_is_claimed() {
+        let cfg = AppConfig::default();
+        let s = session_with(SessionStatus::Done, Some("uuid-1"), Some("/tmp/ws"));
+        assert!(!can_resume(&s, false, &cfg, false));
+        assert!(can_resume(&s, true, &cfg, false));
     }
 }
