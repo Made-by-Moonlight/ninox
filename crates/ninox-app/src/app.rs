@@ -202,6 +202,30 @@ pub struct BrainViewState {
     pub layout: HashMap<String, (f32, f32)>,
 }
 
+/// One orchestrator's registered goals/plan doc, as last read from disk.
+/// Keyed by `orchestrator_id` on `App::plan_docs` — see
+/// `docs/superpowers/specs/2026-08-26-orchestrator-plan-tracking-design.md`.
+/// Not `Clone`/`Debug`-derived: `text_editor::Content` supports neither.
+pub struct PlanDocState {
+    pub file_path:  Option<String>,
+    pub content:    iced::widget::text_editor::Content,
+    last_mtime:     Option<std::time::SystemTime>,
+    /// Set when the row exists but the file itself is missing/unreadable —
+    /// distinct from "nothing registered" so the panel can say so.
+    pub error:      Option<String>,
+}
+
+impl Default for PlanDocState {
+    fn default() -> Self {
+        Self {
+            file_path: None,
+            content: iced::widget::text_editor::Content::new(),
+            last_mtime: None,
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum View {
     FleetBoard { scope: Option<OrchestratorId> },
@@ -245,6 +269,9 @@ pub struct App {
     /// Absent = not fetched yet (render "Loading…"); `Some(None)` = fetched,
     /// no diff (no workspace recorded, or a clean working tree).
     pub diffs:           HashMap<SessionId, Option<String>>,
+    /// Registered goals/plan doc per orchestrator, refreshed by
+    /// `ensure_plan` — see `PlanDocState`.
+    pub plan_docs:       HashMap<OrchestratorId, PlanDocState>,
     pub notifications:   VecDeque<Notification>,
     /// True while an `ApplyUpdate`-triggered `cargo install` subprocess is
     /// running — disables the "Update now" action so a second click can't
@@ -338,6 +365,11 @@ pub enum Message {
     CatalogueFormConfirm,
     CatalogueFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
+    /// A non-edit `text_editor::Action` (click/drag/select/scroll) from the
+    /// read-only Plan panel — applied to `plan_docs[orchestrator_id]` so
+    /// selection/copy work; `Action::Edit(_)` is deliberately dropped (see
+    /// `components::selectable_markdown`).
+    PlanEditorAction { orchestrator_id: OrchestratorId, action: iced::widget::text_editor::Action },
     RemoveOrchestrator(OrchestratorId),
     RemoveSession(SessionId),
     /// Kill the tmux session and respawn the same name/workspace with the
@@ -877,6 +909,7 @@ impl App {
             ci_status:      HashMap::new(),
             review_threads,
             diffs:          HashMap::new(),
+            plan_docs:      HashMap::new(),
             notifications:  VecDeque::new(),
             update_in_progress: false,
             version_check:  VersionCheckState::NotChecked,
@@ -988,6 +1021,40 @@ impl App {
             .await;
             Message::DiffFetched { session_id: sid, diff }
         })
+    }
+
+    /// Refreshes `state.plan_docs[orchestrator_id]` from the store + disk,
+    /// synchronously — no async round-trip, since this is a local sqlite
+    /// lookup plus a small markdown file read, not a subprocess. Called
+    /// on-demand when the Plan panel is opened, and on every `PollSessions`
+    /// tick while it stays open (no file-watcher; see the design doc).
+    /// Skips the disk read entirely when the file's mtime hasn't moved.
+    fn ensure_plan(state: &mut App, orchestrator_id: &str) -> Task<Message> {
+        let Ok(Some(registration)) = state.engine.store.get_orchestrator_plan(orchestrator_id)
+        else {
+            state.plan_docs.remove(orchestrator_id);
+            return Task::none();
+        };
+        let mtime = std::fs::metadata(&registration.file_path).and_then(|m| m.modified()).ok();
+        let doc = state.plan_docs.entry(orchestrator_id.to_string()).or_default();
+        let unchanged = mtime.is_some()
+            && mtime == doc.last_mtime
+            && doc.file_path.as_deref() == Some(registration.file_path.as_str());
+        if unchanged {
+            return Task::none();
+        }
+        doc.file_path = Some(registration.file_path.clone());
+        doc.last_mtime = mtime;
+        match std::fs::read_to_string(&registration.file_path) {
+            Ok(text) => {
+                doc.content = iced::widget::text_editor::Content::with_text(&text);
+                doc.error = None;
+            }
+            Err(error) => {
+                doc.error = Some(error.to_string());
+            }
+        }
+        Task::none()
     }
 
     /// Kicks off an on-demand registry check for Settings' version line.
@@ -2105,8 +2172,18 @@ impl App {
                 }
                 match (new_panel, session_id) {
                     (DetailPanel::Diff, Some(sid)) => Self::ensure_diff(state, &sid),
+                    (DetailPanel::Plan, Some(sid)) => Self::ensure_plan(state, &sid),
                     _ => Task::none(),
                 }
+            }
+
+            Message::PlanEditorAction { orchestrator_id, action } => {
+                if !action.is_edit() {
+                    if let Some(doc) = state.plan_docs.get_mut(&orchestrator_id) {
+                        doc.content.perform(action);
+                    }
+                }
+                Task::none()
             }
 
             Message::RemoveOrchestrator(id) => {
@@ -2123,6 +2200,7 @@ impl App {
                 });
                 state.terminals.remove(&id);
                 state.diffs.remove(&id);
+                state.plan_docs.remove(&id);
                 // Drop clients for the orchestrator itself and any worker
                 // sessions removed above — only surviving sessions keep theirs.
                 state.clients.retain(|sid, _| state.sessions.contains_key(sid));
@@ -2795,9 +2873,16 @@ impl App {
                 // Refresh the diff for whatever session is on the Diff panel
                 // right now — a live session's diff changes as the worker
                 // commits, so this is the "keeps updating" tick for it.
+                // Same idea for the Plan panel: no file-watcher exists in
+                // this codebase, so this 3s tick doubles as the plan doc's
+                // freshness bar too (see docs/superpowers/specs/2026-08-26-
+                // orchestrator-plan-tracking-design.md).
                 match &state.view {
                     View::SessionDetail { session_id, panel: DetailPanel::Diff } => {
                         Self::ensure_diff(state, &session_id.clone())
+                    }
+                    View::SessionDetail { session_id, panel: DetailPanel::Plan } => {
+                        Self::ensure_plan(state, &session_id.clone())
                     }
                     _ => Task::none(),
                 }
@@ -3793,6 +3878,20 @@ delivery, Ninox will also warn you (`[Ninox] Worker … opened N PRs beyond its
 tracked PR`) if a worker opens extra PRs anyway; review each extra PR and
 either close it or hand it to a dedicated worker.
 
+## Tracking Your Plan
+
+Register a markdown file as your goals/plan doc so the user can follow along
+live in the desktop app, rendered and updating as you edit the file:
+
+```bash
+{ninox_bin} plan register /absolute/path/to/plan.md
+```
+
+Keep editing that same file as your plan evolves — no need to re-run
+`register` unless the path changes; re-registering (or re-editing) is always
+safe, it just replaces the tracked content. `{ninox_bin} plan show` prints
+the current registration; `{ninox_bin} plan unregister` stops tracking it.
+
 ## The Rule
 
 **Never use the Agent tool for implementation work.** All implementation goes
@@ -4307,6 +4406,7 @@ mod tests {
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
             diffs:          HashMap::new(),
+            plan_docs:      HashMap::new(),
             notifications:  VecDeque::new(),
             update_in_progress: false,
             version_check:  VersionCheckState::NotChecked,
@@ -5783,6 +5883,41 @@ mod tests {
             m.diffs.get("s1"),
             Some(&Some("diff --git a/x b/x\n+hello\n".to_string())),
         );
+    }
+
+    #[test]
+    fn plan_editor_action_drops_edits_but_applies_non_edit_actions() {
+        use iced::widget::text_editor::{Action, Edit};
+
+        let e = test_engine();
+        let mut m = base(e);
+        m.plan_docs.insert(
+            "orch".into(),
+            PlanDocState {
+                file_path: Some("/plan.md".into()),
+                content: iced::widget::text_editor::Content::with_text("hello"),
+                ..Default::default()
+            },
+        );
+        let before = m.plan_docs.get("orch").unwrap().content.text();
+
+        let (m, _) = m.update(Message::PlanEditorAction {
+            orchestrator_id: "orch".into(),
+            action: Action::Edit(Edit::Insert('x')),
+        });
+        assert_eq!(
+            m.plan_docs.get("orch").unwrap().content.text(),
+            before,
+            "an Edit action must never mutate a read-only plan doc"
+        );
+
+        // A non-edit action (e.g. select-all) is allowed through — it must
+        // not panic, and must not touch the text either.
+        let (m, _) = m.update(Message::PlanEditorAction {
+            orchestrator_id: "orch".into(),
+            action: Action::SelectAll,
+        });
+        assert_eq!(m.plan_docs.get("orch").unwrap().content.text(), before);
     }
 
     #[test]

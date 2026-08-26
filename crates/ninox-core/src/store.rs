@@ -567,6 +567,12 @@ impl Store {
                 claimed_at INTEGER NOT NULL,
                 finalized_at INTEGER
             );
+            CREATE TABLE IF NOT EXISTS orchestrator_plans (
+                orchestrator_id TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                registered_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
         ")?;
         migrate_legacy_worker_incarnations(&mut conn)?;
         // Migrations for columns added after initial release — idempotent so
@@ -1367,6 +1373,56 @@ impl Store {
         .map_err(Into::into)
     }
 
+    /// Register (or re-register) `orchestrator_id`'s goals/plan doc. Upsert:
+    /// re-registering bumps `updated_at` but leaves the original
+    /// `registered_at` untouched.
+    pub fn register_orchestrator_plan(
+        &self,
+        orchestrator_id: &str,
+        file_path: &str,
+        now: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO orchestrator_plans(orchestrator_id,file_path,registered_at,updated_at)
+             VALUES(?1,?2,?3,?3)
+             ON CONFLICT(orchestrator_id) DO UPDATE SET
+                file_path=excluded.file_path,
+                updated_at=excluded.updated_at",
+            params![orchestrator_id, file_path, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_orchestrator_plan(&self, orchestrator_id: &str) -> Result<Option<OrchestratorPlan>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT orchestrator_id,file_path,registered_at,updated_at
+             FROM orchestrator_plans WHERE orchestrator_id=?1",
+            [orchestrator_id],
+            |row| {
+                Ok(OrchestratorPlan {
+                    orchestrator_id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    registered_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Returns whether a row was actually removed.
+    pub fn unregister_orchestrator_plan(&self, orchestrator_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "DELETE FROM orchestrator_plans WHERE orchestrator_id=?1",
+            [orchestrator_id],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn sessions_by_orchestrator(&self, orchestrator_id: &str) -> Result<Vec<Session>> {
         let sessions = self.list_sessions()?;
         Ok(sessions.into_iter().filter(|s| s.orchestrator_id.as_deref() == Some(orchestrator_id)).collect())
@@ -1400,6 +1456,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         conn.execute("DELETE FROM orchestrator_runtimes WHERE orchestrator_id=?1", [id])?;
+        conn.execute("DELETE FROM orchestrator_plans WHERE orchestrator_id=?1", [id])?;
         conn.execute("DELETE FROM orchestrators WHERE id = ?1", [id])?;
         Ok(())
     }
@@ -5449,5 +5506,31 @@ mod tests {
             store.get_session("legacy").unwrap().unwrap().status,
             SessionStatus::Working
         ));
+    }
+
+    #[test]
+    fn orchestrator_plan_round_trips_and_upsert_preserves_registered_at() {
+        let store = test_store();
+        assert!(store.get_orchestrator_plan("orch").unwrap().is_none());
+
+        store
+            .register_orchestrator_plan("orch", "/plan.md", 100)
+            .unwrap();
+        let plan = store.get_orchestrator_plan("orch").unwrap().unwrap();
+        assert_eq!(plan.file_path, "/plan.md");
+        assert_eq!(plan.registered_at, 100);
+        assert_eq!(plan.updated_at, 100);
+
+        store
+            .register_orchestrator_plan("orch", "/other-plan.md", 200)
+            .unwrap();
+        let plan = store.get_orchestrator_plan("orch").unwrap().unwrap();
+        assert_eq!(plan.file_path, "/other-plan.md");
+        assert_eq!(plan.registered_at, 100, "registered_at must not move on re-register");
+        assert_eq!(plan.updated_at, 200);
+
+        assert!(store.unregister_orchestrator_plan("orch").unwrap());
+        assert!(store.get_orchestrator_plan("orch").unwrap().is_none());
+        assert!(!store.unregister_orchestrator_plan("orch").unwrap());
     }
 }

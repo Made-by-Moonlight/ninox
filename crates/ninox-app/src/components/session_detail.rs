@@ -196,6 +196,10 @@ pub enum DetailPanel {
     Info,
     Inspector,
     Diff,
+    /// Orchestrator-only: terminal + the registered plan doc, side by side —
+    /// the same layout/resize mechanics as `Split`, with `plan_pane`
+    /// instead of `info_pane`.
+    Plan,
 }
 
 /// Diff view — unified `git diff` text for the session's workspace
@@ -530,31 +534,37 @@ pub fn session_detail<'a>(
     });
 
     // ── Panel tabs ────────────────────────────────────────────────────────────
-    let tabs_block: Element<Message> = if is_orchestrator {
-        Space::new(0, 0).into()
+    // Orchestrator sessions get a reduced tab set (no Split/Info/Inspector/
+    // Diff — those are worker/PR concepts) plus the orchestrator-only Plan
+    // tab.
+    let tab_row: Element<Message> = if is_orchestrator {
+        row![
+            panel_btn(app, "Terminal", DetailPanel::Terminal, *panel),
+            panel_btn(app, "Plan", DetailPanel::Plan, *panel),
+        ]
+        .spacing(22)
+        .align_y(Alignment::Center)
+        .into()
     } else {
-        container(
-            column![
-                row![
-                    panel_btn(app, "Terminal", DetailPanel::Terminal, *panel),
-                    panel_btn(app, "Split", DetailPanel::Split, *panel),
-                    panel_btn(app, "Info", DetailPanel::Info, *panel),
-                    panel_btn(app, "Inspector", DetailPanel::Inspector, *panel),
-                    panel_btn(app, "Diff", DetailPanel::Diff, *panel),
-                ]
-                .spacing(22)
-                .align_y(Alignment::Center),
-                crate::style::hline(s.ink, 2.0),
-            ],
-        )
+        row![
+            panel_btn(app, "Terminal", DetailPanel::Terminal, *panel),
+            panel_btn(app, "Split", DetailPanel::Split, *panel),
+            panel_btn(app, "Info", DetailPanel::Info, *panel),
+            panel_btn(app, "Inspector", DetailPanel::Inspector, *panel),
+            panel_btn(app, "Diff", DetailPanel::Diff, *panel),
+        ]
+        .spacing(22)
+        .align_y(Alignment::Center)
+        .into()
+    };
+    let tabs_block: Element<Message> = container(column![tab_row, crate::style::hline(s.ink, 2.0)])
         .padding(Padding { top: 10.0, right: 28.0, bottom: 0.0, left: 28.0 })
         .width(Length::Fill)
         .style(move |_theme| container::Style {
             background: Some(Background::Color(s.card)),
             ..Default::default()
         })
-        .into()
-    };
+        .into();
 
     // ── Terminal pane ─────────────────────────────────────────────────────────
     let terminal_bg = s.term_bg;
@@ -644,7 +654,24 @@ pub fn session_detail<'a>(
     .into();
 
     // ── Panel routing ─────────────────────────────────────────────────────────
-    let effective_panel = if is_orchestrator { &DetailPanel::Terminal } else { panel };
+    // Orchestrators only ever see Terminal or Plan; anything else (a stale
+    // `worker_panel` global carried over from a worker session) falls back
+    // to Terminal rather than rendering a worker-only panel for an
+    // orchestrator.
+    let effective_panel = if is_orchestrator {
+        match panel {
+            DetailPanel::Plan => &DetailPanel::Plan,
+            _ => &DetailPanel::Terminal,
+        }
+    } else {
+        // The sticky global `worker_panel` can carry `Plan` over from an
+        // orchestrator session; Plan isn't offered in a worker's tab row,
+        // so fall back to Split rather than showing an always-empty panel.
+        match panel {
+            DetailPanel::Plan => &DetailPanel::Split,
+            _ => panel,
+        }
+    };
     let content: Element<Message> = match effective_panel {
         DetailPanel::Terminal => {
             term_stage(s, term_frame(s, color, tmux_line, status_word, terminal_pane))
@@ -659,6 +686,13 @@ pub fn session_detail<'a>(
         DetailPanel::Info => info_pane,
         DetailPanel::Inspector => inspector_panel(app, session),
         DetailPanel::Diff => diff_panel(app, session_id, s),
+        DetailPanel::Plan => row![
+            term_stage(s, term_frame(s, color, tmux_line, status_word, terminal_pane)),
+            App::drag_handle(DragTarget::InfoPanel, s.rule_dark),
+            crate::components::plan_panel::plan_pane(app, session_id, s),
+        ]
+        .height(Length::Fill)
+        .into(),
     };
 
     column![header, tabs_block, content]

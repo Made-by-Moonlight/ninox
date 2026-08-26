@@ -110,6 +110,18 @@ pub struct OrchestratorRuntimeIdentity {
     pub registered_at: i64,
 }
 
+/// An orchestrator's registered goals/plan markdown doc — a pointer
+/// (`file_path`), not the content itself. The desktop app polls the file
+/// on disk and re-reads it on mtime change; see
+/// `docs/superpowers/specs/2026-08-26-orchestrator-plan-tracking-design.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrchestratorPlan {
+    pub orchestrator_id: String,
+    pub file_path: String,
+    pub registered_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerFinalization {
     pub session_id: String,
