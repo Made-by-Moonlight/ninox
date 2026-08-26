@@ -37,6 +37,7 @@ short_description = "GPU-accelerated desktop UI for the Ninox orchestrator engin
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio = { workspace = true, features = ["test-util"] }
 rusqlite = { workspace = true }
 # Used only to drive `iced::Task<Message>` (returned from `App::update`) to
 # completion synchronously in tests — specifically

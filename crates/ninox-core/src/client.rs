@@ -10,6 +10,52 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+const BEGIN_SYNC_UPDATE: &[u8] = b"\x1b[?2026h";
+const END_SYNC_UPDATE: &[u8] = b"\x1b[?2026l";
+const MAX_INITIAL_OUTPUT_BYTES: usize = 256 * 1024;
+
+/// Holds tmux's attach prelude and first synchronized redraw until the redraw
+/// boundary is complete. The app therefore receives one atomic initial
+/// `ClientOutput`, even when the PTY split either mode sequence across reads.
+struct InitialOutputGate {
+    bytes: Vec<u8>,
+    begin: Option<usize>,
+    released: bool,
+    expect_sync: bool,
+}
+
+impl InitialOutputGate {
+    fn new(expect_sync: bool) -> Self {
+        Self { bytes: Vec::new(), begin: None, released: false, expect_sync }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Option<Vec<u8>> {
+        if self.released {
+            return Some(chunk.to_vec());
+        }
+        if !self.expect_sync {
+            self.released = true;
+            return Some(chunk.to_vec());
+        }
+        self.bytes.extend_from_slice(chunk);
+        if self.begin.is_none() {
+            self.begin = find_subslice(&self.bytes, BEGIN_SYNC_UPDATE);
+        }
+        let completed = self.begin.is_some_and(|begin| {
+            find_subslice(&self.bytes[begin + BEGIN_SYNC_UPDATE.len()..], END_SYNC_UPDATE).is_some()
+        });
+        if completed || self.bytes.len() >= MAX_INITIAL_OUTPUT_BYTES {
+            self.released = true;
+            return Some(std::mem::take(&mut self.bytes));
+        }
+        None
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
 pub struct AttachedClient {
     input:  mpsc::UnboundedSender<Vec<u8>>,
     master: Box<dyn MasterPty + Send>,
@@ -42,6 +88,10 @@ impl AttachedClient {
         let mut cmd = CommandBuilder::new(&argv[0]);
         cmd.args(&argv[1..]);
         cmd.env("TERM", "xterm-256color");
+        // Managed-server argv contains `-L <socket>` and advertises the sync
+        // feature. Legacy default-server sessions cannot promise a frame, so
+        // they keep their former immediate streaming behavior.
+        let expect_sync = argv.iter().any(|arg| arg == "-L");
         let mut child = pair.slave.spawn_command(cmd).context("spawn tmux attach")?;
         let mut killer = child.clone_killer();
         drop(pair.slave);
@@ -68,12 +118,14 @@ impl AttachedClient {
             }
         };
 
-        // Reader thread: PTY master → ClientOutput events. Blocking reads on
-        // a dedicated thread; Engine::emit is sync so no runtime needed here.
+        // Reader thread: PTY master → ClientOutput events. The attach prelude
+        // is gated through one complete synchronized repaint, then blocking
+        // reads stream normally. Engine::emit is sync so no runtime needed.
         let engine_out = engine.clone();
         let sid = session_id.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
+            let mut initial = InitialOutputGate::new(expect_sync);
             loop {
                 match std::io::Read::read(&mut reader, &mut buf) {
                     Ok(0) => break,
@@ -83,11 +135,15 @@ impl AttachedClient {
                     // spurious ClientClosed.
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
-                    Ok(n) => engine_out.emit(Event::ClientOutput {
-                        session_id: sid.clone(),
-                        generation,
-                        bytes:      buf[..n].to_vec(),
-                    }),
+                    Ok(n) => {
+                        if let Some(bytes) = initial.push(&buf[..n]) {
+                            engine_out.emit(Event::ClientOutput {
+                                session_id: sid.clone(),
+                                generation,
+                                bytes,
+                            });
+                        }
+                    }
                 }
             }
             let _ = child.wait();
@@ -157,6 +213,32 @@ mod tests {
     fn test_engine() -> Arc<crate::events::Engine> {
         let store = Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
         crate::events::Engine::new(store)
+    }
+
+    #[test]
+    fn initial_output_gate_waits_for_fragmented_sync_frame() {
+        let mut gate = InitialOutputGate::new(true);
+        assert!(gate.push(b"\x1b[?1049h\x1b[?20").is_none());
+        assert!(gate.push(b"26h\x1b[Htail").is_none());
+        let paint = gate.push(b"\x1b[?2026l").unwrap();
+        assert_eq!(paint, b"\x1b[?1049h\x1b[?2026h\x1b[Htail\x1b[?2026l");
+        assert_eq!(gate.push(b"live").unwrap(), b"live");
+    }
+
+    #[test]
+    fn initial_output_gate_has_a_hard_memory_bound_without_sync_support() {
+        let mut gate = InitialOutputGate::new(true);
+        let first = vec![b'x'; MAX_INITIAL_OUTPUT_BYTES - 1];
+        assert!(gate.push(&first).is_none());
+        let paint = gate.push(b"yz").unwrap();
+        assert_eq!(paint.len(), MAX_INITIAL_OUTPUT_BYTES + 1);
+        assert_eq!(gate.bytes.capacity(), 0);
+    }
+
+    #[test]
+    fn legacy_client_without_sync_streams_first_read_immediately() {
+        let mut gate = InitialOutputGate::new(false);
+        assert_eq!(gate.push(b"legacy repaint").unwrap(), b"legacy repaint");
     }
 
     async fn collect_client_output(

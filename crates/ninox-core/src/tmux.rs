@@ -198,6 +198,44 @@ pub struct TmuxSession {
     pub tty:        Option<String>,
 }
 
+/// Bounded styled capture used for the terminal's first paint. Coordinates
+/// are tmux pane rows (`0` is the top of the currently visible pane), never
+/// negative history rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewportTailCapture {
+    pub start: i64,
+    pub end: i64,
+    pub pane_width: u16,
+    pub pane_height: u16,
+    pub cursor_x: u16,
+    pub cursor_y: u16,
+    pub bytes: Vec<u8>,
+}
+
+fn viewport_tail_range(pane_height: u16, viewport_rows: u16) -> (i64, i64) {
+    let pane_height = pane_height.max(1);
+    let rows = viewport_rows.max(1).min(pane_height);
+    let start = pane_height - rows;
+    (i64::from(start), i64::from(pane_height - 1))
+}
+
+fn empty_viewport_capture(
+    viewport_cols: u16,
+    viewport_rows: u16,
+) -> ViewportTailCapture {
+    let pane_width = viewport_cols.max(1);
+    let pane_height = viewport_rows.max(1);
+    ViewportTailCapture {
+        start: 0,
+        end: i64::from(pane_height - 1),
+        pane_width,
+        pane_height,
+        cursor_x: 0,
+        cursor_y: pane_height - 1,
+        bytes: Vec::new(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExactTmuxSession {
     pub physical_tmux_name: String,
@@ -223,14 +261,33 @@ async fn run(args: &[&str]) -> Result<String> {
     run_raw(&full).await
 }
 
+/// Run a tmux subcommand without trimming stdout. `capture-pane` uses blank
+/// lines as data, so its trailing separators must survive.
+async fn run_preserving_output(args: &[&str]) -> Result<Vec<u8>> {
+    ensure_server_ready().await;
+    let prefix = socket_args();
+    let mut full: Vec<&str> = prefix.iter().map(String::as_str).collect();
+    full.extend_from_slice(args);
+    run_raw_bytes(&full).await
+}
+
 /// Run tmux with NO socket routing (the user's default server) — only for
 /// legacy sessions created by pre-private-socket builds.
 async fn run_default(args: &[&str]) -> Result<String> {
     run_raw(args).await
 }
 
-/// The old `run` body, renamed: spawn tmux with exactly these args.
+async fn run_default_preserving_output(args: &[&str]) -> Result<Vec<u8>> {
+    run_raw_bytes(args).await
+}
+
+/// Run tmux with exactly these args and return trimmed stdout.
 async fn run_raw(args: &[&str]) -> Result<String> {
+    let stdout = run_raw_bytes(args).await?;
+    Ok(String::from_utf8_lossy(&stdout).trim_end().to_string())
+}
+
+async fn run_raw_bytes(args: &[&str]) -> Result<Vec<u8>> {
     let out = Command::new("tmux")
         .args(args)
         .kill_on_drop(true)
@@ -241,7 +298,7 @@ async fn run_raw(args: &[&str]) -> Result<String> {
         let stderr = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("tmux {:?} failed: {}", args, stderr.trim());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    Ok(out.stdout)
 }
 
 /// Run a command that targets an existing session. Tries the ninox server
@@ -249,6 +306,13 @@ async fn run_raw(args: &[&str]) -> Result<String> {
 async fn run_session_scoped(args: &[&str]) -> Result<String> {
     match run(args).await {
         Err(e) if is_missing_session(&e) => run_default(args).await,
+        other => other,
+    }
+}
+
+async fn run_session_scoped_preserving_output(args: &[&str]) -> Result<Vec<u8>> {
+    match run_preserving_output(args).await {
+        Err(e) if is_missing_session(&e) => run_default_preserving_output(args).await,
         other => other,
     }
 }
@@ -659,16 +723,103 @@ pub async fn history_size(session_id: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// Capture styled pane content for the line range [start, end], where
-/// negative indices address history (-1 = newest history line). No -J:
-/// lines stay wrapped at pane width so they re-parse at the same columns.
-pub async fn capture_history(session_id: &str, start: i64, end: i64) -> Vec<u8> {
+/// Capture only the rows that can contribute to the first viewport. This is
+/// intentionally independent from pane history: a 100k-row Cursor chat still
+/// captures at most `viewport_rows` physical rows and paints them in one app
+/// update before the attached client starts streaming.
+pub async fn capture_viewport_tail(
+    session_id: &str,
+    viewport_rows: u16,
+) -> Option<ViewportTailCapture> {
+    let metadata = run_session_scoped(&[
+        "display-message",
+        "-p",
+        "-t",
+        session_id,
+        "#{pane_width} #{pane_height} #{cursor_x} #{cursor_y}",
+    ])
+    .await
+    .ok()?;
+    let mut fields = metadata.split_whitespace().filter_map(|field| field.parse::<u16>().ok());
+    let pane_width = fields.next()?;
+    let pane_height = fields.next()?;
+    let cursor_x = fields.next().unwrap_or(0);
+    let cursor_y = fields.next().unwrap_or(pane_height.saturating_sub(1));
+    let (start, end) = viewport_tail_range(pane_height, viewport_rows);
+    let bytes = run_session_scoped_preserving_output(&[
+        "capture-pane",
+        "-p",
+        "-e",
+        "-t",
+        session_id,
+        "-S",
+        &start.to_string(),
+        "-E",
+        &end.to_string(),
+    ])
+    .await
+    .ok()?;
+    Some(ViewportTailCapture {
+        start,
+        end,
+        pane_width,
+        pane_height,
+        cursor_x,
+        cursor_y: cursor_y.saturating_sub(start as u16),
+        bytes,
+    })
+}
+
+/// Resize a detached pane before attaching the hidden client, then capture a
+/// stable viewport tail. Resizing after attach makes TUIs reflow their entire
+/// conversation into a visible client; doing it first leaves that work
+/// detached and makes the subsequent attach a same-size bounded redraw.
+pub async fn prepare_viewport_tail(
+    session_id: &str,
+    viewport_cols: u16,
+    viewport_rows: u16,
+) -> Option<ViewportTailCapture> {
     run_session_scoped(&[
-        "capture-pane", "-p", "-e", "-t", session_id,
+        "resize-window",
+        "-t",
+        session_id,
+        "-x",
+        &viewport_cols.max(1).to_string(),
+        "-y",
+        &viewport_rows.max(1).to_string(),
+    ])
+    .await
+    .ok()?;
+
+    // Pane processes react to SIGWINCH asynchronously. Compare bounded tail
+    // snapshots instead of sleeping for one guessed "long enough" delay.
+    // The cap keeps attach latency finite even under continuous live output.
+    let mut previous: Option<ViewportTailCapture> = None;
+    for _ in 0..80 {
+        let Some(current) = capture_viewport_tail(session_id, viewport_rows).await else {
+            return Some(previous.unwrap_or_else(|| {
+                empty_viewport_capture(viewport_cols, viewport_rows)
+            }));
+        };
+        if previous.as_ref().is_some_and(|before| before == &current) {
+            return Some(current);
+        }
+        previous = Some(current);
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+    Some(previous.unwrap_or_else(|| empty_viewport_capture(viewport_cols, viewport_rows)))
+}
+
+/// Capture styled pane content for the line range [start, end], where
+/// negative indices address history (-1 = newest history line). `-J` joins
+/// tmux soft wraps; replay at the same pane width restores physical rows and
+/// their WRAPLINE flags, preserving copy semantics across page boundaries.
+pub async fn capture_history(session_id: &str, start: i64, end: i64) -> Vec<u8> {
+    run_session_scoped_preserving_output(&[
+        "capture-pane", "-p", "-e", "-J", "-t", session_id,
         "-S", &start.to_string(), "-E", &end.to_string(),
     ])
     .await
-    .map(|s| s.into_bytes())
     .unwrap_or_default()
 }
 
@@ -1545,6 +1696,75 @@ mod tests {
         let bytes = capture_history(&id, -hist, -1).await;
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("line-1"), "oldest line missing from history capture: {text}");
+        kill_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn capture_history_preserves_blank_rows() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(
+            &id,
+            "/tmp",
+            "bash -c 'for i in $(seq 1 80); do echo; done; sleep 30'",
+            &[],
+        )
+        .await
+        .unwrap();
+        sleep(Duration::from_millis(500)).await;
+        let hist = history_size(&id).await;
+        assert!(hist > 0, "expected blank rows to accumulate in history");
+        let bytes = capture_history(&id, -hist, -1).await;
+        assert!(
+            bytes.contains(&b'\n'),
+            "blank rows need separators so hydration can preserve their line count"
+        );
+        kill_session(&id).await.unwrap();
+    }
+
+    #[test]
+    fn viewport_capture_range_is_tail_first_and_bounded() {
+        assert_eq!(viewport_tail_range(50, 24), (26, 49));
+        assert_eq!(viewport_tail_range(12, 24), (0, 11));
+        assert_eq!(viewport_tail_range(0, 0), (0, 0));
+    }
+
+    #[test]
+    fn prepared_viewport_fallback_keeps_resized_dimensions_after_capture_failure() {
+        let capture = empty_viewport_capture(91, 27);
+        assert_eq!((capture.pane_width, capture.pane_height), (91, 27));
+        assert_eq!((capture.start, capture.end), (0, 26));
+        assert!(capture.bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn viewport_capture_never_reads_long_history() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(
+            &id,
+            "/tmp",
+            "bash -c 'for i in $(seq 1 2000); do echo history-$i; done; echo TAIL; sleep 30'",
+            &[],
+        )
+        .await
+        .unwrap();
+        sleep(Duration::from_millis(500)).await;
+        let history = history_size(&id).await;
+        assert!(history > 1_000);
+
+        let capture = prepare_viewport_tail(&id, 72, 8).await.unwrap();
+        let text = String::from_utf8_lossy(&capture.bytes);
+        assert_eq!((capture.pane_width, capture.pane_height), (72, 8));
+        assert_eq!((capture.start, capture.end), (0, 7));
+        assert_eq!(capture.end - capture.start + 1, 8);
+        assert!(text.contains("TAIL"));
+        assert!(!text.contains("history-1\n"));
+        assert!(
+            capture.bytes.len() <= usize::from(capture.pane_width) * 8 * 16,
+            "capture bytes must be proportional to viewport, got {}",
+            capture.bytes.len()
+        );
         kill_session(&id).await.unwrap();
     }
 }

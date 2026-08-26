@@ -363,6 +363,10 @@ impl TerminalState {
         let size = TermSize::new(cols as usize, rows as usize);
         let config = Config {
             kitty_keyboard: true,
+            // tmux owns the durable 100k-row history. Retaining a second
+            // emulator copy makes an initial attach proportional to the whole
+            // chat and defeats bounded page hydration.
+            scrolling_history: 0,
             ..Config::default()
         };
         let term = Term::new(config, &size, EventProxy(reply));
@@ -400,7 +404,15 @@ impl TerminalState {
         if bytes.is_empty() {
             return false;
         }
+        let before = self
+            .is_scrolled_back()
+            .then(|| visible_styled_lines(&self.term));
         self.parser.advance(&mut self.term, bytes);
+        if let Some(before) = before {
+            let after = visible_styled_lines(&self.term);
+            let scrolled = detect_live_scroll(&before, &after);
+            self.scrollback.append_live_scrolled(scrolled);
+        }
         self.cache.clear();
         #[cfg(test)]
         {
@@ -412,6 +424,29 @@ impl TerminalState {
     #[cfg(test)]
     fn output_commit_count(&self) -> usize {
         self.output_commits
+    }
+
+    /// Paint a bounded `capture-pane` tail as one synchronized first frame.
+    /// The hidden tmux client's stateful redraw follows through the regular
+    /// stream, but the user sees the current end before that process starts.
+    pub fn hydrate_viewport_tail(&mut self, capture: &ninox_core::tmux::ViewportTailCapture) {
+        let mut frame = Vec::with_capacity(capture.bytes.len() + 64);
+        frame.extend_from_slice(b"\x1b[?2026h\x1b[H\x1b[2J");
+        for &byte in &capture.bytes {
+            if byte == b'\n' {
+                frame.push(b'\r');
+            }
+            frame.push(byte);
+        }
+        use std::fmt::Write;
+        write!(
+            StringWriter(&mut frame),
+            "\x1b[{};{}H\x1b[?2026l",
+            capture.cursor_y.saturating_add(1),
+            capture.cursor_x.saturating_add(1)
+        )
+        .expect("writing to Vec cannot fail");
+        self.process(&frame);
     }
 
     /// Scroll by `delta` lines (positive = up). Returns true when older
@@ -441,7 +476,7 @@ impl TerminalState {
     /// the background — accepted for now; see the module doc on
     /// `Scrollback`.
     pub fn scroll_to_bottom(&mut self) {
-        self.scrollback = Default::default();
+        self.scrollback.reset();
         self.cache.clear();
     }
 
@@ -468,9 +503,58 @@ impl TerminalState {
         // width; keeping them around after a resize would render
         // stale-width lines (see scroll_to_bottom for the same
         // capture-pane-index-drift trade-off this also avoids).
-        self.scrollback = Default::default();
+        self.scrollback.reset();
         self.cache.clear();
     }
+}
+
+struct StringWriter<'a>(&'a mut Vec<u8>);
+
+impl std::fmt::Write for StringWriter<'_> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.0.extend_from_slice(value.as_bytes());
+        Ok(())
+    }
+}
+
+fn visible_styled_lines(term: &Term<EventProxy>) -> Vec<crate::components::scrollback::StyledLine> {
+    use alacritty_terminal::{
+        grid::Dimensions,
+        index::{Column, Line},
+    };
+    let grid = term.grid();
+    (0..grid.screen_lines())
+        .map(|row| {
+            (0..grid.columns())
+                .map(|column| {
+                    let cell = &grid[Line(row as i32)][Column(column)];
+                    crate::components::scrollback::StyledCell {
+                        c: cell.c,
+                        zerowidth: cell.zerowidth().unwrap_or_default().to_vec(),
+                        fg: cell.fg,
+                        bg: cell.bg,
+                        flags: cell.flags,
+                        hyperlink: cell.hyperlink().map(|link| link.uri().to_string()),
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn detect_live_scroll(
+    before: &[crate::components::scrollback::StyledLine],
+    after: &[crate::components::scrollback::StyledLine],
+) -> Vec<crate::components::scrollback::StyledLine> {
+    if before.len() != after.len() || before == after {
+        return Vec::new();
+    }
+    for shifted in 1..before.len() {
+        if before[shifted..] == after[..before.len() - shifted] {
+            return before[..shifted].to_vec();
+        }
+    }
+    Vec::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -881,7 +965,10 @@ impl<'a> TerminalWidget<'a> {
                 line_text.extend(cell.zerowidth.iter().copied());
             }
             out.push_str(line_text.trim_end());
-            if row < end_row {
+            let wrapped = cells
+                .last()
+                .is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE));
+            if row < end_row && !wrapped {
                 out.push('\n');
             }
         }
@@ -1745,9 +1832,13 @@ pub fn extract_selection(
 
         let logical = row as i32 - offset;
         let mut line_text = String::new();
+        let wrapped;
         if logical < 0 {
             // History row — same index math as the draw path.
             if let Some(cells) = state.scrollback.line_above((-logical - 1) as usize) {
+                wrapped = cells
+                    .last()
+                    .is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE));
                 for cell in cells.iter().skip(col_start).take(col_end + 1 - col_start) {
                     if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                         continue;
@@ -1755,9 +1846,14 @@ pub fn extract_selection(
                     line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
                     line_text.extend(cell.zerowidth.iter().copied());
                 }
+            } else {
+                wrapped = false;
             }
         } else {
             let line = Line(logical);
+            wrapped = grid[line][Column(cols.saturating_sub(1))]
+                .flags
+                .contains(Flags::WRAPLINE);
             for col in col_start..=col_end {
                 let cell = &grid[line][Column(col)];
                 if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
@@ -1770,7 +1866,7 @@ pub fn extract_selection(
         // Strip trailing spaces from each line.
         let trimmed = line_text.trim_end();
         out.push_str(trimmed);
-        if row < end_row {
+        if row < end_row && !wrapped {
             out.push('\n');
         }
     }
@@ -1792,6 +1888,89 @@ mod tests {
     fn process_ansi_no_panic() {
         let mut s = TerminalState::new(80, 24, None);
         s.process(b"\x1b[31mred\x1b[0m");
+    }
+
+    #[test]
+    fn viewport_tail_hydrates_in_one_paint_without_emulator_history() {
+        use alacritty_terminal::{
+            grid::Dimensions,
+            index::{Column, Line, Point},
+        };
+        let mut state = TerminalState::new(20, 4, None);
+        let capture = ninox_core::tmux::ViewportTailCapture {
+            start: 46,
+            end: 49,
+            pane_width: 20,
+            pane_height: 50,
+            cursor_x: 6,
+            cursor_y: 3,
+            bytes: b"tail-1\ntail-2\ntail-3\nprompt".to_vec(),
+        };
+        state.hydrate_viewport_tail(&capture);
+
+        assert_eq!(state.output_commit_count(), 1);
+        assert_eq!(state.term.grid().history_size(), 0);
+        assert_eq!(state.term.grid().cursor.point, Point::new(Line(3), Column(6)));
+        let rows = visible_styled_lines(&state.term);
+        assert_eq!(rows[0][0].c, 't');
+        assert_eq!(rows[3][0].c, 'p');
+    }
+
+    #[test]
+    fn synchronized_fragments_only_advance_one_visible_frame() {
+        let mut state = TerminalState::new(20, 3, None);
+        state.process(b"stable");
+        let stable_commits = state.output_commit_count();
+        state.process(b"\x1b[?20");
+        assert_eq!(state.output_commit_count(), stable_commits);
+        state.process(b"26h\x1b[Hnew");
+        assert_eq!(state.output_commit_count(), stable_commits);
+        state.process(b" tail");
+        assert_eq!(state.output_commit_count(), stable_commits);
+        state.process(b"\x1b[?2026l");
+        assert_eq!(state.output_commit_count(), stable_commits + 1);
+    }
+
+    #[test]
+    fn separate_steady_sync_frames_remain_distinct_from_tail_hydration() {
+        let mut state = TerminalState::new(20, 3, None);
+        let capture = ninox_core::tmux::ViewportTailCapture {
+            start: 0,
+            end: 2,
+            pane_width: 20,
+            pane_height: 3,
+            cursor_x: 0,
+            cursor_y: 2,
+            bytes: b"chat tail\n\nwaiting".to_vec(),
+        };
+        state.hydrate_viewport_tail(&capture);
+        assert_eq!(state.output_commit_count(), 1);
+
+        state.process(b"\x1b[?2026h\x1b[3;1H\x1b[2Kworking-1\x1b[?2026l");
+        state.process(b"\x1b[?2026h\x1b[3;1H\x1b[2Kworking-2\x1b[?2026l");
+        assert_eq!(
+            state.output_commit_count(),
+            3,
+            "producer-delimited steady frames intentionally remain separate paints"
+        );
+    }
+
+    #[test]
+    fn live_output_preserves_scrolled_viewport_anchor() {
+        let mut state = TerminalState::new(8, 3, None);
+        state.process(b"one\r\ntwo\r\nthree");
+        state.scrollback.absorb(vec![vec![]; 10], -10, false);
+        state.scroll(2);
+        let anchor = state.scrollback.line_above(state.scrollback.offset - 1).cloned();
+
+        state.process(b"\r\nfour");
+
+        assert_eq!(state.scrollback.offset, 3);
+        assert_eq!(
+            state.scrollback.line_above(state.scrollback.offset - 1),
+            anchor.as_ref()
+        );
+        assert_eq!(state.scrollback.lines.len(), 11);
     }
 
     #[test]
@@ -2611,6 +2790,17 @@ mod tests {
         // this offset — row 0 → history one, row 1 → history two.
         let text = extract_selection(&s, 0, 0, 19, 1);
         assert_eq!(text, "history one\nhistory two");
+    }
+
+    #[test]
+    fn history_copy_does_not_insert_newline_at_soft_wrap() {
+        let mut state = TerminalState::new(4, 3, None);
+        let mut lines = crate::components::scrollback::parse_capture(b"abcdefgh", 4);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].last().unwrap().flags.contains(Flags::WRAPLINE));
+        state.scrollback.absorb(std::mem::take(&mut lines), -2, true);
+        state.scrollback.offset = 2;
+        assert_eq!(extract_selection(&state, 0, 0, 3, 1), "abcdefgh");
     }
 
     #[test]
