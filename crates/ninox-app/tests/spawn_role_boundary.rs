@@ -2,6 +2,12 @@ use std::{path::Path, process::Command};
 
 use tempfile::tempdir;
 
+// Unlike `completion_command` below, this doesn't need an isolated
+// `TMUX_TMPDIR`: `reject_recursive_worker_spawn` runs as the very first
+// statement of `spawn` handling, before any tmux interaction, so the
+// ambient-socket hazard that motivates that isolation never comes into play
+// here. If `spawn` ever grows a tmux check ahead of that role rejection,
+// this helper will need the same treatment.
 fn denied_spawn(
     root: &Path,
     execution_role: Option<&str>,
