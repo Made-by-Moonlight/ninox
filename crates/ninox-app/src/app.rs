@@ -231,6 +231,31 @@ pub enum VersionCheckState {
     Failed,
 }
 
+/// One orchestrator's registered goals/plan doc, as last read from disk.
+/// Keyed by `orchestrator_id` on `App::plan_docs` — see
+/// `docs/superpowers/specs/2026-08-26-orchestrator-plan-tracking-design.md`.
+/// Not `Clone`/`Debug`-derived: `text_editor::Content` supports neither.
+#[derive(Default)]
+pub struct PlanDocState {
+    pub file_path:  Option<String>,
+    pub blocks:     Vec<PlanBlockView>,
+    last_mtime:     Option<std::time::SystemTime>,
+    /// Set when the row exists but the file itself is missing/unreadable —
+    /// distinct from "nothing registered" so the panel can say so.
+    pub error:      Option<String>,
+}
+
+/// One rendered markdown block (heading/paragraph/list-item/code) — the
+/// displayed text already has bullet/checkbox prefixes applied and
+/// markdown syntax stripped (see `components::markdown_blocks`), paired
+/// with a `text_editor::Content` so it's independently selectable.
+pub struct PlanBlockView {
+    pub kind:    crate::components::markdown_blocks::BlockKind,
+    pub content: iced::widget::text_editor::Content,
+    pub spans:   Vec<(std::ops::Range<usize>, crate::components::markdown_blocks::InlineStyle)>,
+    pub links:   Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BrainViewState {
     pub entries:  Vec<BrainEntry>,
@@ -325,6 +350,9 @@ pub struct App {
     /// Absent = not fetched yet (render "Loading…"); `Some(None)` = fetched,
     /// no diff (no workspace recorded, or a clean working tree).
     pub diffs:           HashMap<SessionId, Option<String>>,
+    /// Registered goals/plan doc per orchestrator, refreshed by
+    /// `ensure_plan` — see `PlanDocState`.
+    pub plan_docs:       HashMap<OrchestratorId, PlanDocState>,
     pub notifications:   VecDeque<Notification>,
     /// True while an `ApplyUpdate`-triggered `cargo install` subprocess is
     /// running — disables the "Update now" action so a second click can't
@@ -438,6 +466,15 @@ pub enum Message {
     CatalogueFormConfirm,
     CatalogueFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
+    /// A non-edit `text_editor::Action` (click/drag/select/scroll) from one
+    /// of the read-only per-block widgets in the Plan panel — applied to
+    /// `plan_docs[orchestrator_id].blocks[block].content` so
+    /// selection/copy work; `Action::Edit(_)` is deliberately dropped.
+    PlanEditorAction {
+        orchestrator_id: OrchestratorId,
+        block: usize,
+        action: iced::widget::text_editor::Action,
+    },
     RemoveOrchestrator(OrchestratorId),
     RemoveSession(SessionId),
     /// Kill the tmux session and respawn the same name/workspace with the
@@ -1251,6 +1288,7 @@ impl App {
             review_threads,
             comment_editors,
             diffs:          HashMap::new(),
+            plan_docs:      HashMap::new(),
             notifications:  VecDeque::new(),
             update_in_progress: false,
             version_check:  VersionCheckState::NotChecked,
@@ -1368,6 +1406,74 @@ impl App {
         })
     }
 
+    /// Refreshes `state.plan_docs[orchestrator_id]` from the store + disk,
+    /// synchronously — no async round-trip, since this is a local sqlite
+    /// lookup plus a small markdown file read, not a subprocess. Called
+    /// on-demand when the Plan panel is opened, and on every `PollSessions`
+    /// tick while it stays open (no file-watcher; see the design doc).
+    /// Skips the disk read entirely when the file's mtime hasn't moved.
+    fn ensure_plan(state: &mut App, orchestrator_id: &str) -> Task<Message> {
+        let Ok(Some(registration)) = state.engine.store.get_orchestrator_plan(orchestrator_id)
+        else {
+            state.plan_docs.remove(orchestrator_id);
+            return Task::none();
+        };
+        let mtime = std::fs::metadata(&registration.file_path).and_then(|m| m.modified()).ok();
+        let doc = state.plan_docs.entry(orchestrator_id.to_string()).or_default();
+        let unchanged = mtime.is_some()
+            && mtime == doc.last_mtime
+            && doc.file_path.as_deref() == Some(registration.file_path.as_str());
+        if unchanged {
+            return Task::none();
+        }
+        doc.file_path = Some(registration.file_path.clone());
+        doc.last_mtime = mtime;
+        match std::fs::read_to_string(&registration.file_path) {
+            Ok(text) => {
+                use crate::components::markdown_blocks::{parse_blocks, BlockKind};
+                doc.blocks = parse_blocks(&text)
+                    .into_iter()
+                    .map(|block| {
+                        let is_checkbox = matches!(block.kind, BlockKind::ListItem { checked: Some(_), .. });
+                        let prefix = match block.kind {
+                            BlockKind::ListItem { checked: Some(true), .. } => "☑ ".to_string(),
+                            BlockKind::ListItem { checked: Some(false), .. } => "☐ ".to_string(),
+                            BlockKind::ListItem { ordinal: Some(n), checked: None } => format!("{n}. "),
+                            BlockKind::ListItem { ordinal: None, checked: None } => "• ".to_string(),
+                            _ => String::new(),
+                        };
+                        let display_text = format!("{prefix}{}", block.text);
+                        let offset = prefix.len();
+                        let mut spans: Vec<_> = block
+                            .spans
+                            .into_iter()
+                            .map(|(range, style)| (range.start + offset..range.end + offset, style))
+                            .collect();
+                        if is_checkbox {
+                            // ☐/☑ aren't covered by the bundled Newsreader/
+                            // Archivo/Spline Sans Mono fonts — route them
+                            // through the app's dingbat font instead of the
+                            // list item's normal (sans) font.
+                            use crate::components::markdown_blocks::InlineStyle;
+                            spans.push((0..offset, InlineStyle { glyph: true, ..Default::default() }));
+                        }
+                        PlanBlockView {
+                            kind: block.kind,
+                            content: iced::widget::text_editor::Content::with_text(&display_text),
+                            spans,
+                            links: block.links,
+                        }
+                    })
+                    .collect();
+                doc.error = None;
+            }
+            Err(error) => {
+                doc.error = Some(error.to_string());
+            }
+        }
+        Task::none()
+    }
+
     /// Kicks off an on-demand registry check for Settings' version line.
     /// Always re-runs on every `NavigateSettings` (unlike `ensure_models`'s
     /// cache-on-first-success) — the whole point is a fresh answer each
@@ -1415,6 +1521,12 @@ impl App {
                 panel: crate::components::session_detail::DetailPanel::Split,
             } if active == session_id
                 && !state.orchestrators.iter().any(|orchestrator| &orchestrator.id == active)
+        ) || matches!(
+            &state.view,
+            View::SessionDetail {
+                session_id: active,
+                panel: crate::components::session_detail::DetailPanel::Plan,
+            } if active == session_id
         );
         let active = matches!(
             &state.view,
@@ -2556,8 +2668,20 @@ impl App {
                 }
                 match (new_panel, session_id) {
                     (DetailPanel::Diff, Some(sid)) => Self::ensure_diff(state, &sid),
+                    (DetailPanel::Plan, Some(sid)) => Self::ensure_plan(state, &sid),
                     _ => Task::none(),
                 }
+            }
+
+            Message::PlanEditorAction { orchestrator_id, block, action } => {
+                if !action.is_edit() {
+                    if let Some(doc) = state.plan_docs.get_mut(&orchestrator_id) {
+                        if let Some(b) = doc.blocks.get_mut(block) {
+                            b.content.perform(action);
+                        }
+                    }
+                }
+                Task::none()
             }
 
             Message::RemoveOrchestrator(id) => {
@@ -2573,6 +2697,7 @@ impl App {
                     k != &id && s.orchestrator_id.as_deref() != Some(id.as_str())
                 });
                 state.terminals.remove(&id);
+                state.plan_docs.remove(&id);
                 state.diffs.remove(&id);
                 // Drop clients for the orchestrator itself and any worker
                 // sessions removed above — only surviving sessions keep theirs.
@@ -3363,9 +3488,16 @@ impl App {
                 // Refresh the diff for whatever session is on the Diff panel
                 // right now — a live session's diff changes as the worker
                 // commits, so this is the "keeps updating" tick for it.
+                // Same idea for the Plan panel: no file-watcher exists in
+                // this codebase, so this 3s tick doubles as the plan doc's
+                // freshness bar too (see docs/superpowers/specs/2026-08-26-
+                // orchestrator-plan-tracking-design.md).
                 match &state.view {
                     View::SessionDetail { session_id, panel: DetailPanel::Diff } => {
                         Self::ensure_diff(state, &session_id.clone())
+                    }
+                    View::SessionDetail { session_id, panel: DetailPanel::Plan } => {
+                        Self::ensure_plan(state, &session_id.clone())
                     }
                     _ => Task::none(),
                 }
@@ -4615,14 +4747,7 @@ pub async fn setup_orchestrator_root(
 
     let claude_dir        = root.join(".claude");
     let claude_skills_dir = claude_dir.join("skills");
-    let reap_skill_dir      = claude_skills_dir.join("reap-workers");
-    let orch_skill_dir      = claude_skills_dir.join("spawn-orchestrator");
     fs::create_dir_all(&claude_dir).await?;
-    fs::create_dir_all(&reap_skill_dir).await?;
-    fs::create_dir_all(&orch_skill_dir).await?;
-
-    let reap_skill_path     = reap_skill_dir.join("SKILL.md");
-    let orch_skill_path     = orch_skill_dir.join("SKILL.md");
 
     let skill_path = |name: &str| claude_skills_dir.join(name).join("SKILL.md");
 
@@ -4653,13 +4778,9 @@ pub async fn setup_orchestrator_root(
             "# Ninox Orchestrator\n\n\
              Before doing anything else, read and follow: `{spawn_skill}`\n\n\
              ## Available Skills\n\n\
-             - `{reap_skill}` — cleaning up workers you are done with\n\
-             - `{orch_skill}` — spawning another orchestrator (only on the user's request)\n\
              {skills}\n\
              Run `{ninox_bin} capabilities --orchestrator` to list what ninox can currently do.\n",
             spawn_skill = skill_path(spawn_skill.name).display(),
-            reap_skill  = reap_skill_path.display(),
-            orch_skill  = orch_skill_path.display(),
             skills      = skills,
             ninox_bin   = ninox_bin,
         );
@@ -4675,141 +4796,6 @@ pub async fn setup_orchestrator_root(
             fs::write(&claude_md_path, body).await?;
         }
     }
-
-    // reap-workers skill — always overwritten.
-    let reap_skill_content = format!(
-        r#"---
-name: reap-workers
-description: Use when workers have finished (PR merged, session dead, work abandoned) and you want their sessions and worktrees cleaned up.
----
-
-# Reap Your Workers
-
-Every worker you spawn checks out its own git worktree under
-`{{repo}}/.claude/worktrees/{{session-id}}`. When the worker finishes, that
-worktree stays on disk until it is reaped. Reaping kills the worker's
-session, removes its worktree, and lets its card age off the fleet board.
-Anything the worker reported but Ninox has not processed yet (a work request,
-a freshly opened PR) is left alone for Ninox to pick up.
-
-You can only ever reap **your own** workers — an id belonging to another
-orchestrator is refused, not cleaned up.
-
-## Reap everything that has finished
-
-```bash
-{ninox_bin} reap
-```
-
-This is the safe default: it touches only workers that are finished for good
-(PR merged, process exited, terminated). Two kinds of worker are never
-selected by it:
-
-- **Still running** — reaping would destroy work in progress.
-- **Interrupted** — its pane died with the machine (a reboot), but its
-  conversation and branch survive and the user can resume it. Reaping gives
-  that up.
-
-## Reap specific workers
-
-```bash
-{ninox_bin} reap ath-123-auth-fix ath-124-api
-```
-
-## Reap a running or interrupted worker
-
-Both need an explicit `--force`, plus `--all` to select them in bulk:
-
-```bash
-{ninox_bin} reap ath-123-auth-fix --force   # this worker whatever state it's in
-{ninox_bin} reap --all --force              # every worker you own
-```
-
-Without `--force` those workers are reported as skipped and left completely
-alone.
-
-## When to reap
-
-- A worker's PR merged and Ninox told you so — reap it.
-- A worker died or was terminated and you have read whatever you needed
-  from it — reap it.
-- You decided a worker's task is no longer wanted — `--force` reap it.
-
-## When NOT to reap
-
-- **Not while a worker is still working.** Message it (`{ninox_bin} send`) or
-  wait. Force-reaping destroys uncommitted work in its worktree.
-- **Not an interrupted worker the user may want back.** After a reboot every
-  worker is interrupted, not finished. `{ninox_bin} reap --all --force` at
-  that moment throws away every resumable session — ask first.
-- **Not to "restart" a worker.** Reap and re-spawn is a fresh session with
-  no memory of the old one.
-- **Not another orchestrator's workers.** They aren't yours; the command
-  will refuse.
-"#,
-        ninox_bin = ninox_bin,
-    );
-    fs::write(&reap_skill_path, reap_skill_content).await?;
-
-    // spawn-orchestrator skill — always overwritten.
-    let orch_skill_content = format!(
-        r#"---
-name: spawn-orchestrator
-description: Use ONLY when the user explicitly asks for another orchestrator. Never spawn one on your own initiative — work you decided to delegate goes to a worker instead.
----
-
-# Spawn an Orchestrator — Only When Asked
-
-You can stand up another orchestrator. You almost never should.
-
-An orchestrator is a *peer*, not a subordinate: it coordinates its own fleet
-of workers, spends its own context, and costs money for as long as it runs.
-Nothing about your own workload justifies creating one.
-
-## The Rule
-
-**Spawn an orchestrator only when the user explicitly asks for one.**
-
-If you are thinking "this would go faster with another orchestrator", the
-answer is a worker (`{ninox_bin} spawn`). Workers are the unit of
-delegation — always.
-
-The command enforces this with a flag you must pass deliberately:
-
-```bash
-{ninox_bin} spawn-orchestrator \
-  --name "billing-migration" \
-  --prompt "Coordinate the billing migration: <goal, scope, constraints>" \
-  --user-requested
-```
-
-`--user-requested` is your assertion that the user asked for this
-orchestrator in this conversation. Without it the command refuses. Do not
-pass it to get around the refusal.
-
-| Thought | Reality |
-|---|---|
-| "Two orchestrators would parallelize this" | Spawn more workers instead. |
-| "This work is a separate concern" | Separate concern, same fleet. Spawn a worker. |
-| "The user would probably want one" | Probably isn't asked. Ask them. |
-| "I'll spawn one and mention it after" | The user decides, before. |
-
-## What the new orchestrator gets
-
-- `--name` is slugified into its session ID (`"Billing Migration"` →
-  `billing-migration`), which must not collide with an existing session.
-- `--prompt` is delivered as its opening brief once its harness is ready,
-  with a footer telling it that it reports back to you. Omit it to start it
-  empty and follow up with `{ninox_bin} send <id> "..."`.
-- It inherits the same brain, the orchestrator skills, and its own workspace
-  under the orchestrator root.
-
-It is a peer, so it does not appear under you on the fleet board and you
-cannot reap it — `{ninox_bin} reap` only ever touches your own workers.
-"#,
-        ninox_bin = ninox_bin,
-    );
-    fs::write(&orch_skill_path, orch_skill_content).await?;
 
     // subagent-blocker hook — always overwritten.
     let blocker = r#"#!/usr/bin/env node
@@ -5434,6 +5420,7 @@ mod tests {
             review_threads: HashMap::new(),
             comment_editors: HashMap::new(),
             diffs:          HashMap::new(),
+            plan_docs:      HashMap::new(),
             notifications:  VecDeque::new(),
             update_in_progress: false,
             version_check:  VersionCheckState::NotChecked,
@@ -7026,6 +7013,90 @@ mod tests {
             "opening the Split panel should narrow the terminal grid to fit the remaining space"
         );
         assert_eq!(term.term.grid().columns(), m2.terminal_cols as usize);
+    }
+
+    /// Regression test: `resize_terminals` used to treat every orchestrator
+    /// session as terminal-only-at-full-width regardless of panel, which
+    /// predates the `Plan` tab. Once an orchestrator can show `Plan`
+    /// (terminal + plan pane side by side, same layout as `Split`), its
+    /// terminal must narrow exactly like a worker's `Split` panel does —
+    /// otherwise the PTY renders at full width while the plan pane visually
+    /// overlaps it.
+    #[test]
+    fn opening_the_plan_panel_narrows_an_orchestrators_terminal() {
+        use crate::components::session_detail::DetailPanel;
+        use alacritty_terminal::grid::Dimensions;
+        let e = test_engine();
+        let mut m = base(e);
+        m.window_width  = 1200.0;
+        m.window_height = 800.0;
+        m.sidebar_width = 220.0;
+        m.info_width    = 300.0;
+
+        let o = Orchestrator { id: "orch1".into(), name: "orch".into(), created_at: 0 };
+        let _ = m.engine.store.upsert_orchestrator(&o);
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorSpawned(o))));
+
+        let (m, _) = m.update(Message::NavigateSession("orch1".into()));
+        let (mut m, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
+        m.terminals.insert(
+            "orch1".into(),
+            crate::components::terminal::TerminalState::new(m.terminal_cols, m.terminal_rows, None),
+        );
+        let (m, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
+        let full_width_cols = m.terminals.get("orch1").unwrap().term.grid().columns();
+
+        let (m2, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Plan));
+
+        let term = m2.terminals.get("orch1").unwrap();
+        assert!(
+            term.term.grid().columns() < full_width_cols,
+            "opening the Plan panel should narrow an orchestrator's terminal grid, \
+             not leave it full-width under the plan pane"
+        );
+        assert_eq!(term.term.grid().columns(), m2.terminal_cols as usize);
+    }
+
+    #[test]
+    fn plan_editor_action_drops_edits_but_applies_non_edit_actions() {
+        use iced::widget::text_editor::{Action, Edit};
+
+        use crate::components::markdown_blocks::BlockKind;
+
+        let e = test_engine();
+        let mut m = base(e);
+        m.plan_docs.insert(
+            "orch".into(),
+            PlanDocState {
+                file_path: Some("/plan.md".into()),
+                blocks: vec![PlanBlockView {
+                    kind: BlockKind::Paragraph,
+                    content: iced::widget::text_editor::Content::with_text("hello"),
+                    spans: Vec::new(),
+                    links: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        );
+        let before = m.plan_docs.get("orch").unwrap().blocks[0].content.text();
+
+        let (m, _) = m.update(Message::PlanEditorAction {
+            orchestrator_id: "orch".into(),
+            block: 0,
+            action: Action::Edit(Edit::Insert('x')),
+        });
+        assert_eq!(
+            m.plan_docs.get("orch").unwrap().blocks[0].content.text(),
+            before,
+            "an Edit action must never mutate a read-only plan doc"
+        );
+
+        let (m, _) = m.update(Message::PlanEditorAction {
+            orchestrator_id: "orch".into(),
+            block: 0,
+            action: Action::SelectAll,
+        });
+        assert_eq!(m.plan_docs.get("orch").unwrap().blocks[0].content.text(), before);
     }
 
     #[test]

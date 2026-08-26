@@ -100,6 +100,10 @@ pub struct WorkerRuntimeClaim {
     pub claim_id: String,
 }
 
+/// An orchestrator's immutable runtime identity — the private tmux pane it
+/// was first authorized from. `authorize_orchestrator` cross-checks every
+/// subsequent orchestrator-facing CLI call against this so a spoofed
+/// `NINOX_ORCHESTRATOR_ID` env var alone can't impersonate it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrchestratorRuntimeIdentity {
     pub orchestrator_id: String,
@@ -391,6 +395,18 @@ pub struct Orchestrator {
     pub id:         OrchestratorId,
     pub name:       String,
     pub created_at: i64,
+}
+
+/// An orchestrator's registered goals/plan markdown doc — a pointer
+/// (`file_path`), not the content itself. The desktop app polls the file
+/// on disk and re-reads it on mtime change; see
+/// `docs/superpowers/specs/2026-08-26-orchestrator-plan-tracking-design.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrchestratorPlan {
+    pub orchestrator_id: String,
+    pub file_path: String,
+    pub registered_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

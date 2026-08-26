@@ -623,6 +623,22 @@ impl Store {
                 created_at INTEGER NOT NULL,
                 PRIMARY KEY (repo, pr_number, opener_session_id)
             );
+            CREATE TABLE IF NOT EXISTS orchestrator_runtimes (
+                orchestrator_id TEXT PRIMARY KEY,
+                runtime_id TEXT NOT NULL UNIQUE,
+                server_epoch TEXT NOT NULL,
+                physical_tmux_name TEXT NOT NULL,
+                pane_id TEXT NOT NULL,
+                root_pid INTEGER NOT NULL,
+                root_created_at INTEGER NOT NULL,
+                registered_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS orchestrator_plans (
+                orchestrator_id TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                registered_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
         ")?;
         migrate_legacy_worker_incarnations(&mut conn)?;
         // Migrations for columns added after initial release — idempotent so
@@ -1424,6 +1440,13 @@ impl Store {
         Ok(())
     }
 
+    /// Self-registers an orchestrator's runtime identity the first time it
+    /// authorizes from a pane whose physical name matches its own id — the
+    /// lazy bootstrap path `authorize_orchestrator` falls back to when no
+    /// runtime has been persisted yet. Requires the caller's session row to
+    /// already record `pid` as this exact pane's root pid (set at spawn
+    /// time), and only fires once per orchestrator (`ON CONFLICT DO NOTHING`).
+    /// Returns whether a row was actually created.
     pub fn register_migrated_orchestrator_runtime(
         &self,
         runtime: &OrchestratorRuntimeIdentity,
@@ -1502,6 +1525,51 @@ impl Store {
         .map_err(Into::into)
     }
 
+    /// Register (or re-register) `orchestrator_id`'s goals/plan doc. Upsert:
+    /// re-registering bumps `updated_at` but leaves the original
+    /// `registered_at` untouched.
+    pub fn register_orchestrator_plan(&self, orchestrator_id: &str, file_path: &str, now: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO orchestrator_plans(orchestrator_id,file_path,registered_at,updated_at)
+             VALUES(?1,?2,?3,?3)
+             ON CONFLICT(orchestrator_id) DO UPDATE SET
+                file_path=excluded.file_path,
+                updated_at=excluded.updated_at",
+            params![orchestrator_id, file_path, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_orchestrator_plan(&self, orchestrator_id: &str) -> Result<Option<OrchestratorPlan>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT orchestrator_id,file_path,registered_at,updated_at
+             FROM orchestrator_plans WHERE orchestrator_id=?1",
+            [orchestrator_id],
+            |row| {
+                Ok(OrchestratorPlan {
+                    orchestrator_id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    registered_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Returns whether a row was actually removed.
+    pub fn unregister_orchestrator_plan(&self, orchestrator_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "DELETE FROM orchestrator_plans WHERE orchestrator_id=?1",
+            [orchestrator_id],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn sessions_by_orchestrator(&self, orchestrator_id: &str) -> Result<Vec<Session>> {
         let sessions = self.list_sessions()?;
         Ok(sessions.into_iter().filter(|s| s.orchestrator_id.as_deref() == Some(orchestrator_id)).collect())
@@ -1550,6 +1618,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         conn.execute("DELETE FROM orchestrator_runtimes WHERE orchestrator_id=?1", [id])?;
+        conn.execute("DELETE FROM orchestrator_plans WHERE orchestrator_id=?1", [id])?;
         conn.execute("DELETE FROM orchestrators WHERE id = ?1", [id])?;
         Ok(())
     }
@@ -7210,5 +7279,48 @@ mod tests {
         store.upsert_pr_watch(&other).unwrap();
         assert_eq!(store.delete_pr_watches_for_pr("o/r", 7).unwrap(), 2);
         assert_eq!(store.list_pr_watches().unwrap(), vec![other]);
+    }
+
+    #[test]
+    fn orchestrator_plan_round_trips_and_upsert_preserves_registered_at() {
+        let store = test_store();
+        assert!(store.get_orchestrator_plan("orch").unwrap().is_none());
+
+        store.register_orchestrator_plan("orch", "/plan.md", 100).unwrap();
+        let plan = store.get_orchestrator_plan("orch").unwrap().unwrap();
+        assert_eq!(plan.file_path, "/plan.md");
+        assert_eq!(plan.registered_at, 100);
+        assert_eq!(plan.updated_at, 100);
+
+        store.register_orchestrator_plan("orch", "/other-plan.md", 200).unwrap();
+        let plan = store.get_orchestrator_plan("orch").unwrap().unwrap();
+        assert_eq!(plan.file_path, "/other-plan.md");
+        assert_eq!(plan.registered_at, 100, "registered_at must not move on re-register");
+        assert_eq!(plan.updated_at, 200);
+
+        assert!(store.unregister_orchestrator_plan("orch").unwrap());
+        assert!(store.get_orchestrator_plan("orch").unwrap().is_none());
+        assert!(!store.unregister_orchestrator_plan("orch").unwrap());
+    }
+
+    #[test]
+    fn register_orchestrator_runtime_requires_persisted_orchestrator() {
+        let store = test_store();
+        let runtime = OrchestratorRuntimeIdentity {
+            orchestrator_id: "orch".into(),
+            runtime_id: "r1".into(),
+            server_epoch: "1:1".into(),
+            physical_tmux_name: "orch".into(),
+            pane_id: "%1".into(),
+            root_pid: 100,
+            root_created_at: 0,
+            registered_at: 0,
+        };
+        assert!(store.register_orchestrator_runtime(&runtime).is_err());
+
+        store.upsert_orchestrator(&Orchestrator { id: "orch".into(), name: "orch".into(), created_at: 0 }).unwrap();
+        store.register_orchestrator_runtime(&runtime).unwrap();
+        let persisted = store.orchestrator_runtime_identity("orch").unwrap().unwrap();
+        assert_eq!(persisted, runtime);
     }
 }

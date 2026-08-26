@@ -13,6 +13,7 @@ pub mod hooks;
 pub mod inbox;
 pub mod lifecycle;
 pub mod messaging;
+pub mod orchestrator_auth;
 pub mod plugin;
 pub mod pty;
 pub mod rust_cache;

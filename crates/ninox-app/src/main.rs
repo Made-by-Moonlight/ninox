@@ -186,6 +186,27 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Register (or inspect) this orchestrator's goals/plan markdown doc,
+    /// rendered live in the desktop app.
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlanAction {
+    /// Register (or re-register) a markdown file as this orchestrator's
+    /// plan doc. Idempotent — safe to call again after editing the file's
+    /// path, or to re-run with the same path.
+    Register {
+        /// Path to the markdown file to track.
+        file: PathBuf,
+    },
+    /// Stop tracking this orchestrator's plan doc, if any.
+    Unregister,
+    /// Print this orchestrator's current plan-doc registration as JSON.
+    Show,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -424,6 +445,11 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Some(Command::Plan { action }) = command {
+        let db_path = args.db.unwrap_or_else(default_db_path);
+        std::process::exit(run_plan_cli(action, db_path).await);
+    }
+
     if let Err(e) = tmux::write_server_config() {
         eprintln!("failed to write tmux config: {e}");
     }
@@ -501,6 +527,9 @@ async fn main() -> anyhow::Result<()> {
         // Same story as Open/Close/List: handled by the early return above.
         Some(Command::Capabilities { .. }) => {
             unreachable!("Capabilities short-circuits and returns earlier in main()")
+        }
+        Some(Command::Plan { .. }) => {
+            unreachable!("Plan short-circuits and returns earlier in main()")
         }
         None => run_tui(store, args.port, args.headless).await,
     }
@@ -609,6 +638,25 @@ fn emit_workers_envelope(ok: bool, data: serde_json::Value, error: serde_json::V
         serde_json::json!({
             "schema_version": WORKERS_CLI_SCHEMA_VERSION,
             "command": "workers",
+            "ok": ok,
+            "data": data,
+            "error": error,
+        })
+    );
+}
+
+const PLAN_CLI_SCHEMA_VERSION: u32 = 1;
+
+fn plan_error(code: &str, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({ "code": code, "message": message.into() })
+}
+
+fn emit_plan_envelope(ok: bool, data: serde_json::Value, error: serde_json::Value) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema_version": PLAN_CLI_SCHEMA_VERSION,
+            "command": "plan",
             "ok": ok,
             "data": data,
             "error": error,
@@ -751,6 +799,98 @@ async fn run_workers_cli(action: WorkersAction, db_path: PathBuf) -> i32 {
                 0
             }
         }
+    }
+}
+
+async fn run_plan_cli(action: PlanAction, db_path: PathBuf) -> i32 {
+    if let Some(parent) = db_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            emit_plan_envelope(false, serde_json::Value::Null, plan_error("database_error", error.to_string()));
+            return 4;
+        }
+    }
+    let store = match Store::open(db_path) {
+        Ok(store) => store,
+        Err(error) => {
+            emit_plan_envelope(false, serde_json::Value::Null, plan_error("database_error", error.to_string()));
+            return 4;
+        }
+    };
+    let runtime = match tmux::current_private_pane_identity().await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            emit_plan_envelope(false, serde_json::Value::Null, plan_error("authorization_failed", error.to_string()));
+            return 2;
+        }
+    };
+    let orchestrator_id = match ninox_core::orchestrator_auth::authorize_orchestrator(
+        &store,
+        std::env::var("NINOX_ORCHESTRATOR_ID").ok().as_deref(),
+        std::env::var("NINOX_CALLER_TYPE").ok().as_deref(),
+        runtime.as_ref(),
+    ) {
+        Ok(orchestrator_id) => orchestrator_id,
+        Err(error) => {
+            emit_plan_envelope(false, serde_json::Value::Null, plan_error("authorization_failed", error.to_string()));
+            return 2;
+        }
+    };
+
+    match action {
+        PlanAction::Register { file } => {
+            let resolved = std::fs::canonicalize(&file)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .into_owned();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            match store.register_orchestrator_plan(&orchestrator_id, &resolved, now) {
+                Ok(()) => {
+                    emit_plan_envelope(true, serde_json::json!({ "file_path": resolved }), serde_json::Value::Null);
+                    0
+                }
+                Err(error) => {
+                    emit_plan_envelope(false, serde_json::Value::Null, plan_error("operation_failed", error.to_string()));
+                    1
+                }
+            }
+        }
+        PlanAction::Unregister => match store.unregister_orchestrator_plan(&orchestrator_id) {
+            Ok(removed) => {
+                emit_plan_envelope(true, serde_json::json!({ "removed": removed }), serde_json::Value::Null);
+                0
+            }
+            Err(error) => {
+                emit_plan_envelope(false, serde_json::Value::Null, plan_error("operation_failed", error.to_string()));
+                1
+            }
+        },
+        PlanAction::Show => match store.get_orchestrator_plan(&orchestrator_id) {
+            Ok(Some(plan)) => {
+                let exists = std::path::Path::new(&plan.file_path).is_file();
+                emit_plan_envelope(
+                    true,
+                    serde_json::json!({
+                        "file_path": plan.file_path,
+                        "registered_at": plan.registered_at,
+                        "updated_at": plan.updated_at,
+                        "exists": exists,
+                    }),
+                    serde_json::Value::Null,
+                );
+                0
+            }
+            Ok(None) => {
+                emit_plan_envelope(false, serde_json::Value::Null, plan_error("not_found", "no plan doc registered for this orchestrator"));
+                3
+            }
+            Err(error) => {
+                emit_plan_envelope(false, serde_json::Value::Null, plan_error("operation_failed", error.to_string()));
+                1
+            }
+        },
     }
 }
 

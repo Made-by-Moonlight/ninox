@@ -4044,6 +4044,7 @@ dependencies = [
  "ninox-core",
  "ninox-server",
  "notify-rust",
+ "pulldown-cmark",
  "rusqlite",
  "serde_json",
  "tempfile",

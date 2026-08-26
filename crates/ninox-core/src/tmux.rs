@@ -243,6 +243,9 @@ pub struct ExactTmuxSession {
     pub pane_pid: u32,
 }
 
+/// A specific tmux pane's identity, as seen at a point in time — used by
+/// `authorize_orchestrator` to bind an orchestrator's persisted runtime
+/// record to the exact pane/process tree it was first authorized from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxPaneIdentity {
     pub physical_tmux_name: String,
@@ -571,6 +574,10 @@ pub async fn private_pane_identity(
     }
 }
 
+/// Whether the calling process descends from `root_pid` — the anti-spoofing
+/// check behind an orchestrator's persisted runtime identity: a plain env
+/// var can be forged, but process ancestry under the exact pane that first
+/// registered cannot.
 pub fn caller_descends_from(root_pid: u32) -> bool {
     process_ancestor_pids().contains(&root_pid)
 }

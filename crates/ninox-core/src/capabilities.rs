@@ -118,6 +118,20 @@ pub const REGISTRY: &[Capability] = &[
         enabled: |_| true,
     },
     Capability {
+        name: "reap-workers",
+        audience: Audience::Orchestrator,
+        orchestrator_md: Some(include_str!("../skills/orchestrator/reap-workers.md")),
+        worker_md: None,
+        enabled: |_| true,
+    },
+    Capability {
+        name: "spawn-orchestrator",
+        audience: Audience::Orchestrator,
+        orchestrator_md: Some(include_str!("../skills/orchestrator/spawn-orchestrator.md")),
+        worker_md: None,
+        enabled: |_| true,
+    },
+    Capability {
         name: "set-agent-config",
         audience: Audience::Orchestrator,
         orchestrator_md: Some(include_str!("../skills/orchestrator/set-agent-config.md")),
@@ -149,6 +163,13 @@ pub const REGISTRY: &[Capability] = &[
         orchestrator_md: None,
         worker_md: Some(include_str!("../skills/worker/watch-pr.md")),
         enabled: |cfg| cfg.pr_watch.enabled,
+    },
+    Capability {
+        name: "plan",
+        audience: Audience::Orchestrator,
+        orchestrator_md: Some(include_str!("../skills/orchestrator/plan.md")),
+        worker_md: None,
+        enabled: |_| true,
     },
 ];
 
@@ -241,7 +262,18 @@ mod tests {
     #[test]
     fn registry_covers_every_migrated_skill() {
         let orch: Vec<_> = for_audience(Audience::Orchestrator).map(|c| c.name).collect();
-        assert_eq!(orch, vec!["spawn-worker", "set-agent-config", "brain", "watch-pr"]);
+        assert_eq!(
+            orch,
+            vec![
+                "spawn-worker",
+                "reap-workers",
+                "spawn-orchestrator",
+                "set-agent-config",
+                "brain",
+                "watch-pr",
+                "plan",
+            ]
+        );
         let worker: Vec<_> = for_audience(Audience::Worker).map(|c| c.name).collect();
         assert_eq!(worker, vec!["brain", "watch-pr"]);
     }

@@ -5,7 +5,7 @@ use iced::{
     Alignment, Background, Element, Length,
 };
 
-use crate::{app::Message, theme::ColorScheme};
+use crate::{app::Message, components::selectable_markdown::selectable_markdown, theme::ColorScheme};
 use ninox_core::types::{CIStatus, Comment, Session, PR};
 
 /// Serif-italic heading over a dotted rule — the "h3" treatment used
@@ -160,28 +160,13 @@ pub fn info_panel<'a>(
                                     // interactive at all — without it the
                                     // widget is inert and cannot be selected.
                                     // Edits are dropped in `update`, so this
-                                    // stays read-only.
-                                    Some(content) => Element::from(
-                                        text_editor(content)
-                                            .on_action(move |action| {
-                                                Message::CommentAction(comment.id, action)
-                                            })
-                                            .size(12)
-                                            .padding(0)
-                                            .style(move |_theme, _status| text_editor::Style {
-                                                background: Background::Color(
-                                                    iced::Color::TRANSPARENT,
-                                                ),
-                                                border: iced::Border::default(),
-                                                icon: s.faint,
-                                                placeholder: s.faint,
-                                                value: s.ink_2,
-                                                selection: iced::Color {
-                                                    a: 0.30,
-                                                    ..s.accent
-                                                },
-                                            }),
-                                    ),
+                                    // stays read-only. GitHub comment bodies
+                                    // are markdown, so this uses the same
+                                    // selectable-markdown widget as the
+                                    // orchestrator Plan panel.
+                                    Some(content) => selectable_markdown(content, s, move |action| {
+                                        Message::CommentAction(comment.id, action)
+                                    }),
                                     None => Space::new(0, 0).into(),
                                 },
                             ],
