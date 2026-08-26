@@ -2,6 +2,12 @@ use std::{path::Path, process::Command};
 
 use tempfile::tempdir;
 
+// Unlike `completion_command` below, this doesn't need an isolated
+// `TMUX_TMPDIR`: `reject_recursive_worker_spawn` runs as the very first
+// statement of `spawn` handling, before any tmux interaction, so the
+// ambient-socket hazard that motivates that isolation never comes into play
+// here. If `spawn` ever grows a tmux check ahead of that role rejection,
+// this helper will need the same treatment.
 fn denied_spawn(
     root: &Path,
     execution_role: Option<&str>,
@@ -59,12 +65,24 @@ fn completion_command(
     execution_role: &str,
     legacy_caller_type: &str,
 ) -> std::process::Output {
+    // The spawned binary is production `ninox`, not a `deps/`-built test
+    // binary, so `tmux::socket()` treats it as the real app and looks for a
+    // caller pane on the shared `-L ninox` server (see tmux.rs's
+    // `is_test_binary` doc comment). Without an isolated `TMUX_TMPDIR`, that
+    // lookup resolves to the OS-default socket directory — the exact one a
+    // real, ambient Ninox session on the host also uses — so running this
+    // test from inside a live Ninox worker session lets it find a real pane
+    // and authorize against it instead of correctly finding none.
+    let tmux_tmp = root.join("tmux-isolated");
+    std::fs::create_dir_all(&tmux_tmp).unwrap();
+
     Command::new(env!("CARGO_BIN_EXE_ninox"))
         .arg("--db")
         .arg(root.join("state/ninox.db"))
         .args(args)
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", root.join("xdg-config"))
+        .env("TMUX_TMPDIR", &tmux_tmp)
         .env("NINOX_EXECUTION_ROLE", execution_role)
         .env("NINOX_CALLER_TYPE", legacy_caller_type)
         .env("NINOX_SESSION", "worker")
