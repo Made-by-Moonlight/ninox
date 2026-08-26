@@ -3221,7 +3221,7 @@ impl App {
                 let terminal_capturing = matches!(
                     &state.view,
                     View::SessionDetail { panel, .. }
-                        if matches!(panel, DetailPanel::Terminal | DetailPanel::Split)
+                        if matches!(panel, DetailPanel::Terminal | DetailPanel::Split | DetailPanel::Plan)
                 );
                 if !terminal_capturing && !modifiers.command() && !modifiers.control() && !modifiers.alt() {
                     if let iced::keyboard::Key::Character(c) = &key {
@@ -3276,7 +3276,8 @@ impl App {
                 if let View::SessionDetail {
                     session_id,
                     panel: crate::components::session_detail::DetailPanel::Terminal
-                        | crate::components::session_detail::DetailPanel::Split,
+                        | crate::components::session_detail::DetailPanel::Split
+                        | crate::components::session_detail::DetailPanel::Plan,
                 } = &state.view {
                     let session_id = session_id.clone();
                     let mode = state.terminals.get(&session_id)
@@ -7464,6 +7465,89 @@ mod tests {
             let m = press_cmd(m, "+");
             assert!(approx(m.zoom, 1.1), "terminal swallowed zoom key: {}", m.zoom);
         });
+    }
+
+    /// Regression test: the `Message::RawKey` handler's `terminal_capturing`
+    /// gate listed only `DetailPanel::Terminal | DetailPanel::Split`, so a
+    /// bare keystroke with the Plan tab open fell through to the "no
+    /// terminal focused" branch and got hijacked as a `1`/`2`/`3`/`t`
+    /// navigation/theme shortcut instead of reaching the terminal — the
+    /// reported "can't type in the terminal with Plan open" bug.
+    /// `DetailPanel::Plan` must capture bare keys exactly like `Split` does.
+    #[test]
+    fn plan_panel_keeps_capturing_bare_keys_for_the_terminal() {
+        let mut m = base(test_engine());
+        m.view = View::SessionDetail {
+            session_id: "orch1".into(),
+            panel: crate::components::session_detail::DetailPanel::Plan,
+        };
+        let m = press(m, "1");
+        assert!(
+            matches!(
+                m.view,
+                View::SessionDetail {
+                    panel: crate::components::session_detail::DetailPanel::Plan,
+                    ..
+                }
+            ),
+            "a bare key with the Plan tab open must not be hijacked by the \
+             navigation-shortcut branch: {:?}",
+            m.view
+        );
+    }
+
+    /// Complements `plan_panel_keeps_capturing_bare_keys_for_the_terminal`:
+    /// that test only proves the `terminal_capturing` gate (guarding the
+    /// bare 1/2/3/t shortcuts) includes `DetailPanel::Plan` — it can't tell
+    /// "the key reached the terminal" apart from "the key was silently
+    /// dropped", since `state.view` is unaffected either way. This exercises
+    /// the actual PTY-write gate end to end against a real tmux pane.
+    #[tokio::test]
+    async fn raw_key_reaches_the_pty_when_the_plan_tab_is_open() {
+        fn tmux_available() -> bool {
+            std::process::Command::new("tmux").args(["-V"]).output()
+                .map(|o| o.status.success()).unwrap_or(false)
+        }
+        if !tmux_available() { return; }
+
+        let e = test_engine();
+        let m = base(e);
+        let sid = format!(
+            "plan-rawkey-test-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+        );
+        ninox_core::tmux::create_session(&sid, "/tmp", "cat", &[]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let (mut m, _) = m.update(Message::NavigateSession(sid.clone()));
+        let argv = ninox_core::tmux::attach_args(&sid).await;
+        let (m2, _) = m.update(Message::ClientAttach { session_id: sid.clone(), argv });
+        m = m2;
+        assert!(m.clients.contains_key(&sid), "attach must succeed");
+
+        m.view = View::SessionDetail {
+            session_id: sid.clone(),
+            panel: crate::components::session_detail::DetailPanel::Plan,
+        };
+
+        // Bound (not discarded): dropping the returned `App` would drop its
+        // `AttachedClient`, killing the PTY attach before the byte we just
+        // queued has a chance to land. Keep it alive past the capture below.
+        let (_m, _) = m.update(Message::RawKey {
+            key:       iced::keyboard::Key::Character("z".into()),
+            modifiers: iced::keyboard::Modifiers::default(),
+            text:      Some("z".into()),
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let captured = ninox_core::tmux::capture_history(&sid, 0, 5).await;
+        let text = String::from_utf8_lossy(&captured);
+        assert!(
+            text.contains('z'),
+            "a keystroke with the Plan tab open must reach the PTY: {text:?}"
+        );
+
+        ninox_core::tmux::kill_session(&sid).await.unwrap();
     }
 
     #[test]
