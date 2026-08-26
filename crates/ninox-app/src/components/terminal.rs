@@ -6,6 +6,7 @@ use iced::widget::canvas::{Cache, Frame, Geometry, Path};
 use iced::{Color as IcedColor, Rectangle, Size, Theme};
 
 use crate::app::Message;
+use crate::components::terminal_layout::{layout_line, LogicalCell, VisualLine};
 
 const NERD_FONT: iced::Font = iced::Font {
     family: iced::font::Family::Name("Symbols Nerd Font Mono"),
@@ -144,6 +145,200 @@ impl alacritty_terminal::event::EventListener for EventProxy {
 // TerminalState — holds the terminal buffer + PTY sender
 // ---------------------------------------------------------------------------
 
+const SYNC_START: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
+const EMPTY_SYNC_FRAME: &[u8] = b"\x1b[?2026h\x1b[?2026l";
+
+#[derive(Debug, Default)]
+struct TerminalOutputFramer {
+    buffered:        Vec<u8>,
+    deferred:        Vec<u8>,
+    sync_open:       bool,
+    recovery_token:  u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TerminalProcessResult {
+    pub recovery_token: Option<u64>,
+    #[cfg(test)]
+    committed:          bool,
+}
+
+impl TerminalOutputFramer {
+    fn push(&mut self, bytes: &[u8]) -> (Vec<u8>, Option<u64>) {
+        let was_pending = self.is_pending();
+        self.buffered.extend_from_slice(bytes);
+        let mut ready = Vec::new();
+
+        loop {
+            if self.sync_open {
+                let Some(end) = find_bytes(&self.buffered, SYNC_END) else {
+                    break;
+                };
+                let frame: Vec<_> = self.buffered.drain(..end + SYNC_END.len()).collect();
+                self.sync_open = false;
+                self.finish_frame(frame, &mut ready);
+                continue;
+            }
+
+            if let Some(start) = find_bytes(&self.buffered, SYNC_START) {
+                let unframed: Vec<_> = self.buffered.drain(..start).collect();
+                self.finish_unframed(unframed, &mut ready);
+                self.sync_open = true;
+                continue;
+            }
+
+            let retained = marker_prefix_suffix_len(&self.buffered, SYNC_START);
+            let unframed: Vec<_> = self
+                .buffered
+                .drain(..self.buffered.len().saturating_sub(retained))
+                .collect();
+            self.finish_unframed(unframed, &mut ready);
+            break;
+        }
+
+        let is_pending = self.is_pending();
+        let recovery_token = if !was_pending && is_pending {
+            self.recovery_token = self.recovery_token.wrapping_add(1);
+            Some(self.recovery_token)
+        } else {
+            None
+        };
+        (ready, recovery_token)
+    }
+
+    fn recover(&mut self, token: u64) -> Vec<u8> {
+        if token != self.recovery_token || !self.is_pending() {
+            return Vec::new();
+        }
+        self.recover_bytes()
+    }
+
+    fn recover_bytes(&mut self) -> Vec<u8> {
+        let mut ready = std::mem::take(&mut self.deferred);
+        if self.sync_open {
+            ready.append(&mut self.buffered);
+            // Complete the parser transaction synthetically. Recovery is one
+            // atomic commit, never a replay of each intermediate fragment.
+            ready.extend_from_slice(SYNC_END);
+        } else {
+            // Ground state retains only a possible prefix of SYNC_START.
+            // Dropping an abandoned partial escape is safer than poisoning
+            // the VTE parser and mistaking later plain bytes for its suffix.
+            self.buffered.clear();
+        }
+        self.sync_open = false;
+        ready
+    }
+
+    fn finish_frame(&mut self, frame: Vec<u8>, ready: &mut Vec<u8>) {
+        // tmux can emit an empty outer transaction after an unframed pane
+        // repaint. It carries no terminal state, so advancing alacritty would
+        // only invalidate and redraw an unchanged iced canvas.
+        if frame == EMPTY_SYNC_FRAME {
+            return;
+        }
+        let has_text = contains_terminal_text(&frame);
+        if !self.deferred.is_empty() {
+            self.deferred.extend_from_slice(&frame);
+            if has_text {
+                ready.append(&mut self.deferred);
+            }
+        } else if !has_text && contains_structural_csi(&frame) {
+            // tmux 3.7 can leak an erase from an inner synchronized update
+            // into its own balanced outer frame. Hold that destructive-only
+            // frame until tmux's final content repaint arrives.
+            self.deferred = frame;
+        } else {
+            ready.extend_from_slice(&frame);
+        }
+    }
+
+    fn finish_unframed(&mut self, bytes: Vec<u8>, ready: &mut Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.deferred.is_empty() {
+            ready.extend_from_slice(&bytes);
+            return;
+        }
+
+        let has_text = contains_terminal_text(&bytes);
+        self.deferred.extend_from_slice(&bytes);
+        if has_text {
+            ready.append(&mut self.deferred);
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        self.sync_open || !self.buffered.is_empty() || !self.deferred.is_empty()
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+fn marker_prefix_suffix_len(bytes: &[u8], marker: &[u8]) -> usize {
+    (1..marker.len())
+        .rev()
+        .find(|&length| bytes.ends_with(&marker[..length]))
+        .unwrap_or(0)
+}
+
+fn terminal_controls(bytes: &[u8], mut visit_csi: impl FnMut(u8)) -> bool {
+    let mut index = 0;
+    let mut has_text = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            0x1b if bytes.get(index + 1) == Some(&b'[') => {
+                index += 2;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    index += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        visit_csi(byte);
+                        break;
+                    }
+                }
+            }
+            0x1b if bytes.get(index + 1) == Some(&b']') => {
+                index += 2;
+                while index < bytes.len() {
+                    if bytes[index] == 0x07 {
+                        index += 1;
+                        break;
+                    }
+                    if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                        index += 2;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            0x1b => index = (index + 2).min(bytes.len()),
+            byte if byte < 0x20 || byte == 0x7f => index += 1,
+            _ => {
+                has_text = true;
+                index += 1;
+            }
+        }
+    }
+    has_text
+}
+
+fn contains_terminal_text(bytes: &[u8]) -> bool {
+    terminal_controls(bytes, |_| {})
+}
+
+fn contains_structural_csi(bytes: &[u8]) -> bool {
+    let mut structural = false;
+    terminal_controls(bytes, |final_byte| {
+        structural |= matches!(final_byte, b'@' | b'J' | b'K' | b'L' | b'M' | b'P' | b'S' | b'T' | b'X');
+    });
+    structural
+}
+
 pub struct TerminalState {
     pub term: Term<EventProxy>,
     pub cache: Cache,
@@ -153,6 +348,9 @@ pub struct TerminalState {
     /// comes from here.
     pub scrollback: crate::components::scrollback::Scrollback,
     parser: Processor,
+    output_framer: TerminalOutputFramer,
+    #[cfg(test)]
+    output_commits: usize,
 }
 
 impl TerminalState {
@@ -173,13 +371,47 @@ impl TerminalState {
             cache: Cache::new(),
             scrollback: Default::default(),
             parser: Processor::new(),
+            output_framer: TerminalOutputFramer::default(),
+            #[cfg(test)]
+            output_commits: 0,
         }
     }
 
     /// Feed raw bytes from the attached tmux client into the emulator.
-    pub fn process(&mut self, bytes: &[u8]) {
+    pub(crate) fn process(&mut self, bytes: &[u8]) -> TerminalProcessResult {
+        let (ready, recovery_token) = self.output_framer.push(bytes);
+        #[cfg(test)]
+        let committed = self.commit_output(&ready);
+        #[cfg(not(test))]
+        self.commit_output(&ready);
+        TerminalProcessResult {
+            recovery_token,
+            #[cfg(test)]
+            committed,
+        }
+    }
+
+    pub(crate) fn recover_output(&mut self, token: u64) -> bool {
+        let ready = self.output_framer.recover(token);
+        self.commit_output(&ready)
+    }
+
+    fn commit_output(&mut self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
         self.parser.advance(&mut self.term, bytes);
         self.cache.clear();
+        #[cfg(test)]
+        {
+            self.output_commits += 1;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn output_commit_count(&self) -> usize {
+        self.output_commits
     }
 
     /// Scroll by `delta` lines (positive = up). Returns true when older
@@ -304,10 +536,13 @@ pub fn ansi_to_iced(
 
 #[derive(Default, Clone)]
 pub struct SelectionState {
-    /// Anchor cell (col, row) where the drag started.
+    /// Logical anchor cell used for links and source-text compatibility.
     anchor: Option<(usize, usize)>,
-    /// Current end cell while dragging.
+    /// Logical end cell used for source-text compatibility.
     end: Option<(usize, usize)>,
+    /// Visual endpoints preserve the exact painted span on BiDi rows.
+    visual_anchor: Option<(usize, usize)>,
+    visual_end:    Option<(usize, usize)>,
     dragging: bool,
     /// Whether the cursor moved after the press (distinguishes click from drag).
     moved: bool,
@@ -320,15 +555,28 @@ pub struct SelectionState {
 }
 
 impl SelectionState {
-    /// Normalised (start, end) in reading order, or None if no selection.
-    fn range(&self) -> Option<((usize, usize), (usize, usize))> {
-        let (a_col, a_row) = self.anchor?;
-        let (e_col, e_row) = self.end?;
+    fn normalized_range(
+        anchor: Option<(usize, usize)>,
+        end: Option<(usize, usize)>,
+    ) -> Option<((usize, usize), (usize, usize))> {
+        let (a_col, a_row) = anchor?;
+        let (e_col, e_row) = end?;
         if a_row < e_row || (a_row == e_row && a_col <= e_col) {
             Some(((a_col, a_row), (e_col, e_row)))
         } else {
             Some(((e_col, e_row), (a_col, a_row)))
         }
+    }
+
+    /// Normalised logical endpoints for legacy/programmatic selections.
+    fn range(&self) -> Option<((usize, usize), (usize, usize))> {
+        Self::normalized_range(self.anchor, self.end)
+    }
+
+    /// Normalised painted endpoints, falling back to logical coordinates for
+    /// programmatic selections that predate visual tracking.
+    fn visual_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        Self::normalized_range(self.visual_anchor, self.visual_end).or_else(|| self.range())
     }
 
     fn pixel_to_cell(
@@ -372,6 +620,62 @@ fn renderable_cursor(term: &Term<EventProxy>) -> alacritty_terminal::term::Rende
     term.renderable_content().cursor
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DisplayCell {
+    c:         char,
+    zerowidth: Vec<char>,
+    fg:        Color,
+    bg:        Color,
+    flags:     Flags,
+}
+
+impl Default for DisplayCell {
+    fn default() -> Self {
+        Self {
+            c:         ' ',
+            zerowidth: Vec::new(),
+            fg:        Color::Named(NamedColor::Foreground),
+            bg:        Color::Named(NamedColor::Background),
+            flags:     Flags::empty(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+struct RowDrawCommands {
+    cells:          Vec<DisplayCell>,
+    layout:         VisualLine,
+    link_spans:     Vec<crate::components::links::LinkSpan>,
+    logical:        i32,
+    cursor:         Option<(usize, CursorShape)>,
+    selected_cells: Vec<bool>,
+    colors:         Vec<Option<Rgb>>,
+    font_size:      f32,
+    terminal_bg:    IcedColor,
+    terminal_fg:    IcedColor,
+    cursor_color:   IcedColor,
+    ansi:           [IcedColor; 16],
+}
+
+fn visual_layout(cells: &[DisplayCell]) -> VisualLine {
+    let logical: Vec<_> = cells
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+        .map(|(column, cell)| {
+            let mut text = String::from(if cell.c == '\0' { ' ' } else { cell.c });
+            text.extend(cell.zerowidth.iter().copied());
+            LogicalCell {
+                column,
+                text,
+                width: if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 },
+            }
+        })
+        .collect();
+    layout_line(&logical, cells.len())
+}
+
 // ---------------------------------------------------------------------------
 // TerminalWidget — iced canvas Program
 // ---------------------------------------------------------------------------
@@ -391,6 +695,70 @@ pub struct TerminalWidget<'a> {
 }
 
 impl<'a> TerminalWidget<'a> {
+    fn row_display_cells(&self, row: usize) -> Option<Vec<DisplayCell>> {
+        use alacritty_terminal::index::{Column, Line};
+
+        let grid = self.state.term.grid();
+        let cols = grid.columns();
+        if row >= grid.screen_lines() {
+            return None;
+        }
+        let logical = row as i32 - self.state.scrollback.offset as i32;
+        if logical < 0 {
+            let history = self.state.scrollback.line_above((-logical - 1) as usize)?;
+            let mut cells: Vec<_> = history
+                .iter()
+                .take(cols)
+                .map(|cell| DisplayCell {
+                    c:         cell.c,
+                    zerowidth: cell.zerowidth.clone(),
+                    fg:        cell.fg,
+                    bg:        cell.bg,
+                    flags:     cell.flags,
+                })
+                .collect();
+            cells.resize(cols, DisplayCell::default());
+            Some(cells)
+        } else {
+            Some(
+                (0..cols)
+                    .map(|column| {
+                        let cell = &grid[Line(logical)][Column(column)];
+                        DisplayCell {
+                            c:         cell.c,
+                            zerowidth: cell.zerowidth().unwrap_or_default().to_vec(),
+                            fg:        cell.fg,
+                            bg:        cell.bg,
+                            flags:     cell.flags,
+                        }
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    fn pixel_to_logical_cell(
+        &self,
+        x: f32,
+        y: f32,
+        cell_w: f32,
+        cell_h: f32,
+        cols: usize,
+        rows: usize,
+    ) -> (usize, usize) {
+        let (visual_col, row) =
+            SelectionState::pixel_to_cell(x, y, cell_w, cell_h, cols, rows);
+        self.visual_to_logical_cell(visual_col, row)
+    }
+
+    fn visual_to_logical_cell(&self, visual_col: usize, row: usize) -> (usize, usize) {
+        let logical_col = self
+            .row_display_cells(row)
+            .map(|cells| visual_layout(&cells).visual_to_logical[visual_col])
+            .unwrap_or(visual_col);
+        (logical_col, row)
+    }
+
     /// The link-detection view of viewport row `row`: each cell's rendered
     /// character plus its OSC 8 hyperlink URI, if any, from either the live
     /// grid or cached scrollback history. Empty if `row` is out of bounds or
@@ -453,7 +821,7 @@ impl<'a> TerminalWidget<'a> {
     }
 
     /// The URL under viewport cell (col, row), if any.
-    fn link_at(&self, col: usize, row: usize) -> Option<String> {
+    fn link_at_logical(&self, col: usize, row: usize) -> Option<String> {
         let mut hyperlink_storage = Vec::new();
         crate::components::links::link_at(&self.row_link_cells(row, &mut hyperlink_storage), col)
     }
@@ -463,10 +831,101 @@ impl<'a> TerminalWidget<'a> {
     /// auto-copy and the explicit Cmd+C / Ctrl+Shift+C shortcut so the two
     /// paths can't drift apart.
     fn copy_message(&self, sel: &SelectionState) -> Option<Message> {
-        sel.range()
-            .map(|((sc, sr), (ec, er))| extract_selection(self.state, sc, sr, ec, er))
+        let selected = if sel.visual_anchor.is_some() && sel.visual_end.is_some() {
+            sel.visual_range()
+                .map(|((sc, sr), (ec, er))| self.extract_visual_selection(sc, sr, ec, er))
+        } else {
+            sel.range()
+                .map(|((sc, sr), (ec, er))| extract_selection(self.state, sc, sr, ec, er))
+        };
+        selected
             .filter(|s| !s.trim().is_empty())
             .map(Message::CopyToClipboard)
+    }
+
+    fn extract_visual_selection(
+        &self,
+        start_col: usize,
+        start_row: usize,
+        end_col: usize,
+        end_row: usize,
+    ) -> String {
+        let cols = self.state.term.grid().columns();
+        let rows = self.state.term.grid().screen_lines();
+        let mut out = String::new();
+
+        for row in start_row..=end_row.min(rows.saturating_sub(1)) {
+            let Some(cells) = self.row_display_cells(row) else {
+                continue;
+            };
+            let col_start = if row == start_row { start_col } else { 0 };
+            let col_end = if row == end_row {
+                end_col
+            } else {
+                cols.saturating_sub(1)
+            }
+            .min(cols.saturating_sub(1));
+            let layout = visual_layout(&cells);
+            let mut logical_columns =
+                layout.visual_to_logical[col_start.min(col_end)..=col_end].to_vec();
+            logical_columns.sort_unstable();
+            logical_columns.dedup();
+
+            let mut line_text = String::new();
+            for logical_col in logical_columns {
+                let cell = &cells[logical_col];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
+                line_text.extend(cell.zerowidth.iter().copied());
+            }
+            out.push_str(line_text.trim_end());
+            if row < end_row {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    fn row_draw_commands(&self, selection: &SelectionState) -> Vec<RowDrawCommands> {
+        use alacritty_terminal::index::Line;
+        use alacritty_terminal::term::color::COUNT;
+
+        let grid = self.state.term.grid();
+        let offset = self.state.scrollback.offset as i32;
+        let cursor = renderable_cursor(&self.state.term);
+        let colors = self.state.term.colors();
+        let colors: Vec<_> = (0..COUNT).map(|index| colors[index]).collect();
+
+        (0..grid.screen_lines())
+            .filter_map(|row| {
+                let logical = row as i32 - offset;
+                let cells = self.row_display_cells(row)?;
+                let cursor = (offset == 0
+                    && logical >= 0
+                    && cursor.point.line == Line(logical))
+                    .then_some((cursor.point.column.0, cursor.shape));
+
+                Some(RowDrawCommands {
+                    layout: visual_layout(&cells),
+                    link_spans: self.row_link_spans(row),
+                    selected_cells: (0..grid.columns())
+                        .map(|column| cell_is_selected(selection, row, column))
+                        .collect(),
+                    cells,
+                    logical,
+                    cursor,
+                    colors: colors.clone(),
+                    font_size: self.font_size,
+                    terminal_bg: self.terminal_bg,
+                    terminal_fg: self.terminal_fg,
+                    cursor_color: self.cursor_color,
+                    ansi: self.ansi,
+                })
+            })
+            .collect()
     }
 }
 
@@ -491,10 +950,13 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
         match &event {
             Event::Mouse(MouseEvent::ButtonPressed(Button::Left)) => {
                 if let Some(pos) = cursor.position_in(bounds) {
-                    let cell =
+                    let visual =
                         SelectionState::pixel_to_cell(pos.x, pos.y, cell_w, cell_h, cols, rows);
-                    state.anchor   = Some(cell);
-                    state.end      = Some(cell);
+                    let logical = self.visual_to_logical_cell(visual.0, visual.1);
+                    state.anchor = Some(logical);
+                    state.end = Some(logical);
+                    state.visual_anchor = Some(visual);
+                    state.visual_end = Some(visual);
                     state.dragging = true;
                     state.moved    = false;
                 }
@@ -507,19 +969,21 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                 let hovering = cursor
                     .position_in(bounds)
                     .map(|pos| {
-                        SelectionState::pixel_to_cell(pos.x, pos.y, cell_w, cell_h, cols, rows)
+                        self.pixel_to_logical_cell(pos.x, pos.y, cell_w, cell_h, cols, rows)
                     })
-                    .is_some_and(|(col, row)| self.link_at(col, row).is_some());
+                    .is_some_and(|(col, row)| self.link_at_logical(col, row).is_some());
                 state.hovering_link = hovering;
 
                 if state.dragging {
                     if let Some(pos) = cursor.position_in(bounds) {
-                        let cell =
+                        let visual =
                             SelectionState::pixel_to_cell(pos.x, pos.y, cell_w, cell_h, cols, rows);
-                        if state.anchor != Some(cell) {
+                        let logical = self.visual_to_logical_cell(visual.0, visual.1);
+                        if state.visual_anchor != Some(visual) {
                             state.moved = true;
                         }
-                        state.end = Some(cell);
+                        state.end = Some(logical);
+                        state.visual_end = Some(visual);
                         self.state.cache.clear();
                         return (iced::widget::canvas::event::Status::Captured, None);
                     }
@@ -534,10 +998,15 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                     // the pointer; further movement while still past the
                     // edge keeps extending/scrolling one step per event.
                     if let Some(pos) = cursor.position() {
-                        let col = ((pos.x - bounds.x) / cell_w) as usize;
-                        let col = col.min(cols.saturating_sub(1));
+                        let visual_col = ((pos.x - bounds.x) / cell_w) as usize;
+                        let visual_col = visual_col.min(cols.saturating_sub(1));
                         if pos.y < bounds.y {
+                            let col = self
+                                .row_display_cells(0)
+                                .map(|cells| visual_layout(&cells).visual_to_logical[visual_col])
+                                .unwrap_or(visual_col);
                             state.end = Some((col, 0));
+                            state.visual_end = Some((visual_col, 0));
                             state.moved = true;
                             self.state.cache.clear();
                             return (
@@ -549,7 +1018,13 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                                 }),
                             );
                         } else if pos.y > bounds.y + bounds.height {
-                            state.end = Some((col, rows.saturating_sub(1)));
+                            let row = rows.saturating_sub(1);
+                            let col = self
+                                .row_display_cells(row)
+                                .map(|cells| visual_layout(&cells).visual_to_logical[visual_col])
+                                .unwrap_or(visual_col);
+                            state.end = Some((col, row));
+                            state.visual_end = Some((visual_col, row));
                             state.moved = true;
                             self.state.cache.clear();
                             return (
@@ -580,9 +1055,11 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                         (state.anchor, cursor.position_in(bounds))
                     {
                         let _ = pos; // bounds-checked via anchor
-                        if let Some(url) = self.link_at(col, row) {
+                        if let Some(url) = self.link_at_logical(col, row) {
                             state.anchor = None;
                             state.end    = None;
+                            state.visual_anchor = None;
+                            state.visual_end = None;
                             return (
                                 iced::widget::canvas::event::Status::Captured,
                                 Some(Message::OpenUrl(url)),
@@ -592,6 +1069,8 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                         if self.session_ids.iter().any(|id| id == &word) {
                             state.anchor = None;
                             state.end    = None;
+                            state.visual_anchor = None;
+                            state.visual_end = None;
                             return (
                                 iced::widget::canvas::event::Status::Captured,
                                 Some(Message::NavigateSession(word)),
@@ -600,6 +1079,8 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                     }
                     state.anchor = None;
                     state.end    = None;
+                    state.visual_anchor = None;
+                    state.visual_end = None;
                     return (iced::widget::canvas::event::Status::Captured, None);
                 }
                 // Drag — copy the selection.
@@ -723,87 +1204,89 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
 
                 let logical = row as i32 - offset;
                 let y = row as f32 * cell_h;
-
-                if logical < 0 {
-                    // History line fetched from tmux capture-pane. Content
-                    // between the cached snapshot and the live screen may be
-                    // stale/missing until jump-to-latest — accepted
-                    // trade-off, not a bug (see Scrollback docs).
-                    let Some(cells) = self.state.scrollback.line_above((-logical - 1) as usize)
-                    else {
-                        continue;
-                    };
-                    let link_spans = self.row_link_spans(row);
-                    for (col, cell) in cells.iter().enumerate().take(cols) {
-                        let x = col as f32 * cell_w;
-                        let is_selected = cell_is_selected(sel, row, col);
-                            let is_link = link_spans
-                                .iter()
-                                .any(|s| col >= s.start_col && col <= s.end_col);
-                        draw_cell(
-                                frame,
-                                x,
-                                y,
-                                cell_w,
-                                cell_h,
-                                self.font_size,
-                                cell.c,
-                                cell.fg,
-                                cell.bg,
-                                cell.flags,
-                            false, // cursor never draws in history
-                                cursor_shape,
-                                is_selected,
-                                is_link,
-                                colors,
-                                &self.ansi,
-                                term_bg,
-                                term_fg,
-                                cursor_color,
-                        );
-                    }
+                let Some(cells) = self.row_display_cells(row) else {
                     continue;
-                }
-
-                let line = Line(logical);
+                };
+                let layout = visual_layout(&cells);
                 let link_spans = self.row_link_spans(row);
-                for col in 0..cols {
-                    let column = Column(col);
-                    let cell = &grid[line][column];
-                    let x = col as f32 * cell_w;
+                let mut shaped = vec![false; cols];
+                for run in layout.runs.iter().filter(|run| run.rtl) {
+                    shaped[run.visual_start..(run.visual_start + run.visual_width).min(cols)]
+                        .fill(true);
+                }
+                for (visual_col, is_shaped) in shaped.iter().copied().enumerate() {
+                    let logical_col = layout.visual_to_logical[visual_col];
+                    let cell = &cells[logical_col];
+                    let x = visual_col as f32 * cell_w;
 
                     // The cursor is suppressed whenever the view is scrolled
                     // back — it lives on the live screen, not in history.
-                        let is_cursor = offset == 0
-                            && cursor_point.line == line
-                            && cursor_point.column == column;
-                    let is_selected = cell_is_selected(sel, row, col);
-                        let is_link = link_spans
-                            .iter()
-                            .any(|s| col >= s.start_col && col <= s.end_col);
+                    let is_cursor = offset == 0
+                        && logical >= 0
+                        && cursor_point.line == Line(logical)
+                        && cursor_point.column == Column(logical_col);
+                    let is_selected = cell_is_selected(sel, row, visual_col);
+                    let is_link = link_spans
+                        .iter()
+                        .any(|span| {
+                            logical_col >= span.start_col && logical_col <= span.end_col
+                        });
 
                     draw_cell(
+                        frame,
+                        x,
+                        y,
+                        cell_w,
+                        cell_h,
+                        self.font_size,
+                        if is_shaped || !cell.zerowidth.is_empty() { ' ' } else { cell.c },
+                        cell.fg,
+                        cell.bg,
+                        cell.flags,
+                        is_cursor,
+                        cursor_shape,
+                        is_selected,
+                        is_link,
+                        colors,
+                        &self.ansi,
+                        term_bg,
+                        term_fg,
+                        cursor_color,
+                    );
+                    if !is_shaped && !cell.zerowidth.is_empty() {
+                        draw_combining_cell(
                             frame,
                             x,
                             y,
                             cell_w,
                             cell_h,
                             self.font_size,
-                            cell.c,
-                            cell.fg,
-                            cell.bg,
-                            cell.flags,
-                            is_cursor,
-                            cursor_shape,
-                            is_selected,
-                            is_link,
+                            cell,
+                            is_cursor && cursor_shape == CursorShape::Block,
                             colors,
                             &self.ansi,
                             term_bg,
                             term_fg,
-                            cursor_color,
-                    );
+                        );
+                    }
                 }
+                draw_glyph_runs(
+                    frame,
+                    &layout,
+                    &cells,
+                    y,
+                    cell_w,
+                    cell_h,
+                    self.font_size,
+                    logical,
+                    offset,
+                    cursor_point,
+                    cursor_shape,
+                    colors,
+                    &self.ansi,
+                    term_bg,
+                    term_fg,
+                );
             }
         });
 
@@ -826,7 +1309,7 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
 
 /// Whether canvas cell (col, row) falls inside the current drag selection.
 fn cell_is_selected(sel: &SelectionState, row: usize, col: usize) -> bool {
-    sel.range()
+    sel.visual_range()
         .map(|((sc, sr), (ec, er))| {
         let in_row = row >= sr && row <= er;
             if !in_row {
@@ -856,6 +1339,193 @@ fn stroke_line(frame: &mut Frame, x1: f32, y1: f32, x2: f32, y2: f32, color: Ice
     );
 }
 
+fn resolved_cell_colors(
+    fg_color: Color,
+    bg_color: Color,
+    flags: Flags,
+    colors: &alacritty_terminal::term::color::Colors,
+    ansi: &[IcedColor; 16],
+    term_bg: IcedColor,
+    term_fg: IcedColor,
+) -> (IcedColor, IcedColor) {
+    let mut fg = ansi_to_iced(fg_color, colors, ansi, term_bg, term_fg);
+    let mut bg = ansi_to_iced(bg_color, colors, ansi, term_bg, term_fg);
+    if flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if flags.contains(Flags::DIM) {
+        fg.a *= 0.6;
+    }
+    if flags.contains(Flags::HIDDEN) {
+        fg = bg;
+    }
+    (fg, bg)
+}
+
+fn shaped_run_width(content: &str, font: iced::Font, font_size: f32) -> f32 {
+    use iced::advanced::graphics::text::{self, cosmic_text};
+
+    let mut font_system = text::font_system().write().expect("write font system");
+    let mut buffer = cosmic_text::BufferLine::new(
+        content,
+        cosmic_text::LineEnding::default(),
+        cosmic_text::AttrsList::new(text::to_attributes(font)),
+        cosmic_text::Shaping::Advanced,
+    );
+    buffer
+        .layout(
+            font_system.raw(),
+            font_size,
+            None,
+            cosmic_text::Wrap::None,
+            None,
+            4,
+        )
+        .iter()
+        .map(|line| line.w)
+        .fold(0.0, f32::max)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_combining_cell(
+    frame: &mut Frame,
+    x: f32,
+    y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    font_size: f32,
+    cell: &DisplayCell,
+    block_cursor: bool,
+    colors: &alacritty_terminal::term::color::Colors,
+    ansi: &[IcedColor; 16],
+    term_bg: IcedColor,
+    term_fg: IcedColor,
+) {
+    let font = font_for_cell(cell.c, cell.flags);
+    let (mut fg, _) =
+        resolved_cell_colors(cell.fg, cell.bg, cell.flags, colors, ansi, term_bg, term_fg);
+    if block_cursor {
+        fg = term_bg;
+    }
+    let mut content = String::from(CONTEXTUAL_FONT_ANCHOR);
+    content.push(cell.c);
+    content.extend(cell.zerowidth.iter().copied());
+    let natural_width = shaped_run_width(&content, font, font_size);
+    let target_width = if cell.flags.contains(Flags::WIDE_CHAR) {
+        2.0 * cell_w
+    } else {
+        cell_w
+    };
+    let scale_x = if natural_width > 0.0 { target_width / natural_width } else { 1.0 };
+    let clip = Rectangle::new(iced::Point::new(x, y), Size::new(target_width, cell_h));
+    frame.with_clip(clip, |frame| {
+        frame.with_save(|frame| {
+            frame.scale_nonuniform(iced::Vector::new(scale_x, 1.0));
+            frame.fill_text(iced::widget::canvas::Text {
+                content,
+                position: iced::Point::new(x / scale_x, y),
+                color: fg,
+                size: iced::Pixels(font_size),
+                font,
+                horizontal_alignment: iced::alignment::Horizontal::Left,
+                vertical_alignment: iced::alignment::Vertical::Top,
+                line_height: iced::widget::text::LineHeight::Relative(cell_h / font_size),
+                shaping: iced::widget::text::Shaping::Advanced,
+            });
+        });
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_glyph_runs(
+    frame: &mut Frame,
+    layout: &VisualLine,
+    cells: &[DisplayCell],
+    y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    font_size: f32,
+    logical_row: i32,
+    scroll_offset: i32,
+    cursor_point: alacritty_terminal::index::Point,
+    cursor_shape: CursorShape,
+    colors: &alacritty_terminal::term::color::Colors,
+    ansi: &[IcedColor; 16],
+    term_bg: IcedColor,
+    term_fg: IcedColor,
+) {
+    use alacritty_terminal::index::{Column, Line};
+
+    for run in layout.runs.iter().filter(|run| run.rtl) {
+        let start_x = run.visual_start as f32 * cell_w;
+        let end_x = (run.visual_start + run.visual_width) as f32 * cell_w;
+        let content = format!("{CONTEXTUAL_FONT_ANCHOR}{}", run.text);
+
+        // Render the same fully shaped run through style-span clips. This keeps
+        // joining context across SGR boundaries while preserving each span's
+        // color and fixed cell geometry.
+        let run_end = run.visual_start + run.visual_width;
+        let glyph_style = |visual_col: usize| {
+            let logical_col = layout.visual_to_logical[visual_col];
+            let cell = &cells[logical_col];
+            let (mut fg, _) = resolved_cell_colors(
+                cell.fg, cell.bg, cell.flags, colors, ansi, term_bg, term_fg,
+            );
+            let block_cursor = scroll_offset == 0
+                && logical_row >= 0
+                && cursor_point.line == Line(logical_row)
+                && cursor_point.column == Column(logical_col)
+                && cursor_shape == CursorShape::Block;
+            if block_cursor {
+                fg = term_bg;
+            }
+            (font_for_cell(cell.c, cell.flags), fg)
+        };
+        let mut visual_col = run.visual_start;
+        while visual_col < run_end {
+            let (font, fg) = glyph_style(visual_col);
+            let mut span_end = visual_col + 1;
+            while span_end < run_end && glyph_style(span_end) == (font, fg) {
+                span_end += 1;
+            }
+            let clip = Rectangle::new(
+                iced::Point::new(visual_col as f32 * cell_w, y),
+                Size::new((span_end - visual_col) as f32 * cell_w, cell_h),
+            );
+            let natural_width = shaped_run_width(&content, font, font_size);
+            let scale_x = if natural_width > 0.0 {
+                (run.visual_width as f32 * cell_w) / natural_width
+            } else {
+                1.0
+            };
+            frame.with_clip(clip, |frame| {
+                frame.with_save(|frame| {
+                    frame.scale_nonuniform(iced::Vector::new(scale_x, 1.0));
+                    frame.fill_text(iced::widget::canvas::Text {
+                        content: content.clone(),
+                        position: iced::Point::new(
+                            if run.rtl { end_x / scale_x } else { start_x / scale_x },
+                            y,
+                        ),
+                        color: fg,
+                        size: iced::Pixels(font_size),
+                        font,
+                        horizontal_alignment: if run.rtl {
+                            iced::alignment::Horizontal::Right
+                        } else {
+                            iced::alignment::Horizontal::Left
+                        },
+                        vertical_alignment: iced::alignment::Vertical::Top,
+                        line_height: iced::widget::text::LineHeight::Relative(cell_h / font_size),
+                        shaping: iced::widget::text::Shaping::Advanced,
+                    });
+                });
+            });
+            visual_col = span_end;
+        }
+    }
+}
+
 /// Draw one terminal cell (background/cursor/selection rect + glyph +
 /// decorations). Shared by live grid rows and tmux-history rows so both
 /// render identically — style resolution (fg/bg/flags → colors+font) lives
@@ -883,17 +1553,8 @@ fn draw_cell(
     cursor_color: IcedColor,
 ) {
     // Resolve colors, then apply attribute transforms.
-    let mut fg = ansi_to_iced(fg_color, colors, ansi, term_bg, term_fg);
-    let mut bg = ansi_to_iced(bg_color, colors, ansi, term_bg, term_fg);
-    if flags.contains(Flags::INVERSE) {
-        std::mem::swap(&mut fg, &mut bg);
-    }
-    if flags.contains(Flags::DIM) {
-        fg.a *= 0.6;
-    }
-    if flags.contains(Flags::HIDDEN) {
-        fg = bg;
-    }
+    let (fg, bg) =
+        resolved_cell_colors(fg_color, bg_color, flags, colors, ansi, term_bg, term_fg);
 
     // Block cursor is a filled rect with an inverted glyph — the historical
     // behavior. Beam/Underline/HollowBlock draw the cell normally and
@@ -1088,14 +1749,22 @@ pub fn extract_selection(
             // History row — same index math as the draw path.
             if let Some(cells) = state.scrollback.line_above((-logical - 1) as usize) {
                 for cell in cells.iter().skip(col_start).take(col_end + 1 - col_start) {
+                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                        continue;
+                    }
                     line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
+                    line_text.extend(cell.zerowidth.iter().copied());
                 }
             }
         } else {
             let line = Line(logical);
             for col in col_start..=col_end {
                 let cell = &grid[line][Column(col)];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
                 line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
+                line_text.extend(cell.zerowidth().unwrap_or_default().iter().copied());
             }
         }
         // Strip trailing spaces from each line.
@@ -1297,6 +1966,287 @@ mod tests {
         assert_ne!(visible.glyph_id, 0);
     }
 
+    fn shaped_glyphs_by_character(text: &str, per_cell: bool) -> Vec<u16> {
+        use iced::advanced::graphics::text::cosmic_text;
+
+        let mut fonts = cosmic_text::FontSystem::new();
+        fonts.db_mut().load_font_data(TERM_FONT_BYTES.to_vec());
+        let attrs =
+            cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrains Mono"));
+
+        if per_cell {
+            return text
+                .chars()
+                .map(|character| {
+                    let mut buffer =
+                        cosmic_text::Buffer::new(&mut fonts, cosmic_text::Metrics::new(13.0, 18.0));
+                    let content = format!("{CONTEXTUAL_FONT_ANCHOR}{character}");
+                    buffer.set_text(
+                        &mut fonts,
+                        &content,
+                        attrs,
+                        cosmic_text::Shaping::Advanced,
+                    );
+                    buffer
+                        .layout_runs()
+                        .next()
+                        .unwrap()
+                        .glyphs
+                        .iter()
+                        .find(|glyph| glyph.start >= CONTEXTUAL_FONT_ANCHOR.len_utf8())
+                        .unwrap()
+                        .glyph_id
+                })
+                .collect();
+        }
+
+        let mut buffer =
+            cosmic_text::Buffer::new(&mut fonts, cosmic_text::Metrics::new(13.0, 18.0));
+        buffer.set_text(&mut fonts, text, attrs, cosmic_text::Shaping::Advanced);
+        let glyphs = buffer.layout_runs().next().unwrap().glyphs;
+        text.char_indices()
+            .map(|(start, _)| {
+                glyphs
+                    .iter()
+                    .find(|glyph| glyph.start <= start && start < glyph.end)
+                    .unwrap()
+                    .glyph_id
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fragmented_utf8_reaches_logical_terminal_cells_unchanged() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let text = "مرحبا שלום";
+        let mut state = TerminalState::new(20, 1, None);
+        for fragment in text.as_bytes().chunks(2) {
+            state.process(fragment);
+        }
+
+        let cells: String = (0..text.chars().count())
+            .map(|column| state.term.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert_eq!(cells, text);
+    }
+
+    #[test]
+    fn arabic_cells_are_contextually_shaped() {
+        let text = "مرحبا";
+        let isolated = shaped_glyphs_by_character(text, true);
+        let contextual = shaped_glyphs_by_character(text, false);
+        let layout = visual_layout(
+            &text
+                .chars()
+                .map(|c| DisplayCell { c, ..DisplayCell::default() })
+                .collect::<Vec<_>>(),
+        );
+
+        assert_ne!(isolated, contextual, "test must distinguish joining forms");
+        assert_eq!(layout.runs.len(), 1);
+        assert_eq!(layout.runs[0].text, text);
+        assert_eq!(
+            shaped_glyphs_by_character(&layout.runs[0].text, false),
+            contextual
+        );
+    }
+
+    #[test]
+    fn proportional_rtl_fallback_is_normalized_to_terminal_cell_width() {
+        let text = format!("{CONTEXTUAL_FONT_ANCHOR}مرحبا");
+        let natural_width = shaped_run_width(&text, TERM_FONT, FONT_SIZE);
+        let target_width = 5.0 * cell_size(FONT_SIZE).0;
+        assert!(natural_width > 0.0);
+        let scale = target_width / natural_width;
+        assert!((natural_width * scale - target_width).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn mixed_direction_line_is_painted_in_unicode_visual_order() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let logical = "English مرحبا 123, שלום!";
+        let mut state = TerminalState::new(40, 1, None);
+        state.process(logical.as_bytes());
+        let currently_painted: String = (0..logical.chars().count())
+            .map(|column| state.term.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert_eq!(
+            currently_painted, logical,
+            "the emulator grid must stay in logical order"
+        );
+
+        let bidi = unicode_bidi::BidiInfo::new(logical, None);
+        let paragraph = &bidi.paragraphs[0];
+        let expected = bidi.reorder_line(paragraph, paragraph.range.clone());
+        let cells = (0..logical.chars().count())
+            .map(|column| {
+                let cell = &state.term.grid()[Line(0)][Column(column)];
+                DisplayCell {
+                    c:         cell.c,
+                    zerowidth: cell.zerowidth().unwrap_or_default().to_vec(),
+                    fg:        cell.fg,
+                    bg:        cell.bg,
+                    flags:     cell.flags,
+                }
+            })
+            .collect::<Vec<_>>();
+        let layout = visual_layout(&cells);
+        let visually_painted: String = layout.visual_to_logical
+            [..logical.chars().count()]
+            .iter()
+            .map(|&column| state.term.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert_eq!(
+            visually_painted, expected,
+            "the visual mapping must apply line-level BiDi"
+        );
+    }
+
+    #[test]
+    fn mixed_direction_cursor_and_hit_testing_map_back_to_logical_cells() {
+        let logical = "abc مرحبا 123";
+        let mut state = TerminalState::new(20, 2, None);
+        state.process(logical.as_bytes());
+        state.process(b"\x1b[1;6H");
+        let widget = test_widget(&state);
+        let cells = widget.row_display_cells(0).unwrap();
+        let layout = visual_layout(&cells);
+        let cursor_logical = state.term.grid().cursor.point.column.0;
+        let cursor_visual = layout.logical_to_visual[cursor_logical];
+        assert_eq!(layout.visual_to_logical[cursor_visual], cursor_logical);
+
+        let (cell_w, cell_h) = cell_size(FONT_SIZE);
+        for visual in 0..logical.chars().count() {
+            let hit = widget.pixel_to_logical_cell(
+                (visual as f32 + 0.5) * cell_w,
+                cell_h / 2.0,
+                cell_w,
+                cell_h,
+                20,
+                2,
+            );
+            assert_eq!(hit, (layout.visual_to_logical[visual], 0));
+        }
+    }
+
+    #[test]
+    fn mixed_direction_drag_selects_visual_cells_and_copies_source_order() {
+        use iced::mouse::Button;
+        use iced::widget::canvas::Program;
+
+        let mut state = TerminalState::new(20, 2, None);
+        state.process("abc אבג xyz".as_bytes());
+        let widget = test_widget(&state);
+        let (cell_w, cell_h) = cell_size(FONT_SIZE);
+        let bounds =
+            Rectangle::new(iced::Point::ORIGIN, Size::new(20.0 * cell_w, 2.0 * cell_h));
+        let mut selection = SelectionState::default();
+        let start = iced::Point::new(3.5 * cell_w, 0.5 * cell_h);
+        let end = iced::Point::new(4.5 * cell_w, 0.5 * cell_h);
+
+        widget.update(
+            &mut selection,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::ButtonPressed(Button::Left)),
+            bounds,
+            iced::mouse::Cursor::Available(start),
+        );
+        widget.update(
+            &mut selection,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
+            bounds,
+            iced::mouse::Cursor::Available(end),
+        );
+
+        let cells = widget.row_display_cells(0).unwrap();
+        let layout = visual_layout(&cells);
+        let highlighted: Vec<_> = layout
+            .visual_to_logical
+            .iter()
+            .enumerate()
+            .filter_map(|(visual, _)| {
+                cell_is_selected(&selection, 0, visual).then_some(visual)
+            })
+            .collect();
+        assert_eq!(highlighted, vec![3, 4]);
+        assert!(matches!(
+            widget.copy_message(&selection),
+            Some(Message::CopyToClipboard(text)) if text == " ג"
+        ));
+    }
+
+    #[test]
+    fn selection_copy_stays_logical_and_preserves_combining_and_bidi_controls() {
+        let logical = "A\u{2067}ש\u{05b8}לום\u{2069} 123";
+        let mut state = TerminalState::new(30, 2, None);
+        state.process(logical.as_bytes());
+
+        let copied = extract_selection(&state, 0, 0, 10, 0);
+        assert_eq!(copied, logical);
+        assert!(copied.contains('\u{2067}'));
+        assert!(copied.contains('\u{2069}'));
+        assert!(copied.contains('\u{05b8}'));
+    }
+
+    #[test]
+    fn latin_emoji_cjk_and_combining_clusters_keep_terminal_widths() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let logical = "A e\u{301} 🙂 界";
+        let mut state = TerminalState::new(20, 2, None);
+        state.process(logical.as_bytes());
+        let grid = state.term.grid();
+        assert_eq!(grid[Line(0)][Column(2)].c, 'e');
+        assert_eq!(
+            grid[Line(0)][Column(2)].zerowidth().unwrap_or_default(),
+            &['\u{301}']
+        );
+        assert!(grid[Line(0)][Column(4)].flags.contains(Flags::WIDE_CHAR));
+        assert!(
+            grid[Line(0)][Column(5)]
+                .flags
+                .contains(Flags::WIDE_CHAR_SPACER)
+        );
+        assert!(grid[Line(0)][Column(7)].flags.contains(Flags::WIDE_CHAR));
+        assert!(
+            grid[Line(0)][Column(8)]
+                .flags
+                .contains(Flags::WIDE_CHAR_SPACER)
+        );
+
+        let layout = visual_layout(&test_widget(&state).row_display_cells(0).unwrap());
+        for logical in 0..20 {
+            let visual = layout.logical_to_visual[logical];
+            assert_eq!(layout.visual_to_logical[visual], logical);
+        }
+    }
+
+    #[test]
+    fn wraps_and_resize_reflow_recompute_visual_layout_from_logical_grid() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let mut state = TerminalState::new(8, 3, None);
+        state.process("abc مرحبا xyz".as_bytes());
+        assert!(
+            state.term.grid()[Line(0)][Column(7)]
+                .flags
+                .contains(Flags::WRAPLINE)
+        );
+        let before = visual_layout(&test_widget(&state).row_display_cells(0).unwrap());
+        assert_ne!(before.visual_to_logical, (0..8).collect::<Vec<_>>());
+
+        state.resize(12, 3);
+        let widget = test_widget(&state);
+        for row in 0..3 {
+            let layout = visual_layout(&widget.row_display_cells(row).unwrap());
+            for logical in 0..12 {
+                let visual = layout.logical_to_visual[logical];
+                assert_eq!(layout.visual_to_logical[visual], logical);
+            }
+        }
+    }
+
     #[test]
     fn render_cursor_honors_tui_visibility_during_repaint() {
         let mut state = TerminalState::new(80, 24, None);
@@ -1350,6 +2300,232 @@ mod tests {
 
         state.process(b"ing\x1b[?2026l");
         assert_eq!(bottom_rows(&state), "Reading app.rs\n❯ working");
+    }
+
+    #[test]
+    fn tmux_split_sync_replay_does_not_commit_the_intermediate_clear() {
+        use alacritty_terminal::index::{Column, Line};
+
+        fn bottom_rows(state: &TerminalState) -> String {
+            let grid = state.term.grid();
+            (2..4)
+                .map(|row| {
+                    (0..grid.columns())
+                        .map(|column| grid[Line(row)][Column(column)].c)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let mut state = TerminalState::new(40, 4, None);
+        state.process("\x1b[3;1H⠹ Working…\x1b[4;1H❯ waiting\x1b[H".as_bytes());
+        let stable = bottom_rows(&state);
+        let stable_commits = state.output_commit_count();
+
+        // Raw hidden-client reads captured from tmux 3.7b while an inner
+        // synchronized frame crossed pane reads. tmux closes an outer frame
+        // around the leaked erase, then emits a cursor-only frame before the
+        // final repaint. Neither intermediate state is a provider frame.
+        let clear = state.process(b"\x1b[?2026h\x1b[J\x1b[?2026l");
+        assert!(!clear.committed);
+        assert_eq!(bottom_rows(&state), stable);
+        let cursor =
+            state.process(b"\x1b[?2026h\x1b[?25l\x1b[?12l\x1b[?25h\x1b[4;7H\x1b[?2026l");
+        assert!(!cursor.committed);
+        assert_eq!(bottom_rows(&state), stable);
+        assert_eq!(state.output_commit_count(), stable_commits);
+
+        let final_frame = state.process(
+            b"\x1b[?2026h\x1b[?25l\x1b[Hfirst rows\x1b[K\r\n\x1b[K\r\n\
+              \x1b[K\r\nbottom-final\x1b[K\x1b[?12l\x1b[?25h\x1b[4;13H\x1b[?2026l",
+        );
+        assert!(final_frame.committed);
+        assert_eq!(state.output_commit_count(), stable_commits + 1);
+        assert_eq!(bottom_rows(&state), "\nbottom-final");
+    }
+
+    #[test]
+    fn fragmented_balanced_sync_frame_has_one_renderer_commit() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let mut state = TerminalState::new(20, 2, None);
+        state.process(b"old");
+        let before = state.output_commit_count();
+
+        let first = state.process(b"\x1b[?20");
+        assert!(!first.committed);
+        assert!(first.recovery_token.is_some());
+        let second = state.process(b"26h\x1b[H\x1b[2Knew");
+        assert!(!second.committed);
+        let third = state.process(b" value\x1b[?2026l");
+
+        assert!(third.committed);
+        assert_eq!(state.output_commit_count(), before + 1);
+        let row: String = (0..20)
+            .map(|column| state.term.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert_eq!(row.trim_end(), "new value");
+    }
+
+    #[test]
+    fn missing_sync_terminator_recovers_as_one_atomic_commit() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let mut state = TerminalState::new(20, 2, None);
+        state.process(b"stable");
+        let before = state.output_commit_count();
+        let pending = state.process(b"\x1b[?2026h\x1b[H\x1b[2Krecovered");
+        let token = pending.recovery_token.expect("open frame needs recovery");
+
+        assert!(!pending.committed);
+        assert_eq!(state.term.grid()[Line(0)][Column(0)].c, 's');
+        assert!(state.recover_output(token));
+        assert_eq!(state.output_commit_count(), before + 1);
+        let row: String = (0..20)
+            .map(|column| state.term.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert_eq!(row.trim_end(), "recovered");
+        assert!(!state.recover_output(token), "recovery must be idempotent");
+    }
+
+    #[test]
+    fn abandoned_partial_sync_marker_does_not_poison_later_unframed_output() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let mut state = TerminalState::new(20, 2, None);
+        let token = state
+            .process(b"\x1b[?20")
+            .recovery_token
+            .expect("partial marker needs bounded recovery");
+
+        assert!(!state.recover_output(token));
+        let plain = state.process(b"plain");
+        assert!(plain.committed);
+        let row: String = (0..20)
+            .map(|column| state.term.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert_eq!(row.trim_end(), "plain");
+    }
+
+    #[test]
+    fn multiple_sync_frames_in_one_read_share_one_renderer_commit() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let mut state = TerminalState::new(20, 2, None);
+        let result = state.process(
+            b"\x1b[?2026h\x1b[Hfirst\x1b[?2026l\
+              \x1b[?2026h\x1b[H\x1b[2Ksecond\x1b[?2026l",
+        );
+
+        assert!(result.committed);
+        assert_eq!(state.output_commit_count(), 1);
+        let row: String = (0..20)
+            .map(|column| state.term.grid()[Line(0)][Column(column)].c)
+            .collect();
+        assert_eq!(row.trim_end(), "second");
+    }
+
+    #[test]
+    fn trailing_empty_tmux_sync_frame_does_not_reinvalidate_live_repaint() {
+        let mut state = TerminalState::new(40, 4, None);
+        state.process(b"stable");
+        let before = state.output_commit_count();
+
+        // Live tmux 3.7b output: Cursor's complete structural repaint arrives
+        // unframed, then a separate balanced frame with no payload follows.
+        let repaint = state.process(
+            b"\x1b[2A\x1b[KRunning\r\n\x1b[Kstatus\r\n\x1b[Kprompt",
+        );
+        assert!(repaint.committed);
+        assert_eq!(state.output_commit_count(), before + 1);
+
+        let empty_frame = state.process(b"\x1b[?2026h\x1b[?2026l");
+        assert!(!empty_frame.committed);
+        assert_eq!(state.output_commit_count(), before + 1);
+    }
+
+    #[test]
+    fn unframed_input_echo_and_logs_commit_without_sync_recovery_delay() {
+        let mut state = TerminalState::new(40, 4, None);
+
+        let echo = state.process(b"typed");
+        assert!(echo.committed);
+        assert!(echo.recovery_token.is_none());
+        let logs = state.process(b"\r\nlog-1\r\nlog-2\r\n");
+        assert!(logs.committed);
+        assert!(logs.recovery_token.is_none());
+        assert_eq!(state.output_commit_count(), 2);
+    }
+
+    #[test]
+    fn one_unframed_read_with_rapid_bottom_row_replacements_commits_only_final_state() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let mut state = TerminalState::new(20, 2, None);
+        let result =
+            state.process(b"\x1b[2;1Hpartial\rreplacement\rfinal\x1b[K");
+
+        assert!(result.committed);
+        assert_eq!(state.output_commit_count(), 1);
+        let row: String = (0..20)
+            .map(|column| state.term.grid()[Line(1)][Column(column)].c)
+            .collect();
+        assert_eq!(row.trim_end(), "final");
+    }
+
+    #[test]
+    fn reconnect_state_does_not_inherit_pending_sync_recovery() {
+        let mut old = TerminalState::new(20, 2, None);
+        let token = old
+            .process(b"\x1b[?2026h\x1b[Hpartial")
+            .recovery_token
+            .unwrap();
+
+        let mut replacement = TerminalState::new(20, 2, None);
+        let fresh = replacement.process(b"fresh");
+
+        assert!(fresh.committed);
+        assert!(!replacement.recover_output(token));
+        assert_eq!(replacement.output_commit_count(), 1);
+    }
+
+    #[test]
+    fn deferred_tmux_repaint_preserves_rtl_visual_mapping() {
+        let mut state = TerminalState::new(20, 2, None);
+        state.process("old עברית".as_bytes());
+        let before = state.output_commit_count();
+        state.process(b"\x1b[?2026h\x1b[H\x1b[J\x1b[?2026l");
+        let final_frame =
+            state.process("\x1b[?2026h\x1b[Hחדש שלום\x1b[?2026l".as_bytes());
+
+        assert!(final_frame.committed);
+        assert_eq!(state.output_commit_count(), before + 1);
+        let cells = test_widget(&state).row_display_cells(0).unwrap();
+        let layout = visual_layout(&cells);
+        assert_ne!(
+            &layout.visual_to_logical[..8],
+            &(0..8).collect::<Vec<_>>()[..]
+        );
+    }
+
+    #[test]
+    fn destructive_only_sync_frame_has_bounded_atomic_recovery() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let mut state = TerminalState::new(20, 2, None);
+        state.process(b"clear me");
+        let before = state.output_commit_count();
+        let pending = state.process(b"\x1b[?2026h\x1b[H\x1b[J\x1b[?2026l");
+        let token = pending.recovery_token.expect("destructive frame needs recovery");
+
+        assert!(!pending.committed);
+        assert_eq!(state.term.grid()[Line(0)][Column(0)].c, 'c');
+        assert!(state.recover_output(token));
+        assert_eq!(state.output_commit_count(), before + 1);
+        assert_eq!(state.term.grid()[Line(0)][Column(0)].c, ' ');
     }
 
     #[test]
@@ -1415,6 +2591,7 @@ mod tests {
             text.chars()
                 .map(|c| StyledCell {
                 c,
+                zerowidth: Vec::new(),
                 fg: Color::Named(NamedColor::Foreground),
                 bg: Color::Named(NamedColor::Background),
                 flags: Flags::empty(),
@@ -1502,6 +2679,79 @@ mod tests {
         }
     }
 
+    fn captured_cursor_footer_redraw(spinner: &str) -> Vec<u8> {
+        let mut frame =
+            b"\x1b[71;1H\x1b[7A\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[64;2H"
+                .to_vec();
+        frame.extend_from_slice(spinner.as_bytes());
+        frame.extend_from_slice(b" Running  357.54k tokens\r\n ");
+        frame.extend("▄".repeat(80).as_bytes());
+        frame.extend_from_slice(b"\x1b[66;1H  \xe2\x86\x92 Add a follow-up");
+        frame.extend_from_slice(b"\x1b[67;1H ");
+        frame.extend("▀".repeat(80).as_bytes());
+        frame.extend_from_slice(
+            b"\x1b[68;1H  1 task\x1b[69;1H  GPT-5.6 Sol 272K High \xc2\xb7 MAX \xc2\xb7 71.7% \xc2\xb7 1 file edited",
+        );
+        frame.extend_from_slice(
+            b"\x1b[70;1H  ~/dev/ninox-w1 \xc2\xb7 mu/ninox/terminal-flicker-visual-root-cause",
+        );
+        frame
+    }
+
+    #[test]
+    fn captured_cursor_spinner_changes_only_its_row_draw_commands() {
+        let mut state = TerminalState::new(157, 71, None);
+        state.process(&captured_cursor_footer_redraw("⠠⠜"));
+        let selection = SelectionState::default();
+        let before = test_widget(&state).row_draw_commands(&selection);
+
+        state.process(&captured_cursor_footer_redraw("⠰⠰"));
+        let after = test_widget(&state).row_draw_commands(&selection);
+        let changed: Vec<_> = before
+            .iter()
+            .zip(&after)
+            .enumerate()
+            .filter_map(|(row, (before, after))| (before != after).then_some(row))
+            .collect();
+
+        assert_eq!(
+            changed,
+            [63],
+            "unchanged footer rows must retain their draw commands"
+        );
+    }
+
+    #[test]
+    fn unchanged_grid_has_stable_row_draw_commands() {
+        let mut state = TerminalState::new(80, 24, None);
+        state.process(b"static shell output\r\nunchanged");
+        let selection = SelectionState::default();
+
+        let first = test_widget(&state).row_draw_commands(&selection);
+        let second = test_widget(&state).row_draw_commands(&selection);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn simple_shell_output_changes_only_its_repainted_row() {
+        let mut state = TerminalState::new(80, 24, None);
+        state.process(b"before");
+        let selection = SelectionState::default();
+        let before = test_widget(&state).row_draw_commands(&selection);
+
+        state.process(b"\rbash: after");
+        let after = test_widget(&state).row_draw_commands(&selection);
+        let changed: Vec<_> = before
+            .iter()
+            .zip(&after)
+            .enumerate()
+            .filter_map(|(row, (before, after))| (before != after).then_some(row))
+            .collect();
+
+        assert_eq!(changed, [0]);
+    }
+
     #[test]
     fn row_link_spans_detects_osc8_hyperlink_on_live_grid() {
         let mut s = TerminalState::new(80, 5, None);
@@ -1529,9 +2779,9 @@ mod tests {
         let mut s = TerminalState::new(80, 5, None);
         s.process(b"see http://example.com/path for docs");
         let widget = test_widget(&s);
-        assert_eq!(widget.link_at(0, 0), None); // inside "see "
+        assert_eq!(widget.link_at_logical(0, 0), None); // inside "see "
         assert_eq!(
-            widget.link_at(5, 0),
+            widget.link_at_logical(5, 0),
             Some("http://example.com/path".to_string())
         );
     }

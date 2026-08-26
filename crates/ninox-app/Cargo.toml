@@ -25,6 +25,7 @@ alacritty_terminal = "0.26"
 async-stream = "0.3.6"
 arboard = "3"
 ttf-parser = "0.25"
+unicode-bidi = "0.3"
 
 [package.metadata.bundle]
 name = "Ninox"

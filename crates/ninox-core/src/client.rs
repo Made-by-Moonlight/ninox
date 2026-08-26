@@ -208,6 +208,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attached_tmux_client_preserves_rtl_utf8_bytes() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        let engine = test_engine();
+        let mut rx = engine.subscribe();
+        let marker = "مرحبا שלום";
+        let command = format!("bash -c 'printf \"{marker}\\\\r\\\\n\"; sleep 5'");
+
+        tmux::create_session(&id, "/tmp", &command, &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        let argv = tmux::attach_args(&id).await;
+        let client = AttachedClient::spawn(engine, id.clone(), argv, 100, 30, 1).unwrap();
+        let output = collect_client_output(&mut rx, &id, 2000).await;
+
+        assert!(
+            output.windows(marker.len()).any(|bytes| bytes == marker.as_bytes()),
+            "tmux client output changed UTF-8 bytes: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+
+        drop(client);
+        tmux::kill_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn resize_drives_tmux_window_size() {
         if !tmux_available() { return; }
         let id = unique_id();
