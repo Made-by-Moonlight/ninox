@@ -187,6 +187,17 @@ fn is_missing_session(e: &anyhow::Error) -> bool {
         // (`exit-empty off`) rather than only ever existing once a real
         // session has been created on it.
         || msg.contains("no current target")
+        // tmux's client-side connect failure ("No such file or directory"
+        // when the socket file is absent, "Connection refused" when nothing
+        // listens on it). `run_session_scoped`'s legacy fallback retries
+        // session-targeted commands against the default server, which on
+        // most machines simply isn't running (e.g. after a reboot) — an
+        // unreachable server holds no sessions, so for session-targeted
+        // commands this is "missing session", not a real failure. Without
+        // this arm, `kill_session` errored here and `Message::ResumeSession`
+        // aborted before relaunching — the Resume button silently did
+        // nothing for every dead session after a reboot.
+        || msg.contains("error connecting to")
 }
 
 /// Metadata about a running tmux session from `list-sessions`.
@@ -1018,6 +1029,26 @@ pub async fn paste_buffer(session_id: &str, buf_name: &str, tmp_path: &str, byte
 mod tests {
     use super::*;
     use tokio::time::{sleep, Duration};
+
+    #[test]
+    fn missing_session_covers_an_unreachable_server_socket() {
+        // tmux's client-side message when the target socket file does not
+        // exist ("No such file or directory") or nothing is listening on it
+        // ("Connection refused"). Session-targeted commands reach this via
+        // `run_session_scoped`'s legacy fallback to the default server on
+        // machines where no default server runs — e.g. right after a
+        // reboot. An unreachable server holds no sessions, so this must
+        // classify as "missing session": before it did, `kill_session`
+        // surfaced it as a real error and `Message::ResumeSession` aborted
+        // with "cannot stop prior runtime" — the Resume button silently
+        // did nothing for every dead session after a reboot.
+        for msg in [
+            "error connecting to /private/tmp/tmux-501/default (No such file or directory)",
+            "error connecting to /private/tmp/tmux-501/default (Connection refused)",
+        ] {
+            assert!(is_missing_session(&anyhow::anyhow!(msg)), "{msg}");
+        }
+    }
 
     struct IsolatedTmuxServer {
         socket: String,
