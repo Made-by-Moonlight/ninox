@@ -5753,6 +5753,69 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn resume_message_relaunches_a_terminated_orchestrator_end_to_end() {
+        // `resume_message_relaunches_and_attaches` above only checks the
+        // synchronous state `update()` mutates; nothing else in this file
+        // drives `Message::ResumeSession`'s `Task` to completion for a
+        // Terminated *orchestrator* (as opposed to
+        // `resume_message_keeps_status_interrupted_when_tmux_create_fails`,
+        // which forces the failure path for a plain worker session). This
+        // exercises the success path end-to-end: a persisted orchestrator
+        // whose session is Terminated with a dead pid but a live workspace +
+        // stored `claude_session_id` — Resume must relaunch it (ClientAttach)
+        // and land on `Working`, not silently no-op.
+        use futures::StreamExt;
+
+        let e = test_engine();
+        let mut m = base(e);
+        // Harness override: run a harmless long-lived command instead of the
+        // real `claude` binary so the pane survives the attach handshake.
+        m.config.harnesses.insert("claude-code".to_string(), ninox_core::harness::HarnessSpec {
+            enabled: true,
+            binary: Some("sleep".into()),
+            resume_args: vec!["30".into()],
+            ..Default::default()
+        });
+        let ws = tempdir().unwrap().keep();
+        let sid = "orch-resume-reboot-test";
+        let orch = ninox_core::types::Orchestrator {
+            id: sid.into(), name: "O".into(), created_at: 0,
+        };
+        m.engine.store.upsert_orchestrator(&orch).unwrap();
+        m.orchestrators.push(orch);
+        let mut s = refile_session(sid);
+        s.status = SessionStatus::Terminated;
+        s.claude_session_id = Some("stored-uuid".into());
+        s.workspace_path = Some(ws.to_string_lossy().to_string());
+        s.pid = Some(u32::MAX); // pane pid from before the reboot — dead
+        s.terminal_at = Some(1);
+        m.engine.store.upsert_session(&s).unwrap();
+        m.sessions.insert(sid.into(), s);
+
+        let (m, task) = m.update(Message::ResumeSession(sid.into()));
+        let mut stream = iced_runtime::task::into_stream(task)
+            .expect("ResumeSession must produce a real Task, not Task::none()");
+        let out = stream.next().await;
+        // Clean up the test-socket tmux session regardless of outcome.
+        let _ = ninox_core::tmux::kill_session(sid).await;
+        let attached = matches!(
+            &out,
+            Some(iced_runtime::Action::Output(Message::ClientAttach { session_id, .. }))
+                if session_id == sid
+        );
+        assert!(
+            attached,
+            "resume of a terminated orchestrator must relaunch and attach; got {:?}",
+            out.map(|a| match a {
+                iced_runtime::Action::Output(msg) => format!("{msg:?}").chars().take(200).collect::<String>(),
+                _ => "non-output action".into(),
+            })
+        );
+        let session = m.engine.store.get_session(sid).unwrap().unwrap();
+        assert!(matches!(session.status, SessionStatus::Working));
+    }
+
     #[test]
     fn navigate_settings_switches_view() {
         let m = base(test_engine());
