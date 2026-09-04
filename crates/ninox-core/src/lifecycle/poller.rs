@@ -182,14 +182,15 @@ impl Poller {
                 _ = usage_interval.tick()  => self.poll_usage().await,
                 _ = update_interval.tick() => self.poll_update_check().await,
                 _ = github_interval.tick() => {
-                    if AppConfig::load().unwrap_or_default().pr_watch.enabled {
-                        self.poll_github_batched().await;
+                    let config = AppConfig::load().unwrap_or_default();
+                    if config.pr_watch.enabled {
+                        self.poll_github_batched(config.auto_reap.enabled).await;
                     } else {
                         // Reconciliation first: a session whose PR the poller
                         // hasn't adopted yet has no `pr_number` for `poll_github`
                         // to enrich, so it must run before (not instead of) it.
                         self.poll_pr_reconciliation().await;
-                        self.poll_github().await;
+                        self.poll_github(config.auto_reap.enabled).await;
                     }
                 }
             }
@@ -632,19 +633,23 @@ impl Poller {
         Some(row)
     }
 
-    async fn poll_github(&self) {
+    /// `auto_reap` mirrors `[auto_reap].enabled` — passed in by `start()`'s
+    /// tick (like `sweep_retired_sessions`'s retention) rather than read
+    /// from `AppConfig::load()` here, so tests control it deterministically.
+    async fn poll_github(&self, auto_reap: bool) {
         let Some(gh) = &self.engine.github else { return };
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
 
         for mut session in sessions {
-            // Only `Done` is excluded here — a session already has its PR's
-            // merge handled by definition once `Done`. `Terminated` (the
-            // worker's own process exited, typically once its PR is merely
-            // *open*) and `Interrupted` sessions may still have a PR whose
-            // fate hasn't resolved yet, so they must keep being polled or a
-            // later merge becomes permanently invisible (no status update,
-            // no notification) the instant the process dies.
-            if matches!(session.status, SessionStatus::Done) {
+            // Merge-handled sessions are excluded here (`Done`, or a
+            // `merged_at` stamp for a worker kept alive after merge — see
+            // `Session::merge_handled`). `Terminated` (the worker's own
+            // process exited, typically once its PR is merely *open*) and
+            // `Interrupted` sessions may still have a PR whose fate hasn't
+            // resolved yet, so they must keep being polled or a later merge
+            // becomes permanently invisible (no status update, no
+            // notification) the instant the process dies.
+            if session.merge_handled() {
                 continue;
             }
             let Some(pr_number) = session.pr_number else { continue };
@@ -770,7 +775,7 @@ impl Poller {
             let Some((owner, repo)) = split_repo(&session.repo) else { continue };
 
             // -- Merge detection — handle before CI (no point polling CI on merged PR) --
-            if self.handle_merge_detection(&session, pr_number, pr_status.merged).await {
+            if self.handle_merge_detection(&session, pr_number, pr_status.merged, auto_reap).await {
                 // Skips the gate-computation block below — a merged session's
                 // gate_status is intentionally left frozen at its last
                 // pre-merge value, not recomputed at the merging tick.
@@ -837,7 +842,9 @@ impl Poller {
     /// fallback exists for repo/PR-number drift, which self-heals on the
     /// legacy path; anyone actually hitting it can flip `[pr_watch] enabled`
     /// off to get it back.
-    async fn poll_github_batched(&self) {
+    /// `auto_reap` mirrors `[auto_reap].enabled`, passed in by `start()`'s
+    /// tick — see `poll_github`.
+    async fn poll_github_batched(&self, auto_reap: bool) {
         // A skipped tick, never a blocked task: checked before anything
         // else, including `self.engine.github_batch`'s own presence check,
         // so a pause set by `note_rate_limit`/`note_batch_error` costs
@@ -850,7 +857,8 @@ impl Poller {
         let watches = self.engine.store.list_pr_watches().unwrap_or_default();
 
         // -- Collect targets --------------------------------------------------
-        // Session PRs: same skip rule as poll_github — only Done is excluded.
+        // Session PRs: same skip rule as poll_github — merge-handled
+        // sessions are excluded (see `Session::merge_handled`).
         let mut pr_keys: Vec<PrKey> = Vec::new();
         // Insertion-ordered, deduped: `candidate_repos` sorts `origin` first,
         // and the adoption loop below walks this Vec (not the result HashMap)
@@ -867,7 +875,7 @@ impl Poller {
         let mut branch_owners: HashMap<BranchKey, Vec<String>> = HashMap::new();
 
         for session in &sessions {
-            if matches!(session.status, SessionStatus::Done) {
+            if session.merge_handled() {
                 continue;
             }
             match session.pr_number {
@@ -950,7 +958,7 @@ impl Poller {
 
         // -- Session enrichment (replaces poll_github's per-session fetches) --
         for mut session in sessions {
-            if matches!(session.status, SessionStatus::Done) {
+            if session.merge_handled() {
                 continue;
             }
             let Some(pr_number) = session.pr_number else { continue };
@@ -970,7 +978,7 @@ impl Poller {
                     self.engine.emit(Event::SessionUpdated(session.clone(), SessionFields::PR_LINK));
                 }
             }
-            if self.handle_merge_detection(&session, pr_number, snap.status.merged).await {
+            if self.handle_merge_detection(&session, pr_number, snap.status.merged, auto_reap).await {
                 continue;
             }
             let Some((owner, repo)) = split_repo(&session.repo) else { continue };
@@ -1544,40 +1552,28 @@ impl Poller {
         session:    &Session,
         pr_number:  u64,
         pr_merged:  bool,
+        auto_reap:  bool,
     ) -> bool {
         if !pr_merged || matches!(session.status, SessionStatus::Done) {
             return false;
         }
-        let worker = match self
-            .engine
-            .store
-            .worker_incarnation_for_snapshot(&session.id, session.started_at)
-        {
-            Ok(worker) => worker,
-            Err(error) => {
-                tracing::warn!("resolve merge capability for {}: {error}", session.id);
-                return false;
-            }
-        };
-        if let Some(worker) = worker {
-            match self.engine.store.retain_worker_after_merge(
-                &session.id,
-                &worker.incarnation_id,
-                session.started_at,
-                pr_number,
-                now_millis(),
-            ) {
-                Ok(Some(_)) => {}
-                Ok(None) => return false,
-                Err(error) => {
-                    tracing::warn!("retain merged worker {}: {error}", session.id);
-                    return false;
-                }
-            }
-        } else if let Err(e) = self.engine.cleanup_session(&session.id).await {
-            tracing::warn!("cleanup_session {}: {e}", session.id);
-            return false;
+        if session.merged_at.is_some() {
+            // Merge already handled on an earlier tick with `[auto_reap]`
+            // off — the worker was deliberately kept alive, so it keeps
+            // surfacing here until it's reaped. Skip enrichment without
+            // re-notifying.
+            return true;
         }
+        // Keep the worker alive for post-merge validation only when
+        // `[auto_reap]` is off AND the worker is actually still running.
+        // Merge detection deliberately also fires for `Terminated`/
+        // `Interrupted` sessions — a worker's process commonly exits while
+        // its PR is merely open, then the PR merges later (see the skip
+        // guard in `poll_github`). There's no live agent in a dead worker
+        // to hand validation to and no reason to preserve its worktree, so
+        // those get the same cleanup + plain done-reaction as the auto-reap
+        // path regardless of the toggle.
+        let keep_alive = !auto_reap && !session.status.is_terminal();
         self.engine.emit(Event::Notification(Notification {
             id:         format!("merged-{}", session.id),
             kind:       NotificationKind::WorkerDone,
@@ -1589,9 +1585,57 @@ impl Poller {
         // Code-level completion guarantee for the orchestrator — independent
         // of whether the worker's own agent ever reports back before exiting.
         if let Some(orch) = session.orchestrator_id.clone() {
-            let msg = crate::lifecycle::reactions::format_worker_done_reaction(session, pr_number);
+            let msg = if keep_alive {
+                crate::lifecycle::reactions::format_worker_done_kept_alive_reaction(session, pr_number)
+            } else {
+                crate::lifecycle::reactions::format_worker_done_reaction(session, pr_number)
+            };
             if let Err(e) = self.engine.send_to_session(&orch, &msg).await {
                 tracing::warn!("send worker-done reaction to orchestrator {orch}: {e}");
+            }
+        }
+        if keep_alive {
+            // The stamp is what makes the notification above once-only and
+            // drops the session out of GitHub enrichment (see
+            // `Session::merged_at`). A failed write is load-bearing here —
+            // it's the ONLY dedup for this path — so log it loudly, unlike
+            // a cosmetic field write.
+            match self.update_live_session_row(session, |row| {
+                row.merged_at = Some(now_millis());
+            }) {
+                Some(row) => self.engine.emit(
+                    Event::SessionUpdated(row, SessionFields::MERGED_AT),
+                ),
+                None => tracing::warn!(
+                    "merge-detected session {} could not be stamped merged_at — \
+                     the merge may re-notify on the next tick",
+                    session.id,
+                ),
+            }
+        } else {
+            let worker = match self
+                .engine
+                .store
+                .worker_incarnation_for_snapshot(&session.id, session.started_at)
+            {
+                Ok(worker) => worker,
+                Err(error) => {
+                    tracing::warn!("resolve merge capability for {}: {error}", session.id);
+                    return false;
+                }
+            };
+            if let Some(worker) = worker {
+                if let Err(error) = self.engine.store.retain_worker_after_merge(
+                    &session.id,
+                    &worker.incarnation_id,
+                    session.started_at,
+                    pr_number,
+                    now_millis(),
+                ) {
+                    tracing::warn!("retain merged worker {}: {error}", session.id);
+                }
+            } else if let Err(e) = self.engine.cleanup_session(&session.id).await {
+                tracing::warn!("cleanup_session {}: {e}", session.id);
             }
         }
         // Remove enrichment state for this session — it's done
@@ -1614,6 +1658,14 @@ impl Poller {
     /// this automatic lifecycle path) have no grace period and are purged
     /// on sight, preserving today's immediate disappearance for those
     /// actions. Orchestrator sessions are never purged this way.
+    ///
+    /// Also reclaims merged-but-kept-alive workers (`merged_at` set with a
+    /// still-live status — `[auto_reap]` off) once `merged_at` is older than
+    /// the same window. The orchestrator owns their reap, but if it never
+    /// comes — the orchestrator is gone, or the worker turned `Interrupted`
+    /// at a reboot, a status this sweep otherwise never touches — this
+    /// fallback stops a merged worker leaking its row/tmux/worktree forever,
+    /// restoring the unconditional cleanup the pre-toggle merge path had.
     async fn sweep_retired_sessions(&self, retention: &SessionRetentionConfig) {
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
         let Ok(orchestrators) = self.engine.store.list_orchestrators() else { return };
@@ -1624,16 +1676,23 @@ impl Poller {
         let retention_ms = retention.retention_millis();
 
         for session in sessions {
-            if !matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
-                continue;
-            }
             if orch_ids.contains(session.id.as_str()) {
                 continue;
             }
             if self.engine.store.is_worker_retained(&session.id).unwrap_or(false) {
                 continue;
             }
-            let expired = match session.terminal_at {
+            let terminal =
+                matches!(session.status, SessionStatus::Done | SessionStatus::Terminated);
+            // Eligible either as a terminal record (retention grace on
+            // `terminal_at`) or as a merged-but-still-live worker (fallback
+            // grace on `merged_at`). A live worker with no merge stamp is
+            // never swept.
+            if !terminal && session.merged_at.is_none() {
+                continue;
+            }
+            let clock = if terminal { session.terminal_at } else { session.merged_at };
+            let expired = match clock {
                 Some(t) => now.saturating_sub(t) >= retention_ms,
                 None    => true,
             };
@@ -1644,11 +1703,16 @@ impl Poller {
             // (see `poll_github`), which already sent
             // `format_worker_done_reaction` to the orchestrator before
             // transitioning the status — notifying again here would be a
-            // duplicate. `Terminated` sessions (worker process died on its
-            // own via `poll_pids`, or a direct `terminate_session`) have
-            // never been told anything — this is their one and only chance
-            // before the record disappears for good.
-            if matches!(session.status, SessionStatus::Terminated) {
+            // duplicate. The same goes for a `merged_at`-stamped session
+            // (merge detected with `[auto_reap]` off, worker kept alive,
+            // later reaped/terminated): the orchestrator already got the
+            // worker-done reaction, and this notice's "was not detected as
+            // merged" wording would flatly contradict it. `Terminated`
+            // sessions without that stamp (worker process died on its own
+            // via `poll_pids`, or a direct `terminate_session`) have never
+            // been told anything — this is their one and only chance before
+            // the record disappears for good.
+            if matches!(session.status, SessionStatus::Terminated) && session.merged_at.is_none() {
                 self.engine.emit(Event::Notification(Notification {
                     id:         format!("retired-{}", session.id),
                     kind:       NotificationKind::WorkerRetired,
@@ -1959,7 +2023,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         }
     }
 
@@ -2681,7 +2745,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake.clone());
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert_eq!(updated.repo, "OwnerB/repoB", "session.repo must self-heal to the remote that actually has the PR");
@@ -2734,7 +2798,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake.clone());
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert_eq!(updated.repo, "OwnerA/repoA", "must not adopt the mirror just because it happens to have a same-numbered PR");
@@ -2783,7 +2847,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert_eq!(
@@ -2836,7 +2900,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert!(
@@ -2896,7 +2960,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert_eq!(updated.repo, "OwnerB/repoB", "self-heal must still land");
@@ -2951,7 +3015,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert!(
@@ -3004,7 +3068,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert_eq!(updated.pr_id, Some(50), "the self-heal write itself must still land");
@@ -3055,7 +3119,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert_eq!(updated.started_at, session.started_at + 1, "the refiled row must survive untouched");
@@ -3100,7 +3164,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         assert!(
             store.get_session("s1").unwrap().is_none(),
@@ -3151,7 +3215,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let after = store.get_session("s1").unwrap().unwrap();
         assert!(
@@ -3195,7 +3259,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let events = drain_events(&mut rx);
         let fields: Vec<SessionFields> = events.iter().filter_map(|e| match e {
@@ -3249,7 +3313,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let events = drain_events(&mut rx);
         let healed = events.iter().find_map(|e| match e {
@@ -3297,14 +3361,14 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
         let events = drain_events(&mut rx);
         let failures = |evs: &[Event]| evs.iter().filter(|e| matches!(
             e, Event::Notification(n) if n.kind == crate::types::NotificationKind::GithubLookupFailed
         )).count();
         assert_eq!(failures(&events), 1, "first failure must notify");
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
         let events = drain_events(&mut rx);
         assert_eq!(failures(&events), 0, "repeated failure must not re-notify");
 
@@ -3316,11 +3380,11 @@ mod tests {
                 title: "t".into(), number: 50, head_sha: "abc".into(),
             },
         );
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         // Fails again — must notify again, since recovery cleared the flag.
         fake.pr_status_ok.lock().unwrap().clear();
-        poller.poll_github().await;
+        poller.poll_github(true).await;
         let events = drain_events(&mut rx);
         assert_eq!(failures(&events), 1, "must notify again after recovering and failing anew");
     }
@@ -3382,7 +3446,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let persisted = store.list_comments().unwrap();
         assert_eq!(persisted.len(), 1);
@@ -3419,7 +3483,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let persisted = store.list_comments().unwrap();
         assert_eq!(persisted.len(), 1, "an empty-body CHANGES_REQUESTED review must still be captured");
@@ -3456,7 +3520,7 @@ mod tests {
 
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let persisted = store.list_comments().unwrap();
         assert_eq!(persisted.len(), 1);
@@ -3486,7 +3550,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let persisted = store.list_comments().unwrap();
         assert_eq!(persisted.len(), 1);
@@ -3521,10 +3585,10 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
         assert_eq!(comment_events(&drain_events(&mut rx)).len(), 1);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
         assert_eq!(
             comment_events(&drain_events(&mut rx)).len(), 0,
             "the second tick's in-memory seen_comment_ids must skip an already-captured comment",
@@ -3557,7 +3621,7 @@ mod tests {
         {
             let engine = github_engine(store.clone(), fake.clone());
             let poller = Poller::new(engine);
-            poller.poll_github().await;
+            poller.poll_github(true).await;
         }
         assert_eq!(store.list_comments().unwrap().len(), 1);
 
@@ -3565,7 +3629,7 @@ mod tests {
         // process restart against the same on-disk store.
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let persisted = store.list_comments().unwrap();
         assert_eq!(persisted.len(), 1, "restart must not duplicate an already-persisted comment");
@@ -3676,7 +3740,7 @@ mod tests {
         let engine = batch_engine(store.clone(), batch.clone());
         let poller = Poller::new(engine);
 
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
 
         let calls = batch.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 1, "one tick must issue exactly one batched fetch");
@@ -3716,7 +3780,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
 
         let after = store.get_session("w1").unwrap().unwrap();
         assert!(matches!(after.status, SessionStatus::Done), "a merged PR's session must transition to Done");
@@ -3763,7 +3827,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
 
         let events = drain_events(&mut rx);
 
@@ -3828,7 +3892,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
 
         let calls = batch.calls.lock().unwrap().clone();
         // The branch-key Vec is built straight from `candidate_repos`, which
@@ -3886,7 +3950,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
 
         assert_eq!(
             batch.calls.lock().unwrap()[0].1, vec![branch_key],
@@ -3932,8 +3996,8 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github_batched().await;
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
+        poller.poll_github_batched(true).await;
 
         assert_eq!(batch.calls.lock().unwrap().len(), 2, "both ticks must have actually fetched");
 
@@ -3967,8 +4031,8 @@ mod tests {
         let engine = batch_engine(store.clone(), batch.clone());
         let poller = Poller::new(engine);
 
-        poller.poll_github_batched().await;
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
+        poller.poll_github_batched(true).await;
 
         assert_eq!(
             batch.calls.lock().unwrap().len(), 1,
@@ -3996,8 +4060,8 @@ mod tests {
         let engine = batch_engine(store.clone(), batch.clone());
         let poller = Poller::new(engine);
 
-        poller.poll_github_batched().await;
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
+        poller.poll_github_batched(true).await;
 
         assert_eq!(
             batch.calls.lock().unwrap().len(), 2,
@@ -4023,8 +4087,8 @@ mod tests {
         let engine = batch_engine(store.clone(), batch.clone());
         let poller = Poller::new(engine);
 
-        poller.poll_github_batched().await; // errors — pauses for 3600s
-        poller.poll_github_batched().await; // must be skipped
+        poller.poll_github_batched(true).await; // errors — pauses for 3600s
+        poller.poll_github_batched(true).await; // must be skipped
 
         assert_eq!(
             batch.calls.lock().unwrap().len(), 1,
@@ -4054,7 +4118,7 @@ mod tests {
 
         let before = now_millis();
         queue_error();
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
         let first_pause = poller.pause_until() - before;
         assert!(
             (110_000..=130_000).contains(&first_pause),
@@ -4065,7 +4129,7 @@ mod tests {
         // instead of being skipped by the pause it just set.
         poller.set_pause_until(0);
         queue_error();
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
         let second_pause = poller.pause_until() - before;
         assert!(
             second_pause >= 2 * first_pause - 10_000,
@@ -4074,7 +4138,7 @@ mod tests {
 
         poller.set_pause_until(0);
         queue_error();
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
         let third_pause = poller.pause_until() - before;
         assert!(
             third_pause >= 2 * second_pause - 10_000,
@@ -4104,10 +4168,10 @@ mod tests {
 
         // Two consecutive errors double the backoff away from the 120s floor.
         queue_error();
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
         poller.set_pause_until(0);
         queue_error();
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
         let doubled_pause = poller.pause_until();
         poller.set_pause_until(0);
         assert!(
@@ -4117,13 +4181,13 @@ mod tests {
 
         // A successful fetch in between must reset the stored backoff.
         batch.result.lock().unwrap().prs.insert(pr_key("Owner/repo", 50), open_snapshot(50));
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
 
         // A fresh error after the success must pause ~120s again, not
         // continue doubling from where the prior outage left off.
         let before = now_millis();
         queue_error();
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
         let fresh_pause = poller.pause_until() - before;
         assert!(
             (110_000..=130_000).contains(&fresh_pause),
@@ -4147,7 +4211,7 @@ mod tests {
         let poller = Poller::new(engine);
         poller.set_pause_until(now_millis() - 1_000);
 
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
 
         assert_eq!(
             batch.calls.lock().unwrap().len(), 1,
@@ -4201,7 +4265,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
 
         let done = notifs(&drain_events(&mut rx), NotificationKind::WorkerDone);
         assert_eq!(done.len(), 1, "a merged watched PR must notify exactly once");
@@ -4240,7 +4304,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
 
         let done = notifs(&drain_events(&mut rx), NotificationKind::WorkerDone);
         assert_eq!(done.len(), 1, "a closed watched PR is terminal too");
@@ -4284,7 +4348,7 @@ mod tests {
         };
 
         tick("failure");
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
         let first = drain_events(&mut rx);
         let ci = notifs(&first, NotificationKind::CiFailure);
         assert_eq!(ci.len(), 1, "the first failing tick must notify the opener");
@@ -4297,7 +4361,7 @@ mod tests {
         );
 
         tick("failure");
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
         let second = drain_events(&mut rx);
         assert!(
             notifs(&second, NotificationKind::CiFailure).is_empty(),
@@ -4309,14 +4373,14 @@ mod tests {
         );
 
         tick("success");
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
         assert!(
             notifs(&drain_events(&mut rx), NotificationKind::CiFailure).is_empty(),
             "a green tick must not notify",
         );
 
         tick("failure");
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
         assert_eq!(
             notifs(&drain_events(&mut rx), NotificationKind::CiFailure).len(), 1,
             "failing again after recovery is a fresh transition and must notify",
@@ -4347,7 +4411,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
 
         let done = notifs(&drain_events(&mut rx), NotificationKind::WorkerDone);
         assert_eq!(done.len(), 1, "an unowned watch still reaches the notification feed");
@@ -4378,7 +4442,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
 
         let after = store.get_session("sess-a").unwrap()
             .expect("a watch reaching a terminal PR must never clean up the opener session");
@@ -4416,8 +4480,8 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github_batched().await;
-        poller.poll_github_batched().await;
+        poller.poll_github_batched(true).await;
+        poller.poll_github_batched(true).await;
 
         assert!(
             notifs(&drain_events(&mut rx), NotificationKind::WorkerDone).is_empty(),
@@ -5007,7 +5071,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        let handled = poller.handle_merge_detection(&s, 42, true).await;
+        let handled = poller.handle_merge_detection(&s, 42, true, true).await;
         assert!(handled, "merge detection must run for a Terminated session");
 
         let after = store.get_session("w1").unwrap().unwrap();
@@ -5040,14 +5104,153 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        let first = poller.handle_merge_detection(&s, 7, true).await;
+        let first = poller.handle_merge_detection(&s, 7, true, true).await;
         assert!(first, "first tick handles the merge");
 
         // Simulate the next poll tick re-reading the (now Done) session from
         // the store before calling merge detection again.
         let updated = store.get_session("w1").unwrap().unwrap();
-        let second = poller.handle_merge_detection(&updated, 7, true).await;
+        let second = poller.handle_merge_detection(&updated, 7, true, true).await;
         assert!(!second, "an already-Done session must not re-fire merge detection");
+
+        let events = drain_events(&mut rx);
+        let merged_notifs = events.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+        )).count();
+        assert_eq!(merged_notifs, 1, "no duplicate WorkerDone notification across ticks");
+    }
+
+    /// A kept-alive merged worker (`merged_at` stamped) must drop out of
+    /// GitHub enrichment entirely — its PR is merged, so polling it every
+    /// tick until the orchestrator reaps the session is pure waste.
+    #[tokio::test]
+    async fn poll_github_skips_a_merge_stamped_session_entirely() {
+        use crate::store::Store;
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Mergeable;
+        s.repo = "Owner/repo".into();
+        s.pr_number = Some(7);
+        s.merged_at = Some(1_000);
+        store.upsert_session(&s).unwrap();
+
+        let engine = github_engine(store.clone(), fake.clone());
+        let poller = Poller::new(engine);
+        poller.poll_github(false).await;
+
+        assert!(
+            fake.calls.lock().unwrap().is_empty(),
+            "no GitHub request may be made for a session whose merge is already handled",
+        );
+    }
+
+    /// With `[auto_reap]` off (the default), a detected merge must NOT clean
+    /// the worker up: the session keeps its live status so the orchestrator
+    /// can run post-merge validation in it, and the `merged_at` stamp is
+    /// what records that the merge was already handled.
+    #[tokio::test]
+    async fn merge_detection_keeps_worker_alive_when_auto_reap_disabled() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Mergeable;
+        s.orchestrator_id = Some("orch1".into());
+        s.pr_number = Some(7);
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        let handled = poller.handle_merge_detection(&s, 7, true, false).await;
+        assert!(handled, "the merge is handled (enrichment skipped) even without cleanup");
+
+        let after = store.get_session("w1").unwrap().unwrap();
+        assert!(
+            matches!(after.status, SessionStatus::Mergeable),
+            "without auto_reap the session must keep its live status, got {:?}",
+            after.status,
+        );
+        assert!(after.merged_at.is_some(), "the merge must be stamped so it's handled exactly once");
+        assert!(
+            after.terminal_at.is_none(),
+            "no terminal_at — the session is alive, not on a retention countdown",
+        );
+
+        let events = drain_events(&mut rx);
+        let merged_notifs = events.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+        )).count();
+        assert_eq!(merged_notifs, 1, "exactly one WorkerDone notification for the merge");
+    }
+
+    /// Even with `[auto_reap]` off, a worker whose process already exited
+    /// (`Terminated`) before its PR merged must NOT be treated as kept-alive:
+    /// there's no live agent to validate in. It gets cleaned up to `Done`
+    /// and the plain done-reaction — never the "still alive" wording, and
+    /// never a `merged_at` stamp that would strand a dead row.
+    #[tokio::test]
+    async fn merge_detection_cleans_up_a_dead_worker_even_with_auto_reap_off() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Terminated; // process exited while PR was open
+        s.orchestrator_id = Some("orch1".into());
+        s.pr_number = Some(7);
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        assert!(poller.handle_merge_detection(&s, 7, true, false).await);
+
+        let after = store.get_session("w1").unwrap().unwrap();
+        assert!(
+            matches!(after.status, SessionStatus::Done),
+            "a dead worker's merge must clean it up regardless of auto_reap, got {:?}",
+            after.status,
+        );
+        assert!(after.merged_at.is_none(), "a dead worker must not be stamped as kept-alive");
+        assert!(after.terminal_at.is_some(), "cleanup must stamp terminal_at for the retention sweep");
+
+        // The reaction must be the plain done one — asserting no session is
+        // falsely advertised as alive. The kept-alive text contains "alive";
+        // the plain one does not.
+        let msgs = drain_events(&mut rx);
+        let notif = msgs.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+        )).count();
+        assert_eq!(notif, 1, "exactly one WorkerDone notification");
+    }
+
+    /// The next tick re-reads the kept-alive session (still a live status,
+    /// but `merged_at` stamped) — merge detection must keep returning `true`
+    /// so enrichment stays skipped, without re-notifying.
+    #[tokio::test]
+    async fn merge_detection_does_not_renotify_a_kept_alive_merged_session() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Mergeable;
+        s.orchestrator_id = Some("orch1".into());
+        s.pr_number = Some(7);
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        assert!(poller.handle_merge_detection(&s, 7, true, false).await);
+
+        let updated = store.get_session("w1").unwrap().unwrap();
+        let second = poller.handle_merge_detection(&updated, 7, true, false).await;
+        assert!(second, "an already-stamped session still skips enrichment");
 
         let events = drain_events(&mut rx);
         let merged_notifs = events.iter().filter(|e| matches!(
@@ -5066,7 +5269,7 @@ mod tests {
         let engine = Engine::new(store.clone());
         let poller = Poller::new(engine);
 
-        let handled = poller.handle_merge_detection(&s, 1, false).await;
+        let handled = poller.handle_merge_detection(&s, 1, false, true).await;
         assert!(!handled);
         assert!(matches!(store.get_session("w1").unwrap().unwrap().status, SessionStatus::Working));
     }
@@ -5226,7 +5429,7 @@ mod tests {
 
         // The merge-detection happy path — this already notifies orch1 and
         // marks the session Done.
-        assert!(poller.handle_merge_detection(&s, 7, true).await);
+        assert!(poller.handle_merge_detection(&s, 7, true, true).await);
         drain_events(&mut rx); // discard the merge-detection's own notification/events
 
         // Fast-forward past the retention window and let the sweep purge it.
@@ -5243,5 +5446,80 @@ mod tests {
             e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerRetired
         )).count();
         assert_eq!(retired_notifs, 0, "must not re-notify a session already told about its merge");
+    }
+
+    /// A worker kept alive past its merge (`[auto_reap]` off, `merged_at`
+    /// stamped) that is later reaped/terminated must be purged WITHOUT the
+    /// retired notice — its "PR was not detected as merged" wording would
+    /// flatly contradict the worker-done reaction the orchestrator already
+    /// received at merge-detection time.
+    #[tokio::test]
+    async fn sweep_retired_sessions_skips_retired_notice_for_a_merge_stamped_worker() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Terminated;
+        s.orchestrator_id = Some("orch1".into());
+        s.pr_number = Some(7);
+        s.merged_at = Some(1_000);
+        // No terminal_at — a reap is a direct action, purged on sight.
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
+
+        assert!(store.get_session("w1").unwrap().is_none(), "session must still be purged");
+
+        let events = drain_events(&mut rx);
+        let retired_notifs = events.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerRetired
+        )).count();
+        assert_eq!(
+            retired_notifs, 0,
+            "no retired notice for a worker whose merge was already announced",
+        );
+    }
+
+    /// A merged-but-kept-alive worker (live status, `merged_at` set) whose
+    /// orchestrator never reaps it must still be reclaimed once `merged_at`
+    /// ages past the retention window — otherwise it leaks its row/worktree
+    /// forever, losing the guaranteed cleanup the pre-toggle merge path had.
+    /// One still inside the window survives.
+    #[tokio::test]
+    async fn sweep_reclaims_a_kept_alive_merged_worker_past_the_window() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let window = SessionRetentionConfig::default().retention_millis();
+        let now = now_millis();
+
+        // Stale: merged well past the window, still parked in a live status.
+        let mut stale = test_session("stale", "/ws-stale");
+        stale.status = SessionStatus::Mergeable;
+        stale.merged_at = Some(now - window - 1);
+        store.upsert_session(&stale).unwrap();
+
+        // Fresh: merged just now, still within its validation window.
+        let mut fresh = test_session("fresh", "/ws-fresh");
+        fresh.status = SessionStatus::Mergeable;
+        fresh.merged_at = Some(now);
+        store.upsert_session(&fresh).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let poller = Poller::new(engine);
+        poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
+
+        assert!(
+            store.get_session("stale").unwrap().is_none(),
+            "a kept-alive merged worker past the window must be reclaimed",
+        );
+        assert!(
+            store.get_session("fresh").unwrap().is_some(),
+            "a kept-alive merged worker still within its window must survive",
+        );
     }
 }

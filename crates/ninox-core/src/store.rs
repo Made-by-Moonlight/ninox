@@ -654,6 +654,7 @@ impl Store {
             ("summary",              "ALTER TABLE sessions ADD COLUMN summary TEXT"),
             ("terminal_at",          "ALTER TABLE sessions ADD COLUMN terminal_at INTEGER"),
             ("gate_status",          "ALTER TABLE sessions ADD COLUMN gate_status TEXT"),
+            ("merged_at",            "ALTER TABLE sessions ADD COLUMN merged_at INTEGER"),
         ] {
             if !Self::column_exists(&conn, "sessions", col)? {
                 conn.execute(ddl, [])?;
@@ -1060,8 +1061,8 @@ impl Store {
             "INSERT INTO sessions (id,orchestrator_id,name,repo,status,agent_type,
              cost_usd,started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id,summary,terminal_at,gate_status)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
+             claude_session_id,summary,terminal_at,gate_status,merged_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
              ON CONFLICT(id) DO UPDATE SET
              repo=excluded.repo,
              status=excluded.status,cost_usd=excluded.cost_usd,
@@ -1076,14 +1077,15 @@ impl Store {
              claude_session_id=excluded.claude_session_id,
              summary=excluded.summary,
              terminal_at=excluded.terminal_at,
-             gate_status=excluded.gate_status",
+             gate_status=excluded.gate_status,
+             merged_at=excluded.merged_at",
             params![
                 s.id, s.orchestrator_id, s.name, s.repo, status, s.agent_type,
                 s.cost_usd, s.started_at, s.pr_number, s.pr_id,
                 s.workspace_path, s.pid, s.model, s.context_tokens,
                 s.catalogue_path, s.context_used_pct, s.context_total_tokens,
                 s.context_window_size, s.claude_session_id, s.summary, s.terminal_at,
-                gate_status
+                gate_status, s.merged_at
             ],
         )?;
         Ok(())
@@ -1242,7 +1244,7 @@ impl Store {
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id,summary,terminal_at,gate_status
+             claude_session_id,summary,terminal_at,gate_status,merged_at
              FROM sessions ORDER BY started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1269,6 +1271,7 @@ impl Store {
                 r.get::<_, Option<String>>(19)?,
                 r.get::<_, Option<i64>>(20)?,
                 r.get::<_, Option<String>>(21)?,
+                r.get::<_, Option<i64>>(22)?,
             ))
         })?;
         rows.map(|r| {
@@ -1276,7 +1279,7 @@ impl Store {
                  cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                  model, context_tokens, catalogue_path, context_used_pct,
                  context_total_tokens, context_window_size, claude_session_id,
-                 summary, terminal_at, gate_status_str) = r?;
+                 summary, terminal_at, gate_status_str, merged_at) = r?;
             let status = serde_json::from_str(&format!("\"{status_str}\""))
                 .unwrap_or(SessionStatus::Working);
             let gate_status = gate_status_str
@@ -1293,6 +1296,7 @@ impl Store {
                 summary,
                 terminal_at,
                 gate_status,
+                merged_at,
             })
         })
         .collect()
@@ -1304,7 +1308,7 @@ impl Store {
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id,summary,terminal_at,gate_status
+             claude_session_id,summary,terminal_at,gate_status,merged_at
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], |r| {
@@ -1331,6 +1335,7 @@ impl Store {
                 r.get::<_, Option<String>>(19)?,
                 r.get::<_, Option<i64>>(20)?,
                 r.get::<_, Option<String>>(21)?,
+                r.get::<_, Option<i64>>(22)?,
             ))
         })?;
         match rows.next() {
@@ -1340,7 +1345,7 @@ impl Store {
                      cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                      model, context_tokens, catalogue_path, context_used_pct,
                      context_total_tokens, context_window_size, claude_session_id,
-                     summary, terminal_at, gate_status_str) = r?;
+                     summary, terminal_at, gate_status_str, merged_at) = r?;
                 let status = serde_json::from_str(&format!("\"{status_str}\""))
                     .unwrap_or(SessionStatus::Working);
                 let gate_status = gate_status_str
@@ -1357,9 +1362,51 @@ impl Store {
                     summary,
                     terminal_at,
                     gate_status,
+                    merged_at,
                 }))
             }
         }
+    }
+
+    /// Column-scoped write of the fields the external `ninox statusline`
+    /// process owns (cost + context readout, and `model` only when not
+    /// already set). Deliberately NOT a `upsert_session` full-row write: the
+    /// statusline hook fires continuously and from a *separate process*, so
+    /// a read-modify-write there would revert any field the in-app poller
+    /// stamped between the read and the write — most visibly `merged_at` on
+    /// a kept-alive merged worker (whose statusline keeps firing during
+    /// post-merge validation), re-triggering its one-shot merge
+    /// notification. A single UPDATE touching only these columns can't
+    /// stomp `status`/`pr_number`/`gate_status`/`merged_at`. Each `None`
+    /// argument leaves its column untouched. Returns whether a row matched.
+    pub fn update_statusline_metrics(
+        &self,
+        session_id:           &str,
+        cost_usd:             Option<f64>,
+        context_used_pct:     Option<f64>,
+        context_total_tokens: Option<u64>,
+        context_window_size:  Option<u64>,
+        model:                Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE sessions SET
+                cost_usd             = COALESCE(?2, cost_usd),
+                context_used_pct     = COALESCE(?3, context_used_pct),
+                context_total_tokens = COALESCE(?4, context_total_tokens),
+                context_window_size  = COALESCE(?5, context_window_size),
+                model                = COALESCE(model, ?6)
+             WHERE id = ?1",
+            params![
+                session_id,
+                cost_usd,
+                context_used_pct,
+                context_total_tokens,
+                context_window_size,
+                model,
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Non-zero `cost_usd` samples recorded for sessions matching the given
@@ -4537,6 +4584,7 @@ mod tests {
             summary: None,
             terminal_at: None,
             gate_status: None,
+            merged_at: None,
         }
     }
 
@@ -4880,7 +4928,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         };
         store.upsert_session(&session).unwrap();
         let list = store.list_sessions().unwrap();
@@ -4900,7 +4948,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         };
         store.upsert_session(&s).unwrap();
         s.status = SessionStatus::Done;
@@ -4926,7 +4974,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         };
         store.upsert_session(&s).unwrap();
         s.repo = "OwnerB/repoB".into();
@@ -4947,7 +4995,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap();
@@ -4968,7 +5016,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap().unwrap();
@@ -4989,7 +5037,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2").unwrap().unwrap();
@@ -5010,7 +5058,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: Some("Fix flaky CI on the auth suite".into()),
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2b").unwrap().unwrap();
@@ -5041,7 +5089,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some("b7e0b3a0-0000-4000-8000-000000000001".into()),
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s3").unwrap().unwrap();
@@ -5072,7 +5120,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: Some(1_720_000_000_000), gate_status: None,
+            terminal_at: Some(1_720_000_000_000), gate_status: None, merged_at: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s5").unwrap().unwrap();
@@ -5106,7 +5154,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         };
         store.upsert_session(&s).unwrap();
         s.started_at = 200;
@@ -5172,7 +5220,7 @@ mod tests {
             context_window_size: Some(200_000),
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap().unwrap();
@@ -5195,7 +5243,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2").unwrap().unwrap();
@@ -5222,7 +5270,7 @@ mod tests {
                 model: model.map(String::from), context_tokens: None, catalogue_path: None,
                 context_used_pct: None, context_total_tokens: None, context_window_size: None,
                 claude_session_id: None, summary: None,
-                terminal_at: None, gate_status: None,
+                terminal_at: None, gate_status: None, merged_at: None,
             }).unwrap();
         }
         let samples = store.cost_samples("claude-code", Some("claude-fable-5")).unwrap();
@@ -5241,7 +5289,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
-            gate_status: None,
+            gate_status: None, merged_at: None,
         };
         session.gate_status = Some(crate::types::GateStatus {
             ci: crate::types::GateCheck::Failing,
@@ -5272,7 +5320,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
-            gate_status: None,
+            gate_status: None, merged_at: None,
         };
         store.upsert_session(&session).unwrap();
         let fetched = store.get_session("s2").unwrap().unwrap();
@@ -6541,6 +6589,7 @@ mod tests {
             summary: None,
             terminal_at: Some(1),
             gate_status: None,
+            merged_at: None,
         };
         store.upsert_session(&session).unwrap();
 
@@ -6580,6 +6629,7 @@ mod tests {
             summary: None,
             terminal_at: Some(1),
             gate_status: None,
+            merged_at: None,
         };
         store.upsert_session(&session).unwrap();
         session.started_at = 2;

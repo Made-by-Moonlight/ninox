@@ -11,6 +11,15 @@ use ninox_core::types::{GateCheck, Session};
 /// check — what the hover tooltip shows. `Mergeable`'s line explains *why*
 /// when it's blocked, rather than just repeating "no."
 pub fn gate_lines(session: &Session) -> Vec<String> {
+    // A kept-alive merged worker ([auto_reap] off) freezes its gate at the
+    // last pre-merge tick, so the checks below describe a stale state. Say
+    // up front that the PR merged and the worker is only awaiting a reap.
+    if session.merged_at.is_some() && !session.status.is_terminal() {
+        return vec![
+            "PR merged — worker kept alive for validation".to_string(),
+            "Reap it (`ninox reap <id> --force`) when done".to_string(),
+        ];
+    }
     let Some(gate) = &session.gate_status else {
         // `pr_number` is set by the metadata hook the moment a PR exists,
         // but `gate_status` only arrives on the next GitHub enrichment
@@ -144,7 +153,7 @@ mod tests {
             pid: None, model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
-            gate_status: gate,
+            merged_at: None, gate_status: gate,
         }
     }
 
@@ -161,6 +170,25 @@ mod tests {
         session.pr_number = Some(42);
         let lines = gate_lines(&session);
         assert_eq!(lines, vec!["Checking PR status…".to_string()]);
+    }
+
+    #[test]
+    fn gate_lines_announces_a_kept_alive_merged_worker() {
+        // A live status with a merged_at stamp: the frozen gate below is
+        // stale, so the tooltip must lead with the merge + reap guidance.
+        let gate = GateStatus {
+            ci: GateCheck::Passing, review: GateCheck::Passing,
+            mergeable: GateCheck::Passing, since: 0,
+        };
+        let mut session = session_with(SessionStatus::Mergeable, Some(gate));
+        session.merged_at = Some(1_000);
+        let lines = gate_lines(&session);
+        assert!(lines[0].contains("merged"), "must say the PR merged: {lines:?}");
+        assert!(lines.iter().any(|l| l.contains("reap")), "must point at the reap: {lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("Mergeable")),
+            "must not show the stale gate breakdown: {lines:?}",
+        );
     }
 
     #[test]

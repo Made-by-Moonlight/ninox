@@ -54,11 +54,21 @@ pub enum ReapOutcome {
     Reaped,
     /// Killed a worker that was still running (needs `force`).
     ReapedLive,
+    /// Killed a worker whose PR already merged but was kept alive for
+    /// post-merge validation (`[auto_reap]` off — see `Session::merged_at`).
+    /// Still "live" in the reap sense (needs `force`), but this is the
+    /// documented happy-path reap, not an interruption of unfinished work.
+    ReapedLiveMerged,
     /// Cleaned up an `Interrupted` worker, giving up the workspace its
     /// resume depended on (needs `force`).
     ReapedResumable,
     /// Still running and `force` wasn't given — nothing was touched.
     SkippedLive,
+    /// PR merged and kept alive for validation (`[auto_reap]` off), and
+    /// `force` wasn't given — nothing was touched. Distinct from
+    /// `SkippedLive` so the report can say "reap when validation's done"
+    /// rather than "you'd interrupt work in progress".
+    SkippedLiveMerged,
     /// `Interrupted`, i.e. resumable, and `force` wasn't given — nothing was
     /// touched.
     SkippedResumable,
@@ -430,9 +440,16 @@ impl Engine {
             // its `--resume` needs).
             let resumable = matches!(session.status, SessionStatus::Interrupted);
             let was_live  = !is_finished(&session.status) && !resumable;
+            // A live worker whose PR already merged (kept alive for
+            // validation, `[auto_reap]` off) reaps like any other live one,
+            // but its report line should read as the intended cleanup, not
+            // an interruption.
+            let merged_alive = was_live && session.merged_at.is_some();
             if !force && (was_live || resumable) {
                 let outcome = if resumable {
                     ReapOutcome::SkippedResumable
+                } else if merged_alive {
+                    ReapOutcome::SkippedLiveMerged
                 } else {
                     ReapOutcome::SkippedLive
                 };
@@ -485,10 +502,11 @@ impl Engine {
                     continue;
                 }
             }
-            outcomes.push((session.id, match (was_live, resumable) {
-                (true, _) => ReapOutcome::ReapedLive,
-                (_, true) => ReapOutcome::ReapedResumable,
-                _         => ReapOutcome::Reaped,
+            outcomes.push((session.id, match (was_live, resumable, merged_alive) {
+                (true, _, true) => ReapOutcome::ReapedLiveMerged,
+                (true, _, _)    => ReapOutcome::ReapedLive,
+                (_, true, _)    => ReapOutcome::ReapedResumable,
+                _               => ReapOutcome::Reaped,
             }));
         }
         Ok(outcomes)
@@ -861,7 +879,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(store);
@@ -904,7 +922,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: Some(1_000), gate_status: None,
+            terminal_at: Some(1_000), gate_status: None, merged_at: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(Arc::clone(&store));
@@ -936,7 +954,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(Arc::clone(&store));
@@ -994,7 +1012,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(Arc::clone(&store));
@@ -1084,6 +1102,7 @@ mod tests {
                 summary: None,
                 terminal_at: None,
                 gate_status: None,
+                merged_at: None,
             })
             .unwrap();
         let engine = Engine::new(store.clone());
@@ -1114,7 +1133,7 @@ mod tests {
             workspace_path: None, pid: None, model: None, context_tokens: None,
             catalogue_path: None, context_used_pct: None, context_total_tokens: None,
             context_window_size: None, claude_session_id: None, summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         }
     }
 
@@ -1319,6 +1338,40 @@ mod tests {
         assert!(
             matches!(store.get_session("live-1").unwrap().unwrap().status, Working),
             "an unselected live worker must be left untouched",
+        );
+    }
+
+    /// A kept-alive merged worker (live status, `merged_at` set) reaps like
+    /// any other live worker but reports the merged-specific outcomes, so the
+    /// CLI can tell the orchestrator this was the documented cleanup rather
+    /// than an interruption of unfinished work.
+    #[tokio::test]
+    async fn reap_reports_merged_specific_outcomes_for_a_kept_alive_worker() {
+        use crate::types::SessionStatus::*;
+        let mut merged = worker("merged-1", "orch-1", Mergeable);
+        merged.merged_at = Some(1_000);
+        let (store, engine) = reap_fixture(&[merged]);
+
+        // Without --force it's skipped, but with the merged-aware wording.
+        let skipped = engine
+            .reap_workers("orch-1", ReapSelection::Ids(&["merged-1".to_string()]), false)
+            .await
+            .unwrap();
+        assert_eq!(skipped, vec![("merged-1".to_string(), ReapOutcome::SkippedLiveMerged)]);
+        assert!(
+            matches!(store.get_session("merged-1").unwrap().unwrap().status, Mergeable),
+            "a skipped merged worker must be left untouched",
+        );
+
+        // With --force it's reaped, reported as the merged happy path.
+        let reaped = engine
+            .reap_workers("orch-1", ReapSelection::Ids(&["merged-1".to_string()]), true)
+            .await
+            .unwrap();
+        assert_eq!(reaped, vec![("merged-1".to_string(), ReapOutcome::ReapedLiveMerged)]);
+        assert!(
+            matches!(store.get_session("merged-1").unwrap().unwrap().status, Terminated),
+            "a force-reaped merged worker is terminated like any live one",
         );
     }
 

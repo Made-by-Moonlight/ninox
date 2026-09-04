@@ -264,6 +264,40 @@ pub struct PrWatchConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-reap configuration
+// ---------------------------------------------------------------------------
+
+/// Opt-out (default ON) automatic reaping of a worker the moment its PR
+/// merges. Default-on preserves the unconditional behavior that predates
+/// this toggle, so existing setups are unaffected — only someone who wants
+/// the post-merge validation window turns it off.
+///
+/// On (default): merge detection immediately runs `Engine::cleanup_session`
+/// — kills the worker's tmux session, removes its worktree, and marks it
+/// `Done`.
+///
+/// Off: the merged notification and worker-done reaction still fire (once —
+/// see `Session::merged_at`), but the worker session and its worktree
+/// survive, so the orchestrator can run post-merge validation in the same
+/// worker that produced the PR and reap it explicitly afterwards
+/// (`ninox reap <id> --force`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoReapConfig {
+    #[serde(default = "default_auto_reap_enabled")]
+    pub enabled: bool,
+}
+
+fn default_auto_reap_enabled() -> bool {
+    true
+}
+
+impl Default for AutoReapConfig {
+    fn default() -> Self {
+        Self { enabled: default_auto_reap_enabled() }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session retention configuration
 // ---------------------------------------------------------------------------
 
@@ -469,6 +503,10 @@ pub struct AppConfig {
     /// `PrWatchConfig`.
     #[serde(default)]
     pub pr_watch: PrWatchConfig,
+    /// Reap a worker automatically the moment its PR merges. Opt-out,
+    /// default on — see `AutoReapConfig`.
+    #[serde(default)]
+    pub auto_reap: AutoReapConfig,
     /// Theme file name (resolves to `~/.config/ninox/themes/<name>.toml`) or
     /// an absolute/`~`-relative path. `None` uses `themes/field-notes.toml`
     /// if present, else the built-in Field Notes palettes.
@@ -525,6 +563,7 @@ impl Default for AppConfig {
             inbox_messaging:  InboxMessagingConfig::default(),
             rust_cache:       RustCacheConfig::default(),
             pr_watch:         PrWatchConfig::default(),
+            auto_reap:        AutoReapConfig::default(),
         }
     }
 }
@@ -1284,6 +1323,25 @@ mod tests {
         let toml_src = "port = 8080\nfont_size = 13.0\n\n[pr_watch]\nenabled = true\n";
         let cfg: AppConfig = toml::from_str(toml_src).unwrap();
         assert!(cfg.pr_watch.enabled);
+    }
+
+    #[test]
+    fn auto_reap_defaults_to_enabled() {
+        // Opt-out: default on preserves the pre-toggle cleanup-on-merge
+        // behavior, both when the whole table is absent and when the table
+        // is present without `enabled`.
+        assert!(AppConfig::default().auto_reap.enabled);
+        let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert!(cfg.auto_reap.enabled);
+        let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n\n[auto_reap]\n").unwrap();
+        assert!(cfg.auto_reap.enabled, "an empty [auto_reap] table must still default enabled");
+    }
+
+    #[test]
+    fn auto_reap_can_be_disabled_via_config() {
+        let toml_src = "port = 8080\nfont_size = 13.0\n\n[auto_reap]\nenabled = false\n";
+        let cfg: AppConfig = toml::from_str(toml_src).unwrap();
+        assert!(!cfg.auto_reap.enabled);
     }
 
     #[test]

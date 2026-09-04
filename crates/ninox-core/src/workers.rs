@@ -628,6 +628,7 @@ mod tests {
             summary: None,
             terminal_at: None,
             gate_status: None,
+            merged_at: None,
         }
     }
 

@@ -34,6 +34,7 @@ fn session(id: &str, orchestrator_id: &str, workspace: &Path) -> Session {
         summary: None,
         terminal_at: None,
         gate_status: None,
+        merged_at: None,
     }
 }
 

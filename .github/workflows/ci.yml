@@ -51,18 +51,46 @@ jobs:
       - name: Test
         run: tmux start-server && cargo test --workspace
 
-  # Deliberately a bare ubuntu:22.04 container, NOT the ubuntu-22.04 runner
+  # The stock-Ubuntu-22.04 gate, split into two parallel jobs so neither
+  # builds the whole workspace at once. It ran as a single job that built
+  # `-p ninox` (the full binary) and then the inference test; that one graph
+  # — aws-sdk-s3, the prebuilt ONNX Runtime (via ort/fastembed), sqlite AND
+  # the iced/wgpu UI stack — overflowed the container's share of the host's
+  # ~14 GB root disk (a linker SIGBUS, then `No space left on device`).
+  # Splitting by crate gives each job a smaller graph on its own runner
+  # disk, and they run concurrently; `-core` never pulls iced/wgpu at all.
+  #
+  # Both run in a bare ubuntu:22.04 container, NOT the ubuntu-22.04 runner
   # image: GitHub runner images preinstall libssl-dev and a newer GCC, which
   # is exactly what let two Ubuntu 22.04 install breakages ship unnoticed
   # (openssl-sys pulled in via fastembed's native-tls defaults, and the
   # GCC 13+ `__cxa_call_terminate` reference in ort-sys's prebuilt ONNX
-  # Runtime). This job proves a stock Ubuntu 22.04 — glibc 2.35, GCC 11, no
-  # OpenSSL headers — can still build the app binary end to end, keeping
-  # `cargo install ninox` working on the oldest supported systems.
-  build-oldest-linux:
-    name: Build on stock Ubuntu 22.04
+  # Runtime). Stock Ubuntu 22.04 is glibc 2.35, GCC 11, no OpenSSL headers,
+  # and this gate keeps `cargo install ninox` working on it.
+  #
+  # `CARGO_PROFILE_DEV_DEBUG: 0` drops debuginfo — roughly halving target/,
+  # the extra headroom that keeps each job on disk. It's irrelevant to what
+  # these jobs prove (linking + runtime), which is why a dev profile is fine
+  # here in the first place: the guarded failures (a -sys crate demanding
+  # missing system headers, unresolvable symbols in the prebuilt static ONNX
+  # Runtime) surface regardless of profile, and dev links the same native
+  # libraries `cargo install`'s release build does.
+
+  # Native-linkage-heavy graph (no iced/wgpu): proves the aws/onnx/sqlite
+  # `-sys` crates build and link on stock 22.04, then that ONNX actually
+  # *runs* — static constructors under this libstdc++ can segfault even when
+  # linking succeeds, so real inference through the prebuilt runtime is the
+  # only true check. The `--ignored fast_embed_embedder` filter pins this to
+  # the embedder tests: a bare `-- --ignored` would also sweep in unrelated
+  # ignored tests (e.g. the 5000-file brain rebuild benchmark). Single-
+  # threaded so the two tests can't race the fresh model download into the
+  # shared fastembed cache on a cold runner.
+  build-oldest-linux-core:
+    name: Build ninox-core on stock Ubuntu 22.04
     runs-on: ubuntu-latest
     container: ubuntu:22.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - name: Install system dependencies
         run: |
@@ -83,31 +111,47 @@ jobs:
             ~/.cargo/git
             ~/.cache/ninox
             target
-          key: ubuntu2204-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ubuntu2204-cargo-
-      # A dev-profile build is enough: the guarded compile/link failure
-      # modes (a -sys crate demanding missing system headers, unresolvable
-      # symbols in the prebuilt static ONNX Runtime) surface regardless of
-      # profile, and dev links the same native libraries `cargo install`'s
-      # release build does.
-      - name: Build
-        run: cargo build --locked -p ninox
-      # Link success isn't enough: toolchain mismatches can also break at
-      # runtime (e.g. ONNX Runtime static constructors segfaulting on a
-      # never-initialized std::cout under pre-GCC-13.3 libstdc++). Starting
-      # the binary covers static init; the ignored embedder tests download
-      # the real model (cached above under ~/.cache/ninox) and run actual
-      # inference through the prebuilt runtime.
-      # The filter pins this to the embedder tests: a bare `-- --ignored`
-      # would also sweep in unrelated ignored tests (e.g. the 5000-file
-      # brain rebuild benchmark) and silently adopt any future ignored test
-      # whose requirements this container doesn't meet. Single-threaded so
-      # the two tests can't race the fresh model download into the shared
-      # fastembed cache on a cold runner.
-      - name: Run binary and real-inference embedder tests
+          key: ubuntu2204-core-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ubuntu2204-core-cargo-
+      - name: Build ninox-core
+        run: cargo build --locked -p ninox-core
+      - name: Real-inference embedder tests
+        run: cargo test --locked -p ninox-core -- --ignored fast_embed_embedder --test-threads=1
+
+  # Full-binary graph (adds the iced/wgpu UI stack): proves `-p ninox` links
+  # end to end, then that the binary starts — which covers ONNX Runtime
+  # static-init, the runtime failure mode link success alone can't catch.
+  build-oldest-linux-app:
+    name: Build ninox binary on stock Ubuntu 22.04
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: Install system dependencies
         run: |
-          ./target/debug/ninox --help > /dev/null
-          cargo test --locked -p ninox-core -- --ignored fast_embed_embedder --test-threads=1
+          apt-get update -q
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            curl ca-certificates build-essential pkg-config git cmake \
+            libxkbcommon-dev libwayland-dev
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Cache Rust
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu2204-app-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ubuntu2204-app-cargo-
+      - name: Build ninox
+        run: cargo build --locked -p ninox
+      - name: Binary smoke test
+        run: ./target/debug/ninox --help > /dev/null
 
   bundle-macos:
     name: macOS App Bundle

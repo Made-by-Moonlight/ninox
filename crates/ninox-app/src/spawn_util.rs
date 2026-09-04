@@ -194,6 +194,10 @@ pub async fn spawn_interactive_session(
         claude_session_id: Some(p.claude_session_id),
         summary:         p.summary,
         terminal_at:     None,
+        // Carried so a resumed session whose PR already merged doesn't
+        // re-fire merge detection (a duplicate notification — or, with
+        // `[auto_reap]` on, an instant cleanup of the row just respawned).
+        merged_at:       prior.and_then(|s| s.merged_at),
         gate_status:     prior.and_then(|s| s.gate_status.clone()),
     };
     let _ = engine.store.upsert_session(&updated);
@@ -2443,6 +2447,7 @@ mod tests {
                 ci: GateCheck::Failing, review: GateCheck::Pending,
                 mergeable: GateCheck::Failing, since: 5,
             }),
+            merged_at: None,
         }).unwrap();
 
         let attach = spawn_interactive_session(
@@ -2499,7 +2504,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some("fixed-uuid".into()),
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         }).unwrap();
 
         let ws = tempdir().unwrap().keep().to_string_lossy().to_string();

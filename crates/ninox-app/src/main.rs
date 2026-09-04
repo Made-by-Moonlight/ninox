@@ -933,6 +933,20 @@ async fn run_spawn(
         .map(slugify)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("worker-{ts}"));
+    // Refuse to reuse an existing session's id BEFORE any side effect
+    // (worktree creation, upsert). The upsert below is a full-row write
+    // keyed on `id`: reusing the name of a live worker — most dangerously a
+    // merged worker kept alive for validation ([auto_reap] off), which now
+    // squats its slug until reaped — would clobber its row (wiping
+    // merged_at/pr_number), and the ensuing duplicate-id tmux-create failure
+    // would mark the hijacked record Terminated, feeding it to the sweep.
+    // Mirrors the TUI spawn modal's collision guard (see `app.rs`).
+    if store.get_session(&id)?.is_some() {
+        anyhow::bail!(
+            "a session named '{id}' already exists — pick another name, or reap the \
+             existing worker first (`ninox reap {id}`, add --force if it's still running)"
+        );
+    }
     let display_name = name.unwrap_or_else(|| first_words(&prompt, 4));
     // The fleet card summary: the first line of the raw task prompt, before
     // the worker-context footer is appended below.
@@ -978,6 +992,7 @@ async fn run_spawn(
         summary: summary.clone(),
         terminal_at: None,
         gate_status: None,
+        merged_at: None,
     };
     anyhow::ensure!(
         store.insert_spawning_session(&pending)?,
@@ -1142,7 +1157,7 @@ async fn run_spawn(
         context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: Some(claude_session_id.clone()),
         summary,
-        terminal_at: None, gate_status: None,
+        terminal_at: None, gate_status: None, merged_at: None,
     };
 
     if let Err(error) = store.upsert_session(&session) {
@@ -1934,7 +1949,10 @@ async fn run_reap(
     for (id, outcome) in &outcomes {
         println!("{}", reap_report_line(id, *outcome));
     }
-    if outcomes.iter().any(|(_, o)| matches!(o, ReapOutcome::SkippedLive | ReapOutcome::SkippedResumable)) {
+    if outcomes.iter().any(|(_, o)| matches!(
+        o,
+        ReapOutcome::SkippedLive | ReapOutcome::SkippedLiveMerged | ReapOutcome::SkippedResumable,
+    )) {
         println!("\nWorkers that were still running or still resumable were left alone — re-run with --force to reap them too.");
     }
     // The retry has to name the ids AND `--force`: the row is still whatever
@@ -1980,8 +1998,12 @@ fn reap_report_line(id: &str, outcome: ninox_core::events::ReapOutcome) -> Strin
     match outcome {
         ReapOutcome::Reaped          => format!("reaped {id}"),
         ReapOutcome::ReapedLive      => format!("reaped {id} (was still running — killed)"),
+        ReapOutcome::ReapedLiveMerged => format!("reaped {id} (PR merged, kept alive for validation)"),
         ReapOutcome::ReapedResumable => format!("reaped {id} (was interrupted — no longer resumable)"),
         ReapOutcome::SkippedLive     => format!("skipped {id} — still running (use --force)"),
+        ReapOutcome::SkippedLiveMerged => {
+            format!("skipped {id} — PR merged, kept alive for validation; reap with --force when done")
+        }
         ReapOutcome::SkippedResumable => {
             format!("skipped {id} — interrupted but resumable (use --force to give that up)")
         }
@@ -2086,7 +2108,7 @@ async fn run_spawn_orchestrator(
         context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: Some(claude_session_id.clone()),
         summary:         None,
-        terminal_at:     None, gate_status: None,
+        terminal_at:     None, gate_status: None, merged_at: None,
     };
     store.upsert_session(&session)?;
 
@@ -2770,7 +2792,7 @@ mod discover_repos_tests {
             context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         }
     }
 
@@ -3144,6 +3166,49 @@ mod worker_env_tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_spawn_refuses_to_clobber_an_existing_session_id() {
+        use std::sync::Arc;
+        use ninox_core::types::{Session, SessionStatus};
+
+        let store = Arc::new(
+            ninox_core::store::Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap(),
+        );
+        // A merged worker kept alive for validation ([auto_reap] off): live
+        // status, merged_at + pr_number set, squatting the slug "ath-123".
+        let kept_alive = Session {
+            id: "ath-123".into(), orchestrator_id: Some("orch1".into()), name: "ath-123".into(),
+            repo: "o/r".into(), status: SessionStatus::Mergeable, agent_type: "claude-code".into(),
+            cost_usd: 0.0, started_at: 0, pr_number: Some(9), pr_id: Some(9),
+            workspace_path: Some("/ws".into()), pid: None, model: None, context_tokens: None,
+            catalogue_path: None, context_used_pct: None, context_total_tokens: None,
+            context_window_size: None, claude_session_id: None, summary: None,
+            terminal_at: None, gate_status: None,
+            merged_at: Some(1_000),
+        };
+        store.upsert_session(&kept_alive).unwrap();
+
+        let result = run_spawn(
+            store.clone(),
+            ninox_core::config::AppConfig::default(),
+            "follow-up task".into(),
+            "/some/other/dir".into(),
+            None,
+            Some("ath-123".into()),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "reusing a live worker's name must be refused");
+
+        let after = store.get_session("ath-123").unwrap().unwrap();
+        assert_eq!(after.merged_at, Some(1_000), "the existing row's merged_at must be untouched");
+        assert_eq!(after.pr_number, Some(9), "the existing row's pr_number must be untouched");
+        assert!(
+            matches!(after.status, SessionStatus::Mergeable),
+            "the existing row must not be hijacked to Terminated, got {:?}", after.status,
+        );
+    }
+
     #[test]
     fn worker_prompt_preserves_path_like_prose_without_parsing_it() {
         let prompt = "Explain why file:///Users/mu/dev/ninox/bad%GG is malformed.";
@@ -3453,6 +3518,7 @@ mod release_cli_tests {
                 summary: None,
                 terminal_at: None,
                 gate_status: None,
+                merged_at: None,
             })
             .unwrap();
         let worker = store
@@ -3785,7 +3851,7 @@ mod orchestrator_cli_tests {
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
-            claude_session_id: None, summary: None, terminal_at: None, gate_status: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
         }).unwrap();
 
         let result = run_spawn_orchestrator(
@@ -3973,6 +4039,19 @@ mod orchestrator_cli_tests {
         let skipped = reap_report_line("w1", ReapOutcome::SkippedResumable);
         assert!(skipped.contains("resumable") && skipped.contains("--force"), "{skipped}");
         assert!(reap_report_line("w1", ReapOutcome::NotFound).contains("not one of your workers"));
+
+        // The merged-but-kept-alive cases must read as the intended cleanup,
+        // naming the merge — not as "you'd interrupt work in progress".
+        let skipped_merged = reap_report_line("w1", ReapOutcome::SkippedLiveMerged);
+        assert!(
+            skipped_merged.contains("merged") && skipped_merged.contains("--force"),
+            "a skipped merged worker must say it merged and how to reap it: {skipped_merged}",
+        );
+        let reaped_merged = reap_report_line("w1", ReapOutcome::ReapedLiveMerged);
+        assert!(
+            reaped_merged.contains("merged") && !reaped_merged.contains("still running"),
+            "a reaped merged worker must name the merge, not read as an interruption: {reaped_merged}",
+        );
     }
 }
 

@@ -286,6 +286,18 @@ pub struct Session {
     /// period. `#[serde(default)]` for wire/DB back-compat.
     #[serde(default)]
     pub terminal_at: Option<i64>,
+    /// Unix epoch milliseconds when merge detection first saw this
+    /// session's PR merged while `[auto_reap]` was disabled — i.e. the
+    /// session was deliberately left alive (tmux + worktree intact) for
+    /// post-merge validation instead of being cleaned up on the spot.
+    /// Once set, the merged notification/worker-done reaction never fire
+    /// again and GitHub enrichment skips the session entirely (its PR is
+    /// merged — there is nothing left to poll), even though its `status`
+    /// stays live until it is reaped. With `[auto_reap]` enabled the
+    /// session goes straight to `Done` instead and this stays `None`.
+    /// `#[serde(default)]` for wire/DB back-compat.
+    #[serde(default)]
+    pub merged_at: Option<i64>,
     /// Structured CI/review/mergeable breakdown behind the current
     /// `status`. `None` until the first GitHub enrichment tick for a
     /// session with an open PR (`Spawning`/`Working` sessions have no PR
@@ -322,6 +334,10 @@ impl SessionFields {
     pub const PID:         Self = Self(1 << 6);
     pub const WORKSPACE:   Self = Self(1 << 7);
     pub const MODEL:       Self = Self(1 << 8);
+    /// A merged-but-kept-alive worker just had `merged_at` stamped (see
+    /// `Session::merged_at`) — so the in-memory copy learns the session is
+    /// merged even though its live `status` is unchanged.
+    pub const MERGED_AT:   Self = Self(1 << 9);
     /// Full-struct replace — only for the spawn-completion event, where the
     /// row is transitioning from an optimistic placeholder to its first real
     /// snapshot and every field is being established for the first time.
@@ -340,6 +356,16 @@ impl std::ops::BitOr for SessionFields {
 }
 
 impl Session {
+    /// True once this session's PR merge has been fully handled by the
+    /// poller — either it reached `Done` (auto-reap cleaned it up) or it was
+    /// kept alive for post-merge validation with `merged_at` stamped (see
+    /// `merged_at`). Both mean GitHub enrichment has nothing left to do for
+    /// it and merge detection must not fire again. The canonical predicate
+    /// for the poller's "skip this session" checks, which must all agree.
+    pub fn merge_handled(&self) -> bool {
+        matches!(self.status, SessionStatus::Done) || self.merged_at.is_some()
+    }
+
     /// Copy only the fields flagged in `fields` from `incoming` onto `self`.
     /// See `SessionFields`'s doc comment for why this must never be a
     /// wholesale replace except when `fields == SessionFields::ALL`.
@@ -377,6 +403,9 @@ impl Session {
         }
         if fields.contains(SessionFields::TERMINAL_AT) {
             self.terminal_at = incoming.terminal_at;
+        }
+        if fields.contains(SessionFields::MERGED_AT) {
+            self.merged_at = incoming.merged_at;
         }
         if fields.contains(SessionFields::PID) {
             self.pid = incoming.pid;
@@ -571,7 +600,7 @@ mod tests {
             catalogue_path: None, context_used_pct: Some(1.0),
             context_total_tokens: Some(10), context_window_size: Some(200_000),
             claude_session_id: None, summary: None, terminal_at: None,
-            gate_status: None,
+            gate_status: None, merged_at: None,
         }
     }
 

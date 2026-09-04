@@ -195,7 +195,7 @@ mod tests {
             pr_number: None, pr_id: None, workspace_path, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
-            claude_session_id: None, summary: None, terminal_at: None, gate_status: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
         }
     }
 

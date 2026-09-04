@@ -77,10 +77,27 @@ pub fn format_extra_pr_reaction(
 /// by the poller when a worker's tracked PR is detected merged. This is a
 /// code-level completion guarantee — unlike the notification/desktop alert,
 /// it doesn't depend on the worker's own agent voluntarily reporting back
-/// (via `ninox send`) before it exits.
+/// (via `ninox send`) before it exits. This wording is for the `[auto_reap]`
+/// path, where the worker session is cleaned up at the same moment.
 pub fn format_worker_done_reaction(worker: &Session, pr_number: u64) -> String {
     format!(
         "[Ninox] Worker `{id}`'s PR #{pr_number} merged.",
+        id = worker.id,
+    )
+}
+
+/// The merge-detected reaction when `[auto_reap]` is off (the default) and
+/// the worker was deliberately kept alive: unlike
+/// [`format_worker_done_reaction`], the session and its worktree still
+/// exist, so the orchestrator is told it can run post-merge validation in
+/// place — and that it now owns the cleanup (`--force` because the session
+/// is still live).
+pub fn format_worker_done_kept_alive_reaction(worker: &Session, pr_number: u64) -> String {
+    format!(
+        "{merged} The worker session is still alive with its worktree intact — \
+         send it post-merge validation with `ninox send {id} \"...\"` if useful, \
+         then reap it with `ninox reap {id} --force` when you're done with it.",
+        merged = format_worker_done_reaction(worker, pr_number),
         id = worker.id,
     )
 }
@@ -181,7 +198,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
         }
     }
 
@@ -232,6 +249,23 @@ mod tests {
         assert!(msg.contains("#9") && msg.contains("#11"), "must list every extra PR");
         assert!(msg.contains("https://github.com/org/repo/pull/9"));
         assert!(msg.contains("s1"));
+    }
+
+    #[test]
+    fn worker_done_kept_alive_reaction_hands_cleanup_to_the_orchestrator() {
+        let worker = mock_session(); // id "s1"
+        let msg = format_worker_done_kept_alive_reaction(&worker, 42);
+        assert!(msg.contains("s1"), "must name the worker session");
+        assert!(msg.contains("#42"), "must name the merged PR");
+        assert!(msg.to_lowercase().contains("merged"));
+        assert!(
+            msg.to_lowercase().contains("alive"),
+            "must say the worker survived its merge — the orchestrator can validate in place",
+        );
+        assert!(
+            msg.contains("ninox reap s1 --force"),
+            "must give the exact reap command — the session is live, so a bare reap would skip it",
+        );
     }
 
     #[test]

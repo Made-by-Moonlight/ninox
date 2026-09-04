@@ -48,9 +48,34 @@ Both need an explicit `--force`, plus `--all` to select them in bulk:
 Without `--force` those workers are reported as skipped and left completely
 alone.
 
+## Merged workers (post-merge validation)
+
+By default (`[auto_reap]` on) a worker is reaped automatically the moment
+its PR merges — its session and worktree are cleaned up for you, and there
+is nothing left to reap.
+
+If `[auto_reap] enabled = false` is set in `{{CONFIG_PATH}}`, a merged
+worker is instead **kept alive** — the merged notification still arrives,
+but the session and worktree survive so you can run post-merge validation
+in the same worker that produced the PR (it still has the conversation,
+checkout, and environment):
+
+```bash
+{{NINOX_BIN}} send ath-123-auth-fix "Your PR merged. Verify the deploy succeeded and the feature works on main."
+```
+
+A kept-alive merged worker still counts as *running*, so once you're done
+with it, reap it with an explicit `--force`:
+
+```bash
+{{NINOX_BIN}} reap ath-123-auth-fix --force
+```
+
 ## When to reap
 
-- A worker's PR merged and Ninox told you so — reap it.
+- A worker's PR merged and you either don't run post-merge validation
+  (auto-reap already cleaned it up) or have finished validating a
+  kept-alive one — `--force` reap the survivor.
 - A worker died or was terminated and you have read whatever you needed
   from it — reap it.
 - You decided a worker's task is no longer wanted — `--force` reap it.
