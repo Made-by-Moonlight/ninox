@@ -602,6 +602,7 @@ fn git_output(path: &Path, args: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::types::Orchestrator;
+    use crate::ActivityState;
     use tempfile::tempdir;
 
     fn session(id: &str, orchestrator_id: &str, workspace: &Path) -> Session {
@@ -629,6 +630,9 @@ mod tests {
             terminal_at: None,
             gate_status: None,
             merged_at: None,
+            activity: ActivityState::Unknown,
+            activity_note: None,
+            activity_since: None,
         }
     }
 

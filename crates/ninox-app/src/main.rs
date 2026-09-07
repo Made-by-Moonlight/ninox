@@ -192,6 +192,78 @@ enum Command {
         #[command(subcommand)]
         action: PlanAction,
     },
+    /// Report a session's activity state (working/idle/blocked) and manage
+    /// worker→worker dependency edges — both rendered live in the desktop
+    /// app's Workers view.
+    WorkerStatus {
+        #[command(subcommand)]
+        action: WorkerStatusAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkerStatusAction {
+    /// Declare this session's activity state
+    Set {
+        /// The state to declare
+        #[arg(value_enum)]
+        state: ActivityStateArg,
+        /// Optional context, e.g. what you're blocked on
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// UserPromptSubmit hook entry point: marks the session working.
+    /// Installed in a worker's worktree settings; not intended for direct use.
+    HookPrompt,
+    /// Stop hook entry point: marks the session idle (unless it declared
+    /// itself blocked). Installed in a worker's worktree settings; not
+    /// intended for direct use.
+    HookStop,
+    /// Declare that a session depends on another session
+    Depend {
+        /// The session (id or name) being depended on
+        target: String,
+        /// Why the dependency exists
+        #[arg(long)]
+        note: Option<String>,
+        /// The depending session (id or name) — defaults to the invoking
+        /// session; orchestrators use this to declare edges between workers
+        #[arg(long = "for")]
+        source: Option<String>,
+    },
+    /// Remove a previously declared dependency
+    Undepend {
+        /// The session (id or name) that was depended on
+        target: String,
+        /// The depending session (id or name) — defaults to the invoking session
+        #[arg(long = "for")]
+        source: Option<String>,
+    },
+    /// List live sessions with their activity state and dependency edges
+    List {
+        /// Emit JSON instead of indented text
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// CLI-facing subset of `ninox_core::ActivityState` — `unknown` is the
+/// absence of a report, never something an agent declares.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ActivityStateArg {
+    Working,
+    Idle,
+    Blocked,
+}
+
+impl From<ActivityStateArg> for ninox_core::ActivityState {
+    fn from(a: ActivityStateArg) -> Self {
+        match a {
+            ActivityStateArg::Working => Self::Working,
+            ActivityStateArg::Idle    => Self::Idle,
+            ActivityStateArg::Blocked => Self::Blocked,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -361,7 +433,7 @@ async fn main() -> anyhow::Result<()> {
     // messaging enabled — same "stay fast, skip the heavy setup" reasoning
     // as Statusline above; this subcommand needs none of it either.
     if let Some(Command::Inbox { action }) = command {
-        run_inbox(action);
+        run_inbox(action, args.db.clone().unwrap_or_else(default_db_path));
         return Ok(());
     }
 
@@ -450,6 +522,55 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(run_plan_cli(action, db_path).await);
     }
 
+    // The hook verbs fire on every UserPromptSubmit/Stop turn of every
+    // worker (same cadence as Inbox above); `set`/`depend` are agent-invoked
+    // mid-session. All need only `Store::open` — keep them out of the heavy
+    // setup below.
+    if let Some(Command::WorkerStatus { action }) = command {
+        let db_path = args.db.unwrap_or_else(default_db_path);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        match action {
+            // No fallible prelude before the hook verbs — their never-fail
+            // contract covers the whole path (a missing/uncreatable data
+            // dir surfaces as a Store::open failure, swallowed inside
+            // run_worker_status_hook).
+            WorkerStatusAction::HookPrompt => {
+                run_worker_status_hook(db_path, WorkerStatusHookKind::Prompt, now);
+                return Ok(());
+            }
+            WorkerStatusAction::HookStop => {
+                run_worker_status_hook(db_path, WorkerStatusHookKind::Stop, now);
+                return Ok(());
+            }
+            action => {
+                std::fs::create_dir_all(db_path.parent().unwrap())?;
+                let store = Store::open(&db_path)?;
+                let env_session = std::env::var("NINOX_SESSION").ok().filter(|s| !s.is_empty());
+                let cwd = std::env::current_dir().ok();
+                let self_session = ninox_core::worker_status::resolve_session_id(
+                    &store, env_session.as_deref(), cwd.as_deref(),
+                )?;
+                let parsed = match action {
+                    WorkerStatusAction::Set { state, note } =>
+                        WorkerStatusCliAction::Set { state: state.into(), note },
+                    WorkerStatusAction::Depend { target, note, source } =>
+                        WorkerStatusCliAction::Depend { target, note, source },
+                    WorkerStatusAction::Undepend { target, source } =>
+                        WorkerStatusCliAction::Undepend { target, source },
+                    WorkerStatusAction::List { json } =>
+                        WorkerStatusCliAction::List { json },
+                    WorkerStatusAction::HookPrompt | WorkerStatusAction::HookStop =>
+                        unreachable!("hook verbs return above"),
+                };
+                println!("{}", run_worker_status(&store, parsed, self_session, now)?);
+                return Ok(());
+            }
+        }
+    }
+
     if let Err(e) = tmux::write_server_config() {
         eprintln!("failed to write tmux config: {e}");
     }
@@ -509,7 +630,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Command::Inbox { action }) => {
-            run_inbox(action);
+            run_inbox(action, db_path);
             Ok(())
         }
         // Workers always short-circuit-returns above before reaching this
@@ -530,6 +651,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Plan { .. }) => {
             unreachable!("Plan short-circuits and returns earlier in main()")
+        }
+        Some(Command::WorkerStatus { .. }) => {
+            unreachable!("WorkerStatus short-circuits and returns earlier in main()")
         }
         None => run_tui(store, args.port, args.headless).await,
     }
@@ -993,6 +1117,9 @@ async fn run_spawn(
         terminal_at: None,
         gate_status: None,
         merged_at: None,
+        activity: ninox_core::types::ActivityState::Unknown,
+        activity_note: None,
+        activity_since: None,
     };
     anyhow::ensure!(
         store.insert_spawning_session(&pending)?,
@@ -1158,6 +1285,7 @@ async fn run_spawn(
         claude_session_id: Some(claude_session_id.clone()),
         summary,
         terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
     };
 
     if let Err(error) = store.upsert_session(&session) {
@@ -2109,6 +2237,7 @@ async fn run_spawn_orchestrator(
         claude_session_id: Some(claude_session_id.clone()),
         summary:         None,
         terminal_at:     None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
     };
     store.upsert_session(&session)?;
 
@@ -2251,7 +2380,7 @@ fn run_request_work(description: &str) -> anyhow::Result<()> {
 /// Claude Code session shut, so any failure here degrades to printing
 /// nothing (Stop proceeds normally / the prompt passes through untouched),
 /// with the actual error logged to stderr for debugging.
-fn run_inbox(action: InboxAction) {
+fn run_inbox(action: InboxAction, db_path: PathBuf) {
     use std::io::Read;
     // Required by the Claude Code hook contract even though neither drain
     // action needs any of its fields: pending-message dedup via mark-
@@ -2265,20 +2394,281 @@ fn run_inbox(action: InboxAction) {
         eprintln!("ninox inbox: NINOX_SESSION not set — nothing to drain");
         return;
     };
-    let sessions_dir = std::env::var("NINOX_DATA_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(AppConfig::sessions_dir);
+    let sessions_dir = inbox_sessions_dir();
 
     let response = match action {
         InboxAction::DrainStop   => ninox_core::inbox::drain_for_stop(&sessions_dir, &session_id),
         InboxAction::DrainPrompt => ninox_core::inbox::drain_for_prompt_submit(&sessions_dir, &session_id),
     };
+    let emitted_block = matches!((&action, &response), (InboxAction::DrainStop, Ok(Some(_))));
     match response {
         Ok(Some(json)) => println!("{json}"),
         Ok(None) => {}
         Err(e) => eprintln!("ninox inbox: {e}"),
+    }
+    // A blocked Stop means the agent continues working on the injected
+    // messages — record that. Best-effort backstop for the parallel-hook
+    // race with `worker-status hook-stop` (see run_worker_status_hook); any
+    // failure is swallowed, same never-fail contract as the drain itself.
+    if emitted_block {
+        if let Ok(store) = Store::open(&db_path) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let _ = ninox_core::worker_status::apply_activity(
+                &store, &session_id,
+                ninox_core::worker_status::ActivityEvent::HookStop { turn_continues: true },
+                now,
+            );
+        }
+    }
+}
+
+/// Which hook invoked `run_worker_status_hook` — the `ActivityEvent` is
+/// built inside the handler because Stop's meaning depends on per-session
+/// state (pending inbox messages).
+enum WorkerStatusHookKind {
+    Prompt,
+    Stop,
+}
+
+/// Handler for `ninox worker-status hook-prompt`/`hook-stop` — the
+/// UserPromptSubmit/Stop hooks installed in a worker's worktree settings
+/// (`ensure_statusline_settings`). Same contract as `run_inbox`: never
+/// returns an error and never panics, because a broken status write must
+/// never wedge the human's Claude Code session — any failure degrades to
+/// doing nothing, with the error on stderr. Prints nothing: these hooks
+/// have no output contract.
+fn run_worker_status_hook(
+    db_path: PathBuf,
+    kind: WorkerStatusHookKind,
+    now: i64,
+) {
+    use std::io::Read;
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+
+    let store = match Store::open(&db_path) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("ninox worker-status: cannot open store: {e}");
+            return;
+        }
+    };
+    let env_session = std::env::var("NINOX_SESSION").ok().filter(|s| !s.is_empty());
+    // The hook payload's cwd is the worker's worktree even when the hook
+    // process itself runs elsewhere; fall back to our own cwd without it.
+    let cwd = ninox_core::worker_status::hook_payload_cwd(&input)
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    let session_id = match ninox_core::worker_status::resolve_session_id(
+        &store, env_session.as_deref(), cwd.as_deref(),
+    ) {
+        Ok(Some(session_id)) => session_id,
+        Ok(None) => return, // unidentifiable session — silently no-op, by contract
+        Err(e) => {
+            eprintln!("ninox worker-status: {e}");
+            return;
+        }
+    };
+    let event = match kind {
+        WorkerStatusHookKind::Prompt => ninox_core::worker_status::ActivityEvent::HookPrompt,
+        // Pending inbox messages mean the sibling `inbox drain-stop` hook
+        // will block this Stop and the agent continues working on the
+        // injected instructions — recording Idle for that whole
+        // continuation would mislead the Workers view. Hooks run in
+        // parallel, so this pending check races the drain's mark-delivered;
+        // `run_inbox`'s Working write on the block path backstops the case
+        // where the drain wins.
+        WorkerStatusHookKind::Stop => {
+            let turn_continues = inbox_messaging_enabled()
+                && ninox_core::inbox::read_pending_messages(&inbox_sessions_dir(), &session_id)
+                    .map(|msgs| !msgs.is_empty())
+                    .unwrap_or(false);
+            ninox_core::worker_status::ActivityEvent::HookStop { turn_continues }
+        }
+    };
+    if let Err(e) = ninox_core::worker_status::apply_activity(&store, &session_id, event, now) {
+        eprintln!("ninox worker-status: {e}");
+    }
+}
+
+fn inbox_messaging_enabled() -> bool {
+    AppConfig::load().unwrap_or_default().send_mechanism()
+        == ninox_core::config::SendMechanism::Inbox
+}
+
+fn inbox_sessions_dir() -> PathBuf {
+    std::env::var("NINOX_DATA_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(AppConfig::sessions_dir)
+}
+
+/// The parsed form of the non-hook `worker-status` verbs, consumed by
+/// [`run_worker_status`] — same testability convention as
+/// [`PrWatchCliAction`]. The hook verbs live in
+/// [`run_worker_status_hook`] instead because their I/O contract differs
+/// (stdin JSON, never fail).
+enum WorkerStatusCliAction {
+    Set { state: ninox_core::ActivityState, note: Option<String> },
+    Depend { target: String, note: Option<String>, source: Option<String> },
+    Undepend { target: String, source: Option<String> },
+    List { json: bool },
+}
+
+/// Core logic for `ninox worker-status set|depend|undepend|list`.
+/// `self_session` is the invoking session as resolved by
+/// `worker_status::resolve_session_id` (env var, then cwd→worktree match).
+/// Returns the message to print.
+fn run_worker_status(
+    store: &ninox_core::store::Store,
+    action: WorkerStatusCliAction,
+    self_session: Option<String>,
+    now: i64,
+) -> anyhow::Result<String> {
+    use ninox_core::types::{DepKind, SessionDep};
+    use ninox_core::worker_status::{apply_activity, ActivityEvent};
+
+    // Depend/Undepend take an explicit `--for <session>` source (the
+    // orchestrator path); everything else acts on the invoking session.
+    let require_source = |explicit: &Option<String>| -> anyhow::Result<String> {
+        if let Some(reference) = explicit {
+            return resolve_session_ref(store, reference);
+        }
+        self_session.clone().ok_or_else(|| anyhow::anyhow!(
+            "cannot identify the invoking session — NINOX_SESSION is unset and the \
+             working directory is not inside a known session workspace; pass --for <session>",
+        ))
+    };
+
+    // A reference can resolve (exact id) to a session that is terminal or
+    // already purged — writes against it would silently vanish, so the
+    // mutating verbs validate liveness first.
+    let ensure_live = |session_id: &str| -> anyhow::Result<()> {
+        match store.get_session(session_id)? {
+            Some(s) if !s.status.is_terminal() => Ok(()),
+            _ => anyhow::bail!("session '{session_id}' is no longer live"),
+        }
+    };
+
+    match action {
+        WorkerStatusCliAction::Set { state, note } => {
+            let session_id = self_session.ok_or_else(|| anyhow::anyhow!(
+                "cannot identify the invoking session — NINOX_SESSION is unset and the \
+                 working directory is not inside a known session workspace",
+            ))?;
+            ensure_live(&session_id)?;
+            let state_str = serde_json::to_string(&state)?.replace('"', "");
+            match apply_activity(store, &session_id, ActivityEvent::Explicit { state, note }, now)? {
+                Some(_) => Ok(format!("activity set to {state_str}")),
+                None    => Ok(format!("activity already {state_str} — nothing to update")),
+            }
+        }
+        WorkerStatusCliAction::Depend { target, note, source } => {
+            let source_id = require_source(&source)?;
+            let target_id = resolve_session_ref(store, &target)?;
+            anyhow::ensure!(
+                source_id != target_id,
+                "a session cannot depend on itself ({source_id})",
+            );
+            ensure_live(&source_id)?;
+            ensure_live(&target_id)?;
+            store.add_session_dep(&SessionDep {
+                session_id: source_id.clone(),
+                depends_on: target_id.clone(),
+                kind: DepKind::Declared,
+                note,
+                created_at: now,
+            })?;
+            Ok(format!("registered dependency: {source_id} → {target_id}"))
+        }
+        WorkerStatusCliAction::Undepend { target, source } => {
+            let source_id = require_source(&source)?;
+            let target_id = resolve_session_ref(store, &target)?;
+            if store.remove_session_dep(&source_id, &target_id, DepKind::Declared)? {
+                Ok(format!("removed dependency: {source_id} → {target_id}"))
+            } else {
+                Ok(format!("no declared dependency {source_id} → {target_id}"))
+            }
+        }
+        WorkerStatusCliAction::List { json } => {
+            let all_sessions = store.list_sessions()?;
+            let sessions: Vec<_> = all_sessions.iter()
+                .filter(|s| !s.status.is_terminal())
+                .collect();
+            let deps = store.list_session_deps()?;
+            // Name lookup over the UNFILTERED list: a dependency target that
+            // just finished (Done, lingering in the DB) must keep printing
+            // by name, not decay to a raw session id.
+            let name_of = |id: &str| all_sessions.iter()
+                .find(|s| s.id == id)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| id.to_string());
+            if json {
+                let items: Vec<_> = sessions.iter().map(|s| {
+                    let depends_on: Vec<_> = deps.iter()
+                        .filter(|d| d.session_id == s.id)
+                        .map(|d| serde_json::json!({
+                            "session_id": d.depends_on,
+                            "name": name_of(&d.depends_on),
+                            "kind": d.kind.as_str(),
+                            "note": d.note,
+                        }))
+                        .collect();
+                    serde_json::json!({
+                        "session_id": s.id,
+                        "name": s.name,
+                        "status": s.status,
+                        "activity": s.activity,
+                        "activity_note": s.activity_note,
+                        "activity_since": s.activity_since,
+                        "depends_on": depends_on,
+                    })
+                }).collect();
+                return Ok(serde_json::to_string_pretty(&items)?);
+            }
+            let mut lines = Vec::new();
+            for s in &sessions {
+                let activity = serde_json::to_string(&s.activity)?.replace('"', "");
+                let note = s.activity_note.as_deref()
+                    .map(|n| format!(" — {n}"))
+                    .unwrap_or_default();
+                lines.push(format!("{}  [{activity}]{note}", s.name));
+                for d in deps.iter().filter(|d| d.session_id == s.id) {
+                    lines.push(format!("  ⭢ depends on {} ({})", name_of(&d.depends_on), d.kind.as_str()));
+                }
+            }
+            if lines.is_empty() {
+                return Ok("no live sessions".to_string());
+            }
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
+/// Resolve a user-supplied session reference (exact id, else exact name
+/// among non-terminal sessions) to a session id.
+fn resolve_session_ref(
+    store: &ninox_core::store::Store,
+    reference: &str,
+) -> anyhow::Result<String> {
+    let sessions = store.list_sessions()?;
+    if sessions.iter().any(|s| s.id == reference) {
+        return Ok(reference.to_string());
+    }
+    let by_name: Vec<_> = sessions.iter()
+        .filter(|s| !s.status.is_terminal() && s.name == reference)
+        .collect();
+    match by_name.as_slice() {
+        [only] => Ok(only.id.clone()),
+        []     => anyhow::bail!("no session with id or name '{reference}'"),
+        many   => anyhow::bail!(
+            "session name '{reference}' is ambiguous — use an id: {}",
+            many.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(", "),
+        ),
     }
 }
 
@@ -2793,6 +3183,7 @@ mod discover_repos_tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         }
     }
 
@@ -3185,6 +3576,7 @@ mod worker_env_tests {
             context_window_size: None, claude_session_id: None, summary: None,
             terminal_at: None, gate_status: None,
             merged_at: Some(1_000),
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&kept_alive).unwrap();
 
@@ -3519,6 +3911,9 @@ mod release_cli_tests {
                 terminal_at: None,
                 gate_status: None,
                 merged_at: None,
+                activity: ninox_core::types::ActivityState::Unknown,
+                activity_note: None,
+                activity_since: None,
             })
             .unwrap();
         let worker = store
@@ -3852,6 +4247,7 @@ mod orchestrator_cli_tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         }).unwrap();
 
         let result = run_spawn_orchestrator(
@@ -4154,5 +4550,254 @@ mod capabilities_cli_tests {
         let arr = parsed.as_array().unwrap();
         assert!(arr.iter().all(|i| i["audience"] != "worker"));
         assert!(arr.iter().any(|i| i["name"] == "spawn-worker"));
+    }
+}
+
+#[cfg(test)]
+mod worker_status_cli_tests {
+    use super::{resolve_session_ref, run_worker_status, WorkerStatusCliAction};
+    use ninox_core::store::Store;
+    use ninox_core::types::{ActivityState, DepKind, Session, SessionStatus};
+
+    fn test_store() -> Store {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        std::mem::forget(dir);
+        Store::open(path).unwrap()
+    }
+
+    fn seed(store: &Store, id: &str, name: &str, status: SessionStatus) {
+        store.upsert_session(&Session {
+            id: id.into(), orchestrator_id: None, name: name.into(),
+            repo: "o/r".into(), status,
+            agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None,
+            gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+        }).unwrap();
+    }
+
+    #[test]
+    fn set_requires_an_identifiable_session() {
+        let store = test_store();
+        let err = run_worker_status(
+            &store,
+            WorkerStatusCliAction::Set { state: ActivityState::Blocked, note: None },
+            None, 100,
+        ).unwrap_err();
+        assert!(err.to_string().contains("session"), "error must explain the identity failure: {err}");
+    }
+
+    #[test]
+    fn set_writes_activity_through_apply_activity() {
+        let store = test_store();
+        seed(&store, "w1", "worker-one", SessionStatus::Working);
+        let msg = run_worker_status(
+            &store,
+            WorkerStatusCliAction::Set {
+                state: ActivityState::Blocked,
+                note: Some("waiting on #12".into()),
+            },
+            Some("w1".into()), 100,
+        ).unwrap();
+        assert!(msg.contains("blocked"), "{msg}");
+        let s = store.get_session("w1").unwrap().unwrap();
+        assert_eq!(s.activity, ActivityState::Blocked);
+        assert_eq!(s.activity_note.as_deref(), Some("waiting on #12"));
+    }
+
+    #[test]
+    fn depend_creates_a_declared_edge_resolving_target_by_name() {
+        let store = test_store();
+        seed(&store, "w1", "worker-one", SessionStatus::Working);
+        seed(&store, "w2", "worker-two", SessionStatus::Working);
+        run_worker_status(
+            &store,
+            WorkerStatusCliAction::Depend {
+                target: "worker-two".into(), note: Some("needs its schema".into()), source: None,
+            },
+            Some("w1".into()), 100,
+        ).unwrap();
+        let deps = store.deps_for_session("w1").unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on, "w2");
+        assert_eq!(deps[0].kind, DepKind::Declared);
+    }
+
+    #[test]
+    fn depend_rejects_self_and_unknown_targets() {
+        let store = test_store();
+        seed(&store, "w1", "worker-one", SessionStatus::Working);
+        assert!(run_worker_status(
+            &store,
+            WorkerStatusCliAction::Depend { target: "w1".into(), note: None, source: None },
+            Some("w1".into()), 100,
+        ).is_err(), "self-dependency must be rejected");
+        assert!(run_worker_status(
+            &store,
+            WorkerStatusCliAction::Depend { target: "nope".into(), note: None, source: None },
+            Some("w1".into()), 100,
+        ).is_err(), "unknown target must be rejected");
+    }
+
+    #[test]
+    fn depend_with_for_lets_an_orchestrator_declare_edges_between_workers() {
+        let store = test_store();
+        seed(&store, "w1", "worker-one", SessionStatus::Working);
+        seed(&store, "w2", "worker-two", SessionStatus::Working);
+        run_worker_status(
+            &store,
+            WorkerStatusCliAction::Depend {
+                target: "w2".into(), note: None, source: Some("worker-one".into()),
+            },
+            None, 100, // orchestrator context: no self worker session needed
+        ).unwrap();
+        let deps = store.deps_for_session("w1").unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on, "w2");
+    }
+
+    #[test]
+    fn undepend_removes_the_edge_and_reports_when_absent() {
+        let store = test_store();
+        seed(&store, "w1", "worker-one", SessionStatus::Working);
+        seed(&store, "w2", "worker-two", SessionStatus::Working);
+        run_worker_status(
+            &store,
+            WorkerStatusCliAction::Depend { target: "w2".into(), note: None, source: None },
+            Some("w1".into()), 100,
+        ).unwrap();
+        let removed = run_worker_status(
+            &store,
+            WorkerStatusCliAction::Undepend { target: "w2".into(), source: None },
+            Some("w1".into()), 200,
+        ).unwrap();
+        assert!(removed.contains("removed"), "{removed}");
+        assert!(store.deps_for_session("w1").unwrap().is_empty());
+
+        let absent = run_worker_status(
+            &store,
+            WorkerStatusCliAction::Undepend { target: "w2".into(), source: None },
+            Some("w1".into()), 300,
+        ).unwrap();
+        assert!(absent.contains("no declared dependency"), "{absent}");
+    }
+
+    #[test]
+    fn list_reports_activity_and_edges_for_live_sessions_only() {
+        let store = test_store();
+        seed(&store, "w1", "worker-one", SessionStatus::Working);
+        seed(&store, "w2", "worker-two", SessionStatus::Working);
+        seed(&store, "dead", "worker-dead", SessionStatus::Terminated);
+        run_worker_status(
+            &store,
+            WorkerStatusCliAction::Set { state: ActivityState::Blocked, note: Some("stuck".into()) },
+            Some("w1".into()), 100,
+        ).unwrap();
+        run_worker_status(
+            &store,
+            WorkerStatusCliAction::Depend { target: "w2".into(), note: None, source: None },
+            Some("w1".into()), 100,
+        ).unwrap();
+
+        let text = run_worker_status(&store, WorkerStatusCliAction::List { json: false }, None, 200).unwrap();
+        assert!(text.contains("worker-one") && text.contains("blocked") && text.contains("worker-two"), "{text}");
+        assert!(!text.contains("worker-dead"), "terminal sessions must not be listed: {text}");
+
+        let json = run_worker_status(&store, WorkerStatusCliAction::List { json: true }, None, 200).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).expect("list --json must emit valid JSON");
+        let arr = v.as_array().expect("top level must be an array");
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn depend_rejects_terminal_targets_even_by_exact_id() {
+        let store = test_store();
+        seed(&store, "w1", "worker-one", SessionStatus::Working);
+        seed(&store, "dead", "worker-dead", SessionStatus::Terminated);
+        let err = run_worker_status(
+            &store,
+            WorkerStatusCliAction::Depend { target: "dead".into(), note: None, source: None },
+            Some("w1".into()), 100,
+        ).unwrap_err();
+        assert!(err.to_string().contains("no longer live"), "{err}");
+        assert!(store.deps_for_session("w1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn undepend_still_works_against_a_terminal_target() {
+        // The whole point of undepend is cleaning up edges whose target is
+        // gone — it must not apply depend's liveness validation.
+        let store = test_store();
+        seed(&store, "w1", "worker-one", SessionStatus::Working);
+        seed(&store, "w2", "worker-two", SessionStatus::Working);
+        run_worker_status(
+            &store,
+            WorkerStatusCliAction::Depend { target: "w2".into(), note: None, source: None },
+            Some("w1".into()), 100,
+        ).unwrap();
+        seed(&store, "w2", "worker-two", SessionStatus::Terminated);
+        let msg = run_worker_status(
+            &store,
+            WorkerStatusCliAction::Undepend { target: "w2".into(), source: None },
+            Some("w1".into()), 200,
+        ).unwrap();
+        assert!(msg.contains("removed"), "{msg}");
+    }
+
+    #[test]
+    fn set_errors_rather_than_claiming_success_on_a_dead_session() {
+        // A session can go terminal between identity resolution and the
+        // write (or a raced NINOX_SESSION can name a dead row) — the agent
+        // must not be told its note was recorded when it wasn't.
+        let store = test_store();
+        seed(&store, "dead", "worker-dead", SessionStatus::Terminated);
+        let err = run_worker_status(
+            &store,
+            WorkerStatusCliAction::Set { state: ActivityState::Blocked, note: Some("n".into()) },
+            Some("dead".into()), 100,
+        ).unwrap_err();
+        assert!(err.to_string().contains("no longer live"), "{err}");
+    }
+
+    #[test]
+    fn list_names_dependency_targets_even_after_they_finish() {
+        let store = test_store();
+        seed(&store, "w1", "worker-one", SessionStatus::Working);
+        seed(&store, "w2", "worker-two", SessionStatus::Working);
+        run_worker_status(
+            &store,
+            WorkerStatusCliAction::Depend { target: "w2".into(), note: None, source: None },
+            Some("w1".into()), 100,
+        ).unwrap();
+        seed(&store, "w2", "worker-two", SessionStatus::Done);
+
+        let text = run_worker_status(&store, WorkerStatusCliAction::List { json: false }, None, 200).unwrap();
+        assert!(
+            text.contains("depends on worker-two"),
+            "a finished dependency must keep its human-readable name, not decay to a raw id: {text}",
+        );
+    }
+
+    #[test]
+    fn resolve_session_ref_prefers_exact_id_then_unique_name() {
+        let store = test_store();
+        seed(&store, "w1", "worker-one", SessionStatus::Working);
+        seed(&store, "w2", "w1", SessionStatus::Working); // a session *named* like another's id
+        assert_eq!(resolve_session_ref(&store, "w1").unwrap(), "w1", "exact id wins over name");
+        assert_eq!(resolve_session_ref(&store, "worker-one").unwrap(), "w1");
+        assert!(resolve_session_ref(&store, "ghost").is_err());
+    }
+
+    #[test]
+    fn resolve_session_ref_rejects_ambiguous_names() {
+        let store = test_store();
+        seed(&store, "a", "twin", SessionStatus::Working);
+        seed(&store, "b", "twin", SessionStatus::Working);
+        let err = resolve_session_ref(&store, "twin").unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
     }
 }

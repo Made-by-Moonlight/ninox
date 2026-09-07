@@ -27,6 +27,9 @@ use tokio_util::sync::CancellationToken;
 /// Last-seen `(cost_usd, context_used_pct, context_total_tokens)` snapshot per session.
 /// Used by `poll_context_updates` to detect external changes.
 type ContextSnapshot = (f64, Option<f64>, Option<u64>);
+type ActivitySnapshot = (crate::types::ActivityState, Option<String>, Option<i64>);
+/// `(repo, head_ref, base_ref)` of a session's open PR.
+type PrRefsSnapshot = (String, String, String);
 
 /// Unix epoch milliseconds "now" — used to stamp `Notification::created_at`
 /// and `Session::terminal_at`. `pub(crate)` so `events::cleanup_session` can
@@ -36,6 +39,29 @@ pub fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Pure stacked-edge derivation over `(session_id, repo, head_ref,
+/// base_ref)` entries: an edge from B to A when B's base branch is A's head
+/// branch within the same repo. Returns an entry for *every* input session
+/// (empty targets included) so the caller's `set_stacked_deps` clears edges
+/// whose branch relationship no longer holds.
+pub(crate) fn derive_stacked_edges(
+    entries: &[(String, String, String, String)],
+) -> Vec<(String, Vec<String>)> {
+    entries.iter().map(|(id, repo, _head, base)| {
+        let mut targets: Vec<String> = entries.iter()
+            .filter(|(other_id, other_repo, other_head, _)| {
+                // GitHub repo slugs are case-insensitive, and the same repo
+                // can be recorded with different casing depending on whether
+                // it was user-typed or parsed from a git remote.
+                other_id != id && other_repo.eq_ignore_ascii_case(repo) && other_head == base
+            })
+            .map(|(other_id, ..)| other_id.clone())
+            .collect();
+        targets.sort();
+        (id.clone(), targets)
+    }).collect()
 }
 
 /// Best-effort extraction of a human-readable message from a
@@ -58,6 +84,14 @@ pub struct Poller {
     /// session, used solely to detect changes written externally by the
     /// `ninox statusline` subcommand — see `poll_context_updates`.
     context_cache:    Arc<std::sync::Mutex<HashMap<String, ContextSnapshot>>>,
+    /// Last-seen `(activity, activity_note, activity_since)` per session —
+    /// same external-writer detection as `context_cache`, but for the
+    /// `ninox worker-status` subcommand. See `poll_activity_updates`.
+    activity_cache:   Arc<std::sync::Mutex<HashMap<String, ActivitySnapshot>>>,
+    /// Last-fetched `(repo, head_ref, base_ref)` per session with an open
+    /// PR, fed by both GitHub polling paths and consumed by
+    /// `reconcile_stacked_deps` to derive stacked dependency edges.
+    pr_refs_cache:    Arc<std::sync::Mutex<HashMap<String, PrRefsSnapshot>>>,
     /// Runs the brain-harvest subprocess (real `claude -p` in production).
     /// Injectable so tests can fake success/failure without spawning a real
     /// process — see `sync_sessions_metadata`'s `trigger_brain_harvest`.
@@ -104,6 +138,8 @@ impl Poller {
             engine,
             enrichment_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             context_cache:    Arc::new(std::sync::Mutex::new(HashMap::new())),
+            activity_cache:   Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pr_refs_cache:    Arc::new(std::sync::Mutex::new(HashMap::new())),
             harvest_runner,
             vault_locks:      Arc::new(std::sync::Mutex::new(HashMap::new())),
             update_source:    Arc::new(CargoRegistryUpdateSource),
@@ -173,6 +209,7 @@ impl Poller {
                 _ = pid_interval.tick()    => {
                     self.poll_pids().await;
                     self.poll_context_updates().await;
+                    self.poll_activity_updates().await;
                     let retention = AppConfig::load()
                         .unwrap_or_default()
                         .session_retention;
@@ -586,6 +623,31 @@ impl Poller {
         }
     }
 
+    /// The `ninox worker-status` subcommand (invoked by the worker's own
+    /// UserPromptSubmit/Stop hooks, or by the agent explicitly) writes
+    /// activity fields directly into the store from a separate short-lived
+    /// process — the same external-writer shape as `poll_context_updates`
+    /// above, so the same diff-cache re-broadcast, flagged ACTIVITY.
+    async fn poll_activity_updates(&self) {
+        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+        let mut changed = Vec::new();
+        {
+            let mut cache = self.activity_cache.lock().unwrap();
+            for session in sessions {
+                let key = (session.activity, session.activity_note.clone(), session.activity_since);
+                // Seed silently on first sight — see `poll_context_updates`.
+                if let Some(prev) = cache.insert(session.id.clone(), key.clone()) {
+                    if prev != key {
+                        changed.push(session);
+                    }
+                }
+            }
+        }
+        for session in changed {
+            self.engine.emit(Event::SessionUpdated(session, SessionFields::ACTIVITY));
+        }
+    }
+
     // ── GitHub enrichment ────────────────────────────────────────────────────
 
     /// Read-modify-write against the *live* session row rather than a
@@ -631,6 +693,58 @@ impl Poller {
         }
         let _ = self.engine.store.upsert_session(&row);
         Some(row)
+    }
+
+    /// Record the just-fetched PR branch refs for a session (both GitHub
+    /// paths call this) so `reconcile_stacked_deps` can derive stacking.
+    fn note_pr_refs(&self, session_id: &str, repo: &str, head_ref: &str, base_ref: &str) {
+        if head_ref.is_empty() || base_ref.is_empty() {
+            return; // REST/GraphQL data missing branch names — nothing to derive
+        }
+        self.pr_refs_cache.lock().unwrap().insert(
+            session_id.to_string(),
+            (repo.to_string(), head_ref.to_string(), base_ref.to_string()),
+        );
+    }
+
+    /// Drop a session's cached PR refs when its PR lookup failed — the last
+    /// good tuple would otherwise re-derive its stacked edges forever (the
+    /// PR may be closed, retargeted, or gone). Transient failures cost only
+    /// a flicker: the edge re-derives on the next successful fetch.
+    fn evict_pr_refs(&self, session_id: &str) {
+        self.pr_refs_cache.lock().unwrap().remove(session_id);
+    }
+
+    /// Re-derive the `stacked` dependency edges from the latest PR branch
+    /// refs: session B stacks on session A when B's PR base branch is A's
+    /// PR head branch in the same repo. Called at the end of each
+    /// *successful* GitHub pass (never from a skipped/rate-limited tick, so
+    /// an empty cache after a restart can't mass-clear persisted edges).
+    /// Every live session gets a `set_stacked_deps` call — an empty target
+    /// list for uncached sessions is what retires edges whose PR vanished.
+    /// The store diffs per session, so an unchanged topology writes
+    /// nothing; declared edges are never touched.
+    fn reconcile_stacked_deps(&self) {
+        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+        let refs = self.pr_refs_cache.lock().unwrap().clone();
+        let live: Vec<&crate::types::Session> = sessions.iter()
+            .filter(|s| !s.status.is_terminal())
+            .collect();
+        let entries: Vec<(String, String, String, String)> = live.iter()
+            .filter_map(|s| refs.get(&s.id).map(|(repo, head, base)| {
+                (s.id.clone(), repo.clone(), head.clone(), base.clone())
+            }))
+            .collect();
+        let derived = derive_stacked_edges(&entries);
+        for session in live {
+            let depends_on = derived.iter()
+                .find(|(id, _)| *id == session.id)
+                .map(|(_, targets)| targets.clone())
+                .unwrap_or_default();
+            if let Err(e) = self.engine.store.set_stacked_deps(&session.id, &depends_on, now_millis()) {
+                tracing::warn!("stacked-deps reconcile failed for {}: {e}", session.id);
+            }
+        }
     }
 
     /// `auto_reap` mirrors `[auto_reap].enabled` — passed in by `start()`'s
@@ -707,6 +821,7 @@ impl Poller {
                     tracing::warn!("github pr status for {}: {e}", session.id);
                 }
                 self.notify_github_lookup_failed(&session);
+                self.evict_pr_refs(&session.id);
                 continue;
             };
             // The GitHub round-trips above can outlive this session's
@@ -729,6 +844,7 @@ impl Poller {
                 continue;
             }
             self.clear_github_lookup_failed(&session.id);
+            self.note_pr_refs(&session.id, &resolved_repo, &pr_status.head_ref, &pr_status.base_ref);
 
             let pr_id: PrId = pr_number as i64;
 
@@ -819,6 +935,7 @@ impl Poller {
 
             self.emit_review_reaction(&session, has_new, review_reaction_already_sent, &new_comments).await;
         }
+        self.reconcile_stacked_deps();
     }
 
     // ── Batched GitHub enrichment (behind `[pr_watch] enabled`) ─────────────
@@ -968,9 +1085,11 @@ impl Poller {
             let key = PrKey { repo: session.repo.clone(), number: pr_number };
             let Some(snap) = result.prs.get(&key) else {
                 self.notify_github_lookup_failed(&session);
+                self.evict_pr_refs(&session.id);
                 continue;
             };
             self.clear_github_lookup_failed(&session.id);
+            self.note_pr_refs(&session.id, &session.repo, &snap.status.head_ref, &snap.status.base_ref);
             let pr_id: PrId = pr_number as i64;
             if session.pr_id != Some(pr_id) {
                 session.pr_id = Some(pr_id);
@@ -1001,6 +1120,7 @@ impl Poller {
         }
 
         self.deliver_watch_updates(&watches, &result).await;
+        self.reconcile_stacked_deps();
     }
 
     /// A whole batched fetch failed — every target this tick is unobserved.
@@ -1860,7 +1980,7 @@ mod tests {
     fn derive_status_merged_becomes_done() {
         let pr = crate::github::PrStatus {
             merged: true, state: "closed".into(), mergeable: None,
-            title: "t".into(), number: 1, head_sha: String::new(),
+            title: "t".into(), number: 1, head_sha: String::new(), head_ref: String::new(), base_ref: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 0, failing: 0, passing: 0, pending: 0 };
         let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, false);
@@ -1871,7 +1991,7 @@ mod tests {
     fn derive_status_ci_failure_overrides_open() {
         let pr = crate::github::PrStatus {
             merged: false, state: "open".into(), mergeable: Some(true),
-            title: "t".into(), number: 1, head_sha: String::new(),
+            title: "t".into(), number: 1, head_sha: String::new(), head_ref: String::new(), base_ref: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 3, failing: 1, passing: 2, pending: 0 };
         let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, false);
@@ -1882,7 +2002,7 @@ mod tests {
     fn derive_status_all_green_becomes_mergeable() {
         let pr = crate::github::PrStatus {
             merged: false, state: "open".into(), mergeable: Some(true),
-            title: "t".into(), number: 1, head_sha: String::new(),
+            title: "t".into(), number: 1, head_sha: String::new(), head_ref: String::new(), base_ref: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 3, failing: 0, passing: 3, pending: 0 };
         let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, false);
@@ -1983,7 +2103,7 @@ mod tests {
     fn derive_status_preserves_done() {
         let pr = crate::github::PrStatus {
             merged: false, state: "open".into(), mergeable: Some(true),
-            title: "t".into(), number: 1, head_sha: String::new(),
+            title: "t".into(), number: 1, head_sha: String::new(), head_ref: String::new(), base_ref: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 0, failing: 0, passing: 0, pending: 0 };
         let s  = derive_session_status(&SessionStatus::Done, &pr, &ci, false);
@@ -1994,7 +2114,7 @@ mod tests {
     fn derive_status_preserves_terminated() {
         let pr = crate::github::PrStatus {
             merged: true, state: "closed".into(), mergeable: None,   // merged=true!
-            title: "t".into(), number: 1, head_sha: String::new(),
+            title: "t".into(), number: 1, head_sha: String::new(), head_ref: String::new(), base_ref: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 0, failing: 0, passing: 0, pending: 0 };
         let s  = derive_session_status(&SessionStatus::Terminated, &pr, &ci, false);
@@ -2005,7 +2125,7 @@ mod tests {
     fn derive_status_changes_requested_becomes_review_pending() {
         let pr = crate::github::PrStatus {
             merged: false, state: "open".into(), mergeable: Some(true),
-            title: "t".into(), number: 1, head_sha: String::new(),
+            title: "t".into(), number: 1, head_sha: String::new(), head_ref: String::new(), base_ref: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 3, failing: 0, passing: 3, pending: 0 };
         let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, true);
@@ -2024,6 +2144,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         }
     }
 
@@ -2209,6 +2330,170 @@ mod tests {
         // A third tick with no further changes emits nothing.
         poller.poll_context_updates().await;
         assert!(drain_events(&mut rx).is_empty());
+    }
+
+    /// Same external-writer story as the statusline test above, but for the
+    /// `ninox worker-status` subcommand's activity fields — the change must
+    /// re-broadcast flagged ACTIVITY (and only for the touched session), or
+    /// the GUI never learns a worker went idle/blocked.
+    #[tokio::test]
+    async fn poll_activity_updates_emits_activity_flag_only_for_changed_sessions() {
+        use crate::store::Store;
+        use crate::types::ActivityState;
+        use crate::worker_status::{apply_activity, ActivityEvent};
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", "/ws1")).unwrap();
+        store.upsert_session(&test_session("s2", "/ws2")).unwrap();
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_activity_updates().await;
+        assert!(drain_events(&mut rx).is_empty(), "baseline seeding must not emit");
+
+        // Simulate the external hook process writing for s1 only.
+        apply_activity(&store, "s1", ActivityEvent::Explicit {
+            state: ActivityState::Blocked, note: Some("stuck".into()),
+        }, 1_000).unwrap();
+
+        poller.poll_activity_updates().await;
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 1, "only the changed session should emit");
+        match &events[0] {
+            Event::SessionUpdated(s, fields) => {
+                assert_eq!(s.id, "s1");
+                assert_eq!(s.activity, ActivityState::Blocked);
+                assert!(fields.contains(SessionFields::ACTIVITY), "must flag ACTIVITY");
+            }
+            other => panic!("expected SessionUpdated, got {other:?}"),
+        }
+
+        poller.poll_activity_updates().await;
+        assert!(drain_events(&mut rx).is_empty(), "steady state must not re-emit");
+    }
+
+    /// Stacked-edge derivation is pure branch topology: B stacks on A when
+    /// B's PR base branch is A's PR head branch, within the same repo.
+    #[test]
+    fn derive_stacked_edges_matches_base_to_head_within_a_repo() {
+        let entries = vec![
+            ("a".to_string(), "o/r".to_string(), "feat/a".to_string(), "main".to_string()),
+            // Differently-cased slug of the same repo (user-typed vs
+            // git-remote-parsed) — GitHub slugs are case-insensitive, so
+            // this still edges onto a.
+            ("b".to_string(), "O/R".to_string(), "feat/b".to_string(), "feat/a".to_string()),
+            // A genuinely different repo — no edge.
+            ("c".to_string(), "o/other".to_string(), "feat/c".to_string(), "feat/a".to_string()),
+        ];
+        let edges = derive_stacked_edges(&entries);
+        let of = |id: &str| edges.iter().find(|(s, _)| s == id).map(|(_, t)| t.clone()).unwrap();
+        assert_eq!(of("a"), Vec::<String>::new(), "base=main matches nobody");
+        assert_eq!(of("b"), vec!["a".to_string()], "repo slug casing must not break the edge");
+        assert_eq!(of("c"), Vec::<String>::new(), "cross-repo branch-name collision must not edge");
+    }
+
+    #[test]
+    fn derive_stacked_edges_never_self_edges_on_degenerate_refs() {
+        // A PR whose base equals its own head (degenerate but possible in
+        // bad API data) must not produce a self-edge.
+        let entries = vec![
+            ("a".to_string(), "o/r".to_string(), "same".to_string(), "same".to_string()),
+        ];
+        let edges = derive_stacked_edges(&entries);
+        assert_eq!(edges, vec![("a".to_string(), Vec::new())]);
+    }
+
+    /// An external `worker-status` write landing mid-tick must survive the
+    /// GitHub pass's read→apply→write — same guarantee the statusline
+    /// fields already have.
+    #[tokio::test]
+    async fn update_live_session_row_does_not_revert_mid_poll_activity_fields() {
+        use crate::store::Store;
+        use crate::types::ActivityState;
+        use crate::worker_status::{apply_activity, ActivityEvent};
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let snapshot = test_session("s1", "/ws1");
+        store.upsert_session(&snapshot).unwrap();
+        let poller = Poller::new(Engine::new(store.clone()));
+
+        // Tick-start snapshot taken (activity Unknown), then the external
+        // hook write lands during the tick's awaits…
+        apply_activity(&store, "s1", ActivityEvent::HookPrompt, 1_000).unwrap();
+
+        // …and the GitHub pass writes its status update from the stale snapshot.
+        let written = poller.update_live_session_row(&snapshot, |row| {
+            row.status = SessionStatus::PrOpen;
+        }).expect("row exists");
+
+        assert_eq!(written.activity, ActivityState::Working, "mid-tick activity write must survive");
+        let fresh = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(fresh.activity, ActivityState::Working);
+        assert!(matches!(fresh.status, SessionStatus::PrOpen), "the tick's own write must still land");
+    }
+
+    /// End-to-end over the REST path: `poll_github` records each session's
+    /// PR branch refs, and `reconcile_stacked_deps` turns "s2's PR is based
+    /// on s1's PR branch" into a stacked edge — then drops it once the
+    /// branch relationship disappears.
+    #[tokio::test]
+    async fn poll_github_derives_and_retires_stacked_edges_from_pr_refs() {
+        use crate::store::Store;
+        use crate::types::DepKind;
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        let open_pr = |number: u64, head: &str, base: &str| crate::github::PrStatus {
+            merged: false, state: "open".into(), mergeable: Some(true),
+            title: "t".into(), number, head_sha: "abc".into(),
+            head_ref: head.into(), base_ref: base.into(),
+        };
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".into(), "repo".into(), 1), open_pr(1, "feat/a", "main"),
+        );
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".into(), "repo".into(), 2), open_pr(2, "feat/b", "feat/a"),
+        );
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        for (id, pr) in [("s1", 1u64), ("s2", 2u64)] {
+            let mut s = test_session(id, &format!("/ws/{id}"));
+            s.repo = "Owner/repo".into();
+            s.pr_number = Some(pr);
+            store.upsert_session(&s).unwrap();
+        }
+        let poller = Poller::new(github_engine(store.clone(), fake.clone()));
+
+        // poll_github reconciles at the end of its own pass — no separate call.
+        poller.poll_github(true).await;
+
+        let deps = store.deps_for_session("s2").unwrap();
+        assert_eq!(deps.len(), 1, "s2's base (feat/a) is s1's head — must edge");
+        assert_eq!(deps[0].depends_on, "s1");
+        assert_eq!(deps[0].kind, DepKind::Stacked);
+        assert!(store.deps_for_session("s1").unwrap().is_empty(), "s1 stacks on nobody");
+
+        // s2's PR is retargeted onto main — the stacked edge must retire.
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".into(), "repo".into(), 2), open_pr(2, "feat/b", "main"),
+        );
+        poller.poll_github(true).await;
+        assert!(store.deps_for_session("s2").unwrap().is_empty(), "retargeted PR must drop the edge");
+
+        // Re-establish the edge, then make s2's PR lookup fail (404) — the
+        // cached refs must be evicted and the edge retired, not re-derived
+        // from the last-good tuple forever.
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".into(), "repo".into(), 2), open_pr(2, "feat/b", "feat/a"),
+        );
+        poller.poll_github(true).await;
+        assert_eq!(store.deps_for_session("s2").unwrap().len(), 1);
+        fake.pr_status_ok.lock().unwrap().remove(&("Owner".into(), "repo".into(), 2));
+        poller.poll_github(true).await;
+        assert!(
+            store.deps_for_session("s2").unwrap().is_empty(),
+            "a failing PR lookup must retire the stacked edge, not freeze it",
+        );
     }
 
     /// Drain every event currently buffered on the receiver.
@@ -2731,7 +3016,7 @@ mod tests {
             ("OwnerB".to_string(), "repoB".to_string(), 99),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 99, head_sha: "abc".into(),
+                title: "t".into(), number: 99, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
         // OwnerA/repoA#50 has no entry — get_pr_status errors, simulating a 404.
@@ -2784,7 +3069,7 @@ mod tests {
             ("OwnerB".to_string(), "repoB".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "someone else's unrelated PR".into(), number: 50, head_sha: "zzz".into(),
+                title: "someone else's unrelated PR".into(), number: 50, head_sha: "zzz".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
         // OwnerA/repoA#50 has no entry — get_pr_status errors, simulating a 404.
@@ -2834,7 +3119,7 @@ mod tests {
             ("Owner".to_string(), "repo".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -2881,7 +3166,7 @@ mod tests {
                 // empty checks/threads) are as green as possible, directly
                 // contradicting the stale stored gate below.
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -2945,7 +3230,7 @@ mod tests {
             ("OwnerB".to_string(), "repoB".to_string(), 99),
             crate::github::PrStatus {
                 merged: true, state: "closed".into(), mergeable: None,
-                title: "t".into(), number: 99, head_sha: "abc".into(),
+                title: "t".into(), number: 99, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
         // OwnerA/repoA#50 has no entry — get_pr_status errors, simulating a 404,
@@ -2994,7 +3279,7 @@ mod tests {
             ("Owner".to_string(), "repo".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -3049,7 +3334,7 @@ mod tests {
             ("Owner".to_string(), "repo".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -3098,6 +3383,7 @@ mod tests {
             crate::github::PrStatus {
                 merged: true, state: "closed".into(), mergeable: Some(true),
                 title: "t".into(), number: 50, head_sha: "abc".into(),
+                head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -3148,7 +3434,7 @@ mod tests {
             ("Owner".to_string(), "repo".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -3193,7 +3479,7 @@ mod tests {
             ("Owner".to_string(), "repo".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -3244,7 +3530,7 @@ mod tests {
             ("Owner".to_string(), "repo".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -3297,7 +3583,7 @@ mod tests {
             ("OwnerB".to_string(), "repoB".to_string(), 99),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 99, head_sha: "abc".into(),
+                title: "t".into(), number: 99, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
         // OwnerA/repoA#50 has no entry — get_pr_status errors, simulating a
@@ -3377,7 +3663,7 @@ mod tests {
             ("OwnerA".to_string(), "repoA".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
         poller.poll_github(true).await;
@@ -3411,7 +3697,7 @@ mod tests {
             ("Owner".to_string(), "repo".to_string(), pr_number),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: pr_number, head_sha: "abc".into(),
+                title: "t".into(), number: pr_number, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
         fake
@@ -3697,7 +3983,7 @@ mod tests {
         crate::github_graphql::PrSnapshot {
             status: crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number, head_sha: "abc".into(),
+                title: "t".into(), number, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
             closed:         false,
             checks:         vec![],

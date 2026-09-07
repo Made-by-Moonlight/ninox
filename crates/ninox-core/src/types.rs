@@ -213,6 +213,25 @@ pub struct GateStatus {
     pub since: i64,
 }
 
+/// Moment-to-moment agent activity, orthogonal to the PR-lifecycle
+/// `SessionStatus`: a session can be `PrOpen` (lifecycle) while `Idle`
+/// (activity). Written by the worker's own Claude Code hooks
+/// (`UserPromptSubmit`/`Stop` → `ninox worker-status hook-*`) and by the
+/// agent's explicit `ninox worker-status set`; see
+/// `ninox_core::worker_status` for the transition rules.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityState {
+    Working,
+    Idle,
+    Blocked,
+    /// No activity signal available: the session predates the status hooks,
+    /// runs a harness without hook support, or hasn't reported yet. Distinct
+    /// from `Idle` — "we don't know" vs "we know it's between turns".
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id:             SessionId,
@@ -305,6 +324,20 @@ pub struct Session {
     /// back-compat with sessions recorded before this field existed.
     #[serde(default)]
     pub gate_status: Option<GateStatus>,
+    /// See `ActivityState`. `#[serde(default)]` (→ `Unknown`) for wire/DB
+    /// back-compat with sessions recorded before this field existed.
+    #[serde(default)]
+    pub activity: ActivityState,
+    /// Free-text context for a self-reported state (`ninox worker-status set
+    /// blocked --note "…"`). Cleared whenever `activity` changes without a
+    /// new note.
+    #[serde(default)]
+    pub activity_note: Option<String>,
+    /// Epoch ms the current `activity` value was first observed — reset on
+    /// every state change, mirroring `GateStatus::since`. `None` until the
+    /// first report.
+    #[serde(default)]
+    pub activity_since: Option<i64>,
 }
 
 /// Which fields of a `Session` a particular `Event::SessionUpdated` carries
@@ -338,6 +371,9 @@ impl SessionFields {
     /// `Session::merged_at`) — so the in-memory copy learns the session is
     /// merged even though its live `status` is unchanged.
     pub const MERGED_AT:   Self = Self(1 << 9);
+    /// `activity`, `activity_note`, `activity_since` — all sourced from the
+    /// same `worker_status::apply_activity` write, so they travel together.
+    pub const ACTIVITY:    Self = Self(1 << 10);
     /// Full-struct replace — only for the spawn-completion event, where the
     /// row is transitioning from an optimistic placeholder to its first real
     /// snapshot and every field is being established for the first time.
@@ -416,6 +452,11 @@ impl Session {
         if fields.contains(SessionFields::MODEL) {
             self.model = incoming.model.clone();
         }
+        if fields.contains(SessionFields::ACTIVITY) {
+            self.activity = incoming.activity;
+            self.activity_note = incoming.activity_note.clone();
+            self.activity_since = incoming.activity_since;
+        }
     }
 }
 
@@ -436,6 +477,46 @@ pub struct OrchestratorPlan {
     pub file_path: String,
     pub registered_at: i64,
     pub updated_at: i64,
+}
+
+/// How a worker→worker dependency edge came to exist. Stored as its
+/// `as_str()` form in the `session_deps` table.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum DepKind {
+    /// Registered explicitly via `ninox worker-status depend <session>`.
+    Declared,
+    /// Inferred by the poller from PR branch stacking (this session's PR
+    /// base ref is the dependency's PR head ref) — re-derived every GitHub
+    /// tick, so it appears and disappears with the branch relationship.
+    Stacked,
+}
+
+impl DepKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Stacked  => "stacked",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "declared" => Some(Self::Declared),
+            "stacked"  => Some(Self::Stacked),
+            _          => None,
+        }
+    }
+}
+
+/// A worker→worker dependency edge: `session_id` depends on `depends_on`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionDep {
+    pub session_id: SessionId,
+    pub depends_on: SessionId,
+    pub kind:       DepKind,
+    pub note:       Option<String>,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -601,6 +682,8 @@ mod tests {
             context_total_tokens: Some(10), context_window_size: Some(200_000),
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
+            activity: ActivityState::Unknown,
+            activity_note: None, activity_since: None,
         }
     }
 
@@ -675,5 +758,63 @@ mod tests {
         assert!(combined.contains(SessionFields::STATUS));
         assert!(combined.contains(SessionFields::PR_LINK));
         assert!(!combined.contains(SessionFields::COST));
+    }
+
+    #[test]
+    fn activity_state_serde_round_trips_snake_case() {
+        for (state, wire) in [
+            (ActivityState::Working, "\"working\""),
+            (ActivityState::Idle,    "\"idle\""),
+            (ActivityState::Blocked, "\"blocked\""),
+            (ActivityState::Unknown, "\"unknown\""),
+        ] {
+            assert_eq!(serde_json::to_string(&state).unwrap(), wire);
+            let parsed: ActivityState = serde_json::from_str(wire).unwrap();
+            assert_eq!(parsed, state);
+        }
+    }
+
+    #[test]
+    fn session_deserializes_without_activity_fields_for_back_compat() {
+        // A row serialized before the activity fields existed must load with
+        // Unknown / empty defaults rather than failing.
+        let mut v = serde_json::to_value(base_session()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("activity");
+        obj.remove("activity_note");
+        obj.remove("activity_since");
+        let s: Session = serde_json::from_value(v).expect("pre-activity payload must deserialize");
+        assert_eq!(s.activity, ActivityState::Unknown);
+        assert_eq!(s.activity_note, None);
+        assert_eq!(s.activity_since, None);
+    }
+
+    #[test]
+    fn merge_from_activity_copies_only_when_flagged() {
+        let mut existing = base_session();
+        let mut incoming = base_session();
+        incoming.activity = ActivityState::Blocked;
+        incoming.activity_note = Some("waiting on migration".into());
+        incoming.activity_since = Some(42);
+
+        existing.merge_from(&incoming, SessionFields::COST); // ACTIVITY not flagged
+        assert_eq!(existing.activity, ActivityState::Unknown, "unflagged activity must not be copied");
+        assert_eq!(existing.activity_note, None);
+        assert_eq!(existing.activity_since, None);
+
+        existing.merge_from(&incoming, SessionFields::ACTIVITY);
+        assert_eq!(existing.activity, ActivityState::Blocked, "flagged activity must be copied");
+        assert_eq!(existing.activity_note.as_deref(), Some("waiting on migration"));
+        assert_eq!(existing.activity_since, Some(42));
+    }
+
+    #[test]
+    fn dep_kind_serde_and_db_string_round_trip() {
+        for (kind, wire) in [(DepKind::Declared, "declared"), (DepKind::Stacked, "stacked")] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{wire}\""));
+            assert_eq!(kind.as_str(), wire);
+            assert_eq!(DepKind::parse(wire), Some(kind));
+        }
+        assert_eq!(DepKind::parse("garbage"), None);
     }
 }

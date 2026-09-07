@@ -171,6 +171,13 @@ pub const REGISTRY: &[Capability] = &[
         worker_md: None,
         enabled: |_| true,
     },
+    Capability {
+        name: "worker-status",
+        audience: Audience::Both,
+        orchestrator_md: Some(include_str!("../skills/orchestrator/worker-status.md")),
+        worker_md: Some(include_str!("../skills/worker/worker-status.md")),
+        enabled: |_| true,
+    },
 ];
 
 /// Placeholder for the invoking `ninox` binary path in orchestrator markdown.
@@ -272,10 +279,11 @@ mod tests {
                 "brain",
                 "watch-pr",
                 "plan",
+                "worker-status",
             ]
         );
         let worker: Vec<_> = for_audience(Audience::Worker).map(|c| c.name).collect();
-        assert_eq!(worker, vec!["brain", "watch-pr"]);
+        assert_eq!(worker, vec!["brain", "watch-pr", "worker-status"]);
     }
 
     #[test]

@@ -21,3 +21,4 @@ pub mod sidebar;
 pub mod spawn_modal;
 pub mod terminal;
 pub(crate) mod terminal_layout;
+pub mod workers_view;

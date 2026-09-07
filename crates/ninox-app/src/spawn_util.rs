@@ -199,6 +199,12 @@ pub async fn spawn_interactive_session(
         // `[auto_reap]` on, an instant cleanup of the row just respawned).
         merged_at:       prior.and_then(|s| s.merged_at),
         gate_status:     prior.and_then(|s| s.gate_status.clone()),
+        // Activity is NOT carried: a respawn is a fresh agent incarnation,
+        // so a prior Blocked/note would lie until the new incarnation's
+        // first hook fires. Unknown is the honest interim value.
+        activity:        Default::default(),
+        activity_note:   None,
+        activity_since:  None,
     };
     let _ = engine.store.upsert_session(&updated);
     engine.emit(Event::SessionUpdated(updated, SessionFields::ALL));
@@ -1221,12 +1227,13 @@ pub fn create_worktree_at(
 /// branch). Best-effort: any failure here must never fail worktree
 /// creation itself, so errors are swallowed rather than propagated.
 ///
-/// `inbox_enabled` gates the `Stop`/`UserPromptSubmit` hooks that drain the
-/// file-based inbox (`ninox_core::inbox`) — off (the default), this
-/// produces byte-for-byte the same settings as before that feature existed.
-/// On, it installs hooks that run `ninox inbox drain-stop`/`drain-prompt`,
-/// which the harness invokes with `NINOX_SESSION`/`NINOX_DATA_DIR` already
-/// set (see `interactive_env_vars`/`worker_env_vars`).
+/// The `Stop`/`UserPromptSubmit` hooks always carry the worker-status
+/// activity commands (`ninox worker-status hook-stop`/`hook-prompt` — see
+/// `ninox_core::worker_status`); `inbox_enabled` additionally prepends the
+/// file-based inbox drains (`ninox inbox drain-stop`/`drain-prompt`, see
+/// `ninox_core::inbox`). The harness invokes all of them with
+/// `NINOX_SESSION`/`NINOX_DATA_DIR` already set (see
+/// `interactive_env_vars`/`worker_env_vars`).
 fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bool) {
     let claude_dir = worktree_path.join(".claude");
     let settings_path = claude_dir.join("settings.json");
@@ -1261,27 +1268,32 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
             "refreshInterval": 20
         }
     });
+    // Claude Code hook `timeout` is in SECONDS, not milliseconds — 5 gives
+    // these fast, local-filesystem-only handlers a generous margin without
+    // risking an accidental multi-minute hang on a hook error.
+    //
+    // Claude Code runs every entry in an event's `hooks` array, so the
+    // opt-in inbox drains and the always-on worker-status activity hooks
+    // compose as siblings here — this is the single place the `hooks`
+    // object is written (write-if-absent, per the early return above), so
+    // there is no merge path that could duplicate entries.
+    let hook = |cmd: &str| serde_json::json!({
+        "type": "command",
+        "command": format!("{ninox_bin_quoted} {cmd}"),
+        "timeout": 5
+    });
+    let mut stop_hooks = Vec::new();
+    let mut prompt_hooks = Vec::new();
     if inbox_enabled {
-        // Claude Code hook `timeout` is in SECONDS, not milliseconds — 5
-        // gives these fast, local-filesystem-only drains a generous margin
-        // without risking an accidental multi-minute hang on a hook error.
-        settings["hooks"] = serde_json::json!({
-            "Stop": [{
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("{ninox_bin_quoted} inbox drain-stop"),
-                    "timeout": 5
-                }]
-            }],
-            "UserPromptSubmit": [{
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("{ninox_bin_quoted} inbox drain-prompt"),
-                    "timeout": 5
-                }]
-            }]
-        });
+        stop_hooks.push(hook("inbox drain-stop"));
+        prompt_hooks.push(hook("inbox drain-prompt"));
     }
+    stop_hooks.push(hook("worker-status hook-stop"));
+    prompt_hooks.push(hook("worker-status hook-prompt"));
+    settings["hooks"] = serde_json::json!({
+        "Stop":             [{ "hooks": stop_hooks }],
+        "UserPromptSubmit": [{ "hooks": prompt_hooks }]
+    });
     if std::fs::create_dir_all(&claude_dir).is_ok() {
         if let Ok(body) = serde_json::to_string_pretty(&settings) {
             if std::fs::write(&settings_path, body).is_ok() {
@@ -2076,9 +2088,26 @@ mod tests {
             .unwrap();
         assert!(bin_path.ends_with("/ninox"), "expected a path to the ninox binary, got: {bin_path}");
         assert!(command.ends_with("statusline"));
-        // Off by default: no hooks table at all — byte-for-byte what this
-        // worktree's settings looked like before inbox messaging existed.
-        assert!(settings.get("hooks").is_none(), "hooks must be absent when inbox messaging is disabled");
+        // Inbox messaging off: no inbox drain hooks, but the always-on
+        // worker-status activity hooks are still installed.
+        let stop_cmds = hook_commands(&settings, "Stop");
+        assert_eq!(stop_cmds.len(), 1, "only the status hook when inbox is off: {stop_cmds:?}");
+        assert!(stop_cmds[0].ends_with("worker-status hook-stop"), "{stop_cmds:?}");
+        let prompt_cmds = hook_commands(&settings, "UserPromptSubmit");
+        assert_eq!(prompt_cmds.len(), 1, "{prompt_cmds:?}");
+        assert!(prompt_cmds[0].ends_with("worker-status hook-prompt"), "{prompt_cmds:?}");
+    }
+
+    /// Every hook command registered for `event`, across matcher groups.
+    fn hook_commands(settings: &serde_json::Value, event: &str) -> Vec<String> {
+        settings["hooks"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|group| group["hooks"].as_array())
+            .flatten()
+            .filter_map(|hook| hook["command"].as_str().map(String::from))
+            .collect()
     }
 
     #[tokio::test]
@@ -2093,10 +2122,14 @@ mod tests {
         // statusLine must still be there, untouched.
         assert_eq!(settings["statusLine"]["type"], "command");
 
-        let stop_cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(stop_cmd.ends_with("inbox drain-stop"), "unexpected Stop hook command: {stop_cmd}");
-        let prompt_cmd = settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(prompt_cmd.ends_with("inbox drain-prompt"), "unexpected UserPromptSubmit hook command: {prompt_cmd}");
+        // Inbox drain and worker-status hooks compose as siblings on the
+        // same events — installing one must not evict the other.
+        let stop_cmds = hook_commands(&settings, "Stop");
+        assert!(stop_cmds.iter().any(|c| c.ends_with("inbox drain-stop")), "{stop_cmds:?}");
+        assert!(stop_cmds.iter().any(|c| c.ends_with("worker-status hook-stop")), "{stop_cmds:?}");
+        let prompt_cmds = hook_commands(&settings, "UserPromptSubmit");
+        assert!(prompt_cmds.iter().any(|c| c.ends_with("inbox drain-prompt")), "{prompt_cmds:?}");
+        assert!(prompt_cmds.iter().any(|c| c.ends_with("worker-status hook-prompt")), "{prompt_cmds:?}");
     }
 
     #[tokio::test]
@@ -2448,6 +2481,9 @@ mod tests {
                 mergeable: GateCheck::Failing, since: 5,
             }),
             merged_at: None,
+            activity: ninox_core::types::ActivityState::Blocked,
+            activity_note: Some("stale note from the previous incarnation".into()),
+            activity_since: Some(50),
         }).unwrap();
 
         let attach = spawn_interactive_session(
@@ -2484,6 +2520,13 @@ mod tests {
         assert!(matches!(gate.ci, GateCheck::Failing));
         assert!(matches!(s.status, SessionStatus::Working), "spawn still owns status");
         assert_eq!(s.terminal_at, None, "retention countdown ends on respawn");
+        assert_eq!(
+            s.activity, ninox_core::types::ActivityState::Unknown,
+            "activity must reset on respawn — the fresh incarnation hasn't reported \
+             yet, and the old one's Blocked/note would lie until its first hook fires",
+        );
+        assert_eq!(s.activity_note, None);
+        assert_eq!(s.activity_since, None);
     }
 
     #[tokio::test]
@@ -2505,6 +2548,7 @@ mod tests {
             claude_session_id: Some("fixed-uuid".into()),
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         }).unwrap();
 
         let ws = tempdir().unwrap().keep().to_string_lossy().to_string();

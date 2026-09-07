@@ -204,7 +204,7 @@ pub(crate) fn build_query(prs: &[PrKey], branches: &[BranchKey]) -> Option<Strin
         q.push_str(&format!(
             "  pr{i}: repository(owner: {owner_q}, name: {name_q}) {{\n    pullRequest(number: {number}) {{\n"
         ));
-        q.push_str("      number title state merged mergeable headRefOid\n");
+        q.push_str("      number title state merged mergeable headRefOid headRefName baseRefName\n");
         q.push_str("      commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {\n");
         q.push_str("        __typename\n");
         q.push_str("        ... on CheckRun { name status conclusion }\n");
@@ -384,10 +384,12 @@ pub(crate) fn parse_response(prs: &[PrKey], branches: &[BranchKey], body: &Value
         let merged = bool_field(pr, "merged");
         let mergeable = opt_str_field(pr, "mergeable").as_deref().and_then(rest_mergeable);
         let head_sha = str_field(pr, "headRefOid");
+        let head_ref = str_field(pr, "headRefName");
+        let base_ref = str_field(pr, "baseRefName");
         let closed = gh_state == "CLOSED" && !merged;
         let state = rest_state(&gh_state);
 
-        let status = PrStatus { merged, state, mergeable, title, number, head_sha };
+        let status = PrStatus { merged, state, mergeable, title, number, head_sha, head_ref, base_ref };
 
         let checks: Vec<CheckRun> = check_nodes(pr).iter().filter_map(parse_check_node).collect();
 
@@ -462,6 +464,7 @@ mod tests {
         assert!(q.contains("rateLimit { cost remaining resetAt }"));
         assert!(q.contains(r#"pr0: repository(owner: "o", name: "r")"#));
         assert!(q.contains("pullRequest(number: 7)"));
+        assert!(q.contains("headRefName baseRefName"), "must fetch branch refs for stacked-dep derivation");
         assert!(q.contains(r#"br0: repository(owner: "o", name: "r")"#));
         assert!(q.contains(r#"headRefName: "feat/x""#));
     }
@@ -479,6 +482,7 @@ mod tests {
                 "pr0": { "pullRequest": {
                     "number": 7, "title": "T", "state": "OPEN", "merged": false,
                     "mergeable": "UNKNOWN", "headRefOid": "abc123",
+                    "headRefName": "feat/x", "baseRefName": "feat/base",
                     "commits": { "nodes": [ { "commit": { "statusCheckRollup": { "contexts": { "nodes": [
                         { "__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE" },
                         { "__typename": "StatusContext", "context": "ci/legacy", "state": "SUCCESS" }
@@ -503,6 +507,8 @@ mod tests {
         assert!(!snap.status.merged);
         assert_eq!(snap.status.mergeable, None); // UNKNOWN
         assert_eq!(snap.status.head_sha, "abc123");
+        assert_eq!(snap.status.head_ref, "feat/x");
+        assert_eq!(snap.status.base_ref, "feat/base");
         assert!(!snap.closed);
         assert_eq!(snap.checks.len(), 2);
         assert_eq!(snap.checks[0].conclusion.as_deref(), Some("failure"));

@@ -880,6 +880,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(store);
@@ -923,6 +924,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: Some(1_000), gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(Arc::clone(&store));
@@ -955,6 +957,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(Arc::clone(&store));
@@ -1013,6 +1016,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(Arc::clone(&store));
@@ -1103,6 +1107,9 @@ mod tests {
                 terminal_at: None,
                 gate_status: None,
                 merged_at: None,
+                activity: crate::types::ActivityState::Unknown,
+                activity_note: None,
+                activity_since: None,
             })
             .unwrap();
         let engine = Engine::new(store.clone());
@@ -1134,6 +1141,7 @@ mod tests {
             catalogue_path: None, context_used_pct: None, context_total_tokens: None,
             context_window_size: None, claude_session_id: None, summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         }
     }
 

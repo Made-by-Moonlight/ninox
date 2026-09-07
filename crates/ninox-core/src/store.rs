@@ -639,6 +639,14 @@ impl Store {
                 registered_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS session_deps (
+                session_id TEXT NOT NULL,
+                depends_on TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                note TEXT,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (session_id, depends_on, kind)
+            );
         ")?;
         migrate_legacy_worker_incarnations(&mut conn)?;
         // Migrations for columns added after initial release — idempotent so
@@ -655,6 +663,9 @@ impl Store {
             ("terminal_at",          "ALTER TABLE sessions ADD COLUMN terminal_at INTEGER"),
             ("gate_status",          "ALTER TABLE sessions ADD COLUMN gate_status TEXT"),
             ("merged_at",            "ALTER TABLE sessions ADD COLUMN merged_at INTEGER"),
+            ("activity",             "ALTER TABLE sessions ADD COLUMN activity TEXT"),
+            ("activity_note",        "ALTER TABLE sessions ADD COLUMN activity_note TEXT"),
+            ("activity_since",       "ALTER TABLE sessions ADD COLUMN activity_since INTEGER"),
         ] {
             if !Self::column_exists(&conn, "sessions", col)? {
                 conn.execute(ddl, [])?;
@@ -1056,13 +1067,15 @@ impl Store {
         let gate_status = s.gate_status.as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let activity = serde_json::to_string(&s.activity)?.replace('"', "");
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO sessions (id,orchestrator_id,name,repo,status,agent_type,
              cost_usd,started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id,summary,terminal_at,gate_status,merged_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
+             claude_session_id,summary,terminal_at,gate_status,merged_at,
+             activity,activity_note,activity_since)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)
              ON CONFLICT(id) DO UPDATE SET
              repo=excluded.repo,
              status=excluded.status,cost_usd=excluded.cost_usd,
@@ -1078,14 +1091,17 @@ impl Store {
              summary=excluded.summary,
              terminal_at=excluded.terminal_at,
              gate_status=excluded.gate_status,
-             merged_at=excluded.merged_at",
+             merged_at=excluded.merged_at,
+             activity=excluded.activity,
+             activity_note=excluded.activity_note,
+             activity_since=excluded.activity_since",
             params![
                 s.id, s.orchestrator_id, s.name, s.repo, status, s.agent_type,
                 s.cost_usd, s.started_at, s.pr_number, s.pr_id,
                 s.workspace_path, s.pid, s.model, s.context_tokens,
                 s.catalogue_path, s.context_used_pct, s.context_total_tokens,
                 s.context_window_size, s.claude_session_id, s.summary, s.terminal_at,
-                gate_status, s.merged_at
+                gate_status, s.merged_at, activity, s.activity_note, s.activity_since
             ],
         )?;
         Ok(())
@@ -1244,7 +1260,8 @@ impl Store {
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id,summary,terminal_at,gate_status,merged_at
+             claude_session_id,summary,terminal_at,gate_status,merged_at,
+             activity,activity_note,activity_since
              FROM sessions ORDER BY started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1272,6 +1289,9 @@ impl Store {
                 r.get::<_, Option<i64>>(20)?,
                 r.get::<_, Option<String>>(21)?,
                 r.get::<_, Option<i64>>(22)?,
+                r.get::<_, Option<String>>(23)?,
+                r.get::<_, Option<String>>(24)?,
+                r.get::<_, Option<i64>>(25)?,
             ))
         })?;
         rows.map(|r| {
@@ -1279,7 +1299,8 @@ impl Store {
                  cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                  model, context_tokens, catalogue_path, context_used_pct,
                  context_total_tokens, context_window_size, claude_session_id,
-                 summary, terminal_at, gate_status_str, merged_at) = r?;
+                 summary, terminal_at, gate_status_str, merged_at,
+                 activity_str, activity_note, activity_since) = r?;
             let status = serde_json::from_str(&format!("\"{status_str}\""))
                 .unwrap_or(SessionStatus::Working);
             let gate_status = gate_status_str
@@ -1297,6 +1318,9 @@ impl Store {
                 terminal_at,
                 gate_status,
                 merged_at,
+                activity: Self::parse_activity(activity_str),
+                activity_note,
+                activity_since,
             })
         })
         .collect()
@@ -1308,7 +1332,8 @@ impl Store {
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id,summary,terminal_at,gate_status,merged_at
+             claude_session_id,summary,terminal_at,gate_status,merged_at,
+             activity,activity_note,activity_since
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], |r| {
@@ -1336,6 +1361,9 @@ impl Store {
                 r.get::<_, Option<i64>>(20)?,
                 r.get::<_, Option<String>>(21)?,
                 r.get::<_, Option<i64>>(22)?,
+                r.get::<_, Option<String>>(23)?,
+                r.get::<_, Option<String>>(24)?,
+                r.get::<_, Option<i64>>(25)?,
             ))
         })?;
         match rows.next() {
@@ -1345,7 +1373,8 @@ impl Store {
                      cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                      model, context_tokens, catalogue_path, context_used_pct,
                      context_total_tokens, context_window_size, claude_session_id,
-                     summary, terminal_at, gate_status_str, merged_at) = r?;
+                     summary, terminal_at, gate_status_str, merged_at,
+                     activity_str, activity_note, activity_since) = r?;
                 let status = serde_json::from_str(&format!("\"{status_str}\""))
                     .unwrap_or(SessionStatus::Working);
                 let gate_status = gate_status_str
@@ -1363,10 +1392,141 @@ impl Store {
                     terminal_at,
                     gate_status,
                     merged_at,
+                    activity: Self::parse_activity(activity_str),
+                    activity_note,
+                    activity_since,
                 }))
             }
         }
     }
+
+    /// NULL (legacy row) and unrecognized values both collapse to `Unknown` —
+    /// same defensive posture as `status`'s `unwrap_or(Working)` above.
+    fn parse_activity(raw: Option<String>) -> ActivityState {
+        raw.and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
+            .unwrap_or_default()
+    }
+
+    /// Targeted write of only the activity columns. The `worker-status`
+    /// hook process runs concurrently with the poller's and GUI's full-row
+    /// upserts — a read→full-row-write from that process could revert their
+    /// fresher fields (status, terminal_at, cost) or re-INSERT a
+    /// just-deleted row; an UPDATE can do neither. The status guard repeats
+    /// `apply_activity`'s terminal check *at write time*, closing the
+    /// read-then-reap window. Returns whether a live row was written.
+    pub fn update_session_activity(
+        &self,
+        id: &str,
+        activity: ActivityState,
+        note: Option<&str>,
+        since: Option<i64>,
+    ) -> Result<bool> {
+        let activity_str = serde_json::to_string(&activity)?.replace('"', "");
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE sessions SET activity=?2, activity_note=?3, activity_since=?4
+             WHERE id=?1 AND status NOT IN ('done','terminated','interrupted')",
+            params![id, activity_str, note, since],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn add_session_dep(&self, dep: &SessionDep) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO session_deps (session_id, depends_on, kind, note, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session_id, depends_on, kind) DO UPDATE SET
+             note=excluded.note",
+            params![dep.session_id, dep.depends_on, dep.kind.as_str(), dep.note, dep.created_at],
+        )?;
+        Ok(())
+    }
+
+    /// Returns whether an edge actually existed and was removed.
+    pub fn remove_session_dep(&self, session_id: &str, depends_on: &str, kind: DepKind) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM session_deps WHERE session_id=?1 AND depends_on=?2 AND kind=?3",
+            params![session_id, depends_on, kind.as_str()],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn list_session_deps(&self) -> Result<Vec<SessionDep>> {
+        self.query_deps("SELECT session_id, depends_on, kind, note, created_at
+                         FROM session_deps ORDER BY created_at", &[])
+    }
+
+    /// Edges *from* `session_id` (what it depends on), both kinds.
+    pub fn deps_for_session(&self, session_id: &str) -> Result<Vec<SessionDep>> {
+        self.query_deps("SELECT session_id, depends_on, kind, note, created_at
+                         FROM session_deps WHERE session_id=?1 ORDER BY created_at",
+                        &[&session_id])
+    }
+
+    fn query_deps(&self, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<SessionDep>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(args, |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (session_id, depends_on, kind_str, note, created_at) = r?;
+            Ok(SessionDep {
+                session_id, depends_on,
+                // An unrecognized kind (from a future version's row) is
+                // surfaced as Declared rather than dropped: better a
+                // mislabeled edge than a silently missing one.
+                kind: DepKind::parse(&kind_str).unwrap_or(DepKind::Declared),
+                note, created_at,
+            })
+        })
+        .collect()
+    }
+
+    /// Reconcile the *stacked* edge set for `session_id` against a fresh
+    /// derivation from PR branch topology: insert what's missing, delete
+    /// what no longer holds, leave `Declared` edges alone. Returns whether
+    /// anything changed — no event carries dep changes today (the Workers
+    /// view re-reads on its poll tick), but callers that want to react to
+    /// churn have the signal.
+    pub fn set_stacked_deps(&self, session_id: &str, depends_on: &[SessionId], now: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT depends_on FROM session_deps WHERE session_id=?1 AND kind='stacked'",
+        )?;
+        let current: Vec<String> = stmt
+            .query_map([session_id], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        let mut changed = false;
+        for stale in current.iter().filter(|c| !depends_on.contains(c)) {
+            conn.execute(
+                "DELETE FROM session_deps WHERE session_id=?1 AND depends_on=?2 AND kind='stacked'",
+                params![session_id, stale],
+            )?;
+            changed = true;
+        }
+        for fresh in depends_on.iter().filter(|d| !current.contains(d)) {
+            conn.execute(
+                "INSERT INTO session_deps (session_id, depends_on, kind, note, created_at)
+                 VALUES (?1, ?2, 'stacked', NULL, ?3)",
+                params![session_id, fresh, now],
+            )?;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
 
     /// Column-scoped write of the fields the external `ninox statusline`
     /// process owns (cost + context readout, and `model` only when not
@@ -1657,12 +1817,25 @@ impl Store {
              WHERE session_id=?1 AND state IN ('cleanup_claimed','release_claimed','released')",
             [id],
         )?;
+        // Edges in either direction would otherwise dangle forever — no
+        // poller pass re-derives *declared* edges.
+        tx.execute("DELETE FROM session_deps WHERE session_id=?1 OR depends_on=?1", [id])?;
         tx.commit()?;
         Ok(())
     }
 
     pub fn delete_orchestrator(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // Edge purge must run while the session rows still exist — it keys
+        // off them to find the orchestrator's workers.
+        conn.execute(
+            "DELETE FROM session_deps WHERE session_id IN
+               (SELECT id FROM sessions WHERE orchestrator_id=?1 OR id=?1)
+             OR depends_on IN
+               (SELECT id FROM sessions WHERE orchestrator_id=?1 OR id=?1)",
+            [id],
+        )?;
+        conn.execute("DELETE FROM sessions WHERE orchestrator_id = ?1", [id])?;
         conn.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         conn.execute("DELETE FROM orchestrator_runtimes WHERE orchestrator_id=?1", [id])?;
         conn.execute("DELETE FROM orchestrator_plans WHERE orchestrator_id=?1", [id])?;
@@ -4585,6 +4758,9 @@ mod tests {
             terminal_at: None,
             gate_status: None,
             merged_at: None,
+            activity: ActivityState::Unknown,
+            activity_note: None,
+            activity_since: None,
         }
     }
 
@@ -4929,6 +5105,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&session).unwrap();
         let list = store.list_sessions().unwrap();
@@ -4949,6 +5126,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&s).unwrap();
         s.status = SessionStatus::Done;
@@ -4975,6 +5153,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&s).unwrap();
         s.repo = "OwnerB/repoB".into();
@@ -4996,6 +5175,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap();
@@ -5017,6 +5197,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap().unwrap();
@@ -5038,6 +5219,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2").unwrap().unwrap();
@@ -5059,6 +5241,7 @@ mod tests {
             claude_session_id: None,
             summary: Some("Fix flaky CI on the auth suite".into()),
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2b").unwrap().unwrap();
@@ -5090,6 +5273,7 @@ mod tests {
             claude_session_id: Some("b7e0b3a0-0000-4000-8000-000000000001".into()),
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s3").unwrap().unwrap();
@@ -5121,6 +5305,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: Some(1_720_000_000_000), gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s5").unwrap().unwrap();
@@ -5155,6 +5340,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&s).unwrap();
         s.started_at = 200;
@@ -5221,6 +5407,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap().unwrap();
@@ -5244,6 +5431,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2").unwrap().unwrap();
@@ -5271,6 +5459,7 @@ mod tests {
                 context_used_pct: None, context_total_tokens: None, context_window_size: None,
                 claude_session_id: None, summary: None,
                 terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
             }).unwrap();
         }
         let samples = store.cost_samples("claude-code", Some("claude-fable-5")).unwrap();
@@ -5290,6 +5479,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         session.gate_status = Some(crate::types::GateStatus {
             ci: crate::types::GateCheck::Failing,
@@ -5321,6 +5511,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         store.upsert_session(&session).unwrap();
         let fetched = store.get_session("s2").unwrap().unwrap();
@@ -6590,6 +6781,9 @@ mod tests {
             terminal_at: Some(1),
             gate_status: None,
             merged_at: None,
+            activity: ActivityState::Unknown,
+            activity_note: None,
+            activity_since: None,
         };
         store.upsert_session(&session).unwrap();
 
@@ -6630,6 +6824,9 @@ mod tests {
             terminal_at: Some(1),
             gate_status: None,
             merged_at: None,
+            activity: ActivityState::Unknown,
+            activity_note: None,
+            activity_since: None,
         };
         store.upsert_session(&session).unwrap();
         session.started_at = 2;
@@ -7279,6 +7476,187 @@ mod tests {
                 .incarnation_id,
             "inc-live",
         );
+    }
+
+    #[test]
+    fn upsert_and_fetch_session_round_trips_activity() {
+        let store = test_store();
+        let mut session = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None,
+            gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+        };
+        session.activity = ActivityState::Blocked;
+        session.activity_note = Some("waiting on schema migration".into());
+        session.activity_since = Some(12_345);
+        store.upsert_session(&session).unwrap();
+
+        let fetched = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(fetched.activity, ActivityState::Blocked);
+        assert_eq!(fetched.activity_note.as_deref(), Some("waiting on schema migration"));
+        assert_eq!(fetched.activity_since, Some(12_345));
+
+        let listed = store.list_sessions().unwrap();
+        assert_eq!(listed[0].activity, ActivityState::Blocked);
+        assert_eq!(listed[0].activity_note, session.activity_note);
+        assert_eq!(listed[0].activity_since, Some(12_345));
+    }
+
+    #[test]
+    fn session_dep_add_list_and_dedup_on_same_edge() {
+        let store = test_store();
+        let dep = SessionDep {
+            session_id: "b".into(), depends_on: "a".into(),
+            kind: DepKind::Declared, note: Some("needs a's schema".into()),
+            created_at: 100,
+        };
+        store.add_session_dep(&dep).unwrap();
+        // Same (session, depends_on, kind) again — must not duplicate; the
+        // fresher note wins.
+        store.add_session_dep(&SessionDep { note: Some("updated".into()), ..dep.clone() }).unwrap();
+
+        let all = store.list_session_deps().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].note.as_deref(), Some("updated"));
+
+        let for_b = store.deps_for_session("b").unwrap();
+        assert_eq!(for_b.len(), 1);
+        assert_eq!(for_b[0].depends_on, "a");
+        assert!(store.deps_for_session("a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_session_dep_reports_whether_an_edge_was_removed() {
+        let store = test_store();
+        let dep = SessionDep {
+            session_id: "b".into(), depends_on: "a".into(),
+            kind: DepKind::Declared, note: None, created_at: 100,
+        };
+        store.add_session_dep(&dep).unwrap();
+        assert!(store.remove_session_dep("b", "a", DepKind::Declared).unwrap());
+        assert!(!store.remove_session_dep("b", "a", DepKind::Declared).unwrap(), "second removal finds nothing");
+        assert!(store.list_session_deps().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_stacked_deps_replaces_stacked_but_preserves_declared() {
+        let store = test_store();
+        store.add_session_dep(&SessionDep {
+            session_id: "b".into(), depends_on: "a".into(),
+            kind: DepKind::Declared, note: None, created_at: 1,
+        }).unwrap();
+        store.add_session_dep(&SessionDep {
+            session_id: "b".into(), depends_on: "old".into(),
+            kind: DepKind::Stacked, note: None, created_at: 1,
+        }).unwrap();
+
+        // Re-derivation: b now stacks on "a" only — "old" must go, the
+        // declared edge must survive, and the same stacked target as a
+        // declared one is a distinct row.
+        let changed = store.set_stacked_deps("b", &["a".to_string()], 2).unwrap();
+        assert!(changed);
+
+        let mut kinds: Vec<(String, DepKind)> = store.deps_for_session("b").unwrap()
+            .into_iter().map(|d| (d.depends_on, d.kind)).collect();
+        kinds.sort();
+        assert_eq!(kinds, vec![
+            ("a".to_string(), DepKind::Declared),
+            ("a".to_string(), DepKind::Stacked),
+        ]);
+
+        // Unchanged re-derivation reports no change.
+        assert!(!store.set_stacked_deps("b", &["a".to_string()], 3).unwrap());
+        // Empty re-derivation drops all stacked edges, keeps declared.
+        assert!(store.set_stacked_deps("b", &[], 4).unwrap());
+        let remaining = store.deps_for_session("b").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].kind, DepKind::Declared);
+    }
+
+    #[test]
+    fn update_session_activity_targets_columns_and_never_inserts_or_touches_terminal_rows() {
+        let store = test_store();
+        // Missing row: no write, and crucially no INSERT — a full-row upsert
+        // here is how a concurrently-deleted session got resurrected.
+        assert!(!store.update_session_activity("ghost", ActivityState::Working, None, Some(1)).unwrap());
+        assert!(store.get_session("ghost").unwrap().is_none());
+
+        let mut s = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::PrOpen,
+            agent_type: "c".into(), cost_usd: 3.5, started_at: 0,
+            pr_number: Some(9), pr_id: Some(9), workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None,
+            gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+        };
+        store.upsert_session(&s).unwrap();
+        assert!(store.update_session_activity("s1", ActivityState::Blocked, Some("stuck"), Some(42)).unwrap());
+        let fetched = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(fetched.activity, ActivityState::Blocked);
+        assert_eq!(fetched.activity_note.as_deref(), Some("stuck"));
+        assert_eq!(fetched.activity_since, Some(42));
+        assert!(matches!(fetched.status, SessionStatus::PrOpen), "non-activity columns untouched");
+        assert_eq!(fetched.cost_usd, 3.5);
+
+        // Terminal row: guarded at write time, not just at the read that
+        // preceded it in another process.
+        s.status = SessionStatus::Terminated;
+        s.activity = ActivityState::Blocked;
+        s.activity_note = Some("stuck".into());
+        s.activity_since = Some(42);
+        store.upsert_session(&s).unwrap();
+        assert!(!store.update_session_activity("s1", ActivityState::Working, None, Some(99)).unwrap());
+        assert_eq!(store.get_session("s1").unwrap().unwrap().activity, ActivityState::Blocked);
+    }
+
+    #[test]
+    fn deleting_an_orchestrator_purges_its_workers_edges() {
+        let store = test_store();
+        let mut w = Session {
+            id: "w1".into(), orchestrator_id: Some("orch".into()), name: "w1".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None,
+            gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+        };
+        store.upsert_session(&w).unwrap();
+        w.id = "w2".into();
+        w.name = "w2".into();
+        store.upsert_session(&w).unwrap();
+        store.add_session_dep(&SessionDep {
+            session_id: "w2".into(), depends_on: "w1".into(),
+            kind: DepKind::Declared, note: None, created_at: 1,
+        }).unwrap();
+
+        store.delete_orchestrator("orch").unwrap();
+        assert!(store.list_session_deps().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_session_purges_edges_in_both_directions() {
+        let store = test_store();
+        for (from, to) in [("b", "a"), ("a", "c")] {
+            store.add_session_dep(&SessionDep {
+                session_id: from.into(), depends_on: to.into(),
+                kind: DepKind::Declared, note: None, created_at: 1,
+            }).unwrap();
+        }
+        store.delete_session("a").unwrap();
+        assert!(store.list_session_deps().unwrap().is_empty(),
+                "edges from AND to the deleted session must go");
     }
 
     #[test]

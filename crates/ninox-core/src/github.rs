@@ -17,6 +17,11 @@ pub struct PrStatus {
     pub title:     String,
     pub number:    u64,
     pub head_sha:  String,
+    /// Head/base branch names — consumed by the poller's stacked-dependency
+    /// derivation (session B stacks on A when B's base is A's head). Empty
+    /// when the API response omitted them.
+    pub head_ref:  String,
+    pub base_ref:  String,
 }
 
 /// A PR found by searching for an existing head branch (`find_open_pr_for_branch`),
@@ -52,6 +57,14 @@ pub struct ReviewThread {
 #[derive(Deserialize)]
 struct GhPrHead {
     sha: String,
+    #[serde(rename = "ref", default)]
+    branch: String,
+}
+
+#[derive(Deserialize)]
+struct GhPrBase {
+    #[serde(rename = "ref", default)]
+    branch: String,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +75,7 @@ struct GhPr {
     merged:    bool,
     mergeable: Option<bool>,
     head:      GhPrHead,
+    base:      Option<GhPrBase>,
 }
 
 #[derive(Deserialize)]
@@ -199,6 +213,8 @@ impl GithubApi for GitHubClient {
             title:     gh.title,
             number:    gh.number,
             head_sha:  gh.head.sha,
+            head_ref:  gh.head.branch,
+            base_ref:  gh.base.map(|b| b.branch).unwrap_or_default(),
         })
     }
 

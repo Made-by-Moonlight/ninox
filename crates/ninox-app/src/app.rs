@@ -302,6 +302,7 @@ pub enum View {
     SessionDetail { session_id: SessionId, panel: DetailPanel },
     PrList,
     Brain,
+    Workers,
     Settings,
 }
 
@@ -331,6 +332,15 @@ pub struct App {
     pub orchestrator_agent: ninox_core::config::AgentConfig,
     pub orchestrators:      Vec<Orchestrator>,
     pub sessions:        HashMap<SessionId, Session>,
+    /// Worker→worker dependency edges mirrored from the store — refreshed
+    /// by `refresh_worker_registry` on entering the Workers view and on
+    /// each `PollSessions` tick while it's open (the 3s tick is this
+    /// codebase's freshness bar; no event carries dep changes).
+    pub session_deps:    Vec<ninox_core::SessionDep>,
+    /// Per-session result of `worker_status::worker_status_hooks_installed`
+    /// — whether the worktree can report activity at all. Refreshed with
+    /// `session_deps`; missing entry means "can't report".
+    pub status_probe:    HashMap<SessionId, bool>,
     pub brain:           Arc<BrainIndex>,
     pub brain_view:      BrainViewState,
     /// All selectable knowledge-base catalogues (`AppConfig::catalogue_options()`,
@@ -509,6 +519,7 @@ pub enum Message {
     PollSessions,
     NavigatePrList,
     NavigateBrain,
+    NavigateWorkers,
     /// Opened from the sidebar footer's `Settings ▸` row.
     NavigateSettings,
     /// Flip a harness's enabled flag (inert for the locked-on claude-code).
@@ -1288,6 +1299,8 @@ impl App {
             orchestrator_agent,
             orchestrators,
             sessions,
+            session_deps:   Vec::new(),
+            status_probe:   HashMap::new(),
             brain,
             brain_view:     BrainViewState::default(),
             catalogues,
@@ -1413,6 +1426,23 @@ impl App {
             .await;
             Message::DiffFetched { session_id: sid, diff }
         })
+    }
+
+    /// Refreshes the Workers view's inputs synchronously: dependency edges
+    /// from the store (one small sqlite query) and the per-session "can
+    /// this worktree report activity" probe (one tiny settings.json read
+    /// per live session with a workspace). Called on entering the view and
+    /// on each `PollSessions` tick while it's open — same freshness model
+    /// as `ensure_plan` below.
+    fn refresh_worker_registry(state: &mut App) {
+        state.session_deps = state.engine.store.list_session_deps().unwrap_or_default();
+        state.status_probe = state.sessions.values()
+            .filter(|s| !s.status.is_terminal())
+            .filter_map(|s| s.workspace_path.as_deref().map(|ws| (
+                s.id.clone(),
+                ninox_core::worker_status::worker_status_hooks_installed(std::path::Path::new(ws)),
+            )))
+            .collect();
     }
 
     /// Refreshes `state.plan_docs[orchestrator_id]` from the store + disk,
@@ -2117,6 +2147,8 @@ impl App {
                             claude_session_id: Some(claude_session_id.clone()),
                             summary:         None,
                             terminal_at:         None, gate_status: None, merged_at: None,
+                            activity: ninox_core::types::ActivityState::Unknown,
+                            activity_note: None, activity_since: None,
                         };
                         match state.engine.store.insert_spawning_session(&session) {
                             Ok(true) => {}
@@ -2594,6 +2626,7 @@ impl App {
                             claude_session_id: Some(claude_session_id.clone()),
                             summary:         None,
                             terminal_at:         None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
                         };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -3238,6 +3271,7 @@ impl App {
                             "1" => return App::apply(state, Message::NavigateFleet { scope: None }),
                             "2" => return App::apply(state, Message::NavigatePrList),
                             "3" => return App::apply(state, Message::NavigateBrain),
+                            "4" => return App::apply(state, Message::NavigateWorkers),
                             "t" => {
                                 let next = match state.active_variant {
                                     ThemeVariant::Dark | ThemeVariant::Ninox => ThemeVariant::Light,
@@ -3509,6 +3543,12 @@ impl App {
                     View::SessionDetail { session_id, panel: DetailPanel::Plan } => {
                         Self::ensure_plan(state, &session_id.clone())
                     }
+                    // The Workers view's dep edges and hook probes have no
+                    // event source — this tick is their freshness bar too.
+                    View::Workers => {
+                        Self::refresh_worker_registry(state);
+                        Task::none()
+                    }
                     _ => Task::none(),
                 }
             }
@@ -3516,6 +3556,14 @@ impl App {
             Message::NavigatePrList => {
                 state.view = View::PrList;
                 // No session is on screen in the PR list; drop all view clients.
+                state.clients.clear();
+                Task::none()
+            }
+
+            Message::NavigateWorkers => {
+                Self::refresh_worker_registry(state);
+                state.view = View::Workers;
+                // No session is on screen here either; drop all view clients.
                 state.clients.clear();
                 Task::none()
             }
@@ -4383,6 +4431,7 @@ impl App {
             View::SessionDetail { session_id, panel } => session_detail(state, session_id, panel),
             View::PrList => pr_list(state),
             View::Brain => brain_panel(state),
+            View::Workers => crate::components::workers_view::workers_view(state),
             View::Settings => settings_panel(state),
         };
 
@@ -5301,6 +5350,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         }
     }
 
@@ -5414,6 +5464,8 @@ mod tests {
             orchestrator_agent: ninox_core::config::AgentConfig::default(),
             orchestrators:      vec![],
             sessions:       HashMap::new(),
+            session_deps:   Vec::new(),
+            status_probe:   HashMap::new(),
             brain,
             brain_view:     BrainViewState::default(),
             catalogues:      vec![ninox_core::config::CatalogueRef {
@@ -5471,6 +5523,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         }
     }
 
@@ -5871,6 +5924,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         let (updated, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         assert!(updated.sessions.contains_key("s1"));
@@ -5893,6 +5947,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         let (updated, _) = app.update(Message::EngineEvent(Box::new(
             Event::SessionSpawned(session.clone()),
@@ -6030,6 +6085,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;
@@ -6080,6 +6136,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         }).unwrap();
         let engine = Engine::new(store);
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
@@ -6105,6 +6162,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = m2;
@@ -6144,6 +6202,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: Some(0), gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         let _ = m.engine.store.upsert_session(&worker);
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(worker))));
@@ -6197,6 +6256,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         });
 
         let (next, _) = m.update(Message::PollSessions);
@@ -6221,6 +6281,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: Some(0), gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         let _ = m.engine.store.upsert_session(&s);
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -6258,6 +6319,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorSpawned(o))));
         m = m2;
@@ -6942,6 +7004,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -6963,6 +7026,7 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -7008,6 +7072,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -7062,6 +7127,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         // NavigateSession defaults to the Split panel, so switch to Terminal
@@ -7195,6 +7261,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -7278,6 +7345,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m, _) = m.update(Message::NavigateSession("s1".into()));
@@ -7332,6 +7400,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -7432,6 +7501,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
             };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
@@ -8567,6 +8637,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;
