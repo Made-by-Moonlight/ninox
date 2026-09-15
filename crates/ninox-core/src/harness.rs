@@ -77,6 +77,7 @@ fn builtin_specs() -> BTreeMap<String, HarnessSpec> {
             "--model".into(), "{model}".into(),
         ],
         known_models:     vec![
+            "claude-fable-5-1".into(),
             "claude-fable-5".into(),
             "claude-opus-4-8".into(),
             "claude-sonnet-5".into(),

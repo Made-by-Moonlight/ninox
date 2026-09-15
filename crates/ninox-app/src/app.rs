@@ -1114,9 +1114,42 @@ mod reconciliation_tests {
     }
 }
 
+/// The `AgentConfig` a relaunch (re-file / resume) should run under.
+///
+/// The persisted row's `model` is a snapshot of what the session *last ran
+/// on* — the usage poller keeps it synced to the transcript's actual model
+/// — so relaunching from it means a `[orchestrator]`/`[worker] model`
+/// edit in `config.toml` never takes effect for any session that already
+/// exists: the stale row wins and then re-perpetuates itself. The
+/// configured default is the user's current intent, so it takes
+/// precedence whenever it applies: the session's harness is still the
+/// configured harness for this session kind AND a model is configured.
+/// Otherwise (harness switched since the session was filed — a model id
+/// is harness-specific — or no configured model) fall back to the row.
+///
+/// "This session kind" follows what filed the session: orchestrators and
+/// standalone sessions (no `orchestrator_id`) come from the Spawn modal,
+/// whose remembered preselection is `[orchestrator]`; only sessions an
+/// orchestrator spawned via `ninox spawn` are `[worker]` sessions.
+fn relaunch_agent(
+    session: &Session,
+    is_orchestrator: bool,
+    config: &AppConfig,
+) -> ninox_core::config::AgentConfig {
+    let filed_from_spawn_modal = is_orchestrator || session.orchestrator_id.is_none();
+    let configured = if filed_from_spawn_modal { &config.orchestrator } else { &config.worker };
+    let model = match &configured.model {
+        Some(m) if configured.harness == session.agent_type => Some(m.clone()),
+        _ => session.model.clone(),
+    };
+    ninox_core::config::AgentConfig { harness: session.agent_type.clone(), model }
+}
+
 /// `None` when the session has no recorded workspace (nothing to respawn
 /// into). A worker re-files interactively — its original spawn prompt is
 /// not stored — but keeps its orchestrator attachment for the tree.
+/// Runs under the configured default model when it applies (see
+/// `relaunch_agent`).
 pub fn refile_plan(
     session: &Session,
     is_orchestrator: bool,
@@ -1124,10 +1157,7 @@ pub fn refile_plan(
     claude_session_id: &str,
 ) -> Option<RefilePlan> {
     let workspace = session.workspace_path.clone()?;
-    let agent = ninox_core::config::AgentConfig {
-        harness: session.agent_type.clone(),
-        model:   session.model.clone(),
-    };
+    let agent = relaunch_agent(session, is_orchestrator, config);
     let base_cmd = config.registry().interactive_cmd(&agent, claude_session_id);
     let catalogue_path = session.catalogue_path.clone()
         .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
@@ -1154,6 +1184,11 @@ pub fn refile_plan(
 /// fresh). `None` when there's no workspace to resume into OR no stored
 /// `claude_session_id` OR the harness can't resume (`resume_cmd` returns
 /// `None`) — any of which means there's nothing to relaunch into.
+///
+/// Also applies the configured default model (see `relaunch_agent`):
+/// claude-code carries a conversation across a `--model` change on
+/// `--resume`, and the user's expectation is that the configured default
+/// applies whenever they start an orchestrator/worker, resumed or not.
 pub fn resume_plan(
     session: &Session,
     is_orchestrator: bool,
@@ -1161,10 +1196,7 @@ pub fn resume_plan(
 ) -> Option<RefilePlan> {
     let workspace = session.workspace_path.clone()?;
     let claude_session_id = session.claude_session_id.as_deref()?;
-    let agent = ninox_core::config::AgentConfig {
-        harness: session.agent_type.clone(),
-        model:   session.model.clone(),
-    };
+    let agent = relaunch_agent(session, is_orchestrator, config);
     let base_cmd = config.registry().resume_cmd(&agent, claude_session_id)?;
     let catalogue_path = session.catalogue_path.clone()
         .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
@@ -5511,9 +5543,11 @@ mod tests {
         }
     }
 
+    /// A worker row (attached to an orchestrator). Set `orchestrator_id`
+    /// to `None` for a standalone session.
     fn refile_session(id: &str) -> Session {
         Session {
-            id: id.into(), orchestrator_id: None, name: id.into(), repo: String::new(),
+            id: id.into(), orchestrator_id: Some("orch".into()), name: id.into(), repo: String::new(),
             status: SessionStatus::Terminated, agent_type: "claude-code".into(),
             cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None,
             workspace_path: Some("/tmp/ws".into()), pid: None,
@@ -5547,6 +5581,83 @@ mod tests {
                 && value == crate::spawn_util::WORKER_EXECUTION_ROLE
         }));
         assert_eq!(plan.agent.harness, "claude-code");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn refile_plan_stale_row_model_is_replaced_by_the_configured_default() {
+        // The row still says the model the session last ran on; the user
+        // has since changed `[worker] model` in config.toml. Re-file must
+        // launch on the configured model, not the stale snapshot.
+        let mut cfg = ninox_core::config::AppConfig::default();
+        cfg.worker.model = Some("claude-fable-5-1".into());
+        let session = refile_session("s1"); // row: claude-opus-4-8
+        let plan = refile_plan(&session, false, &cfg, "fresh-uuid").expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-fable-5-1"));
+        assert!(plan.base_cmd.contains("claude-fable-5-1"));
+        assert!(!plan.base_cmd.contains("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn refile_plan_picks_the_default_for_the_session_kind() {
+        // An orchestrator row follows `[orchestrator]`, a worker row (one an
+        // orchestrator spawned) follows `[worker]` — never the other way
+        // round.
+        let mut cfg = ninox_core::config::AppConfig::default();
+        cfg.orchestrator.model = Some("orch-model".into());
+        cfg.worker.model       = Some("worker-model".into());
+        let session = refile_session("s1");
+        let orch   = refile_plan(&session, true,  &cfg, "u").expect("plan");
+        let worker = refile_plan(&session, false, &cfg, "u").expect("plan");
+        assert_eq!(orch.agent.model.as_deref(),   Some("orch-model"));
+        assert_eq!(worker.agent.model.as_deref(), Some("worker-model"));
+    }
+
+    #[test]
+    fn refile_plan_standalone_session_follows_the_orchestrator_default() {
+        // Standalone sessions are filed from the Spawn modal, whose
+        // remembered preselection is `[orchestrator]` — relaunch must not
+        // silently move them onto `[worker] model` just because they are
+        // not in the orchestrators list.
+        let mut cfg = ninox_core::config::AppConfig::default();
+        cfg.orchestrator.model = Some("orch-model".into());
+        cfg.worker.model       = Some("worker-model".into());
+        let mut session = refile_session("s1");
+        session.orchestrator_id = None;
+        let plan = refile_plan(&session, false, &cfg, "u").expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("orch-model"));
+
+        // ...and the harness-mismatch guard is evaluated against
+        // `[orchestrator]` for them too.
+        cfg.orchestrator.harness = "codex".into();
+        let plan = refile_plan(&session, false, &cfg, "u").expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
+
+        session.claude_session_id = Some("stored-uuid".into());
+        cfg.orchestrator.harness = "claude-code".into();
+        let plan = resume_plan(&session, false, &cfg).expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("orch-model"));
+    }
+
+    #[test]
+    fn refile_plan_harness_mismatch_keeps_the_session_model() {
+        // Model ids are harness-specific: a `[worker] model` set for codex
+        // must not be pushed onto a claude-code session.
+        let mut cfg = ninox_core::config::AppConfig::default();
+        cfg.worker.harness = "codex".into();
+        cfg.worker.model   = Some("gpt-5-codex".into());
+        let session = refile_session("s1"); // agent_type: claude-code
+        let plan = refile_plan(&session, false, &cfg, "fresh-uuid").expect("plan");
+        assert_eq!(plan.agent.harness, "claude-code");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
+        assert!(!plan.base_cmd.contains("gpt-5-codex"));
+    }
+
+    #[test]
+    fn refile_plan_unset_config_model_keeps_the_session_model() {
+        let cfg = ninox_core::config::AppConfig::default(); // worker.model: None
+        let session = refile_session("s1");
+        let plan = refile_plan(&session, false, &cfg, "fresh-uuid").expect("plan");
         assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
     }
 
@@ -5658,6 +5769,35 @@ mod tests {
             key == crate::spawn_util::EXECUTION_ROLE_ENV
                 && value == crate::spawn_util::WORKER_EXECUTION_ROLE
         }));
+    }
+
+    #[test]
+    fn resume_plan_applies_the_configured_default_model() {
+        let mut cfg = ninox_core::config::AppConfig::default();
+        cfg.orchestrator.model = Some("claude-fable-5-1".into());
+        let mut session = refile_session("o1"); // row: claude-opus-4-8
+        session.claude_session_id = Some("stored-uuid".into());
+        let plan = resume_plan(&session, true, &cfg).expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-fable-5-1"));
+        assert!(plan.base_cmd.contains("--resume"));
+        assert!(plan.base_cmd.contains("claude-fable-5-1"));
+        assert!(!plan.base_cmd.contains("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn resume_plan_keeps_the_session_model_on_harness_mismatch_or_unset_default() {
+        let mut session = refile_session("s1");
+        session.claude_session_id = Some("stored-uuid".into());
+
+        let cfg = ninox_core::config::AppConfig::default();
+        let plan = resume_plan(&session, false, &cfg).expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
+
+        let mut cfg = ninox_core::config::AppConfig::default();
+        cfg.worker.harness = "codex".into();
+        cfg.worker.model   = Some("gpt-5-codex".into());
+        let plan = resume_plan(&session, false, &cfg).expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
     }
 
     #[test]
