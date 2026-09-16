@@ -287,13 +287,15 @@ pub struct BrainViewState {
     /// `App::refresh_brain_graph` and `brain_pinboard::resolve_edges`.
     /// Never re-derived per canvas draw.
     pub edges: Vec<(usize, usize)>,
-    /// Force-directed pinboard layout: each entry id's normalized `(x, y)`
-    /// position in `[0.05, 0.95]`, computed once per data change by
-    /// `brain_pinboard::force_layout` alongside `edges` (same triggers,
-    /// same `App::refresh_brain_graph`) — never recomputed per canvas
-    /// draw. `Pinboard::nodes()` falls back to the old hash-based position
-    /// for any id missing here (e.g. a reindex race).
-    pub layout: HashMap<String, (f32, f32)>,
+    /// Live force-directed layout for the pinboard canvas — positions in
+    /// normalized `[0,1]^2` space, stepped by `Message::BrainPhysicsTick`.
+    /// Session-only: discarded wholesale by `reload_brain_entries`, so
+    /// every reindex/catalogue switch (and every app restart) reseeds from
+    /// the hash scatter. Never persisted to disk.
+    pub layout: crate::components::force_layout::ForceLayout,
+    /// Id of the pinboard node currently being dragged, if any — excluded
+    /// from `layout`'s force integration while set (see `BrainDragMove`).
+    pub dragging: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -548,6 +550,19 @@ pub enum Message {
     /// The pinboard canvas's hovered node changed (including to/from `None`)
     /// — emitted only on change, never on every mouse move.
     BrainHoverEntry(Option<String>),
+    /// One physics step of the pinboard's live force-directed layout —
+    /// ticked by `App::subscription`'s physics subscription, only while
+    /// the Brain view is open in Pinboard mode.
+    BrainPhysicsTick,
+    /// A pinboard node's press crossed the drag threshold — pins it so the
+    /// physics tick stops integrating forces onto it directly (it still
+    /// exerts forces on its neighbors).
+    BrainDragStart(String),
+    /// The dragged node's cursor-driven position, in normalized `[0,1]^2`
+    /// pinboard-space.
+    BrainDragMove(String, f32, f32),
+    /// The drag ended — release the node back to the simulation.
+    BrainDragEnd,
     BrainFilterQuery(String),
     BrainReindex,
     BrainSetMode(BrainMode),
@@ -1632,23 +1647,19 @@ impl App {
         resized
     }
 
-    /// Re-derive pinboard edges (node-index pairs into `brain_view.entries`)
-    /// and the force-directed layout built from them. Called once per data
-    /// change — `NavigateBrain`'s initial load and every
+    /// Re-derive pinboard edges (node-index pairs into `brain_view.entries`).
+    /// Called once per data change — `NavigateBrain`'s initial load and every
     /// `reload_brain_entries` (reindex, catalogue switch, background
-    /// freshen) — never per canvas draw. A DB error is tolerated: warn and
-    /// leave the pinboard edge-less (and layout unchanged) rather than
+    /// freshen) — never per canvas draw. The live force layout is stepped
+    /// separately (`Message::BrainPhysicsTick`), not recomputed here. A DB
+    /// error is tolerated: warn and leave the pinboard edge-less rather than
     /// panic.
-    fn refresh_brain_graph(state: &mut Self) {
+    fn refresh_brain_edges(state: &mut Self) {
         match state.brain.links_all() {
             Ok(links) => {
                 state.brain_view.edges = crate::components::brain_pinboard::resolve_edges(
                     &state.brain_view.entries,
                     &links,
-                );
-                state.brain_view.layout = crate::components::brain_pinboard::force_layout(
-                    &state.brain_view.entries,
-                    &state.brain_view.edges,
                 );
             }
             Err(e) => {
@@ -1699,7 +1710,15 @@ impl App {
         match state.brain.query("", None, QueryFilters::default()) {
             Ok(entries) => {
                 state.brain_view.entries = entries;
-                Self::refresh_brain_graph(state);
+                Self::refresh_brain_edges(state);
+                // Drags are session-only and scoped to one entry set:
+                // reseed the board from scratch rather than carrying
+                // hand-placed positions across a reindex or a switch to a
+                // different catalogue entirely. Clearing `dragging` too
+                // keeps a drag that was in flight when the reload landed
+                // from pinning a node that no longer exists.
+                state.brain_view.layout = Default::default();
+                state.brain_view.dragging = None;
                 // The selected entry may have been renamed or deleted by
                 // whatever changed the entry set — if it no longer resolves,
                 // clear the pane instead of showing a ghost selection.
@@ -3609,7 +3628,7 @@ impl App {
                         Ok(entries) => {
                             state.brain_view.entries = entries;
                             state.brain_view.loaded = true;
-                            Self::refresh_brain_graph(state);
+                            Self::refresh_brain_edges(state);
                         }
                         Err(e) => tracing::error!("brain query: {e}"),
                     }
@@ -3824,6 +3843,35 @@ impl App {
                 Task::none()
             }
 
+            Message::BrainPhysicsTick => {
+                state.brain_view.layout.sync_entries(&state.brain_view.entries);
+                let pinned = state.brain_view.dragging.clone();
+                state.brain_view.layout.step(
+                    &state.brain_view.entries,
+                    &state.brain_view.edges,
+                    pinned.as_deref(),
+                    1.0 / 60.0,
+                );
+                Task::none()
+            }
+
+            Message::BrainDragStart(id) => {
+                state.brain_view.dragging = Some(id);
+                Task::none()
+            }
+
+            Message::BrainDragMove(id, x, y) => {
+                if state.brain_view.dragging.as_deref() == Some(id.as_str()) {
+                    state.brain_view.layout.set_position(&id, (x, y));
+                }
+                Task::none()
+            }
+
+            Message::BrainDragEnd => {
+                state.brain_view.dragging = None;
+                Task::none()
+            }
+
             Message::BrainFilterQuery(query) => {
                 state.brain_view.filter = query;
                 Task::none()
@@ -3890,6 +3938,12 @@ impl App {
             Message::BrainSetMode(m) => {
                 state.brain_view.mode = m;
                 state.brain_view.hovered = None;
+                // Leaving Pinboard mode drops the canvas's `PinboardState`
+                // without ever delivering the `ButtonReleased` that would
+                // have ended an in-flight drag, which would otherwise leave
+                // the node pinned out of physics for the rest of the
+                // session.
+                state.brain_view.dragging = None;
                 Task::none()
             }
 
@@ -3937,7 +3991,6 @@ impl App {
                             state.brain_view.backlinks.clear();
                             state.brain_view.related.clear();
                             state.brain_view.edges.clear();
-                            state.brain_view.layout.clear();
                             state.brain_view.loaded = false;
                             Self::reload_brain_entries(state);
                             // The local open above keeps the switch instant;
@@ -4686,7 +4739,14 @@ impl ClientOutputCoalescer {
 }
 
 impl App {
-    /// Subscription that drives engine event batches into one iced update.
+    /// Whether the pinboard's physics subscription should be running —
+    /// pulled out of `subscription()` so the (View, BrainMode) predicate is
+    /// directly unit-testable without going through `Subscription` itself.
+    fn wants_physics_tick(view: &View, mode: BrainMode) -> bool {
+        matches!(view, View::Brain) && mode == BrainMode::Pinboard
+    }
+
+    /// Subscription that drives `Message::EngineEvent` from the engine broadcast channel.
     pub fn subscription(state: &Self) -> Subscription<Message> {
         let mut rx: broadcast::Receiver<Event> = state.engine.subscribe();
         let engine_sub = Subscription::run_with_id(
@@ -4718,7 +4778,13 @@ impl App {
             },
         );
 
-        Subscription::batch([engine_sub, keyboard_sub, poll_sub])
+        let physics_sub = if Self::wants_physics_tick(&state.view, state.brain_view.mode) {
+            iced::time::every(std::time::Duration::from_millis(16)).map(|_| Message::BrainPhysicsTick)
+        } else {
+            Subscription::none()
+        };
+
+        Subscription::batch([engine_sub, keyboard_sub, poll_sub, physics_sub])
     }
 
     /// Theme accessor for the iced `.theme()` builder.
@@ -6659,6 +6725,149 @@ mod tests {
         assert_eq!(m3.brain_view.hovered, None);
     }
 
+    /// Leaving Pinboard mode mid-drag never delivers a `BrainDragEnd`, so
+    /// the mode switch itself has to release the pin — otherwise the node
+    /// sits out physics for the rest of the session.
+    #[test]
+    fn switching_mode_clears_dragging() {
+        let e = test_engine();
+        let m = base(e);
+        let (m, _) = m.update(Message::BrainSetMode(BrainMode::Pinboard));
+        let (m, _) = m.update(Message::BrainDragStart("symbols/x.md".into()));
+        assert_eq!(m.brain_view.dragging.as_deref(), Some("symbols/x.md"));
+        let (m, _) = m.update(Message::BrainSetMode(BrainMode::Catalogue));
+        assert_eq!(m.brain_view.dragging, None);
+    }
+
+    #[test]
+    fn physics_tick_seeds_and_positions_new_entries() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("concepts")).unwrap();
+        std::fs::write(brain_dir.join("concepts").join("note.md"), "---\nname: Note\n---\nbody").unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild(None).unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m, _) = m.update(Message::NavigateBrain);
+        assert!(m.brain_view.layout.position("concepts/note.md").is_none());
+
+        let (m, _) = m.update(Message::BrainPhysicsTick);
+        assert!(m.brain_view.layout.position("concepts/note.md").is_some());
+    }
+
+    #[test]
+    fn drag_start_move_end_pins_then_releases_a_node() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("concepts")).unwrap();
+        std::fs::write(brain_dir.join("concepts").join("note.md"), "---\nname: Note\n---\nbody").unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild(None).unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m, _) = m.update(Message::NavigateBrain);
+        let (m, _) = m.update(Message::BrainPhysicsTick); // seeds the layout
+
+        let (m, _) = m.update(Message::BrainDragStart("concepts/note.md".into()));
+        assert_eq!(m.brain_view.dragging.as_deref(), Some("concepts/note.md"));
+
+        let (m, _) = m.update(Message::BrainDragMove("concepts/note.md".into(), 0.9, 0.1));
+        assert_eq!(m.brain_view.layout.position("concepts/note.md"), Some((0.9, 0.1)));
+
+        let (m, _) = m.update(Message::BrainDragEnd);
+        assert_eq!(m.brain_view.dragging, None);
+        assert_eq!(m.brain_view.layout.position("concepts/note.md"), Some((0.9, 0.1)));
+    }
+
+    /// Drag positions are session-only and scoped to one entry set, so a
+    /// reindex drops them back to the deterministic hash seed instead of
+    /// carrying hand-placed coordinates across the reload.
+    #[test]
+    fn reindexing_reseeds_the_layout_and_releases_a_drag() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("concepts")).unwrap();
+        std::fs::write(brain_dir.join("concepts").join("note.md"), "---\nname: Note\n---\nbody").unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild(None).unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m, _) = m.update(Message::NavigateBrain);
+        let (m, _) = m.update(Message::BrainPhysicsTick);
+        let seeded = m.brain_view.layout.position("concepts/note.md").unwrap();
+
+        let (m, _) = m.update(Message::BrainDragStart("concepts/note.md".into()));
+        let (m, _) = m.update(Message::BrainDragMove("concepts/note.md".into(), 0.9, 0.1));
+        assert_eq!(m.brain_view.layout.position("concepts/note.md"), Some((0.9, 0.1)));
+
+        let path = m.brain.path().to_path_buf();
+        let (m, _) = m.update(Message::BrainReindexed { path, result: Ok(1) });
+        assert_eq!(m.brain_view.dragging, None);
+        assert_eq!(m.brain_view.layout.position("concepts/note.md"), None);
+
+        let (m, _) = m.update(Message::BrainPhysicsTick);
+        assert_eq!(m.brain_view.layout.position("concepts/note.md"), Some(seeded));
+    }
+
+    /// Same reset via the other door into `reload_brain_entries`: switching
+    /// catalogues entirely.
+    #[test]
+    fn switching_catalogue_reseeds_the_layout() {
+        let dir_a = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_a.join("concepts")).unwrap();
+        std::fs::write(dir_a.join("concepts").join("a.md"), "a body").unwrap();
+        let dir_b = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_b.join("concepts")).unwrap();
+        std::fs::write(dir_b.join("concepts").join("b.md"), "b body").unwrap();
+
+        let brain_a = Arc::new(BrainIndex::open(&dir_a).unwrap());
+        brain_a.rebuild(None).unwrap();
+        BrainIndex::open(&dir_b).unwrap().rebuild(None).unwrap();
+
+        let e = test_engine();
+        let mut app = base_with_brain(e, brain_a);
+        app.catalogues = vec![
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+        ];
+        let (app, _) = app.update(Message::NavigateBrain);
+        let (app, _) = app.update(Message::BrainPhysicsTick);
+        let (app, _) = app.update(Message::BrainDragStart("concepts/a.md".into()));
+        let (app, _) = app.update(Message::BrainDragMove("concepts/a.md".into(), 0.9, 0.1));
+
+        let (app, _) = app.update(Message::BrainSwitchCatalogue(1));
+        assert_eq!(app.brain_view.dragging, None);
+        assert!(app.brain_view.layout.position("concepts/a.md").is_none());
+    }
+
+    #[test]
+    fn drag_move_for_a_different_id_than_dragging_is_ignored() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("concepts")).unwrap();
+        std::fs::write(brain_dir.join("concepts").join("a.md"), "---\nname: A\n---\nbody").unwrap();
+        std::fs::write(brain_dir.join("concepts").join("b.md"), "---\nname: B\n---\nbody").unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild(None).unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m, _) = m.update(Message::NavigateBrain);
+        let (m, _) = m.update(Message::BrainPhysicsTick);
+        let before = m.brain_view.layout.position("concepts/b.md").unwrap();
+
+        let (m, _) = m.update(Message::BrainDragStart("concepts/a.md".into()));
+        let (m, _) = m.update(Message::BrainDragMove("concepts/b.md".into(), 0.5, 0.5));
+        assert_eq!(m.brain_view.layout.position("concepts/b.md"), Some(before));
+    }
+
+    #[test]
+    fn wants_physics_tick_only_for_brain_pinboard() {
+        assert!(App::wants_physics_tick(&View::Brain, BrainMode::Pinboard));
+        assert!(!App::wants_physics_tick(&View::Brain, BrainMode::Catalogue));
+        assert!(!App::wants_physics_tick(&View::FleetBoard { scope: None }, BrainMode::Pinboard));
+    }
+
     #[test]
     fn switching_catalogue_resets_selection_and_active_index() {
         let dir_a = tempdir().unwrap().keep();
@@ -6854,12 +7063,13 @@ mod tests {
 
         let e = test_engine();
         let m = base_with_brain(e, brain);
-        assert!(m.brain_view.layout.is_empty());
+        assert!(m.brain_view.entries.is_empty());
 
-        let (m2, _) = m.update(Message::NavigateBrain);
-        assert_eq!(m2.brain_view.layout.len(), 2);
+        let (m, _) = m.update(Message::NavigateBrain);
+        let (m2, _) = m.update(Message::BrainPhysicsTick); // seeds the layout
+        assert_eq!(m2.brain_view.entries.len(), 2);
         for entry in &m2.brain_view.entries {
-            let (x, y) = m2.brain_view.layout[&entry.id];
+            let (x, y) = m2.brain_view.layout.position(&entry.id).unwrap();
             assert!((0.05..=0.95).contains(&x));
             assert!((0.05..=0.95).contains(&y));
         }
@@ -7088,15 +7298,20 @@ mod tests {
             ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
         ];
         let (app, _) = app.update(Message::NavigateBrain);
-        assert_eq!(app.brain_view.layout.len(), 2);
+        let (app, _) = app.update(Message::BrainPhysicsTick); // seeds the layout
+        assert!(app.brain_view.layout.position("people/alice.md").is_some());
+        assert!(app.brain_view.layout.position("people/bob.md").is_some());
 
         let (app, _) = app.update(Message::BrainSwitchCatalogue(1));
-        assert_eq!(
-            app.brain_view.layout.len(),
-            1,
+        assert!(
+            app.brain_view.layout.position("people/alice.md").is_none(),
+            "catalogue B's reload must clear catalogue A's layout, not leave it stale"
+        );
+        let (app, _) = app.update(Message::BrainPhysicsTick); // repopulates for catalogue B
+        assert!(
+            app.brain_view.layout.position("people/carol.md").is_some(),
             "catalogue B has one entry -- layout must be repopulated for it, not left over from A"
         );
-        assert!(app.brain_view.layout.contains_key("people/carol.md"));
     }
 
     #[test]
