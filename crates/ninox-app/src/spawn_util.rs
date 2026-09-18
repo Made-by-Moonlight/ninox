@@ -123,6 +123,21 @@ pub async fn spawn_interactive_session(
     let base_cmd = p.base_cmd;
     let launch_cmd = format!("export PATH='{ninox_bin_dir_str}':\"$PATH\"; {base_cmd}");
 
+    // Without a trust entry the session blocks forever on Claude Code's
+    // "do you trust this folder?" dialog instead of reaching its input
+    // prompt (fresh orchestrator workspaces and worker worktrees have none).
+    // On a blocking thread for the same reason as `create_worker_worktree`:
+    // this reads and rewrites the user's whole ~/.claude.json (hundreds of
+    // KB of accumulated per-project state) and would stall a runtime worker.
+    let trust_ws = p.workspace.clone();
+    let seed = tokio::task::spawn_blocking(move || {
+        ninox_core::trust::seed_workspace_trust(std::path::Path::new(&trust_ws))
+    })
+    .await;
+    if let Err(e) = seed.unwrap_or_else(|join_err| Err(anyhow::anyhow!(join_err))) {
+        tracing::warn!("failed to seed claude workspace trust for {}: {e}", p.workspace);
+    }
+
     if let Err(e) = tmux::create_session(&sid, &p.workspace, &launch_cmd, &env).await {
         tracing::error!("tmux create failed for {sid}: {e}");
         // Surface the failure: without this the optimistically inserted

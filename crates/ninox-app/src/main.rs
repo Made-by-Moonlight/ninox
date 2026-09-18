@@ -1213,6 +1213,11 @@ async fn run_spawn(
         anyhow::bail!("worker incarnation changed before checkout binding");
     }
 
+    // Without a trust entry the headless worker blocks forever on Claude
+    // Code's "do you trust this folder?" dialog instead of taking the prompt.
+    if let Err(e) = ninox_core::trust::seed_workspace_trust(std::path::Path::new(&effective_workspace)) {
+        tracing::warn!("failed to seed claude workspace trust for {effective_workspace}: {e}");
+    }
     // Durable, on-disk counterpart to the `worker_context_footer` below: the
     // footer is lost after context compaction, but a seeded SKILL.md
     // survives for the life of the worktree. Which skills land (and whether
@@ -2197,6 +2202,11 @@ async fn run_spawn_orchestrator(
     }
     let ws = root.join(&id);
     tokio::fs::create_dir_all(&ws).await?;
+    // Without a trust entry the headless session blocks forever on Claude
+    // Code's "do you trust this folder?" dialog instead of taking the brief.
+    if let Err(e) = ninox_core::trust::seed_workspace_trust(&ws) {
+        tracing::warn!("failed to seed claude workspace trust for {}: {e}", ws.display());
+    }
     let ws_str = ws.to_string_lossy().to_string();
 
     // The new orchestrator thinks with the same brain as its spawner when

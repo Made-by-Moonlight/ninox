@@ -20,6 +20,7 @@ pub mod rust_cache;
 pub mod session_socket;
 pub mod store;
 pub mod tmux;
+pub mod trust;
 pub mod types;
 pub mod worker_status;
 pub mod workers;

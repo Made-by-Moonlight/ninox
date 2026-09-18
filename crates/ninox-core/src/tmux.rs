@@ -22,7 +22,7 @@ pub(crate) fn socket() -> &'static str {
 /// so it can't race under parallel test execution the way a shared env var
 /// would (see `lifecycle::usage::ENV_TEST_GUARD` for a case where that
 /// exact hazard already had to be worked around once in this codebase).
-fn is_test_binary() -> bool {
+pub(crate) fn is_test_binary() -> bool {
     std::env::current_exe()
         .ok()
         .is_some_and(|p| p.components().any(|c| c.as_os_str() == "deps"))
