@@ -46,6 +46,9 @@ fn event_to_json(event: &Event) -> Option<String> {
             serde_json::json!({"type": "review_comment", "payload": {"pr_id": pr_id, "comment": comment}})
         }
         Event::Notification(n) => serde_json::json!({"type": "notification", "payload": n}),
+        Event::MessagesDelivered { session_id, count } => {
+            serde_json::json!({"type": "messages_delivered", "payload": {"session_id": session_id, "count": count}})
+        }
         Event::TerminalOutput { .. } => return None,
         Event::ClientOutput { .. } => return None,
         Event::ClientClosed { .. } => return None,
@@ -64,6 +67,15 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["type"], "worker_done");
         assert_eq!(v["payload"]["session_id"], "s1");
+    }
+
+    #[test]
+    fn messages_delivered_format() {
+        let line = event_to_json(&Event::MessagesDelivered { session_id: "s1".into(), count: 2 }).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "messages_delivered");
+        assert_eq!(v["payload"]["session_id"], "s1");
+        assert_eq!(v["payload"]["count"], 2);
     }
 
     #[test]

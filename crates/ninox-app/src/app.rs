@@ -366,6 +366,10 @@ pub struct App {
     /// `ensure_plan` — see `PlanDocState`.
     pub plan_docs:       HashMap<OrchestratorId, PlanDocState>,
     pub notifications:   VecDeque<Notification>,
+    /// Messages delivered to each session since the user last had it open
+    /// (`Event::MessagesDelivered`). Drives the sidebar's per-row badge;
+    /// cleared by `NavigateSession`.
+    pub unread_messages: HashMap<SessionId, u64>,
     /// True while an `ApplyUpdate`-triggered `cargo install` subprocess is
     /// running — disables the "Update now" action so a second click can't
     /// spawn a duplicate install.
@@ -1359,6 +1363,7 @@ impl App {
             diffs:          HashMap::new(),
             plan_docs:      HashMap::new(),
             notifications:  VecDeque::new(),
+            unread_messages: HashMap::new(),
             update_in_progress: false,
             version_check:  VersionCheckState::NotChecked,
             sidebar:        SidebarState::default(),
@@ -1813,6 +1818,7 @@ impl App {
                     session_id: id.clone(),
                     panel: state.worker_panel,
                 };
+                state.unread_messages.remove(&id);
                 // Drop every client that is no longer on screen — the tmux
                 // sessions stay detached and running.
                 state.clients.retain(|sid, _| sid == &id);
@@ -4250,7 +4256,12 @@ impl App {
 
             Event::OrchestratorRemoved(id) => {
                 state.orchestrators.retain(|o| o.id != id);
-                state.sessions.retain(|_, s| s.orchestrator_id.as_deref() != Some(id.as_str()));
+                let sessions = &mut state.sessions;
+                state.unread_messages.retain(|sid, _| {
+                    sid != &id
+                        && sessions.get(sid).and_then(|s| s.orchestrator_id.as_deref()) != Some(id.as_str())
+                });
+                sessions.retain(|_, s| s.orchestrator_id.as_deref() != Some(id.as_str()));
                 Task::none()
             }
 
@@ -4271,6 +4282,7 @@ impl App {
                 if let Some(s) = state.sessions.get_mut(&id) {
                     s.status = SessionStatus::Done;
                 }
+                state.unread_messages.remove(&id);
                 state.terminals.remove(&id);
                 // A done session is definitionally not viewable.
                 state.clients.remove(&id);
@@ -4398,6 +4410,15 @@ impl App {
 
             Event::Notification(n) => {
                 Self::push_notification(state, n);
+                Task::none()
+            }
+
+            Event::MessagesDelivered { session_id, count } => {
+                let on_screen = matches!(&state.view,
+                    View::SessionDetail { session_id: sid, .. } if sid == &session_id);
+                if !on_screen {
+                    *state.unread_messages.entry(session_id).or_insert(0) += count;
+                }
                 Task::none()
             }
         }
@@ -5582,6 +5603,7 @@ mod tests {
             diffs:          HashMap::new(),
             plan_docs:      HashMap::new(),
             notifications:  VecDeque::new(),
+            unread_messages: HashMap::new(),
             update_in_progress: false,
             version_check:  VersionCheckState::NotChecked,
             sidebar:        SidebarState::default(),
@@ -6209,6 +6231,73 @@ mod tests {
         let session = updated.sessions.get("s1").unwrap();
         assert_eq!(session.pr_number, Some(42), "tracked PR must not change");
         assert_eq!(session.pr_id, Some(42), "tracked PR must not change");
+    }
+
+    fn messages_delivered(session_id: &str, count: u64) -> Message {
+        Message::EngineEvent(Box::new(Event::MessagesDelivered { session_id: session_id.into(), count }))
+    }
+
+    #[test]
+    fn messages_delivered_to_a_session_not_on_screen_accumulate_as_unread() {
+        let m = base(test_engine());
+        let (m, _) = m.update(messages_delivered("orch-1", 1));
+        let (m, _) = m.update(messages_delivered("orch-1", 2));
+        assert_eq!(m.unread_messages.get("orch-1"), Some(&3));
+    }
+
+    #[test]
+    fn messages_delivered_to_the_session_on_screen_are_not_unread() {
+        let mut m = base(test_engine());
+        m.view = View::SessionDetail { session_id: "orch-1".into(), panel: DetailPanel::Split };
+        let (m, _) = m.update(messages_delivered("orch-1", 1));
+        assert_eq!(m.unread_messages.get("orch-1"), None);
+    }
+
+    #[test]
+    fn opening_a_session_clears_its_unread_messages() {
+        let m = base(test_engine());
+        let (m, _) = m.update(messages_delivered("orch-1", 4));
+        let (m, _) = m.update(messages_delivered("orch-2", 1));
+        let (m, _) = m.update(Message::NavigateSession("orch-1".into()));
+        assert_eq!(m.unread_messages.get("orch-1"), None);
+        assert_eq!(m.unread_messages.get("orch-2"), Some(&1), "other sessions keep their badge");
+    }
+
+    #[test]
+    fn removing_an_orchestrator_clears_unread_for_it_and_its_workers() {
+        let mut m = base(test_engine());
+        m.orchestrators.push(Orchestrator { id: "o1".into(), name: "orch".into(), created_at: 0 });
+        let mut w = Session {
+            id: "w1".into(), orchestrator_id: Some("o1".into()), name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+        };
+        m.sessions.insert("w1".into(), w.clone());
+        w.id = "other".into();
+        w.orchestrator_id = None;
+        m.sessions.insert("other".into(), w);
+        let (m, _) = m.update(messages_delivered("o1", 1));
+        let (m, _) = m.update(messages_delivered("w1", 1));
+        let (m, _) = m.update(messages_delivered("other", 1));
+
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorRemoved("o1".into()))));
+
+        assert_eq!(m.unread_messages.get("o1"), None);
+        assert_eq!(m.unread_messages.get("w1"), None);
+        assert_eq!(m.unread_messages.get("other"), Some(&1));
+    }
+
+    #[test]
+    fn a_finished_session_drops_its_unread_messages() {
+        let m = base(test_engine());
+        let (m, _) = m.update(messages_delivered("w1", 2));
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionDone("w1".into()))));
+        assert_eq!(m.unread_messages.get("w1"), None);
     }
 
     #[test]

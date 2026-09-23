@@ -54,6 +54,22 @@ pub async fn deliver_message(
     message:      &str,
     mechanism:    SendMechanism,
 ) -> Result<()> {
+    deliver_by_mechanism(store, sessions_dir, session_id, message, mechanism).await?;
+    // The counter feeds the sidebar's unread badge (`Store::message_delivered_counts`);
+    // a miss there must never turn an already-delivered message into an error.
+    if let Err(e) = store.record_message_delivered(session_id) {
+        tracing::warn!("record delivered message for {session_id}: {e}");
+    }
+    Ok(())
+}
+
+async fn deliver_by_mechanism(
+    store:        &Store,
+    sessions_dir: &Path,
+    session_id:   &str,
+    message:      &str,
+    mechanism:    SendMechanism,
+) -> Result<()> {
     match mechanism {
         SendMechanism::SessionSocket => {
             deliver_via_session_socket(session_socket::find_peer(session_id), session_id, message).await
@@ -334,6 +350,32 @@ mod tests {
         let pending = inbox::read_pending_messages(sessions_dir.path(), "worker-1").unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].text, "hello worker");
+    }
+
+    #[tokio::test]
+    async fn a_successful_delivery_is_counted_against_the_target_session() {
+        let store = Store::open(tempdir().unwrap().keep().join("t.db")).unwrap();
+        let ws = tempdir().unwrap().keep();
+        write_installed_hooks(&ws);
+        store.upsert_session(&session_with("worker-1", "claude-code", Some(ws.to_string_lossy().to_string()))).unwrap();
+        let sessions_dir = tempdir().unwrap();
+
+        deliver_message(&store, sessions_dir.path(), "worker-1", "one", SendMechanism::Inbox).await.unwrap();
+        deliver_message(&store, sessions_dir.path(), "worker-1", "two", SendMechanism::Inbox).await.unwrap();
+
+        assert_eq!(store.message_delivered_counts().unwrap().get("worker-1"), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn a_failed_delivery_is_not_counted() {
+        let store = Store::open(tempdir().unwrap().keep().join("t.db")).unwrap();
+        let sessions_dir = tempdir().unwrap();
+
+        let result =
+            deliver_message(&store, sessions_dir.path(), "orch-1", "hello", SendMechanism::Keystrokes).await;
+
+        assert!(result.is_err(), "no tmux session named orch-1 exists, so keystrokes must fail");
+        assert!(store.message_delivered_counts().unwrap().is_empty());
     }
 
     #[tokio::test]

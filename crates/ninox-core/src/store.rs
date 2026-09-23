@@ -647,6 +647,10 @@ impl Store {
                 created_at INTEGER NOT NULL,
                 PRIMARY KEY (session_id, depends_on, kind)
             );
+            CREATE TABLE IF NOT EXISTS session_messages (
+                session_id TEXT PRIMARY KEY,
+                delivered_count INTEGER NOT NULL
+            );
         ")?;
         migrate_legacy_worker_incarnations(&mut conn)?;
         // Migrations for columns added after initial release — idempotent so
@@ -1777,6 +1781,27 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Count one more message delivered to `session_id` (see
+    /// `messaging::deliver_message`). Lives in its own table rather than on
+    /// the `sessions` row because `upsert_session` is a full-row write and
+    /// several processes hold stale snapshots of that row.
+    pub fn record_message_delivered(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO session_messages (session_id, delivered_count) VALUES (?1, 1)
+             ON CONFLICT(session_id) DO UPDATE SET delivered_count = delivered_count + 1",
+            [session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn message_delivered_counts(&self) -> Result<HashMap<String, u64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT session_id, delivered_count FROM session_messages")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     pub fn sessions_by_orchestrator(&self, orchestrator_id: &str) -> Result<Vec<Session>> {
         let sessions = self.list_sessions()?;
         Ok(sessions.into_iter().filter(|s| s.orchestrator_id.as_deref() == Some(orchestrator_id)).collect())
@@ -1820,6 +1845,7 @@ impl Store {
         // Edges in either direction would otherwise dangle forever — no
         // poller pass re-derives *declared* edges.
         tx.execute("DELETE FROM session_deps WHERE session_id=?1 OR depends_on=?1", [id])?;
+        tx.execute("DELETE FROM session_messages WHERE session_id = ?1", [id])?;
         tx.commit()?;
         Ok(())
     }
@@ -1833,6 +1859,11 @@ impl Store {
                (SELECT id FROM sessions WHERE orchestrator_id=?1 OR id=?1)
              OR depends_on IN
                (SELECT id FROM sessions WHERE orchestrator_id=?1 OR id=?1)",
+            [id],
+        )?;
+        conn.execute(
+            "DELETE FROM session_messages WHERE session_id = ?1
+             OR session_id IN (SELECT id FROM sessions WHERE orchestrator_id = ?1)",
             [id],
         )?;
         conn.execute("DELETE FROM sessions WHERE orchestrator_id = ?1", [id])?;
@@ -7750,5 +7781,54 @@ mod tests {
         store.register_orchestrator_runtime(&runtime).unwrap();
         let persisted = store.orchestrator_runtime_identity("orch").unwrap().unwrap();
         assert_eq!(persisted, runtime);
+    }
+
+    #[test]
+    fn record_message_delivered_counts_per_session() {
+        let store = test_store();
+        store.record_message_delivered("orch-1").unwrap();
+        store.record_message_delivered("orch-1").unwrap();
+        store.record_message_delivered("worker-1").unwrap();
+
+        let counts = store.message_delivered_counts().unwrap();
+        assert_eq!(counts.get("orch-1"), Some(&2));
+        assert_eq!(counts.get("worker-1"), Some(&1));
+        assert_eq!(counts.get("never-sent"), None);
+    }
+
+    #[test]
+    fn deleting_a_session_drops_its_message_counter() {
+        let store = test_store();
+        store.record_message_delivered("worker-1").unwrap();
+        store.delete_session("worker-1").unwrap();
+        assert!(store.message_delivered_counts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_an_orchestrator_drops_its_own_and_its_workers_message_counters() {
+        let store = test_store();
+        let mut worker = crate::types::Session {
+            id: "w1".into(), orchestrator_id: Some("orch".into()), name: "w1".into(),
+            repo: String::new(), status: crate::types::SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+        };
+        store.upsert_session(&worker).unwrap();
+        worker.id = "unrelated".into();
+        worker.orchestrator_id = None;
+        store.upsert_session(&worker).unwrap();
+        store.record_message_delivered("orch").unwrap();
+        store.record_message_delivered("w1").unwrap();
+        store.record_message_delivered("unrelated").unwrap();
+
+        store.delete_orchestrator("orch").unwrap();
+
+        let counts = store.message_delivered_counts().unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get("unrelated"), Some(&1));
     }
 }

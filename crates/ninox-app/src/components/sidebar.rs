@@ -18,6 +18,11 @@ fn worker_count_label(count: usize) -> String {
     if count == 1 { "1 worker".to_string() } else { format!("{count} workers") }
 }
 
+/// Two digits at most, so the pill can't stretch the row.
+fn unread_badge_text(count: u64) -> String {
+    count.min(99).to_string()
+}
+
 /// Status dot: filled circle, 1.5px border in the status color.
 /// Done/terminated renders hollow (transparent fill).
 fn status_dot(color: Color, hollow: bool) -> Element<'static, Message> {
@@ -202,6 +207,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
             &orch.name,
             &worker_count_label(worker_count),
             app.sessions.get(&orch.id).map(|se| &se.status),
+            app.unread_messages.get(orch.id.as_str()).copied().unwrap_or(0),
             true,  // bold
             false, // not indented
             Some((orch.id.clone(), is_expanded)), // chevron: toggle this orchestrator
@@ -217,7 +223,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
             for w in workers {
                 items.push(tree_row(
                     app, &w.id, &w.name, repo_short(&w.repo),
-                    Some(&w.status), false, true, None,
+                    Some(&w.status), 0, false, true, None,
                     Some(Message::RemoveSession(w.id.clone())),
                 ));
             }
@@ -241,7 +247,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     for w in standalone {
         items.push(tree_row(
             app, &w.id, &w.name, repo_short(&w.repo),
-            Some(&w.status), false, false, None,
+            Some(&w.status), 0, false, false, None,
             Some(Message::RemoveSession(w.id.clone())),
         ));
     }
@@ -291,6 +297,7 @@ fn tree_row<'a>(
     name: &'a str,
     right: &str,
     status: Option<&ninox_core::types::SessionStatus>,
+    unread: u64,
     bold: bool,
     indented: bool,
     chevron_toggle: Option<(ninox_core::types::OrchestratorId, bool)>,
@@ -362,6 +369,22 @@ fn tree_row<'a>(
         .width(Length::Fill)
         .clip(true)
         .into(),
+    ];
+    if unread > 0 {
+        nav_row_items.push(Space::new(6, 0).into());
+        // Same accent pill as the Alerts count in the action row.
+        nav_row_items.push(
+            container(text(unread_badge_text(unread)).size(8).font(SANS_BOLD).color(s.card))
+                .padding([1, 4])
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(s.accent)),
+                    border: Border { radius: 7.0.into(), ..Default::default() },
+                    ..Default::default()
+                })
+                .into(),
+        );
+    }
+    nav_row_items.extend([
         Space::new(6, 0).into(),
         text(right.to_owned())
             .size(10)
@@ -369,7 +392,7 @@ fn tree_row<'a>(
             .color(s.faint)
             .wrapping(iced::widget::text::Wrapping::None)
             .into(),
-    ];
+    ]);
     if let Some(badge) = retention_badge {
         nav_row_items.push(Space::new(6, 0).into());
         nav_row_items.push(badge);
@@ -474,5 +497,12 @@ mod tests {
         assert_eq!(worker_count_label(1), "1 worker");
         assert_eq!(worker_count_label(2), "2 workers");
         assert_eq!(worker_count_label(11), "11 workers");
+    }
+
+    #[test]
+    fn unread_badge_text_caps_at_two_digits() {
+        assert_eq!(unread_badge_text(1), "1");
+        assert_eq!(unread_badge_text(99), "99");
+        assert_eq!(unread_badge_text(150), "99");
     }
 }

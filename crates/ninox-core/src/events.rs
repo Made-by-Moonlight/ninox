@@ -30,6 +30,10 @@ pub enum Event {
     ExtraPrDetected(PR),
     ReviewComment  { pr_id: PrId, comment: Comment },
     Notification(Notification),
+    /// `count` more messages reached `session_id` since the poller's last
+    /// look at `Store::message_delivered_counts`. The UI accumulates these
+    /// into the sidebar's unread badge for sessions the user has not opened.
+    MessagesDelivered { session_id: SessionId, count: u64 },
 }
 
 /// Which of an orchestrator's workers [`Engine::reap_workers`] acts on.

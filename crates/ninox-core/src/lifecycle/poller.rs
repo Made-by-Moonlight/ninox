@@ -92,6 +92,10 @@ pub struct Poller {
     /// PR, fed by both GitHub polling paths and consumed by
     /// `reconcile_stacked_deps` to derive stacked dependency edges.
     pr_refs_cache:    Arc<std::sync::Mutex<HashMap<String, PrRefsSnapshot>>>,
+    /// Last `Store::message_delivered_counts` seen per session, so
+    /// `poll_message_counts` emits only when a count moves. `None` until the
+    /// first tick takes its baseline snapshot.
+    message_count_cache: Arc<std::sync::Mutex<Option<HashMap<String, u64>>>>,
     /// Runs the brain-harvest subprocess (real `claude -p` in production).
     /// Injectable so tests can fake success/failure without spawning a real
     /// process — see `sync_sessions_metadata`'s `trigger_brain_harvest`.
@@ -140,6 +144,7 @@ impl Poller {
             context_cache:    Arc::new(std::sync::Mutex::new(HashMap::new())),
             activity_cache:   Arc::new(std::sync::Mutex::new(HashMap::new())),
             pr_refs_cache:    Arc::new(std::sync::Mutex::new(HashMap::new())),
+            message_count_cache: Arc::new(std::sync::Mutex::new(None)),
             harvest_runner,
             vault_locks:      Arc::new(std::sync::Mutex::new(HashMap::new())),
             update_source:    Arc::new(CargoRegistryUpdateSource),
@@ -210,6 +215,7 @@ impl Poller {
                     self.poll_pids().await;
                     self.poll_context_updates().await;
                     self.poll_activity_updates().await;
+                    self.poll_message_counts().await;
                     let retention = AppConfig::load()
                         .unwrap_or_default()
                         .session_retention;
@@ -645,6 +651,42 @@ impl Poller {
         }
         for session in changed {
             self.engine.emit(Event::SessionUpdated(session, SessionFields::ACTIVITY));
+        }
+    }
+
+    /// Emit `MessagesDelivered` for every session whose delivered-message
+    /// count moved since the last tick. Both `ninox send` (another process)
+    /// and this process's own reactions bump the counter, so polling the
+    /// store is the one place that sees them all.
+    async fn poll_message_counts(&self) {
+        let Ok(counts) = self.engine.store.message_delivered_counts() else { return };
+        let mut changed = Vec::new();
+        {
+            let mut cache = self.message_count_cache.lock().unwrap();
+            // The first tick only takes a baseline: everything delivered
+            // before this poller started is history, not news. After that a
+            // session without a cache entry is genuinely new, and its whole
+            // count is news — unlike `poll_context_updates`, whose per-key
+            // silent seeding would swallow the first message to every
+            // session spawned after startup.
+            let Some(cache) = cache.as_mut() else {
+                *cache = Some(counts);
+                return;
+            };
+            for (session_id, total) in &counts {
+                let prev = cache.insert(session_id.clone(), *total).unwrap_or(0);
+                // A counter below its last value means the row was deleted
+                // and recreated under the same id (orchestrator ids are
+                // user slugs), so everything on it is new.
+                let new = if *total < prev { *total } else { total - prev };
+                if new > 0 {
+                    changed.push((session_id.clone(), new));
+                }
+            }
+            cache.retain(|session_id, _| counts.contains_key(session_id));
+        }
+        for (session_id, count) in changed {
+            self.engine.emit(Event::MessagesDelivered { session_id, count });
         }
     }
 
@@ -2611,6 +2653,122 @@ mod tests {
         assert!(matches!(session.status, SessionStatus::PrOpen));
         let events = drain_events(&mut rx);
         assert!(!events.iter().any(|e| matches!(e, Event::Notification(_))));
+    }
+
+    #[tokio::test]
+    async fn message_counts_first_sighting_is_seeded_silently() {
+        use crate::store::Store;
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.record_message_delivered("orch-1").unwrap();
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_message_counts().await;
+
+        assert!(
+            !drain_events(&mut rx).iter().any(|e| matches!(e, Event::MessagesDelivered { .. })),
+            "deliveries that predate the poller must not read as new on startup",
+        );
+    }
+
+    #[tokio::test]
+    async fn message_counts_treat_a_session_first_seen_after_startup_as_all_new() {
+        use crate::store::Store;
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+        poller.poll_message_counts().await;
+        drain_events(&mut rx);
+
+        store.record_message_delivered("orch-new").unwrap();
+        poller.poll_message_counts().await;
+
+        let deltas: Vec<(String, u64)> = drain_events(&mut rx).iter().filter_map(|e| match e {
+            Event::MessagesDelivered { session_id, count } => Some((session_id.clone(), *count)),
+            _ => None,
+        }).collect();
+        assert_eq!(deltas, vec![("orch-new".to_string(), 1)], "the first message to a new session is news");
+    }
+
+    #[tokio::test]
+    async fn message_counts_treat_a_counter_that_restarted_as_all_new() {
+        use crate::store::Store;
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        for _ in 0..5 { store.record_message_delivered("orch-1").unwrap(); }
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+        poller.poll_message_counts().await;
+        drain_events(&mut rx);
+
+        // Same id removed and recreated between two ticks: the counter row
+        // restarts at 1 while the cache still remembers 5.
+        store.delete_session("orch-1").unwrap();
+        store.record_message_delivered("orch-1").unwrap();
+        store.record_message_delivered("orch-1").unwrap();
+        poller.poll_message_counts().await;
+
+        let deltas: Vec<(String, u64)> = drain_events(&mut rx).iter().filter_map(|e| match e {
+            Event::MessagesDelivered { session_id, count } => Some((session_id.clone(), *count)),
+            _ => None,
+        }).collect();
+        assert_eq!(deltas, vec![("orch-1".to_string(), 2)]);
+    }
+
+    #[tokio::test]
+    async fn message_counts_forget_a_session_whose_counter_row_is_gone() {
+        use crate::store::Store;
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        for _ in 0..5 { store.record_message_delivered("orch-1").unwrap(); }
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+        poller.poll_message_counts().await;
+        drain_events(&mut rx);
+
+        store.delete_session("orch-1").unwrap();
+        poller.poll_message_counts().await;
+        assert!(drain_events(&mut rx).is_empty());
+
+        store.record_message_delivered("orch-1").unwrap();
+        poller.poll_message_counts().await;
+
+        let deltas: Vec<(String, u64)> = drain_events(&mut rx).iter().filter_map(|e| match e {
+            Event::MessagesDelivered { session_id, count } => Some((session_id.clone(), *count)),
+            _ => None,
+        }).collect();
+        assert_eq!(deltas, vec![("orch-1".to_string(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn message_counts_emit_once_per_change_with_the_number_of_new_messages() {
+        use crate::store::Store;
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.record_message_delivered("orch-1").unwrap();
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+        poller.poll_message_counts().await;
+        drain_events(&mut rx);
+
+        store.record_message_delivered("orch-1").unwrap();
+        store.record_message_delivered("orch-1").unwrap();
+        poller.poll_message_counts().await;
+
+        let events = drain_events(&mut rx);
+        let deltas: Vec<(String, u64)> = events.iter().filter_map(|e| match e {
+            Event::MessagesDelivered { session_id, count } => Some((session_id.clone(), *count)),
+            _ => None,
+        }).collect();
+        assert_eq!(deltas, vec![("orch-1".to_string(), 2)]);
+
+        poller.poll_message_counts().await;
+        assert!(
+            !drain_events(&mut rx).iter().any(|e| matches!(e, Event::MessagesDelivered { .. })),
+            "an unchanged count must not re-emit",
+        );
     }
 
     /// Work requests recorded by `ninox request-work` surface exactly one
