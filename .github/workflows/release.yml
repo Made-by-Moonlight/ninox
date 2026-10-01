@@ -124,11 +124,11 @@ jobs:
           echo "Releasing v$next (was $current, bump: $BUMP)"
 
           # Crate versions (hand-aligned manifests — preserve the spacing)
-          # and the ninox-core/ninox-server pins in dependent crates.
+          # and the ninox-ptyd/ninox-core/ninox-server pins in dependent crates.
           perl -pi -e "s/^version(\s+)= \"\Q$current\E\"/version\${1}= \"$next\"/" \
+            crates/ninox-ptyd/Cargo.toml crates/ninox-core/Cargo.toml crates/ninox-server/Cargo.toml crates/ninox-app/Cargo.toml
+          perl -pi -e "s/(ninox-(?:ptyd|core|server)\s*=\s*\{[^}]*version = )\"\Q$current\E\"/\${1}\"$next\"/" \
             crates/ninox-core/Cargo.toml crates/ninox-server/Cargo.toml crates/ninox-app/Cargo.toml
-          perl -pi -e "s/(ninox-(?:core|server)\s*=\s*\{[^}]*version = )\"\Q$current\E\"/\${1}\"$next\"/" \
-            crates/ninox-server/Cargo.toml crates/ninox-app/Cargo.toml
           cargo update --workspace
 
           # Release notes grouped angular-style. Tolerate the same leading

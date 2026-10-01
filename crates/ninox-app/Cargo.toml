@@ -9,7 +9,7 @@ repository  = "https://github.com/Made-by-Moonlight/ninox"
 [dependencies]
 ninox-core   = { path = "../ninox-core", version = "0.28.0" }
 ninox-server = { path = "../ninox-server", version = "0.28.0" }
-ninox-ptyd   = { path = "../ninox-ptyd", version = "0.27.0" }
+ninox-ptyd   = { path = "../ninox-ptyd", version = "0.28.0" }
 tokio         = { workspace = true }
 anyhow        = { workspace = true }
 tracing       = { workspace = true }

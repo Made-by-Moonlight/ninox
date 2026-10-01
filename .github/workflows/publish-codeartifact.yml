@@ -166,7 +166,7 @@ jobs:
           set -euo pipefail
           metadata=$(cargo metadata --no-deps --format-version 1)
           any=false
-          for entry in core:ninox-core server:ninox-server app:ninox; do
+          for entry in ptyd:ninox-ptyd core:ninox-core server:ninox-server app:ninox; do
             key="${entry%%:*}"
             crate="${entry##*:}"
             version=$(echo "$metadata" | jq -r --arg n "$crate" '.packages[] | select(.name==$n) | .version')
@@ -334,6 +334,12 @@ jobs:
           echo "Timed out waiting for the CodeArtifact index to include all locked versions." >&2
           tail -n 20 /tmp/cargo-fetch.log >&2
           exit 1
+
+      - name: Publish ninox-ptyd
+        if: steps.config.outputs.configured == 'true' && steps.plan.outputs.ptyd_publish == 'true'
+        run: |
+          cargo publish -p ninox-ptyd --registry "$CODEARTIFACT_REPOSITORY"
+          /tmp/wait-for-crate.sh ninox-ptyd "${{ steps.plan.outputs.ptyd_version }}"
 
       - name: Publish ninox-core
         if: steps.config.outputs.configured == 'true' && steps.plan.outputs.core_publish == 'true'
