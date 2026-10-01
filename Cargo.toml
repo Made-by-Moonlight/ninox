@@ -3,6 +3,7 @@ members = [
     "crates/ninox-core",
     "crates/ninox-server",
     "crates/ninox-app",
+    "crates/ninox-ptyd",
 ]
 resolver = "2"
 
@@ -48,3 +49,6 @@ time        = { version = "0.3", features = ["formatting"] }
 # SigV4-signed requests) rides the same TLS stack as the rest of the workspace.
 aws-config  = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls", "sso"] }
 aws-sdk-s3  = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+ratatui     = "0.29"
+crossterm   = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"

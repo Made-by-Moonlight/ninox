@@ -8,14 +8,14 @@
 //! (the "migration" path) so no separate registration step is needed at
 //! spawn time.
 
-use crate::{store::Store, tmux, types::OrchestratorRuntimeIdentity};
+use crate::{runtime, store::Store, types::OrchestratorRuntimeIdentity};
 use anyhow::{Context, Result};
 
 pub fn authorize_orchestrator(
     store: &Store,
     orchestrator_id: Option<&str>,
     caller_type: Option<&str>,
-    runtime: Option<&tmux::TmuxPaneIdentity>,
+    runtime: Option<&runtime::PaneIdentity>,
 ) -> Result<String> {
     let orchestrator_id = orchestrator_id
         .filter(|id| !id.is_empty())
@@ -32,7 +32,7 @@ pub fn authorize_orchestrator(
     let mut persisted = store.orchestrator_runtime_identity(orchestrator_id)?;
     if persisted.is_none()
         && runtime.physical_tmux_name == orchestrator_id
-        && tmux::caller_descends_from(runtime.pane_pid)
+        && runtime::caller_descends_from(runtime.pane_pid)
     {
         let registered_at = crate::lifecycle::poller::now_millis();
         let migrated = OrchestratorRuntimeIdentity {
@@ -59,7 +59,7 @@ pub fn authorize_orchestrator(
             && persisted.pane_id == runtime.pane_id
             && persisted.root_pid == runtime.pane_pid
             && (persisted.root_created_at - runtime.pane_created_at).abs() <= 2_000
-            && tmux::caller_descends_from(persisted.root_pid),
+            && runtime::caller_descends_from(persisted.root_pid),
         "caller is not running under the immutable orchestrator runtime"
     );
     Ok(orchestrator_id.to_string())

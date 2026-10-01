@@ -344,6 +344,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_viewer_client_never_resizes_the_window() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        let engine = test_engine();
+        tmux::create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        let app = AttachedClient::spawn(engine.clone(), id.clone(), tmux::attach_args(&id).await, 100, 30, 1).unwrap();
+        sleep(Duration::from_millis(400)).await;
+        assert_eq!(tmux::window_size(&id).await, Some((100, 30)));
+
+        let argv = crate::runtime::viewer_attach_args(tmux::attach_args(&id).await);
+        let viewer = AttachedClient::spawn(engine.clone(), id.clone(), argv, 80, 24, 2).unwrap();
+        sleep(Duration::from_millis(300)).await;
+        // Typing makes the viewer the latest client, which would win under
+        // `window-size latest` without ignore-size.
+        viewer.write(b"x".to_vec());
+        sleep(Duration::from_millis(400)).await;
+        assert_eq!(tmux::window_size(&id).await, Some((100, 30)), "the viewer resized the agent's window");
+
+        drop(viewer);
+        drop(app);
+        tmux::kill_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn shift_enter_csi_u_reaches_kitty_enabled_app() {
         if !tmux_available() { return; }
         // extended-keys-format csi-u (how tmux disambiguates Shift+Enter for

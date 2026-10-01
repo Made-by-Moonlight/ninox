@@ -77,8 +77,124 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// Decide what a session's status becomes when its tmux pane is found
+/// gone at startup. `has_resume_args` is the harness's capability (from
+/// `HarnessRegistry::resume_cmd(...).is_some()` against a placeholder id —
+/// callers don't have a real command to build yet, just the capability
+/// check), not whether resume has ever been attempted.
+pub(crate) fn reconciled_status_for_dead_session(
+    claude_session_id: &Option<String>,
+    has_resume_args:   bool,
+) -> SessionStatus {
+    if claude_session_id.is_some() && has_resume_args {
+        SessionStatus::Interrupted
+    } else {
+        SessionStatus::Terminated
+    }
+}
+
+/// Reconcile one session whose tmux session is already known to be gone.
+/// Re-reads the live row (the caller has just awaited `tmux::has_session`,
+/// so its snapshot is stale), leaves rows that went terminal meanwhile
+/// alone, and writes the reconciled status: Interrupted when the harness
+/// can `--resume` it, Terminated — stamped with `terminal_at` so the
+/// retention sweep gives it a window instead of purging on sight —
+/// otherwise. Returns the written row so callers with an `Engine` can emit
+/// `SessionUpdated`. Shared by the poller's startup sweep and `ninox
+/// connect`: a connect attempt right after a reboot runs before any
+/// daemon has reconciled, and must not burn resumability the sweep would
+/// have preserved.
+pub fn reconcile_dead_session(
+    store:      &crate::store::Store,
+    registry:   &crate::harness::HarnessRegistry,
+    session_id: &str,
+) -> anyhow::Result<Option<Session>> {
+    let Some(mut live) = store.get_session(session_id)? else { return Ok(None) };
+    if live.status.is_terminal() {
+        return Ok(None);
+    }
+    let agent = crate::config::AgentConfig {
+        harness: live.agent_type.clone(),
+        model:   live.model.clone(),
+    };
+    let has_resume = registry.resume_cmd(&agent, "placeholder").is_some();
+    let last_status = live.status.clone();
+    live.status = reconciled_status_for_dead_session(&live.claude_session_id, has_resume);
+    if live.status == SessionStatus::Terminated {
+        live.terminal_at = Some(now_millis());
+    }
+    store.upsert_session(&live)?;
+    crate::fleet::record_interruption(store, &live.id, live.started_at, &last_status, now_millis());
+    if let (SessionStatus::Terminated, Some(at)) = (&live.status, live.terminal_at) {
+        if let Err(e) = store.mark_reconciled_terminal(&live.id, at) {
+            tracing::warn!("fleet: mark {} reconciled-terminated: {e}", live.id);
+        }
+    }
+    Ok(Some(live))
+}
+
+/// Follow a branch the agent created (git wrapper metadata) so restore's
+/// workspace check compares against the branch it actually works on.
+fn sync_recorded_branch(store: &crate::store::Store, session_id: &str, branch: &str) {
+    let recorded = store.fleet_record(session_id).ok().flatten().and_then(|r| r.branch);
+    if recorded.as_deref() == Some(branch) {
+        return;
+    }
+    if let Err(e) = store.set_session_branch(session_id, branch) {
+        tracing::warn!("fleet: record branch {branch} for {session_id}: {e}");
+    }
+}
+
+/// Mirror delivered-from-file work requests into the store; only those in
+/// `sent` actually reached the orchestrator.
+fn record_work_requests(
+    store:   &crate::store::Store,
+    session: &Session,
+    pending: &[hooks::WorkRequest],
+    sent:    &std::collections::HashSet<String>,
+    now:     i64,
+) {
+    for request in pending {
+        // Requests filed before the table existed have no row; mirror
+        // them now so the fleet history is complete.
+        let _ = store.insert_work_request(&crate::store::WorkRequestRow {
+            id:              request.id.clone(),
+            from_session:    session.id.clone(),
+            orchestrator_id: session.orchestrator_id.clone(),
+            body:            request.description.clone(),
+            created_at:      request.requested_at,
+            delivered_at:    None,
+            resolved_at:     None,
+        });
+        if !sent.contains(&request.id) {
+            continue;
+        }
+        if let Err(e) = store.mark_work_request_delivered(&request.id, now) {
+            tracing::warn!("record work request {} delivered: {e}", request.id);
+        }
+    }
+}
+
+/// Runs a fleet restore; see `Poller::with_fleet_restorer`.
+pub type FleetRestorer = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
+/// Liveness check used by reconciliation; injectable for tests.
+type LivenessCheck<'a> = &'a (dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::runtime::Liveness> + Send>> + Sync);
+
+/// Arbitrary; how often a reconciliation retry may try to start the ptyd
+/// host again.
+const PREPARE_LIVENESS_EVERY_MS: i64 = 60_000;
+
 pub struct Poller {
     engine:           Arc<Engine>,
+    fleet_restorer:   Option<FleetRestorer>,
+    /// Sessions startup reconciliation couldn't judge because the ptyd host
+    /// didn't answer. Retried on the pid tick; `poll_pids` leaves them alone
+    /// meanwhile, since a pid check would burn their resumability.
+    unreconciled:     Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    last_liveness_prepare: Arc<std::sync::Mutex<i64>>,
     enrichment_cache: Arc<std::sync::Mutex<EnrichmentCache>>,
     /// Last-seen `(cost_usd, context_used_pct, context_total_tokens)` per
     /// session, used solely to detect changes written externally by the
@@ -140,6 +256,9 @@ impl Poller {
     pub fn new_with_harvest_runner(engine: Arc<Engine>, harvest_runner: Arc<dyn HarvestRunner>) -> Self {
         Self {
             engine,
+            fleet_restorer:   None,
+            unreconciled:     Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            last_liveness_prepare: Arc::new(std::sync::Mutex::new(0)),
             enrichment_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             context_cache:    Arc::new(std::sync::Mutex::new(HashMap::new())),
             activity_cache:   Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -195,7 +314,125 @@ impl Poller {
             .clone()
     }
 
+    /// Inject what `[fleet] restore_policy = "auto"` runs after startup
+    /// reconciliation (the app's `ninox fleet restore` executor). Without
+    /// one, `auto` degrades to `prompt`.
+    pub fn with_fleet_restorer(mut self, restorer: FleetRestorer) -> Self {
+        self.fleet_restorer = Some(restorer);
+        self
+    }
+
+    async fn apply_restore_policy(&self) {
+        let policy = AppConfig::load().unwrap_or_default().fleet.restore_policy;
+        let store = &self.engine.store;
+        match crate::fleet::startup::on_engine_startup(store, policy, now_millis()) {
+            crate::fleet::StartupAction::AutoRestore(summary) => match &self.fleet_restorer {
+                Some(restore) => {
+                    tracing::info!(
+                        "fleet: auto-restoring {} worker(s) and {} orchestrator(s)",
+                        summary.workers, summary.orchestrators,
+                    );
+                    // Spawned: a restore waits on harness prompts for
+                    // minutes and must not hold up the poll loop.
+                    tokio::spawn(restore());
+                }
+                None => crate::fleet::startup::flag_pending_restore(store, now_millis()),
+            },
+            crate::fleet::StartupAction::FlaggedPending(summary) => tracing::info!(
+                "fleet: restore pending ({} worker(s), {} orchestrator(s)) — run `ninox fleet restore`",
+                summary.workers, summary.orchestrators,
+            ),
+            crate::fleet::StartupAction::Nothing => {}
+        }
+    }
+
+    /// One-shot startup sweep: any non-terminal session whose pane no longer
+    /// exists lost it to a host death (reboot). Mark it Interrupted when its
+    /// harness can --resume it, Terminated otherwise. Runs before the first
+    /// poll_pids tick: poll_pids only checks pid liveness and would mark
+    /// these Terminated, destroying resumability.
+    ///
+    /// "Pane gone" must be a real answer. After a reboot the ptyd host isn't
+    /// running yet, so it is started first and a fresh host that doesn't
+    /// know a pane means Dead. A host that still doesn't answer (mid-upgrade,
+    /// slow start) proves nothing: those sessions are deferred and retried.
+    async fn reconcile_dead_sessions(&self) {
+        *self.last_liveness_prepare.lock().unwrap_or_else(|e| e.into_inner()) = now_millis();
+        crate::runtime::prepare_liveness().await;
+        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+        let ids = sessions.into_iter().filter(|s| !s.status.is_terminal()).map(|s| s.id).collect();
+        self.reconcile_sessions(ids, &|id| Box::pin(async move { crate::runtime::liveness(&id).await })).await;
+    }
+
+    /// Reconcile `ids` against `check`; returns whether any was found dead.
+    /// Replaces the deferred set with whatever is still unknown.
+    async fn reconcile_sessions(&self, ids: Vec<String>, check: LivenessCheck<'_>) -> bool {
+        use crate::runtime::Liveness;
+        let registry = AppConfig::load().unwrap_or_default().registry();
+        let mut deferred = std::collections::HashSet::new();
+        let mut reconciled = false;
+        for id in ids {
+            match check(id.clone()).await {
+                Liveness::Live => {}
+                Liveness::Unknown => {
+                    deferred.insert(id);
+                }
+                Liveness::Dead => match reconcile_dead_session(&self.engine.store, &registry, &id) {
+                    Ok(Some(live)) => {
+                        reconciled = true;
+                        self.engine.emit(Event::SessionUpdated(live, SessionFields::STATUS));
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("reconcile {id}: {e}"),
+                },
+            }
+        }
+        if !deferred.is_empty() {
+            tracing::warn!(
+                "ptyd host not answering: {} session(s) left unreconciled, retrying",
+                deferred.len(),
+            );
+        }
+        *self.unreconciled.lock().unwrap_or_else(|e| e.into_inner()) = deferred;
+        reconciled
+    }
+
+    /// Pid-tick retry of the sessions [`reconcile_dead_sessions`] deferred.
+    async fn retry_unreconciled(&self, check: LivenessCheck<'_>) {
+        let ids: Vec<String> = self.unreconciled.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
+        if ids.is_empty() {
+            return;
+        }
+        let ids = ids.into_iter()
+            .filter(|id| self.engine.store.get_session(id).ok().flatten().is_some_and(|s| !s.status.is_terminal()))
+            .collect();
+        if self.reconcile_sessions(ids, check).await {
+            self.apply_restore_policy().await;
+        }
+    }
+
+    async fn retry_unreconciled_live(&self) {
+        if self.unreconciled.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            return;
+        }
+        let due = {
+            let mut last = self.last_liveness_prepare.lock().unwrap_or_else(|e| e.into_inner());
+            let due = now_millis() - *last >= PREPARE_LIVENESS_EVERY_MS;
+            if due {
+                *last = now_millis();
+            }
+            due
+        };
+        if due {
+            crate::runtime::prepare_liveness().await;
+        }
+        self.retry_unreconciled(&|id| Box::pin(async move { crate::runtime::liveness(&id).await })).await;
+    }
+
     pub async fn start(self, token: CancellationToken) {
+        self.reconcile_dead_sessions().await;
+        self.apply_restore_policy().await;
+
         let mut pid_interval    = tokio::time::interval(Duration::from_secs(5));
         let mut usage_interval  = tokio::time::interval(Duration::from_secs(10));
         let mut github_interval = tokio::time::interval(Duration::from_secs(30));
@@ -212,6 +449,7 @@ impl Poller {
             tokio::select! {
                 _ = token.cancelled()      => break,
                 _ = pid_interval.tick()    => {
+                    self.retry_unreconciled_live().await;
                     self.poll_pids().await;
                     self.poll_context_updates().await;
                     self.poll_activity_updates().await;
@@ -331,8 +569,12 @@ impl Poller {
         self.sync_sessions_metadata(&AppConfig::sessions_dir()).await;
 
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
+        let unreconciled = self.unreconciled.lock().unwrap_or_else(|e| e.into_inner()).clone();
         for mut session in sessions {
             if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted) {
+                continue;
+            }
+            if unreconciled.contains(&session.id) {
                 continue;
             }
             if let Some(pid) = session.pid {
@@ -367,6 +609,9 @@ impl Poller {
             let Ok(meta) = hooks::read_session_metadata(sessions_dir, &session.id) else {
                 continue;
             };
+            if let Some(branch) = meta.branch.as_deref() {
+                sync_recorded_branch(&self.engine.store, &session.id, branch);
+            }
 
             // -- First reported PR becomes the session's tracked PR --
             if session.pr_number.is_none() {
@@ -533,6 +778,7 @@ impl Poller {
             Ok(p) if !p.is_empty() => p,
             _ => return,
         };
+        let mut sent = std::collections::HashSet::new();
         for request in &pending {
             self.engine.emit(Event::Notification(Notification {
                 id:         format!("work-request-{}", request.id),
@@ -546,18 +792,21 @@ impl Poller {
                 let msg = crate::lifecycle::reactions::format_work_request_reaction(
                     session, &request.description,
                 );
-                if let Err(e) = self.engine.send_to_session(&orch, &msg).await {
-                    tracing::warn!("send work request to orchestrator {orch}: {e}");
+                match self.engine.send_to_session(&orch, &msg).await {
+                    Ok(()) => { sent.insert(request.id.clone()); }
+                    Err(e) => tracing::warn!("send work request to orchestrator {orch}: {e}"),
                 }
             }
         }
-        // Marked delivered even when the tmux nudge failed — the UI
+        // Moved out of the pending set even when the nudge failed — the UI
         // notification is already out, and retrying every tick would spam
-        // both channels.
+        // both channels. The store row keeps `delivered_at` empty instead,
+        // so the orchestrator's next recovery briefing carries it.
         let ids: Vec<String> = pending.iter().map(|r| r.id.clone()).collect();
         if let Err(e) = hooks::mark_work_requests_delivered(sessions_dir, &session.id, &ids) {
             tracing::warn!("mark work requests delivered for {}: {e}", session.id);
         }
+        record_work_requests(&self.engine.store, session, &pending, &sent, now_millis());
     }
 
     // ── Cost / context-window usage ─────────────────────────────────────────
@@ -1834,6 +2083,8 @@ impl Poller {
         let orch_ids: std::collections::HashSet<&str> =
             orchestrators.iter().map(|o| o.id.as_str()).collect();
 
+        let fleet = self.engine.store.fleet_records().unwrap_or_default();
+
         let now = now_millis();
         let retention_ms = retention.retention_millis();
 
@@ -1842,6 +2093,15 @@ impl Poller {
                 continue;
             }
             if self.engine.store.is_worker_retained(&session.id).unwrap_or(false) {
+                continue;
+            }
+            // A restore candidate the user hasn't restored yet (manual
+            // policy, or a declined prompt) keeps its row and worktree.
+            // Merged ones don't need restoring, so the merged fallback
+            // below still reclaims them.
+            let pending_restore = fleet.get(&session.id)
+                .is_some_and(|r| crate::fleet::awaits_restore(&session, r));
+            if pending_restore && session.merged_at.is_none() {
                 continue;
             }
             let terminal =
@@ -2188,6 +2448,56 @@ mod tests {
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
         }
+    }
+
+    #[test]
+    fn reconcile_marks_the_terminated_row_it_writes_as_a_restore_candidate() {
+        use crate::store::Store;
+        let store = Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap();
+        // No claude_session_id: can't resume, so reconciled to Terminated.
+        store.upsert_session(&test_session("dead-1", "/ws")).unwrap();
+        let registry = crate::harness::HarnessRegistry::from_config(&Default::default());
+        let live = reconcile_dead_session(&store, &registry, "dead-1").unwrap().unwrap();
+        assert_eq!(live.status, SessionStatus::Terminated);
+        let record = store.fleet_record("dead-1").unwrap().unwrap();
+        assert_eq!(record.reconciled_terminal_at, live.terminal_at);
+        assert!(crate::fleet::awaits_restore(&live, &record));
+    }
+
+    /// An engine starting while ptyd is mid-upgrade must not mark the
+    /// sessions it can't see Interrupted; once the host answers they are
+    /// judged for real.
+    #[tokio::test]
+    async fn unreachable_ptyd_defers_reconciliation_instead_of_marking_sessions_dead() {
+        use crate::runtime::Liveness;
+        use crate::store::Store;
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        for id in ["unseen", "dead"] {
+            store.upsert_session(&test_session(id, "/ws")).unwrap();
+        }
+        let poller = Poller::new(Engine::new(store.clone()));
+
+        let host_down = |id: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = Liveness> + Send>> {
+            Box::pin(async move { if id == "unseen" { Liveness::Unknown } else { Liveness::Dead } })
+        };
+        poller.reconcile_sessions(vec!["unseen".into(), "dead".into()], &host_down).await;
+        assert_eq!(store.get_session("unseen").unwrap().unwrap().status, SessionStatus::Working);
+        assert_eq!(store.get_session("dead").unwrap().unwrap().status, SessionStatus::Terminated);
+        assert!(poller.unreconciled.lock().unwrap().contains("unseen"));
+
+        // poll_pids must not burn its resumability with a stale pid either.
+        let mut s = store.get_session("unseen").unwrap().unwrap();
+        s.pid = Some(999_999);
+        store.upsert_session(&s).unwrap();
+        poller.poll_pids().await;
+        assert_eq!(store.get_session("unseen").unwrap().unwrap().status, SessionStatus::Working);
+
+        let host_up_without_it = |_: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = Liveness> + Send>> {
+            Box::pin(async { Liveness::Dead })
+        };
+        poller.retry_unreconciled(&host_up_without_it).await;
+        assert_eq!(store.get_session("unseen").unwrap().unwrap().status, SessionStatus::Terminated);
+        assert!(poller.unreconciled.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2807,6 +3117,45 @@ mod tests {
             !events.iter().any(|e| matches!(e, Event::Notification(_))),
             "delivered work requests must not fire again",
         );
+    }
+
+    /// A worker that creates its own branch (`git checkout -b`, recorded by
+    /// the git wrapper) must have that branch recorded for restore, not the
+    /// one it was spawned on.
+    #[tokio::test]
+    async fn metadata_sync_records_the_branch_the_agent_created() {
+        use crate::store::Store;
+        let sessions_dir = tempfile::tempdir().unwrap();
+        std::fs::write(sessions_dir.path().join("s1.json"), r#"{"branch": "feat/parser"}"#).unwrap();
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", "/ws")).unwrap();
+        store.record_spawn_facts("s1", "brief", Some("s1")).unwrap();
+        let poller = Poller::new(Engine::new(store.clone()));
+
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        let r = store.fleet_record("s1").unwrap().unwrap();
+        assert_eq!(r.branch.as_deref(), Some("feat/parser"));
+        assert_eq!(r.task_brief.as_deref(), Some("brief"));
+    }
+
+    /// During a restore workers resume before their orchestrator, so the
+    /// nudge to it fails; the request must stay undelivered in the store so
+    /// the orchestrator's recovery briefing carries it.
+    #[test]
+    fn work_requests_that_never_reached_the_orchestrator_stay_undelivered() {
+        use crate::store::Store;
+        let store = Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap();
+        let mut session = test_session("w1", "/ws");
+        session.orchestrator_id = Some("o1".into());
+        let req = |id: &str| hooks::WorkRequest { id: id.into(), description: format!("do {id}"), requested_at: 5 };
+        let sent: std::collections::HashSet<String> = ["ok".to_string()].into();
+
+        record_work_requests(&store, &session, &[req("ok"), req("failed")], &sent, 9);
+
+        let rows = store.open_work_requests(Some("o1")).unwrap();
+        let delivered: Vec<_> = rows.iter().map(|r| (r.id.as_str(), r.delivered_at)).collect();
+        assert_eq!(delivered, [("failed", None), ("ok", Some(9))]);
     }
 
     /// A worker can request work and exit before the next tick — the request
@@ -5756,6 +6105,37 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, Event::SessionDone(id) if id == "expired")));
     }
 
+    /// Reconciliation stamps an un-resumable dead session `Terminated` with
+    /// a `terminal_at`; under a manual restore policy it must still be
+    /// there (worktree included) when the user gets round to restoring.
+    #[tokio::test]
+    async fn sweep_retired_sessions_keeps_unrestored_fleet_candidates() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let long_ago = now_millis() - SessionRetentionConfig::default().retention_millis() - 1_000;
+        for id in ["sweep-candidate", "sweep-not-candidate"] {
+            let mut s = test_session(id, "/ws");
+            s.status = SessionStatus::Terminated;
+            s.terminal_at = Some(long_ago);
+            store.upsert_session(&s).unwrap();
+            store.record_interruption(id, long_ago - 1, &SessionStatus::Working, Some("reboot")).unwrap();
+        }
+        store.mark_reconciled_terminal("sweep-candidate", long_ago).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+        poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
+
+        assert!(store.get_session("sweep-candidate").unwrap().is_some(), "awaiting restore: kept");
+        assert!(store.get_session("sweep-not-candidate").unwrap().is_none());
+        let events = drain_events(&mut rx);
+        assert!(!events.iter().any(|e| matches!(
+            e, Event::Notification(n) if n.session_id.as_deref() == Some("sweep-candidate")
+        )), "no 'retired' notice for a session still awaiting restore");
+    }
+
     /// A session terminated via a direct user action
     /// (`terminate_session`/`remove_session`) never gets `terminal_at`
     /// stamped — those must stay "immediate", so the sweep purges them on
@@ -5890,6 +6270,88 @@ mod tests {
             e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerRetired
         )).count();
         assert_eq!(retired_notifs, 0, "must not re-notify a session already told about its merge");
+    }
+
+    // ── Dead-session reconciliation ─────────────────────────────────────────
+
+    fn test_poller() -> (Poller, std::sync::Arc<crate::store::Store>) {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let engine = Engine::new(store.clone());
+        (Poller::new(engine), store)
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_dead_session_interrupted_when_resumable() {
+        // Session in Working state, a claude_session_id, and no live tmux
+        // session behind it (tests never create real tmux sessions on the
+        // private socket, so has_session() is false).
+        let (poller, store) = test_poller();
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Working;
+        s.claude_session_id = Some("abc".into());
+        s.agent_type = "claude-code".into(); // default harness: has resume args
+        store.upsert_session(&s).unwrap();
+
+        poller.reconcile_dead_sessions().await;
+
+        let after = store.get_session("w1").unwrap().unwrap();
+        assert_eq!(after.status, SessionStatus::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_the_interruption_for_fleet_restore() {
+        let (poller, store) = test_poller();
+        let mut s = test_session("w3", "/ws");
+        s.status = SessionStatus::PrOpen;
+        s.claude_session_id = Some("abc".into());
+        s.agent_type = "claude-code".into();
+        store.upsert_session(&s).unwrap();
+
+        poller.reconcile_dead_sessions().await;
+
+        let rec = store.fleet_record("w3").unwrap().expect("interruption recorded");
+        assert_eq!(rec.last_status, Some(SessionStatus::PrOpen));
+        assert!(rec.interrupted_at.is_some());
+        assert!(rec.interrupt_cause.is_some());
+        assert!(rec.awaiting_restore());
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_terminal_sessions() {
+        let (poller, store) = test_poller();
+        let mut s = test_session("w2", "/ws");
+        s.status = SessionStatus::Done;
+        store.upsert_session(&s).unwrap();
+
+        poller.reconcile_dead_sessions().await;
+
+        assert_eq!(store.get_session("w2").unwrap().unwrap().status, SessionStatus::Done);
+    }
+
+    #[test]
+    fn session_with_id_and_resumable_harness_becomes_interrupted() {
+        assert_eq!(
+            reconciled_status_for_dead_session(&Some("uuid-1".into()), true),
+            SessionStatus::Interrupted,
+        );
+    }
+
+    #[test]
+    fn legacy_session_without_id_becomes_terminated() {
+        assert_eq!(
+            reconciled_status_for_dead_session(&None, true),
+            SessionStatus::Terminated,
+        );
+    }
+
+    #[test]
+    fn session_under_non_resumable_harness_becomes_terminated_even_with_an_id() {
+        assert_eq!(
+            reconciled_status_for_dead_session(&Some("uuid-1".into()), false),
+            SessionStatus::Terminated,
+        );
     }
 
     /// A worker kept alive past its merge (`[auto_reap]` off, `merged_at`

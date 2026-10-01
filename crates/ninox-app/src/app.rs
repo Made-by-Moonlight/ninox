@@ -547,6 +547,7 @@ pub enum Message {
     /// Replaces the `SettingsToggleInboxMessaging` bool: the inbox is now
     /// one of three mutually exclusive mechanisms rather than on/off.
     SettingsSetSendMechanism(SendMechanism),
+    SettingsSetRuntimeBackend(ninox_core::runtime::Backend),
     /// Flip the opt-in consolidated PR-watching toggle (`[pr_watch].enabled`,
     /// default off — see `ninox_core::config::PrWatchConfig`).
     SettingsTogglePrWatch,
@@ -752,97 +753,6 @@ fn adopts_terminal_status(known: &SessionStatus, from_store: &SessionStatus) -> 
     from_store.is_terminal() && from_store != known
 }
 
-/// Decide what a session's status becomes when its tmux pane is found
-/// gone at startup. `has_resume_args` is the harness's capability (from
-/// `HarnessRegistry::resume_cmd(...).is_some()` against a placeholder id —
-/// callers don't have a real command to build yet, just the capability
-/// check), not whether resume has ever been attempted.
-fn reconciled_status_for_dead_session(
-    claude_session_id: &Option<String>,
-    has_resume_args:   bool,
-) -> SessionStatus {
-    if claude_session_id.is_some() && has_resume_args {
-        SessionStatus::Interrupted
-    } else {
-        SessionStatus::Terminated
-    }
-}
-
-async fn reconcile_live_sessions_at_startup_with<F, Fut>(
-    engine: &Engine,
-    registry: &ninox_core::harness::HarnessRegistry,
-    exact_legacy_lookup: F,
-) where
-    F: Fn(String) -> Fut,
-    Fut: std::future::Future<
-        Output = anyhow::Result<Option<ninox_core::tmux::ExactTmuxSession>>,
-    >,
-{
-    use ninox_core::{tmux, Event as CoreEvent};
-
-    let sessions = match engine.store.list_sessions() {
-        Ok(sessions) => sessions,
-        Err(error) => {
-            tracing::error!("restore: list_sessions: {error}");
-            return;
-        }
-    };
-    for session in sessions {
-        if matches!(
-            session.status,
-            SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted
-        ) {
-            continue;
-        }
-
-        let runtime_alive = match engine.store.legacy_worker_runtime(&session.id) {
-            Ok(Some(capability)) => {
-                if session.pid != Some(capability.pane_pid) {
-                    continue;
-                }
-                match exact_legacy_lookup(capability.physical_tmux_name.clone()).await {
-                    Ok(Some(runtime))
-                        if runtime.physical_tmux_name == capability.physical_tmux_name
-                            && runtime.pane_id == capability.pane_id
-                            && runtime.pane_pid == capability.pane_pid =>
-                    {
-                        true
-                    }
-                    Ok(None) => false,
-                    // A live but mismatched runtime, multiple panes, or lookup
-                    // failure is uncertain. Never bless it or mutate status.
-                    Ok(Some(_)) | Err(_) => continue,
-                }
-            }
-            Ok(None) => tmux::has_session(&session.id).await,
-            Err(_) => continue,
-        };
-        if runtime_alive {
-            continue;
-        }
-
-        let agent = ninox_core::config::AgentConfig {
-            harness: session.agent_type.clone(),
-            model: session.model.clone(),
-        };
-        let has_resume_args = registry.resume_cmd(&agent, "placeholder").is_some();
-        let new_status =
-            reconciled_status_for_dead_session(&session.claude_session_id, has_resume_args);
-        // Re-read immediately before writing (no await between) and change
-        // only `status`, so a full-row write of the pre-await snapshot
-        // doesn't revert a field the poller stamped during that await (e.g.
-        // `merged_at`) — the read→apply→write convention (see
-        // `poller::update_live_session_row`).
-        let mut dead = match engine.store.get_session(&session.id) {
-            Ok(Some(fresh)) => fresh,
-            _               => session.clone(),
-        };
-        dead.status = new_status;
-        let _ = engine.store.upsert_session(&dead);
-        engine.emit(CoreEvent::SessionUpdated(dead, SessionFields::STATUS));
-    }
-}
-
 /// Apply a `text_editor` action to a Marginalia comment buffer while keeping
 /// it read-only: selection, navigation and scrolling are applied, edits are
 /// dropped. Copy is handled inside the widget itself (it writes the clipboard
@@ -960,176 +870,6 @@ mod poll_adoption_tests {
     #[test]
     fn adopts_a_force_reaped_interrupted_worker_becoming_terminated() {
         assert!(adopts_terminal_status(&SessionStatus::Interrupted, &SessionStatus::Terminated));
-    }
-}
-
-#[cfg(test)]
-mod reconciliation_tests {
-    use super::*;
-
-    fn migrated_live_legacy_worker() -> (tempfile::TempDir, Arc<Engine>) {
-        let root = tempfile::tempdir().unwrap();
-        let db = root.path().join("legacy.db");
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE sessions (
-                id TEXT PRIMARY KEY, orchestrator_id TEXT,
-                name TEXT NOT NULL, repo TEXT NOT NULL,
-                status TEXT NOT NULL, agent_type TEXT NOT NULL,
-                cost_usd REAL NOT NULL DEFAULT 0, started_at INTEGER NOT NULL,
-                pr_number INTEGER, pr_id INTEGER, workspace_path TEXT, pid INTEGER,
-                model TEXT, context_tokens INTEGER, current_incarnation_id TEXT,
-                incarnation TEXT NOT NULL DEFAULT ''
-            );
-            INSERT INTO sessions(
-                id,orchestrator_id,name,repo,status,agent_type,started_at,
-                workspace_path,pid,current_incarnation_id,incarnation
-            ) VALUES (
-                'legacy-live','orch','legacy-live','org/repo','working','cursor-agent',
-                100,'/repo-w1',4242,'inc-live','inc-live'
-            );
-            CREATE TABLE pooled_checkouts (
-                path TEXT PRIMARY KEY, source_repo TEXT NOT NULL,
-                common_git_dir TEXT NOT NULL, slot INTEGER NOT NULL,
-                path_kind TEXT NOT NULL, worktree_git_dir TEXT,
-                worktree_identity TEXT, state TEXT NOT NULL, session_id TEXT,
-                owner_incarnation_id TEXT, lease_id TEXT, branch TEXT,
-                quarantine_reason TEXT
-            );
-            INSERT INTO pooled_checkouts(
-                path,source_repo,common_git_dir,slot,path_kind,state,session_id,
-                owner_incarnation_id,lease_id,branch
-            ) VALUES (
-                '/repo-w1','/repo','/repo/.git',0,'explicit','leased',
-                'legacy-live','inc-live','lease-live','worker-branch'
-            );
-            CREATE TABLE worker_retention (
-                session_id TEXT NOT NULL, orchestrator_id TEXT NOT NULL,
-                incarnation TEXT NOT NULL, retained_at INTEGER NOT NULL,
-                finalized_at INTEGER,
-                PRIMARY KEY(session_id,incarnation)
-            );
-            CREATE TABLE worker_incarnations (
-                session_id TEXT NOT NULL, incarnation_id TEXT NOT NULL,
-                phase TEXT NOT NULL, ui_outcome TEXT,
-                physical_tmux_name TEXT NOT NULL, pane_id TEXT, pane_pid INTEGER,
-                workspace_path TEXT, pool_path TEXT, lease_id TEXT,
-                worktree_identity TEXT, artifact_dir TEXT NOT NULL,
-                started_at INTEGER NOT NULL, terminal_at INTEGER,
-                migration_hold INTEGER NOT NULL DEFAULT 0,
-                allocator_pid INTEGER, allocator_token TEXT,
-                orchestrator_id TEXT, source_workspace TEXT,
-                checkout_backed INTEGER, state TEXT,
-                PRIMARY KEY(session_id,incarnation_id),
-                UNIQUE(physical_tmux_name)
-            );
-            INSERT INTO worker_incarnations VALUES (
-                'legacy-live','inc-live','running',NULL,'nxw-live-inc','%42',4242,
-                '/repo-w1','/repo-w1','lease-live','identity','/sessions/inc-live',
-                100,NULL,0,NULL,NULL,'orch','/repo',1,'active'
-            );
-            ",
-        )
-        .unwrap();
-        drop(conn);
-        let store = Arc::new(ninox_core::store::Store::open(&db).unwrap());
-        (root, Engine::new(store))
-    }
-
-    #[tokio::test]
-    async fn startup_preserves_working_for_exact_live_legacy_runtime() {
-        let (_root, engine) = migrated_live_legacy_worker();
-        let registry = AppConfig::default().registry();
-
-        reconcile_live_sessions_at_startup_with(&engine, &registry, |physical| async move {
-            assert_eq!(physical, "nxw-live-inc");
-            Ok(Some(ninox_core::tmux::ExactTmuxSession {
-                physical_tmux_name: physical,
-                pane_id: "%42".into(),
-                pane_pid: 4242,
-            }))
-        })
-        .await;
-
-        let session = engine.store.get_session("legacy-live").unwrap().unwrap();
-        assert_eq!(session.status, SessionStatus::Working);
-        assert_eq!(session.pid, Some(4242));
-    }
-
-    #[tokio::test]
-    async fn startup_does_not_adopt_ambiguous_legacy_runtime() {
-        let (_root, engine) = migrated_live_legacy_worker();
-        let registry = AppConfig::default().registry();
-
-        reconcile_live_sessions_at_startup_with(&engine, &registry, |_physical| async move {
-            anyhow::bail!("exact physical runtime has multiple panes")
-        })
-        .await;
-
-        assert_eq!(
-            engine.store.get_session("legacy-live").unwrap().unwrap().status,
-            SessionStatus::Working
-        );
-    }
-
-    #[tokio::test]
-    async fn startup_does_not_fall_back_when_legacy_pid_capability_mismatches() {
-        let (_root, engine) = migrated_live_legacy_worker();
-        let registry = AppConfig::default().registry();
-        let mut session = engine.store.get_session("legacy-live").unwrap().unwrap();
-        session.pid = Some(9999);
-        engine.store.upsert_session(&session).unwrap();
-
-        reconcile_live_sessions_at_startup_with(&engine, &registry, |_physical| async move {
-            panic!("mismatched DB capability must not probe or fall back");
-        })
-        .await;
-
-        assert_eq!(
-            engine.store.get_session("legacy-live").unwrap().unwrap().status,
-            SessionStatus::Working
-        );
-    }
-
-    #[tokio::test]
-    async fn startup_interrupts_confirmed_missing_legacy_runtime() {
-        let (_root, engine) = migrated_live_legacy_worker();
-        let registry = AppConfig::default().registry();
-
-        reconcile_live_sessions_at_startup_with(&engine, &registry, |_physical| async move {
-            Ok(None)
-        })
-        .await;
-
-        assert_ne!(
-            engine.store.get_session("legacy-live").unwrap().unwrap().status,
-            SessionStatus::Working
-        );
-    }
-
-    #[test]
-    fn session_with_id_and_resumable_harness_becomes_interrupted() {
-        assert_eq!(
-            reconciled_status_for_dead_session(&Some("uuid-1".into()), true),
-            SessionStatus::Interrupted,
-        );
-    }
-
-    #[test]
-    fn legacy_session_without_id_becomes_terminated() {
-        assert_eq!(
-            reconciled_status_for_dead_session(&None, true),
-            SessionStatus::Terminated,
-        );
-    }
-
-    #[test]
-    fn session_under_non_resumable_harness_becomes_terminated_even_with_an_id() {
-        assert_eq!(
-            reconciled_status_for_dead_session(&Some("uuid-1".into()), false),
-            SessionStatus::Terminated,
-        );
     }
 }
 
@@ -1396,21 +1136,10 @@ impl App {
         };
         Self::resize_terminals(&mut app);
 
-        // Asynchronously mark dead sessions as Terminated.
-        // PTY streaming is NOT started here — we stream on demand when the user
-        // navigates to a session (NavigateSession).  Eagerly streaming at startup
-        // with the wrong default dimensions (140×50) creates competing FIFO readers
-        // that race with NavigateSession and re-populate state.terminals with
-        // wrong-dimension content, causing the garbled-terminal bug.
-        let task = Task::future(async move {
-            let registry = AppConfig::load().unwrap_or_default().registry();
-            reconcile_live_sessions_at_startup_with(&engine, &registry, |physical| async move {
-                ninox_core::tmux::exact_private_session(&physical).await
-            })
-            .await;
-
-            Message::Noop
-        });
+        // Dead-session reconciliation now runs in `Poller::start`
+        // (`reconcile_dead_sessions`) so every host of the poller — GUI and
+        // the headless daemon alike — gets it, not just this startup task.
+        let task = Task::none();
 
         (app, task)
     }
@@ -1445,6 +1174,23 @@ impl App {
     /// harness in-flight immediately (as a `None` entry — pickers fall
     /// through to known_models until the result lands) so a second trigger
     /// before completion doesn't spawn a duplicate subprocess.
+    /// Persist a config change read → apply → write against the file, so an
+    /// edit made meanwhile (e.g. in `nx`'s settings) is never clobbered by
+    /// this process's stale copy; `state.config` becomes the saved result.
+    /// If the file can't be read back, the change only applies in memory.
+    fn persist_config<R>(state: &mut App, what: &str, f: impl Fn(&mut AppConfig) -> R) -> R {
+        match AppConfig::update(&f) {
+            Ok((saved, r)) => {
+                state.config = saved;
+                r
+            }
+            Err(e) => {
+                tracing::warn!("failed to save config ({what}): {e}");
+                f(&mut state.config)
+            }
+        }
+    }
+
     fn ensure_models(state: &mut App, harness: &str) -> Task<Message> {
         if state.model_lists.contains_key(harness) {
             return Task::none();
@@ -1838,15 +1584,22 @@ impl App {
                 let engine = state.engine.clone();
                 let (viewport_cols, viewport_rows) = Self::terminal_size_for(state, &id);
                 let attach_task = Task::future(async move {
-                    if !ninox_core::tmux::has_session(&id).await {
-                        if let Ok(Some(mut s)) = engine.store.get_session(&id) {
-                            s.status = ninox_core::types::SessionStatus::Terminated;
-                            let _ = engine.store.upsert_session(&s);
-                            engine.emit(ninox_core::events::Event::SessionUpdated(
-                                s, ninox_core::types::SessionFields::STATUS,
-                            ));
+                    match ninox_core::runtime::liveness(&id).await {
+                        ninox_core::runtime::Liveness::Live => {}
+                        // ptyd not answering (upgrade, slow start): nothing
+                        // to attach to yet, but no evidence the pane is gone.
+                        ninox_core::runtime::Liveness::Unknown => return Message::Noop,
+                        ninox_core::runtime::Liveness::Dead => {
+                            // Same rule as the poller: Interrupted when the
+                            // harness can resume it, re-reading the row.
+                            let registry = ninox_core::config::AppConfig::load().unwrap_or_default().registry();
+                            if let Ok(Some(s)) = ninox_core::lifecycle::poller::reconcile_dead_session(&engine.store, &registry, &id) {
+                                engine.emit(ninox_core::events::Event::SessionUpdated(
+                                    s, ninox_core::types::SessionFields::STATUS,
+                                ));
+                            }
+                            return Message::Noop;
                         }
-                        return Message::Noop;
                     }
                     let Some(initial_tail) = ninox_core::tmux::prepare_viewport_tail(
                         &id,
@@ -1862,7 +1615,7 @@ impl App {
                     if let Err(e) = ninox_core::pty::start_streaming(engine.clone(), id.clone(), &id).await {
                         tracing::warn!("pipe-pane tap for {id}: {e}");
                     }
-                    let argv = ninox_core::tmux::attach_args(&id).await;
+                    let argv = ninox_core::runtime::attach_args(&id).await;
                     Message::ClientAttach { session_id: id, argv, initial_tail: Some(initial_tail) }
                 });
                 Task::batch(vec![diff_task, attach_task])
@@ -1887,6 +1640,7 @@ impl App {
                 let prepared_at_final_size = initial_tail.is_some();
                 let generation = state.next_client_generation;
                 state.next_client_generation += 1;
+                let argv = ninox_core::runtime::embedded_attach_args(argv);
                 match ninox_core::client::AttachedClient::spawn(
                     state.engine.clone(), session_id.clone(), argv, cols, rows, generation,
                 ) {
@@ -2090,17 +1844,16 @@ impl App {
                     return Task::none();
                 }
 
-                state.config.brain.catalogues.push(ninox_core::config::CatalogueRef {
-                    name: name.clone(),
-                    path: path.clone(),
-                    remote: None,
-                    endpoint: None,
-                    region: None,
-                    cache_ttl_secs: None,
+                Self::persist_config(state, "add catalogue", |c| {
+                    c.brain.catalogues.push(ninox_core::config::CatalogueRef {
+                        name: name.clone(),
+                        path: path.clone(),
+                        remote: None,
+                        endpoint: None,
+                        region: None,
+                        cache_ttl_secs: None,
+                    })
                 });
-                if let Err(e) = state.config.save() {
-                    tracing::warn!("failed to save config after adding catalogue '{name}': {e}");
-                }
                 state.catalogues = state.config.catalogue_options();
                 let idx = state
                     .catalogues
@@ -2348,10 +2101,7 @@ impl App {
                             || state.config.orchestrator.model != agent.model
                         {
                             state.orchestrator_agent = agent.clone();
-                            state.config.orchestrator = agent.clone();
-                            if let Err(e) = state.config.save() {
-                                tracing::warn!("failed to save remembered agent preselection: {e}");
-                            }
+                            Self::persist_config(state, "agent preselection", |c| c.orchestrator = agent.clone());
                         }
 
                         state.sessions.insert(session.id.clone(), session.clone());
@@ -2640,10 +2390,7 @@ impl App {
                             || state.config.orchestrator.model != agent.model
                         {
                             state.orchestrator_agent = agent.clone();
-                            state.config.orchestrator = agent.clone();
-                            if let Err(e) = state.config.save() {
-                                tracing::warn!("failed to save remembered agent preselection: {e}");
-                            }
+                            Self::persist_config(state, "agent preselection", |c| c.orchestrator = agent.clone());
                         }
 
                         let orch = Orchestrator {
@@ -2885,11 +2632,11 @@ impl App {
                             return Message::Noop;
                         }
                     } else if is_orch {
-                        if let Err(error) = ninox_core::tmux::kill_session(&id).await {
+                        if let Err(error) = ninox_core::runtime::kill_session(&id).await {
                             emit_checkout_unavailable(&engine, &id, &name, &error);
                             return Message::Noop;
                         }
-                    } else if ninox_core::tmux::has_session(&id).await {
+                    } else if ninox_core::runtime::has_session(&id).await {
                         let error = anyhow::anyhow!(
                             "cannot verify legacy worker runtime capability before Re-file"
                         );
@@ -3201,7 +2948,7 @@ impl App {
                 let config = state.config.clone();
                 Task::future(async move {
                     let mut runtime_claim = runtime_claim;
-                    if let Err(error) = ninox_core::tmux::kill_session(&id).await {
+                    if let Err(error) = ninox_core::runtime::kill_session(&id).await {
                         tracing::warn!("resume {id}: cannot stop prior runtime: {error}");
                         return Message::Noop;
                     }
@@ -3363,10 +3110,7 @@ impl App {
                             let z = (z * 10.0).round() / 10.0;
                             if (z - state.zoom).abs() > f64::EPSILON {
                                 state.zoom = z;
-                                state.config.zoom = z;
-                                if let Err(e) = state.config.save() {
-                                    tracing::error!("failed to save zoom config: {e}");
-                                }
+                                Self::persist_config(state, "zoom", |c| c.zoom = z);
                             }
                             return Task::none();
                         }
@@ -3430,13 +3174,10 @@ impl App {
             Message::SwitchTheme(variant) => {
                 state.active_variant = variant;
                 state.scheme = state.themes.scheme(variant);
-                state.config.theme = variant;
                 for term in state.terminals.values_mut() {
                     term.cache.clear();
                 }
-                if let Err(e) = state.config.save() {
-                    tracing::error!("failed to save theme config: {e}");
-                }
+                Self::persist_config(state, "theme", |c| c.theme = variant);
                 Task::none()
             }
 
@@ -3447,11 +3188,8 @@ impl App {
 
             Message::ToggleSidebar => {
                 state.sidebar_hidden = !state.sidebar_hidden;
-                state.config.sidebar_hidden = state.sidebar_hidden;
-                // Mirrors the SwitchTheme config-save pattern above.
-                if let Err(e) = state.config.save() {
-                    tracing::error!("failed to save sidebar state: {e}");
-                }
+                let hidden = state.sidebar_hidden;
+                Self::persist_config(state, "sidebar", |c| c.sidebar_hidden = hidden);
                 // Content width changed, so reflow terminals and sync the
                 // backing tmux panes (same as a completed resize drag).
                 let resized = Self::resize_terminals(state);
@@ -3496,10 +3234,8 @@ impl App {
                     // SwitchTheme config-save pattern. InfoPanel width is
                     // session-local and intentionally not persisted.
                     if matches!(target, DragTarget::Sidebar) {
-                        state.config.sidebar_width = state.sidebar_width;
-                        if let Err(e) = state.config.save() {
-                            tracing::error!("failed to save sidebar width: {e}");
-                        }
+                        let width = state.sidebar_width;
+                        Self::persist_config(state, "sidebar width", |c| c.sidebar_width = width);
                     }
                 }
                 Task::none()
@@ -3659,45 +3395,22 @@ impl App {
             }
 
             Message::SettingsToggleHarness(name) => {
-                // claude-code is the locked-on default — inert by design.
-                if name == "claude-code" {
-                    return Task::none();
-                }
-                // Write the FULL effective spec with `enabled` flipped —
-                // config entries replace builtin specs wholesale, so a bare
-                // `{ enabled: true }` would wipe the builtin's args.
-                let mut spec = state.config.registry().spec(&name);
-                spec.enabled = !spec.enabled;
-                state.config.harnesses.insert(name.clone(), spec);
-                if let Err(e) = state.config.save() {
-                    tracing::warn!("failed to save config after toggling harness {name}: {e}");
-                }
+                Self::persist_config(state, "toggle harness", |c| c.toggle_harness(&name));
                 Task::none()
             }
 
             Message::SettingsWorkerHarness(h) => {
                 // pick_list fires on re-selecting the current value — don't
                 // wipe (and re-save) the model for a no-op selection.
-                if state.config.worker.harness == h {
+                if !Self::persist_config(state, "worker harness", |c| c.worker.set_harness(&h)) {
                     return Task::none();
                 }
-                let task = Self::ensure_models(state, &h);
-                state.config.worker.harness = h;
-                // Clear the model — ids from one harness must not leak into
-                // another's launch command.
-                state.config.worker.model = None;
                 state.settings.worker_custom = None;
-                if let Err(e) = state.config.save() {
-                    tracing::warn!("failed to save worker harness: {e}");
-                }
-                task
+                Self::ensure_models(state, &h)
             }
 
             Message::SettingsEditor(editor) => {
-                state.config.editor = editor;
-                if let Err(e) = state.config.save() {
-                    tracing::warn!("failed to save editor choice: {e}");
-                }
+                Self::persist_config(state, "editor", |c| c.editor = editor);
                 Task::none()
             }
 
@@ -3708,10 +3421,7 @@ impl App {
                     return Task::none();
                 }
                 state.settings.worker_custom = None;
-                state.config.worker.model = Some(v);
-                if let Err(e) = state.config.save() {
-                    tracing::warn!("failed to save worker model: {e}");
-                }
+                Self::persist_config(state, "worker model", |c| c.worker.model = Some(v.clone()));
                 Task::none()
             }
 
@@ -3722,20 +3432,14 @@ impl App {
 
             Message::SettingsWorkerCustomCommit => {
                 if let Some(v) = state.settings.worker_custom.take() {
-                    let t = v.trim();
-                    state.config.worker.model = (!t.is_empty()).then(|| t.to_string());
-                    if let Err(e) = state.config.save() {
-                        tracing::warn!("failed to save worker model: {e}");
-                    }
+                    let model = Some(v.trim().to_string()).filter(|t| !t.is_empty());
+                    Self::persist_config(state, "worker model", |c| c.worker.model = model.clone());
                 }
                 Task::none()
             }
 
             Message::SettingsSetSendMechanism(mechanism) => {
-                state.config.set_send_mechanism(mechanism);
-                if let Err(e) = state.config.save() {
-                    tracing::warn!("failed to save config after choosing send mechanism: {e}");
-                }
+                Self::persist_config(state, "send mechanism", |c| c.set_send_mechanism(mechanism));
                 Task::none()
             }
 
@@ -3825,11 +3529,24 @@ impl App {
             }
 
             Message::SettingsTogglePrWatch => {
-                state.config.pr_watch.enabled = !state.config.pr_watch.enabled;
-                if let Err(e) = state.config.save() {
-                    tracing::warn!("failed to save config after toggling PR watch: {e}");
-                }
+                Self::persist_config(state, "PR watch", |c| c.pr_watch.enabled = !c.pr_watch.enabled);
                 Task::none()
+            }
+
+            Message::SettingsSetRuntimeBackend(backend) => {
+                Self::persist_config(state, "session runtime", |c| c.runtime.backend = backend);
+                if backend != ninox_core::runtime::Backend::Ptyd {
+                    return Task::none();
+                }
+                // Start the host now so the first new session doesn't pay for it.
+                Task::future(async move {
+                    if let Ok(exe) = std::env::current_exe() {
+                        if let Err(e) = ninox_core::runtime::ensure_ptyd_host(&exe).await {
+                            tracing::warn!("could not start the ptyd host: {e}");
+                        }
+                    }
+                    Message::Noop
+                })
             }
 
             Message::BrainSelectEntry(id) => {
@@ -4343,7 +4060,7 @@ impl App {
                     let (viewport_cols, viewport_rows) =
                         Self::terminal_size_for(state, &session_id);
                     return Task::future(async move {
-                        if !ninox_core::tmux::has_session(&session_id).await {
+                        if !ninox_core::runtime::has_session(&session_id).await {
                             return Message::Noop;
                         }
                         let Some(initial_tail) = ninox_core::tmux::prepare_viewport_tail(
@@ -4356,7 +4073,7 @@ impl App {
                             tracing::warn!("prepare terminal viewport for {session_id} failed");
                             return Message::Noop;
                         };
-                        let argv = ninox_core::tmux::attach_args(&session_id).await;
+                        let argv = ninox_core::runtime::attach_args(&session_id).await;
                         Message::ClientAttach {
                             session_id,
                             argv,
@@ -4859,166 +4576,6 @@ pub fn pr_url_for_session(
     Some(format!("https://github.com/{}/pull/{number}", session.repo))
 }
 
-/// Writes one `<skills_dir>/<name>/SKILL.md` per entry in `caps` whose
-/// [`Capability::enabled`] gate is satisfied by `config`, with the seed-time
-/// placeholders substituted, and returns the entries actually seeded (in the
-/// order given) so callers can advertise exactly what landed on disk.
-///
-/// Split out of [`setup_orchestrator_root`] so the gating loop can be tested
-/// against a caller-supplied capability slice — the real `REGISTRY` is a
-/// `const`, so a deliberately-disabled entry can't be injected into it.
-///
-/// Files are always overwritten: an upgraded ninox re-seeds the current
-/// wording over whatever the previous version wrote. Note that a
-/// now-disabled capability's *stale* file is left in place rather than
-/// deleted — removing files from a directory the user may have added their
-/// own skills to is not this function's call to make.
-async fn seed_orchestrator_skills<'a>(
-    skills_dir: &std::path::Path,
-    config: &AppConfig,
-    caps: &[&'a ninox_core::capabilities::Capability],
-    ninox_bin: &str,
-    config_path: &str,
-) -> anyhow::Result<Vec<&'a ninox_core::capabilities::Capability>> {
-    use ninox_core::capabilities;
-    use tokio::fs;
-
-    let mut seeded = Vec::new();
-    for cap in caps {
-        let Some(md) = cap.orchestrator_md else { continue };
-        if !(cap.enabled)(config) {
-            continue;
-        }
-        let dir = skills_dir.join(cap.name);
-        fs::create_dir_all(&dir).await?;
-        fs::write(dir.join("SKILL.md"), capabilities::render(md, ninox_bin, config_path)).await?;
-        seeded.push(*cap);
-    }
-    Ok(seeded)
-}
-
-/// Seeds `~/.config/ninox/orchestrator/` (or the configured root) with the
-/// files that orchestrator sessions need: AGENTS.md (canonical, CLAUDE.md
-/// symlinks to it), one SKILL.md per *enabled* orchestrator-facing capability
-/// in `ninox_core::capabilities::REGISTRY`, and the subagent-blocker
-/// PreToolUse hook.
-///
-/// Both the seeded skills and AGENTS.md's "Available Skills" list are driven
-/// by that registry, so adding a capability needs no edit here — and both are
-/// filtered by each capability's `enabled` gate against `config`, evaluated
-/// once per call (every orchestrator entry is currently ungated, so this
-/// changes nothing today). Skill bodies go through `capabilities::render` to
-/// substitute the seed-time placeholders (`{{NINOX_BIN}}`, `{{CONFIG_PATH}}`)
-/// — see the `ninox_core::capabilities` module docs.
-///
-/// AGENTS.md and settings.json are skipped if already present (user-editable).
-/// Generated skills are refreshed while untouched; user-modified skills and
-/// unrelated files are preserved. The blocker is always overwritten.
-pub async fn setup_orchestrator_root(
-    root: &std::path::Path,
-    config: &AppConfig,
-    ninox_bin: &str,
-    config_path: &str,
-) -> anyhow::Result<()> {
-    use ninox_core::capabilities::{self, Audience};
-    use tokio::fs;
-
-    let claude_dir        = root.join(".claude");
-    let claude_skills_dir = claude_dir.join("skills");
-    fs::create_dir_all(&claude_dir).await?;
-
-    let skill_path = |name: &str| claude_skills_dir.join(name).join("SKILL.md");
-
-    let caps: Vec<_> = capabilities::for_audience(Audience::Orchestrator).collect();
-    let seeded =
-        seed_orchestrator_skills(&claude_skills_dir, config, &caps, ninox_bin, config_path).await?;
-
-    // AGENTS.md is canonical; CLAUDE.md symlinks to it.
-    let agents_md_path = root.join("AGENTS.md");
-    if !agents_md_path.exists() {
-        let mut skills = String::new();
-        for cap in &seeded {
-            let Some(md) = cap.orchestrator_md else { continue };
-            skills.push_str(&format!(
-                "- `{}` — {}\n",
-                skill_path(cap.name).display(),
-                capabilities::description(md).unwrap_or(""),
-            ));
-        }
-        // The preamble points at whichever entry owns the spawn-worker
-        // capability rather than a hand-typed directory name, so a rename in
-        // the registry can't silently leave a dangling path here.
-        let spawn_skill = seeded
-            .iter()
-            .find(|c| c.name == "spawn-worker")
-            .expect("registry must declare an orchestrator spawn-worker capability");
-        let body = format!(
-            "# Ninox Orchestrator\n\n\
-             Before doing anything else, read and follow: `{spawn_skill}`\n\n\
-             ## Available Skills\n\n\
-             {skills}\n\
-             Run `{ninox_bin} capabilities --orchestrator` to list what ninox can currently do.\n",
-            spawn_skill = skill_path(spawn_skill.name).display(),
-            skills      = skills,
-            ninox_bin   = ninox_bin,
-        );
-        fs::write(&agents_md_path, body).await?;
-    }
-    let claude_md_path = root.join("CLAUDE.md");
-    if !claude_md_path.exists() {
-        #[cfg(unix)]
-        tokio::fs::symlink("AGENTS.md", &claude_md_path).await?;
-        #[cfg(not(unix))]
-        {
-            let body = fs::read_to_string(&agents_md_path).await?;
-            fs::write(&claude_md_path, body).await?;
-        }
-    }
-
-    // subagent-blocker hook — always overwritten.
-    let blocker = r#"#!/usr/bin/env node
-const { readFileSync } = require("node:fs");
-const callerType = process.env.NINOX_CALLER_TYPE || "";
-if (callerType !== "orchestrator") process.exit(0);
-let raw = "";
-try { raw = readFileSync(0, "utf-8"); } catch { process.exit(0); }
-let payload;
-try { payload = JSON.parse(raw || "{}"); } catch { process.exit(0); }
-const toolName = typeof payload.tool_name === "string" ? payload.tool_name : "";
-if (toolName !== "Task" && toolName !== "Agent") process.exit(0);
-const sub = (payload.tool_input?.subagent_type || "").toLowerCase();
-if (sub === "explore" || sub === "plan") process.exit(0);
-process.stdout.write(JSON.stringify({
-  hookSpecificOutput: {
-    hookEventName: "PreToolUse",
-    permissionDecision: "deny",
-    permissionDecisionReason: "Use `${NINOX_BIN:-ninox} spawn` instead of native subagents.",
-  },
-}) + "\n");
-process.exit(0);
-"#;
-    fs::write(claude_dir.join("subagent-blocker.cjs"), blocker).await?;
-
-    let settings_path = claude_dir.join("settings.json");
-    if !settings_path.exists() {
-        let settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": "Task|Agent",
-                    "hooks": [{"type": "command", "command": "node .claude/subagent-blocker.cjs", "timeout": 2000}]
-                }]
-            },
-            "statusLine": {
-                "type": "command",
-                "command": format!("'{}' statusline", ninox_bin.replace('\'', "'\\''")),
-                "refreshInterval": 20
-            }
-        });
-        fs::write(&settings_path, serde_json::to_string_pretty(&settings)?).await?;
-    }
-
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -8160,33 +7717,7 @@ mod tests {
         });
     }
 
-    /// Serializes tests that mutate process-global env vars (`NINOX_CONFIG`)
-    /// against each other — `cargo test` runs test fns on parallel threads,
-    /// so without this guard one test's env mutation could leak into
-    /// another's read.
-    static ENV_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Set `key=value` for the duration of `f`, restoring the prior value
-    /// (or unsetting it) afterward. Serialized via `ENV_TEST_GUARD` since
-    /// env vars are process-global state shared across parallel test
-    /// threads. Mirrors `ninox_core::config::tests::with_env_override`.
-    fn with_env_override<T>(
-        key: &str,
-        value: impl AsRef<std::ffi::OsStr>,
-        f: impl FnOnce() -> T,
-    ) -> T {
-        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var(key).ok();
-        std::env::set_var(key, value);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-
-        match prior {
-            Some(v) => std::env::set_var(key, v),
-            None    => std::env::remove_var(key),
-        }
-        result.unwrap()
-    }
+    use crate::test_fixtures::with_env_override;
 
     #[test]
     fn t_toggles_light_dark() {
@@ -8328,6 +7859,47 @@ mod tests {
             // toggling back disables
             let (m, _) = m.update(Message::SettingsToggleHarness("codex".into()));
             assert!(!m.config.registry().enabled_names().contains(&"codex".to_string()));
+        });
+    }
+
+    #[test]
+    fn choosing_the_session_runtime_persists_it() {
+        use ninox_core::runtime::Backend;
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("runtime_backend_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            assert_eq!(m.config.runtime.backend, Backend::Tmux);
+            // Tmux needs no host, so this stays a pure config write.
+            let (m, _) = m.update(Message::SettingsSetRuntimeBackend(Backend::Tmux));
+            assert_eq!(m.config.runtime.backend, Backend::Tmux);
+            let mut m = m;
+            m.config.runtime.backend = Backend::Ptyd;
+            m.config.save().unwrap();
+            assert_eq!(ninox_core::config::AppConfig::load().unwrap().runtime.backend, Backend::Ptyd);
+            let (m, _) = m.update(Message::SettingsSetRuntimeBackend(Backend::Tmux));
+            assert_eq!(m.config.runtime.backend, Backend::Tmux);
+            assert_eq!(ninox_core::config::AppConfig::load().unwrap().runtime.backend, Backend::Tmux);
+        });
+    }
+
+    #[test]
+    fn settings_changes_keep_edits_made_on_disk_meanwhile() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("concurrent_edit_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            // `nx`'s settings form writes the file while the app is open.
+            let mut on_disk = ninox_core::config::AppConfig::load().unwrap();
+            on_disk.tui.prefix = "C-a".into();
+            on_disk.save().unwrap();
+
+            let (m, _) = m.update(Message::SettingsTogglePrWatch);
+            let (m, _) = m.update(Message::SettingsSetRuntimeBackend(ninox_core::runtime::Backend::Tmux));
+            let loaded = ninox_core::config::AppConfig::load().unwrap();
+            assert!(loaded.pr_watch.enabled);
+            assert_eq!(loaded.tui.prefix, "C-a", "the app must not write back its stale copy");
+            assert_eq!(m.config.tui.prefix, "C-a", "the app adopts what it saved");
         });
     }
 
@@ -9110,295 +8682,5 @@ mod tests {
             matches!(m.view, View::PrList),
             "\"1\" must not navigate while the spawn modal is open"
         );
-    }
-
-    #[tokio::test]
-    async fn spawn_skill_teaches_work_request_handling() {
-        let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
-
-        let skill = std::fs::read_to_string(
-            root.join(".claude").join("skills").join("spawn-worker").join("SKILL.md"),
-        ).unwrap();
-        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
-        assert!(skill.contains("name: spawn-worker"));
-        assert!(skill.contains("description:"));
-        assert!(skill.contains("--delivery pr"));
-        assert!(skill.contains("--delivery direct"));
-        assert!(skill.contains("primary repository checkout"));
-        assert!(skill.contains("<repo>-w1"));
-        assert!(
-            skill.contains("request-work"),
-            "skill must explain the worker→orchestrator work-request channel"
-        );
-        assert!(
-            skill.contains("spawn a new worker") || skill.contains("spawn a dedicated worker"),
-            "skill must tell the orchestrator to spawn a worker for requested work"
-        );
-        assert!(
-            skill.to_lowercase().contains("never") && skill.to_lowercase().contains("widen"),
-            "skill must forbid widening an existing worker's scope"
-        );
-    }
-
-    #[tokio::test]
-    async fn setup_orchestrator_root_seeds_reap_skill() {
-        let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
-
-        let skill_path = root.join(".claude").join("skills").join("reap-workers").join("SKILL.md");
-        let skill = std::fs::read_to_string(&skill_path).unwrap();
-        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
-        assert!(skill.contains("name: reap-workers"));
-        assert!(skill.contains("description:"));
-        assert!(skill.contains("ninox reap"));
-        assert!(
-            skill.contains("--force"),
-            "skill must document the flag that reaping a live worker needs"
-        );
-        assert!(
-            skill.to_lowercase().contains("not while a worker is still working"),
-            "skill must warn against force-reaping live work"
-        );
-
-        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
-        assert!(
-            agents_md.contains(&skill_path.display().to_string()),
-            "AGENTS.md should point orchestrators at the reap skill"
-        );
-    }
-
-    /// The spawn-worker skill is rewritten on every startup, so it reaches
-    /// orchestrator roots whose (user-editable, never-overwritten) AGENTS.md
-    /// predates reaping and will never list the new skill.
-    #[tokio::test]
-    async fn spawn_skill_points_at_reaping() {
-        let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
-
-        let skill = std::fs::read_to_string(
-            root.join(".claude").join("skills").join("spawn-worker").join("SKILL.md"),
-        ).unwrap();
-        assert!(skill.contains("ninox reap"));
-    }
-
-    #[tokio::test]
-    async fn setup_orchestrator_root_seeds_spawn_orchestrator_skill() {
-        let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
-
-        let skill_path = root.join(".claude").join("skills").join("spawn-orchestrator").join("SKILL.md");
-        let skill = std::fs::read_to_string(&skill_path).unwrap();
-        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
-        assert!(skill.contains("name: spawn-orchestrator"));
-        assert!(skill.contains("ninox spawn-orchestrator"));
-        assert!(
-            skill.contains("--user-requested"),
-            "skill must name the flag the command requires"
-        );
-        // The whole point of this skill is the restraint, not the mechanics.
-        let lower = skill.to_lowercase();
-        assert!(
-            lower.contains("only when the user explicitly asks"),
-            "skill must state the by-request-only rule"
-        );
-        assert!(
-            skill.contains("--description") || skill.contains("description:"),
-            "skill must carry a description for discovery"
-        );
-
-        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
-        assert!(agents_md.contains(&skill_path.display().to_string()));
-    }
-
-    #[tokio::test]
-    async fn setup_orchestrator_root_seeds_watch_pr_skill() {
-        let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
-
-        let skill_path = root.join(".claude").join("skills").join("watch-pr").join("SKILL.md");
-        let skill = std::fs::read_to_string(&skill_path).unwrap();
-        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
-        assert!(skill.contains("name: watch-pr"));
-        assert!(skill.contains("description:"));
-        assert!(skill.contains("ninox open --pr"));
-        assert!(skill.contains("ninox close --pr"));
-        assert!(skill.contains("ninox list --prs"));
-
-        let spawn_skill = std::fs::read_to_string(
-            root.join(".claude").join("skills").join("spawn-worker").join("SKILL.md"),
-        ).unwrap();
-        assert!(
-            spawn_skill.contains("see the `watch-pr` skill"),
-            "spawn-worker skill must cross-link the watch-pr skill"
-        );
-
-        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
-        assert!(
-            agents_md.contains(&skill_path.display().to_string()),
-            "AGENTS.md should list the watch-pr skill in Available Skills"
-        );
-    }
-
-    #[tokio::test]
-    async fn set_agent_config_skill_has_frontmatter() {
-        let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
-
-        let skill = std::fs::read_to_string(
-            root.join(".claude").join("skills").join("set-agent-config").join("SKILL.md"),
-        ).unwrap();
-        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
-        assert!(skill.contains("name: set-agent-config"));
-        assert!(skill.contains("description:"));
-    }
-
-    #[tokio::test]
-    async fn setup_orchestrator_root_seeds_brain_skill() {
-        let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
-
-        let skill_path = root.join(".claude").join("skills").join("brain").join("SKILL.md");
-        let skill = std::fs::read_to_string(&skill_path).unwrap();
-        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
-        assert!(skill.contains("name: brain"));
-        assert!(skill.contains("description:"));
-        assert!(skill.contains("ninox brain query"));
-        assert!(skill.contains("ninox brain index"));
-        assert!(skill.contains("ninox brain show"));
-        assert!(skill.contains("blends keyword and semantic matches"));
-
-        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
-        assert!(
-            agents_md.contains(&skill_path.display().to_string()),
-            "AGENTS.md should point orchestrators at the brain skill"
-        );
-    }
-
-    /// Seeding is registry-driven: every orchestrator-facing capability gets
-    /// a SKILL.md whose body is that entry's markdown with the seed-time
-    /// placeholders substituted, and AGENTS.md lists all of them.
-    #[tokio::test]
-    async fn setup_orchestrator_root_seeds_every_registry_orchestrator_skill() {
-        use ninox_core::capabilities::{self, Audience};
-        let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, &AppConfig::default(), "/path/to/ninox", "/cfg.toml").await.unwrap();
-
-        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
-        for cap in capabilities::for_audience(Audience::Orchestrator) {
-            let md = cap.orchestrator_md.expect("orchestrator entry has markdown");
-            let path = root.join(".claude").join("skills").join(cap.name).join("SKILL.md");
-            let body = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{} not seeded: {e}", cap.name));
-            assert_eq!(
-                body,
-                capabilities::render(md, "/path/to/ninox", "/cfg.toml"),
-                "{} must be seeded as the rendered registry markdown",
-                cap.name,
-            );
-            assert!(!body.contains("{{"), "{} left an unsubstituted placeholder", cap.name);
-            assert!(
-                agents_md.contains(&path.display().to_string()),
-                "AGENTS.md must list {} under Available Skills",
-                cap.name,
-            );
-            assert!(
-                agents_md.contains(capabilities::description(md).unwrap()),
-                "AGENTS.md must describe {} from its frontmatter",
-                cap.name,
-            );
-        }
-        // Audience-scoped: an unfiltered listing would show the orchestrator
-        // the worker-only variants of skills it shares (e.g. watch-pr).
-        assert!(
-            agents_md.contains("/path/to/ninox capabilities --orchestrator"),
-            "AGENTS.md must point at the orchestrator-scoped capabilities command"
-        );
-    }
-
-    /// The `enabled` gate is honored on the orchestrator side too, not just
-    /// the worker side. `REGISTRY` is a `const` whose entries are all
-    /// ungated today, so this drives the extracted seeding loop with a
-    /// locally-built capability slice instead.
-    #[tokio::test]
-    async fn seed_orchestrator_skills_skips_gated_off_capabilities() {
-        use ninox_core::capabilities::{Audience, Capability};
-
-        let on = Capability {
-            name: "always-on",
-            audience: Audience::Orchestrator,
-            orchestrator_md: Some("---\nname: always-on\ndescription: On.\n---\n\nbody\n"),
-            worker_md: None,
-            enabled: |_| true,
-        };
-        let off = Capability {
-            name: "gated-off",
-            audience: Audience::Orchestrator,
-            orchestrator_md: Some("---\nname: gated-off\ndescription: Off.\n---\n\nbody\n"),
-            worker_md: None,
-            enabled: |_| false,
-        };
-
-        let dir = tempdir().unwrap().keep();
-        let seeded = seed_orchestrator_skills(
-            &dir, &AppConfig::default(), &[&on, &off], "ninox", "/cfg.toml",
-        )
-        .await
-        .unwrap();
-
-        assert!(dir.join("always-on").join("SKILL.md").exists(), "enabled entry must be seeded");
-        assert!(
-            !dir.join("gated-off").join("SKILL.md").exists(),
-            "a capability whose gate is off must not be seeded"
-        );
-        // The returned set is what AGENTS.md advertises — a disabled
-        // capability must not be listed there either.
-        assert_eq!(seeded.iter().map(|c| c.name).collect::<Vec<_>>(), vec!["always-on"]);
-    }
-
-    /// The skills are always re-seeded, so a stale copy from an older ninox
-    /// is replaced rather than left in place (AGENTS.md, by contrast, stays
-    /// user-editable and is only written when absent).
-    #[tokio::test]
-    async fn setup_orchestrator_root_overwrites_stale_skills_but_not_agents_md() {
-        let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
-
-        let skill = root.join(".claude").join("skills").join("brain").join("SKILL.md");
-        std::fs::write(&skill, "stale\n").unwrap();
-        std::fs::write(root.join("AGENTS.md"), "hand-edited\n").unwrap();
-
-        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
-
-        assert_ne!(std::fs::read_to_string(&skill).unwrap(), "stale\n");
-        assert_eq!(std::fs::read_to_string(root.join("AGENTS.md")).unwrap(), "hand-edited\n");
-    }
-
-    #[tokio::test]
-    async fn setup_orchestrator_root_configures_statusline() {
-        let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, &AppConfig::default(), "/path/to/ninox", "/cfg.toml").await.unwrap();
-
-        let settings: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(root.join(".claude").join("settings.json")).unwrap(),
-        ).unwrap();
-        assert_eq!(settings["statusLine"]["type"], "command");
-        assert_eq!(settings["statusLine"]["command"], "'/path/to/ninox' statusline");
-        assert_eq!(settings["statusLine"]["refreshInterval"], 20);
-        // The existing subagent-blocker hook must still be present.
-        assert!(settings["hooks"]["PreToolUse"].is_array());
-    }
-
-    #[tokio::test]
-    async fn setup_orchestrator_root_never_overwrites_existing_settings_json() {
-        let root = tempdir().unwrap().keep();
-        let claude_dir = root.join(".claude");
-        std::fs::create_dir_all(&claude_dir).unwrap();
-        std::fs::write(claude_dir.join("settings.json"), r#"{"userCustom": true}"#).unwrap();
-
-        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
-
-        let contents = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
-        assert_eq!(contents, r#"{"userCustom": true}"#, "pre-existing settings.json must be left byte-for-byte alone");
     }
 }

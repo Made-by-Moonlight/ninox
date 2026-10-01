@@ -63,6 +63,30 @@ cargo build --release -p ninox
 
 The HTTP server always starts on `127.0.0.1:8080` (or `--port`), exposing the engine's HTTP/WebSocket API — so everything the UI does is also scriptable.
 
+## Terminal mode
+
+Ninox also offers a terminal UI (TUI) for SSH access or headless environments. The TUI is available via `ninox tui` on any platform; on Linux and SSH (where there is no display), `ninox` with no arguments automatically opens the TUI instead of the native window.
+
+On macOS, `has_display()` is hardcoded `true`, so bare `ninox` always opens the native GUI — use `ninox tui` explicitly if you want the terminal interface instead.
+
+### Terminal commands
+
+```bash
+# Start the terminal UI
+ninox tui
+
+# List running sessions (--json for machine-readable output)
+ninox list [--json]
+
+# Connect to an existing session
+ninox connect <session-id>
+
+# Spawn a new orchestrator session
+ninox orchestrate <name> [--prompt <brief>] [--no-attach]
+```
+
+The daemon automatically starts in the background on first use and logs to `~/.local/share/ninox/daemon.log` (Linux) or `~/Library/Application Support/ninox/daemon.log` (macOS). Quitting the TUI doesn't shut down the daemon — sessions continue running in the background.
+
 ## macOS app bundle
 
 Every [tagged release](https://github.com/Made-by-Moonlight/ninox/releases) has a prebuilt `Ninox.app.zip` attached as a release asset — download it, unzip, and drag `Ninox.app` into `/Applications`. No local Rust toolchain needed.

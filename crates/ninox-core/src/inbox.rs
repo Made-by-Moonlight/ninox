@@ -90,6 +90,12 @@ pub fn read_pending_messages(dir: &Path, session_id: &str) -> Result<Vec<InboxMe
     Ok(messages)
 }
 
+/// Number of undelivered messages for `session_id` (0 when unreadable).
+/// [`read_pending_messages`] lists them.
+pub fn pending_count(dir: &Path, session_id: &str) -> usize {
+    read_pending_messages(dir, session_id).map(|m| m.len()).unwrap_or(0)
+}
+
 /// Mark messages delivered by renaming their file out of the pending set
 /// (`.json` → `.json.delivered`), kept on disk as an audit trail. Best-effort
 /// per id, mirroring `hooks::mark_work_requests_delivered`: one failed

@@ -59,6 +59,7 @@ extending the substitution and its no-`{{`-left-behind tests.
   write a stale snapshot row.
 - Hot-path CLI subcommands invoked by agents or hooks short-circuit in
   `main.rs` before the tmux-config/wrapper/self-shim setup (see
-  `Statusline`, `Inbox`, `Open`/`Close`/`List`, `Capabilities`).
+  `Statusline`, `Inbox`, `Open`/`Close`/`List` (reads sessions), `Connect`,
+  `Capabilities`).
 - Query the shared brain before exploring unfamiliar code and write back
   what you learn: `ninox brain query "<topic>"` / `ninox brain add`.

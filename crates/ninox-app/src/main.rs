@@ -1,10 +1,15 @@
 mod app;
 mod components;
+mod connect;
+mod fleet;
 mod input;
 mod models;
+mod runtime_cli;
+mod service;
 mod spawn_util;
 mod style;
 mod theme;
+mod tui;
 
 use anyhow::Context as _;
 use spawn_util::{
@@ -167,11 +172,14 @@ enum Command {
         #[arg(long)]
         pr: String,
     },
-    /// List watched resources
+    /// List sessions (default) or watched resources
     List {
-        /// List active PR watches
+        /// List active PR watches instead of sessions
         #[arg(long)]
         prs: bool,
+        /// Emit JSON instead of the session board
+        #[arg(long)]
+        json: bool,
     },
     /// List the agent-facing capabilities Ninox currently offers, with each
     /// one's live enabled/disabled state (see `ninox_core::capabilities`).
@@ -192,12 +200,73 @@ enum Command {
         #[command(subcommand)]
         action: PlanAction,
     },
+    /// Attach your terminal to a running session (worker or orchestrator).
+    /// Detach with your `[tui] prefix` then d (ptyd sessions; default C-\ on
+    /// macOS, C-Space elsewhere) or tmux's detach key
+    /// (default: C-b d) to return to your shell.
+    Connect {
+        /// Session ID (see `ninox list`)
+        session_id: String,
+    },
+    /// Start a new orchestrator and attach your terminal to it.
+    Orchestrate {
+        /// Display name; slugified into the session ID
+        name: String,
+        /// Initial brief, delivered before attaching
+        #[arg(long, short)]
+        prompt: Option<String>,
+        /// Print the workspace directory and a connect hint instead of attaching
+        #[arg(long)]
+        no_attach: bool,
+    },
+    /// Open the terminal UI — what bare `nx` does from a terminal.
+    Tui,
+    /// Durable fleets: status, ordered restore after a reboot, recovery
+    /// briefings and their acknowledgement.
+    Fleet {
+        #[command(subcommand)]
+        action: fleet::FleetAction,
+    },
+    /// Start the headless engine at login (launchd / systemd user unit).
+    Service {
+        #[command(subcommand)]
+        action: service::ServiceAction,
+    },
+    /// Open the desktop app, even when run from a terminal.
+    Gui,
     /// Report a session's activity state (working/idle/blocked) and manage
     /// worker→worker dependency edges — both rendered live in the desktop
     /// app's Workers view.
     WorkerStatus {
         #[command(subcommand)]
         action: WorkerStatusAction,
+    },
+    /// Run the ninox-ptyd PTY host in the foreground. Started on demand by
+    /// the engine and CLI; not intended for direct use.
+    #[command(hide = true)]
+    Ptyd {
+        /// Take over a running host's panes instead of refusing to start.
+        #[arg(long)]
+        takeover: bool,
+        #[command(subcommand)]
+        action: Option<runtime_cli::PtydAction>,
+    },
+    /// Inspect or attach to panes held by the ptyd host.
+    Pane {
+        #[command(subcommand)]
+        action: runtime_cli::PaneAction,
+    },
+    /// Print a session's current screen (plain text unless --ansi).
+    Read {
+        /// Session ID (see `ninox list`)
+        session_id: String,
+        /// Print the last N lines, reaching into scrollback, instead of
+        /// just the visible screen
+        #[arg(long)]
+        lines: Option<usize>,
+        /// Keep colors and styles as ANSI escape sequences
+        #[arg(long)]
+        ansi: bool,
     },
 }
 
@@ -407,7 +476,7 @@ enum RemoteAction {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-    let command = args.command;
+    let mut command = args.command;
 
     // `spawn` must reject worker callers before the shared CLI startup below:
     // that path writes tmux config and wrappers, creates the DB parent, and
@@ -427,6 +496,18 @@ async fn main() -> anyhow::Result<()> {
     if matches!(command, Some(Command::Statusline)) {
         run_statusline(args.db.unwrap_or_else(default_db_path));
         return Ok(());
+    }
+
+    // The PTY host, pane bridges and screen reads are runtime plumbing
+    // (`ninox read` is agent-invoked mid-session); none of them touch the
+    // store or need the setup below.
+    if let Some(Command::Ptyd { .. } | Command::Pane { .. } | Command::Read { .. }) = &command {
+        return match command.unwrap() {
+            Command::Ptyd { takeover, action } => runtime_cli::run_ptyd(takeover, action).await,
+            Command::Pane { action } => runtime_cli::run_pane(action).await,
+            Command::Read { session_id, lines, ansi } => runtime_cli::run_read(&session_id, lines, ansi).await,
+            _ => unreachable!(),
+        };
     }
 
     // Fires on every Stop/UserPromptSubmit turn of every worker with inbox
@@ -463,34 +544,50 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(run_workers_cli(action, db_path).await);
     }
 
-    // Fires on every `ninox open --pr` / `ninox close --pr` / `ninox list
-    // --prs` invocation — agents call these directly (via NINOX_BIN) on
-    // every PR they open or finish with, so this must stay fast and skip
+    // Fires on every `ninox open --pr` / `ninox close --pr` / `ninox list` /
+    // `ninox connect` invocation — agents call these directly (via
+    // NINOX_BIN) on every PR they open or finish with, and connect needs to
+    // land the user in tmux without delay, so this must stay fast and skip
     // the tmux-config/wrapper-hook/self-shim setup below the same way
-    // Statusline/Inbox do above; it needs only `Store::open`. `matches!`
+    // Statusline/Inbox do above; it needs only `Store::open` (+ tmux for
+    // Connect). `matches!`
     // (rather than `if let ... = command`) is used as the guard because the
-    // three variants carry different fields — binding them here would move
+    // variants carry different fields — binding them here would move
     // `command` on a branch that falls through to the `match command` below
     // instead of returning, which the borrow checker rejects. `..` patterns
     // bind nothing, so the guard itself never moves `command`; the actual
-    // move happens via `command.unwrap()` a few lines down, on a path that
-    // unconditionally returns.
+    // move happens via the full match below, on a path that unconditionally
+    // returns.
     if matches!(
         command,
-        Some(Command::Open { .. } | Command::Close { .. } | Command::List { .. })
+        Some(Command::Open { .. } | Command::Close { .. } | Command::List { .. } | Command::Connect { .. })
     ) {
         let db_path = args.db.unwrap_or_else(default_db_path);
         std::fs::create_dir_all(db_path.parent().unwrap())?;
         let store = Store::open(&db_path)?;
+        let cmd = command.unwrap();
+
+        // Handle session board listing (prs: false) separately; doesn't need config/env
+        if let Command::List { prs: false, json } = cmd {
+            warn_if_daemon_down(args.port).await;
+            println!("{}", run_list_sessions(&store, json)?);
+            return Ok(());
+        }
+
+        // Terminal attach only needs Store + tmux, like List{prs:false} above.
+        if let Command::Connect { session_id } = cmd {
+            warn_if_daemon_down(args.port).await;
+            connect::run_connect(&store, &session_id).await?;
+            return Ok(());
+        }
+
+        // PR watch operations (Open, Close, List{prs:true}) share config setup
         let enabled = AppConfig::load().unwrap_or_default().pr_watch.enabled;
         let opener = std::env::var("NINOX_SESSION").ok().filter(|s| !s.is_empty());
-        let action = match command.unwrap() {
+        let action = match cmd {
             Command::Open { pr }  => PrWatchCliAction::Open { pr },
             Command::Close { pr } => PrWatchCliAction::Close { pr },
-            Command::List { prs } => {
-                anyhow::ensure!(prs, "nothing to list — pass --prs");
-                PrWatchCliAction::List
-            }
+            Command::List { prs: true, .. } => PrWatchCliAction::List,
             _ => unreachable!(),
         };
         println!("{}", run_pr_watch(&store, enabled, action, opener)?);
@@ -571,16 +668,38 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if let Err(e) = tmux::write_server_config() {
-        eprintln!("failed to write tmux config: {e}");
+    // `fleet ack`/`status`/`brief` are agent-invoked; only a real restore
+    // needs the wrapper/shim setup below (it launches sessions).
+    if let Some(Command::Fleet { action }) = command {
+        if fleet::is_lightweight(&action) {
+            let db_path = args.db.unwrap_or_else(default_db_path);
+            std::fs::create_dir_all(db_path.parent().unwrap())?;
+            let store = Arc::new(Store::open(&db_path)?);
+            return fleet::run_cli(action, store, AppConfig::load().unwrap_or_default()).await;
+        }
+        command = Some(Command::Fleet { action });
+    }
+    if let Some(Command::Service { action }) = command {
+        return service::run(action);
+    }
+
+    // ptyd users needn't have tmux installed; a legacy tmux session still
+    // gets the config written lazily by tmux.rs's own server bootstrap.
+    if ninox_core::runtime::configured_backend() == ninox_core::runtime::Backend::Tmux {
+        if let Err(e) = tmux::write_server_config() {
+            eprintln!("failed to write tmux config: {e}");
+        }
     }
 
     if let Err(e) = ninox_core::hooks::install_wrappers() {
         tracing::warn!("failed to install wrapper hooks: {e}");
     }
-    if let Ok(exe) = std::env::current_exe() {
+    if let Ok(exe) = ninox_core::hooks::canonical_exe() {
         if let Err(e) = ninox_core::hooks::install_self_shim(&exe) {
             tracing::warn!("failed to install ninox self-shim: {e}");
+        }
+        if let Err(e) = ninox_core::hooks::install_nx_alias(&exe, std::env::var_os("PATH").as_deref()) {
+            tracing::debug!("nx alias not installed: {e}");
         }
     }
 
@@ -601,6 +720,16 @@ async fn main() -> anyhow::Result<()> {
             let config = AppConfig::load().unwrap_or_default();
             run_spawn_orchestrator(store, config, name, prompt, user_requested).await
         }
+        Some(Command::Orchestrate { name, prompt, no_attach }) => {
+            let config = AppConfig::load().unwrap_or_default();
+            let port = args.port.unwrap_or(config.port);
+            run_orchestrate(store, config, port, db_path, name, prompt, no_attach).await
+        }
+        Some(Command::Tui) => {
+            let config = AppConfig::load().unwrap_or_default();
+            let port = args.port.unwrap_or(config.port);
+            tui::run(store, port, db_path).await
+        }
         Some(Command::Reap { session_ids, all, force, orchestrator_id }) => {
             run_reap(store, session_ids, all, force, orchestrator_id).await
         }
@@ -617,7 +746,13 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Some(Command::RequestWork { description }) => {
-            run_request_work(&description)
+            run_request_work(&store, &description)
+        }
+        Some(Command::Fleet { action }) => {
+            fleet::run_cli(action, store, AppConfig::load().unwrap_or_default()).await
+        }
+        Some(Command::Service { .. }) => {
+            unreachable!("Service short-circuits and returns earlier in main()")
         }
         Some(Command::Complete { .. } | Command::ReceiveCompletion { .. }) => {
             unreachable!("completion commands short-circuit and return earlier in main()")
@@ -652,10 +787,18 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Plan { .. }) => {
             unreachable!("Plan short-circuits and returns earlier in main()")
         }
+        // Same story as Open/Close/List: handled by the early return above.
+        Some(Command::Connect { .. }) => {
+            unreachable!("Connect short-circuits and returns earlier in main()")
+        }
         Some(Command::WorkerStatus { .. }) => {
             unreachable!("WorkerStatus short-circuits and returns earlier in main()")
         }
-        None => run_tui(store, args.port, args.headless).await,
+        Some(Command::Ptyd { .. } | Command::Pane { .. } | Command::Read { .. }) => {
+            unreachable!("runtime commands short-circuit and return earlier in main()")
+        }
+        Some(Command::Gui) => run_tui(store, args.port, args.headless, db_path, true).await,
+        None => run_tui(store, args.port, args.headless, db_path, false).await,
     }
 }
 
@@ -940,7 +1083,7 @@ async fn run_plan_cli(action: PlanAction, db_path: PathBuf) -> i32 {
             return 4;
         }
     };
-    let runtime = match tmux::current_private_pane_identity().await {
+    let runtime = match ninox_core::runtime::current_private_pane_identity().await {
         Ok(runtime) => runtime,
         Err(error) => {
             emit_plan_envelope(false, serde_json::Value::Null, plan_error("authorization_failed", error.to_string()));
@@ -1168,6 +1311,12 @@ async fn run_spawn(
                     .await;
             if rolled_back {
                 let _ = store.terminalize_spawning_session_snapshot(&id, ts, &workspace);
+                // The task brief is what a fleet restore re-briefs this
+                // worker with if its conversation can't be resumed — record
+                // it even though the worker never reached a live runtime.
+                if let Err(e) = store.record_spawn_facts(&id, &prompt, None) {
+                    tracing::warn!("record spawn facts for {id}: {e}");
+                }
             }
             return Err(error);
         }
@@ -1238,6 +1387,9 @@ async fn run_spawn(
 
     let orch_id_env = orchestrator_id.as_deref().unwrap_or("").to_string();
 
+    // The task brief and branch are what a fleet restore re-briefs this
+    // worker with if its conversation can't be resumed.
+    let task_brief = prompt.clone();
     // Append worker context so every agent knows its session ID, delivery
     // contract, orchestrator ID, and how to communicate back when done.
     let mut effective_prompt = match worker_prompt_for_canonical_workspace(
@@ -1302,6 +1454,12 @@ async fn run_spawn(
         )
         .await;
         return Err(error);
+    }
+    // The task brief and branch are what a fleet restore re-briefs this
+    // worker with if its conversation can't be resumed.
+    let branch = ninox_core::fleet::probe::current_branch(std::path::Path::new(&effective_workspace));
+    if let Err(e) = store.record_spawn_facts(&id, &task_brief, branch.as_deref()) {
+        tracing::warn!("record spawn facts for {id}: {e}");
     }
 
     // Prepend the ninox bin dir inside the shell command rather than via tmux
@@ -1369,7 +1527,7 @@ async fn run_spawn(
     // mark it Terminated before bailing. A pid-less Working ghost is
     // invisible to poll_pids and would linger until the next app restart's
     // reconciliation.
-    if let Err(e) = tmux::create_session(&id, &effective_workspace, &cmd, &env_vec).await {
+    if let Err(e) = ninox_core::runtime::create_session(config.runtime.backend, &id, &effective_workspace, &cmd, &env_vec).await {
         let _ = store.abort_worker_runtime_start(
             &id,
             &incarnation.incarnation_id,
@@ -1393,7 +1551,7 @@ async fn run_spawn(
         &incarnation.incarnation_id,
         &runtime_claim.claim_id,
     )? {
-        let _ = tmux::kill_private_session(&id).await;
+        let _ = ninox_core::runtime::kill_session(&id).await;
         anyhow::bail!("worker incarnation changed before runtime launch completed");
     }
     println!("spawned {}", session.id);
@@ -2173,7 +2331,54 @@ async fn run_spawn_orchestrator(
         );
     }
 
-    let id = slugify(&name);
+    let want_brief = prompt.is_some();
+    let spawned = spawn_orchestrator_common(&store, &config, &name, prompt).await?;
+    println!("spawned orchestrator {}", spawned.id);
+    if !want_brief {
+        println!("send it a brief with: ninox send {} \"<your message>\"", spawned.id);
+    }
+    Ok(())
+}
+
+pub(crate) struct SpawnedOrchestrator {
+    pub id:        String,
+    pub workspace: String,
+}
+
+async fn run_orchestrate(
+    store:     Arc<Store>,
+    config:    AppConfig,
+    port:      u16,
+    db_path:   PathBuf,
+    name:      String,
+    prompt:    Option<String>,
+    no_attach: bool,
+) -> anyhow::Result<()> {
+    // Sessions outlive this command; make sure the poller/services do too.
+    if let Ok(exe) = std::env::current_exe() {
+        if let ninox_core::daemon::DaemonStatus::Failed(e) =
+            ninox_core::daemon::ensure_daemon(port, &exe, &db_path).await
+        {
+            eprintln!("warning: background services not running ({e}) — statuses may go stale");
+        }
+    }
+    let spawned = spawn_orchestrator_common(&store, &config, &name, prompt).await?;
+    println!("spawned orchestrator {}", spawned.id);
+    if no_attach {
+        println!("dir: {}", spawned.workspace);
+        println!("connect with: ninox connect {}", spawned.id);
+        return Ok(());
+    }
+    connect::exec_attach(ninox_core::runtime::attach_args(&spawned.id).await)
+}
+
+pub(crate) async fn spawn_orchestrator_common(
+    store:  &Store,
+    config: &AppConfig,
+    name:   &str,
+    prompt: Option<String>,
+) -> anyhow::Result<SpawnedOrchestrator> {
+    let id = slugify(name);
     if id.is_empty() {
         anyhow::bail!("--name must contain at least one alphanumeric character");
     }
@@ -2187,7 +2392,7 @@ async fn run_spawn_orchestrator(
     }
 
     let agent = config.orchestrator.clone();
-    let ninox_bin = std::env::current_exe()
+    let ninox_bin = ninox_core::hooks::canonical_exe()
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "ninox".to_string());
@@ -2197,7 +2402,9 @@ async fn run_spawn_orchestrator(
     // blocker, which every orchestrator session inherits. Normally seeded at
     // app startup, but a spawn must not depend on the app having run first.
     let root = config.resolved_orchestrator_root();
-    if let Err(e) = app::setup_orchestrator_root(&root, &config, &ninox_bin, &config_path).await {
+    if let Err(e) =
+        ninox_core::orchestrator_root::setup_orchestrator_root(&root, config, &ninox_bin, &config_path).await
+    {
         tracing::warn!("orchestrator root setup failed: {e}");
     }
     let ws = root.join(&id);
@@ -2224,13 +2431,13 @@ async fn run_spawn_orchestrator(
 
     store.upsert_orchestrator(&ninox_core::types::Orchestrator {
         id:         id.clone(),
-        name:       name.clone(),
+        name:       name.to_string(),
         created_at: ts,
     })?;
     let session = Session {
         id:              id.clone(),
         orchestrator_id: None,
-        name:            name.clone(),
+        name:            name.to_string(),
         repo:            String::new(),
         status:          SessionStatus::Working,
         agent_type:      agent.harness.clone(),
@@ -2267,7 +2474,7 @@ async fn run_spawn_orchestrator(
         &ninox_bin, &config_path, &catalogue_path, &id, &sessions_dir_str,
     );
 
-    if let Err(e) = tmux::create_session(&id, &ws_str, &cmd, &env).await {
+    if let Err(e) = ninox_core::runtime::create_session(config.runtime.backend, &id, &ws_str, &cmd, &env).await {
         // Roll BOTH rows back rather than marking the session Terminated the
         // way `run_spawn` does for a worker. A worker's Terminated row is a
         // useful record that the retention sweep eventually purges; an
@@ -2280,29 +2487,26 @@ async fn run_spawn_orchestrator(
         let _ = store.delete_orchestrator(&id);
         return Err(e);
     }
-    println!("spawned orchestrator {id}");
 
-    let Some(brief) = prompt else {
-        println!("send it a brief with: ninox send {id} \"<your message>\"");
-        return Ok(());
-    };
+    if let Some(brief) = prompt {
+        // Typing at a harness that hasn't drawn its input box yet is swallowed
+        // outright, so wait for the prompt before delivering the brief.
+        let spawner = std::env::var("NINOX_ORCHESTRATOR_ID").ok().filter(|s| !s.is_empty());
+        let message = format!("{brief}{}", orchestrator_context_footer(&id, spawner.as_deref()));
+        if !ninox_core::runtime::wait_for_input_prompt(&id, std::time::Duration::from_secs(90)).await {
+            eprintln!("warning: {id} is still starting up — sending the brief anyway");
+        }
+        if let Err(e) = ninox_core::messaging::deliver_message(
+            store, &sessions_dir, &id, &message, config.send_mechanism(),
+        ).await {
+            eprintln!(
+                "warning: could not deliver the initial brief to {id}: {e}\n\
+                 retry with: ninox send {id} \"<the brief>\""
+            );
+        }
+    }
 
-    // Typing at a harness that hasn't drawn its input box yet is swallowed
-    // outright, so wait for the prompt before delivering the brief.
-    let spawner = std::env::var("NINOX_ORCHESTRATOR_ID").ok().filter(|s| !s.is_empty());
-    let message = format!("{brief}{}", orchestrator_context_footer(&id, spawner.as_deref()));
-    if !tmux::wait_for_input_prompt(&id, std::time::Duration::from_secs(90)).await {
-        eprintln!("warning: {id} is still starting up — sending the brief anyway");
-    }
-    if let Err(e) = ninox_core::messaging::deliver_message(
-        &store, &sessions_dir, &id, &message, config.send_mechanism(),
-    ).await {
-        eprintln!(
-            "warning: could not deliver the initial brief to {id}: {e}\n\
-             retry with: ninox send {id} \"<the brief>\""
-        );
-    }
-    Ok(())
+    Ok(SpawnedOrchestrator { id, workspace: ws_str })
 }
 
 /// The tmux env for a CLI-spawned orchestrator. Mirrors
@@ -2358,7 +2562,7 @@ fn orchestrator_context_footer(id: &str, spawner: Option<&str>) -> String {
 /// `ninox request-work` — record a work request in this worker's session
 /// metadata. The engine's poller notices it within one tick, notifies the
 /// UI, and forwards it to the orchestrator's terminal.
-fn run_request_work(description: &str) -> anyhow::Result<()> {
+fn run_request_work(store: &Store, description: &str) -> anyhow::Result<()> {
     let description = description.trim();
     if description.is_empty() {
         anyhow::bail!("request-work needs a non-empty description of the work");
@@ -2376,6 +2580,22 @@ fn run_request_work(description: &str) -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(AppConfig::sessions_dir);
     let request = ninox_core::hooks::append_work_request(&sessions_dir, &session_id, description)?;
+    // The file above is the delivery queue; this row is the fleet's
+    // queryable record of what the orchestrator still owes.
+    let orchestrator_id = store.get_session(&session_id).ok().flatten()
+        .and_then(|s| s.orchestrator_id)
+        .or_else(|| std::env::var("NINOX_ORCHESTRATOR_ID").ok().filter(|s| !s.is_empty()));
+    if let Err(e) = store.insert_work_request(&ninox_core::store::WorkRequestRow {
+        id:              request.id.clone(),
+        from_session:    session_id.clone(),
+        orchestrator_id,
+        body:            request.description.clone(),
+        created_at:      request.requested_at,
+        delivered_at:    None,
+        resolved_at:     None,
+    }) {
+        tracing::warn!("record work request {} in the store: {e}", request.id);
+    }
     println!(
         "work request {} recorded — the orchestrator will be asked to spawn a worker for it",
         request.id,
@@ -2753,6 +2973,82 @@ fn run_pr_watch(
                 .join("\n"))
         }
     }
+}
+
+pub(crate) fn group_sessions(
+    sessions: Vec<Session>,
+    orchestrators: Vec<ninox_core::types::Orchestrator>,
+) -> Vec<(Option<ninox_core::types::Orchestrator>, Vec<Session>)> {
+    let mut groups: Vec<(Option<ninox_core::types::Orchestrator>, Vec<Session>)> = orchestrators
+        .into_iter()
+        .map(|o| (Some(o), Vec::new()))
+        .collect();
+    let mut ungrouped: Vec<Session> = Vec::new();
+    for s in sessions {
+        // An orchestrator's own session row shares its id; a worker points
+        // at its orchestrator via orchestrator_id.
+        let owner = s.orchestrator_id.as_deref().unwrap_or(&s.id).to_string();
+        match groups.iter_mut().find(|(o, _)| o.as_ref().is_some_and(|o| o.id == owner)) {
+            Some((_, members)) => members.push(s),
+            None => ungrouped.push(s),
+        }
+    }
+    // Orchestrator's own row first within its group.
+    for (o, members) in &mut groups {
+        let oid = o.as_ref().map(|o| o.id.clone()).unwrap_or_default();
+        members.sort_by_key(|s| (s.id != oid, s.started_at));
+    }
+    if !ungrouped.is_empty() {
+        groups.push((None, ungrouped));
+    }
+    groups
+}
+
+pub(crate) fn render_session_board(groups: &[(Option<ninox_core::types::Orchestrator>, Vec<Session>)]) -> String {
+    if groups.iter().all(|(_, m)| m.is_empty()) {
+        return "no sessions — start one with `ninox orchestrate <name>`".to_string();
+    }
+    let mut out = String::new();
+    for (orch, members) in groups {
+        match orch {
+            Some(o) => out.push_str(&format!("{} ({})\n", o.name, o.id)),
+            None    => out.push_str("(no orchestrator)\n"),
+        }
+        for s in members {
+            let pr = s.pr_number.map(|n| format!("PR #{n}")).unwrap_or_default();
+            out.push_str(&format!(
+                "  {:<24} {:<10} {:<20} {:<8} ${:.2}\n",
+                s.id, status_slug(&s.status), s.repo, pr, s.cost_usd,
+            ));
+        }
+    }
+    out
+}
+
+pub(crate) fn status_slug(s: &SessionStatus) -> &'static str {
+    match s {
+        SessionStatus::Spawning      => "spawning",
+        SessionStatus::Working       => "working",
+        SessionStatus::PrOpen        => "pr_open",
+        SessionStatus::CiFailed      => "ci_failed",
+        SessionStatus::ReviewPending => "review_pending",
+        SessionStatus::Mergeable     => "mergeable",
+        SessionStatus::Done          => "done",
+        SessionStatus::Terminated    => "terminated",
+        SessionStatus::Interrupted   => "interrupted",
+    }
+}
+
+pub(crate) fn run_list_sessions(store: &ninox_core::store::Store, json: bool) -> anyhow::Result<String> {
+    let sessions = store.list_sessions()?;
+    let orchestrators = store.list_orchestrators()?;
+    if json {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "orchestrators": orchestrators,
+            "sessions": sessions,
+        }))?);
+    }
+    Ok(render_session_board(&group_sessions(sessions, orchestrators)))
 }
 
 /// Core of `ninox capabilities`, split out from arg parsing so it can be
@@ -3247,7 +3543,13 @@ mod discover_repos_tests {
 /// model cache, unsupported platform, etc. Embedding is an enhancement
 /// layer; it must never be a hard dependency of `brain index`/`brain query`.
 fn try_build_embedder() -> Option<Arc<dyn ninox_core::embeddings::Embedder>> {
-    match ninox_core::embeddings::FastEmbedEmbedder::try_new() {
+    build_embedder(true)
+}
+
+/// `try_build_embedder`, optionally without the download progress bar
+/// (the TUI owns the terminal).
+fn build_embedder(show_download_progress: bool) -> Option<Arc<dyn ninox_core::embeddings::Embedder>> {
+    match ninox_core::embeddings::FastEmbedEmbedder::try_new_with_progress(show_download_progress) {
         Ok(embedder) => Some(Arc::new(embedder)),
         Err(err) => {
             tracing::warn!("brain: embedding model unavailable, falling back to keyword-only search: {err}");
@@ -3256,7 +3558,22 @@ fn try_build_embedder() -> Option<Arc<dyn ninox_core::embeddings::Embedder>> {
     }
 }
 
-async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> anyhow::Result<()> {
+/// True when this process was started through the `nx` alias.
+fn invoked_as_nx() -> bool {
+    std::env::args_os().next().is_some_and(|a| is_nx_argv0(std::path::Path::new(&a)))
+}
+
+fn is_nx_argv0(argv0: &std::path::Path) -> bool {
+    argv0.file_stem().is_some_and(|s| s == ninox_core::hooks::NX_ALIAS)
+}
+
+async fn run_tui(
+    store: Arc<Store>,
+    port_arg: Option<u16>,
+    headless: bool,
+    db_path: PathBuf,
+    force_gui: bool,
+) -> anyhow::Result<()> {
     let config = AppConfig::load().unwrap_or_default();
     let port = port_arg.unwrap_or(config.port);
     let orchestrator_root = config.resolved_orchestrator_root();
@@ -3264,13 +3581,34 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
     let config_path = AppConfig::config_path().to_string_lossy().to_string();
     let brain_path = config.resolved_brain_path();
 
-    let ninox_bin = std::env::current_exe()
+    let ninox_bin = ninox_core::hooks::canonical_exe()
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "ninox".to_string());
 
-    if let Err(e) =
-        app::setup_orchestrator_root(&orchestrator_root, &config, &ninox_bin, &config_path).await
+    use std::io::IsTerminal;
+    // Bare `nx` from a terminal, or bare `ninox` with no display to open,
+    // runs the TUI as a *client* (tui::run ensures the daemon out-of-process,
+    // so quitting it leaves agents and the poller running). Bare `ninox`
+    // with a display keeps opening the desktop app, as does `ninox gui`;
+    // --headless still means "be the daemon" and never opens either.
+    if !headless && !force_gui && std::io::stdout().is_terminal() && (invoked_as_nx() || !has_display()) {
+        return crate::tui::run(store, port, db_path).await;
+    }
+
+    let act_as_daemon = headless || !has_display();
+    if daemon_should_yield(act_as_daemon, port).await {
+        // Exit 0: launchd's KeepAlive{SuccessfulExit=false} and systemd's
+        // Restart=on-failure only restart failures, so a login-item daemon
+        // finding the GUI (or a TUI-spawned daemon) on the port stops here
+        // instead of crash-looping, each loop re-seeding and polling.
+        tracing::info!("another ninox already serves :{port} — exiting");
+        return Ok(());
+    }
+
+    if let Err(e) = ninox_core::orchestrator_root::setup_orchestrator_root(
+        &orchestrator_root, &config, &ninox_bin, &config_path,
+    ).await
     {
         tracing::warn!("orchestrator root setup failed: {e}");
     }
@@ -3294,34 +3632,90 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
     };
     let token = CancellationToken::new();
 
-    let poller = Poller::new(engine.clone());
+    // A deliberate --headless (and the no-display daemon fallback below,
+    // which behaves the same way) must bind the port or die — otherwise a
+    // bind failure just gets traced and the process parks on ctrl_c forever,
+    // leaving a permanent duplicate poller. The GUI path instead skips
+    // hosting entirely when something is already listening, since the GUI
+    // reads the store directly and doesn't need its own poller/server.
+    let already_running = !act_as_daemon && ninox_core::daemon::port_in_use(port).await;
+
+    // The GUI always hosts its own poller: its live PR/cost/context updates
+    // arrive as in-process Engine events, and `PollSessions` only adopts
+    // new rows and terminal statuses from the store — an out-of-process
+    // daemon's writes would leave the fleet stale. Two pollers against the
+    // same store double GitHub polling while both run (the pre-existing
+    // cost of GUI + `--headless` together); only the server bind is skipped
+    // when something already holds the port.
+    let poller = Poller::new(engine.clone())
+        .with_fleet_restorer(fleet::auto_restorer(Arc::clone(&store)));
     tokio::spawn({
         let t = token.clone();
         async move { poller.start(t).await }
     });
 
-    tokio::spawn({
-        let e = engine.clone();
-        let b = brain.clone();
-        let emb = embedder.clone();
-        async move {
-            if let Err(err) = ninox_server::start(e, b, emb, port).await {
-                tracing::error!("server: {err}");
+    let server_task = if already_running {
+        tracing::info!("port :{port} already in use — not binding the server (poller runs in-process)");
+        None
+    } else {
+        let task = tokio::spawn({
+            let e = engine.clone();
+            let b = brain.clone();
+            let emb = embedder.clone();
+            async move {
+                // Traced here, inside the task, rather than only at the
+                // headless select-arm below — the GUI path never awaits
+                // this handle, so that's the only place a bind/start
+                // failure would otherwise be visible at all.
+                let res = ninox_server::start(e, b, emb, port).await;
+                if let Err(err) = &res {
+                    tracing::error!("server: {err}");
+                }
+                res
             }
-        }
-    });
+        });
+        tracing::info!("ninox ready on :{port}");
+        Some(task)
+    };
 
-    tracing::info!("ninox ready on :{port}");
-
-    if headless || !has_display() {
-        tokio::signal::ctrl_c().await?;
+    if act_as_daemon {
+        // already_running is forced false above when act_as_daemon, so the
+        // server was always spawned.
+        let task = server_task.expect("act_as_daemon implies the server was spawned");
+        let failure = tokio::select! {
+            _ = tokio::signal::ctrl_c() => None,
+            res = task => match res {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e),
+                Err(join_err) => Some(anyhow::anyhow!("server task panicked: {join_err}")),
+            },
+        };
         token.cancel();
+        match failure {
+            // Lost a bind race to another ninox since the probe above.
+            Some(_) if ninox_core::daemon::port_in_use(port).await => {
+                tracing::info!("another ninox already serves :{port} — exiting");
+            }
+            // A daemon that can't bind/run its port is a duplicate poller
+            // waiting to happen — die loudly instead of parking on ctrl_c
+            // forever (daemon.log is where `ensure_daemon`'s startup wait
+            // points users). `process::exit` skips destructors, so an
+            // in-flight auto-restore's lease is released by hand first.
+            Some(e) => {
+                tracing::error!("server: {e}");
+                fleet::release_own_restore_lease(&store);
+                std::process::exit(1);
+            }
+            None => {}
+        }
         return Ok(());
     }
 
-    if let Err(e) = tmux::require_version().await {
-        eprintln!("{e}");
-        std::process::exit(1);
+    if config.runtime.backend == ninox_core::runtime::Backend::Tmux {
+        if let Err(e) = tmux::require_version().await {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -3370,6 +3764,20 @@ async fn run_tui(store: Arc<Store>, port_arg: Option<u16>, headless: bool) -> an
     Ok(())
 }
 
+/// Prints a stderr-only hint (stdout stays clean for `--json` consumers)
+/// when nothing is listening on the effective port, so `ninox list`/`ninox
+/// connect` can warn readers that statuses may be stale without depending
+/// on a daemon they didn't start.
+async fn warn_if_daemon_down(port_arg: Option<u16>) {
+    let port = port_arg.unwrap_or_else(|| AppConfig::load().unwrap_or_default().port);
+    if !ninox_core::daemon::port_in_use(port).await {
+        eprintln!(
+            "note: background services not running — statuses may be stale \
+             (they start automatically with ninox tui or ninox orchestrate)"
+        );
+    }
+}
+
 fn default_db_path() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -3391,6 +3799,19 @@ fn first_line(s: &str, max_chars: usize) -> Option<String> {
     } else {
         let clipped: String = line.chars().take(max_chars).collect();
         Some(format!("{clipped}…"))
+    }
+}
+
+#[cfg(test)]
+mod nx_alias_tests {
+    use std::path::Path;
+
+    #[test]
+    fn only_the_nx_alias_counts_as_nx() {
+        assert!(super::is_nx_argv0(Path::new("nx")));
+        assert!(super::is_nx_argv0(Path::new("/Users/me/.cargo/bin/nx")));
+        assert!(!super::is_nx_argv0(Path::new("/Users/me/.cargo/bin/ninox")));
+        assert!(!super::is_nx_argv0(Path::new("nxx")));
     }
 }
 
@@ -3425,11 +3846,30 @@ mod brain_add_tests {
     }
 }
 
+/// The daemon path must not start a second poller beside a ninox that
+/// already holds the port.
+async fn daemon_should_yield(act_as_daemon: bool, port: u16) -> bool {
+    act_as_daemon && ninox_core::daemon::port_in_use(port).await
+}
+
 fn has_display() -> bool {
     #[cfg(target_os = "macos")]
     { true }
     #[cfg(not(target_os = "macos"))]
     { std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok() }
+}
+
+#[cfg(test)]
+mod daemon_yield_tests {
+    #[tokio::test]
+    async fn daemon_yields_only_when_the_port_is_held() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(super::daemon_should_yield(true, port).await);
+        assert!(!super::daemon_should_yield(false, port).await, "the GUI path shares the port");
+        drop(listener);
+        assert!(!super::daemon_should_yield(true, port).await);
+    }
 }
 
 #[cfg(test)]
@@ -3565,6 +4005,10 @@ mod worker_env_tests {
             matches!(session.status, ninox_core::SessionStatus::Terminated),
             "failed spawn must not leave a Working ghost, got {:?}", session.status,
         );
+        // The raw task brief (no worker-context footer) is what a fleet
+        // restore re-briefs a fresh-restarted worker with.
+        let facts = store.fleet_record("ghost-spawn-test").unwrap().unwrap();
+        assert_eq!(facts.task_brief.as_deref(), Some("do the task"));
     }
 
     #[tokio::test]
@@ -4809,5 +5253,118 @@ mod worker_status_cli_tests {
         seed(&store, "b", "twin", SessionStatus::Working);
         let err = resolve_session_ref(&store, "twin").unwrap_err();
         assert!(err.to_string().contains("ambiguous"), "{err}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    use ninox_core::types::{Session, SessionStatus};
+
+    /// Serializes tests that mutate process-global env vars (`NINOX_CONFIG`)
+    /// against each other — `cargo test` runs test fns on parallel threads,
+    /// so without this guard one test's env mutation could leak into
+    /// another's read.
+    pub(crate) static ENV_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set `key=value` for the duration of `f`, restoring the prior value
+    /// (or unsetting it) afterward. Serialized via `ENV_TEST_GUARD` since
+    /// env vars are process-global state shared across parallel test
+    /// threads. Mirrors `ninox_core::config::tests::with_env_override`.
+    pub(crate) fn with_env_override<T>(
+        key: &str,
+        value: impl AsRef<std::ffi::OsStr>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(key).ok();
+        std::env::set_var(key, value);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        match prior {
+            Some(v) => std::env::set_var(key, v),
+            None    => std::env::remove_var(key),
+        }
+        result.unwrap()
+    }
+
+    pub(crate) fn session(id: &str, orch: Option<&str>, status: SessionStatus) -> Session {
+        Session {
+            id: id.into(),
+            orchestrator_id: orch.map(String::from),
+            name: id.into(),
+            repo: "owner/repo".into(),
+            status,
+            agent_type: "claude-code".into(),
+            cost_usd: 1.5,
+            started_at: 0,
+            pr_number: Some(42),
+            pr_id: None,
+            workspace_path: None,
+            pid: None,
+            model: None,
+            context_tokens: None,
+            catalogue_path: None,
+            context_used_pct: None,
+            context_total_tokens: None,
+            context_window_size: None,
+            claude_session_id: None,
+            summary: None,
+            terminal_at: None,
+            gate_status: None,
+            merged_at: None,
+            activity: ninox_core::ActivityState::Unknown,
+            activity_note: None,
+            activity_since: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod list_sessions_tests {
+    use super::{group_sessions, render_session_board, test_fixtures};
+    use ninox_core::types::{Orchestrator, SessionStatus};
+
+    #[test]
+    fn workers_group_under_their_orchestrator() {
+        let orch = Orchestrator { id: "boss".into(), name: "Boss".into(), created_at: 0 };
+        // The orchestrator's own session row shares its id.
+        let rows = group_sessions(
+            vec![
+                test_fixtures::session("boss", None, SessionStatus::Working),
+                test_fixtures::session("w1", Some("boss"), SessionStatus::Working),
+                test_fixtures::session("stray", Some("gone-orch"), SessionStatus::Terminated),
+            ],
+            vec![orch],
+        );
+        assert_eq!(rows.len(), 2); // boss group + ungrouped
+        assert_eq!(rows[0].0.as_ref().unwrap().id, "boss");
+        assert_eq!(rows[0].1.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec!["boss", "w1"]);
+        assert!(rows[1].0.is_none());
+        assert_eq!(rows[1].1[0].id, "stray");
+    }
+
+    #[test]
+    fn board_renders_status_repo_pr_and_cost() {
+        let orch = Orchestrator { id: "boss".into(), name: "Boss".into(), created_at: 0 };
+        let out = render_session_board(&group_sessions(
+            vec![
+                test_fixtures::session("boss", None, SessionStatus::Working),
+                test_fixtures::session("w1", Some("boss"), SessionStatus::PrOpen),
+            ],
+            vec![orch],
+        ));
+        assert!(out.contains("boss"), "{out}");
+        assert!(out.contains("w1"), "{out}");
+        assert!(out.contains("PR #42"), "{out}");
+        assert!(out.contains("$1.50"), "{out}");
+        assert!(out.contains("pr_open"), "{out}");
+    }
+
+    #[test]
+    fn empty_store_prints_hint() {
+        let out = render_session_board(&group_sessions(vec![], vec![]));
+        assert!(out.contains("no sessions"), "{out}");
+        assert!(out.contains("ninox orchestrate"), "{out}");
     }
 }

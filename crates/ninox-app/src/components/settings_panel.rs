@@ -63,6 +63,7 @@ pub fn settings_panel(app: &App) -> Element<'_, Message> {
         workers_card(app),
         rust_cache_card(app),
         messaging_card(app),
+        runtime_card(app),
         version_card(app),
     ]
     .spacing(18)
@@ -451,6 +452,31 @@ fn messaging_card(app: &App) -> Element<'_, Message> {
         .size(10)
         .font(MONO)
         .color(s.faint),
+    ]
+    .spacing(0)
+    .into())
+}
+
+/// Runtime card: which process hosts new sessions (`[runtime] backend` —
+/// see `ninox_core::runtime::Backend`). Same picker shape as the messaging
+/// card; the blurb tracks the selection.
+fn runtime_card(app: &App) -> Element<'_, Message> {
+    use iced::widget::pick_list;
+    let s = &app.scheme;
+    let backend = app.config.runtime.backend;
+    let pick = pick_list(
+        ninox_core::runtime::Backend::ALL.as_slice(),
+        Some(backend),
+        Message::SettingsSetRuntimeBackend,
+    )
+    .font(MONO)
+    .text_size(12)
+    .padding([6, 10])
+    .style(crate::style::pick_style(s));
+    card(app, "Session runtime", column![
+        column![micro_label("Runtime for new sessions", s.faint), Space::new(0, 6), pick].spacing(0),
+        Space::new(0, 10),
+        text(backend.description()).size(10).font(MONO).color(s.faint),
     ]
     .spacing(0)
     .into())

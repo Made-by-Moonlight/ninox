@@ -126,16 +126,43 @@ pub fn registry_dir() -> PathBuf {
 /// tmux pane it runs in as `"<session-name>:@<window>.<pane>"` — so the
 /// part before the first `:` is the join key between the two systems.
 ///
+/// A ptyd pane has no tmux name, so Claude Code records no `"tmux"` field
+/// there. For those, `pane_pid` (the pane's root process) is the join key
+/// instead: a record without a `"tmux"` field matches when its pid is the
+/// pane's root or descends from it. The shallowest such record wins (the
+/// pane root itself, then its direct child, ...), so a nested Claude Code
+/// the worker started inside its pane never shadows the worker's own.
+///
 /// Any of these mean "no peer", none of them an error: the harness isn't
 /// Claude Code, the version predates the feature, the feature is off for
 /// that session, or the registry directory doesn't exist at all.
-pub fn find_peer(session_id: &str) -> Option<PeerSession> {
-    find_peer_in(&registry_dir(), session_id)
+pub fn find_peer(session_id: &str, pane_pid: Option<u32>) -> Option<PeerSession> {
+    find_peer_in(&registry_dir(), session_id, pane_pid)
 }
 
 /// [`find_peer`] against an explicit registry directory, for tests.
-pub fn find_peer_in(registry_dir: &Path, session_id: &str) -> Option<PeerSession> {
-    find_peer_where(registry_dir, session_id, is_pid_alive)
+pub fn find_peer_in(registry_dir: &Path, session_id: &str, pane_pid: Option<u32>) -> Option<PeerSession> {
+    let parents = std::cell::OnceCell::new();
+    find_peer_joined(registry_dir, session_id, pane_pid, is_pid_alive, |pid, root| {
+        depth_below(parents.get_or_init(crate::runtime::process::parent_map), pid, root)
+    })
+}
+
+/// How many generations `pid` is below `root` (0 = `root` itself), or
+/// `None` when it does not descend from it.
+fn depth_below(parents: &std::collections::HashMap<u32, u32>, pid: u32, root: u32) -> Option<usize> {
+    let mut current = pid;
+    // Bounded so a pid-reuse cycle in a stale snapshot can't spin forever.
+    for depth in 0..256 {
+        if current == root {
+            return Some(depth);
+        }
+        match parents.get(&current) {
+            Some(&parent) if parent != current && current > 1 => current = parent,
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// [`find_peer_in`] with the liveness probe injected, so tests can describe
@@ -152,10 +179,23 @@ pub fn find_peer_in(registry_dir: &Path, session_id: &str) -> Option<PeerSession
 /// and so stops matching this tmux session. The exception is the window
 /// where it has bound its socket but not yet written its record, which is
 /// real but narrow, and would need `procStart` matching to close.
+#[cfg(test)]
 fn find_peer_where(
     registry_dir: &Path,
     session_id:   &str,
     is_alive:     impl Fn(u32) -> bool,
+) -> Option<PeerSession> {
+    find_peer_joined(registry_dir, session_id, None, is_alive, |_, _| None)
+}
+
+/// [`find_peer_where`] plus the ptyd pid join, with the process-tree probe
+/// injected (`depth(pid, root)`, see [`depth_below`]).
+fn find_peer_joined(
+    registry_dir: &Path,
+    session_id:   &str,
+    pane_pid:     Option<u32>,
+    is_alive:     impl Fn(u32) -> bool,
+    depth:        impl Fn(u32, u32) -> Option<usize>,
 ) -> Option<PeerSession> {
     let entries = std::fs::read_dir(registry_dir).ok()?;
     entries
@@ -168,21 +208,23 @@ fn find_peer_where(
             let raw = std::fs::read_to_string(&path).ok()?;
             let record: serde_json::Value = serde_json::from_str(&raw).ok()?;
 
-            let tmux = record.get("tmux")?.as_str()?;
-            if tmux.split(':').next()? != session_id {
-                return None;
-            }
+            let depth = match record.get("tmux").and_then(|v| v.as_str()).filter(|t| !t.is_empty()) {
+                Some(tmux) => (tmux.split(':').next() == Some(session_id)).then_some(0),
+                None => pane_pid.and_then(|root| if pid == root { Some(0) } else { depth(pid, root) }),
+            }?;
             let socket_path = record.get("messagingSocketPath")?.as_str()?;
             if socket_path.is_empty() {
                 return None;
             }
-            Some(PeerSession {
+            let peer = PeerSession {
                 pid,
                 socket_path: PathBuf::from(socket_path),
                 started_at: record.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0),
-            })
+            };
+            Some((depth, peer))
         })
-        .max_by_key(|peer| (peer.started_at, peer.pid))
+        .max_by_key(|(depth, peer)| (std::cmp::Reverse(*depth), peer.started_at, peer.pid))
+        .map(|(_, peer)| peer)
 }
 
 /// Enqueue `message` as a user message on `peer`'s socket.
@@ -276,6 +318,59 @@ mod tests {
         let peer = find_peer_where(dir.path(), "my-worker", |_| true).unwrap();
         assert_eq!(peer.pid, 200);
         assert_eq!(peer.socket_path, PathBuf::from("/tmp/cc-socks/200.sock"));
+    }
+
+    fn ptyd_record(socket: &str, started_at: i64) -> serde_json::Value {
+        serde_json::json!({ "messagingSocketPath": socket, "startedAt": started_at })
+    }
+
+    #[test]
+    fn a_ptyd_pane_joins_on_a_record_descending_from_its_root_pid() {
+        let dir = tempdir().unwrap();
+        write_record(dir.path(), 300, ptyd_record("/tmp/cc-socks/300.sock", 10));
+        write_record(dir.path(), 400, ptyd_record("/tmp/cc-socks/400.sock", 20));
+        // 300 runs under pane root 50; 400 belongs to some other pane.
+        let descends = |pid: u32, root: u32| ((pid, root) == (300, 50)).then_some(2);
+
+        let peer = find_peer_joined(dir.path(), "my-worker", Some(50), |_| true, descends).unwrap();
+        assert_eq!(peer.pid, 300);
+        assert_eq!(find_peer_joined(dir.path(), "my-worker", Some(400), |_| true, |_, _| None).unwrap().pid, 400,
+            "the pane root itself counts");
+        assert_eq!(find_peer_joined(dir.path(), "my-worker", Some(51), |_| true, descends), None);
+    }
+
+    #[test]
+    fn a_ptyd_pane_prefers_the_shallowest_descendant_over_a_newer_nested_one() {
+        let dir = tempdir().unwrap();
+        // Pane root 50 runs a shell (60) running the worker's claude (300);
+        // that claude later started a nested claude (400, via 350).
+        write_record(dir.path(), 300, ptyd_record("/tmp/cc-socks/300.sock", 10));
+        write_record(dir.path(), 400, ptyd_record("/tmp/cc-socks/400.sock", 99));
+        write_record(dir.path(), 310, ptyd_record("/tmp/cc-socks/310.sock", 20));
+        let parents: std::collections::HashMap<u32, u32> =
+            [(60, 50), (300, 60), (310, 60), (350, 300), (400, 350), (50, 1)].into();
+        let depth = |pid, root| depth_below(&parents, pid, root);
+
+        let peer = find_peer_joined(dir.path(), "my-worker", Some(50), |_| true, depth).unwrap();
+        assert_eq!(peer.pid, 310, "depth first, then the newest among equals");
+        assert_eq!(depth_below(&parents, 50, 50), Some(0));
+        assert_eq!(depth_below(&parents, 400, 50), Some(4));
+        assert_eq!(depth_below(&parents, 400, 60), Some(3));
+        assert_eq!(depth_below(&parents, 60, 300), None);
+    }
+
+    #[test]
+    fn the_pid_join_never_applies_to_a_record_naming_a_tmux_session() {
+        let dir = tempdir().unwrap();
+        write_record(dir.path(), 300, record_for("someone-else:@1.%1", "/tmp/cc-socks/300.sock", 10));
+        assert_eq!(find_peer_joined(dir.path(), "my-worker", Some(50), |_| true, |_, _| Some(1)), None);
+    }
+
+    #[test]
+    fn records_without_a_tmux_field_never_match_a_tmux_session() {
+        let dir = tempdir().unwrap();
+        write_record(dir.path(), 300, ptyd_record("/tmp/cc-socks/300.sock", 10));
+        assert_eq!(find_peer_joined(dir.path(), "my-worker", None, |_| true, |_, _| Some(1)), None);
     }
 
     #[test]
@@ -374,7 +469,7 @@ mod tests {
         let dir = tempdir().unwrap();
         // Pid 1 is init/launchd: always alive, never a Claude Code session.
         write_record(dir.path(), 1, record_for("my-worker:@1.%1", "/tmp/cc-socks/1.sock", 10));
-        assert!(find_peer_in(dir.path(), "my-worker").is_some());
+        assert!(find_peer_in(dir.path(), "my-worker", None).is_some());
 
         // Spawn and reap a child to name a pid that is definitely dead.
         // Picking an arbitrarily large number instead is not portable: pids
@@ -386,7 +481,7 @@ mod tests {
 
         let dead = tempdir().unwrap();
         write_record(dead.path(), dead_pid, record_for("my-worker:@1.%1", "/tmp/cc-socks/x.sock", 10));
-        assert_eq!(find_peer_in(dead.path(), "my-worker"), None);
+        assert_eq!(find_peer_in(dead.path(), "my-worker", None), None);
     }
 
     #[test]

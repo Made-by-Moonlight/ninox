@@ -297,7 +297,7 @@ impl Engine {
             self.emit(Event::SessionDone(session.id.clone()));
         }
         // Also kill the orchestrator's own tmux session (same id as orchestrator).
-        let _ = crate::tmux::kill_session(orchestrator_id).await;
+        let _ = crate::runtime::kill_session(orchestrator_id).await;
         self.store.delete_orchestrator(orchestrator_id)?;
         self.emit(Event::OrchestratorRemoved(orchestrator_id.to_string()));
         Ok(())
@@ -360,6 +360,40 @@ impl Engine {
                 "{stop_error}; exact cleanup claim abort failed: {abort_error}"
             )),
         }
+    }
+
+    /// [`Self::remove_orchestrator`] that leaves running workers alone: only
+    /// ended workers lose their worktree and record, and each live one is
+    /// detached into a standalone session. Returns the ids kept running.
+    pub async fn remove_orchestrator_keeping_live(&self, orchestrator_id: &str) -> anyhow::Result<Vec<String>> {
+        let sessions_dir = crate::config::AppConfig::sessions_dir();
+        let mut kept = Vec::new();
+        for session in self.store.sessions_by_orchestrator(orchestrator_id)? {
+            // Re-read: a worker resumed since the caller looked is live again.
+            let session = self.store.get_session(&session.id)?.unwrap_or(session);
+            // Interrupted is resumable (reboot, host death), so it is kept too.
+            if !is_finished(&session.status) || crate::runtime::has_session(&session.id).await {
+                self.store.detach_from_orchestrator(&session.id)?;
+                kept.push(session.id);
+                continue;
+            }
+            let _ = crate::runtime::kill_session(&session.id).await;
+            remove_worktree_and_artifacts(
+                &self.store,
+                &session.id,
+                session.workspace_path.as_deref(),
+                &sessions_dir,
+                RecoveryMetadata::Remove,
+                None,
+            )
+            .await;
+            self.store.delete_session(&session.id)?;
+            self.emit(Event::SessionDone(session.id));
+        }
+        let _ = crate::runtime::kill_session(orchestrator_id).await;
+        self.store.delete_orchestrator(orchestrator_id)?;
+        self.emit(Event::OrchestratorRemoved(orchestrator_id.to_string()));
+        Ok(kept)
     }
 
     /// Reap an orchestrator's workers: kill each one's tmux session, remove
@@ -461,7 +495,7 @@ impl Engine {
                 continue;
             }
 
-            let _ = crate::tmux::kill_session(&session.id).await;
+            let _ = crate::runtime::kill_session(&session.id).await;
             // The worktree only — NOT the hook artifacts. Those carry work
             // requests and PR reports the poller has not necessarily
             // ingested yet: `deliver_work_requests` runs on its own tick and
@@ -475,6 +509,11 @@ impl Engine {
             // once it purges the row, so nothing leaks by waiting.
             if let Some(wp) = session.workspace_path.as_deref() {
                 remove_worker_worktree(wp, &session.id, RecoveryMetadata::Remove).await;
+            }
+            // Reaped on purpose: no later `ninox fleet restore` may bring it
+            // back as a fresh restart.
+            if let Err(e) = self.store.clear_interruption(&session.id) {
+                tracing::warn!("reap {}: clear fleet interruption: {e}", session.id);
             }
 
             // Only a worker WE just made terminal gets a status write. An
@@ -636,9 +675,14 @@ impl Engine {
     /// Kill the tmux session, mark it Terminated in the DB, and emit SessionUpdated.
     pub async fn terminate_session(&self, session_id: &str) -> anyhow::Result<()> {
         // Best-effort tmux kill (session may already be dead).
-        let _ = crate::tmux::kill_session(session_id).await;
+        let _ = crate::runtime::kill_session(session_id).await;
 
         if let Some(mut session) = self.store.get_session(session_id)? {
+            // Killed on purpose, so not a restore candidate — except an
+            // `Interrupted` row, which this leaves as it is (resumable).
+            if session.status != SessionStatus::Interrupted {
+                self.store.clear_interruption(session_id)?;
+            }
             // Never clobber a terminal status — most importantly, never flip
             // a `Done` session back to `Terminated`. `Done` is only ever
             // reached via `handle_merge_detection`, which already notified
@@ -1135,6 +1179,35 @@ mod tests {
     }
 
     // ── Orchestrator removal cleanup claims ───────────────────────────────────
+
+    #[tokio::test]
+    async fn removing_an_orchestrator_keeping_live_detaches_running_and_resumable_workers() {
+        use crate::types::SessionStatus::*;
+        let mut orch = worker("orch-1", "orch-1", Terminated);
+        orch.orchestrator_id = None;
+        let (store, engine) = reap_fixture(&[
+            orch,
+            worker("done-1", "orch-1", Done),
+            worker("intr-1", "orch-1", Interrupted),
+            worker("live-1", "orch-1", Working),
+        ]);
+        store.upsert_orchestrator(&crate::types::Orchestrator { id: "orch-1".into(), name: "o".into(), created_at: 0 }).unwrap();
+
+        let kept = engine.remove_orchestrator_keeping_live("orch-1").await.unwrap();
+
+        assert_eq!(kept, ["intr-1", "live-1"]);
+        for id in ["intr-1", "live-1"] {
+            let s = store.get_session(id).unwrap().expect("live and resumable workers keep their records");
+            assert_eq!(s.orchestrator_id, None, "detached, so the orchestrator delete can't take {id}");
+        }
+        assert_eq!(store.get_session("intr-1").unwrap().unwrap().status, Interrupted, "still resumable");
+        for gone in ["orch-1", "done-1"] {
+            assert!(store.get_session(gone).unwrap().is_none(), "{gone} should be removed");
+        }
+        assert!(store.list_orchestrators().unwrap().is_empty());
+    }
+
+    // ── Reap ────────────────────────────────────────────────────────────────
 
     fn worker(id: &str, orchestrator: &str, status: crate::types::SessionStatus) -> Session {
         Session {
@@ -1747,6 +1820,42 @@ mod tests {
             .unwrap();
 
         assert!(!worktree_path.exists(), "reap must remove the worker's worktree");
+    }
+
+    /// Reaping (or killing) a restore candidate dismisses it: a later
+    /// `ninox fleet restore` must not bring back a worker the orchestrator
+    /// deliberately cleaned up.
+    #[tokio::test]
+    async fn reap_and_terminate_dismiss_pending_fleet_restores() {
+        use crate::types::SessionStatus::*;
+        let mut reconciled = worker("reconciled", "orch-1", Terminated);
+        reconciled.terminal_at = Some(50);
+        let (store, engine) = reap_fixture(&[
+            worker("interrupted", "orch-1", Interrupted),
+            reconciled.clone(),
+            Session { id: "killed".into(), ..reconciled.clone() },
+        ]);
+        for id in ["interrupted", "reconciled", "killed"] {
+            store.record_interruption(id, 10, &Working, Some("reboot")).unwrap();
+        }
+        store.mark_reconciled_terminal("reconciled", 50).unwrap();
+        store.mark_reconciled_terminal("killed", 50).unwrap();
+        let awaiting = |id: &str| {
+            let s = store.get_session(id).unwrap().unwrap();
+            crate::fleet::awaits_restore(&s, &store.fleet_record(id).unwrap().unwrap_or_default())
+        };
+        assert!(awaiting("interrupted") && awaiting("reconciled") && awaiting("killed"));
+
+        let ids = ["interrupted".to_string(), "reconciled".to_string()];
+        engine
+            .reap_workers("orch-1", ReapSelection::Ids(&ids), true)
+            .await
+            .unwrap();
+        engine.terminate_session("killed").await.unwrap();
+
+        assert!(!awaiting("interrupted"), "a reaped Interrupted worker is gone for good");
+        assert!(!awaiting("reconciled"), "a reaped fresh-restart candidate is gone for good");
+        assert!(!awaiting("killed"), "a killed fresh-restart candidate is gone for good");
     }
 
     #[tokio::test]

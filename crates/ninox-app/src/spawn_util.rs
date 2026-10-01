@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use ninox_core::{
-    events::Engine, pty, session_socket::CLAUDE_MESSAGING_GATE_ENV, tmux, Event,
+    events::Engine, pty, runtime, session_socket::CLAUDE_MESSAGING_GATE_ENV, tmux, Event,
     PooledCheckoutLease, PooledCheckoutState, Session, SessionFields, SessionStatus, Store,
 };
 
@@ -72,7 +72,18 @@ pub struct InteractiveSpawnParams {
 /// Working forever, and `None` is returned.
 pub async fn spawn_interactive_session(
     engine: Arc<Engine>,
+    p: InteractiveSpawnParams,
+) -> Option<Vec<String>> {
+    launch_interactive_session(engine, p, true).await
+}
+
+/// [`spawn_interactive_session`] with PTY streaming optional: a short-lived
+/// CLI process (`ninox fleet restore`) must not pipe the pane into a FIFO
+/// that dies with it.
+pub async fn launch_interactive_session(
+    engine: Arc<Engine>,
     mut p: InteractiveSpawnParams,
+    stream_pty: bool,
 ) -> Option<Vec<String>> {
     let sid = p.session_id;
     let execution_role = p
@@ -89,7 +100,7 @@ pub async fn spawn_interactive_session(
         |role| role == ORCHESTRATOR_EXECUTION_ROLE,
     );
 
-    let ninox_bin = std::env::current_exe()
+    let ninox_bin = ninox_core::hooks::canonical_exe()
         .ok()
         .and_then(|x| x.to_str().map(str::to_string))
         .unwrap_or_else(|| "ninox".to_string());
@@ -138,8 +149,8 @@ pub async fn spawn_interactive_session(
         tracing::warn!("failed to seed claude workspace trust for {}: {e}", p.workspace);
     }
 
-    if let Err(e) = tmux::create_session(&sid, &p.workspace, &launch_cmd, &env).await {
-        tracing::error!("tmux create failed for {sid}: {e}");
+    if let Err(e) = runtime::create_session(runtime::configured_backend(), &sid, &p.workspace, &launch_cmd, &env).await {
+        tracing::error!("session create failed for {sid}: {e}");
         // Surface the failure: without this the optimistically inserted
         // session would sit in Working forever.
         if engine
@@ -168,11 +179,7 @@ pub async fn spawn_interactive_session(
 
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
-    let pid = tmux::list_sessions()
-        .await
-        .ok()
-        .and_then(|ss| ss.into_iter().find(|s| s.id == sid))
-        .and_then(|s| s.pid);
+    let pid = runtime::session_pid(&sid).await;
 
     // Resume and Re-file respawn an *existing* row — carry forward every
     // field the spawn isn't authoritative for (PR linkage, gate breakdown,
@@ -187,6 +194,7 @@ pub async fn spawn_interactive_session(
     // ends.
     let prior = engine.store.get_session(&sid).ok().flatten();
     let prior = prior.as_ref();
+    let resumed = prior.and_then(|s| s.claude_session_id.as_deref()) == Some(p.claude_session_id.as_str());
     let updated = Session {
         id:              sid.clone(),
         orchestrator_id: p.orchestrator_id,
@@ -223,13 +231,72 @@ pub async fn spawn_interactive_session(
     };
     let _ = engine.store.upsert_session(&updated);
     engine.emit(Event::SessionUpdated(updated, SessionFields::ALL));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    ninox_core::fleet::note_relaunch(&engine.store, &sid, resumed, now);
 
-    if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &sid).await {
-        tracing::error!("pty setup failed for {sid}: {e}");
+    if stream_pty {
+        if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &sid).await {
+            tracing::error!("pty setup failed for {sid}: {e}");
+        }
     }
 
     // Hidden tmux client attach argv — mirrors NavigateSession's attach flow.
-    Some(tmux::attach_args(&sid).await)
+    Some(runtime::attach_args(&sid).await)
+}
+
+/// Everything needed to relaunch an existing session row under its own id.
+pub struct RelaunchRequest {
+    pub session:           Session,
+    pub is_orchestrator:   bool,
+    pub plan:              crate::app::RefilePlan,
+    /// The id to `--resume` (Resume) or a freshly minted one (fresh restart).
+    pub claude_session_id: String,
+    pub started_at:        i64,
+    pub failure_status:    SessionStatus,
+}
+
+/// The shared relaunch sequence behind the app's Resume action and `ninox
+/// fleet restore`: kill any stale pane, make sure the workspace exists,
+/// then launch under the same session id.
+pub async fn relaunch_in_place(
+    engine:     Arc<Engine>,
+    req:        RelaunchRequest,
+    config:     &ninox_core::config::AppConfig,
+    stream_pty: bool,
+) -> Option<Vec<String>> {
+    let id = req.session.id.clone();
+    let _ = ninox_core::runtime::kill_session(&id).await;
+    // The worktree may have been torn down since the session ran (merge
+    // cleanup, manual prune). Recreate it at the same path — claude-code
+    // keys the conversation to that path, so this is what makes `--resume`
+    // find it. On failure, fall through: `create_session` rejects a
+    // missing workspace, so the spawn fails visibly into `failure_status`
+    // instead of the agent silently starting in $HOME.
+    if let Err(e) = ensure_session_workspace(&req.plan.workspace, &id, req.is_orchestrator, config).await {
+        tracing::warn!("relaunch {id}: cannot restore workspace: {e}");
+    }
+    launch_interactive_session(
+        engine,
+        InteractiveSpawnParams {
+            session_id:        id,
+            name:              req.session.name,
+            workspace:         req.plan.workspace,
+            repo:              req.session.repo,
+            orchestrator_id:   req.session.orchestrator_id,
+            agent:             req.plan.agent,
+            base_cmd:          req.plan.base_cmd,
+            catalogue_path:    req.plan.catalogue_path,
+            extra_env:         req.plan.extra_env,
+            started_at:        req.started_at,
+            claude_session_id: req.claude_session_id,
+            failure_status:    req.failure_status,
+            summary:           req.session.summary,
+        },
+        stream_pty,
+    )
+    .await
 }
 
 pub async fn configured_worker_rust_cache_env(
@@ -2464,6 +2531,57 @@ mod tests {
         assert_eq!(session.claude_session_id.as_deref(), Some("fixed-uuid-for-test"));
 
         ninox_core::tmux::kill_session("spawn-uuid-test").await.ok();
+    }
+
+    /// A session resumed by hand (the app's Resume, not `ninox fleet
+    /// restore`) must close its interruption: otherwise its next ordinary
+    /// death would make a later restore resurrect it.
+    #[tokio::test]
+    async fn relaunch_by_hand_closes_the_fleet_interruption() {
+        use ninox_core::{config::AgentConfig, fleet::awaits_restore, store::Store, SessionStatus};
+        use tempfile::tempdir;
+
+        let store = std::sync::Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
+        let engine = ninox_core::events::Engine::new(store.clone());
+        let ws = tempdir().unwrap().keep().to_string_lossy().to_string();
+        let id = "relaunch-closes-interruption-test";
+        let mut row = crate::test_fixtures::session(id, None, SessionStatus::Interrupted);
+        row.workspace_path = Some(ws.clone());
+        row.claude_session_id = Some("same-uuid".into());
+        store.upsert_session(&row).unwrap();
+        store.record_interruption(id, 10, &SessionStatus::Working, Some("reboot")).unwrap();
+
+        let attach = spawn_interactive_session(
+            engine,
+            InteractiveSpawnParams {
+                session_id:        id.into(),
+                name:              "n".into(),
+                workspace:         ws,
+                repo:              String::new(),
+                orchestrator_id:   None,
+                agent:             AgentConfig::default(),
+                base_cmd:          "sleep 30".into(),
+                catalogue_path:    String::new(),
+                extra_env:         Vec::new(),
+                started_at:        1,
+                claude_session_id: "same-uuid".into(),
+                failure_status:    SessionStatus::Interrupted,
+                summary:           None,
+            },
+        )
+        .await;
+        ninox_core::tmux::kill_session(id).await.ok();
+        assert!(attach.is_some(), "tmux create must succeed");
+
+        let record = store.fleet_record(id).unwrap().unwrap();
+        assert!(!record.awaiting_restore());
+        assert_eq!(record.restore_mode.as_deref(), Some("resumed"));
+
+        // The agent later finishes and the poller marks it Terminated.
+        let mut ended = store.get_session(id).unwrap().unwrap();
+        ended.status = SessionStatus::Terminated;
+        ended.terminal_at = Some(i64::MAX);
+        assert!(!awaits_restore(&ended, &record));
     }
 
     /// Resume/Re-file respawn an existing row: the success snapshot must

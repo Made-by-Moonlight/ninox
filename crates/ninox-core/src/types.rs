@@ -170,7 +170,7 @@ pub enum SessionStatus {
     /// ("gone for good") — an `Interrupted` session has a
     /// `claude_session_id` and a harness capable of `--resume`, so the
     /// user can pick the exact same conversation back up. Never set
-    /// silently: only the startup reconciliation in `app.rs` assigns it,
+    /// silently: only the poller's startup reconciliation assigns it,
     /// and only a user-triggered Resume action clears it.
     Interrupted,
 }

@@ -31,6 +31,7 @@ sha2       = { workspace = true }
 time       = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+ninox-ptyd = { path = "../ninox-ptyd" }
 
 [build-dependencies]
 # Compiles src/ort_link_compat.cpp on gnu-Linux targets only — the iostream

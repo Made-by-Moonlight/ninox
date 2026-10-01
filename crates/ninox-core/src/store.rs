@@ -463,6 +463,10 @@ fn migrate_legacy_worker_incarnations(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+#[path = "store_fleet.rs"]
+mod fleet;
+pub use fleet::{FleetRecord, RecoveryRecord, WorkRequestRow};
+
 pub struct Store {
     conn: Mutex<Connection>,
     allocator_lock_dir: PathBuf,
@@ -752,6 +756,7 @@ impl Store {
         Self::reclaim_dead_runtime_claims(&mut conn, &allocator_lock_dir)?;
         Self::backfill_legacy_managed_workers(&conn)?;
         Self::remove_orphan_spawning_sessions(&mut conn)?;
+        fleet::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             allocator_lock_dir,
@@ -1846,7 +1851,16 @@ impl Store {
         // poller pass re-derives *declared* edges.
         tx.execute("DELETE FROM session_deps WHERE session_id=?1 OR depends_on=?1", [id])?;
         tx.execute("DELETE FROM session_messages WHERE session_id = ?1", [id])?;
+        Self::purge_fleet_rows(&tx, id)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Make `session_id` a standalone session, so deleting its orchestrator
+    /// leaves its row (and its messages and dependency edges) alone.
+    pub fn detach_from_orchestrator(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE sessions SET orchestrator_id = NULL WHERE id = ?1", [session_id])?;
         Ok(())
     }
 
@@ -1866,6 +1880,13 @@ impl Store {
              OR session_id IN (SELECT id FROM sessions WHERE orchestrator_id = ?1)",
             [id],
         )?;
+        conn.execute(
+            "DELETE FROM fleet_sessions WHERE session_id IN
+               (SELECT id FROM sessions WHERE orchestrator_id=?1)",
+            [id],
+        )?;
+        Self::purge_fleet_rows(&conn, id)?;
+        conn.execute("DELETE FROM work_requests WHERE orchestrator_id=?1", [id])?;
         conn.execute("DELETE FROM sessions WHERE orchestrator_id = ?1", [id])?;
         conn.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         conn.execute("DELETE FROM orchestrator_runtimes WHERE orchestrator_id=?1", [id])?;

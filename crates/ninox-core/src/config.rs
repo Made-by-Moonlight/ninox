@@ -86,6 +86,19 @@ impl Default for AgentConfig {
     }
 }
 
+impl AgentConfig {
+    /// Switch harness, clearing the model: ids from one harness must not
+    /// leak into another's launch command. Returns whether it changed.
+    pub fn set_harness(&mut self, harness: &str) -> bool {
+        if self.harness == harness {
+            return false;
+        }
+        self.harness = harness.to_string();
+        self.model = None;
+        true
+    }
+}
+
 // Launch-command construction lives in `crate::harness` — `AgentConfig` is
 // only the per-role/per-spawn pointer (harness name + model) into the
 // registry; resolve via `AppConfig::registry().interactive_cmd/worker_cmd`.
@@ -263,6 +276,28 @@ pub struct PrWatchConfig {
     pub enabled: bool,
 }
 
+/// What engine startup does with sessions reconciliation found interrupted
+/// (spec §5.4). See `crate::fleet::startup`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RestorePolicy {
+    /// Nothing happens until someone runs `ninox fleet restore`. Default:
+    /// an orchestrator must never act unattended without consent.
+    #[default]
+    Manual,
+    /// Record a pending-restore flag that the TUI offers to act on.
+    Prompt,
+    /// Restore the fleet immediately after startup reconciliation.
+    Auto,
+}
+
+/// `[fleet]` — durable-fleet behaviour. Opt-in, default `manual`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FleetConfig {
+    #[serde(default)]
+    pub restore_policy: RestorePolicy,
+}
+
 // ---------------------------------------------------------------------------
 // Auto-reap configuration
 // ---------------------------------------------------------------------------
@@ -407,6 +442,109 @@ impl RustCacheConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Session runtime configuration
+// ---------------------------------------------------------------------------
+
+/// Which runtime hosts newly created agent sessions. Existing sessions stay
+/// on whichever runtime holds them — see `crate::runtime`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    #[serde(default)]
+    pub backend: crate::runtime::Backend,
+}
+
+// ---------------------------------------------------------------------------
+// TUI configuration
+// ---------------------------------------------------------------------------
+
+/// `[tui]`: settings for the terminal UI and the `ninox pane attach` bridge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TuiConfig {
+    /// Prefix chord, written `Ctrl+<key>` (e.g. `Ctrl+Space`, `Ctrl+g`, `Ctrl+\\`; the older `C-<key>` form also parses).
+    /// Defaults to `C-\\` on macOS, where the system claims Ctrl-Space for
+    /// switching input sources, and `C-Space` elsewhere; neither is bound by
+    /// Claude Code or Codex. `C-a`/`C-b` are rejected because they
+    /// collide with users' own screen/tmux, as are chords that alias
+    /// Tab/Enter/Escape/interrupt (`C-i`, `C-m`, `C-[`, `C-c`).
+    /// Left out of a saved config while it holds the platform default, so
+    /// saving settings never pins one platform's default on another.
+    #[serde(default = "default_tui_prefix", skip_serializing_if = "is_default_tui_prefix")]
+    pub prefix: String,
+    /// `terminal` (default) draws the chrome in the host terminal's own
+    /// default colours and 16-colour ANSI palette; `field-notes` paints the
+    /// desktop app's theme in RGB.
+    #[serde(default)]
+    pub colors: TuiColors,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TuiColors {
+    #[default]
+    Terminal,
+    FieldNotes,
+}
+
+/// The default `[tui] prefix` spelling for this platform.
+pub const DEFAULT_PREFIX: &str = if cfg!(target_os = "macos") { "Ctrl+\\" } else { "Ctrl+Space" };
+
+fn default_tui_prefix() -> String {
+    DEFAULT_PREFIX.to_string()
+}
+
+/// Any spelling of the default chord (`Ctrl+\\`, `C-\\`, …) counts, so a
+/// save never pins it.
+fn is_default_tui_prefix(prefix: &str) -> bool {
+    parse_prefix(prefix) == Ok(DEFAULT_PREFIX_BYTE)
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self { prefix: default_tui_prefix(), colors: TuiColors::default() }
+    }
+}
+
+/// The control byte for `DEFAULT_PREFIX` (Ctrl-\ is FS, Ctrl-Space NUL);
+/// what the prefix falls back to.
+pub const DEFAULT_PREFIX_BYTE: u8 = if cfg!(target_os = "macos") { 0x1c } else { 0x00 };
+
+impl TuiConfig {
+    /// The prefix as the control byte a terminal sends for it, or `Err`
+    /// with a reason when the setting is unparseable or disallowed.
+    pub fn prefix_byte(&self) -> Result<u8, String> {
+        parse_prefix(&self.prefix)
+    }
+
+    /// `prefix_byte`, falling back to the platform default on a bad setting.
+    pub fn prefix_byte_or_default(&self) -> u8 {
+        self.prefix_byte().unwrap_or(DEFAULT_PREFIX_BYTE)
+    }
+}
+
+fn parse_prefix(spec: &str) -> Result<u8, String> {
+    let lower = spec.trim().to_ascii_lowercase();
+    let key = ["c-", "ctrl-", "ctrl+", "control-", "^"]
+        .iter()
+        .find_map(|p| lower.strip_prefix(p))
+        .ok_or_else(|| format!("prefix {spec:?} must be a Ctrl chord like Ctrl+Space"))?;
+    let byte = match key {
+        "space" | "spc" | " " | "@" | "2" => 0x00,
+        "\\" => 0x1c,
+        "]" => 0x1d,
+        "^" | "6" => 0x1e,
+        "_" | "-" => 0x1f,
+        k if k.len() == 1 && k.as_bytes()[0].is_ascii_lowercase() => k.as_bytes()[0] - b'a' + 1,
+        "[" => 0x1b,
+        _ => return Err(format!("prefix {spec:?} is not a recognised Ctrl chord")),
+    };
+    match byte {
+        0x01 | 0x02 => Err(format!("prefix {spec:?} collides with screen/tmux; pick another (default {DEFAULT_PREFIX})")),
+        0x03 | 0x09 | 0x0d | 0x1b => Err(format!("prefix {spec:?} aliases interrupt/Tab/Enter/Escape")),
+        b => Ok(b),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App configuration
 // ---------------------------------------------------------------------------
 
@@ -507,6 +645,9 @@ pub struct AppConfig {
     /// default on — see `AutoReapConfig`.
     #[serde(default)]
     pub auto_reap: AutoReapConfig,
+    /// Durable-fleet restore policy — see `FleetConfig`.
+    #[serde(default)]
+    pub fleet: FleetConfig,
     /// Theme file name (resolves to `~/.config/ninox/themes/<name>.toml`) or
     /// an absolute/`~`-relative path. `None` uses `themes/field-notes.toml`
     /// if present, else the built-in Field Notes palettes.
@@ -522,6 +663,12 @@ pub struct AppConfig {
     /// `sidebar_width` so showing it again restores the prior size.
     #[serde(default)]
     pub sidebar_hidden: bool,
+    /// `[runtime] backend = "ptyd" | "tmux"` — see `RuntimeConfig`.
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
+    /// Terminal UI settings — see `TuiConfig`.
+    #[serde(default)]
+    pub tui: TuiConfig,
     /// Agent-harness registry overrides/extensions (`[harnesses.<name>]`).
     /// Builtin specs for claude-code/codex/opencode/aider/freebuff apply
     /// when a name is absent here. See `crate::harness`. Kept last so TOML
@@ -558,12 +705,15 @@ impl Default for AppConfig {
             theme_file:       None,
             sidebar_width:    default_sidebar_width(),
             sidebar_hidden:   false,
+            runtime:          RuntimeConfig::default(),
             harnesses:        BTreeMap::new(),
             messaging:        None,
             inbox_messaging:  InboxMessagingConfig::default(),
             rust_cache:       RustCacheConfig::default(),
             pr_watch:         PrWatchConfig::default(),
             auto_reap:        AutoReapConfig::default(),
+            fleet:            FleetConfig::default(),
+            tui:              TuiConfig::default(),
         }
     }
 }
@@ -680,6 +830,23 @@ impl AppConfig {
     /// config's `[harnesses.*]` entries.
     pub fn registry(&self) -> HarnessRegistry {
         HarnessRegistry::from_config(&self.harnesses)
+    }
+
+    /// The harness `claude-code`: always enabled, its toggle is inert.
+    pub const LOCKED_HARNESS: &'static str = "claude-code";
+
+    /// Flip a harness's `enabled`, writing the FULL effective spec — config
+    /// entries replace builtin specs wholesale, so a bare `{ enabled }`
+    /// would wipe the builtin's args. Returns false (no change) for
+    /// `LOCKED_HARNESS`.
+    pub fn toggle_harness(&mut self, name: &str) -> bool {
+        if name == Self::LOCKED_HARNESS {
+            return false;
+        }
+        let mut spec = self.registry().spec(name);
+        spec.enabled = !spec.enabled;
+        self.harnesses.insert(name.to_string(), spec);
+        true
     }
 
     /// Which mechanism to deliver orchestrator↔worker messages by.
@@ -890,6 +1057,20 @@ impl AppConfig {
         fs::write(p, toml::to_string(self)?)?;
         Ok(())
     }
+
+    /// Read → apply → write against the file on disk, so a change made by
+    /// one process never clobbers another's edits with a stale in-memory
+    /// copy. A file that doesn't parse is left untouched (the error is
+    /// returned), and an `f` that changes nothing writes nothing.
+    pub fn update<R>(f: impl FnOnce(&mut Self) -> R) -> Result<(Self, R)> {
+        let mut cfg = Self::load()?;
+        let before = toml::to_string(&cfg)?;
+        let r = f(&mut cfg);
+        if toml::to_string(&cfg)? != before || !Self::path().exists() {
+            cfg.save()?;
+        }
+        Ok((cfg, r))
+    }
 }
 
 /// Serializes tests that mutate process-global env vars (`NINOX_CONFIG`,
@@ -929,6 +1110,27 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn update_applies_to_the_file_not_a_stale_copy() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        with_env_override("NINOX_CONFIG", &path, || {
+            let stale = AppConfig::load().unwrap();
+            let mut other = stale.clone();
+            other.zoom = 1.3;
+            other.save().unwrap();
+
+            let (saved, ()) = AppConfig::update(|c| c.pr_watch.enabled = true).unwrap();
+            assert!(saved.pr_watch.enabled);
+            assert_eq!(saved.zoom, 1.3, "another process's edit survives");
+            assert_eq!(AppConfig::load().unwrap().zoom, 1.3);
+
+            std::fs::write(&path, "not = [valid").unwrap();
+            assert!(AppConfig::update(|c| c.pr_watch.enabled = false).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "not = [valid", "a broken file is never overwritten");
+        });
+    }
+
+    #[test]
     fn round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -938,6 +1140,27 @@ mod tests {
         assert_eq!(loaded.port, 9090);
         assert_eq!(loaded.theme, ThemeVariant::Light);
         assert!(loaded.orchestrator_root.is_none());
+    }
+
+    #[test]
+    fn runtime_backend_defaults_to_tmux_and_round_trips() {
+        use crate::runtime::Backend;
+        assert_eq!(AppConfig::default().runtime.backend, Backend::Tmux);
+        let legacy: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert_eq!(legacy.runtime.backend, Backend::Tmux);
+
+        let cfg = AppConfig { runtime: RuntimeConfig { backend: Backend::Ptyd }, ..AppConfig::default() };
+        let serialized = toml::to_string(&cfg).unwrap();
+        assert!(serialized.contains("[runtime]\nbackend = \"ptyd\""), "{serialized}");
+        let loaded: AppConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(loaded.runtime.backend, Backend::Ptyd);
+
+        let with_harness = AppConfig {
+            harnesses: [("x".to_string(), crate::harness::HarnessSpec::default())].into(),
+            ..cfg
+        };
+        let loaded: AppConfig = toml::from_str(&toml::to_string(&with_harness).unwrap()).unwrap();
+        assert_eq!(loaded.runtime.backend, Backend::Ptyd);
     }
 
     #[test]
@@ -1308,6 +1531,19 @@ mod tests {
     }
 
     #[test]
+    fn fleet_restore_policy_defaults_to_manual_and_parses() {
+        assert_eq!(AppConfig::default().fleet.restore_policy, RestorePolicy::Manual);
+        let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert_eq!(cfg.fleet.restore_policy, RestorePolicy::Manual);
+        let cfg: AppConfig =
+            toml::from_str("port = 8080\nfont_size = 13.0\n\n[fleet]\nrestore_policy = \"auto\"\n").unwrap();
+        assert_eq!(cfg.fleet.restore_policy, RestorePolicy::Auto);
+        let serialized = toml::to_string(&cfg).unwrap();
+        let back: AppConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(back.fleet.restore_policy, RestorePolicy::Auto);
+    }
+
+    #[test]
     fn pr_watch_defaults_to_disabled() {
         assert!(!AppConfig::default().pr_watch.enabled);
     }
@@ -1407,5 +1643,58 @@ mod tests {
         let cfg: AppConfig = toml::from_str(toml_src).unwrap();
         assert!(cfg.brain.catalogues[0].remote.is_none());
         assert!(cfg.brain.catalogues[0].cache_ttl_secs.is_none());
+    }
+}
+
+#[cfg(test)]
+mod tui_config_tests {
+    use super::*;
+
+    fn byte(s: &str) -> Result<u8, String> {
+        TuiConfig { prefix: s.into(), ..Default::default() }.prefix_byte()
+    }
+
+    #[test]
+    fn default_prefix_is_ctrl_backslash_on_macos_and_ctrl_space_elsewhere() {
+        let want = if cfg!(target_os = "macos") { 0x1c } else { 0x00 };
+        assert_eq!(TuiConfig::default().prefix_byte(), Ok(want));
+        assert_eq!(DEFAULT_PREFIX_BYTE, want);
+        let cfg: AppConfig = toml::from_str("port = 1\nfont_size = 12.0\n").unwrap();
+        assert_eq!(cfg.tui, TuiConfig::default());
+    }
+
+    #[test]
+    fn the_default_prefix_is_not_pinned_by_a_save_but_a_choice_is() {
+        let text = toml::to_string(&AppConfig::default()).unwrap();
+        assert!(!text.contains("prefix"), "{text}");
+        let mut cfg = AppConfig::default();
+        cfg.tui.prefix = "C-g".into();
+        let back: AppConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.tui.prefix, "C-g");
+    }
+
+    #[test]
+    fn parses_ctrl_chords() {
+        assert_eq!(byte("C-g"), Ok(0x07));
+        assert_eq!(byte("ctrl+G"), Ok(0x07));
+        assert_eq!(byte("C-\\"), Ok(0x1c));
+        assert_eq!(byte("^]"), Ok(0x1d));
+    }
+
+    #[test]
+    fn rejects_colliding_and_unusable_prefixes() {
+        for bad in ["C-b", "C-a", "C-c", "C-i", "C-m", "C-[", "g", "C-F1"] {
+            assert!(byte(bad).is_err(), "{bad} must be rejected");
+        }
+        assert_eq!(TuiConfig { prefix: "C-b".into(), ..Default::default() }.prefix_byte_or_default(), DEFAULT_PREFIX_BYTE);
+    }
+
+    #[test]
+    fn tui_table_round_trips_after_scalars() {
+        let mut cfg = AppConfig::default();
+        cfg.tui.prefix = "C-g".into();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: AppConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.tui.prefix, "C-g");
     }
 }

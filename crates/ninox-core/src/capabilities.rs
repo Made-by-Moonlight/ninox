@@ -5,7 +5,7 @@
 //! [`REGISTRY`], and every surface that needs to know about capabilities
 //! loops that slice rather than restating the list:
 //!
-//! - `ninox_app::app::setup_orchestrator_root` seeds each *enabled*
+//! - `ninox_core::orchestrator_root::setup_orchestrator_root` seeds each *enabled*
 //!   orchestrator entry's [`Capability::orchestrator_md`] as
 //!   `<root>/.claude/skills/<name>/SKILL.md` and builds AGENTS.md's
 //!   "Available Skills" bullets from the same (gated) set.
@@ -178,6 +178,20 @@ pub const REGISTRY: &[Capability] = &[
         worker_md: Some(include_str!("../skills/worker/worker-status.md")),
         enabled: |_| true,
     },
+    Capability {
+        name: "read-worker-screen",
+        audience: Audience::Orchestrator,
+        orchestrator_md: Some(include_str!("../skills/orchestrator/read-worker-screen.md")),
+        worker_md: None,
+        enabled: |_| true,
+    },
+    Capability {
+        name: "fleet-recovery",
+        audience: Audience::Both,
+        orchestrator_md: Some(include_str!("../skills/orchestrator/fleet-recovery.md")),
+        worker_md: Some(include_str!("../skills/worker/fleet-recovery.md")),
+        enabled: |_| true,
+    },
 ];
 
 /// Placeholder for the invoking `ninox` binary path in orchestrator markdown.
@@ -280,10 +294,12 @@ mod tests {
                 "watch-pr",
                 "plan",
                 "worker-status",
+                "read-worker-screen",
+                "fleet-recovery",
             ]
         );
         let worker: Vec<_> = for_audience(Audience::Worker).map(|c| c.name).collect();
-        assert_eq!(worker, vec!["brain", "watch-pr", "worker-status"]);
+        assert_eq!(worker, vec!["brain", "watch-pr", "worker-status", "fleet-recovery"]);
     }
 
     #[test]

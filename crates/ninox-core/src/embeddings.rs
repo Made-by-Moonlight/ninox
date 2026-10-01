@@ -78,6 +78,12 @@ impl FastEmbedEmbedder {
     /// `{cache_dir}/ninox/fastembed` on first use. Every call after the
     /// first (across process restarts) is fully offline.
     pub fn try_new() -> Result<Self> {
+        Self::try_new_with_progress(true)
+    }
+
+    /// `try_new` without the first-run download progress bar, which draws
+    /// on stderr: for callers that own the terminal (the TUI).
+    pub fn try_new_with_progress(show_download_progress: bool) -> Result<Self> {
         // No-op call that anchors the ort_link_compat C++ object (and its
         // iostream initializer) into any binary that links the embedder —
         // see the ort_link_compat module docs. This is currently the sole
@@ -93,7 +99,7 @@ impl FastEmbedEmbedder {
         let model = TextEmbedding::try_new(
             TextInitOptions::new(EmbeddingModel::SnowflakeArcticEmbedXS)
                 .with_cache_dir(cache_dir)
-                .with_show_download_progress(true),
+                .with_show_download_progress(show_download_progress),
         )?;
         Ok(Self { model: Mutex::new(model) })
     }

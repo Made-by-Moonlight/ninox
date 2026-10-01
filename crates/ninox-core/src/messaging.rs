@@ -3,7 +3,7 @@
 //! into a session: the `ninox send` CLI and `Engine::send_to_session`
 //! (poller reactions).
 
-use crate::{config::SendMechanism, inbox, session_socket, store::Store, tmux};
+use crate::{config::SendMechanism, inbox, runtime, session_socket, store::Store};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -72,11 +72,12 @@ async fn deliver_by_mechanism(
 ) -> Result<()> {
     match mechanism {
         SendMechanism::SessionSocket => {
-            deliver_via_session_socket(session_socket::find_peer(session_id), session_id, message).await
+            let pane_pid = runtime::ptyd_pane_pid(session_id).await;
+            deliver_via_session_socket(session_socket::find_peer(session_id, pane_pid), session_id, message).await
         }
         SendMechanism::Inbox if target_can_drain_inbox(store, session_id) => {
             inbox::write_message(sessions_dir, session_id, message)?;
-            if let Err(e) = tmux::wake_idle_session(session_id).await {
+            if let Err(e) = runtime::wake_idle_session(session_id).await {
                 tracing::warn!(
                     "idle-wake nudge failed for {session_id} (message already delivered via inbox): {e}"
                 );
@@ -84,7 +85,7 @@ async fn deliver_by_mechanism(
             Ok(())
         }
         SendMechanism::Inbox | SendMechanism::Keystrokes => {
-            tmux::send_keys(session_id, message).await
+            runtime::send_keys(session_id, message).await
         }
     }
 }
@@ -111,7 +112,7 @@ async fn deliver_via_session_socket(
         tracing::debug!(
             "{session_id} advertises no Claude Code messaging socket; sending as keystrokes"
         );
-        return tmux::send_keys(session_id, message).await;
+        return runtime::send_keys(session_id, message).await;
     };
     match session_socket::send(&peer, message).await {
         Ok(()) => Ok(()),
@@ -121,7 +122,7 @@ async fn deliver_via_session_socket(
                  falling back to keystrokes: {e}",
                 peer.pid
             );
-            tmux::send_keys(session_id, message).await
+            runtime::send_keys(session_id, message).await
         }
     }
 }
