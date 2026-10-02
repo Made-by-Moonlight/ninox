@@ -1,0 +1,29 @@
+[package]
+name        = "ninox-ptyd"
+version     = "0.28.1"
+edition     = "2021"
+description = "PTY host for Ninox: owns agent PTYs and one terminal emulator per pane."
+license     = "MIT"
+repository  = "https://github.com/Made-by-Moonlight/ninox"
+
+[dependencies]
+tokio        = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+anyhow       = { workspace = true }
+tracing      = { workspace = true }
+libc         = { workspace = true }
+dirs         = { workspace = true }
+portable-pty = "0.8"
+alacritty_terminal = "0.26"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Standalone host binary: `ninox ptyd` is the production entry point; this
+# one exists for the integration tests (a real separate host process) and
+# for manual smoke testing.
+[[bin]]
+name = "ninox-ptyd"
+path = "src/bin/ninox-ptyd.rs"

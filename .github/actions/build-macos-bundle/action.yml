@@ -2,7 +2,7 @@ name: Build macOS app bundle
 description: >
   Build Ninox.app with cargo-bundle, verify its structure, ad-hoc code-sign
   it, verify the signature, and (optionally) zip it with ditto. Shared by
-  ci.yml, release.yml, and publish-codeartifact.yml so the build/sign
+  ci.yml and release.yml so the build/sign
   sequence can't drift between them.
 
 inputs:

@@ -3,7 +3,7 @@
 //! the footer); harness registry toggles and the worker default follow in
 //! their own cards.
 
-use ninox_core::config::{AppConfig, ThemeVariant};
+use ninox_core::config::{AppConfig, EditorChoice, SendMechanism, ThemeVariant};
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
     Alignment, Background, Border, Element, Length,
@@ -63,6 +63,7 @@ pub fn settings_panel(app: &App) -> Element<'_, Message> {
         workers_card(app),
         rust_cache_card(app),
         messaging_card(app),
+        runtime_card(app),
         version_card(app),
     ]
     .spacing(18)
@@ -250,6 +251,16 @@ fn workers_card(app: &App) -> Element<'_, Message> {
         .padding([6, 10])
         .style(crate::style::pick_style(s));
 
+    let editor_pick = pick_list(
+        EditorChoice::ALL.as_slice(),
+        Some(app.config.editor),
+        Message::SettingsEditor,
+    )
+    .font(MONO)
+    .text_size(12)
+    .padding([6, 10])
+    .style(crate::style::pick_style(s));
+
     let mut body = column![
         row![
             column![micro_label("Harness", s.faint), Space::new(0, 6), harness_pick].spacing(0),
@@ -257,6 +268,8 @@ fn workers_card(app: &App) -> Element<'_, Message> {
             column![micro_label("Model", s.faint), Space::new(0, 6), model_pick].spacing(0),
         ]
         .align_y(Alignment::Start),
+        Space::new(0, 14),
+        column![micro_label("Editor", s.faint), Space::new(0, 6), editor_pick].spacing(0),
     ]
     .spacing(0);
     if let Some(v) = &app.settings.worker_custom {
@@ -370,24 +383,36 @@ fn settings_toggle<'a>(
         .into()
 }
 
-/// Messaging card: the opt-in file-based inbox toggle
-/// (`[inbox_messaging].enabled`, default off — see
-/// `ninox_core::config::InboxMessagingConfig`). Off is the pre-existing
-/// behavior (direct verified keystroke injection); on drains messages
-/// through Stop/UserPromptSubmit hooks installed in worker worktrees,
-/// keeping keystrokes only as an idle-wake nudge. Same ink-fill toggle
-/// styling as `harnesses_card`'s per-harness switch.
+/// Messaging card: how orchestrator↔worker messages get delivered
+/// (`[messaging].mechanism` — see `ninox_core::config::SendMechanism`).
+/// A picker rather than a toggle because the three mechanisms are mutually
+/// exclusive, styled like `workers_card`'s harness/model/editor pickers.
+/// The blurb below it tracks the selection, since the difference between
+/// the three is entirely in behavior nobody can infer from the name.
 fn messaging_card(app: &App) -> Element<'_, Message> {
+    use iced::widget::pick_list;
     let s = &app.scheme;
-    let enabled = app.config.inbox_messaging.enabled;
+    let mechanism = app.config.send_mechanism();
 
-    let toggle = button(Space::new(0, 0))
-        .on_press(Message::SettingsToggleInboxMessaging)
+    let mechanism_pick = pick_list(
+        SendMechanism::ALL.as_slice(),
+        Some(mechanism),
+        Message::SettingsSetSendMechanism,
+    )
+    .font(MONO)
+    .text_size(12)
+    .padding([6, 10])
+    .style(crate::style::pick_style(s));
+
+    let pr_watch_enabled = app.config.pr_watch.enabled;
+
+    let pr_watch_toggle = button(Space::new(0, 0))
+        .on_press(Message::SettingsTogglePrWatch)
         .width(Length::Fixed(30.0))
         .height(Length::Fixed(16.0))
         .padding(0)
         .style(move |_t, status| button::Style {
-            background: enabled.then_some(Background::Color(s.ink)),
+            background: pr_watch_enabled.then_some(Background::Color(s.ink)),
             text_color: s.ink,
             border: Border {
                 color: if matches!(status, button::Status::Hovered) { s.accent } else { s.ink },
@@ -397,22 +422,61 @@ fn messaging_card(app: &App) -> Element<'_, Message> {
             ..Default::default()
         });
 
-    let label = text("File-based inbox").size(14).font(SERIF)
-        .color(if enabled { s.ink } else { s.ink_2 });
-    let state_label = text(if enabled { "on" } else { "off" }).size(10).font(MONO).color(s.faint);
+    let pr_watch_label = text("Consolidated PR watching (batched GraphQL)").size(14).font(SERIF)
+        .color(if pr_watch_enabled { s.ink } else { s.ink_2 });
+    let pr_watch_state_label =
+        text(if pr_watch_enabled { "on" } else { "off" }).size(10).font(MONO).color(s.faint);
 
     card(app, "Messaging", column![
-        row![toggle, Space::new(12, 0), label, Space::new(Length::Fill, 0), state_label]
-            .align_y(Alignment::Center),
+        column![micro_label("Send mechanism", s.faint), Space::new(0, 6), mechanism_pick].spacing(0),
+        Space::new(0, 10),
+        // Tracks the selection — the old copy here described the two states
+        // of the bool this replaced, so it cannot survive the mechanism
+        // becoming a three-way choice.
+        text(mechanism.description()).size(10).font(MONO).color(s.faint),
+        Space::new(0, 14),
+        row![
+            pr_watch_toggle,
+            Space::new(12, 0),
+            pr_watch_label,
+            Space::new(Length::Fill, 0),
+            pr_watch_state_label,
+        ]
+        .align_y(Alignment::Center),
         Space::new(0, 10),
         text(
-            "Off: orchestrator↔worker messages are injected as verified keystrokes (default). \
-             On: messages are delivered through Stop/UserPromptSubmit hooks in new worker \
-             worktrees, with keystrokes only used to wake an idle session."
+            "Off: PR/CI state is polled per session via REST, as before. On: one batched \
+             GraphQL query per tick covers every watched PR, including extra PRs registered \
+             with `ninox open --pr`."
         )
         .size(10)
         .font(MONO)
         .color(s.faint),
+    ]
+    .spacing(0)
+    .into())
+}
+
+/// Runtime card: which process hosts new sessions (`[runtime] backend` —
+/// see `ninox_core::runtime::Backend`). Same picker shape as the messaging
+/// card; the blurb tracks the selection.
+fn runtime_card(app: &App) -> Element<'_, Message> {
+    use iced::widget::pick_list;
+    let s = &app.scheme;
+    let backend = app.config.runtime.backend;
+    let pick = pick_list(
+        ninox_core::runtime::Backend::ALL.as_slice(),
+        Some(backend),
+        Message::SettingsSetRuntimeBackend,
+    )
+    .font(MONO)
+    .text_size(12)
+    .padding([6, 10])
+    .style(crate::style::pick_style(s));
+    card(app, "Session runtime", column![
+        column![micro_label("Runtime for new sessions", s.faint), Space::new(0, 6), pick].spacing(0),
+        Space::new(0, 10),
+        text(backend.description()).size(10).font(MONO).color(s.faint),
     ]
     .spacing(0)
     .into())

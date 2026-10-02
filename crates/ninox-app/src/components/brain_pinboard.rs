@@ -1,11 +1,9 @@
 //! Brain pinboard specimen board — a canvas of wikilink-connected nodes
-//! (spec §IV "Pinboard"). Node positions come from the cached force-directed
-//! `layout` on `BrainViewState` (recomputed once per data change by
-//! `App::refresh_brain_graph`, never per draw), falling back to a
-//! deterministic hash-based scatter for any id missing from that cache. The
-//! canvas itself stays stateless — normalized positions are scaled to the
-//! current `bounds` on every draw, so resizing the window can never leave
-//! stale/clipped node positions behind.
+//! (spec §IV "Pinboard"). Node positions live in `app.brain_view.layout`
+//! (the shared `ForceLayout`, ticked by physics and pinned while dragging)
+//! as normalized `[0,1]^2` coordinates, scaled against the canvas bounds on
+//! every draw rather than stored in canvas-space — so resizing the window
+//! can never leave stale/clipped node positions behind.
 
 use std::collections::HashMap;
 
@@ -42,9 +40,10 @@ pub(crate) fn hash01(s: &str, salt: u64) -> f32 {
 }
 
 /// The pinboard canvas program. Borrows `App` for the duration of a single
-/// `view()` call; its only mutable state is [`PinboardState`]'s hover
-/// selection — node positions themselves come from the cached `layout` (see
-/// module docs), scaled to the current bounds on every draw.
+/// `view()` call; node positions live in `app.brain_view.layout` (a
+/// `ForceLayout` advanced by `Message::BrainPhysicsTick`) as normalized
+/// coordinates, scaled to `bounds` at draw time. Its own mutable state is
+/// [`PinboardState`] — the hover selection plus the press/drag machine.
 pub struct Pinboard<'a> {
     pub app: &'a App,
 }
@@ -52,7 +51,7 @@ pub struct Pinboard<'a> {
 impl<'a> Pinboard<'a> {
     /// Lay out one [`Node`] per brain entry within `bounds`, sized by node
     /// degree (in `self.app.brain_view.edges`, resolved once per data change
-    /// — see `App::refresh_brain_graph` — never re-derived here) and flagged
+    /// — see `App::refresh_brain_edges` — never re-derived here) and flagged
     /// `hit` when the entry matches the active search filter.
     fn nodes(&self, bounds: Rectangle) -> Vec<Node> {
         let s = &self.app.scheme;
@@ -74,19 +73,12 @@ impl<'a> Pinboard<'a> {
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                // `layout` is the cached force-directed position, recomputed
-                // once per data change by `App::refresh_brain_graph` — a
-                // cache miss (e.g. a reindex race) falls back to the old
-                // hash-based scatter position rather than hiding the node.
                 let (nx, ny) = self
                     .app
                     .brain_view
                     .layout
-                    .get(&e.id)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        (0.05 + 0.90 * hash01(&e.id, 7), 0.06 + 0.88 * hash01(&e.id, 13))
-                    });
+                    .position(&e.id)
+                    .unwrap_or((0.05 + 0.90 * hash01(&e.id, 7), 0.06 + 0.88 * hash01(&e.id, 13)));
                 Node {
                     x: bounds.width * nx,
                     y: bounds.height * ny,
@@ -101,20 +93,36 @@ impl<'a> Pinboard<'a> {
     }
 }
 
-/// The pinboard canvas `Program`'s interaction state: which node (if any)
-/// the cursor is currently hovering. Mutated in `update()` and read back in
-/// `draw()` (to render the hover ring) and `mouse_interaction()` (to switch
-/// to a pointer cursor) — node positions themselves come from the cached
-/// `layout` (see module docs), only the hover *selection* lives here.
+/// The pinboard canvas `Program`'s interaction state. `draw()` does not
+/// read any of it: the hover and selection rings render from the shared
+/// `app.brain_view.hovered`/`.selected` so the sidebar and the canvas
+/// cross-highlight each other.
 #[derive(Default)]
 pub struct PinboardState {
+    /// Last hover this canvas emitted a `BrainHoverEntry` for — read by
+    /// `mouse_interaction()` (pointer cursor) and by `handle_mouse_event`'s
+    /// dedupe guard, so a hover that moves within the same node doesn't
+    /// re-emit.
     hovered: Option<String>,
+    /// Candidate node + press-origin (local canvas coords), recorded on
+    /// `ButtonPressed`, before it's known whether this press resolves to a
+    /// click (select) or a drag.
+    press: Option<(String, Point)>,
+    /// Set once a press has moved past `DRAG_THRESHOLD` — the id currently
+    /// being dragged. Mirrored into `App.brain_view.dragging` via
+    /// `BrainDragStart`/`BrainDragEnd` so the physics tick knows to pin it.
+    dragging: Option<String>,
 }
 
+/// Minimum cursor movement (local canvas pixels) from the press origin
+/// before a press upgrades from "candidate click" to "drag".
+const DRAG_THRESHOLD: f32 = 4.0;
+
 /// Nearest node to `pos`, if within `r + 6` of it — the shared hit-test
-/// tolerance for both click-to-select (`update`'s `ButtonPressed`) and
-/// hover-preview detection (`update`'s `CursorMoved`), so hovering and
-/// clicking always agree on which node is "under" the cursor.
+/// tolerance for the press/click-to-select path (`ButtonPressed` records
+/// the candidate, `ButtonReleased` resolves it to a selection) and for
+/// hover-preview detection (`CursorMoved`), so hovering and clicking
+/// always agree on which node is "under" the cursor.
 fn hit_test(nodes: &[Node], pos: Point) -> Option<String> {
     nodes
         .iter()
@@ -141,7 +149,7 @@ fn edge_key(a: usize, b: usize) -> (usize, usize) {
 /// Resolve `BrainIndex::links_all()`'s `(from_id, to_id)` string pairs into
 /// deduplicated, undirected node-index pairs against `entries`'s current
 /// order — the form the pinboard canvas draws from. Called once per data
-/// change (`App::refresh_brain_graph`, on `NavigateBrain` / `BrainReindex` /
+/// change (`App::refresh_brain_edges`, on `NavigateBrain` / `BrainReindex` /
 /// `BrainSwitchCatalogue`), never per draw.
 ///
 /// A link endpoint that isn't in `entries` (index/entries drift, or a link
@@ -167,94 +175,69 @@ pub(crate) fn resolve_edges(entries: &[BrainEntry], links: &[(String, String)]) 
     edges
 }
 
-/// Relaxation steps `force_layout` runs — fixed rather than convergence-
-/// threshold-based, so the result is a pure, deterministic function of
-/// `entries`/`edges` alone (no wall-clock or RNG dependency anywhere in
-/// this function beyond the deterministic `hash01`-seeded start
-/// positions).
-const FORCE_LAYOUT_ITERATIONS: u32 = 400;
-
-/// Fruchterman-Reingold force-directed layout: nodes repel each other,
-/// linked nodes attract along `edges`, and per-iteration displacement is
-/// capped by a linearly-cooling "temperature" so the system settles
-/// instead of oscillating. Run once per data change (see
-/// `App::refresh_brain_graph`) and cached — NOT recomputed per canvas
-/// draw, unlike the rest of this module's per-frame re-derivation.
-///
-/// Initial positions come from the existing `hash01` (same salts the old
-/// pure-scatter placement used), so re-running on unchanged
-/// `entries`/`edges` reproduces bit-identical output. Returns each entry's
-/// normalized `(x, y)` in `[0.05, 0.95]` on both axes (the same margin the
-/// old hash-based placement used), keyed by entry id.
-pub(crate) fn force_layout(
-    entries: &[BrainEntry],
-    edges: &[(usize, usize)],
-) -> HashMap<String, (f32, f32)> {
-    let n = entries.len();
-    if n == 0 {
-        return HashMap::new();
-    }
-
-    let mut x: Vec<f32> = entries.iter().map(|e| 0.05 + 0.90 * hash01(&e.id, 7)).collect();
-    let mut y: Vec<f32> = entries.iter().map(|e| 0.05 + 0.90 * hash01(&e.id, 13)).collect();
-
-    // Ideal spacing scales down as node count grows, so density stays
-    // roughly constant regardless of how many specimens are in the graph.
-    let k = 0.9 / (n as f32).sqrt();
-    let mut temperature = 0.1f32;
-    let cooling = temperature / FORCE_LAYOUT_ITERATIONS as f32;
-
-    for _ in 0..FORCE_LAYOUT_ITERATIONS {
-        let mut dx = vec![0.0f32; n];
-        let mut dy = vec![0.0f32; n];
-
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let ddx = x[i] - x[j];
-                let ddy = y[i] - y[j];
-                let d = (ddx * ddx + ddy * ddy).sqrt().max(1e-3);
-                let f = (k * k) / d;
-                let (ux, uy) = (ddx / d, ddy / d);
-                dx[i] += ux * f;
-                dy[i] += uy * f;
-                dx[j] -= ux * f;
-                dy[j] -= uy * f;
-            }
-        }
-
-        for &(a, b) in edges {
-            let ddx = x[b] - x[a];
-            let ddy = y[b] - y[a];
-            let d = (ddx * ddx + ddy * ddy).sqrt().max(1e-3);
-            let f = (d * d) / k;
-            let (ux, uy) = (ddx / d, ddy / d);
-            dx[a] += ux * f;
-            dy[a] += uy * f;
-            dx[b] -= ux * f;
-            dy[b] -= uy * f;
-        }
-
-        for i in 0..n {
-            let mag = (dx[i] * dx[i] + dy[i] * dy[i]).sqrt().max(1e-6);
-            let capped = mag.min(temperature);
-            x[i] = (x[i] + (dx[i] / mag) * capped).clamp(0.05, 0.95);
-            y[i] = (y[i] + (dy[i] / mag) * capped).clamp(0.05, 0.95);
-        }
-
-        temperature = (temperature - cooling).max(0.0);
-    }
-
-    entries
-        .iter()
-        .enumerate()
-        .map(|(i, e)| (e.id.clone(), (x[i], y[i])))
-        .collect()
-}
-
 /// Specimen dot radius: a 3px floor, growing with wikilink count, clamped to
 /// a 9px ceiling so heavily-linked notes don't overwhelm the board.
 fn node_radius(link_count: f32) -> f32 {
     3.0 + (link_count * 1.2).min(6.0)
+}
+
+/// The press/drag/hover state machine, factored out of `Program::update` so
+/// it's testable without a real `App`. `hit` is whichever node (if any) is
+/// under the cursor for this event, already resolved via `hit_test`; `pos`
+/// is the cursor's local-canvas position (`None` once it's left this
+/// canvas's own bounds, matching `cursor.position_in`); `bounds` is used
+/// only to normalize a drag's emitted position into `[0,1]^2`.
+fn handle_mouse_event(
+    state: &mut PinboardState,
+    event: mouse::Event,
+    pos: Option<Point>,
+    hit: Option<String>,
+    bounds: Rectangle,
+) -> (canvas::event::Status, Option<Message>) {
+    match event {
+        mouse::Event::ButtonPressed(mouse::Button::Left) => {
+            if let (Some(pos), Some(id)) = (pos, hit) {
+                state.press = Some((id, pos));
+            }
+            (canvas::event::Status::Ignored, None)
+        }
+        mouse::Event::ButtonReleased(mouse::Button::Left) => {
+            if state.dragging.take().is_some() {
+                return (canvas::event::Status::Captured, Some(Message::BrainDragEnd));
+            }
+            if let Some((id, _)) = state.press.take() {
+                return (canvas::event::Status::Captured, Some(Message::BrainSelectEntry(id)));
+            }
+            (canvas::event::Status::Ignored, None)
+        }
+        mouse::Event::CursorMoved { .. } | mouse::Event::CursorLeft => {
+            if let Some(pos) = pos {
+                if let Some(dragging) = state.dragging.clone() {
+                    let nx = (pos.x / bounds.width).clamp(0.0, 1.0);
+                    let ny = (pos.y / bounds.height).clamp(0.0, 1.0);
+                    return (canvas::event::Status::Captured, Some(Message::BrainDragMove(dragging, nx, ny)));
+                }
+                if let Some((id, origin)) = state.press.clone() {
+                    if (pos.x - origin.x).hypot(pos.y - origin.y) > DRAG_THRESHOLD {
+                        state.press = None;
+                        state.dragging = Some(id.clone());
+                        return (canvas::event::Status::Captured, Some(Message::BrainDragStart(id)));
+                    }
+                }
+            }
+
+            // Written only on the path that also emits the matching
+            // message: the branches above return without one, so recording
+            // the hover there would leave `app.brain_view.hovered` behind
+            // forever — the dedupe guard would never see it change back.
+            if hit != state.hovered {
+                state.hovered = hit.clone();
+                return (canvas::event::Status::Ignored, Some(Message::BrainHoverEntry(hit)));
+            }
+            (canvas::event::Status::Ignored, None)
+        }
+        _ => (canvas::event::Status::Ignored, None),
+    }
 }
 
 impl<'a> canvas::Program<Message> for Pinboard<'a> {
@@ -262,7 +245,7 @@ impl<'a> canvas::Program<Message> for Pinboard<'a> {
 
     fn draw(
         &self,
-        state: &PinboardState,
+        _state: &PinboardState,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
@@ -277,7 +260,7 @@ impl<'a> canvas::Program<Message> for Pinboard<'a> {
 
         // Dashed link threads: faint ink by default, lit accent when either
         // endpoint matches the active search. Edges are precomputed
-        // node-index pairs (`App::refresh_brain_graph` /
+        // node-index pairs (`App::refresh_brain_edges` /
         // `resolve_edges`) — already deduped by undirected pair, so a
         // mutual link (A -> B and B -> A) is stroked once, not twice.
         let ink_edge = Color { a: 0.18, ..s.ink };
@@ -314,32 +297,24 @@ impl<'a> canvas::Program<Message> for Pinboard<'a> {
                     Stroke::default().with_color(s.accent).with_width(1.2),
                 );
             }
-            // Hover ring: full-alpha ink, +3px — deliberately narrower and a
-            // different color from the +4px vermilion search-hit ring above
-            // so the two states never read as the same thing.
-            if state.hovered.as_deref() == Some(n.id.as_str()) {
+            // Selection ring: thicker, always-on accent ring, matching the
+            // sidebar's selected-row accent bar (`dentry_row`) — shared
+            // source of truth (`app.brain_view.selected`), not local mouse
+            // state.
+            if self.app.brain_view.selected.as_deref() == Some(n.id.as_str()) {
+                frame.stroke(
+                    &Path::circle(Point::new(n.x, n.y), n.r + 5.0),
+                    Stroke::default().with_color(s.accent).with_width(2.0),
+                );
+            }
+            // Hover ring: sourced from `app.brain_view.hovered`, shared with
+            // the sidebar's cross-highlight (`dentry_row`'s `is_cross_hovered`)
+            // — a sidebar-row hover rings the matching node here too, not
+            // just this canvas's own mouse movement.
+            if self.app.brain_view.hovered.as_deref() == Some(n.id.as_str()) {
                 frame.stroke(
                     &Path::circle(Point::new(n.x, n.y), n.r + 3.0),
                     Stroke::default().with_color(Color { a: 1.0, ..s.ink }).with_width(1.4),
-                );
-            }
-            // Persistent selection ring: dashed +6px accent — distinct from
-            // both the solid +4px search-hit ring and the solid +3px hover
-            // ring above, so all three states stay visually distinguishable
-            // even when they overlap (e.g. hovering the selected node).
-            // Unlike hover (transient, cursor-driven `state.hovered`),
-            // selection comes from `self.app.brain_view.selected`, set by a
-            // canvas click OR a sidebar drawer click, and persists until a
-            // different entry is selected.
-            if self.app.brain_view.selected.as_deref() == Some(n.id.as_str()) {
-                frame.stroke(
-                    &Path::circle(Point::new(n.x, n.y), n.r + 6.0),
-                    Stroke {
-                        style: canvas::Style::Solid(s.accent),
-                        width: 1.4,
-                        line_dash: canvas::LineDash { segments: &[3.0, 3.0], offset: 0 },
-                        ..Stroke::default()
-                    },
                 );
             }
         }
@@ -354,33 +329,14 @@ impl<'a> canvas::Program<Message> for Pinboard<'a> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> (canvas::event::Status, Option<Message>) {
-        match event {
-            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                if let Some(pos) = cursor.position_in(bounds) {
-                    let local_bounds = Rectangle { x: 0.0, y: 0.0, ..bounds };
-                    let nodes = self.nodes(local_bounds);
-                    if let Some(id) = hit_test(&nodes, pos) {
-                        return (canvas::event::Status::Captured, Some(Message::BrainSelectEntry(id)));
-                    }
-                }
-            }
-            // `CursorLeft` fires when the cursor exits the *window*, which
-            // `position_in` alone wouldn't catch; folded into the same
-            // handling as `CursorMoved` (whose `position_in` already goes
-            // `None` once the cursor leaves just this canvas's bounds) so
-            // both paths converge on one hover-state update.
-            canvas::Event::Mouse(mouse::Event::CursorMoved { .. } | mouse::Event::CursorLeft) => {
-                let local_bounds = Rectangle { x: 0.0, y: 0.0, ..bounds };
-                let nodes = self.nodes(local_bounds);
-                let hovered = cursor.position_in(bounds).and_then(|pos| hit_test(&nodes, pos));
-                if hovered != state.hovered {
-                    state.hovered = hovered.clone();
-                    return (canvas::event::Status::Ignored, Some(Message::BrainHoverEntry(hovered)));
-                }
-            }
-            _ => {}
-        }
-        (canvas::event::Status::Ignored, None)
+        let canvas::Event::Mouse(mouse_event) = event else {
+            return (canvas::event::Status::Ignored, None);
+        };
+        let local_bounds = Rectangle { x: 0.0, y: 0.0, ..bounds };
+        let nodes = self.nodes(local_bounds);
+        let pos = cursor.position_in(bounds);
+        let hit = pos.and_then(|p| hit_test(&nodes, p));
+        handle_mouse_event(state, mouse_event, pos, hit, bounds)
     }
 
     fn mouse_interaction(
@@ -398,8 +354,9 @@ impl<'a> canvas::Program<Message> for Pinboard<'a> {
 }
 
 /// The pinboard canvas widget — fills its container on both axes so window
-/// resizes never clip or misalign the board (node positions are re-derived
-/// from bounds on every draw, never cached in absolute coordinates).
+/// resizes never clip or misalign the board (`brain_view.layout` stores
+/// normalized positions, scaled against bounds on every draw, never cached
+/// in absolute coordinates).
 pub fn pinboard_canvas(app: &App) -> Element<'_, Message> {
     Canvas::new(Pinboard { app }).width(Length::Fill).height(Length::Fill).into()
 }
@@ -461,6 +418,138 @@ mod tests {
         assert_eq!(edge_key(0, 0), (0, 0));
     }
 
+    fn bounds_100() -> Rectangle {
+        Rectangle { x: 0.0, y: 0.0, width: 100.0, height: 100.0 }
+    }
+
+    #[test]
+    fn click_without_movement_selects() {
+        let mut state = PinboardState::default();
+        let bounds = bounds_100();
+        let (_, msg) = handle_mouse_event(
+            &mut state,
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            Some(Point::new(10.0, 10.0)),
+            Some("a.md".to_string()),
+            bounds,
+        );
+        assert!(msg.is_none());
+        assert!(matches!(&state.press, Some((id, _)) if id == "a.md"));
+
+        let (_, msg) = handle_mouse_event(
+            &mut state,
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+            Some(Point::new(11.0, 10.0)),
+            Some("a.md".to_string()),
+            bounds,
+        );
+        assert!(matches!(msg, Some(Message::BrainSelectEntry(id)) if id == "a.md"));
+        assert!(state.press.is_none());
+        assert!(state.dragging.is_none());
+    }
+
+    #[test]
+    fn press_move_past_threshold_starts_a_drag_not_a_select() {
+        let mut state = PinboardState::default();
+        let bounds = bounds_100();
+        handle_mouse_event(
+            &mut state,
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            Some(Point::new(10.0, 10.0)),
+            Some("a.md".to_string()),
+            bounds,
+        );
+
+        let (_, msg) = handle_mouse_event(
+            &mut state,
+            mouse::Event::CursorMoved { position: Point::new(30.0, 10.0) },
+            Some(Point::new(30.0, 10.0)),
+            Some("a.md".to_string()),
+            bounds,
+        );
+        assert!(matches!(msg, Some(Message::BrainDragStart(id)) if id == "a.md"));
+        assert_eq!(state.dragging.as_deref(), Some("a.md"));
+        assert!(state.press.is_none());
+
+        let (_, msg) = handle_mouse_event(
+            &mut state,
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+            Some(Point::new(30.0, 10.0)),
+            Some("a.md".to_string()),
+            bounds,
+        );
+        assert!(matches!(msg, Some(Message::BrainDragEnd)));
+        assert!(state.dragging.is_none());
+    }
+
+    #[test]
+    fn dragging_emits_normalized_position() {
+        let mut state = PinboardState { dragging: Some("a.md".to_string()), ..Default::default() };
+        let bounds = bounds_100();
+        let (_, msg) = handle_mouse_event(
+            &mut state,
+            mouse::Event::CursorMoved { position: Point::new(25.0, 75.0) },
+            Some(Point::new(25.0, 75.0)),
+            None,
+            bounds,
+        );
+        assert!(matches!(
+            msg,
+            Some(Message::BrainDragMove(id, x, y))
+                if id == "a.md" && (x - 0.25).abs() < 1e-6 && (y - 0.75).abs() < 1e-6
+        ));
+    }
+
+    /// Mid-drag the dragged node's rendered position lags the cursor, so
+    /// the hit test can land on some *other* node. That must not quietly
+    /// advance `state.hovered`: no `BrainHoverEntry` goes out on this path,
+    /// and a silently-advanced guard would swallow the next real hover
+    /// change, desyncing `app.brain_view.hovered` for good.
+    #[test]
+    fn dragging_does_not_swallow_a_hover_change() {
+        let mut state = PinboardState {
+            dragging: Some("a.md".to_string()),
+            hovered: Some("a.md".to_string()),
+            ..Default::default()
+        };
+        let bounds = bounds_100();
+        let (_, msg) = handle_mouse_event(
+            &mut state,
+            mouse::Event::CursorMoved { position: Point::new(25.0, 75.0) },
+            Some(Point::new(25.0, 75.0)),
+            Some("b.md".to_string()),
+            bounds,
+        );
+        assert!(matches!(msg, Some(Message::BrainDragMove(id, _, _)) if id == "a.md"));
+        assert_eq!(state.hovered.as_deref(), Some("a.md"));
+
+        // Drag over: the still-pending change is detected and emitted now.
+        state.dragging = None;
+        let (_, msg) = handle_mouse_event(
+            &mut state,
+            mouse::Event::CursorMoved { position: Point::new(25.0, 75.0) },
+            Some(Point::new(25.0, 75.0)),
+            Some("b.md".to_string()),
+            bounds,
+        );
+        assert!(matches!(msg, Some(Message::BrainHoverEntry(Some(id))) if id == "b.md"));
+        assert_eq!(state.hovered.as_deref(), Some("b.md"));
+    }
+
+    #[test]
+    fn hover_still_fires_when_not_pressing() {
+        let mut state = PinboardState::default();
+        let bounds = bounds_100();
+        let (_, msg) = handle_mouse_event(
+            &mut state,
+            mouse::Event::CursorMoved { position: Point::new(10.0, 10.0) },
+            Some(Point::new(10.0, 10.0)),
+            Some("a.md".to_string()),
+            bounds,
+        );
+        assert!(matches!(msg, Some(Message::BrainHoverEntry(Some(id))) if id == "a.md"));
+    }
+
     fn entry(id: &str) -> BrainEntry {
         BrainEntry {
             id: id.to_string(),
@@ -508,65 +597,5 @@ mod tests {
         let entries = vec![entry("a.md")];
         let links = vec![("a.md".to_string(), "a.md".to_string())];
         assert!(resolve_edges(&entries, &links).is_empty());
-    }
-
-    #[test]
-    fn force_layout_is_deterministic() {
-        let entries = vec![entry("a.md"), entry("b.md"), entry("c.md")];
-        let edges = vec![(0, 1)];
-        let first = force_layout(&entries, &edges);
-        let second = force_layout(&entries, &edges);
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn force_layout_keeps_positions_within_the_canvas_margin() {
-        let entries: Vec<BrainEntry> = (0..12).map(|i| entry(&format!("n{i}.md"))).collect();
-        let edges: Vec<(usize, usize)> = (0..11).map(|i| (i, i + 1)).collect();
-        let positions = force_layout(&entries, &edges);
-        for (x, y) in positions.values() {
-            assert!((0.05..=0.95).contains(x), "x {x} out of bounds");
-            assert!((0.05..=0.95).contains(y), "y {y} out of bounds");
-        }
-    }
-
-    #[test]
-    fn force_layout_pulls_linked_nodes_closer_than_an_unlinked_outlier() {
-        // A tightly-linked triangle (a-b, b-c, a-c) plus one entirely unlinked
-        // outlier — the triangle's own pairwise distances should end up
-        // smaller than any distance from the outlier to the triangle.
-        let entries = vec![entry("a.md"), entry("b.md"), entry("c.md"), entry("outlier.md")];
-        let edges = vec![(0, 1), (1, 2), (0, 2)];
-        let positions = force_layout(&entries, &edges);
-
-        let dist = |a: &str, b: &str| {
-            let (ax, ay) = positions[a];
-            let (bx, by) = positions[b];
-            ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt()
-        };
-
-        let max_triangle_dist =
-            dist("a.md", "b.md").max(dist("b.md", "c.md")).max(dist("a.md", "c.md"));
-        let min_outlier_dist = dist("a.md", "outlier.md")
-            .min(dist("b.md", "outlier.md"))
-            .min(dist("c.md", "outlier.md"));
-
-        assert!(
-            max_triangle_dist < min_outlier_dist,
-            "triangle pairwise distances ({max_triangle_dist}) should be smaller than any \
-             distance to the unlinked outlier ({min_outlier_dist})"
-        );
-    }
-
-    #[test]
-    fn force_layout_handles_empty_and_singleton_input_without_panicking() {
-        assert!(force_layout(&[], &[]).is_empty());
-
-        let one = vec![entry("solo.md")];
-        let positions = force_layout(&one, &[]);
-        assert_eq!(positions.len(), 1);
-        let (x, y) = positions["solo.md"];
-        assert!((0.05..=0.95).contains(&x));
-        assert!((0.05..=0.95).contains(&y));
     }
 }

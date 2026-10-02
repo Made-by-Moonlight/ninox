@@ -2,23 +2,15 @@
 //! distributed through for a newer version, and (on user action) applies it
 //! via `cargo install --force`.
 //!
-//! ## Why the Cargo registry, not GitHub Releases
+//! ## Why the Cargo registry
 //!
-//! Two distribution channels exist (see the repo's `.github/workflows/`):
-//! `github.com/Made-by-Moonlight/ninox` tags commits but its `release.yml`
-//! workflow is disabled and publishes no binaries/bundles anywhere — there
-//! is nothing there to check against or download. The private mirror
-//! (`Synthesia-Technologies/ninox`) publishes every version bump to a
-//! private Cargo registry (`synthesia-cargo`, on AWS CodeArtifact) via
-//! `publish-codeartifact.yml`, and `cargo install ninox` against that
-//! registry is already the primary install path (the registry is the
-//! default via `~/.cargo/config.toml` source replacement — see
-//! `.github/workflows/publish-codeartifact.yml`'s header comment for the
-//! exact setup). That registry's sparse index is therefore both the
-//! authoritative "what's the latest version" source AND requires no new
-//! infrastructure: this module reads the same `~/.cargo/config.toml` cargo
-//! itself uses and mints tokens via the same
-//! `cargo:token-from-stdout` credential provider CI configures there.
+//! A machine that installs ninox from a private Cargo registry (wired up
+//! via `[source.crates-io] replace-with` in `~/.cargo/config.toml`) already
+//! has everything needed to ask "what's the latest version": the
+//! registry's sparse index, and the `cargo:token-from-stdout` credential
+//! provider cargo itself uses. This module reads that same config, so it
+//! needs no new infrastructure; a machine without source replacement
+//! simply skips the check.
 //!
 //! If ninox ever starts publishing binaries to GitHub Releases, swap
 //! `CargoRegistryUpdateSource` for a GitHub-releases-backed `UpdateSource` —
@@ -184,8 +176,8 @@ impl UpdateSource for CargoRegistryUpdateSource {
         let url = format!("{}{}", source.index_url, sparse_index_path(package));
         let mut request = reqwest::Client::new().get(&url);
         if let Some(token) = token {
-            // Raw token, no "Bearer " prefix — CodeArtifact's cargo data
-            // plane rejects a prefixed token with 401.
+            // Raw token, no "Bearer " prefix — Cargo sends registry tokens
+            // verbatim, and some registries reject a prefixed one with 401.
             request = request.header(reqwest::header::AUTHORIZATION, token);
         }
         let response = request.send().await.context("fetching sparse index")?;
@@ -257,18 +249,18 @@ mod tests {
     fn resolve_registry_source_reads_replace_with_chain() {
         let dir = tempfile::tempdir().unwrap();
         write_cargo_config(dir.path(), r#"
-[registries.synthesia-cargo]
-index = "sparse+https://example.com/cargo/synthesia-cargo/"
-credential-provider = "cargo:token-from-stdout aws codeartifact get-authorization-token --domain d --domain-owner o --region r --query authorizationToken --output text"
+[registries.private-cargo]
+index = "sparse+https://example.com/cargo/private-cargo/"
+credential-provider = "cargo:token-from-stdout mint-registry-token --registry private-cargo"
 
 [source.crates-io]
-replace-with = "synthesia-cargo"
+replace-with = "private-cargo"
 "#);
         let source = resolve_registry_source(dir.path()).expect("must resolve");
-        assert_eq!(source.index_url, "https://example.com/cargo/synthesia-cargo/");
+        assert_eq!(source.index_url, "https://example.com/cargo/private-cargo/");
         assert_eq!(
             source.credential_provider.as_deref(),
-            Some("cargo:token-from-stdout aws codeartifact get-authorization-token --domain d --domain-owner o --region r --query authorizationToken --output text"),
+            Some("cargo:token-from-stdout mint-registry-token --registry private-cargo"),
         );
     }
 
@@ -276,8 +268,8 @@ replace-with = "synthesia-cargo"
     fn resolve_registry_source_none_without_replace_with() {
         let dir = tempfile::tempdir().unwrap();
         write_cargo_config(dir.path(), r#"
-[registries.synthesia-cargo]
-index = "sparse+https://example.com/cargo/synthesia-cargo/"
+[registries.private-cargo]
+index = "sparse+https://example.com/cargo/private-cargo/"
 "#);
         assert!(resolve_registry_source(dir.path()).is_none());
     }
@@ -292,10 +284,10 @@ index = "sparse+https://example.com/cargo/synthesia-cargo/"
     fn resolve_registry_source_none_when_registry_has_no_index() {
         let dir = tempfile::tempdir().unwrap();
         write_cargo_config(dir.path(), r#"
-[registries.synthesia-cargo]
+[registries.private-cargo]
 
 [source.crates-io]
-replace-with = "synthesia-cargo"
+replace-with = "private-cargo"
 "#);
         assert!(resolve_registry_source(dir.path()).is_none());
     }

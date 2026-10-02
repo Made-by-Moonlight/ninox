@@ -101,18 +101,6 @@ pub struct WorkerRuntimeClaim {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OrchestratorRuntimeIdentity {
-    pub orchestrator_id: String,
-    pub runtime_id: String,
-    pub server_epoch: String,
-    pub physical_tmux_name: String,
-    pub pane_id: String,
-    pub root_pid: u32,
-    pub root_created_at: i64,
-    pub registered_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerFinalization {
     pub session_id: String,
     pub incarnation_id: String,
@@ -166,12 +154,21 @@ pub enum SessionStatus {
     /// ("gone for good") — an `Interrupted` session has a
     /// `claude_session_id` and a harness capable of `--resume`, so the
     /// user can pick the exact same conversation back up. Never set
-    /// silently: only the startup reconciliation in `app.rs` assigns it,
+    /// silently: only the poller's startup reconciliation assigns it,
     /// and only a user-triggered Resume action clears it.
     Interrupted,
 }
 
 impl SessionStatus {
+    /// No live agent process behind this status: the session has finished,
+    /// been killed, or lost its pane. The canonical definition — several
+    /// places need "is this session still live?" and they must agree, since
+    /// a row that ends up non-terminal without a live process is a permanent
+    /// ghost (`sweep_retired_sessions` only purges `Done`/`Terminated`, and
+    /// `poll_pids` needs a `pid`, which a CLI-spawned worker never has).
+    ///
+    /// Note this is broader than `events`' reap-local `is_finished`, which
+    /// deliberately excludes the resumable `Interrupted`.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Done | Self::Terminated | Self::Interrupted)
     }
@@ -198,6 +195,25 @@ pub struct GateStatus {
     /// Epoch ms this exact (ci, review, mergeable) combination was first
     /// observed — reset whenever any of the three values changes.
     pub since: i64,
+}
+
+/// Moment-to-moment agent activity, orthogonal to the PR-lifecycle
+/// `SessionStatus`: a session can be `PrOpen` (lifecycle) while `Idle`
+/// (activity). Written by the worker's own Claude Code hooks
+/// (`UserPromptSubmit`/`Stop` → `ninox worker-status hook-*`) and by the
+/// agent's explicit `ninox worker-status set`; see
+/// `ninox_core::worker_status` for the transition rules.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityState {
+    Working,
+    Idle,
+    Blocked,
+    /// No activity signal available: the session predates the status hooks,
+    /// runs a harness without hook support, or hasn't reported yet. Distinct
+    /// from `Idle` — "we don't know" vs "we know it's between turns".
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +289,18 @@ pub struct Session {
     /// period. `#[serde(default)]` for wire/DB back-compat.
     #[serde(default)]
     pub terminal_at: Option<i64>,
+    /// Unix epoch milliseconds when merge detection first saw this
+    /// session's PR merged while `[auto_reap]` was disabled — i.e. the
+    /// session was deliberately left alive (tmux + worktree intact) for
+    /// post-merge validation instead of being cleaned up on the spot.
+    /// Once set, the merged notification/worker-done reaction never fire
+    /// again and GitHub enrichment skips the session entirely (its PR is
+    /// merged — there is nothing left to poll), even though its `status`
+    /// stays live until it is reaped. With `[auto_reap]` enabled the
+    /// session goes straight to `Done` instead and this stays `None`.
+    /// `#[serde(default)]` for wire/DB back-compat.
+    #[serde(default)]
+    pub merged_at: Option<i64>,
     /// Structured CI/review/mergeable breakdown behind the current
     /// `status`. `None` until the first GitHub enrichment tick for a
     /// session with an open PR (`Spawning`/`Working` sessions have no PR
@@ -280,6 +308,20 @@ pub struct Session {
     /// back-compat with sessions recorded before this field existed.
     #[serde(default)]
     pub gate_status: Option<GateStatus>,
+    /// See `ActivityState`. `#[serde(default)]` (→ `Unknown`) for wire/DB
+    /// back-compat with sessions recorded before this field existed.
+    #[serde(default)]
+    pub activity: ActivityState,
+    /// Free-text context for a self-reported state (`ninox worker-status set
+    /// blocked --note "…"`). Cleared whenever `activity` changes without a
+    /// new note.
+    #[serde(default)]
+    pub activity_note: Option<String>,
+    /// Epoch ms the current `activity` value was first observed — reset on
+    /// every state change, mirroring `GateStatus::since`. `None` until the
+    /// first report.
+    #[serde(default)]
+    pub activity_since: Option<i64>,
 }
 
 /// Which fields of a `Session` a particular `Event::SessionUpdated` carries
@@ -309,6 +351,13 @@ impl SessionFields {
     pub const PID:         Self = Self(1 << 6);
     pub const WORKSPACE:   Self = Self(1 << 7);
     pub const MODEL:       Self = Self(1 << 8);
+    /// A merged-but-kept-alive worker just had `merged_at` stamped (see
+    /// `Session::merged_at`) — so the in-memory copy learns the session is
+    /// merged even though its live `status` is unchanged.
+    pub const MERGED_AT:   Self = Self(1 << 9);
+    /// `activity`, `activity_note`, `activity_since` — all sourced from the
+    /// same `worker_status::apply_activity` write, so they travel together.
+    pub const ACTIVITY:    Self = Self(1 << 10);
     /// Full-struct replace — only for the spawn-completion event, where the
     /// row is transitioning from an optimistic placeholder to its first real
     /// snapshot and every field is being established for the first time.
@@ -327,6 +376,16 @@ impl std::ops::BitOr for SessionFields {
 }
 
 impl Session {
+    /// True once this session's PR merge has been fully handled by the
+    /// poller — either it reached `Done` (auto-reap cleaned it up) or it was
+    /// kept alive for post-merge validation with `merged_at` stamped (see
+    /// `merged_at`). Both mean GitHub enrichment has nothing left to do for
+    /// it and merge detection must not fire again. The canonical predicate
+    /// for the poller's "skip this session" checks, which must all agree.
+    pub fn merge_handled(&self) -> bool {
+        matches!(self.status, SessionStatus::Done) || self.merged_at.is_some()
+    }
+
     /// Copy only the fields flagged in `fields` from `incoming` onto `self`.
     /// See `SessionFields`'s doc comment for why this must never be a
     /// wholesale replace except when `fields == SessionFields::ALL`.
@@ -365,6 +424,9 @@ impl Session {
         if fields.contains(SessionFields::TERMINAL_AT) {
             self.terminal_at = incoming.terminal_at;
         }
+        if fields.contains(SessionFields::MERGED_AT) {
+            self.merged_at = incoming.merged_at;
+        }
         if fields.contains(SessionFields::PID) {
             self.pid = incoming.pid;
         }
@@ -374,6 +436,11 @@ impl Session {
         if fields.contains(SessionFields::MODEL) {
             self.model = incoming.model.clone();
         }
+        if fields.contains(SessionFields::ACTIVITY) {
+            self.activity = incoming.activity;
+            self.activity_note = incoming.activity_note.clone();
+            self.activity_since = incoming.activity_since;
+        }
     }
 }
 
@@ -381,6 +448,74 @@ impl Session {
 pub struct Orchestrator {
     pub id:         OrchestratorId,
     pub name:       String,
+    pub created_at: i64,
+}
+
+/// An orchestrator's immutable runtime identity — the private tmux pane it
+/// was first authorized from. `authorize_orchestrator` cross-checks every
+/// subsequent orchestrator-facing CLI call against this so a spoofed
+/// `NINOX_ORCHESTRATOR_ID` env var alone can't impersonate it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrchestratorRuntimeIdentity {
+    pub orchestrator_id: String,
+    pub runtime_id: String,
+    pub server_epoch: String,
+    pub physical_tmux_name: String,
+    pub pane_id: String,
+    pub root_pid: u32,
+    pub root_created_at: i64,
+    pub registered_at: i64,
+}
+
+/// An orchestrator's registered goals/plan markdown doc — a pointer
+/// (`file_path`), not the content itself. The desktop app polls the file
+/// on disk and re-reads it on mtime change; see
+/// `docs/superpowers/specs/2026-08-26-orchestrator-plan-tracking-design.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrchestratorPlan {
+    pub orchestrator_id: String,
+    pub file_path: String,
+    pub registered_at: i64,
+    pub updated_at: i64,
+}
+
+/// How a worker→worker dependency edge came to exist. Stored as its
+/// `as_str()` form in the `session_deps` table.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum DepKind {
+    /// Registered explicitly via `ninox worker-status depend <session>`.
+    Declared,
+    /// Inferred by the poller from PR branch stacking (this session's PR
+    /// base ref is the dependency's PR head ref) — re-derived every GitHub
+    /// tick, so it appears and disappears with the branch relationship.
+    Stacked,
+}
+
+impl DepKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Stacked  => "stacked",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "declared" => Some(Self::Declared),
+            "stacked"  => Some(Self::Stacked),
+            _          => None,
+        }
+    }
+}
+
+/// A worker→worker dependency edge: `session_id` depends on `depends_on`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionDep {
+    pub session_id: SessionId,
+    pub depends_on: SessionId,
+    pub kind:       DepKind,
+    pub note:       Option<String>,
     pub created_at: i64,
 }
 
@@ -412,6 +547,20 @@ pub struct Comment {
     pub path:       Option<String>,
     pub line:       Option<u32>,
     pub created_at: i64,
+}
+
+/// An explicit PR watch registered via `ninox open --pr` — additive to the
+/// implicit watching of session-attached PRs. `opener_session_id = None`
+/// means the watch was registered outside any ninox session (state/UI
+/// events only, no tmux delivery target). Auto-removed when the PR merges
+/// or closes; otherwise lives until `ninox close --pr`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrWatch {
+    pub repo:              String,
+    pub pr_number:         u64,
+    pub pr_url:            String,
+    pub opener_session_id: Option<String>,
+    pub created_at:        i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -532,7 +681,9 @@ mod tests {
             catalogue_path: None, context_used_pct: Some(1.0),
             context_total_tokens: Some(10), context_window_size: Some(200_000),
             claude_session_id: None, summary: None, terminal_at: None,
-            gate_status: None,
+            gate_status: None, merged_at: None,
+            activity: ActivityState::Unknown,
+            activity_note: None, activity_since: None,
         }
     }
 
@@ -607,5 +758,63 @@ mod tests {
         assert!(combined.contains(SessionFields::STATUS));
         assert!(combined.contains(SessionFields::PR_LINK));
         assert!(!combined.contains(SessionFields::COST));
+    }
+
+    #[test]
+    fn activity_state_serde_round_trips_snake_case() {
+        for (state, wire) in [
+            (ActivityState::Working, "\"working\""),
+            (ActivityState::Idle,    "\"idle\""),
+            (ActivityState::Blocked, "\"blocked\""),
+            (ActivityState::Unknown, "\"unknown\""),
+        ] {
+            assert_eq!(serde_json::to_string(&state).unwrap(), wire);
+            let parsed: ActivityState = serde_json::from_str(wire).unwrap();
+            assert_eq!(parsed, state);
+        }
+    }
+
+    #[test]
+    fn session_deserializes_without_activity_fields_for_back_compat() {
+        // A row serialized before the activity fields existed must load with
+        // Unknown / empty defaults rather than failing.
+        let mut v = serde_json::to_value(base_session()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("activity");
+        obj.remove("activity_note");
+        obj.remove("activity_since");
+        let s: Session = serde_json::from_value(v).expect("pre-activity payload must deserialize");
+        assert_eq!(s.activity, ActivityState::Unknown);
+        assert_eq!(s.activity_note, None);
+        assert_eq!(s.activity_since, None);
+    }
+
+    #[test]
+    fn merge_from_activity_copies_only_when_flagged() {
+        let mut existing = base_session();
+        let mut incoming = base_session();
+        incoming.activity = ActivityState::Blocked;
+        incoming.activity_note = Some("waiting on migration".into());
+        incoming.activity_since = Some(42);
+
+        existing.merge_from(&incoming, SessionFields::COST); // ACTIVITY not flagged
+        assert_eq!(existing.activity, ActivityState::Unknown, "unflagged activity must not be copied");
+        assert_eq!(existing.activity_note, None);
+        assert_eq!(existing.activity_since, None);
+
+        existing.merge_from(&incoming, SessionFields::ACTIVITY);
+        assert_eq!(existing.activity, ActivityState::Blocked, "flagged activity must be copied");
+        assert_eq!(existing.activity_note.as_deref(), Some("waiting on migration"));
+        assert_eq!(existing.activity_since, Some(42));
+    }
+
+    #[test]
+    fn dep_kind_serde_and_db_string_round_trip() {
+        for (kind, wire) in [(DepKind::Declared, "declared"), (DepKind::Stacked, "stacked")] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{wire}\""));
+            assert_eq!(kind.as_str(), wire);
+            assert_eq!(DepKind::parse(wire), Some(kind));
+        }
+        assert_eq!(DepKind::parse("garbage"), None);
     }
 }

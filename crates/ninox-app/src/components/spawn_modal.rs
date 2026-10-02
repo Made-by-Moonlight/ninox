@@ -44,7 +44,7 @@ pub fn static_prior(harness: &str, model: Option<&str>) -> Option<(f64, f64)> {
         return None;
     }
     match model {
-        Some("claude-fable-5")   => Some((4.0, 8.0)),
+        Some("claude-fable-5-1") | Some("claude-fable-5") => Some((4.0, 8.0)),
         Some("claude-opus-4-8")  => Some((2.0, 4.0)),
         Some("claude-sonnet-5")  => Some((1.0, 2.0)),
         Some("claude-haiku-4-5") => Some((0.4, 1.2)),
@@ -402,6 +402,7 @@ mod tests {
     #[test]
     fn static_priors_cover_claude_models_only() {
         assert_eq!(static_prior("claude-code", Some("claude-fable-5")),   Some((4.0, 8.0)));
+        assert_eq!(static_prior("claude-code", Some("claude-fable-5-1")), Some((4.0, 8.0)));
         assert_eq!(static_prior("claude-code", Some("claude-opus-4-8")),  Some((2.0, 4.0)));
         assert_eq!(static_prior("claude-code", Some("claude-sonnet-5")),  Some((1.0, 2.0)));
         assert_eq!(static_prior("claude-code", Some("claude-haiku-4-5")), Some((0.4, 1.2)));

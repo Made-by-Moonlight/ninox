@@ -29,7 +29,16 @@ Use Ninox when you've outgrown a single agent in a single terminal:
 
 - Rust toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - tmux 3.2+ (3.5+ recommended for full extended-keyboard support)
-- macOS or Linux (Windows not yet supported)
+- macOS or Linux (Windows not yet supported). Ubuntu 22.04 and newer are
+  supported and covered by CI; on Debian/Ubuntu install the build
+  dependencies first:
+
+  ```bash
+  sudo apt-get install -y build-essential pkg-config cmake \
+    libxkbcommon-dev libwayland-dev
+  ```
+
+  No OpenSSL headers are required — all TLS goes through rustls.
 
 ## Install
 
@@ -53,6 +62,30 @@ cargo build --release -p ninox
 ```
 
 The HTTP server always starts on `127.0.0.1:8080` (or `--port`), exposing the engine's HTTP/WebSocket API — so everything the UI does is also scriptable.
+
+## Terminal mode
+
+Ninox also offers a terminal UI (TUI) for SSH access or headless environments. The TUI is available via `ninox tui` on any platform; on Linux and SSH (where there is no display), `ninox` with no arguments automatically opens the TUI instead of the native window.
+
+On macOS, `has_display()` is hardcoded `true`, so bare `ninox` always opens the native GUI — use `ninox tui` explicitly if you want the terminal interface instead.
+
+### Terminal commands
+
+```bash
+# Start the terminal UI
+ninox tui
+
+# List running sessions (--json for machine-readable output)
+ninox list [--json]
+
+# Connect to an existing session
+ninox connect <session-id>
+
+# Spawn a new orchestrator session
+ninox orchestrate <name> [--prompt <brief>] [--no-attach]
+```
+
+The daemon automatically starts in the background on first use and logs to `~/.local/share/ninox/daemon.log` (Linux) or `~/Library/Application Support/ninox/daemon.log` (macOS). Quitting the TUI doesn't shut down the daemon — sessions continue running in the background.
 
 ## macOS app bundle
 

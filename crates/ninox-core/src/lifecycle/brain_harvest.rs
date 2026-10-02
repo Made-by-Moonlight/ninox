@@ -257,8 +257,8 @@ pub async fn compute_nontrivial_diff(workspace: &Path) -> Option<String> {
     diff_text(workspace, &range).await
 }
 
-/// Build the one-shot harvest prompt. Inlines the same brain workflow
-/// `WORKER_BRAIN_SKILL` teaches an interactive worker — query before
+/// Build the one-shot harvest prompt. Inlines the same brain workflow the
+/// worker `brain` capability teaches an interactive worker — query before
 /// writing, categorized Markdown with YAML frontmatter, reindex when done —
 /// since a headless `-p` invocation has no skill-loading step of its own.
 pub fn build_harvest_prompt(session_id: &str, diff: &str) -> String {

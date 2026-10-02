@@ -1,6 +1,11 @@
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
+use crate::runtime::prompt::{
+    message_stuck_at_prompt, nudge_still_alone_at_prompt, prompt_line_content, IDLE_WAKE_NUDGE,
+    PROMPT_POLL_DELAY_MS, SEND_SUBMIT_DELAY_MS, SEND_VERIFY_ATTEMPTS, SEND_VERIFY_DELAY_MS,
+};
+
 /// Name of the private tmux server socket all ninox sessions live on.
 /// Isolates ninox from the user's own tmux server and ~/.tmux.conf — and,
 /// via `is_test_binary`, isolates the test suite's own tmux server from the
@@ -9,8 +14,22 @@ use tokio::process::Command;
 /// kill-server`) kills the user's actual live orchestrator/worker panes,
 /// since tests and the production app previously shared this exact socket.
 /// Not a `const` because it depends on that runtime check.
+///
+/// `NINOX_TMUX_SOCKET` overrides the name for isolated sandboxes (see
+/// `docs/terminal-native-runtime-testing.md`); test binaries ignore it so a
+/// stray export can never point the suite at a real server.
 pub(crate) fn socket() -> &'static str {
-    if is_test_binary() { "ninox-test" } else { "ninox" }
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| socket_for(is_test_binary(), std::env::var(TMUX_SOCKET_ENV).ok()))
+}
+
+pub const TMUX_SOCKET_ENV: &str = "NINOX_TMUX_SOCKET";
+
+fn socket_for(test_binary: bool, override_name: Option<String>) -> String {
+    if test_binary {
+        return "ninox-test".into();
+    }
+    override_name.filter(|s| !s.is_empty() && !s.contains('/')).unwrap_or_else(|| "ninox".into())
 }
 
 /// Cargo places every test/bench/example binary's compiled output under
@@ -22,7 +41,7 @@ pub(crate) fn socket() -> &'static str {
 /// so it can't race under parallel test execution the way a shared env var
 /// would (see `lifecycle::usage::ENV_TEST_GUARD` for a case where that
 /// exact hazard already had to be worked around once in this codebase).
-fn is_test_binary() -> bool {
+pub(crate) fn is_test_binary() -> bool {
     std::env::current_exe()
         .ok()
         .is_some_and(|p| p.components().any(|c| c.as_os_str() == "deps"))
@@ -76,6 +95,9 @@ fn server_config_for_version(version: (u32, u32)) -> String {
     cfg.push_str("set -g  history-limit 100000\n");
     cfg.push_str("set -g  status off\n");
     cfg.push_str("set -s  escape-time 0\n");
+    // The TUI's viewer panes attach as extra clients. With `latest` the most
+    // recently active client sizes the window, so a full-screen attach the
+    // user is typing into wins back its size from a background viewer.
     cfg.push_str("set -g  window-size latest\n");
     cfg.push_str("set -g  allow-passthrough on\n");
     cfg.push_str("set -g  focus-events on\n");
@@ -187,6 +209,20 @@ fn is_missing_session(e: &anyhow::Error) -> bool {
         // (`exit-empty off`) rather than only ever existing once a real
         // session has been created on it.
         || msg.contains("no current target")
+        // tmux's client-side connect failure when the target socket is
+        // unreachable: "No such file or directory" when the socket file is
+        // absent, "Connection refused" when nothing listens on it. Matched
+        // by suffix (not just the "error connecting to" prefix) so a
+        // different connect failure on the same socket — e.g. "Permission
+        // denied" — still surfaces as a real error rather than being
+        // silently treated as "no session". `run_session_scoped`'s legacy
+        // fallback retries session-targeted commands against the default
+        // server, which on most machines simply isn't running (e.g. after a
+        // reboot) — an unreachable server holds no sessions, so for
+        // session-targeted commands this is "missing session", not a real
+        // failure.
+        || (msg.contains("error connecting to")
+            && (msg.contains("No such file or directory") || msg.contains("Connection refused")))
 }
 
 /// Metadata about a running tmux session from `list-sessions`.
@@ -341,6 +377,19 @@ async fn run_best_effort_default(args: &[&str]) -> String {
     }
 }
 
+/// `-t` value matching the session named `id` exactly. A bare name is
+/// resolved by tmux as a unique prefix (`mlops-2675` finds `mlops-2675-fix`),
+/// which would let one session's lookup act on another's pane.
+fn exact_session(id: &str) -> String {
+    format!("={id}")
+}
+
+/// Pane/window `-t` value for the active pane of exactly session `id`; the
+/// trailing `:` is required — `=id` alone is parsed as a window/pane name.
+fn exact_pane(id: &str) -> String {
+    format!("={id}:")
+}
+
 /// Shell-quote a string to prevent injection in tmux commands.
 /// Wraps the string in single quotes and escapes interior single quotes.
 fn shell_quote(s: &str) -> String {
@@ -402,7 +451,7 @@ pub async fn create_session(
 /// `run_session_scoped` falls back to the default socket when the session
 /// isn't found on the ninox server, so legacy sessions are killed there too.
 pub async fn kill_session(id: &str) -> Result<()> {
-    match run_session_scoped(&["kill-session", "-t", id]).await {
+    match run_session_scoped(&["kill-session", "-t", &exact_session(id)]).await {
         Ok(_) => Ok(()),
         Err(e) => {
             if is_missing_session(&e) {
@@ -426,7 +475,7 @@ pub async fn kill_private_session(id: &str) -> Result<()> {
 
 /// Returns `true` if a tmux session with this name is currently running.
 pub async fn has_session(id: &str) -> bool {
-    run_session_scoped(&["has-session", "-t", id]).await.is_ok()
+    run_session_scoped(&["has-session", "-t", &exact_session(id)]).await.is_ok()
 }
 
 /// Resolve one immutable physical runtime on the private server only.
@@ -682,7 +731,7 @@ pub async fn list_sessions() -> Result<Vec<TmuxSession>> {
 
 /// Return the tty device path (e.g. `/dev/ttys003`) for the session's active pane.
 pub async fn get_pane_tty(id: &str) -> Result<Option<String>> {
-    let out = run_session_scoped(&["list-panes", "-t", id, "-F", "#{pane_tty}"]).await?;
+    let out = run_session_scoped(&["list-panes", "-t", &exact_pane(id), "-F", "#{pane_tty}"]).await?;
     Ok(out
         .lines()
         .next()
@@ -693,7 +742,7 @@ pub async fn get_pane_tty(id: &str) -> Result<Option<String>> {
 /// Start piping pane output to `dest_path` (regular file, not FIFO).
 /// Does NOT use `-o` so it force-restarts any existing pipe — required for reconnect.
 pub async fn pipe_pane(id: &str, dest_path: &str) -> Result<()> {
-    run_session_scoped(&["pipe-pane", "-t", id, &format!("cat > {}", shell_quote(dest_path))]).await?;
+    run_session_scoped(&["pipe-pane", "-t", &exact_pane(id), &format!("cat > {}", shell_quote(dest_path))]).await?;
     Ok(())
 }
 
@@ -701,7 +750,7 @@ pub async fn pipe_pane(id: &str, dest_path: &str) -> Result<()> {
 /// resolving whether it lives on the ninox or the legacy default server.
 pub async fn attach_args(session_id: &str) -> Vec<String> {
     let mut argv = vec!["tmux".to_string()];
-    if run(&["has-session", "-t", session_id]).await.is_ok() {
+    if run(&["has-session", "-t", &exact_session(session_id)]).await.is_ok() {
         argv.extend(socket_args());
     } else {
         tracing::warn!(
@@ -710,13 +759,20 @@ pub async fn attach_args(session_id: &str) -> Vec<String> {
              keys / resize guarantees are degraded until it terminates naturally)"
         );
     }
-    argv.extend(["attach-session", "-t", session_id].map(String::from));
+    argv.extend(["attach-session".to_string(), "-t".to_string(), exact_session(session_id)]);
     argv
+}
+
+/// The session's current window size, `(cols, rows)`.
+pub async fn window_size(session_id: &str) -> Option<(u16, u16)> {
+    let out = run_session_scoped(&["display-message", "-p", "-t", &exact_pane(session_id), "#{window_width}x#{window_height}"]).await.ok()?;
+    let (w, h) = out.trim().split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
 }
 
 /// Number of scrolled-off lines tmux holds for this pane.
 pub async fn history_size(session_id: &str) -> i64 {
-    run_session_scoped(&["display-message", "-p", "-t", session_id, "#{history_size}"])
+    run_session_scoped(&["display-message", "-p", "-t", &exact_pane(session_id), "#{history_size}"])
         .await
         .ok()
         .and_then(|s| s.trim().parse().ok())
@@ -735,7 +791,7 @@ pub async fn capture_viewport_tail(
         "display-message",
         "-p",
         "-t",
-        session_id,
+        &exact_pane(session_id),
         "#{pane_width} #{pane_height} #{cursor_x} #{cursor_y}",
     ])
     .await
@@ -751,7 +807,7 @@ pub async fn capture_viewport_tail(
         "-p",
         "-e",
         "-t",
-        session_id,
+        &exact_pane(session_id),
         "-S",
         &start.to_string(),
         "-E",
@@ -782,7 +838,7 @@ pub async fn prepare_viewport_tail(
     run_session_scoped(&[
         "resize-window",
         "-t",
-        session_id,
+        &exact_pane(session_id),
         "-x",
         &viewport_cols.max(1).to_string(),
         "-y",
@@ -816,21 +872,27 @@ pub async fn prepare_viewport_tail(
 /// their WRAPLINE flags, preserving copy semantics across page boundaries.
 pub async fn capture_history(session_id: &str, start: i64, end: i64) -> Vec<u8> {
     run_session_scoped_preserving_output(&[
-        "capture-pane", "-p", "-e", "-J", "-t", session_id,
+        "capture-pane", "-p", "-e", "-J", "-t", &exact_pane(session_id),
         "-S", &start.to_string(), "-E", &end.to_string(),
     ])
     .await
     .unwrap_or_default()
 }
 
-/// A burst of injected characters makes Claude Code's TUI enter paste
-/// handling; an Enter arriving before that settles is swallowed and the
-/// message sits unsubmitted in the input box. Wait this long before Enter.
-const SEND_SUBMIT_DELAY_MS: u64 = 300;
-/// After Enter, re-check delivery this many times, this far apart,
-/// re-sending Enter whenever the message is still visible at the prompt.
-const SEND_VERIFY_ATTEMPTS: u32 = 3;
-const SEND_VERIFY_DELAY_MS: u64 = 500;
+/// The pane's visible screen, plus `scrollback` history lines above it, for
+/// `ninox read`. `ansi` keeps SGR styling (`capture-pane -e`).
+pub async fn capture_screen(session_id: &str, scrollback: usize, ansi: bool) -> Result<String> {
+    let start = format!("-{scrollback}");
+    let target = exact_pane(session_id);
+    let mut args = vec!["capture-pane", "-p", "-t", &target];
+    if ansi {
+        args.push("-e");
+    }
+    if scrollback > 0 {
+        args.extend(["-S", start.as_str()]);
+    }
+    run_session_scoped(&args).await
+}
 
 /// Send text to a tmux session as if typed at the keyboard.
 /// The text is followed by Enter so the agent receives and acts on it.
@@ -846,10 +908,10 @@ const SEND_VERIFY_DELAY_MS: u64 = 500;
 /// half-typed input.
 pub async fn send_keys(session_id: &str, text: &str) -> Result<()> {
     // Send the message text in literal mode
-    run_session_scoped(&["send-keys", "-t", session_id, "-l", text]).await?;
+    run_session_scoped(&["send-keys", "-t", &exact_pane(session_id), "-l", text]).await?;
     // Let the TUI finish paste processing before submitting.
     tokio::time::sleep(std::time::Duration::from_millis(SEND_SUBMIT_DELAY_MS)).await;
-    run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await?;
+    run_session_scoped(&["send-keys", "-t", &exact_pane(session_id), "Enter"]).await?;
 
     // Every Enter — the initial one and each retry — gets its own
     // verification pass, so a submission by the final retry is still
@@ -861,7 +923,7 @@ pub async fn send_keys(session_id: &str, text: &str) -> Result<()> {
             return Ok(());
         }
         if attempt < SEND_VERIFY_ATTEMPTS {
-            run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await?;
+            run_session_scoped(&["send-keys", "-t", &exact_pane(session_id), "Enter"]).await?;
         }
     }
     anyhow::bail!(
@@ -873,71 +935,9 @@ pub async fn send_keys(session_id: &str, text: &str) -> Result<()> {
 /// Plain-text capture of the pane's visible contents — no `-e`, so the
 /// output carries no escape sequences and can be string-matched.
 async fn capture_visible_plain(session_id: &str) -> String {
-    run_session_scoped(&["capture-pane", "-p", "-t", session_id])
+    run_session_scoped(&["capture-pane", "-p", "-t", &exact_pane(session_id)])
         .await
         .unwrap_or_default()
-}
-
-/// The trimmed content after the pane's last `❯` input-prompt line, with the
-/// input box's right border/padding stripped (`  msg   │` → `msg`). `None`
-/// when no prompt line is visible at all (plain shell, alt-screen app) —
-/// distinct from `Some("")`, an empty-but-present input box. Shared by
-/// [`message_stuck_at_prompt`] and [`wake_idle_session`].
-fn prompt_line_content(pane: &str) -> Option<&str> {
-    const PROMPT: char = '❯';
-    let line = pane.lines().rev().find(|l| l.contains(PROMPT))?;
-    let after = &line[line.rfind(PROMPT).unwrap() + PROMPT.len_utf8()..];
-    // Strip the input box's right border and padding: `  msg   │`.
-    Some(after.trim().trim_end_matches('│').trim())
-}
-
-/// Whether a message we just injected is sitting unsubmitted in the target
-/// pane's input box. Looks at the last line holding the `❯` input prompt:
-/// stuck means it shows a `[Pasted text #N]` attachment marker or the
-/// message text itself (prefix-matched both ways, since the box truncates
-/// long lines). Anything else after the prompt — empty box, a placeholder
-/// hint, a human's half-typed message — is NOT ours to submit, so this
-/// stays false and no retry Enter is ever sent at it.
-fn message_stuck_at_prompt(pane: &str, text: &str) -> bool {
-    let Some(content) = prompt_line_content(pane) else {
-        return false;
-    };
-    if content.is_empty() {
-        return false;
-    }
-    if content.starts_with("[Pasted text") {
-        return true;
-    }
-    let first_line = text.lines().next().unwrap_or("").trim();
-    if first_line.is_empty() {
-        return false;
-    }
-    if content.starts_with(first_line) {
-        return true;
-    }
-    // Truncated stuck message: the box cuts long lines at the pane edge,
-    // so the visible content is a leading fragment of the message. Require
-    // it to be long enough to be distinctive — every reaction starts with
-    // `[Ninox]`, and a human who has typed `[` (or `[Ninox] C`) when this
-    // check runs must not have their unfinished input Enter'd for them. A
-    // genuinely truncated line is pane-width, far above this floor.
-    const MIN_TRUNCATED_MATCH_CHARS: usize = 10;
-    content.chars().count() >= MIN_TRUNCATED_MATCH_CHARS && first_line.starts_with(content)
-}
-
-/// Marker text for [`wake_idle_session`]'s idle-wake nudge — never the
-/// actual message, which (when the opt-in file-based inbox is enabled) is
-/// delivered entirely through the Stop/UserPromptSubmit hooks' JSON output,
-/// not the keystroke. Kept short and distinctive so it can never collide
-/// with real content a human might be mid-typing.
-const IDLE_WAKE_NUDGE: &str = ".";
-
-/// Whether the pane's prompt currently holds ONLY the idle-wake nudge
-/// marker — nothing added, nothing removed. Used both right before sending
-/// Enter and (implicitly, by its absence) to detect that Enter already
-/// submitted cleanly.
-fn nudge_still_alone_at_prompt(pane: &str) -> bool {
-    prompt_line_content(pane) == Some(IDLE_WAKE_NUDGE)
 }
 
 /// Wake an idle session so its Stop/UserPromptSubmit hooks run and drain
@@ -985,18 +985,44 @@ pub async fn wake_idle_session(session_id: &str) -> Result<()> {
             // Our own nudge, left over un-submitted from a previous call —
             // submit it now rather than treating the box as permanently
             // occupied.
-            return run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await.map(|_| ());
+            return run_session_scoped(&["send-keys", "-t", &exact_pane(session_id), "Enter"]).await.map(|_| ());
         }
         _ => return Ok(()), // genuinely occupied by something else
     }
 
-    run_session_scoped(&["send-keys", "-t", session_id, "-l", IDLE_WAKE_NUDGE]).await?;
+    run_session_scoped(&["send-keys", "-t", &exact_pane(session_id), "-l", IDLE_WAKE_NUDGE]).await?;
     tokio::time::sleep(std::time::Duration::from_millis(SEND_SUBMIT_DELAY_MS)).await;
 
     if !nudge_still_alone_at_prompt(&capture_visible_plain(session_id).await) {
         return Ok(());
     }
-    run_session_scoped(&["send-keys", "-t", session_id, "Enter"]).await.map(|_| ())
+    run_session_scoped(&["send-keys", "-t", &exact_pane(session_id), "Enter"]).await.map(|_| ())
+}
+
+
+/// Wait until `session_id`'s pane shows an agent input prompt (`❯`), i.e.
+/// the harness has finished booting and will actually accept typed input.
+/// Returns `true` once the prompt appears, `false` if `timeout` elapses
+/// first.
+///
+/// Exists for the one caller that types into a session it just created
+/// (`ninox spawn-orchestrator`'s initial brief): [`send_keys`]'s verify/
+/// retry loop recovers a message stuck in a *rendered* input box, but
+/// nothing recovers keystrokes sent at a TUI that hasn't drawn its input
+/// box yet — those are simply swallowed by the welcome/auth screens. A
+/// timeout is not an error: the caller is expected to try the send anyway
+/// and report the failure, which beats silently declining to deliver.
+pub async fn wait_for_input_prompt(session_id: &str, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if prompt_line_content(&capture_visible_plain(session_id).await).is_some() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(PROMPT_POLL_DELAY_MS)).await;
+    }
 }
 
 /// Write `bytes` to the session's master PTY via tmux's paste-buffer
@@ -1008,7 +1034,7 @@ pub async fn paste_buffer(session_id: &str, buf_name: &str, tmp_path: &str, byte
     std::fs::write(tmp_path, bytes)?;
     let result = run_session_scoped(&[
         "load-buffer", "-b", buf_name, tmp_path, ";",
-        "paste-buffer", "-b", buf_name, "-t", session_id, "-d",
+        "paste-buffer", "-b", buf_name, "-t", &exact_pane(session_id), "-d",
     ]).await;
     let _ = std::fs::remove_file(tmp_path);
     result.map(|_| ())
@@ -1150,6 +1176,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn missing_session_covers_an_unreachable_server_socket() {
+        // tmux's client-side message when the target socket file does not
+        // exist ("No such file or directory") or nothing is listening on it
+        // ("Connection refused"). Session-targeted commands reach this via
+        // `run_session_scoped`'s legacy fallback to the default server on
+        // machines where no default server runs — e.g. right after a
+        // reboot. An unreachable server holds no sessions, so this must
+        // classify as "missing session": before it did, `kill_session`
+        // surfaced it as a real error and `Message::ResumeSession` aborted
+        // with "cannot stop prior runtime" — the Resume button silently
+        // did nothing for every dead session after a reboot.
+        for msg in [
+            "error connecting to /private/tmp/tmux-501/default (No such file or directory)",
+            "error connecting to /private/tmp/tmux-501/default (Connection refused)",
+        ] {
+            assert!(is_missing_session(&anyhow::anyhow!(msg)), "{msg}");
+        }
+    }
+
     fn tmux_available() -> bool {
         std::process::Command::new("tmux")
             .args(["-V"])
@@ -1256,6 +1302,14 @@ mod tests {
         assert_eq!(starts, ends, "reconciled client emitted unbalanced sync frames");
     }
 
+    #[test]
+    fn socket_override_applies_only_outside_test_binaries() {
+        assert_eq!(socket_for(false, None), "ninox");
+        assert_eq!(socket_for(false, Some("tnr-sbx".into())), "tnr-sbx");
+        assert_eq!(socket_for(false, Some(String::new())), "ninox");
+        assert_eq!(socket_for(true, Some("tnr-sbx".into())), "ninox-test");
+    }
+
     #[tokio::test]
     async fn create_session_fails_when_workspace_dir_is_missing() {
         if !tmux_available() { return; }
@@ -1270,6 +1324,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_for_input_prompt_returns_once_the_prompt_is_drawn() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        // Stand in for a harness that takes a moment to draw its input box:
+        // nothing prompt-like on screen at first, `❯` a beat later.
+        create_session(&id, "/tmp", "sleep 1; printf '\\n❯ '; sleep 30", &[]).await.unwrap();
+
+        let ready = wait_for_input_prompt(&id, Duration::from_secs(10)).await;
+
+        assert!(ready, "must return as soon as the input prompt appears");
+        kill_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_input_prompt_gives_up_at_the_timeout() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        // A pane that never draws a prompt — the caller still needs control
+        // back so it can try the send (and report the failure) anyway.
+        create_session(&id, "/tmp", "sleep 30", &[]).await.unwrap();
+
+        let ready = wait_for_input_prompt(&id, Duration::from_millis(600)).await;
+
+        assert!(!ready, "must time out rather than block forever");
+        kill_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn create_and_has_and_kill() {
         if !tmux_available() { return; }
         let id = unique_id();
@@ -1277,6 +1359,31 @@ mod tests {
         assert!(has_session(&id).await);
         kill_session(&id).await.unwrap();
         assert!(!has_session(&id).await);
+    }
+
+    #[tokio::test]
+    async fn session_targets_never_resolve_a_name_prefix() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        let longer = format!("{id}-fix");
+        create_session(&longer, "/tmp", "sleep 30", &[]).await.unwrap();
+        assert!(!has_session(&id).await, "a prefix must not match {longer}");
+        assert!(capture_screen(&id, 0, false).await.is_err());
+        assert!(send_keys(&id, "x").await.is_err());
+        assert!(!attach_args(&id).await.contains(&id), "attach must target ={id}, not a bare prefix");
+        kill_session(&id).await.unwrap();
+        assert!(has_session(&longer).await, "kill_session on a prefix killed {longer}");
+        kill_session(&longer).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn window_size_reads_the_session_window() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        create_session(&id, "/tmp", "sleep 30", &[]).await.unwrap();
+        assert_eq!(window_size(&id).await, Some((140, 50)));
+        assert_eq!(window_size(&format!("{id}-missing")).await, None);
+        kill_session(&id).await.unwrap();
     }
 
     #[tokio::test]

@@ -127,6 +127,11 @@ pub async fn register_live_orchestrator_runtime(
     store: &Store,
     orchestrator_id: &str,
 ) -> Result<()> {
+    // A ptyd pane has no tmux identity to snapshot here; it registers lazily
+    // on its first authorization instead (`authorize_orchestrator`).
+    if crate::runtime::ptyd_pane_pid(orchestrator_id).await.is_some() {
+        return Ok(());
+    }
     let pane = tmux::private_pane_identity(orchestrator_id)
         .await?
         .context("new orchestrator runtime is missing")?;
@@ -366,6 +371,16 @@ pub(crate) async fn stop_exact_runtime(store: &Store, worker: &WorkerIncarnation
         return Ok(());
     }
 
+    // ptyd exposes no per-pane environment, so its panes can't be matched to
+    // an incarnation; the session id is the strongest identity available.
+    if crate::runtime::ptyd_pane_pid(&worker.session_id).await.is_some() {
+        crate::runtime::kill_session(&worker.session_id).await?;
+        anyhow::ensure!(
+            !crate::runtime::has_session(&worker.session_id).await,
+            "worker runtime absence could not be confirmed after stop"
+        );
+        return Ok(());
+    }
     if tmux::exact_private_session(&worker.session_id)
         .await?
         .is_none()
@@ -412,10 +427,21 @@ async fn inspect_session(store: &Store, session: Session) -> Result<WorkerInspec
         }
         (_, None) => false,
     };
+    let ptyd_pid = if legacy.is_none() {
+        crate::runtime::ptyd_pane_pid(&session.id).await
+    } else {
+        None
+    };
     let runtime = if runtime_matches {
         HarnessInspection {
             state: HarnessState::Running,
             pid: exact_runtime.as_ref().map(|runtime| runtime.pane_pid),
+            exit_status: None,
+        }
+    } else if let Some(pid) = ptyd_pid {
+        HarnessInspection {
+            state: HarnessState::Running,
+            pid: Some(pid),
             exit_status: None,
         }
     } else {
@@ -627,7 +653,7 @@ mod tests {
             claude_session_id: None,
             summary: None,
             terminal_at: None,
-            gate_status: None,
+            gate_status: None, merged_at: None, activity: Default::default(), activity_note: None, activity_since: None,
         }
     }
 

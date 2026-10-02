@@ -771,6 +771,12 @@ fn ensure_gitignore(brain_path: &Path) -> Result<()> {
 // Frontmatter parsing (manual YAML split, no extra dep)
 // ---------------------------------------------------------------------------
 
+/// A scalar frontmatter field (`name`, `type`, …) of a markdown entry, read
+/// the way the indexer reads it; `None` when absent or empty.
+pub fn frontmatter_str(content: &str, key: &str) -> Option<String> {
+    parse_markdown(content).frontmatter.get(key).and_then(|v| v.as_str()).map(str::to_string).filter(|s| !s.is_empty())
+}
+
 struct FmValue {
     str_val: Option<String>,
     seq_val: Option<Vec<String>>,
@@ -890,6 +896,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let brain = BrainIndex::open(dir.path()).unwrap();
         (brain, dir)
+    }
+
+    #[test]
+    fn frontmatter_str_reads_scalars_only() {
+        let md = "---\nname: Tmux sockets\ntype: \"concepts\"\nempty:\ntags: [a, b]\n---\nbody";
+        assert_eq!(frontmatter_str(md, "name").as_deref(), Some("Tmux sockets"));
+        assert_eq!(frontmatter_str(md, "type").as_deref(), Some("concepts"));
+        assert_eq!(frontmatter_str(md, "empty"), None);
+        assert_eq!(frontmatter_str(md, "tags"), None);
+        assert_eq!(frontmatter_str("no frontmatter", "name"), None);
     }
 
     /// Deterministic, call-counting fake — never touches the network or a

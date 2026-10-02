@@ -1,9 +1,11 @@
+use std::collections::HashMap;
+
 use iced::{
-    widget::{column, container, rich_text, row, scrollable, span, text, Space},
+    widget::{column, container, rich_text, row, scrollable, span, text, text_editor, Space},
     Alignment, Background, Element, Length,
 };
 
-use crate::{app::Message, theme::ColorScheme};
+use crate::{app::Message, components::selectable_markdown::selectable_markdown, theme::ColorScheme};
 use ninox_core::types::{CIStatus, Comment, Session, PR};
 
 /// Serif-italic heading over a dotted rule — the "h3" treatment used
@@ -31,6 +33,10 @@ pub fn info_panel<'a>(
     pr: Option<&'a PR>,
     ci: Option<&'a CIStatus>,
     comments: &'a [Comment],
+    // Read-only `text_editor` buffer per comment id, so comment bodies are
+    // selectable and copyable. Keyed by `Comment::id`; a comment with no
+    // entry yet simply renders nothing for its body this frame.
+    comment_editors: &'a HashMap<i64, text_editor::Content>,
     s: &'a ColorScheme,
 ) -> Element<'a, Message> {
     let mut items: Vec<Element<'a, Message>> = Vec::new();
@@ -120,50 +126,57 @@ pub fn info_panel<'a>(
 
             if !comments.is_empty() {
                 items.push(Space::new(0, 12).into());
+                items.push(heading("Marginalia", Some(format!("{} comments", comments.len())), s));
 
-                let mut rows: Vec<Element<'a, Message>> = Vec::new();
-                rows.push(heading("Marginalia", Some(format!("{} comments", comments.len())), s));
-
+                // One card per comment — no shared block, no dotted dividers.
                 for comment in comments {
                     let location = match (&comment.path, comment.line) {
                         (Some(path), Some(line)) => format!("{path}:{line}"),
                         (Some(path), None) => path.clone(),
                         _ => String::new(),
                     };
-                    rows.push(Space::new(0, 10).into());
-                    rows.push(
-                        column![
-                            row![
-                                text(comment.author.clone())
-                                    .size(12)
-                                    .font(crate::style::SANS_BOLD)
-                                    .color(s.accent),
-                                if !location.is_empty() {
-                                    Element::from(row![
-                                        Space::new(8, 0),
-                                        text(location).size(9.5).font(crate::style::MONO).color(s.faint),
-                                    ])
-                                } else {
-                                    Space::new(0, 0).into()
+                    items.push(Space::new(0, 8).into());
+                    items.push(
+                        container(
+                            column![
+                                row![
+                                    text(comment.author.clone())
+                                        .size(12)
+                                        .font(crate::style::SANS_BOLD)
+                                        .color(s.accent),
+                                    if !location.is_empty() {
+                                        Element::from(row![
+                                            Space::new(8, 0),
+                                            text(location).size(9.5).font(crate::style::MONO).color(s.faint),
+                                        ])
+                                    } else {
+                                        Space::new(0, 0).into()
+                                    },
+                                ]
+                                .align_y(Alignment::Center),
+                                Space::new(0, 4),
+                                match comment_editors.get(&comment.id) {
+                                    // `on_action` is what makes the editor
+                                    // interactive at all — without it the
+                                    // widget is inert and cannot be selected.
+                                    // Edits are dropped in `update`, so this
+                                    // stays read-only. GitHub comment bodies
+                                    // are markdown, so this uses the same
+                                    // selectable-markdown widget as the
+                                    // orchestrator Plan panel.
+                                    Some(content) => selectable_markdown(content, s, move |action| {
+                                        Message::CommentAction(comment.id, action)
+                                    }),
+                                    None => Space::new(0, 0).into(),
                                 },
-                            ]
-                            .align_y(Alignment::Center),
-                            Space::new(0, 4),
-                            text(comment.body.as_str()).size(12).color(s.ink_2),
-                        ]
-                        .into(),
-                    );
-                    rows.push(Space::new(0, 8).into());
-                    rows.push(crate::style::dotted_rule(s.rule_dark));
-                }
-
-                items.push(
-                    container(column(rows))
+                            ],
+                        )
                         .width(Length::Fill)
                         .padding([14, 16])
                         .style(move |_theme| crate::style::card_style(s))
                         .into(),
-                );
+                    );
+                }
             }
         }
     }

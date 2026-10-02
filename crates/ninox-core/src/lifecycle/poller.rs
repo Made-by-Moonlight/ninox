@@ -2,6 +2,7 @@ use crate::{
     config::{AppConfig, SessionRetentionConfig},
     events::{Engine, Event},
     github::{split_repo, CheckRun},
+    github_graphql::{BranchKey, PrKey},
     hooks,
     lifecycle::{
         brain_harvest::{self, ClaudeHarvestRunner, HarvestRunner},
@@ -26,6 +27,9 @@ use tokio_util::sync::CancellationToken;
 /// Last-seen `(cost_usd, context_used_pct, context_total_tokens)` snapshot per session.
 /// Used by `poll_context_updates` to detect external changes.
 type ContextSnapshot = (f64, Option<f64>, Option<u64>);
+type ActivitySnapshot = (crate::types::ActivityState, Option<String>, Option<i64>);
+/// `(repo, head_ref, base_ref)` of a session's open PR.
+type PrRefsSnapshot = (String, String, String);
 
 /// Unix epoch milliseconds "now" — used to stamp `Notification::created_at`
 /// and `Session::terminal_at`. `pub(crate)` so `events::cleanup_session` can
@@ -35,6 +39,29 @@ pub fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Pure stacked-edge derivation over `(session_id, repo, head_ref,
+/// base_ref)` entries: an edge from B to A when B's base branch is A's head
+/// branch within the same repo. Returns an entry for *every* input session
+/// (empty targets included) so the caller's `set_stacked_deps` clears edges
+/// whose branch relationship no longer holds.
+pub(crate) fn derive_stacked_edges(
+    entries: &[(String, String, String, String)],
+) -> Vec<(String, Vec<String>)> {
+    entries.iter().map(|(id, repo, _head, base)| {
+        let mut targets: Vec<String> = entries.iter()
+            .filter(|(other_id, other_repo, other_head, _)| {
+                // GitHub repo slugs are case-insensitive, and the same repo
+                // can be recorded with different casing depending on whether
+                // it was user-typed or parsed from a git remote.
+                other_id != id && other_repo.eq_ignore_ascii_case(repo) && other_head == base
+            })
+            .map(|(other_id, ..)| other_id.clone())
+            .collect();
+        targets.sort();
+        (id.clone(), targets)
+    }).collect()
 }
 
 /// Best-effort extraction of a human-readable message from a
@@ -50,13 +77,167 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// Decide what a session's status becomes when its tmux pane is found
+/// gone at startup. `has_resume_args` is the harness's capability (from
+/// `HarnessRegistry::resume_cmd(...).is_some()` against a placeholder id —
+/// callers don't have a real command to build yet, just the capability
+/// check), not whether resume has ever been attempted.
+pub(crate) fn reconciled_status_for_dead_session(
+    claude_session_id: &Option<String>,
+    has_resume_args:   bool,
+) -> SessionStatus {
+    if claude_session_id.is_some() && has_resume_args {
+        SessionStatus::Interrupted
+    } else {
+        SessionStatus::Terminated
+    }
+}
+
+/// Startup liveness. A worker adopted from a legacy runtime is checked against
+/// its exact recorded tmux pane; anything short of a confirmed absence leaves
+/// it alone, since an ambiguous or mismatched pane is not evidence of death.
+async fn startup_liveness(store: &crate::store::Store, id: &str) -> crate::runtime::Liveness {
+    use crate::runtime::Liveness;
+    match store.legacy_worker_runtime(id) {
+        Ok(None) => crate::runtime::liveness(id).await,
+        Ok(Some(capability)) => {
+            let pid_matches = store
+                .get_session(id)
+                .ok()
+                .flatten()
+                .is_some_and(|session| session.pid == Some(capability.pane_pid));
+            if !pid_matches {
+                return Liveness::Live;
+            }
+            match crate::tmux::exact_private_session(&capability.physical_tmux_name).await {
+                Ok(None) => Liveness::Dead,
+                Ok(Some(_)) | Err(_) => Liveness::Live,
+            }
+        }
+        Err(_) => Liveness::Live,
+    }
+}
+
+
+/// Reconcile one session whose tmux session is already known to be gone.
+/// Re-reads the live row (the caller has just awaited `tmux::has_session`,
+/// so its snapshot is stale), leaves rows that went terminal meanwhile
+/// alone, and writes the reconciled status: Interrupted when the harness
+/// can `--resume` it, Terminated — stamped with `terminal_at` so the
+/// retention sweep gives it a window instead of purging on sight —
+/// otherwise. Returns the written row so callers with an `Engine` can emit
+/// `SessionUpdated`. Shared by the poller's startup sweep and `ninox
+/// connect`: a connect attempt right after a reboot runs before any
+/// daemon has reconciled, and must not burn resumability the sweep would
+/// have preserved.
+pub fn reconcile_dead_session(
+    store:      &crate::store::Store,
+    registry:   &crate::harness::HarnessRegistry,
+    session_id: &str,
+) -> anyhow::Result<Option<Session>> {
+    let Some(mut live) = store.get_session(session_id)? else { return Ok(None) };
+    if live.status.is_terminal() {
+        return Ok(None);
+    }
+    let agent = crate::config::AgentConfig {
+        harness: live.agent_type.clone(),
+        model:   live.model.clone(),
+    };
+    let has_resume = registry.resume_cmd(&agent, "placeholder").is_some();
+    let last_status = live.status.clone();
+    live.status = reconciled_status_for_dead_session(&live.claude_session_id, has_resume);
+    if live.status == SessionStatus::Terminated {
+        live.terminal_at = Some(now_millis());
+    }
+    store.upsert_session(&live)?;
+    crate::fleet::record_interruption(store, &live.id, live.started_at, &last_status, now_millis());
+    if let (SessionStatus::Terminated, Some(at)) = (&live.status, live.terminal_at) {
+        if let Err(e) = store.mark_reconciled_terminal(&live.id, at) {
+            tracing::warn!("fleet: mark {} reconciled-terminated: {e}", live.id);
+        }
+    }
+    Ok(Some(live))
+}
+
+/// Follow a branch the agent created (git wrapper metadata) so restore's
+/// workspace check compares against the branch it actually works on.
+fn sync_recorded_branch(store: &crate::store::Store, session_id: &str, branch: &str) {
+    let recorded = store.fleet_record(session_id).ok().flatten().and_then(|r| r.branch);
+    if recorded.as_deref() == Some(branch) {
+        return;
+    }
+    if let Err(e) = store.set_session_branch(session_id, branch) {
+        tracing::warn!("fleet: record branch {branch} for {session_id}: {e}");
+    }
+}
+
+/// Mirror delivered-from-file work requests into the store; only those in
+/// `sent` actually reached the orchestrator.
+fn record_work_requests(
+    store:   &crate::store::Store,
+    session: &Session,
+    pending: &[hooks::WorkRequest],
+    sent:    &std::collections::HashSet<String>,
+    now:     i64,
+) {
+    for request in pending {
+        // Requests filed before the table existed have no row; mirror
+        // them now so the fleet history is complete.
+        let _ = store.insert_work_request(&crate::store::WorkRequestRow {
+            id:              request.id.clone(),
+            from_session:    session.id.clone(),
+            orchestrator_id: session.orchestrator_id.clone(),
+            body:            request.description.clone(),
+            created_at:      request.requested_at,
+            delivered_at:    None,
+            resolved_at:     None,
+        });
+        if !sent.contains(&request.id) {
+            continue;
+        }
+        if let Err(e) = store.mark_work_request_delivered(&request.id, now) {
+            tracing::warn!("record work request {} delivered: {e}", request.id);
+        }
+    }
+}
+
+/// Runs a fleet restore; see `Poller::with_fleet_restorer`.
+pub type FleetRestorer = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
+/// Liveness check used by reconciliation; injectable for tests.
+type LivenessCheck<'a> = &'a (dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::runtime::Liveness> + Send>> + Sync);
+
+/// Arbitrary; how often a reconciliation retry may try to start the ptyd
+/// host again.
+const PREPARE_LIVENESS_EVERY_MS: i64 = 60_000;
+
 pub struct Poller {
     engine:           Arc<Engine>,
+    fleet_restorer:   Option<FleetRestorer>,
+    /// Sessions startup reconciliation couldn't judge because the ptyd host
+    /// didn't answer. Retried on the pid tick; `poll_pids` leaves them alone
+    /// meanwhile, since a pid check would burn their resumability.
+    unreconciled:     Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    last_liveness_prepare: Arc<std::sync::Mutex<i64>>,
     enrichment_cache: Arc<std::sync::Mutex<EnrichmentCache>>,
     /// Last-seen `(cost_usd, context_used_pct, context_total_tokens)` per
     /// session, used solely to detect changes written externally by the
     /// `ninox statusline` subcommand — see `poll_context_updates`.
     context_cache:    Arc<std::sync::Mutex<HashMap<String, ContextSnapshot>>>,
+    /// Last-seen `(activity, activity_note, activity_since)` per session —
+    /// same external-writer detection as `context_cache`, but for the
+    /// `ninox worker-status` subcommand. See `poll_activity_updates`.
+    activity_cache:   Arc<std::sync::Mutex<HashMap<String, ActivitySnapshot>>>,
+    /// Last-fetched `(repo, head_ref, base_ref)` per session with an open
+    /// PR, fed by both GitHub polling paths and consumed by
+    /// `reconcile_stacked_deps` to derive stacked dependency edges.
+    pr_refs_cache:    Arc<std::sync::Mutex<HashMap<String, PrRefsSnapshot>>>,
+    /// Last `Store::message_delivered_counts` seen per session, so
+    /// `poll_message_counts` emits only when a count moves. `None` until the
+    /// first tick takes its baseline snapshot.
+    message_count_cache: Arc<std::sync::Mutex<Option<HashMap<String, u64>>>>,
     /// Runs the brain-harvest subprocess (real `claude -p` in production).
     /// Injectable so tests can fake success/failure without spawning a real
     /// process — see `sync_sessions_metadata`'s `trigger_brain_harvest`.
@@ -76,6 +257,21 @@ pub struct Poller {
     /// about, so a steady "still on 0.14.0" state re-notifies only once,
     /// not every tick — same dedup shape as `github_lookup_failed_notified`.
     last_notified_update: Arc<std::sync::Mutex<Option<semver::Version>>>,
+    /// Unix millis until which `poll_github_batched` must skip its tick
+    /// entirely (0 = no pause). Set by `note_rate_limit` (GraphQL budget
+    /// running low) or `note_batch_error` (GitHub answered 403/429). A
+    /// paused tick returns before `GithubBatchApi::fetch_batch` is even
+    /// called — a skipped tick, never a blocked task — so it costs nothing
+    /// beyond the interval's own tick.
+    rate_limit_pause_until: Arc<std::sync::Mutex<i64>>,
+    /// The backoff duration (seconds) applied by the *last* Retry-After-less
+    /// `RateLimitedError`, so consecutive such errors double it instead of
+    /// re-pausing for a flat 120s each time (0 = no backoff established
+    /// yet). A `RateLimitedError` that carries its own `Retry-After` uses
+    /// that value directly and leaves this untouched. Reset to 0 by
+    /// `note_rate_limit` on any successful fetch, so a fresh outage after a
+    /// recovery starts the doubling over from 120s.
+    rate_limit_backoff_secs: Arc<std::sync::Mutex<u64>>,
 }
 
 impl Poller {
@@ -86,12 +282,20 @@ impl Poller {
     pub fn new_with_harvest_runner(engine: Arc<Engine>, harvest_runner: Arc<dyn HarvestRunner>) -> Self {
         Self {
             engine,
+            fleet_restorer:   None,
+            unreconciled:     Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            last_liveness_prepare: Arc::new(std::sync::Mutex::new(0)),
             enrichment_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             context_cache:    Arc::new(std::sync::Mutex::new(HashMap::new())),
+            activity_cache:   Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pr_refs_cache:    Arc::new(std::sync::Mutex::new(HashMap::new())),
+            message_count_cache: Arc::new(std::sync::Mutex::new(None)),
             harvest_runner,
             vault_locks:      Arc::new(std::sync::Mutex::new(HashMap::new())),
             update_source:    Arc::new(CargoRegistryUpdateSource),
             last_notified_update: Arc::new(std::sync::Mutex::new(None)),
+            rate_limit_pause_until: Arc::new(std::sync::Mutex::new(0)),
+            rate_limit_backoff_secs: Arc::new(std::sync::Mutex::new(0)),
         }
     }
 
@@ -100,6 +304,23 @@ impl Poller {
     pub fn with_update_source(mut self, source: Arc<dyn UpdateSource>) -> Self {
         self.update_source = source;
         self
+    }
+
+    /// Test seam: force `rate_limit_pause_until` directly, so pause-expiry
+    /// behavior (a past pause not skipping a tick) can be exercised without
+    /// waiting on a real clock or driving it through `note_rate_limit`/
+    /// `note_batch_error`.
+    #[cfg(test)]
+    fn set_pause_until(&self, t: i64) {
+        *self.rate_limit_pause_until.lock().unwrap_or_else(|e| e.into_inner()) = t;
+    }
+
+    /// Test seam: read `rate_limit_pause_until` directly, so exponential
+    /// backoff (successive Retry-After-less `RateLimitedError`s doubling
+    /// the pause) is assertable without waiting on a real clock.
+    #[cfg(test)]
+    fn pause_until(&self) -> i64 {
+        *self.rate_limit_pause_until.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The (created-on-first-use) lock for a given vault path — see
@@ -119,14 +340,136 @@ impl Poller {
             .clone()
     }
 
+    /// Inject what `[fleet] restore_policy = "auto"` runs after startup
+    /// reconciliation (the app's `ninox fleet restore` executor). Without
+    /// one, `auto` degrades to `prompt`.
+    pub fn with_fleet_restorer(mut self, restorer: FleetRestorer) -> Self {
+        self.fleet_restorer = Some(restorer);
+        self
+    }
+
+    async fn apply_restore_policy(&self) {
+        let policy = AppConfig::load().unwrap_or_default().fleet.restore_policy;
+        let store = &self.engine.store;
+        match crate::fleet::startup::on_engine_startup(store, policy, now_millis()) {
+            crate::fleet::StartupAction::AutoRestore(summary) => match &self.fleet_restorer {
+                Some(restore) => {
+                    tracing::info!(
+                        "fleet: auto-restoring {} worker(s) and {} orchestrator(s)",
+                        summary.workers, summary.orchestrators,
+                    );
+                    // Spawned: a restore waits on harness prompts for
+                    // minutes and must not hold up the poll loop.
+                    tokio::spawn(restore());
+                }
+                None => crate::fleet::startup::flag_pending_restore(store, now_millis()),
+            },
+            crate::fleet::StartupAction::FlaggedPending(summary) => tracing::info!(
+                "fleet: restore pending ({} worker(s), {} orchestrator(s)) — run `ninox fleet restore`",
+                summary.workers, summary.orchestrators,
+            ),
+            crate::fleet::StartupAction::Nothing => {}
+        }
+    }
+
+    /// One-shot startup sweep: any non-terminal session whose pane no longer
+    /// exists lost it to a host death (reboot). Mark it Interrupted when its
+    /// harness can --resume it, Terminated otherwise. Runs before the first
+    /// poll_pids tick: poll_pids only checks pid liveness and would mark
+    /// these Terminated, destroying resumability.
+    ///
+    /// "Pane gone" must be a real answer. After a reboot the ptyd host isn't
+    /// running yet, so it is started first and a fresh host that doesn't
+    /// know a pane means Dead. A host that still doesn't answer (mid-upgrade,
+    /// slow start) proves nothing: those sessions are deferred and retried.
+    async fn reconcile_dead_sessions(&self) {
+        *self.last_liveness_prepare.lock().unwrap_or_else(|e| e.into_inner()) = now_millis();
+        crate::runtime::prepare_liveness().await;
+        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+        let ids = sessions.into_iter().filter(|s| !s.status.is_terminal()).map(|s| s.id).collect();
+        let store = self.engine.store.clone();
+        self.reconcile_sessions(ids, &|id| {
+            let store = store.clone();
+            Box::pin(async move { startup_liveness(&store, &id).await })
+        }).await;
+    }
+
+    /// Reconcile `ids` against `check`; returns whether any was found dead.
+    /// Replaces the deferred set with whatever is still unknown.
+    async fn reconcile_sessions(&self, ids: Vec<String>, check: LivenessCheck<'_>) -> bool {
+        use crate::runtime::Liveness;
+        let registry = AppConfig::load().unwrap_or_default().registry();
+        let mut deferred = std::collections::HashSet::new();
+        let mut reconciled = false;
+        for id in ids {
+            match check(id.clone()).await {
+                Liveness::Live => {}
+                Liveness::Unknown => {
+                    deferred.insert(id);
+                }
+                Liveness::Dead => match reconcile_dead_session(&self.engine.store, &registry, &id) {
+                    Ok(Some(live)) => {
+                        reconciled = true;
+                        self.engine.emit(Event::SessionUpdated(live, SessionFields::STATUS));
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("reconcile {id}: {e}"),
+                },
+            }
+        }
+        if !deferred.is_empty() {
+            tracing::warn!(
+                "ptyd host not answering: {} session(s) left unreconciled, retrying",
+                deferred.len(),
+            );
+        }
+        *self.unreconciled.lock().unwrap_or_else(|e| e.into_inner()) = deferred;
+        reconciled
+    }
+
+    /// Pid-tick retry of the sessions [`reconcile_dead_sessions`] deferred.
+    async fn retry_unreconciled(&self, check: LivenessCheck<'_>) {
+        let ids: Vec<String> = self.unreconciled.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
+        if ids.is_empty() {
+            return;
+        }
+        let ids = ids.into_iter()
+            .filter(|id| self.engine.store.get_session(id).ok().flatten().is_some_and(|s| !s.status.is_terminal()))
+            .collect();
+        if self.reconcile_sessions(ids, check).await {
+            self.apply_restore_policy().await;
+        }
+    }
+
+    async fn retry_unreconciled_live(&self) {
+        if self.unreconciled.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            return;
+        }
+        let due = {
+            let mut last = self.last_liveness_prepare.lock().unwrap_or_else(|e| e.into_inner());
+            let due = now_millis() - *last >= PREPARE_LIVENESS_EVERY_MS;
+            if due {
+                *last = now_millis();
+            }
+            due
+        };
+        if due {
+            crate::runtime::prepare_liveness().await;
+        }
+        self.retry_unreconciled(&|id| Box::pin(async move { crate::runtime::liveness(&id).await })).await;
+    }
+
     pub async fn start(self, token: CancellationToken) {
+        self.reconcile_dead_sessions().await;
+        self.apply_restore_policy().await;
+
         let mut pid_interval    = tokio::time::interval(Duration::from_secs(5));
         let mut usage_interval  = tokio::time::interval(Duration::from_secs(10));
         let mut github_interval = tokio::time::interval(Duration::from_secs(30));
         // Releases only happen on merge-to-main, so this doesn't need to be
         // frequent — 6h keeps the once-per-startup check (interval's first
         // tick fires immediately) without hammering the registry or
-        // shelling out to `aws codeartifact get-authorization-token` often.
+        // running the registry credential provider often.
         let mut update_interval = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
         // Prevent a missed tick from causing back-to-back polls.
         github_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -136,8 +479,11 @@ impl Poller {
             tokio::select! {
                 _ = token.cancelled()      => break,
                 _ = pid_interval.tick()    => {
+                    self.retry_unreconciled_live().await;
                     self.poll_pids().await;
                     self.poll_context_updates().await;
+                    self.poll_activity_updates().await;
+                    self.poll_message_counts().await;
                     let retention = AppConfig::load()
                         .unwrap_or_default()
                         .session_retention;
@@ -147,11 +493,16 @@ impl Poller {
                 _ = usage_interval.tick()  => self.poll_usage().await,
                 _ = update_interval.tick() => self.poll_update_check().await,
                 _ = github_interval.tick() => {
-                    // Reconciliation first: a session whose PR the poller
-                    // hasn't adopted yet has no `pr_number` for `poll_github`
-                    // to enrich, so it must run before (not instead of) it.
-                    self.poll_pr_reconciliation().await;
-                    self.poll_github().await;
+                    let config = AppConfig::load().unwrap_or_default();
+                    if config.pr_watch.enabled {
+                        self.poll_github_batched(config.auto_reap.enabled).await;
+                    } else {
+                        // Reconciliation first: a session whose PR the poller
+                        // hasn't adopted yet has no `pr_number` for `poll_github`
+                        // to enrich, so it must run before (not instead of) it.
+                        self.poll_pr_reconciliation().await;
+                        self.poll_github(config.auto_reap.enabled).await;
+                    }
                 }
             }
         }
@@ -248,8 +599,12 @@ impl Poller {
         self.sync_sessions_metadata(&AppConfig::sessions_dir()).await;
 
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
+        let unreconciled = self.unreconciled.lock().unwrap_or_else(|e| e.into_inner()).clone();
         for mut session in sessions {
             if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted) {
+                continue;
+            }
+            if unreconciled.contains(&session.id) {
                 continue;
             }
             if let Some(pid) = session.pid {
@@ -284,6 +639,9 @@ impl Poller {
             let Ok(meta) = hooks::read_session_metadata(sessions_dir, &session.id) else {
                 continue;
             };
+            if let Some(branch) = meta.branch.as_deref() {
+                sync_recorded_branch(&self.engine.store, &session.id, branch);
+            }
 
             // -- First reported PR becomes the session's tracked PR --
             if session.pr_number.is_none() {
@@ -450,6 +808,7 @@ impl Poller {
             Ok(p) if !p.is_empty() => p,
             _ => return,
         };
+        let mut sent = std::collections::HashSet::new();
         for request in &pending {
             self.engine.emit(Event::Notification(Notification {
                 id:         format!("work-request-{}", request.id),
@@ -463,18 +822,21 @@ impl Poller {
                 let msg = crate::lifecycle::reactions::format_work_request_reaction(
                     session, &request.description,
                 );
-                if let Err(e) = self.engine.send_to_session(&orch, &msg).await {
-                    tracing::warn!("send work request to orchestrator {orch}: {e}");
+                match self.engine.send_to_session(&orch, &msg).await {
+                    Ok(()) => { sent.insert(request.id.clone()); }
+                    Err(e) => tracing::warn!("send work request to orchestrator {orch}: {e}"),
                 }
             }
         }
-        // Marked delivered even when the tmux nudge failed — the UI
+        // Moved out of the pending set even when the nudge failed — the UI
         // notification is already out, and retrying every tick would spam
-        // both channels.
+        // both channels. The store row keeps `delivered_at` empty instead,
+        // so the orchestrator's next recovery briefing carries it.
         let ids: Vec<String> = pending.iter().map(|r| r.id.clone()).collect();
         if let Err(e) = hooks::mark_work_requests_delivered(sessions_dir, &session.id, &ids) {
             tracing::warn!("mark work requests delivered for {}: {e}", session.id);
         }
+        record_work_requests(&self.engine.store, session, &pending, &sent, now_millis());
     }
 
     // ── Cost / context-window usage ─────────────────────────────────────────
@@ -546,6 +908,67 @@ impl Poller {
         }
     }
 
+    /// The `ninox worker-status` subcommand (invoked by the worker's own
+    /// UserPromptSubmit/Stop hooks, or by the agent explicitly) writes
+    /// activity fields directly into the store from a separate short-lived
+    /// process — the same external-writer shape as `poll_context_updates`
+    /// above, so the same diff-cache re-broadcast, flagged ACTIVITY.
+    async fn poll_activity_updates(&self) {
+        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+        let mut changed = Vec::new();
+        {
+            let mut cache = self.activity_cache.lock().unwrap();
+            for session in sessions {
+                let key = (session.activity, session.activity_note.clone(), session.activity_since);
+                // Seed silently on first sight — see `poll_context_updates`.
+                if let Some(prev) = cache.insert(session.id.clone(), key.clone()) {
+                    if prev != key {
+                        changed.push(session);
+                    }
+                }
+            }
+        }
+        for session in changed {
+            self.engine.emit(Event::SessionUpdated(session, SessionFields::ACTIVITY));
+        }
+    }
+
+    /// Emit `MessagesDelivered` for every session whose delivered-message
+    /// count moved since the last tick. Both `ninox send` (another process)
+    /// and this process's own reactions bump the counter, so polling the
+    /// store is the one place that sees them all.
+    async fn poll_message_counts(&self) {
+        let Ok(counts) = self.engine.store.message_delivered_counts() else { return };
+        let mut changed = Vec::new();
+        {
+            let mut cache = self.message_count_cache.lock().unwrap();
+            // The first tick only takes a baseline: everything delivered
+            // before this poller started is history, not news. After that a
+            // session without a cache entry is genuinely new, and its whole
+            // count is news — unlike `poll_context_updates`, whose per-key
+            // silent seeding would swallow the first message to every
+            // session spawned after startup.
+            let Some(cache) = cache.as_mut() else {
+                *cache = Some(counts);
+                return;
+            };
+            for (session_id, total) in &counts {
+                let prev = cache.insert(session_id.clone(), *total).unwrap_or(0);
+                // A counter below its last value means the row was deleted
+                // and recreated under the same id (orchestrator ids are
+                // user slugs), so everything on it is new.
+                let new = if *total < prev { *total } else { total - prev };
+                if new > 0 {
+                    changed.push((session_id.clone(), new));
+                }
+            }
+            cache.retain(|session_id, _| counts.contains_key(session_id));
+        }
+        for (session_id, count) in changed {
+            self.engine.emit(Event::MessagesDelivered { session_id, count });
+        }
+    }
+
     // ── GitHub enrichment ────────────────────────────────────────────────────
 
     /// Read-modify-write against the *live* session row rather than a
@@ -568,24 +991,100 @@ impl Poller {
             Ok(None)      => return None,
             Err(_)        => snapshot.clone(),
         };
+        let was_terminal = row.status.is_terminal();
         apply(&mut row);
+        // Never resurrect a terminal row to a live status. Every caller
+        // derives its new status from the tick-start *snapshot* (e.g.
+        // `poll_github`'s `derive_session_status(&session.status, ...)`), so a
+        // status that became terminal during this tick's awaits is invisible
+        // to that decision. `ninox reap` runs in its own process and is the
+        // first writer that can land a `status` write inside that window: it
+        // kills the worker, deletes its worktree, and writes `Terminated`,
+        // and this closure would then put the row back to `Mergeable`. That
+        // row is unrecoverable — `sweep_retired_sessions` only purges
+        // `Done`/`Terminated`, and `poll_pids` needs a `pid`, which a
+        // CLI-spawned worker never has (`run_spawn` inserts `pid: None`) — so
+        // it would sit on the fleet board as live forever, with no session
+        // and no worktree behind it.
+        if was_terminal && !row.status.is_terminal() {
+            row.status = self.engine.store.get_session(&snapshot.id)
+                .ok()
+                .flatten()
+                .map_or(row.status, |fresh| fresh.status);
+        }
         let _ = self.engine.store.upsert_session(&row);
         Some(row)
     }
 
-    async fn poll_github(&self) {
+    /// Record the just-fetched PR branch refs for a session (both GitHub
+    /// paths call this) so `reconcile_stacked_deps` can derive stacking.
+    fn note_pr_refs(&self, session_id: &str, repo: &str, head_ref: &str, base_ref: &str) {
+        if head_ref.is_empty() || base_ref.is_empty() {
+            return; // REST/GraphQL data missing branch names — nothing to derive
+        }
+        self.pr_refs_cache.lock().unwrap().insert(
+            session_id.to_string(),
+            (repo.to_string(), head_ref.to_string(), base_ref.to_string()),
+        );
+    }
+
+    /// Drop a session's cached PR refs when its PR lookup failed — the last
+    /// good tuple would otherwise re-derive its stacked edges forever (the
+    /// PR may be closed, retargeted, or gone). Transient failures cost only
+    /// a flicker: the edge re-derives on the next successful fetch.
+    fn evict_pr_refs(&self, session_id: &str) {
+        self.pr_refs_cache.lock().unwrap().remove(session_id);
+    }
+
+    /// Re-derive the `stacked` dependency edges from the latest PR branch
+    /// refs: session B stacks on session A when B's PR base branch is A's
+    /// PR head branch in the same repo. Called at the end of each
+    /// *successful* GitHub pass (never from a skipped/rate-limited tick, so
+    /// an empty cache after a restart can't mass-clear persisted edges).
+    /// Every live session gets a `set_stacked_deps` call — an empty target
+    /// list for uncached sessions is what retires edges whose PR vanished.
+    /// The store diffs per session, so an unchanged topology writes
+    /// nothing; declared edges are never touched.
+    fn reconcile_stacked_deps(&self) {
+        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+        let refs = self.pr_refs_cache.lock().unwrap().clone();
+        let live: Vec<&crate::types::Session> = sessions.iter()
+            .filter(|s| !s.status.is_terminal())
+            .collect();
+        let entries: Vec<(String, String, String, String)> = live.iter()
+            .filter_map(|s| refs.get(&s.id).map(|(repo, head, base)| {
+                (s.id.clone(), repo.clone(), head.clone(), base.clone())
+            }))
+            .collect();
+        let derived = derive_stacked_edges(&entries);
+        for session in live {
+            let depends_on = derived.iter()
+                .find(|(id, _)| *id == session.id)
+                .map(|(_, targets)| targets.clone())
+                .unwrap_or_default();
+            if let Err(e) = self.engine.store.set_stacked_deps(&session.id, &depends_on, now_millis()) {
+                tracing::warn!("stacked-deps reconcile failed for {}: {e}", session.id);
+            }
+        }
+    }
+
+    /// `auto_reap` mirrors `[auto_reap].enabled` — passed in by `start()`'s
+    /// tick (like `sweep_retired_sessions`'s retention) rather than read
+    /// from `AppConfig::load()` here, so tests control it deterministically.
+    async fn poll_github(&self, auto_reap: bool) {
         let Some(gh) = &self.engine.github else { return };
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
 
         for mut session in sessions {
-            // Only `Done` is excluded here — a session already has its PR's
-            // merge handled by definition once `Done`. `Terminated` (the
-            // worker's own process exited, typically once its PR is merely
-            // *open*) and `Interrupted` sessions may still have a PR whose
-            // fate hasn't resolved yet, so they must keep being polled or a
-            // later merge becomes permanently invisible (no status update,
-            // no notification) the instant the process dies.
-            if matches!(session.status, SessionStatus::Done) {
+            // Merge-handled sessions are excluded here (`Done`, or a
+            // `merged_at` stamp for a worker kept alive after merge — see
+            // `Session::merge_handled`). `Terminated` (the worker's own
+            // process exited, typically once its PR is merely *open*) and
+            // `Interrupted` sessions may still have a PR whose fate hasn't
+            // resolved yet, so they must keep being polled or a later merge
+            // becomes permanently invisible (no status update, no
+            // notification) the instant the process dies.
+            if session.merge_handled() {
                 continue;
             }
             let Some(pr_number) = session.pr_number else { continue };
@@ -643,6 +1142,7 @@ impl Poller {
                     tracing::warn!("github pr status for {}: {e}", session.id);
                 }
                 self.notify_github_lookup_failed(&session);
+                self.evict_pr_refs(&session.id);
                 continue;
             };
             // The GitHub round-trips above can outlive this session's
@@ -665,6 +1165,7 @@ impl Poller {
                 continue;
             }
             self.clear_github_lookup_failed(&session.id);
+            self.note_pr_refs(&session.id, &resolved_repo, &pr_status.head_ref, &pr_status.base_ref);
 
             let pr_id: PrId = pr_number as i64;
 
@@ -711,7 +1212,7 @@ impl Poller {
             let Some((owner, repo)) = split_repo(&session.repo) else { continue };
 
             // -- Merge detection — handle before CI (no point polling CI on merged PR) --
-            if self.handle_merge_detection(&session, pr_number, pr_status.merged).await {
+            if self.handle_merge_detection(&session, pr_number, pr_status.merged, auto_reap).await {
                 // Skips the gate-computation block below — a merged session's
                 // gate_status is intentionally left frozen at its last
                 // pre-merge value, not recomputed at the merging tick.
@@ -737,51 +1238,7 @@ impl Poller {
                 Ok(c)  => c,
                 Err(e) => { tracing::warn!("github ci checks: {e}"); vec![] }
             };
-            let ci = summarize_checks(pr_id, &checks);
-            let _ = self.engine.store.upsert_ci_status(&ci);
-            self.engine.emit(Event::CiUpdated { pr_id, status: ci.clone() });
-
-            // -- Detect CI transition and update session status --
-            let (newly_failing, ci_reaction_already_sent) = {
-                let mut cache = self.enrichment_cache.lock().unwrap();
-                let state = cache.entry(session.id.clone()).or_default();
-
-                let newly_failing = state.prev_failing.is_none_or(|p| p == 0)
-                    && ci.failing > 0;
-                state.prev_failing = Some(ci.failing);
-
-                let already_sent = state.ci_reaction_sent;
-                if newly_failing && !already_sent {
-                    state.ci_reaction_sent = true;
-                }
-                if ci.failing == 0 {
-                    state.ci_reaction_sent = false;
-                }
-                (newly_failing, already_sent)
-            };
-
-            if newly_failing && !ci_reaction_already_sent {
-                self.engine.emit(Event::Notification(Notification {
-                    id:         format!("ci-{}", session.id),
-                    kind:       NotificationKind::CiFailure,
-                    title:      format!("CI failing — {}", session.name),
-                    body:       format!("{}/{} checks failing", ci.failing, ci.total),
-                    session_id: Some(session.id.clone()),
-                    created_at: now_millis(),
-                }));
-                // Send reaction to the agent in the tmux session
-                let failing_names: Vec<String> = checks.iter()
-                    .filter(|c| c.conclusion.as_deref() == Some("failure")
-                             || c.conclusion.as_deref() == Some("timed_out"))
-                    .map(|c| c.name.clone())
-                    .collect();
-                let msg = crate::lifecycle::reactions::format_ci_reaction(
-                    &session, &ci, &failing_names
-                );
-                if let Err(e) = self.engine.send_to_session(&session.id, &msg).await {
-                    tracing::warn!("send ci reaction to {}: {e}", session.id);
-                }
-            }
+            let ci = self.ingest_ci(&session, pr_id, &checks).await;
 
             // -- Review threads + issue comments (throttled via seen_comment_ids) --
             let threads = match gh.get_review_threads(&owner, &repo, pr_number).await {
@@ -792,113 +1249,636 @@ impl Poller {
                 Ok(c)  => c,
                 Err(e) => { tracing::warn!("github issue comments: {e}"); vec![] }
             };
+            let (has_new, review_reaction_already_sent, new_comments, has_changes_requested) =
+                self.scan_reviews(&session.id, pr_id, &threads, &issue_comments);
 
-            let has_changes_requested = threads.iter().any(|t| t.state == "CHANGES_REQUESTED");
+            self.apply_status_and_gate(&session, &pr_status, &ci, has_changes_requested);
 
-            let (has_new, review_reaction_already_sent, new_comments) = {
-                let mut cache = self.enrichment_cache.lock().unwrap();
-                let state = cache.entry(session.id.clone()).or_default();
-                let mut has_new = false;
-                let mut new_comments: Vec<Comment> = Vec::new();
+            self.emit_review_reaction(&session, has_new, review_reaction_already_sent, &new_comments).await;
+        }
+        self.reconcile_stacked_deps();
+    }
 
-                // Persist + emit every displayable comment — CHANGES_REQUESTED
-                // and plain COMMENTED reviews (which also covers inline diff
-                // comments, tagged COMMENTED by `get_review_threads`) — so the
-                // Info panel's Marginalia feed shows the whole conversation.
-                // `has_new`/`new_comments` stay CHANGES_REQUESTED-only: they
-                // drive the reaction/notification path below, which must not
-                // widen just because the display feed did. A bare
-                // empty-body "Comment" review (whose only content is inline
-                // comments, already captured separately) is skipped so the
-                // feed doesn't show blank entries — but never for
-                // CHANGES_REQUESTED, which must keep being captured (and
-                // reacted to) exactly as before regardless of body content.
-                for thread in &threads {
-                    let is_changes_requested = thread.state == "CHANGES_REQUESTED";
-                    let is_displayable = is_changes_requested || thread.state == "COMMENTED";
-                    if !is_displayable || state.seen_comment_ids.contains(&thread.id) {
-                        continue;
-                    }
-                    if !is_changes_requested && thread.body.trim().is_empty() {
-                        continue;
-                    }
-                    state.seen_comment_ids.insert(thread.id);
-                    let comment = Comment {
-                        id:         thread.id,
-                        pr_id,
-                        author:     thread.author.clone(),
-                        body:       thread.body.clone(),
-                        path:       thread.path.clone(),
-                        line:       thread.line,
-                        created_at: thread.created_at,
-                    };
-                    let _ = self.engine.store.upsert_comment(&comment);
-                    self.engine.emit(Event::ReviewComment { pr_id, comment: comment.clone() });
-                    if is_changes_requested {
-                        has_new = true;
-                        new_comments.push(comment);
+    // ── Batched GitHub enrichment (behind `[pr_watch] enabled`) ─────────────
+
+    /// One tick of the batched path: collect every PR the app cares about
+    /// (session PRs + registry watches) plus every branch still awaiting PR
+    /// adoption, fetch them all in a single `GithubBatchApi::fetch_batch`
+    /// call, then run the *same* enrichment helpers `poll_github` uses over
+    /// the returned snapshots. It replaces both `poll_pr_reconciliation` and
+    /// `poll_github` for the tick — `start()` calls one or the other, never
+    /// both, so the legacy REST path stays byte-for-byte what it was when the
+    /// toggle is off.
+    ///
+    /// Deliberate simplification vs the legacy path, called out because it is
+    /// a behavior change and not an oversight: the legacy cross-repo 404
+    /// fallback (`poll_github` re-matching the session's *branch* against
+    /// every other configured remote when the recorded repo 404s, then
+    /// self-healing `session.repo`/`pr_number`) is NOT replicated here. A
+    /// session whose recorded `(repo, number)` alias comes back missing gets
+    /// the existing deduped `GithubLookupFailed` notification instead. That
+    /// fallback exists for repo/PR-number drift, which self-heals on the
+    /// legacy path; anyone actually hitting it can flip `[pr_watch] enabled`
+    /// off to get it back.
+    /// `auto_reap` mirrors `[auto_reap].enabled`, passed in by `start()`'s
+    /// tick — see `poll_github`.
+    async fn poll_github_batched(&self, auto_reap: bool) {
+        // A skipped tick, never a blocked task: checked before anything
+        // else, including `self.engine.github_batch`'s own presence check,
+        // so a pause set by `note_rate_limit`/`note_batch_error` costs
+        // nothing beyond this one lock+compare every interval tick.
+        if now_millis() < *self.rate_limit_pause_until.lock().unwrap_or_else(|e| e.into_inner()) {
+            return;
+        }
+        let Some(batch) = &self.engine.github_batch else { return };
+        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+        let watches = self.engine.store.list_pr_watches().unwrap_or_default();
+
+        // -- Collect targets --------------------------------------------------
+        // Session PRs: same skip rule as poll_github — merge-handled
+        // sessions are excluded (see `Session::merge_handled`).
+        let mut pr_keys: Vec<PrKey> = Vec::new();
+        // Insertion-ordered, deduped: `candidate_repos` sorts `origin` first,
+        // and the adoption loop below walks this Vec (not the result HashMap)
+        // so a session with several remotes deterministically adopts from the
+        // *first* one that has a PR — matching `poll_pr_reconciliation`'s
+        // origin-first, break-on-first-match behavior. Dedup is done with a
+        // seen-set while building rather than `sort`+`dedup`, which would
+        // destroy that origin-first ordering.
+        let mut branch_keys: Vec<BranchKey> = Vec::new();
+        let mut seen_branch_keys: std::collections::HashSet<BranchKey> = std::collections::HashSet::new();
+        // Every session awaiting adoption on a given (repo, branch). Several
+        // sessions can share one workspace (and so one key) — all of them must
+        // adopt, exactly as the legacy per-session reconciliation loop does.
+        let mut branch_owners: HashMap<BranchKey, Vec<String>> = HashMap::new();
+
+        for session in &sessions {
+            if session.merge_handled() {
+                continue;
+            }
+            match session.pr_number {
+                Some(n) if !session.repo.is_empty() => {
+                    pr_keys.push(PrKey { repo: session.repo.clone(), number: n });
+                }
+                None if !matches!(
+                    session.status,
+                    SessionStatus::Terminated | SessionStatus::Interrupted
+                ) => {
+                    // poll_pr_reconciliation equivalent, batched.
+                    if let Some(ws) = &session.workspace_path {
+                        if let Some(branch) = crate::github::current_branch(ws) {
+                            for repo_slug in crate::github::candidate_repos(ws) {
+                                let key = BranchKey { repo: repo_slug, branch: branch.clone() };
+                                branch_owners.entry(key.clone()).or_default().push(session.id.clone());
+                                if seen_branch_keys.insert(key.clone()) {
+                                    branch_keys.push(key);
+                                }
+                            }
+                        }
                     }
                 }
+                _ => {}
+            }
+        }
+        for w in &watches {
+            pr_keys.push(PrKey { repo: w.repo.clone(), number: w.pr_number });
+        }
+        pr_keys.sort_by(|a, b| (&a.repo, a.number).cmp(&(&b.repo, b.number)));
+        pr_keys.dedup();
+        if pr_keys.is_empty() && branch_keys.is_empty() {
+            return;
+        }
 
-                for issue_comment in &issue_comments {
-                    if state.seen_comment_ids.contains(&issue_comment.id) {
-                        continue;
-                    }
-                    state.seen_comment_ids.insert(issue_comment.id);
-                    let comment = Comment { pr_id, ..issue_comment.clone() };
-                    let _ = self.engine.store.upsert_comment(&comment);
-                    self.engine.emit(Event::ReviewComment { pr_id, comment });
-                }
+        // -- One batched fetch ------------------------------------------------
+        let result = match batch.fetch_batch(&pr_keys, &branch_keys).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.note_batch_error(&e);
+                return;
+            }
+        };
+        self.note_rate_limit(&result.rate_limit);
 
-                let already_sent = state.review_reaction_sent;
-                if has_new && !already_sent {
-                    state.review_reaction_sent = true;
+        // -- Branch adoption (replaces poll_pr_reconciliation) ----------------
+        // Driven by `branch_keys` (insertion-ordered, origin-first) rather
+        // than `result.branch_prs` (a HashMap with arbitrary iteration order),
+        // so which remote a multi-remote session adopts from is deterministic.
+        for key in &branch_keys {
+            let Some(Some(pr_ref)) = result.branch_prs.get(key) else { continue };
+            let Some(owner_ids) = branch_owners.get(key) else { continue };
+            for session_id in owner_ids {
+                let Ok(Some(mut session)) = self.engine.store.get_session(session_id) else { continue };
+                if session.pr_number.is_some() {
+                    // Already adopted — either via an earlier (higher-priority)
+                    // key this tick, which is what makes the first matching
+                    // remote win, or before this tick entirely.
+                    continue;
                 }
-                // Reset when all CHANGES_REQUESTED are resolved
-                if !has_changes_requested {
-                    state.review_reaction_sent = false;
-                }
-                (has_new, already_sent, new_comments)
-            };
-
-            // Update session status in DB (after review threads so has_changes_requested is known)
-            let new_status = derive_session_status(&session.status, &pr_status, &ci, has_changes_requested);
-            let new_gate = compute_new_gate(
-                &session.status, &ci, has_changes_requested, pr_status.mergeable,
-                session.gate_status.as_ref(), now_millis(),
-            );
-            if new_status != session.status || new_gate != session.gate_status {
-                // `session` is the tick-start snapshot, several GitHub
-                // awaits old — write through the live row instead (see
-                // `update_live_session_row`), and skip both write and emit
-                // if the session was deleted mid-tick.
-                if let Some(updated) = self.update_live_session_row(&session, |row| {
-                    row.status = new_status;
-                    row.gate_status = new_gate;
+                session.pr_number = Some(pr_ref.number);
+                session.repo      = key.repo.clone();
+                session.status    = SessionStatus::PrOpen;
+                if let Some(written) = self.update_live_session_row(&session, |row| {
+                    row.pr_number = session.pr_number;
+                    row.repo      = session.repo.clone();
+                    row.status    = session.status.clone();
                 }) {
                     self.engine.emit(Event::SessionUpdated(
-                        updated,
-                        SessionFields::STATUS | SessionFields::GATE,
+                        written,
+                        SessionFields::PR_LINK | SessionFields::STATUS,
                     ));
+                    tracing::info!(
+                        "session {} PR #{} detected via reconciliation ({}, branch {})",
+                        session.id, pr_ref.number, key.repo, key.branch,
+                    );
+                }
+            }
+        }
+
+        // -- Session enrichment (replaces poll_github's per-session fetches) --
+        for mut session in sessions {
+            if session.merge_handled() {
+                continue;
+            }
+            let Some(pr_number) = session.pr_number else { continue };
+            if session.repo.is_empty() {
+                continue;
+            }
+            let key = PrKey { repo: session.repo.clone(), number: pr_number };
+            let Some(snap) = result.prs.get(&key) else {
+                self.notify_github_lookup_failed(&session);
+                self.evict_pr_refs(&session.id);
+                continue;
+            };
+            self.clear_github_lookup_failed(&session.id);
+            self.note_pr_refs(&session.id, &session.repo, &snap.status.head_ref, &snap.status.base_ref);
+            let pr_id: PrId = pr_number as i64;
+            if session.pr_id != Some(pr_id) {
+                session.pr_id = Some(pr_id);
+                if self.update_live_session_row(&session, |row| row.pr_id = Some(pr_id)).is_some() {
+                    self.engine.emit(Event::SessionUpdated(session.clone(), SessionFields::PR_LINK));
+                }
+            }
+            if self.handle_merge_detection(&session, pr_number, snap.status.merged, auto_reap).await {
+                continue;
+            }
+            let Some((owner, repo)) = split_repo(&session.repo) else { continue };
+            let pr = PR {
+                id:         pr_id,
+                number:     pr_number,
+                title:      snap.status.title.clone(),
+                url:        format!("https://github.com/{owner}/{repo}/pull/{pr_number}"),
+                body:       String::new(),
+                session_id: session.id.clone(),
+            };
+            let _ = self.engine.store.upsert_pr(&pr);
+            self.engine.emit(Event::PrOpened { session_id: session.id.clone(), pr });
+
+            let ci = self.ingest_ci(&session, pr_id, &snap.checks).await;
+            let (has_new, already_sent, new_comments, has_changes_requested) =
+                self.scan_reviews(&session.id, pr_id, &snap.threads, &snap.issue_comments);
+            self.apply_status_and_gate(&session, &snap.status, &ci, has_changes_requested);
+            self.emit_review_reaction(&session, has_new, already_sent, &new_comments).await;
+        }
+
+        self.deliver_watch_updates(&watches, &result).await;
+        self.reconcile_stacked_deps();
+    }
+
+    /// A whole batched fetch failed — every target this tick is unobserved.
+    /// `RateLimitedError` (403/429 from GitHub's GraphQL endpoint) pauses
+    /// `poll_github_batched` for its `Retry-After` hint, or an exponentially
+    /// doubling backoff (120s, 240s, 480s, ... capped at 3600s) when GitHub
+    /// sent none — consecutive Retry-After-less errors keep doubling
+    /// `rate_limit_backoff_secs` instead of re-pausing for a flat 120s
+    /// every time, so a sustained outage backs off instead of hammering
+    /// GitHub every two minutes. A Retry-After-bearing error uses GitHub's
+    /// own value and leaves the stored backoff untouched — it isn't a
+    /// signal about the *next* Retry-After-less error's pause. Any other
+    /// error (a transient network blip, say) is logged only — polling must
+    /// not stall over something that will very likely have cleared up by
+    /// the next tick. `{e:#}` logs the full `anyhow` cause chain, not just
+    /// the top-level message, so a sustained outage (which otherwise
+    /// notifies nobody — watches/sessions simply go quiet) is still
+    /// diagnosable from logs alone.
+    fn note_batch_error(&self, e: &anyhow::Error) {
+        if let Some(rl) = e.downcast_ref::<crate::github_graphql::RateLimitedError>() {
+            let pause_until = match rl.retry_after_secs {
+                Some(secs) => now_millis() + secs as i64 * 1000,
+                None       => {
+                    let mut backoff = self.rate_limit_backoff_secs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let next = if *backoff == 0 { 120 } else { (*backoff * 2).min(3600) };
+                    *backoff = next;
+                    now_millis() + next as i64 * 1000
+                }
+            };
+            *self.rate_limit_pause_until.lock().unwrap_or_else(|e| e.into_inner()) = pause_until;
+            tracing::warn!("github batch fetch rate limited, pausing until {pause_until}: {e:#}");
+        } else {
+            tracing::warn!("github batch fetch failed (no pause; retrying next tick): {e:#}");
+        }
+    }
+
+    /// Record the GraphQL rate-limit budget reported by the last fetch. Once
+    /// the remaining budget drops below a small floor, pause
+    /// `poll_github_batched` until GitHub's own reset time rather than
+    /// grinding the remaining quota to zero. Warns only when newly pausing
+    /// (not on every low-budget tick): once paused, `poll_github_batched`'s
+    /// own pause check stops this from being called again until the pause
+    /// has actually elapsed, so re-warning here would only fire for a pause
+    /// that's already expired — i.e. genuinely new.
+    fn note_rate_limit(&self, rate_limit: &crate::github_graphql::RateLimitInfo) {
+        // This only ever runs after a successful fetch (the caller returns
+        // early on error before reaching here) — reset the Retry-After-less
+        // backoff so a fresh outage after a recovery starts doubling over
+        // from 120s again, not from wherever the last outage left off.
+        *self.rate_limit_backoff_secs.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        if rate_limit.remaining >= 100 || rate_limit.reset_at <= now_millis() {
+            return;
+        }
+        let mut pause = self.rate_limit_pause_until.lock().unwrap_or_else(|e| e.into_inner());
+        let already_paused = *pause > now_millis();
+        *pause = rate_limit.reset_at;
+        if !already_paused {
+            tracing::warn!(
+                "github rate limit low ({} remaining, cost {}) — pausing batched polling until {}",
+                rate_limit.remaining, rate_limit.cost, rate_limit.reset_at,
+            );
+        }
+    }
+
+    /// Fan the batched snapshots out to the registry's PR watches: merge/close
+    /// (terminal, and auto-closing), newly-failing CI and new
+    /// CHANGES_REQUESTED review activity.
+    ///
+    /// Watches are *notification-only*. They deliver a `Notification` (feed +
+    /// desktop) and a tmux reaction to the opener session, and nothing else —
+    /// no session status/gate change, no `cleanup_session`, and none of the
+    /// session-owned store rows (`upsert_pr`/`upsert_ci_status`/
+    /// `upsert_comment`). Lifecycle transitions stay exclusive to
+    /// session-attached PRs, which is why this deliberately doesn't route
+    /// through `ingest_ci`/`scan_reviews` despite the transition logic
+    /// looking alike: those write the session's rows and fire the session's
+    /// notifications, neither of which a watch is allowed to touch.
+    ///
+    /// Dedup rides on the same `enrichment_cache` under a synthetic key
+    /// (`watch:{repo}#{number}:{opener}`), so a watch on a PR that is *also*
+    /// some session's tracked PR keeps its own independent transition state
+    /// instead of stealing/clobbering the session's.
+    async fn deliver_watch_updates(
+        &self,
+        watches: &[crate::types::PrWatch],
+        result: &crate::github_graphql::BatchResult,
+    ) {
+        let mut terminal_prs: Vec<(String, u64)> = Vec::new();
+        for w in watches {
+            let key = PrKey { repo: w.repo.clone(), number: w.pr_number };
+            let cache_key = format!(
+                "watch:{}#{}:{}",
+                w.repo, w.pr_number, w.opener_session_id.as_deref().unwrap_or(""),
+            );
+            let Some(snap) = result.prs.get(&key) else {
+                // The PR vanished from the batch result (deleted/renamed repo,
+                // access revoked, etc.) without an explicit batch error — the
+                // watch has no terminal signal to act on, so it stays
+                // registered forever unless the user runs `ninox close --pr`.
+                // Warn once per run of consecutive misses via the same
+                // dedup flag `notify_github_lookup_failed` uses, but log only
+                // — no notification event (that stays session-scoped).
+                let mut cache = self.enrichment_cache.lock().unwrap();
+                let state = cache.entry(cache_key.clone()).or_default();
+                if !state.github_lookup_failed_notified {
+                    tracing::warn!(
+                        "watch {}#{}: PR absent from batch result (deleted/renamed repo?); \
+                         watch stays until `ninox close --pr`",
+                        w.repo, w.pr_number,
+                    );
+                    state.github_lookup_failed_notified = true;
+                }
+                continue;
+            };
+            {
+                let mut cache = self.enrichment_cache.lock().unwrap();
+                if let Some(state) = cache.get_mut(&cache_key) {
+                    state.github_lookup_failed_notified = false;
                 }
             }
 
-            if has_new && !review_reaction_already_sent {
+            if snap.status.merged || snap.closed {
                 self.engine.emit(Event::Notification(Notification {
-                    id:         format!("review-{}", session.id),
-                    kind:       NotificationKind::PrNeedsAttention,
-                    title:      format!("Review comments — {}", session.name),
-                    body:       "Changes requested on your PR".to_string(),
-                    session_id: Some(session.id.clone()),
+                    id:         format!("watch-done-{cache_key}"),
+                    kind:       NotificationKind::WorkerDone,
+                    title:      format!(
+                        "Watched PR {} — {}#{}",
+                        if snap.status.merged { "merged" } else { "closed" },
+                        w.repo, w.pr_number,
+                    ),
+                    body:       w.pr_url.clone(),
+                    session_id: w.opener_session_id.clone(),
                     created_at: now_millis(),
                 }));
-                if !new_comments.is_empty() {
-                    let msg = crate::lifecycle::reactions::format_review_reaction(
-                        &session, &new_comments
+                if let Some(opener) = &w.opener_session_id {
+                    let msg = crate::lifecycle::reactions::format_watched_pr_terminal(
+                        &w.repo, w.pr_number, snap.status.merged,
                     );
-                    if let Err(e) = self.engine.send_to_session(&session.id, &msg).await {
-                        tracing::warn!("send review reaction to {}: {e}", session.id);
+                    if let Err(e) = self.engine.send_to_session(opener, &msg).await {
+                        tracing::warn!("send watched-pr terminal reaction to {opener}: {e}");
                     }
+                }
+                self.enrichment_cache.lock().unwrap().remove(&cache_key);
+                terminal_prs.push((w.repo.clone(), w.pr_number));
+                continue;
+            }
+
+            // CI transition — the same newly-failing logic as `ingest_ci`,
+            // against the watch's own cache entry.
+            let ci = summarize_checks(w.pr_number as PrId, &snap.checks);
+            let (newly_failing, ci_already_sent) = {
+                let mut cache = self.enrichment_cache.lock().unwrap();
+                let state = cache.entry(cache_key.clone()).or_default();
+                let newly_failing = state.prev_failing.is_none_or(|p| p == 0) && ci.failing > 0;
+                state.prev_failing = Some(ci.failing);
+                let already = state.ci_reaction_sent;
+                if newly_failing && !already {
+                    state.ci_reaction_sent = true;
+                }
+                if ci.failing == 0 {
+                    state.ci_reaction_sent = false;
+                }
+                (newly_failing, already)
+            };
+            if newly_failing && !ci_already_sent {
+                self.engine.emit(Event::Notification(Notification {
+                    id:         format!("watch-ci-{cache_key}"),
+                    kind:       NotificationKind::CiFailure,
+                    title:      format!("Watched PR CI failing — {}#{}", w.repo, w.pr_number),
+                    body:       format!("{}/{} checks failing", ci.failing, ci.total),
+                    session_id: w.opener_session_id.clone(),
+                    created_at: now_millis(),
+                }));
+                if let Some(opener) = &w.opener_session_id {
+                    let failing_names: Vec<String> = snap.checks.iter()
+                        .filter(|c| c.conclusion.as_deref() == Some("failure")
+                                 || c.conclusion.as_deref() == Some("timed_out"))
+                        .map(|c| c.name.clone())
+                        .collect();
+                    let msg = crate::lifecycle::reactions::format_watched_pr_ci(
+                        &w.repo, w.pr_number, &ci, &failing_names,
+                    );
+                    if let Err(e) = self.engine.send_to_session(opener, &msg).await {
+                        tracing::warn!("send watched-pr ci reaction to {opener}: {e}");
+                    }
+                }
+            }
+
+            // New CHANGES_REQUESTED review activity — `seen_comment_ids` dedup
+            // on the watch's own cache entry (store writes for comments are
+            // the session path's job; watches only notify).
+            let new_comments: Vec<Comment> = {
+                let mut cache = self.enrichment_cache.lock().unwrap();
+                let state = cache.entry(cache_key.clone()).or_default();
+                snap.threads.iter()
+                    .filter(|t| t.state == "CHANGES_REQUESTED")
+                    .filter(|t| state.seen_comment_ids.insert(t.id))
+                    .map(|t| Comment {
+                        id:         t.id,
+                        pr_id:      w.pr_number as PrId,
+                        author:     t.author.clone(),
+                        body:       t.body.clone(),
+                        path:       t.path.clone(),
+                        line:       t.line,
+                        created_at: t.created_at,
+                    })
+                    .collect()
+            };
+            if !new_comments.is_empty() {
+                self.engine.emit(Event::Notification(Notification {
+                    id:         format!("watch-review-{cache_key}"),
+                    kind:       NotificationKind::PrNeedsAttention,
+                    title:      format!("Watched PR review — {}#{}", w.repo, w.pr_number),
+                    body:       "Changes requested".to_string(),
+                    session_id: w.opener_session_id.clone(),
+                    created_at: now_millis(),
+                }));
+                if let Some(opener) = &w.opener_session_id {
+                    let msg = crate::lifecycle::reactions::format_watched_pr_review(
+                        &w.repo, w.pr_number, &new_comments,
+                    );
+                    if let Err(e) = self.engine.send_to_session(opener, &msg).await {
+                        tracing::warn!("send watched-pr review reaction to {opener}: {e}");
+                    }
+                }
+            }
+        }
+
+        // Auto-close: every watch on a PR that reached a terminal state goes,
+        // whoever opened it — deduped so N openers cost one DELETE.
+        terminal_prs.sort();
+        terminal_prs.dedup();
+        for (repo, number) in terminal_prs {
+            if let Err(e) = self.engine.store.delete_pr_watches_for_pr(&repo, number) {
+                tracing::warn!("auto-close watches for {repo}#{number}: {e}");
+            }
+        }
+    }
+
+    /// The CI block: summarize → upsert → `CiUpdated` emit → newly-failing
+    /// transition (via `enrichment_cache`) → `CiFailure` notification +
+    /// `format_ci_reaction` sent into the session's tmux. Takes already-fetched
+    /// checks (the caller owns the `get_ci_checks` network call) so a
+    /// non-REST caller can reuse this. Returns the computed `CIStatus`.
+    async fn ingest_ci(&self, session: &Session, pr_id: PrId, checks: &[CheckRun]) -> CIStatus {
+        let ci = summarize_checks(pr_id, checks);
+        let _ = self.engine.store.upsert_ci_status(&ci);
+        self.engine.emit(Event::CiUpdated { pr_id, status: ci.clone() });
+
+        // -- Detect CI transition and update session status --
+        let (newly_failing, ci_reaction_already_sent) = {
+            let mut cache = self.enrichment_cache.lock().unwrap();
+            let state = cache.entry(session.id.clone()).or_default();
+
+            let newly_failing = state.prev_failing.is_none_or(|p| p == 0)
+                && ci.failing > 0;
+            state.prev_failing = Some(ci.failing);
+
+            let already_sent = state.ci_reaction_sent;
+            if newly_failing && !already_sent {
+                state.ci_reaction_sent = true;
+            }
+            if ci.failing == 0 {
+                state.ci_reaction_sent = false;
+            }
+            (newly_failing, already_sent)
+        };
+
+        if newly_failing && !ci_reaction_already_sent {
+            self.engine.emit(Event::Notification(Notification {
+                id:         format!("ci-{}", session.id),
+                kind:       NotificationKind::CiFailure,
+                title:      format!("CI failing — {}", session.name),
+                body:       format!("{}/{} checks failing", ci.failing, ci.total),
+                session_id: Some(session.id.clone()),
+                created_at: now_millis(),
+            }));
+            // Send reaction to the agent in the tmux session
+            let failing_names: Vec<String> = checks.iter()
+                .filter(|c| c.conclusion.as_deref() == Some("failure")
+                         || c.conclusion.as_deref() == Some("timed_out"))
+                .map(|c| c.name.clone())
+                .collect();
+            let msg = crate::lifecycle::reactions::format_ci_reaction(
+                session, &ci, &failing_names
+            );
+            if let Err(e) = self.engine.send_to_session(&session.id, &msg).await {
+                tracing::warn!("send ci reaction to {}: {e}", session.id);
+            }
+        }
+
+        ci
+    }
+
+    /// The review-scan block: dedup via `seen_comment_ids`, then
+    /// `upsert_comment` and `ReviewComment` emits. Pure w.r.t. the network —
+    /// the caller owns the `get_review_threads`/`get_issue_comments`
+    /// fetches. Returns `(has_new, review_reaction_already_sent,
+    /// new_comments, has_changes_requested)`.
+    fn scan_reviews(
+        &self,
+        session_id: &str,
+        pr_id: PrId,
+        threads: &[crate::github::ReviewThread],
+        issue_comments: &[Comment],
+    ) -> (bool, bool, Vec<Comment>, bool) {
+        let has_changes_requested = threads.iter().any(|t| t.state == "CHANGES_REQUESTED");
+
+        let (has_new, review_reaction_already_sent, new_comments) = {
+            let mut cache = self.enrichment_cache.lock().unwrap();
+            let state = cache.entry(session_id.to_string()).or_default();
+            let mut has_new = false;
+            let mut new_comments: Vec<Comment> = Vec::new();
+
+            // Persist + emit every displayable comment — CHANGES_REQUESTED
+            // and plain COMMENTED reviews (which also covers inline diff
+            // comments, tagged COMMENTED by `get_review_threads`) — so the
+            // Info panel's Marginalia feed shows the whole conversation.
+            // `has_new`/`new_comments` stay CHANGES_REQUESTED-only: they
+            // drive the reaction/notification path below, which must not
+            // widen just because the display feed did. A bare
+            // empty-body "Comment" review (whose only content is inline
+            // comments, already captured separately) is skipped so the
+            // feed doesn't show blank entries — but never for
+            // CHANGES_REQUESTED, which must keep being captured (and
+            // reacted to) exactly as before regardless of body content.
+            for thread in threads {
+                let is_changes_requested = thread.state == "CHANGES_REQUESTED";
+                let is_displayable = is_changes_requested || thread.state == "COMMENTED";
+                if !is_displayable || state.seen_comment_ids.contains(&thread.id) {
+                    continue;
+                }
+                if !is_changes_requested && thread.body.trim().is_empty() {
+                    continue;
+                }
+                state.seen_comment_ids.insert(thread.id);
+                let comment = Comment {
+                    id:         thread.id,
+                    pr_id,
+                    author:     thread.author.clone(),
+                    body:       thread.body.clone(),
+                    path:       thread.path.clone(),
+                    line:       thread.line,
+                    created_at: thread.created_at,
+                };
+                let _ = self.engine.store.upsert_comment(&comment);
+                self.engine.emit(Event::ReviewComment { pr_id, comment: comment.clone() });
+                if is_changes_requested {
+                    has_new = true;
+                    new_comments.push(comment);
+                }
+            }
+
+            for issue_comment in issue_comments {
+                if state.seen_comment_ids.contains(&issue_comment.id) {
+                    continue;
+                }
+                state.seen_comment_ids.insert(issue_comment.id);
+                let comment = Comment { pr_id, ..issue_comment.clone() };
+                let _ = self.engine.store.upsert_comment(&comment);
+                self.engine.emit(Event::ReviewComment { pr_id, comment });
+            }
+
+            let already_sent = state.review_reaction_sent;
+            if has_new && !already_sent {
+                state.review_reaction_sent = true;
+            }
+            // Reset when all CHANGES_REQUESTED are resolved
+            if !has_changes_requested {
+                state.review_reaction_sent = false;
+            }
+            (has_new, already_sent, new_comments)
+        };
+
+        (has_new, review_reaction_already_sent, new_comments, has_changes_requested)
+    }
+
+    /// The status/gate write block: derive the new status/gate, write
+    /// through the live session row, and emit `SessionUpdated(STATUS |
+    /// GATE)` only when something actually changed.
+    fn apply_status_and_gate(
+        &self,
+        session: &Session,
+        pr_status: &crate::github::PrStatus,
+        ci: &CIStatus,
+        has_changes_requested: bool,
+    ) {
+        // Update session status in DB (after review threads so has_changes_requested is known)
+        let new_status = derive_session_status(&session.status, pr_status, ci, has_changes_requested);
+        let new_gate = compute_new_gate(
+            &session.status, ci, has_changes_requested, pr_status.mergeable,
+            session.gate_status.as_ref(), now_millis(),
+        );
+        if new_status != session.status || new_gate != session.gate_status {
+            // `session` is the tick-start snapshot, several GitHub
+            // awaits old — write through the live row instead (see
+            // `update_live_session_row`), and skip both write and emit
+            // if the session was deleted mid-tick.
+            if let Some(updated) = self.update_live_session_row(session, |row| {
+                row.status = new_status;
+                row.gate_status = new_gate;
+            }) {
+                self.engine.emit(Event::SessionUpdated(
+                    updated,
+                    SessionFields::STATUS | SessionFields::GATE,
+                ));
+            }
+        }
+    }
+
+    /// The review notification/reaction block: `PrNeedsAttention`
+    /// notification plus `format_review_reaction` sent into the session's
+    /// tmux for newly-seen CHANGES_REQUESTED comments.
+    async fn emit_review_reaction(
+        &self,
+        session: &Session,
+        has_new: bool,
+        already_sent: bool,
+        new_comments: &[Comment],
+    ) {
+        if has_new && !already_sent {
+            self.engine.emit(Event::Notification(Notification {
+                id:         format!("review-{}", session.id),
+                kind:       NotificationKind::PrNeedsAttention,
+                title:      format!("Review comments — {}", session.name),
+                body:       "Changes requested on your PR".to_string(),
+                session_id: Some(session.id.clone()),
+                created_at: now_millis(),
+            }));
+            if !new_comments.is_empty() {
+                let msg = crate::lifecycle::reactions::format_review_reaction(
+                    session, new_comments
+                );
+                if let Err(e) = self.engine.send_to_session(&session.id, &msg).await {
+                    tracing::warn!("send review reaction to {}: {e}", session.id);
                 }
             }
         }
@@ -1013,40 +1993,28 @@ impl Poller {
         session:    &Session,
         pr_number:  u64,
         pr_merged:  bool,
+        auto_reap:  bool,
     ) -> bool {
         if !pr_merged || matches!(session.status, SessionStatus::Done) {
             return false;
         }
-        let worker = match self
-            .engine
-            .store
-            .worker_incarnation_for_snapshot(&session.id, session.started_at)
-        {
-            Ok(worker) => worker,
-            Err(error) => {
-                tracing::warn!("resolve merge capability for {}: {error}", session.id);
-                return false;
-            }
-        };
-        if let Some(worker) = worker {
-            match self.engine.store.retain_worker_after_merge(
-                &session.id,
-                &worker.incarnation_id,
-                session.started_at,
-                pr_number,
-                now_millis(),
-            ) {
-                Ok(Some(_)) => {}
-                Ok(None) => return false,
-                Err(error) => {
-                    tracing::warn!("retain merged worker {}: {error}", session.id);
-                    return false;
-                }
-            }
-        } else if let Err(e) = self.engine.cleanup_session(&session.id).await {
-            tracing::warn!("cleanup_session {}: {e}", session.id);
-            return false;
+        if session.merged_at.is_some() {
+            // Merge already handled on an earlier tick with `[auto_reap]`
+            // off — the worker was deliberately kept alive, so it keeps
+            // surfacing here until it's reaped. Skip enrichment without
+            // re-notifying.
+            return true;
         }
+        // Keep the worker alive for post-merge validation only when
+        // `[auto_reap]` is off AND the worker is actually still running.
+        // Merge detection deliberately also fires for `Terminated`/
+        // `Interrupted` sessions — a worker's process commonly exits while
+        // its PR is merely open, then the PR merges later (see the skip
+        // guard in `poll_github`). There's no live agent in a dead worker
+        // to hand validation to and no reason to preserve its worktree, so
+        // those get the same cleanup + plain done-reaction as the auto-reap
+        // path regardless of the toggle.
+        let keep_alive = !auto_reap && !session.status.is_terminal();
         self.engine.emit(Event::Notification(Notification {
             id:         format!("merged-{}", session.id),
             kind:       NotificationKind::WorkerDone,
@@ -1058,10 +2026,35 @@ impl Poller {
         // Code-level completion guarantee for the orchestrator — independent
         // of whether the worker's own agent ever reports back before exiting.
         if let Some(orch) = session.orchestrator_id.clone() {
-            let msg = crate::lifecycle::reactions::format_worker_done_reaction(session, pr_number);
+            let msg = if keep_alive {
+                crate::lifecycle::reactions::format_worker_done_kept_alive_reaction(session, pr_number)
+            } else {
+                crate::lifecycle::reactions::format_worker_done_reaction(session, pr_number)
+            };
             if let Err(e) = self.engine.send_to_session(&orch, &msg).await {
                 tracing::warn!("send worker-done reaction to orchestrator {orch}: {e}");
             }
+        }
+        if keep_alive {
+            // The stamp is what makes the notification above once-only and
+            // drops the session out of GitHub enrichment (see
+            // `Session::merged_at`). A failed write is load-bearing here —
+            // it's the ONLY dedup for this path — so log it loudly, unlike
+            // a cosmetic field write.
+            match self.update_live_session_row(session, |row| {
+                row.merged_at = Some(now_millis());
+            }) {
+                Some(row) => self.engine.emit(
+                    Event::SessionUpdated(row, SessionFields::MERGED_AT),
+                ),
+                None => tracing::warn!(
+                    "merge-detected session {} could not be stamped merged_at — \
+                     the merge may re-notify on the next tick",
+                    session.id,
+                ),
+            }
+        } else if let Err(e) = self.engine.cleanup_session(&session.id).await {
+            tracing::warn!("cleanup_session {}: {e}", session.id);
         }
         // Remove enrichment state for this session — it's done
         {
@@ -1083,26 +2076,52 @@ impl Poller {
     /// this automatic lifecycle path) have no grace period and are purged
     /// on sight, preserving today's immediate disappearance for those
     /// actions. Orchestrator sessions are never purged this way.
+    ///
+    /// Also reclaims merged-but-kept-alive workers (`merged_at` set with a
+    /// still-live status — `[auto_reap]` off) once `merged_at` is older than
+    /// the same window. The orchestrator owns their reap, but if it never
+    /// comes — the orchestrator is gone, or the worker turned `Interrupted`
+    /// at a reboot, a status this sweep otherwise never touches — this
+    /// fallback stops a merged worker leaking its row/tmux/worktree forever,
+    /// restoring the unconditional cleanup the pre-toggle merge path had.
     async fn sweep_retired_sessions(&self, retention: &SessionRetentionConfig) {
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
         let Ok(orchestrators) = self.engine.store.list_orchestrators() else { return };
         let orch_ids: std::collections::HashSet<&str> =
             orchestrators.iter().map(|o| o.id.as_str()).collect();
 
+        let fleet = self.engine.store.fleet_records().unwrap_or_default();
+
         let now = now_millis();
         let retention_ms = retention.retention_millis();
 
         for session in sessions {
-            if !matches!(session.status, SessionStatus::Done | SessionStatus::Terminated) {
-                continue;
-            }
             if orch_ids.contains(session.id.as_str()) {
                 continue;
             }
             if self.engine.store.is_worker_retained(&session.id).unwrap_or(false) {
                 continue;
             }
-            let expired = match session.terminal_at {
+            // A restore candidate the user hasn't restored yet (manual
+            // policy, or a declined prompt) keeps its row and worktree.
+            // Merged ones don't need restoring, so the merged fallback
+            // below still reclaims them.
+            let pending_restore = fleet.get(&session.id)
+                .is_some_and(|r| crate::fleet::awaits_restore(&session, r));
+            if pending_restore && session.merged_at.is_none() {
+                continue;
+            }
+            let terminal =
+                matches!(session.status, SessionStatus::Done | SessionStatus::Terminated);
+            // Eligible either as a terminal record (retention grace on
+            // `terminal_at`) or as a merged-but-still-live worker (fallback
+            // grace on `merged_at`). A live worker with no merge stamp is
+            // never swept.
+            if !terminal && session.merged_at.is_none() {
+                continue;
+            }
+            let clock = if terminal { session.terminal_at } else { session.merged_at };
+            let expired = match clock {
                 Some(t) => now.saturating_sub(t) >= retention_ms,
                 None    => true,
             };
@@ -1113,11 +2132,16 @@ impl Poller {
             // (see `poll_github`), which already sent
             // `format_worker_done_reaction` to the orchestrator before
             // transitioning the status — notifying again here would be a
-            // duplicate. `Terminated` sessions (worker process died on its
-            // own via `poll_pids`, or a direct `terminate_session`) have
-            // never been told anything — this is their one and only chance
-            // before the record disappears for good.
-            if matches!(session.status, SessionStatus::Terminated) {
+            // duplicate. The same goes for a `merged_at`-stamped session
+            // (merge detected with `[auto_reap]` off, worker kept alive,
+            // later reaped/terminated): the orchestrator already got the
+            // worker-done reaction, and this notice's "was not detected as
+            // merged" wording would flatly contradict it. `Terminated`
+            // sessions without that stamp (worker process died on its own
+            // via `poll_pids`, or a direct `terminate_session`) have never
+            // been told anything — this is their one and only chance before
+            // the record disappears for good.
+            if matches!(session.status, SessionStatus::Terminated) && session.merged_at.is_none() {
                 self.engine.emit(Event::Notification(Notification {
                     id:         format!("retired-{}", session.id),
                     kind:       NotificationKind::WorkerRetired,
@@ -1265,7 +2289,7 @@ mod tests {
     fn derive_status_merged_becomes_done() {
         let pr = crate::github::PrStatus {
             merged: true, state: "closed".into(), mergeable: None,
-            title: "t".into(), number: 1, head_sha: String::new(),
+            title: "t".into(), number: 1, head_sha: String::new(), head_ref: String::new(), base_ref: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 0, failing: 0, passing: 0, pending: 0 };
         let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, false);
@@ -1276,7 +2300,7 @@ mod tests {
     fn derive_status_ci_failure_overrides_open() {
         let pr = crate::github::PrStatus {
             merged: false, state: "open".into(), mergeable: Some(true),
-            title: "t".into(), number: 1, head_sha: String::new(),
+            title: "t".into(), number: 1, head_sha: String::new(), head_ref: String::new(), base_ref: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 3, failing: 1, passing: 2, pending: 0 };
         let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, false);
@@ -1287,7 +2311,7 @@ mod tests {
     fn derive_status_all_green_becomes_mergeable() {
         let pr = crate::github::PrStatus {
             merged: false, state: "open".into(), mergeable: Some(true),
-            title: "t".into(), number: 1, head_sha: String::new(),
+            title: "t".into(), number: 1, head_sha: String::new(), head_ref: String::new(), base_ref: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 3, failing: 0, passing: 3, pending: 0 };
         let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, false);
@@ -1388,7 +2412,7 @@ mod tests {
     fn derive_status_preserves_done() {
         let pr = crate::github::PrStatus {
             merged: false, state: "open".into(), mergeable: Some(true),
-            title: "t".into(), number: 1, head_sha: String::new(),
+            title: "t".into(), number: 1, head_sha: String::new(), head_ref: String::new(), base_ref: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 0, failing: 0, passing: 0, pending: 0 };
         let s  = derive_session_status(&SessionStatus::Done, &pr, &ci, false);
@@ -1399,7 +2423,7 @@ mod tests {
     fn derive_status_preserves_terminated() {
         let pr = crate::github::PrStatus {
             merged: true, state: "closed".into(), mergeable: None,   // merged=true!
-            title: "t".into(), number: 1, head_sha: String::new(),
+            title: "t".into(), number: 1, head_sha: String::new(), head_ref: String::new(), base_ref: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 0, failing: 0, passing: 0, pending: 0 };
         let s  = derive_session_status(&SessionStatus::Terminated, &pr, &ci, false);
@@ -1410,7 +2434,7 @@ mod tests {
     fn derive_status_changes_requested_becomes_review_pending() {
         let pr = crate::github::PrStatus {
             merged: false, state: "open".into(), mergeable: Some(true),
-            title: "t".into(), number: 1, head_sha: String::new(),
+            title: "t".into(), number: 1, head_sha: String::new(), head_ref: String::new(), base_ref: String::new(),
         };
         let ci = CIStatus { pr_id: 1, total: 3, failing: 0, passing: 3, pending: 0 };
         let s  = derive_session_status(&SessionStatus::PrOpen, &pr, &ci, true);
@@ -1428,8 +2452,59 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         }
+    }
+
+    #[test]
+    fn reconcile_marks_the_terminated_row_it_writes_as_a_restore_candidate() {
+        use crate::store::Store;
+        let store = Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap();
+        // No claude_session_id: can't resume, so reconciled to Terminated.
+        store.upsert_session(&test_session("dead-1", "/ws")).unwrap();
+        let registry = crate::harness::HarnessRegistry::from_config(&Default::default());
+        let live = reconcile_dead_session(&store, &registry, "dead-1").unwrap().unwrap();
+        assert_eq!(live.status, SessionStatus::Terminated);
+        let record = store.fleet_record("dead-1").unwrap().unwrap();
+        assert_eq!(record.reconciled_terminal_at, live.terminal_at);
+        assert!(crate::fleet::awaits_restore(&live, &record));
+    }
+
+    /// An engine starting while ptyd is mid-upgrade must not mark the
+    /// sessions it can't see Interrupted; once the host answers they are
+    /// judged for real.
+    #[tokio::test]
+    async fn unreachable_ptyd_defers_reconciliation_instead_of_marking_sessions_dead() {
+        use crate::runtime::Liveness;
+        use crate::store::Store;
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        for id in ["unseen", "dead"] {
+            store.upsert_session(&test_session(id, "/ws")).unwrap();
+        }
+        let poller = Poller::new(Engine::new(store.clone()));
+
+        let host_down = |id: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = Liveness> + Send>> {
+            Box::pin(async move { if id == "unseen" { Liveness::Unknown } else { Liveness::Dead } })
+        };
+        poller.reconcile_sessions(vec!["unseen".into(), "dead".into()], &host_down).await;
+        assert_eq!(store.get_session("unseen").unwrap().unwrap().status, SessionStatus::Working);
+        assert_eq!(store.get_session("dead").unwrap().unwrap().status, SessionStatus::Terminated);
+        assert!(poller.unreconciled.lock().unwrap().contains("unseen"));
+
+        // poll_pids must not burn its resumability with a stale pid either.
+        let mut s = store.get_session("unseen").unwrap().unwrap();
+        s.pid = Some(999_999);
+        store.upsert_session(&s).unwrap();
+        poller.poll_pids().await;
+        assert_eq!(store.get_session("unseen").unwrap().unwrap().status, SessionStatus::Working);
+
+        let host_up_without_it = |_: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = Liveness> + Send>> {
+            Box::pin(async { Liveness::Dead })
+        };
+        poller.retry_unreconciled(&host_up_without_it).await;
+        assert_eq!(store.get_session("unseen").unwrap().unwrap().status, SessionStatus::Terminated);
+        assert!(poller.unreconciled.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1616,6 +2691,170 @@ mod tests {
         assert!(drain_events(&mut rx).is_empty());
     }
 
+    /// Same external-writer story as the statusline test above, but for the
+    /// `ninox worker-status` subcommand's activity fields — the change must
+    /// re-broadcast flagged ACTIVITY (and only for the touched session), or
+    /// the GUI never learns a worker went idle/blocked.
+    #[tokio::test]
+    async fn poll_activity_updates_emits_activity_flag_only_for_changed_sessions() {
+        use crate::store::Store;
+        use crate::types::ActivityState;
+        use crate::worker_status::{apply_activity, ActivityEvent};
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", "/ws1")).unwrap();
+        store.upsert_session(&test_session("s2", "/ws2")).unwrap();
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_activity_updates().await;
+        assert!(drain_events(&mut rx).is_empty(), "baseline seeding must not emit");
+
+        // Simulate the external hook process writing for s1 only.
+        apply_activity(&store, "s1", ActivityEvent::Explicit {
+            state: ActivityState::Blocked, note: Some("stuck".into()),
+        }, 1_000).unwrap();
+
+        poller.poll_activity_updates().await;
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 1, "only the changed session should emit");
+        match &events[0] {
+            Event::SessionUpdated(s, fields) => {
+                assert_eq!(s.id, "s1");
+                assert_eq!(s.activity, ActivityState::Blocked);
+                assert!(fields.contains(SessionFields::ACTIVITY), "must flag ACTIVITY");
+            }
+            other => panic!("expected SessionUpdated, got {other:?}"),
+        }
+
+        poller.poll_activity_updates().await;
+        assert!(drain_events(&mut rx).is_empty(), "steady state must not re-emit");
+    }
+
+    /// Stacked-edge derivation is pure branch topology: B stacks on A when
+    /// B's PR base branch is A's PR head branch, within the same repo.
+    #[test]
+    fn derive_stacked_edges_matches_base_to_head_within_a_repo() {
+        let entries = vec![
+            ("a".to_string(), "o/r".to_string(), "feat/a".to_string(), "main".to_string()),
+            // Differently-cased slug of the same repo (user-typed vs
+            // git-remote-parsed) — GitHub slugs are case-insensitive, so
+            // this still edges onto a.
+            ("b".to_string(), "O/R".to_string(), "feat/b".to_string(), "feat/a".to_string()),
+            // A genuinely different repo — no edge.
+            ("c".to_string(), "o/other".to_string(), "feat/c".to_string(), "feat/a".to_string()),
+        ];
+        let edges = derive_stacked_edges(&entries);
+        let of = |id: &str| edges.iter().find(|(s, _)| s == id).map(|(_, t)| t.clone()).unwrap();
+        assert_eq!(of("a"), Vec::<String>::new(), "base=main matches nobody");
+        assert_eq!(of("b"), vec!["a".to_string()], "repo slug casing must not break the edge");
+        assert_eq!(of("c"), Vec::<String>::new(), "cross-repo branch-name collision must not edge");
+    }
+
+    #[test]
+    fn derive_stacked_edges_never_self_edges_on_degenerate_refs() {
+        // A PR whose base equals its own head (degenerate but possible in
+        // bad API data) must not produce a self-edge.
+        let entries = vec![
+            ("a".to_string(), "o/r".to_string(), "same".to_string(), "same".to_string()),
+        ];
+        let edges = derive_stacked_edges(&entries);
+        assert_eq!(edges, vec![("a".to_string(), Vec::new())]);
+    }
+
+    /// An external `worker-status` write landing mid-tick must survive the
+    /// GitHub pass's read→apply→write — same guarantee the statusline
+    /// fields already have.
+    #[tokio::test]
+    async fn update_live_session_row_does_not_revert_mid_poll_activity_fields() {
+        use crate::store::Store;
+        use crate::types::ActivityState;
+        use crate::worker_status::{apply_activity, ActivityEvent};
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let snapshot = test_session("s1", "/ws1");
+        store.upsert_session(&snapshot).unwrap();
+        let poller = Poller::new(Engine::new(store.clone()));
+
+        // Tick-start snapshot taken (activity Unknown), then the external
+        // hook write lands during the tick's awaits…
+        apply_activity(&store, "s1", ActivityEvent::HookPrompt, 1_000).unwrap();
+
+        // …and the GitHub pass writes its status update from the stale snapshot.
+        let written = poller.update_live_session_row(&snapshot, |row| {
+            row.status = SessionStatus::PrOpen;
+        }).expect("row exists");
+
+        assert_eq!(written.activity, ActivityState::Working, "mid-tick activity write must survive");
+        let fresh = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(fresh.activity, ActivityState::Working);
+        assert!(matches!(fresh.status, SessionStatus::PrOpen), "the tick's own write must still land");
+    }
+
+    /// End-to-end over the REST path: `poll_github` records each session's
+    /// PR branch refs, and `reconcile_stacked_deps` turns "s2's PR is based
+    /// on s1's PR branch" into a stacked edge — then drops it once the
+    /// branch relationship disappears.
+    #[tokio::test]
+    async fn poll_github_derives_and_retires_stacked_edges_from_pr_refs() {
+        use crate::store::Store;
+        use crate::types::DepKind;
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        let open_pr = |number: u64, head: &str, base: &str| crate::github::PrStatus {
+            merged: false, state: "open".into(), mergeable: Some(true),
+            title: "t".into(), number, head_sha: "abc".into(),
+            head_ref: head.into(), base_ref: base.into(),
+        };
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".into(), "repo".into(), 1), open_pr(1, "feat/a", "main"),
+        );
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".into(), "repo".into(), 2), open_pr(2, "feat/b", "feat/a"),
+        );
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        for (id, pr) in [("s1", 1u64), ("s2", 2u64)] {
+            let mut s = test_session(id, &format!("/ws/{id}"));
+            s.repo = "Owner/repo".into();
+            s.pr_number = Some(pr);
+            store.upsert_session(&s).unwrap();
+        }
+        let poller = Poller::new(github_engine(store.clone(), fake.clone()));
+
+        // poll_github reconciles at the end of its own pass — no separate call.
+        poller.poll_github(true).await;
+
+        let deps = store.deps_for_session("s2").unwrap();
+        assert_eq!(deps.len(), 1, "s2's base (feat/a) is s1's head — must edge");
+        assert_eq!(deps[0].depends_on, "s1");
+        assert_eq!(deps[0].kind, DepKind::Stacked);
+        assert!(store.deps_for_session("s1").unwrap().is_empty(), "s1 stacks on nobody");
+
+        // s2's PR is retargeted onto main — the stacked edge must retire.
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".into(), "repo".into(), 2), open_pr(2, "feat/b", "main"),
+        );
+        poller.poll_github(true).await;
+        assert!(store.deps_for_session("s2").unwrap().is_empty(), "retargeted PR must drop the edge");
+
+        // Re-establish the edge, then make s2's PR lookup fail (404) — the
+        // cached refs must be evicted and the edge retired, not re-derived
+        // from the last-good tuple forever.
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".into(), "repo".into(), 2), open_pr(2, "feat/b", "feat/a"),
+        );
+        poller.poll_github(true).await;
+        assert_eq!(store.deps_for_session("s2").unwrap().len(), 1);
+        fake.pr_status_ok.lock().unwrap().remove(&("Owner".into(), "repo".into(), 2));
+        poller.poll_github(true).await;
+        assert!(
+            store.deps_for_session("s2").unwrap().is_empty(),
+            "a failing PR lookup must retire the stacked edge, not freeze it",
+        );
+    }
+
     /// Drain every event currently buffered on the receiver.
     fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<Event>) -> Vec<Event> {
         let mut events = Vec::new();
@@ -1733,6 +2972,122 @@ mod tests {
         assert!(!events.iter().any(|e| matches!(e, Event::Notification(_))));
     }
 
+    #[tokio::test]
+    async fn message_counts_first_sighting_is_seeded_silently() {
+        use crate::store::Store;
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.record_message_delivered("orch-1").unwrap();
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_message_counts().await;
+
+        assert!(
+            !drain_events(&mut rx).iter().any(|e| matches!(e, Event::MessagesDelivered { .. })),
+            "deliveries that predate the poller must not read as new on startup",
+        );
+    }
+
+    #[tokio::test]
+    async fn message_counts_treat_a_session_first_seen_after_startup_as_all_new() {
+        use crate::store::Store;
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+        poller.poll_message_counts().await;
+        drain_events(&mut rx);
+
+        store.record_message_delivered("orch-new").unwrap();
+        poller.poll_message_counts().await;
+
+        let deltas: Vec<(String, u64)> = drain_events(&mut rx).iter().filter_map(|e| match e {
+            Event::MessagesDelivered { session_id, count } => Some((session_id.clone(), *count)),
+            _ => None,
+        }).collect();
+        assert_eq!(deltas, vec![("orch-new".to_string(), 1)], "the first message to a new session is news");
+    }
+
+    #[tokio::test]
+    async fn message_counts_treat_a_counter_that_restarted_as_all_new() {
+        use crate::store::Store;
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        for _ in 0..5 { store.record_message_delivered("orch-1").unwrap(); }
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+        poller.poll_message_counts().await;
+        drain_events(&mut rx);
+
+        // Same id removed and recreated between two ticks: the counter row
+        // restarts at 1 while the cache still remembers 5.
+        store.delete_session("orch-1").unwrap();
+        store.record_message_delivered("orch-1").unwrap();
+        store.record_message_delivered("orch-1").unwrap();
+        poller.poll_message_counts().await;
+
+        let deltas: Vec<(String, u64)> = drain_events(&mut rx).iter().filter_map(|e| match e {
+            Event::MessagesDelivered { session_id, count } => Some((session_id.clone(), *count)),
+            _ => None,
+        }).collect();
+        assert_eq!(deltas, vec![("orch-1".to_string(), 2)]);
+    }
+
+    #[tokio::test]
+    async fn message_counts_forget_a_session_whose_counter_row_is_gone() {
+        use crate::store::Store;
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        for _ in 0..5 { store.record_message_delivered("orch-1").unwrap(); }
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+        poller.poll_message_counts().await;
+        drain_events(&mut rx);
+
+        store.delete_session("orch-1").unwrap();
+        poller.poll_message_counts().await;
+        assert!(drain_events(&mut rx).is_empty());
+
+        store.record_message_delivered("orch-1").unwrap();
+        poller.poll_message_counts().await;
+
+        let deltas: Vec<(String, u64)> = drain_events(&mut rx).iter().filter_map(|e| match e {
+            Event::MessagesDelivered { session_id, count } => Some((session_id.clone(), *count)),
+            _ => None,
+        }).collect();
+        assert_eq!(deltas, vec![("orch-1".to_string(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn message_counts_emit_once_per_change_with_the_number_of_new_messages() {
+        use crate::store::Store;
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.record_message_delivered("orch-1").unwrap();
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+        poller.poll_message_counts().await;
+        drain_events(&mut rx);
+
+        store.record_message_delivered("orch-1").unwrap();
+        store.record_message_delivered("orch-1").unwrap();
+        poller.poll_message_counts().await;
+
+        let events = drain_events(&mut rx);
+        let deltas: Vec<(String, u64)> = events.iter().filter_map(|e| match e {
+            Event::MessagesDelivered { session_id, count } => Some((session_id.clone(), *count)),
+            _ => None,
+        }).collect();
+        assert_eq!(deltas, vec![("orch-1".to_string(), 2)]);
+
+        poller.poll_message_counts().await;
+        assert!(
+            !drain_events(&mut rx).iter().any(|e| matches!(e, Event::MessagesDelivered { .. })),
+            "an unchanged count must not re-emit",
+        );
+    }
+
     /// Work requests recorded by `ninox request-work` surface exactly one
     /// WorkRequested notification each, then are marked delivered.
     #[tokio::test]
@@ -1769,6 +3124,45 @@ mod tests {
             !events.iter().any(|e| matches!(e, Event::Notification(_))),
             "delivered work requests must not fire again",
         );
+    }
+
+    /// A worker that creates its own branch (`git checkout -b`, recorded by
+    /// the git wrapper) must have that branch recorded for restore, not the
+    /// one it was spawned on.
+    #[tokio::test]
+    async fn metadata_sync_records_the_branch_the_agent_created() {
+        use crate::store::Store;
+        let sessions_dir = tempfile::tempdir().unwrap();
+        std::fs::write(sessions_dir.path().join("s1.json"), r#"{"branch": "feat/parser"}"#).unwrap();
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", "/ws")).unwrap();
+        store.record_spawn_facts("s1", "brief", Some("s1")).unwrap();
+        let poller = Poller::new(Engine::new(store.clone()));
+
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        let r = store.fleet_record("s1").unwrap().unwrap();
+        assert_eq!(r.branch.as_deref(), Some("feat/parser"));
+        assert_eq!(r.task_brief.as_deref(), Some("brief"));
+    }
+
+    /// During a restore workers resume before their orchestrator, so the
+    /// nudge to it fails; the request must stay undelivered in the store so
+    /// the orchestrator's recovery briefing carries it.
+    #[test]
+    fn work_requests_that_never_reached_the_orchestrator_stay_undelivered() {
+        use crate::store::Store;
+        let store = Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap();
+        let mut session = test_session("w1", "/ws");
+        session.orchestrator_id = Some("o1".into());
+        let req = |id: &str| hooks::WorkRequest { id: id.into(), description: format!("do {id}"), requested_at: 5 };
+        let sent: std::collections::HashSet<String> = ["ok".to_string()].into();
+
+        record_work_requests(&store, &session, &[req("ok"), req("failed")], &sent, 9);
+
+        let rows = store.open_work_requests(Some("o1")).unwrap();
+        let delivered: Vec<_> = rows.iter().map(|r| (r.id.as_str(), r.delivered_at)).collect();
+        assert_eq!(delivered, [("failed", None), ("ok", Some(9))]);
     }
 
     /// A worker can request work and exit before the next tick — the request
@@ -2136,7 +3530,7 @@ mod tests {
             ("OwnerB".to_string(), "repoB".to_string(), 99),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 99, head_sha: "abc".into(),
+                title: "t".into(), number: 99, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
         // OwnerA/repoA#50 has no entry — get_pr_status errors, simulating a 404.
@@ -2150,7 +3544,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake.clone());
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert_eq!(updated.repo, "OwnerB/repoB", "session.repo must self-heal to the remote that actually has the PR");
@@ -2189,7 +3583,7 @@ mod tests {
             ("OwnerB".to_string(), "repoB".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "someone else's unrelated PR".into(), number: 50, head_sha: "zzz".into(),
+                title: "someone else's unrelated PR".into(), number: 50, head_sha: "zzz".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
         // OwnerA/repoA#50 has no entry — get_pr_status errors, simulating a 404.
@@ -2203,7 +3597,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake.clone());
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert_eq!(updated.repo, "OwnerA/repoA", "must not adopt the mirror just because it happens to have a same-numbered PR");
@@ -2239,7 +3633,7 @@ mod tests {
             ("Owner".to_string(), "repo".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -2252,7 +3646,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert_eq!(
@@ -2286,7 +3680,7 @@ mod tests {
                 // empty checks/threads) are as green as possible, directly
                 // contradicting the stale stored gate below.
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -2305,7 +3699,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert!(
@@ -2350,7 +3744,7 @@ mod tests {
             ("OwnerB".to_string(), "repoB".to_string(), 99),
             crate::github::PrStatus {
                 merged: true, state: "closed".into(), mergeable: None,
-                title: "t".into(), number: 99, head_sha: "abc".into(),
+                title: "t".into(), number: 99, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
         // OwnerA/repoA#50 has no entry — get_pr_status errors, simulating a 404,
@@ -2365,7 +3759,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert_eq!(updated.repo, "OwnerB/repoB", "self-heal must still land");
@@ -2399,7 +3793,7 @@ mod tests {
             ("Owner".to_string(), "repo".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -2420,7 +3814,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert!(
@@ -2454,7 +3848,7 @@ mod tests {
             ("Owner".to_string(), "repo".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -2473,7 +3867,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert_eq!(updated.pr_id, Some(50), "the self-heal write itself must still land");
@@ -2503,6 +3897,7 @@ mod tests {
             crate::github::PrStatus {
                 merged: true, state: "closed".into(), mergeable: Some(true),
                 title: "t".into(), number: 50, head_sha: "abc".into(),
+                head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -2524,7 +3919,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let updated = store.get_session("s1").unwrap().unwrap();
         assert_eq!(updated.started_at, session.started_at + 1, "the refiled row must survive untouched");
@@ -2553,7 +3948,7 @@ mod tests {
             ("Owner".to_string(), "repo".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -2569,12 +3964,66 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         assert!(
             store.get_session("s1").unwrap().is_none(),
             "a session deleted mid-poll must not be re-inserted by the status/gate write",
         );
+    }
+
+    /// A status write must never resurrect a row that reached a terminal
+    /// state mid-tick. `poll_github` derives `new_status` from the tick-start
+    /// snapshot, so a `Terminated` written during its GitHub awaits is
+    /// invisible to that decision — and `ninox reap` runs in its own process,
+    /// making it the first writer that can land one there. Writing
+    /// `Mergeable` back over it would be unrecoverable: `sweep_retired_sessions`
+    /// only purges `Done`/`Terminated`, and `poll_pids` needs a `pid`, which a
+    /// CLI-spawned worker never has — so the card would sit on the fleet board
+    /// as live forever with no session and no worktree behind it.
+    #[tokio::test]
+    async fn poll_github_status_write_does_not_resurrect_a_session_reaped_mid_poll() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        fake.pr_status_ok.lock().unwrap().insert(
+            ("Owner".to_string(), "repo".to_string(), 50),
+            crate::github::PrStatus {
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
+            },
+        );
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", &workspace);
+        session.repo = "Owner/repo".into();
+        session.pr_number = Some(50);
+        session.pr_id = Some(50); // fully consistent — no self-heal write this tick
+        session.status = SessionStatus::PrOpen;
+        store.upsert_session(&session).unwrap();
+
+        // Simulate `ninox reap s1 --force` landing mid-tick: killed, worktree
+        // gone, row written Terminated with the countdown started.
+        let mut reaped = session.clone();
+        reaped.status = SessionStatus::Terminated;
+        reaped.terminal_at = Some(1_000);
+        *fake.mid_review_upsert.lock().unwrap() = Some((store.clone(), reaped));
+
+        let engine = github_engine(store.clone(), fake);
+        let poller = Poller::new(engine);
+
+        poller.poll_github(true).await;
+
+        let after = store.get_session("s1").unwrap().unwrap();
+        assert!(
+            matches!(after.status, SessionStatus::Terminated),
+            "a reaped session must stay Terminated, got {:?} — anything live here is a \
+             permanent ghost the sweep and poll_pids can both never clean up", after.status,
+        );
+        assert_eq!(after.terminal_at, Some(1_000), "the reap's countdown must survive");
     }
 
     /// Per the `SessionFields` contract (see its doc comment), a producer
@@ -2595,7 +4044,7 @@ mod tests {
             ("Owner".to_string(), "repo".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
 
@@ -2610,7 +4059,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let events = drain_events(&mut rx);
         let fields: Vec<SessionFields> = events.iter().filter_map(|e| match e {
@@ -2648,7 +4097,7 @@ mod tests {
             ("OwnerB".to_string(), "repoB".to_string(), 99),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 99, head_sha: "abc".into(),
+                title: "t".into(), number: 99, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
         // OwnerA/repoA#50 has no entry — get_pr_status errors, simulating a
@@ -2664,7 +4113,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let events = drain_events(&mut rx);
         let healed = events.iter().find_map(|e| match e {
@@ -2712,14 +4161,14 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
         let events = drain_events(&mut rx);
         let failures = |evs: &[Event]| evs.iter().filter(|e| matches!(
             e, Event::Notification(n) if n.kind == crate::types::NotificationKind::GithubLookupFailed
         )).count();
         assert_eq!(failures(&events), 1, "first failure must notify");
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
         let events = drain_events(&mut rx);
         assert_eq!(failures(&events), 0, "repeated failure must not re-notify");
 
@@ -2728,14 +4177,14 @@ mod tests {
             ("OwnerA".to_string(), "repoA".to_string(), 50),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: 50, head_sha: "abc".into(),
+                title: "t".into(), number: 50, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         // Fails again — must notify again, since recovery cleared the flag.
         fake.pr_status_ok.lock().unwrap().clear();
-        poller.poll_github().await;
+        poller.poll_github(true).await;
         let events = drain_events(&mut rx);
         assert_eq!(failures(&events), 1, "must notify again after recovering and failing anew");
     }
@@ -2762,7 +4211,7 @@ mod tests {
             ("Owner".to_string(), "repo".to_string(), pr_number),
             crate::github::PrStatus {
                 merged: false, state: "open".into(), mergeable: Some(true),
-                title: "t".into(), number: pr_number, head_sha: "abc".into(),
+                title: "t".into(), number: pr_number, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
             },
         );
         fake
@@ -2797,7 +4246,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let persisted = store.list_comments().unwrap();
         assert_eq!(persisted.len(), 1);
@@ -2834,7 +4283,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let persisted = store.list_comments().unwrap();
         assert_eq!(persisted.len(), 1, "an empty-body CHANGES_REQUESTED review must still be captured");
@@ -2871,7 +4320,7 @@ mod tests {
 
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let persisted = store.list_comments().unwrap();
         assert_eq!(persisted.len(), 1);
@@ -2901,7 +4350,7 @@ mod tests {
         let engine = github_engine(store.clone(), fake);
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let persisted = store.list_comments().unwrap();
         assert_eq!(persisted.len(), 1);
@@ -2936,10 +4385,10 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
         assert_eq!(comment_events(&drain_events(&mut rx)).len(), 1);
 
-        poller.poll_github().await;
+        poller.poll_github(true).await;
         assert_eq!(
             comment_events(&drain_events(&mut rx)).len(), 0,
             "the second tick's in-memory seen_comment_ids must skip an already-captured comment",
@@ -2972,7 +4421,7 @@ mod tests {
         {
             let engine = github_engine(store.clone(), fake.clone());
             let poller = Poller::new(engine);
-            poller.poll_github().await;
+            poller.poll_github(true).await;
         }
         assert_eq!(store.list_comments().unwrap().len(), 1);
 
@@ -2980,11 +4429,872 @@ mod tests {
         // process restart against the same on-disk store.
         let engine = github_engine(store.clone(), fake);
         let poller = Poller::new(engine);
-        poller.poll_github().await;
+        poller.poll_github(true).await;
 
         let persisted = store.list_comments().unwrap();
         assert_eq!(persisted.len(), 1, "restart must not duplicate an already-persisted comment");
         assert_eq!(persisted[0].id, 501);
+    }
+
+    // ── Batched GraphQL path (`poll_github_batched`) ─────────────────────────
+    //
+    // The batched path collapses `poll_pr_reconciliation` + `poll_github`'s
+    // per-session REST fan-out into one `fetch_batch` call. These tests drive
+    // it through a `GithubBatchApi` fake, so the collection/dedup rules, the
+    // branch-adoption half and the enrichment half are all exercised without
+    // any network access.
+
+    #[derive(Default)]
+    struct FakeBatchApi {
+        /// Handed out (by `std::mem::take`) on the *first* `fetch_batch` call;
+        /// later calls see an empty `BatchResult`, which is exactly the
+        /// "alias missing" shape the lookup-failure dedup test needs.
+        result: std::sync::Mutex<crate::github_graphql::BatchResult>,
+        /// Queued front-first, ahead of `result` above: a test that wants a
+        /// specific `fetch_batch` call to fail (e.g. with a
+        /// `RateLimitedError`) pushes one here. Once drained, calls fall
+        /// back to the `result`/`mem::take` behavior as before — most tests
+        /// never touch this and see no change.
+        queued_errors: std::sync::Mutex<std::collections::VecDeque<anyhow::Error>>,
+        /// Every `(pr_keys, branch_keys)` pair the poller asked for, in order.
+        calls:  std::sync::Mutex<Vec<(Vec<crate::github_graphql::PrKey>, Vec<crate::github_graphql::BranchKey>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::github_graphql::GithubBatchApi for FakeBatchApi {
+        async fn fetch_batch(
+            &self,
+            prs: &[crate::github_graphql::PrKey],
+            branches: &[crate::github_graphql::BranchKey],
+        ) -> anyhow::Result<crate::github_graphql::BatchResult> {
+            self.calls.lock().unwrap().push((prs.to_vec(), branches.to_vec()));
+            if let Some(err) = self.queued_errors.lock().unwrap().pop_front() {
+                return Err(err);
+            }
+            Ok(std::mem::take(&mut *self.result.lock().unwrap()))
+        }
+    }
+
+    /// An `Engine` wired to a batch fake (plus an inert REST fake, so the
+    /// legacy path would 404 rather than silently satisfying an assertion the
+    /// batched path is supposed to satisfy).
+    fn batch_engine(
+        store: std::sync::Arc<crate::store::Store>,
+        batch: std::sync::Arc<FakeBatchApi>,
+    ) -> std::sync::Arc<Engine> {
+        Engine::new_with_github_apis(
+            store,
+            std::sync::Arc::new(FakeGithub::default()) as std::sync::Arc<dyn crate::github::GithubApi>,
+            batch as std::sync::Arc<dyn crate::github_graphql::GithubBatchApi>,
+        )
+    }
+
+    fn pr_key(repo: &str, number: u64) -> crate::github_graphql::PrKey {
+        crate::github_graphql::PrKey { repo: repo.into(), number }
+    }
+
+    fn open_snapshot(number: u64) -> crate::github_graphql::PrSnapshot {
+        crate::github_graphql::PrSnapshot {
+            status: crate::github::PrStatus {
+                merged: false, state: "open".into(), mergeable: Some(true),
+                title: "t".into(), number, head_sha: "abc".into(), head_ref: String::new(), base_ref: String::new(),
+            },
+            closed:         false,
+            checks:         vec![],
+            threads:        vec![],
+            issue_comments: vec![],
+        }
+    }
+
+    fn watch(repo: &str, pr_number: u64) -> crate::types::PrWatch {
+        crate::types::PrWatch {
+            repo:              repo.into(),
+            pr_number,
+            pr_url:            format!("https://github.com/{repo}/pull/{pr_number}"),
+            opener_session_id: None,
+            created_at:        0,
+        }
+    }
+
+    /// The whole point of batching: N sessions (and any registry watches)
+    /// pointing at the same PR must cost exactly one alias in the query, not
+    /// one per row.
+    #[tokio::test]
+    async fn batched_poll_dedupes_session_and_watch_targets() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        for id in ["s1", "s2"] {
+            let mut s = test_session(id, "/ws");
+            s.status    = SessionStatus::PrOpen;
+            s.repo      = "o/r".into();
+            s.pr_number = Some(7);
+            store.upsert_session(&s).unwrap();
+        }
+        // A registry watch on the very same PR — must collapse into the same key.
+        store.upsert_pr_watch(&watch("o/r", 7)).unwrap();
+        // A second, distinct PR proves dedup isn't just "keep one key".
+        store.upsert_pr_watch(&watch("o/r", 9)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        let engine = batch_engine(store.clone(), batch.clone());
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched(true).await;
+
+        let calls = batch.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "one tick must issue exactly one batched fetch");
+        assert_eq!(
+            calls[0].0,
+            vec![pr_key("o/r", 7), pr_key("o/r", 9)],
+            "two sessions plus a watch on o/r#7 must contribute a single deduped key",
+        );
+        assert!(calls[0].1.is_empty(), "sessions that already track a PR contribute no branch keys");
+    }
+
+    /// Merge detection must work identically on the batched path: the
+    /// snapshot's `merged` flag drives the same `handle_merge_detection`
+    /// transition (Done + `terminal_at`) and the same single `WorkerDone`
+    /// notification the legacy path produces.
+    #[tokio::test]
+    async fn batched_poll_marks_merged_session_done_and_notifies_orchestrator() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status          = SessionStatus::Working;
+        s.orchestrator_id = Some("orch1".into());
+        s.repo            = "Owner/repo".into();
+        s.pr_number       = Some(7);
+        store.upsert_session(&s).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        {
+            let mut merged = open_snapshot(7);
+            merged.status.merged = true;
+            merged.status.state  = "closed".into();
+            batch.result.lock().unwrap().prs.insert(pr_key("Owner/repo", 7), merged);
+        }
+
+        let engine = batch_engine(store.clone(), batch);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched(true).await;
+
+        let after = store.get_session("w1").unwrap().unwrap();
+        assert!(matches!(after.status, SessionStatus::Done), "a merged PR's session must transition to Done");
+        assert!(after.terminal_at.is_some(), "Done via merge detection must stamp terminal_at");
+        assert_eq!(after.pr_id, Some(7), "pr_id must be persisted before merge detection ends the session");
+
+        let events = drain_events(&mut rx);
+        let merged_notifs = events.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+        )).count();
+        assert_eq!(merged_notifs, 1, "exactly one WorkerDone notification for the merge");
+    }
+
+    /// The enrichment half must reuse the exact `ingest_ci`/`scan_reviews`/
+    /// `apply_status_and_gate` helpers the legacy path uses — so a snapshot
+    /// carrying one failing check and one CHANGES_REQUESTED review yields the
+    /// same CI row, comment row, PR row and derived session status.
+    #[tokio::test]
+    async fn batched_poll_ingests_ci_and_reviews_like_legacy() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        {
+            let mut snap = open_snapshot(50);
+            snap.checks = vec![
+                CheckRun { name: "lint".into(), status: "completed".into(), conclusion: Some("success".into()) },
+                CheckRun { name: "test".into(), status: "completed".into(), conclusion: Some("failure".into()) },
+            ];
+            snap.threads = vec![crate::github::ReviewThread {
+                id: 601, author: "alice".into(), body: "please fix".into(),
+                path: None, line: None, state: "CHANGES_REQUESTED".into(), created_at: 7_000,
+            }];
+            snap.issue_comments = vec![Comment {
+                id: 900, pr_id: 0, author: "erin".into(), body: "ping".into(),
+                path: None, line: None, created_at: 8_000,
+            }];
+            batch.result.lock().unwrap().prs.insert(pr_key("Owner/repo", 50), snap);
+        }
+
+        let engine = batch_engine(store.clone(), batch);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched(true).await;
+
+        let events = drain_events(&mut rx);
+
+        let ci = events.iter().find_map(|e| match e {
+            Event::CiUpdated { pr_id: 50, status } => Some(status.clone()),
+            _ => None,
+        }).expect("CiUpdated must be emitted for the batched snapshot's checks");
+        assert_eq!((ci.total, ci.passing, ci.failing), (2, 1, 1));
+
+        let mut persisted: Vec<i64> = store.list_comments().unwrap().iter().map(|c| c.id).collect();
+        persisted.sort();
+        assert_eq!(persisted, vec![601, 900], "review and issue comments must both be captured");
+        assert_eq!(
+            store.list_comments().unwrap().iter().find(|c| c.id == 900).unwrap().pr_id, 50,
+            "pr_id must be stamped from the resolved PR",
+        );
+
+        let pr_row = store.get_pr(50).unwrap().expect("the PR row must be upserted from the snapshot");
+        assert_eq!(pr_row.url, "https://github.com/Owner/repo/pull/50");
+        assert_eq!(pr_row.session_id, "s1");
+
+        let after = store.get_session("s1").unwrap().unwrap();
+        assert!(
+            matches!(after.status, SessionStatus::CiFailed),
+            "a failing check must drive the same derived status as the legacy path, got {:?}", after.status,
+        );
+        let gate = after.gate_status.expect("gate must be computed on the batched path too");
+        assert!(matches!(gate.ci, GateCheck::Failing));
+        assert!(matches!(gate.review, GateCheck::Failing));
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e, Event::Notification(n) if n.kind == crate::types::NotificationKind::PrNeedsAttention
+            )),
+            "a CHANGES_REQUESTED review must still drive the review reaction path",
+        );
+    }
+
+    /// The batched path subsumes `poll_pr_reconciliation`: a session with no
+    /// tracked PR contributes a branch key for every candidate remote, and
+    /// whatever open PR comes back is adopted (number, repo, PrOpen).
+    #[tokio::test]
+    async fn batched_poll_adopts_branch_pr_for_prless_session() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", &workspace)).unwrap();
+
+        let branch_key = crate::github_graphql::BranchKey {
+            repo: "Owner/repo".into(), branch: "worker-branch".into(),
+        };
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        batch.result.lock().unwrap().branch_prs.insert(
+            branch_key.clone(),
+            Some(crate::github::PrRef { number: 9, url: "https://github.com/Owner/repo/pull/9".into() }),
+        );
+
+        let engine = batch_engine(store.clone(), batch.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched(true).await;
+
+        let calls = batch.calls.lock().unwrap().clone();
+        // The branch-key Vec is built straight from `candidate_repos`, which
+        // sorts `origin` first — and the adoption loop walks that Vec rather
+        // than the result HashMap, so a multi-remote session deterministically
+        // adopts from the first (origin) remote that has a PR, exactly as
+        // `poll_pr_reconciliation`'s break-on-first-match loop does.
+        assert_eq!(calls[0].1, vec![branch_key], "a PR-less session must contribute its branch key");
+
+        let after = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(after.pr_number, Some(9), "the branch's open PR must be adopted");
+        assert_eq!(after.repo, "Owner/repo", "adoption must record the repo the PR was found in");
+        assert!(matches!(after.status, SessionStatus::PrOpen));
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e, Event::SessionUpdated(s, fields)
+                    if s.id == "s1"
+                    && s.pr_number == Some(9)
+                    && fields.contains(SessionFields::PR_LINK)
+                    && fields.contains(SessionFields::STATUS)
+            )),
+            "adoption must broadcast the PR link and status to the UI",
+        );
+    }
+
+    /// Several sessions can share one workspace (an orchestrator and its
+    /// worker on the same worktree, a re-attached session, a split follow-up).
+    /// They collapse to a single branch key — one alias in the query — but the
+    /// adoption must still fan back out to *every* owner, exactly as the
+    /// legacy per-session reconciliation loop does. A last-writer-wins owner
+    /// map would leave all but one of them permanently un-adopted.
+    #[tokio::test]
+    async fn batched_poll_adopts_branch_pr_for_every_session_sharing_a_workspace() {
+        use crate::store::Store;
+
+        let repo_dir = init_git_repo("worker-branch", &[("origin", "https://github.com/Owner/repo.git")]);
+        let workspace = repo_dir.path().to_string_lossy().to_string();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("s1", &workspace)).unwrap();
+        store.upsert_session(&test_session("s2", &workspace)).unwrap();
+
+        let branch_key = crate::github_graphql::BranchKey {
+            repo: "Owner/repo".into(), branch: "worker-branch".into(),
+        };
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        batch.result.lock().unwrap().branch_prs.insert(
+            branch_key.clone(),
+            Some(crate::github::PrRef { number: 9, url: "https://github.com/Owner/repo/pull/9".into() }),
+        );
+
+        let engine = batch_engine(store.clone(), batch.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched(true).await;
+
+        assert_eq!(
+            batch.calls.lock().unwrap()[0].1, vec![branch_key],
+            "two sessions on one workspace must still cost exactly one branch alias",
+        );
+
+        for id in ["s1", "s2"] {
+            let after = store.get_session(id).unwrap().unwrap();
+            assert_eq!(after.pr_number, Some(9), "{id} must adopt the branch's PR too");
+            assert_eq!(after.repo, "Owner/repo", "{id} must record the repo the PR was found in");
+            assert!(matches!(after.status, SessionStatus::PrOpen), "{id} must move to PrOpen");
+        }
+
+        let events = drain_events(&mut rx);
+        let adopted: std::collections::HashSet<String> = events.iter().filter_map(|e| match e {
+            Event::SessionUpdated(s, fields)
+                if s.pr_number == Some(9)
+                    && fields.contains(SessionFields::PR_LINK)
+                    && fields.contains(SessionFields::STATUS) => Some(s.id.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(
+            adopted,
+            ["s1".to_string(), "s2".to_string()].into_iter().collect::<std::collections::HashSet<_>>(),
+            "both sessions' adoptions must reach the UI",
+        );
+    }
+
+    /// The batched path deliberately drops the legacy cross-repo 404 fallback
+    /// (see `poll_github_batched`'s doc comment): a key missing from the
+    /// result map is a lookup failure, notified exactly once per run of
+    /// consecutive failures — not once per tick.
+    #[tokio::test]
+    async fn batched_poll_missing_alias_fires_lookup_failed_once() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        // Empty result: the `Owner/repo#50` alias errored out server-side.
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        let engine = batch_engine(store.clone(), batch.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched(true).await;
+        poller.poll_github_batched(true).await;
+
+        assert_eq!(batch.calls.lock().unwrap().len(), 2, "both ticks must have actually fetched");
+
+        let failures = drain_events(&mut rx).iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::GithubLookupFailed
+        )).count();
+        assert_eq!(failures, 1, "a missing alias must notify once, not once per tick");
+    }
+
+    // ── Rate-limit floor and Retry-After backoff (`note_rate_limit` /
+    //    `note_batch_error` / the pause check atop `poll_github_batched`) ────
+
+    /// A low-but-nonzero remaining budget must pause the *next* tick before
+    /// it even calls `fetch_batch` — a skipped tick, not a blocked one.
+    #[tokio::test]
+    async fn low_rate_limit_remaining_pauses_next_tick() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        {
+            let mut result = batch.result.lock().unwrap();
+            result.prs.insert(pr_key("Owner/repo", 50), open_snapshot(50));
+            result.rate_limit = crate::github_graphql::RateLimitInfo {
+                cost: 1, remaining: 50, reset_at: now_millis() + 60_000,
+            };
+        }
+
+        let engine = batch_engine(store.clone(), batch.clone());
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched(true).await;
+        poller.poll_github_batched(true).await;
+
+        assert_eq!(
+            batch.calls.lock().unwrap().len(), 1,
+            "a low remaining budget must pause the second tick before it fetches",
+        );
+    }
+
+    /// A healthy remaining budget must never pause — both ticks fetch.
+    #[tokio::test]
+    async fn healthy_rate_limit_does_not_pause() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        {
+            let mut result = batch.result.lock().unwrap();
+            result.prs.insert(pr_key("Owner/repo", 50), open_snapshot(50));
+            result.rate_limit = crate::github_graphql::RateLimitInfo {
+                cost: 1, remaining: 4000, reset_at: now_millis() + 60_000,
+            };
+        }
+
+        let engine = batch_engine(store.clone(), batch.clone());
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched(true).await;
+        poller.poll_github_batched(true).await;
+
+        assert_eq!(
+            batch.calls.lock().unwrap().len(), 2,
+            "a healthy remaining budget must never pause polling",
+        );
+    }
+
+    /// A `RateLimitedError` with a `Retry-After` hint pauses for exactly
+    /// that long — the next tick must be skipped, not merely retried.
+    #[tokio::test]
+    async fn rate_limited_error_with_retry_after_pauses() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        batch.queued_errors.lock().unwrap().push_back(
+            anyhow::Error::new(crate::github_graphql::RateLimitedError { retry_after_secs: Some(3600) })
+        );
+        batch.result.lock().unwrap().prs.insert(pr_key("Owner/repo", 50), open_snapshot(50));
+
+        let engine = batch_engine(store.clone(), batch.clone());
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched(true).await; // errors — pauses for 3600s
+        poller.poll_github_batched(true).await; // must be skipped
+
+        assert_eq!(
+            batch.calls.lock().unwrap().len(), 1,
+            "a Retry-After-bearing rate limit error must pause the next tick",
+        );
+    }
+
+    /// Consecutive `RateLimitedError`s with no `Retry-After` hint must
+    /// double the pause each time (120s, then 240s, then 480s) instead of
+    /// re-pausing for a flat 120s every tick.
+    #[tokio::test]
+    async fn rate_limited_error_without_retry_after_backs_off_exponentially() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        let engine = batch_engine(store.clone(), batch.clone());
+        let poller = Poller::new(engine);
+
+        let queue_error = || {
+            batch.queued_errors.lock().unwrap().push_back(
+                anyhow::Error::new(crate::github_graphql::RateLimitedError { retry_after_secs: None })
+            );
+        };
+
+        let before = now_millis();
+        queue_error();
+        poller.poll_github_batched(true).await;
+        let first_pause = poller.pause_until() - before;
+        assert!(
+            (110_000..=130_000).contains(&first_pause),
+            "the first Retry-After-less rate limit must pause ~120s, got {first_pause}ms",
+        );
+
+        // Clear the pause so the next tick actually reaches `fetch_batch`
+        // instead of being skipped by the pause it just set.
+        poller.set_pause_until(0);
+        queue_error();
+        poller.poll_github_batched(true).await;
+        let second_pause = poller.pause_until() - before;
+        assert!(
+            second_pause >= 2 * first_pause - 10_000,
+            "a second consecutive error must double the pause, got {second_pause}ms after a first of {first_pause}ms",
+        );
+
+        poller.set_pause_until(0);
+        queue_error();
+        poller.poll_github_batched(true).await;
+        let third_pause = poller.pause_until() - before;
+        assert!(
+            third_pause >= 2 * second_pause - 10_000,
+            "a third consecutive error must double again, got {third_pause}ms after a second of {second_pause}ms",
+        );
+    }
+
+    /// A successful fetch resets the stored Retry-After-less backoff, so a
+    /// fresh outage after a recovery starts doubling over from 120s again
+    /// instead of continuing where a prior outage left off.
+    #[tokio::test]
+    async fn successful_fetch_resets_rate_limit_backoff() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        let engine = batch_engine(store.clone(), batch.clone());
+        let poller = Poller::new(engine);
+
+        let queue_error = || {
+            batch.queued_errors.lock().unwrap().push_back(
+                anyhow::Error::new(crate::github_graphql::RateLimitedError { retry_after_secs: None })
+            );
+        };
+
+        // Two consecutive errors double the backoff away from the 120s floor.
+        queue_error();
+        poller.poll_github_batched(true).await;
+        poller.set_pause_until(0);
+        queue_error();
+        poller.poll_github_batched(true).await;
+        let doubled_pause = poller.pause_until();
+        poller.set_pause_until(0);
+        assert!(
+            doubled_pause - now_millis() > 200_000,
+            "sanity check: two consecutive errors must have doubled past 120s",
+        );
+
+        // A successful fetch in between must reset the stored backoff.
+        batch.result.lock().unwrap().prs.insert(pr_key("Owner/repo", 50), open_snapshot(50));
+        poller.poll_github_batched(true).await;
+
+        // A fresh error after the success must pause ~120s again, not
+        // continue doubling from where the prior outage left off.
+        let before = now_millis();
+        queue_error();
+        poller.poll_github_batched(true).await;
+        let fresh_pause = poller.pause_until() - before;
+        assert!(
+            (110_000..=130_000).contains(&fresh_pause),
+            "a fresh error after a success must pause ~120s again, got {fresh_pause}ms",
+        );
+    }
+
+    /// A pause timestamp already in the past must not skip a tick — the
+    /// pause check compares against "now", not merely "is it set".
+    #[tokio::test]
+    async fn past_pause_does_not_skip_tick() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        batch.result.lock().unwrap().prs.insert(pr_key("Owner/repo", 50), open_snapshot(50));
+
+        let engine = batch_engine(store.clone(), batch.clone());
+        let poller = Poller::new(engine);
+        poller.set_pause_until(now_millis() - 1_000);
+
+        poller.poll_github_batched(true).await;
+
+        assert_eq!(
+            batch.calls.lock().unwrap().len(), 1,
+            "a pause timestamp already in the past must not skip the tick",
+        );
+    }
+
+    // ── Registry watch delivery (`deliver_watch_updates`) ────────────────────
+    //
+    // Watches are notification-only: they deliver to the *opener* session (and
+    // to the UI's notification feed) but never move any session's status/gate
+    // and never write the session-owned PR/CI/comment rows. Auto-close drops
+    // every watch on a PR once it reaches a terminal state.
+
+    fn watch_by(repo: &str, pr_number: u64, opener: &str) -> crate::types::PrWatch {
+        crate::types::PrWatch {
+            opener_session_id: Some(opener.into()),
+            ..watch(repo, pr_number)
+        }
+    }
+
+    fn merged_snapshot(number: u64) -> crate::github_graphql::PrSnapshot {
+        let mut snap = open_snapshot(number);
+        snap.status.merged = true;
+        snap.status.state  = "closed".into();
+        snap.closed        = true;
+        snap
+    }
+
+    fn notifs(events: &[Event], kind: NotificationKind) -> Vec<Notification> {
+        events.iter().filter_map(|e| match e {
+            Event::Notification(n) if n.kind == kind => Some(n.clone()),
+            _ => None,
+        }).collect()
+    }
+
+    #[tokio::test]
+    async fn watch_on_merged_pr_notifies_opener_and_auto_closes() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        // The opener exists but tracks no PR of its own — anything that
+        // happens to it here could only have come from the watch path.
+        store.upsert_session(&test_session("sess-a", "/ws")).unwrap();
+        store.upsert_pr_watch(&watch_by("o/r", 7, "sess-a")).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        batch.result.lock().unwrap().prs.insert(pr_key("o/r", 7), merged_snapshot(7));
+
+        let engine = batch_engine(store.clone(), batch);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched(true).await;
+
+        let done = notifs(&drain_events(&mut rx), NotificationKind::WorkerDone);
+        assert_eq!(done.len(), 1, "a merged watched PR must notify exactly once");
+        assert_eq!(done[0].session_id.as_deref(), Some("sess-a"), "the notification belongs to the opener");
+        assert!(done[0].title.contains("merged"), "title must say merged, got {:?}", done[0].title);
+        assert!(done[0].title.contains("o/r#7"), "title must name the watched PR, got {:?}", done[0].title);
+        assert_eq!(done[0].body, "https://github.com/o/r/pull/7", "body carries the watch's URL");
+
+        assert!(
+            store.list_pr_watches().unwrap().is_empty(),
+            "a merged PR must auto-close its watches",
+        );
+        assert!(
+            store.get_pr(7).unwrap().is_none(),
+            "the watch path must not write session-owned PR rows",
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_on_closed_unmerged_pr_also_auto_closes() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("sess-a", "/ws")).unwrap();
+        store.upsert_pr_watch(&watch_by("o/r", 7, "sess-a")).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        {
+            let mut snap = open_snapshot(7);
+            snap.closed       = true;
+            snap.status.state = "closed".into(); // merged stays false
+            batch.result.lock().unwrap().prs.insert(pr_key("o/r", 7), snap);
+        }
+
+        let engine = batch_engine(store.clone(), batch);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched(true).await;
+
+        let done = notifs(&drain_events(&mut rx), NotificationKind::WorkerDone);
+        assert_eq!(done.len(), 1, "a closed watched PR is terminal too");
+        assert!(done[0].title.contains("closed"), "title must say closed, got {:?}", done[0].title);
+        assert!(!done[0].title.contains("merged"), "an unmerged close must not claim a merge");
+        assert!(store.list_pr_watches().unwrap().is_empty(), "closing must auto-close the watch");
+    }
+
+    #[tokio::test]
+    async fn watch_ci_failure_notifies_once_until_recovery() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("sess-a", "/ws")).unwrap();
+        store.upsert_pr_watch(&watch_by("o/r", 7, "sess-a")).unwrap();
+
+        // A CHANGES_REQUESTED review rides along on every snapshot: it must
+        // notify exactly once across all four ticks (`seen_comment_ids`
+        // dedup on the watch's own cache entry), and never persist a
+        // comment row — those belong to the session path.
+        let snapshot = |conclusion: &str| {
+            let mut snap = open_snapshot(7);
+            snap.checks = vec![CheckRun {
+                name: "test".into(), status: "completed".into(), conclusion: Some(conclusion.into()),
+            }];
+            snap.threads = vec![crate::github::ReviewThread {
+                id: 701, author: "alice".into(), body: "please fix".into(),
+                path: Some("src/lib.rs".into()), line: Some(3),
+                state: "CHANGES_REQUESTED".into(), created_at: 5_000,
+            }];
+            snap
+        };
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        let engine = batch_engine(store.clone(), batch.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        let tick = |conclusion: &str| {
+            batch.result.lock().unwrap().prs.insert(pr_key("o/r", 7), snapshot(conclusion));
+        };
+
+        tick("failure");
+        poller.poll_github_batched(true).await;
+        let first = drain_events(&mut rx);
+        let ci = notifs(&first, NotificationKind::CiFailure);
+        assert_eq!(ci.len(), 1, "the first failing tick must notify the opener");
+        assert_eq!(ci[0].session_id.as_deref(), Some("sess-a"));
+        assert!(ci[0].title.contains("o/r#7"), "title must name the watched PR, got {:?}", ci[0].title);
+        assert_eq!(ci[0].body, "1/1 checks failing");
+        assert_eq!(
+            notifs(&first, NotificationKind::PrNeedsAttention).len(), 1,
+            "the new CHANGES_REQUESTED review must notify the opener once",
+        );
+
+        tick("failure");
+        poller.poll_github_batched(true).await;
+        let second = drain_events(&mut rx);
+        assert!(
+            notifs(&second, NotificationKind::CiFailure).is_empty(),
+            "a still-failing PR must not re-notify",
+        );
+        assert!(
+            notifs(&second, NotificationKind::PrNeedsAttention).is_empty(),
+            "an already-seen review comment must not re-notify",
+        );
+
+        tick("success");
+        poller.poll_github_batched(true).await;
+        assert!(
+            notifs(&drain_events(&mut rx), NotificationKind::CiFailure).is_empty(),
+            "a green tick must not notify",
+        );
+
+        tick("failure");
+        poller.poll_github_batched(true).await;
+        assert_eq!(
+            notifs(&drain_events(&mut rx), NotificationKind::CiFailure).len(), 1,
+            "failing again after recovery is a fresh transition and must notify",
+        );
+
+        assert!(
+            store.list_comments().unwrap().is_empty(),
+            "the watch path must not write session-owned comment rows",
+        );
+        assert_eq!(
+            store.list_pr_watches().unwrap().len(), 1,
+            "a non-terminal PR keeps its watch registered",
+        );
+    }
+
+    #[tokio::test]
+    async fn unowned_watch_emits_events_but_no_session_delivery() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_pr_watch(&watch("o/r", 7)).unwrap(); // opener: None
+        assert_eq!(store.list_pr_watches().unwrap().len(), 1);
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        batch.result.lock().unwrap().prs.insert(pr_key("o/r", 7), merged_snapshot(7));
+
+        let engine = batch_engine(store.clone(), batch);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched(true).await;
+
+        let done = notifs(&drain_events(&mut rx), NotificationKind::WorkerDone);
+        assert_eq!(done.len(), 1, "an unowned watch still reaches the notification feed");
+        assert_eq!(done[0].session_id, None, "an unowned watch has no session to attribute to");
+        assert!(store.list_pr_watches().unwrap().is_empty(), "auto-close applies to unowned watches too");
+    }
+
+    #[tokio::test]
+    async fn watch_never_mutates_any_session_status() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        // sess-a's OWN PR is Owner/repo#50 and is wide open; the PR it
+        // *watches* (o/r#7) is merged. Lifecycle transitions belong to the
+        // session-attached PR only, so sess-a must land where its own open PR
+        // puts it (Mergeable) — never Done, never cleaned up.
+        store.upsert_session(&open_pr_session("sess-a", "/ws", 50)).unwrap();
+        store.upsert_pr_watch(&watch_by("o/r", 7, "sess-a")).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        {
+            let mut result = batch.result.lock().unwrap();
+            result.prs.insert(pr_key("Owner/repo", 50), open_snapshot(50));
+            result.prs.insert(pr_key("o/r", 7), merged_snapshot(7));
+        }
+
+        let engine = batch_engine(store.clone(), batch);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched(true).await;
+
+        let after = store.get_session("sess-a").unwrap()
+            .expect("a watch reaching a terminal PR must never clean up the opener session");
+        assert!(
+            matches!(after.status, SessionStatus::Mergeable),
+            "the opener's status must follow its OWN open PR, not the watched merge; got {:?}", after.status,
+        );
+        assert!(after.terminal_at.is_none(), "no watch may stamp a session terminal");
+
+        // The watch's own terminal notification still fires, attributed to the opener.
+        let done = notifs(&drain_events(&mut rx), NotificationKind::WorkerDone);
+        assert_eq!(done.len(), 1, "exactly one terminal notification — the watch's, not a session merge");
+        assert!(done[0].title.contains("o/r#7"), "it must be about the watched PR, got {:?}", done[0].title);
+        assert!(store.list_pr_watches().unwrap().is_empty());
+    }
+
+    /// A watch whose PR key never shows up in the batch result (deleted or
+    /// renamed repo, access revoked, etc.) has no terminal signal to act
+    /// on — it must stay registered forever (only `ninox close --pr` may
+    /// drop it) and must never emit a `Notification` event. The dedup log
+    /// warning is a controller-ruled log-only path with no assertable
+    /// event, so this only asserts on the registry and the event stream.
+    #[tokio::test]
+    async fn watch_missing_from_batch_result_stays_registered_and_silent() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("sess-a", "/ws")).unwrap();
+        store.upsert_pr_watch(&watch_by("o/r", 7, "sess-a")).unwrap();
+
+        // Batch result never contains a "o/r"#7 entry — the PR is absent.
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+
+        let engine = batch_engine(store.clone(), batch);
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.poll_github_batched(true).await;
+        poller.poll_github_batched(true).await;
+
+        assert!(
+            notifs(&drain_events(&mut rx), NotificationKind::WorkerDone).is_empty(),
+            "a missing batch entry is not a terminal signal — no WorkerDone",
+        );
+        assert!(
+            notifs(&drain_events(&mut rx), NotificationKind::GithubLookupFailed).is_empty(),
+            "the miss is log-only — no notification event, deduped or otherwise",
+        );
+        assert_eq!(
+            store.list_pr_watches().unwrap().len(), 1,
+            "the watch must stay registered across repeated misses until `ninox close --pr`",
+        );
     }
 
     // ── Update check ─────────────────────────────────────────────────────────
@@ -3561,7 +5871,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        let handled = poller.handle_merge_detection(&s, 42, true).await;
+        let handled = poller.handle_merge_detection(&s, 42, true, true).await;
         assert!(handled, "merge detection must run for a Terminated session");
 
         let after = store.get_session("w1").unwrap().unwrap();
@@ -3594,14 +5904,153 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        let first = poller.handle_merge_detection(&s, 7, true).await;
+        let first = poller.handle_merge_detection(&s, 7, true, true).await;
         assert!(first, "first tick handles the merge");
 
         // Simulate the next poll tick re-reading the (now Done) session from
         // the store before calling merge detection again.
         let updated = store.get_session("w1").unwrap().unwrap();
-        let second = poller.handle_merge_detection(&updated, 7, true).await;
+        let second = poller.handle_merge_detection(&updated, 7, true, true).await;
         assert!(!second, "an already-Done session must not re-fire merge detection");
+
+        let events = drain_events(&mut rx);
+        let merged_notifs = events.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+        )).count();
+        assert_eq!(merged_notifs, 1, "no duplicate WorkerDone notification across ticks");
+    }
+
+    /// A kept-alive merged worker (`merged_at` stamped) must drop out of
+    /// GitHub enrichment entirely — its PR is merged, so polling it every
+    /// tick until the orchestrator reaps the session is pure waste.
+    #[tokio::test]
+    async fn poll_github_skips_a_merge_stamped_session_entirely() {
+        use crate::store::Store;
+
+        let fake = std::sync::Arc::new(FakeGithub::default());
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Mergeable;
+        s.repo = "Owner/repo".into();
+        s.pr_number = Some(7);
+        s.merged_at = Some(1_000);
+        store.upsert_session(&s).unwrap();
+
+        let engine = github_engine(store.clone(), fake.clone());
+        let poller = Poller::new(engine);
+        poller.poll_github(false).await;
+
+        assert!(
+            fake.calls.lock().unwrap().is_empty(),
+            "no GitHub request may be made for a session whose merge is already handled",
+        );
+    }
+
+    /// With `[auto_reap]` off (the default), a detected merge must NOT clean
+    /// the worker up: the session keeps its live status so the orchestrator
+    /// can run post-merge validation in it, and the `merged_at` stamp is
+    /// what records that the merge was already handled.
+    #[tokio::test]
+    async fn merge_detection_keeps_worker_alive_when_auto_reap_disabled() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Mergeable;
+        s.orchestrator_id = Some("orch1".into());
+        s.pr_number = Some(7);
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        let handled = poller.handle_merge_detection(&s, 7, true, false).await;
+        assert!(handled, "the merge is handled (enrichment skipped) even without cleanup");
+
+        let after = store.get_session("w1").unwrap().unwrap();
+        assert!(
+            matches!(after.status, SessionStatus::Mergeable),
+            "without auto_reap the session must keep its live status, got {:?}",
+            after.status,
+        );
+        assert!(after.merged_at.is_some(), "the merge must be stamped so it's handled exactly once");
+        assert!(
+            after.terminal_at.is_none(),
+            "no terminal_at — the session is alive, not on a retention countdown",
+        );
+
+        let events = drain_events(&mut rx);
+        let merged_notifs = events.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+        )).count();
+        assert_eq!(merged_notifs, 1, "exactly one WorkerDone notification for the merge");
+    }
+
+    /// Even with `[auto_reap]` off, a worker whose process already exited
+    /// (`Terminated`) before its PR merged must NOT be treated as kept-alive:
+    /// there's no live agent to validate in. It gets cleaned up to `Done`
+    /// and the plain done-reaction — never the "still alive" wording, and
+    /// never a `merged_at` stamp that would strand a dead row.
+    #[tokio::test]
+    async fn merge_detection_cleans_up_a_dead_worker_even_with_auto_reap_off() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Terminated; // process exited while PR was open
+        s.orchestrator_id = Some("orch1".into());
+        s.pr_number = Some(7);
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        assert!(poller.handle_merge_detection(&s, 7, true, false).await);
+
+        let after = store.get_session("w1").unwrap().unwrap();
+        assert!(
+            matches!(after.status, SessionStatus::Done),
+            "a dead worker's merge must clean it up regardless of auto_reap, got {:?}",
+            after.status,
+        );
+        assert!(after.merged_at.is_none(), "a dead worker must not be stamped as kept-alive");
+        assert!(after.terminal_at.is_some(), "cleanup must stamp terminal_at for the retention sweep");
+
+        // The reaction must be the plain done one — asserting no session is
+        // falsely advertised as alive. The kept-alive text contains "alive";
+        // the plain one does not.
+        let msgs = drain_events(&mut rx);
+        let notif = msgs.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerDone
+        )).count();
+        assert_eq!(notif, 1, "exactly one WorkerDone notification");
+    }
+
+    /// The next tick re-reads the kept-alive session (still a live status,
+    /// but `merged_at` stamped) — merge detection must keep returning `true`
+    /// so enrichment stays skipped, without re-notifying.
+    #[tokio::test]
+    async fn merge_detection_does_not_renotify_a_kept_alive_merged_session() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Mergeable;
+        s.orchestrator_id = Some("orch1".into());
+        s.pr_number = Some(7);
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        assert!(poller.handle_merge_detection(&s, 7, true, false).await);
+
+        let updated = store.get_session("w1").unwrap().unwrap();
+        let second = poller.handle_merge_detection(&updated, 7, true, false).await;
+        assert!(second, "an already-stamped session still skips enrichment");
 
         let events = drain_events(&mut rx);
         let merged_notifs = events.iter().filter(|e| matches!(
@@ -3620,7 +6069,7 @@ mod tests {
         let engine = Engine::new(store.clone());
         let poller = Poller::new(engine);
 
-        let handled = poller.handle_merge_detection(&s, 1, false).await;
+        let handled = poller.handle_merge_detection(&s, 1, false, true).await;
         assert!(!handled);
         assert!(matches!(store.get_session("w1").unwrap().unwrap().status, SessionStatus::Working));
     }
@@ -3661,6 +6110,37 @@ mod tests {
 
         let events = drain_events(&mut rx);
         assert!(events.iter().any(|e| matches!(e, Event::SessionDone(id) if id == "expired")));
+    }
+
+    /// Reconciliation stamps an un-resumable dead session `Terminated` with
+    /// a `terminal_at`; under a manual restore policy it must still be
+    /// there (worktree included) when the user gets round to restoring.
+    #[tokio::test]
+    async fn sweep_retired_sessions_keeps_unrestored_fleet_candidates() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let long_ago = now_millis() - SessionRetentionConfig::default().retention_millis() - 1_000;
+        for id in ["sweep-candidate", "sweep-not-candidate"] {
+            let mut s = test_session(id, "/ws");
+            s.status = SessionStatus::Terminated;
+            s.terminal_at = Some(long_ago);
+            store.upsert_session(&s).unwrap();
+            store.record_interruption(id, long_ago - 1, &SessionStatus::Working, Some("reboot")).unwrap();
+        }
+        store.mark_reconciled_terminal("sweep-candidate", long_ago).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+        poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
+
+        assert!(store.get_session("sweep-candidate").unwrap().is_some(), "awaiting restore: kept");
+        assert!(store.get_session("sweep-not-candidate").unwrap().is_none());
+        let events = drain_events(&mut rx);
+        assert!(!events.iter().any(|e| matches!(
+            e, Event::Notification(n) if n.session_id.as_deref() == Some("sweep-candidate")
+        )), "no 'retired' notice for a session still awaiting restore");
     }
 
     /// A session terminated via a direct user action
@@ -3780,7 +6260,7 @@ mod tests {
 
         // The merge-detection happy path — this already notifies orch1 and
         // marks the session Done.
-        assert!(poller.handle_merge_detection(&s, 7, true).await);
+        assert!(poller.handle_merge_detection(&s, 7, true, true).await);
         drain_events(&mut rx); // discard the merge-detection's own notification/events
 
         // Fast-forward past the retention window and let the sweep purge it.
@@ -3797,5 +6277,162 @@ mod tests {
             e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerRetired
         )).count();
         assert_eq!(retired_notifs, 0, "must not re-notify a session already told about its merge");
+    }
+
+    // ── Dead-session reconciliation ─────────────────────────────────────────
+
+    fn test_poller() -> (Poller, std::sync::Arc<crate::store::Store>) {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let engine = Engine::new(store.clone());
+        (Poller::new(engine), store)
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_dead_session_interrupted_when_resumable() {
+        // Session in Working state, a claude_session_id, and no live tmux
+        // session behind it (tests never create real tmux sessions on the
+        // private socket, so has_session() is false).
+        let (poller, store) = test_poller();
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Working;
+        s.claude_session_id = Some("abc".into());
+        s.agent_type = "claude-code".into(); // default harness: has resume args
+        store.upsert_session(&s).unwrap();
+
+        poller.reconcile_dead_sessions().await;
+
+        let after = store.get_session("w1").unwrap().unwrap();
+        assert_eq!(after.status, SessionStatus::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_the_interruption_for_fleet_restore() {
+        let (poller, store) = test_poller();
+        let mut s = test_session("w3", "/ws");
+        s.status = SessionStatus::PrOpen;
+        s.claude_session_id = Some("abc".into());
+        s.agent_type = "claude-code".into();
+        store.upsert_session(&s).unwrap();
+
+        poller.reconcile_dead_sessions().await;
+
+        let rec = store.fleet_record("w3").unwrap().expect("interruption recorded");
+        assert_eq!(rec.last_status, Some(SessionStatus::PrOpen));
+        assert!(rec.interrupted_at.is_some());
+        assert!(rec.interrupt_cause.is_some());
+        assert!(rec.awaiting_restore());
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_terminal_sessions() {
+        let (poller, store) = test_poller();
+        let mut s = test_session("w2", "/ws");
+        s.status = SessionStatus::Done;
+        store.upsert_session(&s).unwrap();
+
+        poller.reconcile_dead_sessions().await;
+
+        assert_eq!(store.get_session("w2").unwrap().unwrap().status, SessionStatus::Done);
+    }
+
+    #[test]
+    fn session_with_id_and_resumable_harness_becomes_interrupted() {
+        assert_eq!(
+            reconciled_status_for_dead_session(&Some("uuid-1".into()), true),
+            SessionStatus::Interrupted,
+        );
+    }
+
+    #[test]
+    fn legacy_session_without_id_becomes_terminated() {
+        assert_eq!(
+            reconciled_status_for_dead_session(&None, true),
+            SessionStatus::Terminated,
+        );
+    }
+
+    #[test]
+    fn session_under_non_resumable_harness_becomes_terminated_even_with_an_id() {
+        assert_eq!(
+            reconciled_status_for_dead_session(&Some("uuid-1".into()), false),
+            SessionStatus::Terminated,
+        );
+    }
+
+    /// A worker kept alive past its merge (`[auto_reap]` off, `merged_at`
+    /// stamped) that is later reaped/terminated must be purged WITHOUT the
+    /// retired notice — its "PR was not detected as merged" wording would
+    /// flatly contradict the worker-done reaction the orchestrator already
+    /// received at merge-detection time.
+    #[tokio::test]
+    async fn sweep_retired_sessions_skips_retired_notice_for_a_merge_stamped_worker() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut s = test_session("w1", "/ws");
+        s.status = SessionStatus::Terminated;
+        s.orchestrator_id = Some("orch1".into());
+        s.pr_number = Some(7);
+        s.merged_at = Some(1_000);
+        // No terminal_at — a reap is a direct action, purged on sight.
+        store.upsert_session(&s).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
+
+        assert!(store.get_session("w1").unwrap().is_none(), "session must still be purged");
+
+        let events = drain_events(&mut rx);
+        let retired_notifs = events.iter().filter(|e| matches!(
+            e, Event::Notification(n) if n.kind == crate::types::NotificationKind::WorkerRetired
+        )).count();
+        assert_eq!(
+            retired_notifs, 0,
+            "no retired notice for a worker whose merge was already announced",
+        );
+    }
+
+    /// A merged-but-kept-alive worker (live status, `merged_at` set) whose
+    /// orchestrator never reaps it must still be reclaimed once `merged_at`
+    /// ages past the retention window — otherwise it leaks its row/worktree
+    /// forever, losing the guaranteed cleanup the pre-toggle merge path had.
+    /// One still inside the window survives.
+    #[tokio::test]
+    async fn sweep_reclaims_a_kept_alive_merged_worker_past_the_window() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let window = SessionRetentionConfig::default().retention_millis();
+        let now = now_millis();
+
+        // Stale: merged well past the window, still parked in a live status.
+        let mut stale = test_session("stale", "/ws-stale");
+        stale.status = SessionStatus::Mergeable;
+        stale.merged_at = Some(now - window - 1);
+        store.upsert_session(&stale).unwrap();
+
+        // Fresh: merged just now, still within its validation window.
+        let mut fresh = test_session("fresh", "/ws-fresh");
+        fresh.status = SessionStatus::Mergeable;
+        fresh.merged_at = Some(now);
+        store.upsert_session(&fresh).unwrap();
+
+        let engine = Engine::new(store.clone());
+        let poller = Poller::new(engine);
+        poller.sweep_retired_sessions(&SessionRetentionConfig::default()).await;
+
+        assert!(
+            store.get_session("stale").unwrap().is_none(),
+            "a kept-alive merged worker past the window must be reclaimed",
+        );
+        assert!(
+            store.get_session("fresh").unwrap().is_some(),
+            "a kept-alive merged worker still within its window must survive",
+        );
     }
 }

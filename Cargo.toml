@@ -3,6 +3,7 @@ members = [
     "crates/ninox-core",
     "crates/ninox-server",
     "crates/ninox-app",
+    "crates/ninox-ptyd",
 ]
 resolver = "2"
 
@@ -15,7 +16,13 @@ rusqlite    = { version = "0.31", features = ["bundled"] }
 anyhow      = "1"
 toml        = "0.8"
 dirs        = "5"
-fastembed   = "5"
+# fastembed's default features select the native-tls variants of its hf-hub
+# and ort-binary-download transports, which pull native-tls → openssl-sys and
+# make the build require system OpenSSL headers (absent on stock Ubuntu — CI
+# only passed because GitHub runner images preinstall libssl-dev). Select the
+# rustls variants instead so the whole workspace stays on rustls with no
+# system OpenSSL requirement.
+fastembed   = { version = "5", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls", "image-models"] }
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-util  = { version = "0.7",  features = ["codec"] }
@@ -42,3 +49,6 @@ time        = { version = "0.3", features = ["formatting"] }
 # SigV4-signed requests) rides the same TLS stack as the rest of the workspace.
 aws-config  = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls", "sso"] }
 aws-sdk-s3  = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+ratatui     = "0.29"
+crossterm   = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"

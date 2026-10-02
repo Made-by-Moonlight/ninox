@@ -32,38 +32,8 @@ pub fn category_color(s: &ColorScheme, ty: &str) -> Color {
         "decisions"     => s.cat_decision,
         "relationships" => s.cat_relationship,
         "errors"        => s.cat_error,
-        _               => procedural_category_color(s, ty),
+        _               => s.faint,
     }
-}
-
-/// Deterministic HSL-hue fallback for any category outside the 8
-/// hand-picked taxonomy colors above — used instead of a flat grey so an
-/// unrecognized or novel category type still reads as its own distinct
-/// color. The same `ty` string always yields the same hue (via `hash01`,
-/// reused from the pinboard's deterministic-layout seed), and saturation/
-/// lightness are fixed per theme to stay legible against `paper`/`ink`.
-fn procedural_category_color(s: &ColorScheme, ty: &str) -> Color {
-    let hue = crate::components::brain_pinboard::hash01(ty, 29) * 360.0;
-    let (sat, light) = if s.dark { (0.45, 0.62) } else { (0.45, 0.40) };
-    hsl_to_rgb(hue, sat, light)
-}
-
-/// Standard HSL→RGB conversion (`h` in degrees `[0, 360)`, `s`/`l` in
-/// `[0, 1]`), returning an opaque `iced::Color`.
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Color {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let h_prime = h / 60.0;
-    let x = c * (1.0 - (h_prime.rem_euclid(2.0) - 1.0).abs());
-    let (r1, g1, b1) = match h_prime as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    let m = l - c / 2.0;
-    Color::from_rgb(r1 + m, g1 + m, b1 + m)
 }
 
 /// Parse the raw text between `[[` and `]]`, handling Obsidian's optional
@@ -219,9 +189,9 @@ pub fn resolve_link<'a>(entries: &'a [BrainEntry], link: &str) -> Option<&'a Bra
 }
 
 /// (category, count), taxonomy order first, then alphabetic for unknown types.
-pub fn categories(entries: &[BrainEntry]) -> Vec<(String, usize)> {
+pub fn categories<E: std::borrow::Borrow<BrainEntry>>(entries: &[E]) -> Vec<(String, usize)> {
     let mut counts: std::collections::HashMap<&str, usize> = Default::default();
-    for e in entries { *counts.entry(e.entry_type.as_str()).or_default() += 1; }
+    for e in entries { *counts.entry(e.borrow().entry_type.as_str()).or_default() += 1; }
     let mut out: Vec<(String, usize)> = Vec::new();
     for t in TAXONOMY {
         if let Some(n) = counts.remove(t) { out.push(((*t).to_string(), n)); }
@@ -472,6 +442,8 @@ fn hover_preview_slip<'a>(s: &'a ColorScheme, entry: &'a BrainEntry) -> Element<
         .into()
 }
 
+/// Pinboard mode: the same drawers rail catalogue mode uses, beside the
+/// specimen-board canvas.
 fn pinboard_body(app: &App) -> Element<'_, Message> {
     let s = &app.scheme;
 
@@ -480,18 +452,15 @@ fn pinboard_body(app: &App) -> Element<'_, Message> {
         .height(Length::Fill)
         .style(move |_theme| crate::style::heavy_frame(s));
 
-    // Preview slip shows whichever is active: a live hover takes precedence
-    // over a persisted selection (e.g. from a drawer click), so moving the
-    // mouse over a different node always reflects what's under the cursor;
-    // otherwise the selected entry's slip stays up as the "highlight in
-    // place" feedback for a drawer-driven selection. Either id may no
-    // longer exist (a reindex/catalogue switch can drop or rename entries
-    // out from under a stale hover/selection) — resolve defensively and
+    // Hovered id may no longer exist (a reindex/catalogue switch can drop or
+    // rename entries out from under a stale hover) — resolve defensively and
     // simply skip the slip rather than panicking or showing stale content.
-    let display_id = app.brain_view.hovered.clone().or_else(|| app.brain_view.selected.clone());
-    let display_entry =
-        display_id.as_deref().and_then(|id| app.brain_view.entries.iter().find(|e| e.id == id));
-    let board: Element<Message> = match display_entry {
+    let hovered_entry = app
+        .brain_view
+        .hovered
+        .as_deref()
+        .and_then(|id| app.brain_view.entries.iter().find(|e| e.id == id));
+    let board: Element<Message> = match hovered_entry {
         Some(e) => iced::widget::stack![board_frame, hover_preview_slip(s, e)].into(),
         None => board_frame.into(),
     };
@@ -520,12 +489,14 @@ fn catalogue_body(app: &App) -> Element<'_, Message> {
 fn drawers_rail(app: &App) -> Element<'_, Message> {
     let s = &app.scheme;
 
-    let filtered_entries: Vec<BrainEntry> = app
+    // Borrowed, not cloned: the pinboard's 60Hz physics subscription
+    // re-renders this rail every frame, and `BrainEntry` carries each
+    // note's full markdown body.
+    let filtered_entries: Vec<&BrainEntry> = app
         .brain_view
         .entries
         .iter()
         .filter(|e| matches_filter(e, &app.brain_view.filter))
-        .cloned()
         .collect();
 
     let body: Element<Message> = if filtered_entries.is_empty() {
@@ -562,7 +533,7 @@ fn drawer<'a>(
     app: &'a App,
     cat: &str,
     count: usize,
-    filtered_entries: &[BrainEntry],
+    filtered_entries: &[&BrainEntry],
 ) -> Element<'a, Message> {
     let s = &app.scheme;
     let color = category_color(s, cat);
@@ -603,7 +574,7 @@ fn drawer<'a>(
 
     if is_open {
         let mut entries: Vec<&BrainEntry> =
-            filtered_entries.iter().filter(|e| e.entry_type == cat).collect();
+            filtered_entries.iter().copied().filter(|e| e.entry_type == cat).collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         children.extend(entries.into_iter().map(|e| dentry_row(app, e)));
     }
@@ -613,35 +584,38 @@ fn drawer<'a>(
     column(children).into()
 }
 
-/// One entry in an open drawer. Selected = accent 3px left bar + `card` bg
-/// + `MONO_MEDIUM`; hovered = `paper_2` bg (visibly distinct from the
-///   transparent resting state) — an old regression collapsed hover to a
-///   no-op, so this must render differently in all three states. Also
-///   dispatches `BrainHoverEntry` on mouse-enter/exit so the pinboard
-///   canvas's hover ring/preview slip react to a drawer hover the same way
-///   they react to hovering the node directly — a no-op in Catalogue mode,
-///   which doesn't read `hovered`.
+/// One drawer entry row. An old regression collapsed hover to a no-op, so
+/// all four states — resting, local-hover, cross-hover, selected — must
+/// stay visually distinct from each other.
 fn dentry_row<'a>(app: &'a App, entry: &BrainEntry) -> Element<'a, Message> {
     let s = &app.scheme;
     let is_selected = app.brain_view.selected.as_deref() == Some(entry.id.as_str());
+    // Hovered via the *pinboard* canvas, not this row's own mouse-over —
+    // rendered as a lighter tint so it reads differently from both the
+    // selected accent bar and the local button-hover background below.
+    let is_cross_hovered =
+        !is_selected && app.brain_view.hovered.as_deref() == Some(entry.id.as_str());
     let id = entry.id.clone();
     let hover_id = entry.id.clone();
     let name = entry.name.clone();
+    let dot_color = category_color(s, &entry.entry_type);
     let updated: String = entry.updated.as_deref().unwrap_or("").chars().take(10).collect();
     let bar_color = if is_selected { s.accent } else { Color::TRANSPARENT };
 
-    let row = button(
+    let row_button = button(
         row![
             vline(bar_color, 3.0),
             container(
                 row![
+                    text("●").size(8).color(dot_color),
+                    Space::new(8, 0),
                     text(name).size(10.5).font(if is_selected { MONO_MEDIUM } else { MONO }),
                     Space::new(Length::Fill, 0),
                     text(updated).size(8.5).font(MONO).color(s.faint),
                 ]
                 .align_y(Alignment::Center),
             )
-            .padding(iced::Padding { top: 4.0, right: 16.0, bottom: 4.0, left: 44.0 })
+            .padding(iced::Padding { top: 4.0, right: 16.0, bottom: 4.0, left: 36.0 })
             .width(Length::Fill),
         ]
         .height(Length::Fixed(22.0)),
@@ -652,10 +626,15 @@ fn dentry_row<'a>(app: &'a App, entry: &BrainEntry) -> Element<'a, Message> {
     .style(move |_theme, status| {
         let hovered = matches!(status, button::Status::Hovered);
         button::Style {
+            // `hovered` is checked before `is_cross_hovered` because the
+            // `mouse_area` below drives `brain_view.hovered` too, so a
+            // plain local hover makes both true — local hover wins.
             background: Some(Background::Color(if is_selected {
                 s.card
             } else if hovered {
                 s.paper_2
+            } else if is_cross_hovered {
+                Color { a: 0.45, ..s.paper_2 }
             } else {
                 Color::TRANSPARENT
             })),
@@ -665,8 +644,8 @@ fn dentry_row<'a>(app: &'a App, entry: &BrainEntry) -> Element<'a, Message> {
         }
     });
 
-    mouse_area(row)
-        .on_enter(Message::BrainHoverEntry(Some(hover_id)))
+    mouse_area(row_button)
+        .on_enter(Message::BrainHoverEntry(Some(hover_id.clone())))
         .on_exit(Message::BrainHoverEntry(None))
         .into()
 }
@@ -934,32 +913,6 @@ mod tests {
         ];
         let cats = categories(&all);
         assert_eq!(cats, vec![("symbols".to_string(), 2), ("errors".to_string(), 1)]);
-    }
-
-    #[test]
-    fn category_color_known_taxonomy_types_are_unaffected_by_the_fallback() {
-        let s = crate::theme::dark();
-        assert_eq!(category_color(&s, "errors"), s.cat_error);
-        assert_eq!(category_color(&s, "repos"), s.status_pr_open);
-    }
-
-    #[test]
-    fn category_color_falls_back_to_a_procedural_color_for_unrecognized_types() {
-        let s = crate::theme::dark();
-        let color = category_color(&s, "totally-new-category");
-        assert_ne!(color, s.faint, "must not wash out to flat grey");
-    }
-
-    #[test]
-    fn category_color_procedural_fallback_is_deterministic() {
-        let s = crate::theme::dark();
-        assert_eq!(category_color(&s, "widgets"), category_color(&s, "widgets"));
-    }
-
-    #[test]
-    fn category_color_procedural_fallback_differs_across_distinct_unknown_categories() {
-        let s = crate::theme::dark();
-        assert_ne!(category_color(&s, "widgets"), category_color(&s, "gadgets"));
     }
 
     #[test]

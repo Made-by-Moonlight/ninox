@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use ninox_core::{
-    events::Engine, pty, tmux, Event, PooledCheckoutLease, PooledCheckoutState, Session,
-    SessionFields, SessionStatus, Store,
+    events::Engine, pty, runtime, session_socket::CLAUDE_MESSAGING_GATE_ENV, Event,
+    PooledCheckoutLease, PooledCheckoutState, Session, SessionFields, SessionStatus, Store,
 };
 
 pub const EXECUTION_ROLE_ENV: &str = "NINOX_EXECUTION_ROLE";
@@ -72,7 +72,18 @@ pub struct InteractiveSpawnParams {
 /// Working forever, and `None` is returned.
 pub async fn spawn_interactive_session(
     engine: Arc<Engine>,
+    p: InteractiveSpawnParams,
+) -> Option<Vec<String>> {
+    launch_interactive_session(engine, p, true).await
+}
+
+/// [`spawn_interactive_session`] with PTY streaming optional: a short-lived
+/// CLI process (`ninox fleet restore`) must not pipe the pane into a FIFO
+/// that dies with it.
+pub async fn launch_interactive_session(
+    engine: Arc<Engine>,
     mut p: InteractiveSpawnParams,
+    stream_pty: bool,
 ) -> Option<Vec<String>> {
     let sid = p.session_id;
     let execution_role = p
@@ -89,7 +100,7 @@ pub async fn spawn_interactive_session(
         |role| role == ORCHESTRATOR_EXECUTION_ROLE,
     );
 
-    let ninox_bin = std::env::current_exe()
+    let ninox_bin = ninox_core::hooks::canonical_exe()
         .ok()
         .and_then(|x| x.to_str().map(str::to_string))
         .unwrap_or_else(|| "ninox".to_string());
@@ -123,8 +134,23 @@ pub async fn spawn_interactive_session(
     let base_cmd = p.base_cmd;
     let launch_cmd = format!("export PATH='{ninox_bin_dir_str}':\"$PATH\"; {base_cmd}");
 
-    if let Err(e) = tmux::create_session(&sid, &p.workspace, &launch_cmd, &env).await {
-        tracing::error!("tmux create failed for {sid}: {e}");
+    // Without a trust entry the session blocks forever on Claude Code's
+    // "do you trust this folder?" dialog instead of reaching its input
+    // prompt (fresh orchestrator workspaces and worker worktrees have none).
+    // On a blocking thread for the same reason as `create_worker_worktree`:
+    // this reads and rewrites the user's whole ~/.claude.json (hundreds of
+    // KB of accumulated per-project state) and would stall a runtime worker.
+    let trust_ws = p.workspace.clone();
+    let seed = tokio::task::spawn_blocking(move || {
+        ninox_core::trust::seed_workspace_trust(std::path::Path::new(&trust_ws))
+    })
+    .await;
+    if let Err(e) = seed.unwrap_or_else(|join_err| Err(anyhow::anyhow!(join_err))) {
+        tracing::warn!("failed to seed claude workspace trust for {}: {e}", p.workspace);
+    }
+
+    if let Err(e) = runtime::create_session(runtime::configured_backend(), &sid, &p.workspace, &launch_cmd, &env).await {
+        tracing::error!("session create failed for {sid}: {e}");
         // Surface the failure: without this the optimistically inserted
         // session would sit in Working forever.
         if engine
@@ -143,7 +169,7 @@ pub async fn spawn_interactive_session(
             ninox_core::workers::register_live_orchestrator_runtime(&engine.store, &sid).await
         {
             tracing::error!("orchestrator runtime registration failed for {sid}: {error}");
-            let _ = tmux::kill_private_session(&sid).await;
+            let _ = runtime::kill_session(&sid).await;
             let _ = engine
                 .store
                 .update_session_status_snapshot(&sid, p.started_at, p.failure_status);
@@ -153,11 +179,7 @@ pub async fn spawn_interactive_session(
 
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
-    let pid = tmux::list_sessions()
-        .await
-        .ok()
-        .and_then(|ss| ss.into_iter().find(|s| s.id == sid))
-        .and_then(|s| s.pid);
+    let pid = runtime::session_pid(&sid).await;
 
     // Resume and Re-file respawn an *existing* row — carry forward every
     // field the spawn isn't authoritative for (PR linkage, gate breakdown,
@@ -172,6 +194,7 @@ pub async fn spawn_interactive_session(
     // ends.
     let prior = engine.store.get_session(&sid).ok().flatten();
     let prior = prior.as_ref();
+    let resumed = prior.and_then(|s| s.claude_session_id.as_deref()) == Some(p.claude_session_id.as_str());
     let updated = Session {
         id:              sid.clone(),
         orchestrator_id: p.orchestrator_id,
@@ -194,17 +217,88 @@ pub async fn spawn_interactive_session(
         claude_session_id: Some(p.claude_session_id),
         summary:         p.summary,
         terminal_at:     None,
+        // Carried so a resumed session whose PR already merged doesn't
+        // re-fire merge detection (a duplicate notification — or, with
+        // `[auto_reap]` on, an instant cleanup of the row just respawned).
+        merged_at:       prior.and_then(|s| s.merged_at),
         gate_status:     prior.and_then(|s| s.gate_status.clone()),
+        // Activity is NOT carried: a respawn is a fresh agent incarnation,
+        // so a prior Blocked/note would lie until the new incarnation's
+        // first hook fires. Unknown is the honest interim value.
+        activity:        Default::default(),
+        activity_note:   None,
+        activity_since:  None,
     };
     let _ = engine.store.upsert_session(&updated);
     engine.emit(Event::SessionUpdated(updated, SessionFields::ALL));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    ninox_core::fleet::note_relaunch(&engine.store, &sid, resumed, now);
 
-    if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &sid).await {
-        tracing::error!("pty setup failed for {sid}: {e}");
+    if stream_pty {
+        if let Err(e) = pty::start_streaming(engine.clone(), sid.clone(), &sid).await {
+            tracing::error!("pty setup failed for {sid}: {e}");
+        }
     }
 
     // Hidden tmux client attach argv — mirrors NavigateSession's attach flow.
-    Some(tmux::attach_args(&sid).await)
+    Some(runtime::attach_args(&sid).await)
+}
+
+/// Everything needed to relaunch an existing session row under its own id.
+pub struct RelaunchRequest {
+    pub session:           Session,
+    pub is_orchestrator:   bool,
+    pub plan:              crate::app::RefilePlan,
+    /// The id to `--resume` (Resume) or a freshly minted one (fresh restart).
+    pub claude_session_id: String,
+    pub started_at:        i64,
+    pub failure_status:    SessionStatus,
+}
+
+/// The shared relaunch sequence behind the app's Resume action and `ninox
+/// fleet restore`: kill any stale pane, make sure the workspace exists,
+/// then launch under the same session id.
+pub async fn relaunch_in_place(
+    engine:     Arc<Engine>,
+    req:        RelaunchRequest,
+    config:     &ninox_core::config::AppConfig,
+    stream_pty: bool,
+) -> Option<Vec<String>> {
+    let id = req.session.id.clone();
+    let _ = ninox_core::runtime::kill_session(&id).await;
+    // The worktree may have been torn down since the session ran (merge
+    // cleanup, manual prune). Recreate it at the same path — claude-code
+    // keys the conversation to that path, so this is what makes `--resume`
+    // find it. On failure, fall through: `create_session` rejects a
+    // missing workspace, so the spawn fails visibly into `failure_status`
+    // instead of the agent silently starting in $HOME.
+    if let Err(e) = ensure_session_workspace_with_store(
+        &engine.store, &req.plan.workspace, &id, req.is_orchestrator, config,
+    ).await {
+        tracing::warn!("relaunch {id}: cannot restore workspace: {e}");
+    }
+    launch_interactive_session(
+        engine,
+        InteractiveSpawnParams {
+            session_id:        id,
+            name:              req.session.name,
+            workspace:         req.plan.workspace,
+            repo:              req.session.repo,
+            orchestrator_id:   req.session.orchestrator_id,
+            agent:             req.plan.agent,
+            base_cmd:          req.plan.base_cmd,
+            catalogue_path:    req.plan.catalogue_path,
+            extra_env:         req.plan.extra_env,
+            started_at:        req.started_at,
+            claude_session_id: req.claude_session_id,
+            failure_status:    req.failure_status,
+            summary:           req.session.summary,
+        },
+        stream_pty,
+    )
+    .await
 }
 
 pub async fn configured_worker_rust_cache_env(
@@ -279,6 +373,17 @@ fn interactive_env_vars<'a>(
         ("NINOX_BRAIN",    catalogue_path),
         ("NINOX_SESSION",  session_id),
         ("NINOX_DATA_DIR", sessions_dir),
+        // Claude Code gates its cross-session messaging socket behind a
+        // remote flag that defaults to OFF, and a session started without
+        // it advertises no socket at all. Since that socket is what
+        // `SendMechanism::SessionSocket` delivers over, leaving the gate to
+        // chance means the configured mechanism silently degrades to
+        // keystrokes on any machine the flag has not reached — working, but
+        // never actually the mechanism that was chosen. This env var is the
+        // gate's own first branch, so setting it makes the behaviour of a
+        // ninox-spawned session deterministic instead of dependent on
+        // someone else's rollout.
+        (CLAUDE_MESSAGING_GATE_ENV, "1"),
     ];
     for (k, v) in extra_env {
         env.push((k.as_str(), v.as_str()));
@@ -908,6 +1013,20 @@ pub async fn stop_exact_worker_runtime(
     incarnation_id: &str,
     caller_session: Option<&str>,
 ) -> anyhow::Result<()> {
+    // ptyd exposes no per-pane environment, so its panes can't be matched to
+    // an incarnation; the session id is the strongest identity available.
+    if ninox_core::runtime::ptyd_pane_pid(session_id).await.is_some() {
+        anyhow::ensure!(
+            caller_session != Some(session_id),
+            "worker {session_id} cannot release its checkout while its own runtime is active"
+        );
+        ninox_core::runtime::kill_session(session_id).await?;
+        anyhow::ensure!(
+            !ninox_core::runtime::has_session(session_id).await,
+            "worker runtime absence could not be confirmed after stop"
+        );
+        return Ok(());
+    }
     let runtime = ninox_core::tmux::session_env(session_id, "NINOX_WORKER_INCARNATION").await?;
     let Some(runtime) = runtime else {
         return Ok(());
@@ -944,7 +1063,9 @@ pub async fn stop_exact_worker_runtime(
 /// running it directly on the calling task would tie up a runtime worker
 /// thread for that whole checkout.
 ///
-/// `inbox_enabled` is the caller's `AppConfig.inbox_messaging.enabled` —
+/// `inbox_enabled` is whether the caller's configured send mechanism is
+/// `SendMechanism::Inbox` (`AppConfig::send_mechanism()`), which is the only
+/// one whose delivery depends on drain hooks existing in the worktree —
 /// threaded through explicitly (rather than read here via
 /// `AppConfig::load()`) so callers control it and tests can exercise both
 /// states without touching the real user config file. See
@@ -988,25 +1109,25 @@ pub async fn create_worker_worktree(
 ///   deletes the branch along with the worktree, and that's fine: a fresh
 ///   branch is cut from the repo's HEAD in that case (the conversation
 ///   lookup only needs the *path* back, not the branch), while a surviving
-///   branch is checked out again. Re-seeds the brain skill the original
-///   spawn wrote (git-excluded, so never on the branch either way).
+///   branch is checked out again. Re-seeds the worker skills the original
+///   spawn wrote (git-excluded, so never on the branch either way) via
+///   [`seed_worker_skills`], gated by `config` exactly as the spawn was.
 /// - Missing and anything else → error, so the spawn fails visibly instead
 ///   of the agent silently running in the wrong directory.
 pub async fn ensure_session_workspace(
-    workspace:       &str,
-    session_id:      &str,
-    is_orchestrator: bool,
-    inbox_enabled:   bool,
+    workspace:         &str,
+    session_id:        &str,
+    is_orchestrator:   bool,
+    config:            &ninox_core::config::AppConfig,
 ) -> anyhow::Result<()> {
+    let inbox_enabled = config.send_mechanism() == ninox_core::config::SendMechanism::Inbox;
     if is_orchestrator {
         std::fs::create_dir_all(workspace)?;
         return Ok(());
     }
     if std::path::Path::new(workspace).is_dir() {
         ensure_statusline_settings(std::path::Path::new(workspace), inbox_enabled);
-        if let Err(e) = seed_worker_brain_skill(workspace).await {
-            tracing::warn!("failed to re-seed brain skill for {session_id}: {e}");
-        }
+        seed_worker_skills(workspace, config).await;
         return Ok(());
     }
     if let Some(mut managed) = ninox_core::worktree::ManagedWorktree::load_for_workspace(
@@ -1019,9 +1140,7 @@ pub async fn ensure_session_workspace(
             let _ = managed.remove_checkout_if_matches_with_metadata(false);
             return Err(error);
         }
-        if let Err(e) = seed_worker_brain_skill(workspace).await {
-            tracing::warn!("failed to re-seed brain skill for {session_id}: {e}");
-        }
+        seed_worker_skills(workspace, config).await;
         return Ok(());
     }
     let suffix = format!("/.claude/worktrees/{session_id}");
@@ -1040,9 +1159,7 @@ pub async fn ensure_session_workspace(
         session_id,
         inbox_enabled,
     )?;
-    if let Err(e) = seed_worker_brain_skill(workspace).await {
-        tracing::warn!("failed to re-seed brain skill for {session_id}: {e}");
-    }
+    seed_worker_skills(workspace, config).await;
     Ok(())
 }
 
@@ -1051,8 +1168,9 @@ pub async fn ensure_session_workspace_with_store(
     workspace: &str,
     session_id: &str,
     is_orchestrator: bool,
-    inbox_enabled: bool,
+    config: &ninox_core::config::AppConfig,
 ) -> anyhow::Result<()> {
+    let inbox_enabled = config.send_mechanism() == ninox_core::config::SendMechanism::Inbox;
     if !is_orchestrator {
         if let Some(mut record) = store.pooled_checkout_by_session(session_id)? {
             if matches!(record.state, PooledCheckoutState::Provisioning) {
@@ -1104,9 +1222,7 @@ pub async fn ensure_session_workspace_with_store(
                 record.path.display()
             );
             ensure_statusline_settings(&record.path, inbox_enabled);
-            if let Err(e) = seed_worker_brain_skill(workspace).await {
-                tracing::warn!("failed to re-seed brain skill for {session_id}: {e}");
-            }
+            seed_worker_skills(workspace, config).await;
             return Ok(());
         }
         if let Some(record) =
@@ -1119,7 +1235,7 @@ pub async fn ensure_session_workspace_with_store(
             );
         }
     }
-    ensure_session_workspace(workspace, session_id, is_orchestrator, inbox_enabled).await
+    ensure_session_workspace(workspace, session_id, is_orchestrator, config).await
 }
 
 /// Walk up from `start` (inclusive) looking for the nearest ancestor
@@ -1211,12 +1327,13 @@ pub fn create_worktree_at(
 /// branch). Best-effort: any failure here must never fail worktree
 /// creation itself, so errors are swallowed rather than propagated.
 ///
-/// `inbox_enabled` gates the `Stop`/`UserPromptSubmit` hooks that drain the
-/// file-based inbox (`ninox_core::inbox`) — off (the default), this
-/// produces byte-for-byte the same settings as before that feature existed.
-/// On, it installs hooks that run `ninox inbox drain-stop`/`drain-prompt`,
-/// which the harness invokes with `NINOX_SESSION`/`NINOX_DATA_DIR` already
-/// set (see `interactive_env_vars`/`worker_env_vars`).
+/// The `Stop`/`UserPromptSubmit` hooks always carry the worker-status
+/// activity commands (`ninox worker-status hook-stop`/`hook-prompt` — see
+/// `ninox_core::worker_status`); `inbox_enabled` additionally prepends the
+/// file-based inbox drains (`ninox inbox drain-stop`/`drain-prompt`, see
+/// `ninox_core::inbox`). The harness invokes all of them with
+/// `NINOX_SESSION`/`NINOX_DATA_DIR` already set (see
+/// `interactive_env_vars`/`worker_env_vars`).
 fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bool) {
     let claude_dir = worktree_path.join(".claude");
     let settings_path = claude_dir.join("settings.json");
@@ -1251,27 +1368,32 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
             "refreshInterval": 20
         }
     });
+    // Claude Code hook `timeout` is in SECONDS, not milliseconds — 5 gives
+    // these fast, local-filesystem-only handlers a generous margin without
+    // risking an accidental multi-minute hang on a hook error.
+    //
+    // Claude Code runs every entry in an event's `hooks` array, so the
+    // opt-in inbox drains and the always-on worker-status activity hooks
+    // compose as siblings here — this is the single place the `hooks`
+    // object is written (write-if-absent, per the early return above), so
+    // there is no merge path that could duplicate entries.
+    let hook = |cmd: &str| serde_json::json!({
+        "type": "command",
+        "command": format!("{ninox_bin_quoted} {cmd}"),
+        "timeout": 5
+    });
+    let mut stop_hooks = Vec::new();
+    let mut prompt_hooks = Vec::new();
     if inbox_enabled {
-        // Claude Code hook `timeout` is in SECONDS, not milliseconds — 5
-        // gives these fast, local-filesystem-only drains a generous margin
-        // without risking an accidental multi-minute hang on a hook error.
-        settings["hooks"] = serde_json::json!({
-            "Stop": [{
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("{ninox_bin_quoted} inbox drain-stop"),
-                    "timeout": 5
-                }]
-            }],
-            "UserPromptSubmit": [{
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("{ninox_bin_quoted} inbox drain-prompt"),
-                    "timeout": 5
-                }]
-            }]
-        });
+        stop_hooks.push(hook("inbox drain-stop"));
+        prompt_hooks.push(hook("inbox drain-prompt"));
     }
+    stop_hooks.push(hook("worker-status hook-stop"));
+    prompt_hooks.push(hook("worker-status hook-prompt"));
+    settings["hooks"] = serde_json::json!({
+        "Stop":             [{ "hooks": stop_hooks }],
+        "UserPromptSubmit": [{ "hooks": prompt_hooks }]
+    });
     if std::fs::create_dir_all(&claude_dir).is_ok() {
         if let Ok(body) = serde_json::to_string_pretty(&settings) {
             if std::fs::write(&settings_path, body).is_ok() {
@@ -1281,86 +1403,6 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
     }
 }
 
-const WORKER_BRAIN_SKILL: &str = r#"---
-name: brain
-description: Read and write Ninox's shared knowledge brain. Use before touching code you haven't seen before, and before finishing your task.
----
-
-# Read and Write the Brain
-
-The brain is Ninox's persistent, shared knowledge store. Your session's
-brain is already resolved via `NINOX_BRAIN` — these commands act on it with
-no extra configuration.
-
-## Before exploring unfamiliar code
-
-Query first — it blends keyword and semantic matches automatically:
-
-```bash
-ninox brain query "<name or concept>"
-```
-
-If a relevant entry exists, read it before you start digging through files
-yourself. It may save you the exploration entirely.
-
-## Before you finish
-
-Write down anything you discovered that the next session — orchestrator or
-worker — would otherwise have to rediscover: where something lives, why
-it's built the way it is, a gotcha you hit. Write it as a Markdown file
-under the section that fits:
-
-```
-repos/          where repositories live, their purpose, entry points
-symbols/        where types, functions, and modules are defined
-concepts/       domain terminology and mental models
-patterns/       conventions and recurring implementation shapes
-decisions/      why something was built a certain way (ADRs)
-architecture/   how the system is structured — components, data flows
-relationships/  how repos, services, and teams connect
-errors/         known failure modes and how to resolve them
-```
-
-Each entry needs YAML frontmatter followed by a Markdown body. Use
-`ninox brain add <path>` to write it — this indexes the entry immediately,
-so it's queryable right away with no separate reindex step:
-
-```bash
-ninox brain add repos/my-crate.md <<'EOF'
----
-type: repo
-name: my-crate
-tags: [auth, core]
-repos: [my-crate]
-updated: 2026-07-06
----
-
-# my-crate
-
-Entry point: `src/main.rs`
-Build: `cargo build`
-
-Facts, not prose. Link related entries with `[[other-entry]]`.
-EOF
-```
-
-If this brain is remote-backed (team-shared), `ninox brain index` also
-pushes your new entries to the team and pulls theirs — nothing extra to
-do. If it reports a conflict copy (`*.conflict-*.md`), merge it into the
-canonical entry and delete the copy when you're confident.
-
-## The Rule
-
-**Query before touching unfamiliar code. Write down what you found before
-you're done.** A stale or empty brain is no better than no brain at all.
-"#;
-
-/// Writes a worker-flavored brain skill into `workspace` so a spawned
-/// worker/standalone session sees "brain" as a real Claude Code skill from
-/// the moment it starts, and makes sure the file can never end up in a
-/// commit. Best-effort: any failure here should be logged and swallowed by
-/// the caller, not treated as fatal to the spawn (mirrors how
-/// `setup_orchestrator_root`'s own failures are handled in `main.rs`).
 fn git_path_is_tracked(workspace: &std::path::Path, relative_path: &str) -> bool {
     std::process::Command::new("git")
         .arg("-C")
@@ -1411,21 +1453,28 @@ fn exclude_generated_provider_file(workspace: &std::path::Path, relative_path: &
     let _ = writeln!(file, "{relative_path}");
 }
 
-/// Writes a worker-flavored brain skill into `workspace` so a spawned
-/// worker/standalone session sees "brain" as a real Claude Code skill from
-/// the moment it starts, and makes sure the file can never end up in a
-/// commit. Best-effort: any failure here should be logged and swallowed by
-/// the caller, not treated as fatal to the spawn (mirrors how
-/// `setup_orchestrator_root`'s own failures are handled in `main.rs`).
-pub async fn seed_worker_brain_skill(workspace: &str) -> anyhow::Result<()> {
+/// Writes `content` as `SKILL.md` under `.claude/skills/<name>/` inside
+/// `workspace`, so a spawned worker/standalone session sees `<name>` as a
+/// real Claude Code skill from the moment it starts, and makes sure the file
+/// can never end up in a commit. Best-effort: any failure here should be
+/// logged and swallowed by the caller, not treated as fatal to the spawn
+/// (mirrors how `setup_orchestrator_root`'s own failures are handled in
+/// `main.rs`).
+///
+/// Shared mechanism behind [`seed_worker_skills`]: (1) refuse to clobber a
+/// copy that's already tracked in git, (2) write the file, (3) idempotently
+/// exclude its path from the repo's shared `info/exclude` so it never shows
+/// up as untracked/stageable.
+async fn seed_worker_skill(workspace: &str, name: &str, content: &str) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use tokio::fs;
 
     let skill_dir = std::path::Path::new(workspace)
         .join(".claude")
         .join("skills")
-        .join("brain");
+        .join(name);
     let skill_path = skill_dir.join("SKILL.md");
+    let repo_rel_path = format!(".claude/skills/{name}/SKILL.md");
 
     // Guard against clobbering a copy that somehow already got committed
     // (e.g. a branch created before this exclude mechanism existed, or a
@@ -1434,21 +1483,21 @@ pub async fn seed_worker_brain_skill(workspace: &str) -> anyhow::Result<()> {
     // that a later `git commit -am` would then happily pick up, exactly
     // what the exclude step below is meant to prevent.
     let tracked = tokio::process::Command::new("git")
-        .args(["-C", workspace, "ls-files", "--error-unmatch", ".claude/skills/brain/SKILL.md"])
+        .args(["-C", workspace, "ls-files", "--error-unmatch", &repo_rel_path])
         .output()
         .await;
     if let Ok(out) = tracked {
         if out.status.success() {
             anyhow::bail!(
-                "brain skill file is already tracked in this repo — skipping write to avoid touching committed content"
+                "{name} skill file is already tracked in this repo — skipping write to avoid touching committed content"
             );
         }
     }
 
-    fs::create_dir_all(&skill_dir).await.context("create .claude/skills/brain")?;
-    fs::write(&skill_path, WORKER_BRAIN_SKILL)
+    fs::create_dir_all(&skill_dir).await.context("create .claude/skills/<name>")?;
+    fs::write(&skill_path, content)
         .await
-        .context("write brain SKILL.md")?;
+        .context("write SKILL.md")?;
 
     let out = tokio::process::Command::new("git")
         .args(["-C", workspace, "rev-parse", "--git-common-dir"])
@@ -1469,9 +1518,9 @@ pub async fn seed_worker_brain_skill(workspace: &str) -> anyhow::Result<()> {
     };
     let exclude_path = common_dir.join("info").join("exclude");
 
-    const EXCLUDE_LINE: &str = ".claude/skills/brain/";
+    let exclude_line = format!(".claude/skills/{name}/");
     let existing = fs::read_to_string(&exclude_path).await.unwrap_or_default();
-    if !existing.lines().any(|l| l.trim() == EXCLUDE_LINE) {
+    if !existing.lines().any(|l| l.trim() == exclude_line) {
         if let Some(parent) = exclude_path.parent() {
             fs::create_dir_all(parent).await.context("create info dir")?;
         }
@@ -1489,12 +1538,41 @@ pub async fn seed_worker_brain_skill(workspace: &str) -> anyhow::Result<()> {
         if !existing.is_empty() && !existing.ends_with('\n') {
             buf.push('\n');
         }
-        buf.push_str(EXCLUDE_LINE);
+        buf.push_str(&exclude_line);
         buf.push('\n');
         file.write_all(buf.as_bytes()).await.context("append info/exclude")?;
     }
 
     Ok(())
+}
+
+/// Seeds every worker-facing capability that `config` currently enables
+/// into `workspace`, so a spawned worker/standalone session sees them as
+/// real Claude Code skills from the moment it starts — durable, on-disk
+/// instructions rather than one-shot lines in its initial prompt (which are
+/// lost after context compaction).
+///
+/// The list, the markdown, and the per-capability gates all come from
+/// `ninox_core::capabilities::REGISTRY`; `config` is read once here rather
+/// than having each call site thread gating booleans down (today only the
+/// worker `watch-pr` entry is gated, on `[pr_watch].enabled`).
+///
+/// Best-effort and infallible by design: an individual skill that can't be
+/// written (e.g. a tracked copy already in the repo) is logged and skipped,
+/// never fatal to the spawn — mirroring how `setup_orchestrator_root`'s own
+/// failures are handled in `main.rs`.
+pub async fn seed_worker_skills(workspace: &str, config: &ninox_core::config::AppConfig) {
+    use ninox_core::capabilities::{for_audience, Audience};
+
+    for cap in for_audience(Audience::Worker) {
+        if !(cap.enabled)(config) {
+            continue;
+        }
+        let Some(md) = cap.worker_md else { continue };
+        if let Err(e) = seed_worker_skill(workspace, cap.name, md).await {
+            tracing::warn!("failed to seed {} skill in {workspace}: {e}", cap.name);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1516,6 +1594,23 @@ mod tests {
         );
     }
 
+    /// An `AppConfig` differing from the default only in `[pr_watch]`, the
+    /// one toggle any worker capability is gated on today.
+    fn cfg(pr_watch: bool) -> ninox_core::config::AppConfig {
+        let mut c = ninox_core::config::AppConfig::default();
+        c.pr_watch.enabled = pr_watch;
+        c
+    }
+
+    /// The registry's worker markdown for `name` — used by the tests that
+    /// drive [`seed_worker_skill`] directly (they need its `Result`, which
+    /// the best-effort [`seed_worker_skills`] loop deliberately swallows).
+    fn worker_md(name: &str) -> &'static str {
+        ninox_core::capabilities::for_audience(ninox_core::capabilities::Audience::Worker)
+            .find(|c| c.name == name)
+            .and_then(|c| c.worker_md)
+            .unwrap_or_else(|| panic!("no worker capability named {name}"))
+    }
 
     /// Minimal real git repo so `git worktree add` has a commit to branch
     /// from — `create_worker_worktree` shells out to real `git`.
@@ -2064,13 +2159,13 @@ mod tests {
         .await
         .unwrap();
 
-        seed_worker_brain_skill(&checkout.workspace).await.unwrap();
+        seed_worker_skills(&checkout.workspace, &cfg(false)).await;
         let seeded = std::fs::read_to_string(
             std::path::Path::new(&checkout.workspace)
                 .join(".claude/skills/brain/SKILL.md"),
         )
         .unwrap();
-        assert_eq!(seeded.as_bytes(), WORKER_BRAIN_SKILL.as_bytes());
+        assert_eq!(seeded.as_bytes(), worker_md("brain").as_bytes());
     }
 
     #[tokio::test]
@@ -2093,9 +2188,26 @@ mod tests {
             .unwrap();
         assert!(bin_path.ends_with("/ninox"), "expected a path to the ninox binary, got: {bin_path}");
         assert!(command.ends_with("statusline"));
-        // Off by default: no hooks table at all — byte-for-byte what this
-        // worktree's settings looked like before inbox messaging existed.
-        assert!(settings.get("hooks").is_none(), "hooks must be absent when inbox messaging is disabled");
+        // Inbox messaging off: no inbox drain hooks, but the always-on
+        // worker-status activity hooks are still installed.
+        let stop_cmds = hook_commands(&settings, "Stop");
+        assert_eq!(stop_cmds.len(), 1, "only the status hook when inbox is off: {stop_cmds:?}");
+        assert!(stop_cmds[0].ends_with("worker-status hook-stop"), "{stop_cmds:?}");
+        let prompt_cmds = hook_commands(&settings, "UserPromptSubmit");
+        assert_eq!(prompt_cmds.len(), 1, "{prompt_cmds:?}");
+        assert!(prompt_cmds[0].ends_with("worker-status hook-prompt"), "{prompt_cmds:?}");
+    }
+
+    /// Every hook command registered for `event`, across matcher groups.
+    fn hook_commands(settings: &serde_json::Value, event: &str) -> Vec<String> {
+        settings["hooks"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|group| group["hooks"].as_array())
+            .flatten()
+            .filter_map(|hook| hook["command"].as_str().map(String::from))
+            .collect()
     }
 
     #[tokio::test]
@@ -2110,10 +2222,14 @@ mod tests {
         // statusLine must still be there, untouched.
         assert_eq!(settings["statusLine"]["type"], "command");
 
-        let stop_cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(stop_cmd.ends_with("inbox drain-stop"), "unexpected Stop hook command: {stop_cmd}");
-        let prompt_cmd = settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(prompt_cmd.ends_with("inbox drain-prompt"), "unexpected UserPromptSubmit hook command: {prompt_cmd}");
+        // Inbox drain and worker-status hooks compose as siblings on the
+        // same events — installing one must not evict the other.
+        let stop_cmds = hook_commands(&settings, "Stop");
+        assert!(stop_cmds.iter().any(|c| c.ends_with("inbox drain-stop")), "{stop_cmds:?}");
+        assert!(stop_cmds.iter().any(|c| c.ends_with("worker-status hook-stop")), "{stop_cmds:?}");
+        let prompt_cmds = hook_commands(&settings, "UserPromptSubmit");
+        assert!(prompt_cmds.iter().any(|c| c.ends_with("inbox drain-prompt")), "{prompt_cmds:?}");
+        assert!(prompt_cmds.iter().any(|c| c.ends_with("worker-status hook-prompt")), "{prompt_cmds:?}");
     }
 
     #[tokio::test]
@@ -2174,7 +2290,7 @@ mod tests {
             .unwrap();
         assert!(!std::path::Path::new(&worktree).exists(), "sanity: worktree removed");
 
-        ensure_session_workspace(&worktree, "ensure-ws-1", false, false).await.unwrap();
+        ensure_session_workspace(&worktree, "ensure-ws-1", false, &cfg(false)).await.unwrap();
 
         assert!(std::path::Path::new(&worktree).is_dir(), "worktree must be recreated at the same path");
         let out = std::process::Command::new("git")
@@ -2203,7 +2319,7 @@ mod tests {
             .output()
             .unwrap();
 
-        ensure_session_workspace(&worktree, "ensure-ws-2", false, false).await.unwrap();
+        ensure_session_workspace(&worktree, "ensure-ws-2", false, &cfg(false)).await.unwrap();
 
         assert!(std::path::Path::new(&worktree).is_dir(), "worktree must be recreated at the same path");
         let out = std::process::Command::new("git")
@@ -2226,7 +2342,7 @@ mod tests {
         // `git worktree add` fail on both the -b and existing-branch paths.
         std::fs::remove_dir_all(&worktree).unwrap();
 
-        ensure_session_workspace(&worktree, "ensure-ws-3", false, false).await.unwrap();
+        ensure_session_workspace(&worktree, "ensure-ws-3", false, &cfg(false)).await.unwrap();
 
         assert!(std::path::Path::new(&worktree).is_dir(), "worktree must be recreated at the same path");
         let out = std::process::Command::new("git")
@@ -2239,7 +2355,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_session_workspace_is_a_noop_when_the_dir_exists() {
         let dir = tempdir().unwrap().keep();
-        ensure_session_workspace(dir.to_str().unwrap(), "whatever", false, false).await.unwrap();
+        ensure_session_workspace(dir.to_str().unwrap(), "whatever", false, &cfg(false)).await.unwrap();
         assert!(dir.is_dir());
     }
 
@@ -2248,7 +2364,7 @@ mod tests {
         // A missing dir that is NOT a ninox worktree ({repo}/.claude/
         // worktrees/{session_id}) can't be safely recreated — error out so
         // the spawn fails visibly instead of claude starting in $HOME.
-        let result = ensure_session_workspace("/definitely/not/a/real/dir", "sess-x", false, false).await;
+        let result = ensure_session_workspace("/definitely/not/a/real/dir", "sess-x", false, &cfg(false)).await;
         assert!(result.is_err());
     }
 
@@ -2261,7 +2377,7 @@ mod tests {
         let ws = parent.join("orch-1");
         assert!(!ws.exists());
 
-        ensure_session_workspace(ws.to_str().unwrap(), "orch-1", true, false).await.unwrap();
+        ensure_session_workspace(ws.to_str().unwrap(), "orch-1", true, &cfg(false)).await.unwrap();
 
         assert!(ws.is_dir(), "orchestrator workspace must be recreated as a plain dir");
     }
@@ -2386,6 +2502,19 @@ mod tests {
         assert!(env.contains(&("NINOX_ORCHESTRATOR_ID", "orch-1")));
     }
 
+    /// The session-socket mechanism is only reachable if the spawned session
+    /// binds a socket, and that is gated behind a remote flag defaulting to
+    /// off. Without this the default mechanism degrades to keystrokes on any
+    /// machine the flag has not reached — silently, since delivery still
+    /// works. See `ninox_core::session_socket::CLAUDE_MESSAGING_GATE_ENV`.
+    #[test]
+    fn interactive_env_vars_forces_the_cross_session_messaging_gate_on() {
+        let env = interactive_env_vars(
+            "/usr/local/bin/ninox", "/cfg/config.toml", "/brain", "sess-1", "/data/sessions", &[],
+        );
+        assert!(env.contains(&(CLAUDE_MESSAGING_GATE_ENV, "1")));
+    }
+
     #[tokio::test]
     async fn spawn_persists_claude_session_id() {
         use ninox_core::{config::AgentConfig, store::Store, SessionStatus};
@@ -2422,6 +2551,57 @@ mod tests {
         ninox_core::tmux::kill_session("spawn-uuid-test").await.ok();
     }
 
+    /// A session resumed by hand (the app's Resume, not `ninox fleet
+    /// restore`) must close its interruption: otherwise its next ordinary
+    /// death would make a later restore resurrect it.
+    #[tokio::test]
+    async fn relaunch_by_hand_closes_the_fleet_interruption() {
+        use ninox_core::{config::AgentConfig, fleet::awaits_restore, store::Store, SessionStatus};
+        use tempfile::tempdir;
+
+        let store = std::sync::Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
+        let engine = ninox_core::events::Engine::new(store.clone());
+        let ws = tempdir().unwrap().keep().to_string_lossy().to_string();
+        let id = "relaunch-closes-interruption-test";
+        let mut row = crate::test_fixtures::session(id, None, SessionStatus::Interrupted);
+        row.workspace_path = Some(ws.clone());
+        row.claude_session_id = Some("same-uuid".into());
+        store.upsert_session(&row).unwrap();
+        store.record_interruption(id, 10, &SessionStatus::Working, Some("reboot")).unwrap();
+
+        let attach = spawn_interactive_session(
+            engine,
+            InteractiveSpawnParams {
+                session_id:        id.into(),
+                name:              "n".into(),
+                workspace:         ws,
+                repo:              String::new(),
+                orchestrator_id:   None,
+                agent:             AgentConfig::default(),
+                base_cmd:          "sleep 30".into(),
+                catalogue_path:    String::new(),
+                extra_env:         Vec::new(),
+                started_at:        1,
+                claude_session_id: "same-uuid".into(),
+                failure_status:    SessionStatus::Interrupted,
+                summary:           None,
+            },
+        )
+        .await;
+        ninox_core::tmux::kill_session(id).await.ok();
+        assert!(attach.is_some(), "tmux create must succeed");
+
+        let record = store.fleet_record(id).unwrap().unwrap();
+        assert!(!record.awaiting_restore());
+        assert_eq!(record.restore_mode.as_deref(), Some("resumed"));
+
+        // The agent later finishes and the poller marks it Terminated.
+        let mut ended = store.get_session(id).unwrap().unwrap();
+        ended.status = SessionStatus::Terminated;
+        ended.terminal_at = Some(i64::MAX);
+        assert!(!awaits_restore(&ended, &record));
+    }
+
     /// Resume/Re-file respawn an existing row: the success snapshot must
     /// carry forward PR linkage, gate breakdown, cost, and context instead
     /// of resetting them — resetting wiped the gate tooltip, PR link, and
@@ -2451,6 +2631,10 @@ mod tests {
                 ci: GateCheck::Failing, review: GateCheck::Pending,
                 mergeable: GateCheck::Failing, since: 5,
             }),
+            merged_at: None,
+            activity: ninox_core::types::ActivityState::Blocked,
+            activity_note: Some("stale note from the previous incarnation".into()),
+            activity_since: Some(50),
         }).unwrap();
 
         let attach = spawn_interactive_session(
@@ -2487,6 +2671,13 @@ mod tests {
         assert!(matches!(gate.ci, GateCheck::Failing));
         assert!(matches!(s.status, SessionStatus::Working), "spawn still owns status");
         assert_eq!(s.terminal_at, None, "retention countdown ends on respawn");
+        assert_eq!(
+            s.activity, ninox_core::types::ActivityState::Unknown,
+            "activity must reset on respawn — the fresh incarnation hasn't reported \
+             yet, and the old one's Blocked/note would lie until its first hook fires",
+        );
+        assert_eq!(s.activity_note, None);
+        assert_eq!(s.activity_since, None);
     }
 
     #[tokio::test]
@@ -2507,7 +2698,8 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some("fixed-uuid".into()),
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
         }).unwrap();
 
         let ws = tempdir().unwrap().keep().to_string_lossy().to_string();
@@ -2553,7 +2745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_brain_skill_writes_skill_with_frontmatter() {
+    async fn seeding_brain_skill_writes_skill_with_frontmatter() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let ws = dir.path().to_str().unwrap().to_string();
@@ -2563,7 +2755,7 @@ mod tests {
             .await
             .unwrap();
 
-        seed_worker_brain_skill(&ws).await.unwrap();
+        seed_worker_skills(&ws, &cfg(false)).await;
 
         let skill = tokio::fs::read_to_string(
             dir.path().join(".claude").join("skills").join("brain").join("SKILL.md"),
@@ -2577,7 +2769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_brain_skill_excludes_itself_from_git_idempotently() {
+    async fn seeding_brain_skill_excludes_itself_from_git_idempotently() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let ws = dir.path().to_str().unwrap().to_string();
@@ -2587,8 +2779,8 @@ mod tests {
             .await
             .unwrap();
 
-        seed_worker_brain_skill(&ws).await.unwrap();
-        seed_worker_brain_skill(&ws).await.unwrap();
+        seed_worker_skills(&ws, &cfg(false)).await;
+        seed_worker_skills(&ws, &cfg(false)).await;
 
         let exclude = tokio::fs::read_to_string(dir.path().join(".git").join("info").join("exclude"))
             .await
@@ -2610,12 +2802,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_brain_skill_skips_exclude_when_not_a_git_repo() {
+    async fn seeding_brain_skill_skips_exclude_when_not_a_git_repo() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let ws = dir.path().to_str().unwrap().to_string();
 
-        seed_worker_brain_skill(&ws).await.unwrap();
+        seed_worker_skills(&ws, &cfg(false)).await;
 
         assert!(
             dir.path().join(".claude").join("skills").join("brain").join("SKILL.md").exists(),
@@ -2625,7 +2817,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_brain_skill_refuses_to_overwrite_a_tracked_copy() {
+    async fn seeding_brain_skill_refuses_to_overwrite_a_tracked_copy() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let ws = dir.path().to_str().unwrap().to_string();
@@ -2653,7 +2845,7 @@ mod tests {
             .unwrap();
         assert!(commit_status.success(), "git commit must succeed to simulate a tracked copy");
 
-        let result = seed_worker_brain_skill(&ws).await;
+        let result = seed_worker_skill(&ws, "brain", worker_md("brain")).await;
         assert!(result.is_err(), "must refuse to silently overwrite a tracked copy");
 
         let content = tokio::fs::read_to_string(skill_dir.join("SKILL.md")).await.unwrap();
@@ -2661,7 +2853,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_worker_brain_skill_targets_shared_common_dir_from_a_worktree() {
+    async fn seeding_brain_skill_targets_shared_common_dir_from_a_worktree() {
         use tempfile::tempdir;
         let repo_dir = tempdir().unwrap();
         let repo = repo_dir.path().to_str().unwrap().to_string();
@@ -2696,7 +2888,7 @@ mod tests {
             .await
             .unwrap();
 
-        seed_worker_brain_skill(&worktree).await.unwrap();
+        seed_worker_skills(&worktree, &cfg(false)).await;
 
         // The exclude must land in the MAIN repo's shared .git/info/exclude,
         // not anywhere under the linked worktree's own (file-based) .git.
@@ -2710,6 +2902,274 @@ mod tests {
         assert!(
             worktree_path.join(".claude").join("skills").join("brain").join("SKILL.md").exists(),
             "skill file must be written into the worktree itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn seeding_watch_pr_skill_writes_skill_with_frontmatter() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git")
+            .args(["init", "-q", &ws])
+            .status()
+            .await
+            .unwrap();
+
+        seed_worker_skills(&ws, &cfg(true)).await;
+
+        let skill = tokio::fs::read_to_string(
+            dir.path().join(".claude").join("skills").join("watch-pr").join("SKILL.md"),
+        )
+        .await
+        .unwrap();
+        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
+        assert!(skill.contains("name: watch-pr"));
+        assert!(skill.contains("description:"));
+        assert!(skill.contains("ninox open --pr"));
+        assert!(skill.contains("ninox close --pr"));
+    }
+
+    #[tokio::test]
+    async fn seeding_watch_pr_skill_excludes_itself_from_git_idempotently() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git")
+            .args(["init", "-q", &ws])
+            .status()
+            .await
+            .unwrap();
+
+        seed_worker_skills(&ws, &cfg(true)).await;
+        seed_worker_skills(&ws, &cfg(true)).await;
+
+        let exclude = tokio::fs::read_to_string(dir.path().join(".git").join("info").join("exclude"))
+            .await
+            .unwrap();
+        let count = exclude.lines().filter(|l| l.trim() == ".claude/skills/watch-pr/").count();
+        assert_eq!(count, 1, "the exclude line must appear exactly once, not duplicated");
+
+        // The whole point of the exclude: the skill file must never show up
+        // as untracked/stageable in this repo.
+        let status = tokio::process::Command::new("git")
+            .args(["-C", &ws, "status", "--porcelain"])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "the watch-pr skill file must be excluded from git status, not merely present on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn seeding_watch_pr_skill_refuses_to_overwrite_a_tracked_copy() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git").args(["init", "-q", &ws]).status().await.unwrap();
+
+        // Simulate a pre-existing tracked copy, e.g. committed before this
+        // exclude mechanism existed.
+        let skill_dir = dir.path().join(".claude").join("skills").join("watch-pr");
+        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+        tokio::fs::write(skill_dir.join("SKILL.md"), "tracked content\n").await.unwrap();
+        tokio::process::Command::new("git")
+            .args(["-C", &ws, "add", ".claude/skills/watch-pr/SKILL.md"])
+            .status()
+            .await
+            .unwrap();
+        let commit_status = tokio::process::Command::new("git")
+            .args([
+                "-C", &ws,
+                "-c", "user.email=test@example.com",
+                "-c", "user.name=Test",
+                "commit", "-q", "-m", "tracked",
+            ])
+            .status()
+            .await
+            .unwrap();
+        assert!(commit_status.success(), "git commit must succeed to simulate a tracked copy");
+
+        let result = seed_worker_skill(&ws, "watch-pr", worker_md("watch-pr")).await;
+        assert!(result.is_err(), "must refuse to silently overwrite a tracked copy");
+
+        let content = tokio::fs::read_to_string(skill_dir.join("SKILL.md")).await.unwrap();
+        assert_eq!(content, "tracked content\n", "tracked content must be left untouched");
+    }
+
+    #[tokio::test]
+    async fn seeding_watch_pr_skill_skips_exclude_when_not_a_git_repo() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+
+        seed_worker_skills(&ws, &cfg(true)).await;
+
+        assert!(
+            dir.path().join(".claude").join("skills").join("watch-pr").join("SKILL.md").exists(),
+            "skill file must still be written even outside a git repo"
+        );
+        assert!(!dir.path().join(".git").exists(), "test setup sanity check: no git repo here");
+    }
+
+    #[tokio::test]
+    async fn seeding_watch_pr_skill_targets_shared_common_dir_from_a_worktree() {
+        use tempfile::tempdir;
+        let repo_dir = tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git").args(["init", "-q", &repo]).status().await.unwrap();
+        // See seeding_brain_skill_targets_shared_common_dir_from_a_worktree
+        // for why `.success()` is checked here rather than just `.status()`.
+        let commit_status = tokio::process::Command::new("git")
+            .args([
+                "-C", &repo,
+                "-c", "user.email=test@example.com",
+                "-c", "user.name=Test",
+                "commit", "-q", "-m", "init", "--allow-empty",
+            ])
+            .status()
+            .await
+            .unwrap();
+        assert!(commit_status.success(), "git commit must succeed to give the worktree a branch point");
+
+        let worktree_path = repo_dir.path().join("wt");
+        let worktree = worktree_path.to_str().unwrap().to_string();
+        tokio::process::Command::new("git")
+            .args(["-C", &repo, "worktree", "add", &worktree, "-b", "wt-branch"])
+            .status()
+            .await
+            .unwrap();
+
+        seed_worker_skills(&worktree, &cfg(true)).await;
+
+        // The exclude must land in the MAIN repo's shared .git/info/exclude,
+        // not anywhere under the linked worktree's own (file-based) .git.
+        let exclude = tokio::fs::read_to_string(
+            repo_dir.path().join(".git").join("info").join("exclude"),
+        )
+        .await
+        .unwrap();
+        assert!(exclude.lines().any(|l| l.trim() == ".claude/skills/watch-pr/"));
+
+        assert!(
+            worktree_path.join(".claude").join("skills").join("watch-pr").join("SKILL.md").exists(),
+            "skill file must be written into the worktree itself"
+        );
+    }
+
+    /// The loop must seed *every* enabled worker capability the registry
+    /// declares, not a hand-maintained subset — this is the assertion that
+    /// fails if someone adds a registry entry and the seeding drifts.
+    #[tokio::test]
+    async fn seed_worker_skills_seeds_every_enabled_registry_entry() {
+        use ninox_core::capabilities::{for_audience, Audience};
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git").args(["init", "-q", &ws]).status().await.unwrap();
+
+        let config = cfg(true);
+        seed_worker_skills(&ws, &config).await;
+
+        let expected: Vec<_> = for_audience(Audience::Worker)
+            .filter(|c| (c.enabled)(&config))
+            .collect();
+        assert!(expected.len() >= 2, "sanity: registry should declare worker skills");
+        for cap in expected {
+            let path = dir.path().join(".claude").join("skills").join(cap.name).join("SKILL.md");
+            let body = tokio::fs::read_to_string(&path)
+                .await
+                .unwrap_or_else(|e| panic!("{} not seeded: {e}", cap.name));
+            assert_eq!(body, cap.worker_md.unwrap(), "{} body must be the registry's", cap.name);
+        }
+    }
+
+    /// Gated entries are skipped, not seeded-then-hidden: with `[pr_watch]`
+    /// off the worker `watch-pr` file must never appear, while the ungated
+    /// entries still land.
+    #[tokio::test]
+    async fn seed_worker_skills_skips_disabled_capabilities() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git").args(["init", "-q", &ws]).status().await.unwrap();
+
+        seed_worker_skills(&ws, &cfg(false)).await;
+
+        let skills = dir.path().join(".claude").join("skills");
+        assert!(skills.join("brain").join("SKILL.md").exists(), "ungated skills must still seed");
+        assert!(
+            !skills.join("watch-pr").join("SKILL.md").exists(),
+            "watch-pr must not be seeded when pr_watch is disabled"
+        );
+    }
+
+    /// Best-effort by design: one capability that can't be written (here, a
+    /// tracked `brain` copy the seeder refuses to clobber) must not abort
+    /// the loop and cost the worker its remaining skills.
+    #[tokio::test]
+    async fn seed_worker_skills_continues_past_a_failing_capability() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().to_str().unwrap().to_string();
+        tokio::process::Command::new("git").args(["init", "-q", &ws]).status().await.unwrap();
+
+        let brain_dir = dir.path().join(".claude").join("skills").join("brain");
+        tokio::fs::create_dir_all(&brain_dir).await.unwrap();
+        tokio::fs::write(brain_dir.join("SKILL.md"), "tracked content\n").await.unwrap();
+        tokio::process::Command::new("git")
+            .args(["-C", &ws, "add", ".claude/skills/brain/SKILL.md"])
+            .status().await.unwrap();
+        let commit = tokio::process::Command::new("git")
+            .args([
+                "-C", &ws,
+                "-c", "user.email=test@example.com",
+                "-c", "user.name=Test",
+                "commit", "-q", "-m", "tracked",
+            ])
+            .status().await.unwrap();
+        assert!(commit.success(), "git commit must succeed to simulate a tracked copy");
+
+        seed_worker_skills(&ws, &cfg(true)).await;
+
+        assert_eq!(
+            tokio::fs::read_to_string(brain_dir.join("SKILL.md")).await.unwrap(),
+            "tracked content\n",
+            "the tracked copy must still be left untouched",
+        );
+        assert!(
+            dir.path().join(".claude").join("skills").join("watch-pr").join("SKILL.md").exists(),
+            "a failing capability must not stop the ones after it",
+        );
+    }
+
+    /// `ensure_session_workspace`'s own gate: a recreated worker worktree
+    /// only gets the watch-pr skill seeded when `pr_watch_enabled` is true —
+    /// mirrors the `worker_context_footer` gating in `main.rs::run_spawn`
+    /// for the (rarer) worktree-recreation path used by Resume/Re-file.
+    #[tokio::test]
+    async fn ensure_session_workspace_seeds_watch_pr_skill_only_when_enabled() {
+        let repo = init_git_repo();
+        let worktree = create_worker_worktree(repo.to_str().unwrap(), "ensure-ws-prw", false).await.unwrap();
+        std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "worktree", "remove", "--force", &worktree])
+            .output()
+            .unwrap();
+
+        ensure_session_workspace(&worktree, "ensure-ws-prw", false, &cfg(false)).await.unwrap();
+        assert!(
+            !std::path::Path::new(&worktree).join(".claude").join("skills").join("watch-pr").join("SKILL.md").exists(),
+            "watch-pr skill must not be seeded when pr_watch is disabled"
+        );
+
+        std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "worktree", "remove", "--force", &worktree])
+            .output()
+            .unwrap();
+
+        ensure_session_workspace(&worktree, "ensure-ws-prw", false, &cfg(true)).await.unwrap();
+        assert!(
+            std::path::Path::new(&worktree).join(".claude").join("skills").join("watch-pr").join("SKILL.md").exists(),
+            "watch-pr skill must be seeded when pr_watch is enabled"
         );
     }
 }

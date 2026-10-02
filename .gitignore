@@ -1,2 +1,4 @@
 target/
 .superpowers/
+# Machine-local agent config: absolute paths, per-developer permissions.
+.claude/settings.json

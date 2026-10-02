@@ -11,7 +11,19 @@ fn fifo_path(session_id: &str) -> String {
     format!("/tmp/ninox-{session_id}.fifo")
 }
 
-/// Wire up PTY streaming for an already-running tmux session:
+/// Wire up output streaming and input for an already-running session on
+/// whichever runtime hosts it (see [`crate::runtime`]). The browser
+/// WebSocket route and background-session monitoring consume the resulting
+/// `Event::TerminalOutput`s and PTY writer.
+pub async fn start_streaming(
+    engine:     Arc<Engine>,
+    session_id: SessionId,
+    pane_id:    &str,
+) -> Result<()> {
+    crate::runtime::start_streaming(engine, session_id, pane_id).await
+}
+
+/// [`start_streaming`] for a tmux session:
 ///
 /// 1. Creates a FIFO at `/tmp/ninox-{session_id}.fifo`.
 /// 2. Opens the FIFO non-blocking for reading so `open()` returns immediately.
@@ -26,7 +38,7 @@ fn fifo_path(session_id: &str) -> String {
 /// sessions and repaints the whole screen on attach. This FIFO/pipe-pane tap
 /// now exists solely for the browser WebSocket route and background-session
 /// monitoring.
-pub async fn start_streaming(
+pub(crate) async fn start_tmux_streaming(
     engine:     Arc<Engine>,
     session_id: SessionId,
     tmux_id:    &str,
