@@ -37,6 +37,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
+#[command(version)]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,

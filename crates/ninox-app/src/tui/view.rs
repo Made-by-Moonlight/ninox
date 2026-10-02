@@ -1311,7 +1311,12 @@ fn draw_settings(f: &mut Frame, lay: &Layout, st: &TuiState) {
     let faint = Style::default().fg(p.faint);
     let path = ninox_core::config::AppConfig::config_path().display().to_string();
     let room = sl.path.width.saturating_sub(sl.open.width + 2) as usize;
-    f.render_widget(Paragraph::new(Span::styled(truncate(&path, room), Style::default().fg(p.ink_2))), sl.path);
+    let version = format!("ninox v{}  ·  ", env!("CARGO_PKG_VERSION"));
+    let line = Line::from(vec![
+        Span::styled(version.clone(), Style::default().fg(p.ink).add_modifier(Modifier::BOLD)),
+        Span::styled(truncate(&path, room.saturating_sub(version.chars().count())), Style::default().fg(p.ink_2)),
+    ]);
+    f.render_widget(Paragraph::new(line), sl.path);
     f.render_widget(
         Paragraph::new(Span::styled(super::layout::OPEN_CONFIG_LABEL, Style::default().fg(p.ink).bg(p.paper_2).add_modifier(Modifier::BOLD))),
         sl.open,
@@ -1477,6 +1482,7 @@ fn draw_modal(f: &mut Frame, area: Rect, st: &TuiState, modal: &Modal) {
                 Span::styled("  (change it in Settings, 5)   ", faint),
                 Span::styled("Ctrl+]", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
                 Span::styled(" always returns to the fleet", faint),
+                Span::styled(format!("   ninox v{}", env!("CARGO_PKG_VERSION")), faint),
             ])];
             for (group, keys) in HELP {
                 lines.push(Line::from(""));
@@ -1647,6 +1653,7 @@ mod tests {
         assert!(out.contains("SESSION RUNTIME") && out.contains("Runtime for new sessions"), "{out}");
         assert!(out.contains("‹ tmux ›"), "the selected choice shows its arrows: {out}");
         assert!(out.contains("[ e Open in $EDITOR ]"));
+        assert!(out.contains(&format!("ninox v{}", env!("CARGO_PKG_VERSION"))), "settings show the running version: {out}");
         assert!(out.contains("Sessions run on Ninox's private tmux server"), "help for the selection: {out}");
         assert!(out.contains("HARNESSES") && out.contains("claude-code") && out.contains("always"));
         st.settings.selected = 1;
