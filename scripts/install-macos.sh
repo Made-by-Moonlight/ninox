@@ -12,7 +12,8 @@
 # Environment:
 #   NINOX_INSTALL_DIR               binary install dir (default ~/.local/bin)
 #   NINOX_CODEARTIFACT_DOMAIN       default synthesia-build
-#   NINOX_CODEARTIFACT_DOMAIN_OWNER default: the account of your AWS session
+#   NINOX_CODEARTIFACT_DOMAIN_OWNER default: from the CodeArtifact registry URL in
+#                                   ~/.cargo/config.toml, else your AWS session's account
 #   NINOX_CODEARTIFACT_REPOSITORY   default synthesia-cargo
 #   NINOX_CODEARTIFACT_REGION       default eu-west-1
 #   AWS_PROFILE                     the SSO profile to use, as for any aws call
@@ -62,6 +63,13 @@ command -v aws >/dev/null 2>&1 || die "the aws CLI is required (brew install aws
 if ! account=$(aws sts get-caller-identity --query Account --output text 2>/dev/null); then
   die "no valid AWS session. Run: aws sso login${AWS_PROFILE:+ --profile $AWS_PROFILE}
 (use the profile for the account that owns the $DOMAIN CodeArtifact domain, e.g. AWS_PROFILE=<profile> $0)"
+fi
+if [ -z "$DOMAIN_OWNER" ]; then
+  cargo_config="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+  [ -f "$cargo_config" ] || cargo_config="${CARGO_HOME:-$HOME/.cargo}/config"
+  if [ -f "$cargo_config" ]; then
+    DOMAIN_OWNER=$(grep -oE "${DOMAIN}-[0-9]{12}\.d\.codeartifact\." "$cargo_config" | head -n1 | sed -E "s/^${DOMAIN}-([0-9]{12}).*/\1/" || true)
+  fi
 fi
 DOMAIN_OWNER="${DOMAIN_OWNER:-$account}"
 

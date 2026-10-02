@@ -165,6 +165,9 @@ fn resolve_owner(coords: &CodeArtifactCoords) -> Result<String> {
     if let Some(owner) = &coords.domain_owner {
         return Ok(owner.clone());
     }
+    if let Some(owner) = bu::cargo_config_text().and_then(|c| bu::owner_from_cargo_config(&c, &coords.domain)) {
+        return Ok(owner);
+    }
     let account = aws(&["sts", "get-caller-identity", "--query", "Account", "--output", "text"].map(String::from))?;
     Ok(account.trim().to_string())
 }

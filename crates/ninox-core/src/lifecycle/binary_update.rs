@@ -373,6 +373,26 @@ pub fn installed_by_cargo(exe: &Path, home: &Path) -> bool {
     exe.starts_with(home.join(".cargo").join("bin"))
 }
 
+/// The domain owner account from a cargo config's CodeArtifact registry
+/// index URL (`sparse+https://<domain>-<owner>.d.codeartifact.<region>…`),
+/// which the registry setup writes for everyone who installs ninox — so the
+/// owner is found without baking an account id in, even when the SSO
+/// profile is a different account.
+pub fn owner_from_cargo_config(config: &str, domain: &str) -> Option<String> {
+    let needle = format!("{domain}-");
+    config.match_indices(&needle).find_map(|(i, _)| {
+        let rest = &config[i + needle.len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        (digits.len() == 12 && rest[digits.len()..].starts_with(".d.codeartifact.")).then_some(digits)
+    })
+}
+
+/// `$CARGO_HOME/config.toml` (or `config`), else `~/.cargo/config.toml`.
+pub fn cargo_config_text() -> Option<String> {
+    let home = std::env::var_os("CARGO_HOME").map(std::path::PathBuf::from).or_else(|| dirs::home_dir().map(|h| h.join(".cargo")))?;
+    ["config.toml", "config"].iter().find_map(|f| std::fs::read_to_string(home.join(f)).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +431,14 @@ mod tests {
         assert_eq!(c.domain, "d");
         assert_eq!(c.domain_owner.as_deref(), Some("123"));
         assert_eq!(c.repository, "synthesia-cargo");
+    }
+
+    #[test]
+    fn domain_owner_comes_from_the_cargo_registry_url() {
+        let cfg = "[registries.x]\nindex = \"sparse+https://acme-build-123456789012.d.codeartifact.eu-west-1.amazonaws.com/cargo/r/\"\n";
+        assert_eq!(owner_from_cargo_config(cfg, "acme-build").as_deref(), Some("123456789012"));
+        assert_eq!(owner_from_cargo_config(cfg, "other"), None);
+        assert_eq!(owner_from_cargo_config("acme-build-12345.d.codeartifact.x", "acme-build"), None, "not an account id");
     }
 
     #[test]
