@@ -1,15 +1,15 @@
 [package]
 name        = "ninox"
-version     = "0.30.0"
+version     = "0.30.1"
 edition     = "2021"
 description = "Ninox native desktop app: GPU-accelerated Rust/Iced UI for the Ninox orchestrator engine."
 license     = "MIT"
 repository  = "https://github.com/Made-by-Moonlight/ninox"
 
 [dependencies]
-ninox-core   = { path = "../ninox-core", version = "0.30.0" }
-ninox-server = { path = "../ninox-server", version = "0.30.0" }
-ninox-ptyd   = { path = "../ninox-ptyd", version = "0.30.0" }
+ninox-core   = { path = "../ninox-core", version = "0.30.1" }
+ninox-server = { path = "../ninox-server", version = "0.30.1" }
+ninox-ptyd   = { path = "../ninox-ptyd", version = "0.30.1" }
 semver       = { workspace = true }
 tokio         = { workspace = true }
 anyhow        = { workspace = true }
