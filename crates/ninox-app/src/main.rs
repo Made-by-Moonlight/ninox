@@ -10,6 +10,7 @@ mod spawn_util;
 mod style;
 mod theme;
 mod tui;
+mod update_cli;
 
 use anyhow::Context as _;
 use spawn_util::{
@@ -235,6 +236,22 @@ enum Command {
     },
     /// Open the desktop app, even when run from a terminal.
     Gui,
+    /// Update this binary (and, with --app, Ninox.app) to the latest
+    /// prebuilt Apple silicon release from CodeArtifact, via the `aws` CLI.
+    Update {
+        /// Only report whether a newer version is published
+        #[arg(long)]
+        check: bool,
+        /// Reinstall even when already on the latest version (never downgrades)
+        #[arg(long)]
+        force: bool,
+        /// Install this exact version (downgrades allowed)
+        #[arg(long, value_name = "X.Y.Z")]
+        version: Option<String>,
+        /// Also replace an installed /Applications (or ~/Applications) Ninox.app
+        #[arg(long)]
+        app: bool,
+    },
     /// Report a session's activity state (working/idle/blocked) and manage
     /// worker→worker dependency edges — both rendered live in the desktop
     /// app's Workers view.
@@ -683,6 +700,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(Command::Service { action }) = command {
         return service::run(action);
     }
+    if let Some(Command::Update { check, force, version, app }) = command {
+        return update_cli::run(update_cli::UpdateArgs { check, force, version, app });
+    }
 
     // ptyd users needn't have tmux installed; a legacy tmux session still
     // gets the config written lazily by tmux.rs's own server bootstrap.
@@ -757,6 +777,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Complete { .. } | Command::ReceiveCompletion { .. }) => {
             unreachable!("completion commands short-circuit and return earlier in main()")
+        }
+        Some(Command::Update { .. }) => {
+            unreachable!("Update short-circuits and returns earlier in main()")
         }
         Some(Command::Brain { action }) => {
             run_brain(action, store).await

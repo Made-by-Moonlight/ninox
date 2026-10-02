@@ -280,7 +280,7 @@ pub fn canonical_exe() -> std::io::Result<std::path::PathBuf> {
     Ok(exe.canonicalize().unwrap_or(exe))
 }
 
-fn inside_app_bundle(path: &Path) -> bool {
+pub fn inside_app_bundle(path: &Path) -> bool {
     let parts: Vec<_> = path.components().map(|c| c.as_os_str()).collect();
     parts.windows(2).any(|w| w[0].to_string_lossy().ends_with(".app") && w[1] == "Contents")
 }

@@ -46,6 +46,9 @@ Use Ninox when you've outgrown a single agent in a single terminal:
 cargo install ninox
 ```
 
+On an Apple silicon Mac with Synthesia AWS access, skip the compile: see
+[Prebuilt macOS binaries](#prebuilt-macos-binaries-apple-silicon) below.
+
 ## Build and run
 
 ```bash
@@ -131,9 +134,60 @@ rm -rf Ninox.iconset
 
 This is the private mirror of ninox — the sections above cover the public
 build/install paths (crates.io, the public repo's GitHub Releases). Internal
-engineers have two additional options: building from source against this
-repo's history, and pulling prebuilt crates from Synthesia's private Cargo
-registry.
+engineers have additional options: prebuilt Apple silicon binaries (no
+compile), building from source against this repo's history, and pulling
+prebuilt crates from Synthesia's private Cargo registry.
+
+### Prebuilt macOS binaries (Apple silicon)
+
+Every release publishes a prebuilt `aarch64-apple-darwin` `ninox` binary and
+`Ninox.app` to CodeArtifact (generic package `ninox/ninox-macos` in the
+`synthesia-cargo` repository, `synthesia-build` domain, `eu-west-1`). You need
+the `aws` CLI and an SSO session for the account that owns that domain:
+
+```bash
+aws sso login --profile <your-build-profile>
+export AWS_PROFILE=<your-build-profile>
+
+# From a checkout of this repo:
+scripts/install-macos.sh            # latest; prompts for Ninox.app when interactive
+scripts/install-macos.sh --app      # also install Ninox.app into /Applications
+scripts/install-macos.sh --version 0.29.0 --app --user-apps   # pin; ~/Applications
+```
+
+No checkout? The script is published alongside each release, so fetch the
+latest copy straight from CodeArtifact:
+
+```bash
+v=$(aws codeartifact list-package-versions --domain synthesia-build --repository synthesia-cargo \
+      --region eu-west-1 --format generic --namespace ninox --package ninox-macos \
+      --status Published --query 'versions[].version' --output text | tr '\t' '\n' | sort -V | tail -n1)
+aws codeartifact get-package-version-asset --domain synthesia-build --repository synthesia-cargo \
+  --region eu-west-1 --format generic --namespace ninox --package ninox-macos \
+  --package-version "$v" --asset install-macos.sh /tmp/install-ninox.sh > /dev/null
+bash /tmp/install-ninox.sh
+```
+
+The script verifies every download against the SHA-256 CodeArtifact recorded
+at publish time, installs `ninox` to `${NINOX_INSTALL_DIR:-~/.local/bin}`
+with an `nx` symlink beside it, clears the quarantine attribute, and tells
+you if another `ninox` (e.g. a `cargo install`ed `~/.cargo/bin/ninox`) would
+win on your `PATH`. Override the registry coordinates with
+`NINOX_CODEARTIFACT_DOMAIN` / `_DOMAIN_OWNER` / `_REPOSITORY` / `_REGION`.
+
+To update later:
+
+```bash
+ninox update --check   # report only
+ninox update           # replace the running binary with the latest release
+ninox update --app     # also refresh an installed Ninox.app
+ninox update --version 0.28.1   # install an exact version (downgrades allowed)
+```
+
+`ninox update` uses the same `aws` session and verification, swaps the binary
+atomically, and refuses to run anywhere but Apple silicon macOS — on Intel
+Macs and Linux, keep using `cargo install --force` (below). Already-running
+ninox processes keep the old version until restarted.
 
 ### Build from source
 

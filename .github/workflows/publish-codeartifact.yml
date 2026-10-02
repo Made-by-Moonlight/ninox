@@ -98,6 +98,18 @@ name: Publish to CodeArtifact
 # "no required repo variable set → no-op" guard covers both jobs — an
 # accidental re-enable of this whole file on an unconfigured repo does
 # nothing in either job.
+#
+# The same `release` job then publishes prebuilt Apple silicon artifacts as a
+# CodeArtifact *generic* package (namespace `ninox`, package `ninox-macos`,
+# version = the `ninox` crate version), reusing the binary and Ninox.app.zip
+# it just built — so internal users can install without compiling
+# (scripts/install-macos.sh, `ninox update`). Assets, in publish order:
+#   install-macos.sh, ninox-<v>-aarch64-apple-darwin.tar.gz, Ninox.app.zip
+# All but the last are published with --unfinished; the last call flips the
+# version to Published. A re-run skips assets already present on an
+# Unfinished version and skips a Published version entirely. Asset names
+# and coordinates must stay in sync with
+# crates/ninox-core/src/lifecycle/binary_update.rs and the install script.
 
 on:
   workflow_dispatch:
@@ -364,8 +376,16 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: write
+      id-token: write # AWS OIDC for the generic-package publish below
     env:
       GH_TOKEN: ${{ github.token }}
+      CODEARTIFACT_DOMAIN: ${{ vars.CODEARTIFACT_DOMAIN }}
+      CODEARTIFACT_DOMAIN_OWNER: ${{ vars.CODEARTIFACT_DOMAIN_OWNER }}
+      CODEARTIFACT_REPOSITORY: ${{ vars.CODEARTIFACT_REPOSITORY }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      CODEARTIFACT_PUBLISH_ROLE_ARN: ${{ vars.CODEARTIFACT_PUBLISH_ROLE_ARN }}
+      GENERIC_NAMESPACE: ninox
+      GENERIC_PACKAGE: ninox-macos
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
@@ -404,3 +424,128 @@ jobs:
 
       - name: Publish release
         run: gh release edit "$GITHUB_REF_NAME" --draft=false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
+        with:
+          role-to-assume: ${{ env.CODEARTIFACT_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Same rule as the crate plan step: only ResourceNotFoundException
+      # means "not published yet"; any other error fails rather than risk a
+      # duplicate publish.
+      - name: Determine macOS binary publish plan
+        id: binplan
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="ninox") | .version')
+          if [ "v${version}" != "$GITHUB_REF_NAME" ]; then
+            echo "ninox crate version ${version} doesn't match tag ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          ca=(--domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER"
+              --repository "$CODEARTIFACT_REPOSITORY" --format generic
+              --namespace "$GENERIC_NAMESPACE" --package "$GENERIC_PACKAGE" --package-version "$version")
+          if status=$(aws codeartifact describe-package-version "${ca[@]}" \
+              --query packageVersion.status --output text 2> /tmp/describe.err); then
+            echo "${GENERIC_PACKAGE} ${version} exists with status ${status}."
+          elif grep -q "ResourceNotFoundException" /tmp/describe.err; then
+            status=absent
+          else
+            cat /tmp/describe.err >&2
+            exit 1
+          fi
+          if [ "$status" = "Published" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            : > /tmp/existing-assets.txt
+          elif [ "$status" = "absent" ] || [ "$status" = "Unfinished" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            if [ "$status" = "Unfinished" ]; then
+              aws codeartifact list-package-version-assets "${ca[@]}" \
+                --query 'assets[].name' --output text | tr '\t' '\n' > /tmp/existing-assets.txt
+            else
+              : > /tmp/existing-assets.txt
+            fi
+          else
+            echo "${GENERIC_PACKAGE} ${version} is in status ${status}; refusing to publish over it." >&2
+            exit 1
+          fi
+
+      - name: Package macOS binary
+        if: steps.binplan.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.binplan.outputs.version }}
+          APP_ZIP: ${{ steps.build.outputs.zip-path }}
+        run: |
+          set -euo pipefail
+          stem="ninox-${VERSION}-aarch64-apple-darwin"
+          dist="$RUNNER_TEMP/dist"
+          stage="$RUNNER_TEMP/$stem"
+          mkdir -p "$dist" "$stage"
+          # cargo bundle builds target/release/ninox before copying it into
+          # the bundle, so this is the same build as Ninox.app's binary.
+          test -x target/release/ninox
+          [ "$(lipo -archs target/release/ninox)" = "arm64" ]
+          cp target/release/ninox "$stage/ninox"
+          codesign --force --sign - "$stage/ninox"
+          codesign --verify --strict "$stage/ninox"
+          cp LICENSE "$stage/LICENSE"
+          cat > "$stage/README.txt" <<EOF
+          ninox ${VERSION} (aarch64-apple-darwin)
+
+          Copy \`ninox\` onto your PATH (e.g. ~/.local/bin) and symlink \`nx\` to it,
+          or use scripts/install-macos.sh, which does that and verifies checksums.
+          Update in place later with \`ninox update\`.
+          EOF
+          COPYFILE_DISABLE=1 tar -C "$RUNNER_TEMP" -czf "$dist/${stem}.tar.gz" "$stem"
+          cp scripts/install-macos.sh "$dist/install-macos.sh"
+          cp "$APP_ZIP" "$dist/Ninox.app.zip"
+          (cd "$dist" && shasum -a 256 install-macos.sh "${stem}.tar.gz" Ninox.app.zip)
+          echo "DIST=$dist" >> "$GITHUB_ENV"
+
+      - name: Publish macOS binaries to CodeArtifact
+        if: steps.binplan.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.binplan.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Order matters: the final asset is published without --unfinished,
+          # which is what flips the version to Published.
+          assets=(install-macos.sh "ninox-${VERSION}-aarch64-apple-darwin.tar.gz" Ninox.app.zip)
+          last=$(( ${#assets[@]} - 1 ))
+          for i in "${!assets[@]}"; do
+            asset="${assets[$i]}"
+            if grep -qxF "$asset" /tmp/existing-assets.txt; then
+              echo "${asset} already uploaded to the Unfinished version — skipping."
+              if [ "$i" -eq "$last" ]; then
+                # Uploading the last asset is what normally flips the version
+                # to Published; it's already there, so flip it explicitly.
+                echo "Marking ${GENERIC_PACKAGE} ${VERSION} Published"
+                aws codeartifact update-package-versions-status \
+                  --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+                  --repository "$CODEARTIFACT_REPOSITORY" --format generic \
+                  --namespace "$GENERIC_NAMESPACE" --package "$GENERIC_PACKAGE" \
+                  --versions "$VERSION" --expected-status Unfinished --target-status Published > /dev/null
+              fi
+              continue
+            fi
+            finish_flag=--unfinished
+            [ "$i" -eq "$last" ] && finish_flag=--no-unfinished
+            sha=$(shasum -a 256 "$DIST/$asset" | cut -d' ' -f1)
+            echo "Publishing ${asset} (sha256 ${sha})"
+            aws codeartifact publish-package-version \
+              --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+              --repository "$CODEARTIFACT_REPOSITORY" --format generic \
+              --namespace "$GENERIC_NAMESPACE" --package "$GENERIC_PACKAGE" \
+              --package-version "$VERSION" \
+              --asset-content "$DIST/$asset" --asset-name "$asset" --asset-sha256 "$sha" \
+              "$finish_flag" > /dev/null
+          done
+          status=$(aws codeartifact describe-package-version \
+            --domain "$CODEARTIFACT_DOMAIN" --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --repository "$CODEARTIFACT_REPOSITORY" --format generic \
+            --namespace "$GENERIC_NAMESPACE" --package "$GENERIC_PACKAGE" \
+            --package-version "$VERSION" --query packageVersion.status --output text)
+          echo "${GENERIC_PACKAGE} ${VERSION} status: ${status}"
+          [ "$status" = "Published" ]
