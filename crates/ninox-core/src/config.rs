@@ -587,7 +587,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub editor:    EditorChoice,
     /// Override for the orchestrator root directory.
-    /// Defaults to `~/.config/ninox/orchestrator`.
+    /// Defaults to `~/ninox/orchestrators` (see `resolved_orchestrator_root`).
     #[serde(default)]
     pub orchestrator_root: Option<PathBuf>,
     /// Root for Ninox-managed worker worktrees.
@@ -949,12 +949,19 @@ impl AppConfig {
             .and_then(|c| build(&c.remote, &c.endpoint, &c.region, &c.cache_ttl_secs))
     }
 
+    /// Falls back to `~/ninox/orchestrators` when `orchestrator_root` is
+    /// unset. This moved off `<config_dir>/ninox/orchestrator` (an
+    /// OS-private, easy-to-miss location) in MLOPS-4659; the change only
+    /// affects the fallback, not the `[orchestrator_root]` override, and
+    /// existing users on the old default simply start fresh at the new path
+    /// on next launch — their old orchestrator directory is left in place
+    /// untouched, not migrated or deleted.
     pub fn resolved_orchestrator_root(&self) -> PathBuf {
         self.orchestrator_root.clone().unwrap_or_else(|| {
-            dirs::config_dir()
+            dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("ninox")
-                .join("orchestrator")
+                .join("orchestrators")
         })
     }
 
@@ -1222,7 +1229,7 @@ mod tests {
     #[test]
     fn resolved_orchestrator_root_default() {
         let cfg = AppConfig::default();
-        assert!(cfg.resolved_orchestrator_root().ends_with("ninox/orchestrator"));
+        assert!(cfg.resolved_orchestrator_root().ends_with("ninox/orchestrators"));
     }
 
     #[test]

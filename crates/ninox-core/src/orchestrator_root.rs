@@ -38,7 +38,7 @@ async fn seed_orchestrator_skills<'a>(
     Ok(seeded)
 }
 
-/// Seeds `~/.config/ninox/orchestrator/` (or the configured root) with the
+/// Seeds `~/ninox/orchestrators/` (or the configured root) with the
 /// files that orchestrator sessions need: AGENTS.md (canonical, CLAUDE.md
 /// symlinks to it), one SKILL.md per *enabled* orchestrator-facing capability
 /// in `ninox_core::capabilities::REGISTRY`, and the subagent-blocker
