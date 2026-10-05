@@ -29,6 +29,14 @@ pub struct Tile {
     pub inner: Rect,
 }
 
+/// A one-line label drawn above an orchestrator group's tiles in the
+/// overview grid, so its workers read as one block.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupHeader {
+    pub outer: Rect,
+    pub label: String,
+}
+
 /// The header's view tabs, in order; `1`..`5` select them.
 pub const TABS: [(View, &str); 5] = [
     (View::Board, "Fleet"),
@@ -179,6 +187,7 @@ pub struct Layout {
     pub prs: Option<PrLayout>,
     pub inspector: Option<Rect>,
     pub tiles: Vec<Tile>,
+    pub group_headers: Vec<GroupHeader>,
     pub overview_cols: u16,
     /// An ended session's report in the pane: its buttons, the clickable
     /// PR lines, the scrolling body under the pinned head, and how far
@@ -490,6 +499,59 @@ fn settings(body: Rect, st: &TuiState) -> SettingsLayout {
     SettingsLayout { path, open, list, lines, offset, value_x, help }
 }
 
+/// Grid placement for every row in `TuiState::overview_rows()`, independent
+/// of the terminal's height: `coords[i]` is `(grid_row, col)` for position
+/// `i`, used both to lay out the visible page and (by `move_tile`) to walk
+/// the whole grid a page doesn't show. A group's members force a fresh grid
+/// row (unless they already land on one) so they never share a row with
+/// another orchestrator's tiles, and that row is recorded in `headers`.
+#[derive(Clone, Debug, Default)]
+pub(super) struct GridInfo {
+    pub coords: Vec<(u16, u16)>,
+    pub total_rows: u16,
+    pub headers: Vec<(u16, String)>,
+}
+
+pub(super) fn overview_grid(st: &TuiState, cols: usize) -> GridInfo {
+    let positions = st.overview_rows();
+    let n = positions.len();
+    let group_of = |i: usize| st.rows.get(positions[i]).and_then(|r| r.group.clone());
+    let label_of = |gid: &str| -> String {
+        st.rows
+            .iter()
+            .find(|r| r.is_orchestrator && r.group.as_deref() == Some(gid))
+            .map(|r| r.session.name.clone())
+            .unwrap_or_else(|| gid.to_string())
+    };
+    let cols = cols.max(1);
+    let mut coords = Vec::with_capacity(n);
+    let mut headers = Vec::new();
+    let (mut row, mut col): (u16, u16) = (0, 0);
+    let mut last: Option<Option<String>> = None;
+    for i in 0..n {
+        let g = group_of(i);
+        let changed = last.as_ref() != Some(&g);
+        if changed && last.is_some() && col != 0 {
+            row += 1;
+            col = 0;
+        }
+        if changed {
+            if let Some(gid) = g.as_deref() {
+                headers.push((row, label_of(gid)));
+            }
+        }
+        coords.push((row, col));
+        last = Some(g);
+        col += 1;
+        if col as usize == cols {
+            row += 1;
+            col = 0;
+        }
+    }
+    let total_rows = (row + u16::from(col != 0)).max(u16::from(n > 0));
+    GridInfo { coords, total_rows, headers }
+}
+
 fn overview(lay: &mut Layout, body: Rect, st: &TuiState) {
     let n = st.overview_rows().len();
     if n == 0 || body.width < MIN_TILE_W || body.height < MIN_TILE_H {
@@ -499,33 +561,81 @@ fn overview(lay: &mut Layout, body: Rect, st: &TuiState) {
     let max_cols = (body.width / MIN_TILE_W).max(1) as usize;
     let max_rows = (body.height / MIN_TILE_H).max(1) as usize;
     let mut cols = (n as f64).sqrt().ceil() as usize;
-    // Wide terminals favour more columns than rows.
-    while cols < max_cols && n.div_ceil(cols) > max_rows {
-        cols += 1;
+    // Wide terminals favour more columns than rows — but only grow when it
+    // actually helps: a run of single-member groups forces its own row
+    // regardless of column count, and growing all the way to `max_cols`
+    // then just wastes width on padding instead of shrinking the page.
+    if overview_grid(st, max_cols).total_rows as usize <= max_rows {
+        while cols < max_cols && overview_grid(st, cols).total_rows as usize > max_rows {
+            cols += 1;
+        }
     }
     let cols = cols.clamp(1, max_cols);
-    let rows = n.div_ceil(cols).clamp(1, max_rows);
-    let per_page = cols * rows;
-    let page = st.overview_sel.min(n - 1) / per_page;
-    let first = page * per_page;
-    let shown = (n - first).min(per_page);
-    let shown_rows = shown.div_ceil(cols);
+    let grid = overview_grid(st, cols);
+    let total_rows = grid.total_rows as usize;
     lay.overview_cols = cols as u16;
-    let tw = body.width / cols as u16;
-    let th = body.height / shown_rows as u16;
+
+    let sel = st.overview_sel.min(n - 1);
+    let sel_row = grid.coords[sel].0;
+    let rows_budget = max_rows.max(1);
+    let page = sel_row as usize / rows_budget;
+    let start_row = (page * rows_budget) as u16;
+    let mut end_row = (start_row as usize + rows_budget).min(total_rows) as u16;
+
+    // A header line steals from the tile-row budget; shrink the page
+    // rather than hand out tiles under `MIN_TILE_H`.
+    let headers_in = |end: u16| grid.headers.iter().filter(|(r, _)| *r >= start_row && *r < end).count();
+    let mut header_count = headers_in(end_row);
+    while end_row - start_row > 1 {
+        let shown = (end_row - start_row) as usize;
+        let avail = (body.height as usize).saturating_sub(header_count);
+        if avail / shown >= MIN_TILE_H as usize {
+            break;
+        }
+        end_row -= 1;
+        header_count = headers_in(end_row);
+    }
+
+    let shown_rows = (end_row - start_row).max(1) as usize;
+    let avail = (body.height as usize).saturating_sub(header_count);
+    let th = (avail / shown_rows).max(1) as u16;
+    let tw = (body.width / cols as u16).max(1);
     // A cell of breathing room between tiles, when there's slack to spare.
     let gap_x = u16::from(tw > MIN_TILE_W);
     let gap_y = u16::from(th > MIN_TILE_H);
-    for k in 0..shown {
-        let (c, r) = ((k % cols) as u16, (k / cols) as u16);
-        let last_col = c as usize == cols - 1;
-        let last_row = r as usize == shown_rows - 1;
-        let w = (if last_col { body.width - tw * c } else { tw }) - if last_col { 0 } else { gap_x };
-        let h = (if last_row { body.height - th * r } else { th }) - if last_row { 0 } else { gap_y };
-        let outer = Rect { x: body.x + tw * c, y: body.y + th * r, width: w, height: h };
+
+    let mut y = body.y;
+    let mut cur_row: i32 = -1;
+    // The row's full pitch (`y` always advances by this); the rendered
+    // tile height is this minus `gap_y`, except on the last row.
+    let mut pitch = th;
+    for i in 0..n {
+        let (r, c) = grid.coords[i];
+        if r < start_row {
+            continue;
+        }
+        if r >= end_row {
+            break;
+        }
+        let is_last_row = r + 1 == end_row;
+        if r as i32 != cur_row {
+            if cur_row >= 0 {
+                y += pitch;
+            }
+            cur_row = r as i32;
+            if let Some((_, label)) = grid.headers.iter().find(|(hr, _)| *hr == r) {
+                lay.group_headers.push(GroupHeader { outer: Rect { x: body.x, y, width: body.width, height: 1 }, label: label.clone() });
+                y += 1;
+            }
+            pitch = if is_last_row { (body.y + body.height).saturating_sub(y).max(1) } else { th };
+        }
+        let is_last_col = c as usize + 1 == cols;
+        let w = (if is_last_col { body.width.saturating_sub(tw * c) } else { tw }).saturating_sub(if is_last_col { 0 } else { gap_x });
+        let h = pitch.saturating_sub(if is_last_row { 0 } else { gap_y });
+        let outer = Rect { x: body.x + tw * c, y, width: w, height: h };
         let inner = Block::default().borders(Borders::ALL).inner(outer);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
-        lay.tiles.push(Tile { index: first + k, outer, inner });
+        lay.tiles.push(Tile { index: i, outer, inner });
     }
 }
 
@@ -536,6 +646,68 @@ mod tests {
 
     fn st(n: usize) -> TuiState {
         TuiState { rows: (0..n).map(|i| Row::test_row(&format!("s{i}"))).collect(), ..Default::default() }
+    }
+
+    /// Orchestrator `o` with workers `w0..w{n}`, then a standalone `solo`.
+    fn grouped(n: usize) -> TuiState {
+        let mut rows = vec![Row { is_orchestrator: true, group: Some("o".into()), ..Row::test_row("o") }];
+        rows.extend((0..n).map(|i| Row { group: Some("o".into()), ..Row::test_row(&format!("w{i}")) }));
+        rows.push(Row::test_row("solo"));
+        TuiState { rows, ..Default::default() }
+    }
+
+    #[test]
+    fn overview_grid_breaks_a_row_rather_than_mixing_groups() {
+        // cols=2: o,w0 fill row 0; w1 alone would share row 1 with solo
+        // unless the group boundary forces solo onto its own row.
+        let st = grouped(2);
+        let grid = overview_grid(&st, 2);
+        assert_eq!(grid.coords, vec![(0, 0), (0, 1), (1, 0), (2, 0)], "o, w0, w1, solo");
+        assert_eq!(grid.total_rows, 3);
+        assert_eq!(grid.headers, vec![(0, "o".to_string())], "solo is ungrouped and gets no header");
+    }
+
+    /// `n` single-member groups — each one forces its own grid row no
+    /// matter the column count, since it has nothing to share a row with.
+    fn lone_groups(n: usize) -> TuiState {
+        let rows = (0..n)
+            .map(|i| {
+                let id = format!("g{i}");
+                Row { is_orchestrator: true, group: Some(id.clone()), ..Row::test_row(&id) }
+            })
+            .collect();
+        TuiState { rows, ..Default::default() }
+    }
+
+    #[test]
+    fn overview_header_lines_dont_shrink_tiles_below_the_minimum() {
+        let mut st = lone_groups(4);
+        st.view = View::Overview;
+        let lay = compute(Rect::new(0, 0, 60, 31), &st); // body height 29: 4 header lines would leave 25/4 < MIN_TILE_H unless the page shrinks
+        assert!(!lay.tiles.is_empty());
+        assert!(lay.tiles.iter().all(|t| t.outer.height >= MIN_TILE_H), "{:#?}", lay.tiles);
+    }
+
+    #[test]
+    fn overview_doesnt_inflate_columns_when_group_breaks_cap_the_row_count() {
+        let mut st = lone_groups(5);
+        st.view = View::Overview;
+        let lay = compute(Rect::new(0, 0, 250, 23), &st); // body height 21: no column count gets 5 lone groups under 3 rows
+        assert_eq!(lay.overview_cols, 3, "growing columns here can't reduce the row count, so it shouldn't grow at all");
+    }
+
+    #[test]
+    fn overview_header_names_the_orchestrator_and_sits_above_its_tiles() {
+        let mut st = grouped(2);
+        st.view = View::Overview;
+        let lay = compute(Rect::new(0, 0, 60, 40), &st);
+        assert_eq!(lay.overview_cols, 2);
+        assert_eq!(lay.group_headers.len(), 1);
+        let header = &lay.group_headers[0];
+        assert_eq!(header.label, "o");
+        let o_tile = lay.tiles.iter().find(|t| t.index == 0).unwrap();
+        assert_eq!(header.outer.y, lay.body.y, "the header sits at the top of the body");
+        assert!(header.outer.bottom() <= o_tile.outer.y, "the header sits above the orchestrator's own tile");
     }
 
     #[test]

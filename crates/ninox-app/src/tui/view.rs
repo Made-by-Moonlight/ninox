@@ -881,6 +881,15 @@ fn draw_overview(f: &mut Frame, st: &TuiState, lay: &Layout) {
         }
         return;
     }
+    for h in &lay.group_headers {
+        let label = format!(" {} ", truncate(&h.label, (h.outer.width as usize).saturating_sub(2)));
+        let rule_w = (h.outer.width as usize).saturating_sub(UnicodeWidthStr::width(label.as_str()));
+        let line = Line::from(vec![
+            Span::styled(label, Style::default().fg(p.ink_2).add_modifier(Modifier::BOLD)),
+            Span::styled("─".repeat(rule_w), Style::default().fg(p.rule)),
+        ]);
+        f.render_widget(Paragraph::new(line), h.outer);
+    }
     for t in &lay.tiles {
         let Some(&idx) = rows.get(t.index) else { continue };
         let Some(row) = st.rows.get(idx) else { continue };
@@ -1725,6 +1734,20 @@ mod tests {
         let out = render(&st, 100, 12);
         assert!(out.contains("restored — waiting for agent"), "{out}");
         assert!(out.contains("before reboot"));
+    }
+
+    #[test]
+    fn overview_labels_each_orchestrators_block_with_its_name() {
+        let mut rows = vec![Row { is_orchestrator: true, group: Some("o".into()), ..Row::test_row("orchestrator-name") }];
+        rows.extend((0..2).map(|i| Row { group: Some("o".into()), ..Row::test_row(&format!("w{i}")) }));
+        rows.push(Row::test_row("solo"));
+        let mut st = TuiState { rows, ..Default::default() };
+        st.view = View::Overview;
+        assert!(render(&st, 100, 30).contains("orchestrator-name"), "{}", render(&st, 100, 30));
+        // Holds up narrow (~80 cols) and wide (~160 cols) without panicking.
+        for (w, h) in [(160, 40), (80, 24)] {
+            render(&st, w, h);
+        }
     }
 
     #[test]

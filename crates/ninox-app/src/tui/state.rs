@@ -1316,16 +1316,28 @@ fn command(st: &mut TuiState, key: KeyEvent) -> Action {
     Action::None
 }
 
+/// `h`/`l` just step through `overview_rows()` in order. `j`/`k` instead
+/// walk the grid a group's header rows may have shifted out of the simple
+/// `index ± cols` arithmetic (`super::layout::overview_grid`), landing on
+/// the closest column in the row above/below.
 fn move_tile(st: &mut TuiState, dx: i32, dy: i32) {
     let n = st.overview_rows().len();
     if n == 0 {
         return;
     }
-    let cols = st.layout.overview_cols.max(1) as i32;
-    let cur = st.overview_sel as i32;
-    let next = cur + dx + dy * cols;
-    if (0..n as i32).contains(&next) {
-        st.overview_sel = next as usize;
+    let cur = st.overview_sel.min(n - 1);
+    if dy == 0 {
+        st.overview_sel = (cur as i32 + dx).clamp(0, n as i32 - 1) as usize;
+        return;
+    }
+    let cols = st.layout.overview_cols.max(1) as usize;
+    let grid = super::layout::overview_grid(st, cols);
+    let (row, col) = grid.coords[cur];
+    let Some(target_row) = row.checked_add_signed(dy as i16) else { return };
+    if let Some(best) =
+        (0..n).filter(|&i| grid.coords[i].0 == target_row).min_by_key(|&i| (grid.coords[i].1 as i32 - col as i32).abs())
+    {
+        st.overview_sel = best;
     }
 }
 
@@ -2844,6 +2856,22 @@ mod tests {
         assert_eq!(st.view, View::Board);
         assert_eq!(st.selected, 3);
         assert_eq!(st.focus, Focus::Pane);
+    }
+
+    #[test]
+    fn overview_j_k_cross_a_group_boundary_by_grid_not_flat_index() {
+        // cols=2: o(0,0) w0(0,1) / w1(1,0) / solo(2,0) — the group boundary
+        // pushes solo onto its own row instead of sharing w1's row, so a
+        // flat `index ± cols` step would miss it (and panic on nothing: it
+        // would just silently stick).
+        let mut st = grouped(2);
+        st.layout.overview_cols = 2;
+        handle_key(&mut st, key('o'));
+        st.overview_sel = 2; // w1
+        handle_key(&mut st, key('j'));
+        assert_eq!(st.overview_sel, 3, "down from w1 lands on solo, not off the grid");
+        handle_key(&mut st, key('k'));
+        assert_eq!(st.overview_sel, 2, "and back up to w1");
     }
 
     #[test]
