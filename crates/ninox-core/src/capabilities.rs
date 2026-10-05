@@ -192,6 +192,13 @@ pub const REGISTRY: &[Capability] = &[
         worker_md: Some(include_str!("../skills/worker/fleet-recovery.md")),
         enabled: |_| true,
     },
+    Capability {
+        name: "restart-session",
+        audience: Audience::Both,
+        orchestrator_md: Some(include_str!("../skills/orchestrator/restart-session.md")),
+        worker_md: Some(include_str!("../skills/worker/restart-session.md")),
+        enabled: |_| true,
+    },
 ];
 
 /// Placeholder for the invoking `ninox` binary path in orchestrator markdown.
@@ -296,10 +303,11 @@ mod tests {
                 "worker-status",
                 "read-worker-screen",
                 "fleet-recovery",
+                "restart-session",
             ]
         );
         let worker: Vec<_> = for_audience(Audience::Worker).map(|c| c.name).collect();
-        assert_eq!(worker, vec!["brain", "watch-pr", "worker-status", "fleet-recovery"]);
+        assert_eq!(worker, vec!["brain", "watch-pr", "worker-status", "fleet-recovery", "restart-session"]);
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod connect;
 mod fleet;
 mod input;
 mod models;
+mod restart;
 mod runtime_cli;
 mod service;
 mod spawn_util;
@@ -228,6 +229,15 @@ enum Command {
     Fleet {
         #[command(subcommand)]
         action: fleet::FleetAction,
+    },
+    /// Restart a live, healthy session in place so it picks up a tooling
+    /// update (a newer `ninox` build, harness version, MCP config, or
+    /// reseeded skills) — conversation resumed wherever the harness
+    /// supports it. For a crashed/interrupted session, use `ninox fleet
+    /// restore` instead.
+    Restart {
+        #[command(flatten)]
+        args: restart::RestartArgs,
     },
     /// Start the headless engine at login (launchd / systemd user unit).
     Service {
@@ -771,6 +781,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Fleet { action }) => {
             fleet::run_cli(action, store, AppConfig::load().unwrap_or_default()).await
+        }
+        Some(Command::Restart { args }) => {
+            let config = AppConfig::load().unwrap_or_default();
+            restart::run_cli(args, store, config, db_path).await
         }
         Some(Command::Service { .. }) => {
             unreachable!("Service short-circuits and returns earlier in main()")

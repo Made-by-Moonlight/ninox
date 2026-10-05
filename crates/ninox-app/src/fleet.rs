@@ -100,11 +100,11 @@ pub async fn run_cli(action: FleetAction, store: Arc<Store>, config: AppConfig) 
     Ok(())
 }
 
-fn env_nonempty(key: &str) -> Option<String> {
+pub(crate) fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -277,7 +277,7 @@ pub fn brief(store: &Store, config: &AppConfig, session_id: &str) -> anyhow::Res
 
 // ── restore ─────────────────────────────────────────────────────────────────
 
-const RESTORE_LOCK: &str = "restore";
+pub(crate) const RESTORE_LOCK: &str = "restore";
 /// Arbitrary; bump if a slow machine's restores legitimately take longer.
 const RESTORE_LEASE_MS: i64 = 30 * 60 * 1000;
 /// Arbitrary; a cold harness start (auth, MCP servers) can be slow.
