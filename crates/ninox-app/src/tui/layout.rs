@@ -220,7 +220,9 @@ pub fn compute(area: Rect, st: &TuiState) -> Layout {
         footer: Rect { y: area.bottom().saturating_sub(1), height: area.height.min(1), ..area },
         ..Default::default()
     };
-    let body = Rect { y: area.y + 1, height: area.height.saturating_sub(2), ..area };
+    // A blank row of breathing room under the header/tab bar, above the
+    // footer; every view's content shares this top margin.
+    let body = Rect { y: area.y + 2, height: area.height.saturating_sub(3), ..area };
     lay.body = body;
     tabs(&mut lay);
     match st.view {
@@ -475,8 +477,9 @@ fn settings(body: Rect, st: &TuiState) -> SettingsLayout {
         (Rect { width: list_w, ..rest }, help)
     } else {
         let hh = rest.height.min(if rest.height >= 12 { 5 } else { 0 });
-        let list = Rect { width: list_w, height: rest.height - hh, ..rest };
-        (list, Rect { y: list.bottom(), height: hh, ..rest })
+        let gap = u16::from(hh > 0);
+        let list = Rect { width: list_w, height: rest.height.saturating_sub(hh + gap), ..rest };
+        (list, Rect { y: list.bottom() + gap, height: hh, ..rest })
     };
     let lines = settings_lines(st);
     let sel = lines.iter().position(|l| *l == SettingsLine::Field(st.settings.selected)).unwrap_or(0);
@@ -510,10 +513,15 @@ fn overview(lay: &mut Layout, body: Rect, st: &TuiState) {
     lay.overview_cols = cols as u16;
     let tw = body.width / cols as u16;
     let th = body.height / shown_rows as u16;
+    // A cell of breathing room between tiles, when there's slack to spare.
+    let gap_x = u16::from(tw > MIN_TILE_W);
+    let gap_y = u16::from(th > MIN_TILE_H);
     for k in 0..shown {
         let (c, r) = ((k % cols) as u16, (k / cols) as u16);
-        let w = if c as usize == cols - 1 { body.width - tw * c } else { tw };
-        let h = if r as usize == shown_rows - 1 { body.height - th * r } else { th };
+        let last_col = c as usize == cols - 1;
+        let last_row = r as usize == shown_rows - 1;
+        let w = (if last_col { body.width - tw * c } else { tw }) - if last_col { 0 } else { gap_x };
+        let h = (if last_row { body.height - th * r } else { th }) - if last_row { 0 } else { gap_y };
         let outer = Rect { x: body.x + tw * c, y: body.y + th * r, width: w, height: h };
         let inner = Block::default().borders(Borders::ALL).inner(outer);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
@@ -539,8 +547,9 @@ mod tests {
         assert_eq!(side.width, 36);
         assert_eq!(pane.x, 36);
         assert_eq!(pane.right(), 120);
-        // Under the pane's header row and rule, padded a cell either side.
-        assert_eq!(lay.pane_inner.unwrap(), Rect::new(37, 3, 82, 36));
+        // Under the header's breathing room, then the pane's header row and
+        // rule, padded a cell either side.
+        assert_eq!(lay.pane_inner.unwrap(), Rect::new(37, 4, 82, 35));
         assert_eq!(compute(Rect::new(0, 0, 300, 40), &s).sidebar.unwrap().width, SIDEBAR_MAX);
     }
 

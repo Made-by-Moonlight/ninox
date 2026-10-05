@@ -1624,7 +1624,7 @@ mod tests {
         live_pane(&mut st, "alpha");
         st.focus = Focus::Pane;
         let out = render(&st, 120, 20);
-        let title = out.lines().nth(1).unwrap();
+        let title = out.lines().find(|l| l.contains("◀ fleet")).unwrap();
         let (back, kill, zoom) = (title.find("◀ fleet").unwrap(), title.find("✕ kill").unwrap(), title.find("⤢ zoom").unwrap());
         assert!(back < kill && kill < zoom, "{title}");
         let footer = out.lines().last().unwrap();
