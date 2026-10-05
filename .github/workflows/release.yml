@@ -63,6 +63,18 @@ jobs:
           fetch-depth: 0
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
+      - name: Sync to latest main
+        # actions/checkout pins HEAD to this run's triggering SHA. Queued
+        # runs from near-simultaneous pushes execute sequentially (see the
+        # concurrency group above), so by the time a later run starts, an
+        # earlier one may have already pushed a release commit + tag to
+        # main. Reset to the live tip so last_tag/bump/next below are always
+        # computed from main's current state, not this run's stale trigger.
+        run: |
+          set -euo pipefail
+          git fetch origin main --tags
+          git reset --hard origin/main
+
       - name: Decide the bump from angular commits
         id: decide
         run: |
