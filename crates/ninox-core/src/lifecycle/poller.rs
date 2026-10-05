@@ -1208,7 +1208,7 @@ impl Poller {
                 Ok(c)  => c,
                 Err(e) => { tracing::warn!("github ci checks: {e}"); vec![] }
             };
-            let ci = self.ingest_ci(&session, pr_id, &checks).await;
+            let ci = self.ingest_ci(&session, pr_id, &checks, pr_status.mergeable).await;
 
             // -- Review threads + issue comments (throttled via seen_comment_ids) --
             let threads = match gh.get_review_threads(&owner, &repo, pr_number).await {
@@ -1403,7 +1403,7 @@ impl Poller {
             let _ = self.engine.store.upsert_pr(&pr);
             self.engine.emit(Event::PrOpened { session_id: session.id.clone(), pr });
 
-            let ci = self.ingest_ci(&session, pr_id, &snap.checks).await;
+            let ci = self.ingest_ci(&session, pr_id, &snap.checks, snap.status.mergeable).await;
             let (has_new, already_sent, new_comments, has_changes_requested) =
                 self.scan_reviews(&session.id, pr_id, &snap.threads, &snap.issue_comments);
             self.apply_status_and_gate(&session, &snap.status, &ci, has_changes_requested);
@@ -1602,6 +1602,42 @@ impl Poller {
                 }
             }
 
+            // Ready-to-merge transition — the same newly-ready logic as
+            // `ingest_ci`, against the watch's own cache entry.
+            let is_ready = ci.failing == 0 && ci.pending == 0 && snap.status.mergeable == Some(true);
+            let (newly_ready, ready_already_sent) = {
+                let mut cache = self.enrichment_cache.lock().unwrap();
+                let state = cache.entry(cache_key.clone()).or_default();
+                let newly_ready = state.prev_ready.is_none_or(|p| !p) && is_ready;
+                state.prev_ready = Some(is_ready);
+                let already = state.ready_reaction_sent;
+                if newly_ready && !already {
+                    state.ready_reaction_sent = true;
+                }
+                if !is_ready {
+                    state.ready_reaction_sent = false;
+                }
+                (newly_ready, already)
+            };
+            if newly_ready && !ready_already_sent {
+                self.engine.emit(Event::Notification(Notification {
+                    id:         format!("watch-ready-{cache_key}"),
+                    kind:       NotificationKind::PrReadyToMerge,
+                    title:      format!("Watched PR ready to merge — {}#{}", w.repo, w.pr_number),
+                    body:       format!("{}/{} checks passing, mergeable", ci.passing, ci.total),
+                    session_id: w.opener_session_id.clone(),
+                    created_at: now_millis(),
+                }));
+                if let Some(opener) = &w.opener_session_id {
+                    let msg = crate::lifecycle::reactions::format_watched_pr_ready(
+                        &w.repo, w.pr_number, &ci,
+                    );
+                    if let Err(e) = self.engine.send_to_session(opener, &msg).await {
+                        tracing::warn!("send watched-pr ready reaction to {opener}: {e}");
+                    }
+                }
+            }
+
             // New CHANGES_REQUESTED review activity — `seen_comment_ids` dedup
             // on the watch's own cache entry (store writes for comments are
             // the session path's job; watches only notify).
@@ -1655,10 +1691,14 @@ impl Poller {
 
     /// The CI block: summarize → upsert → `CiUpdated` emit → newly-failing
     /// transition (via `enrichment_cache`) → `CiFailure` notification +
-    /// `format_ci_reaction` sent into the session's tmux. Takes already-fetched
-    /// checks (the caller owns the `get_ci_checks` network call) so a
-    /// non-REST caller can reuse this. Returns the computed `CIStatus`.
-    async fn ingest_ci(&self, session: &Session, pr_id: PrId, checks: &[CheckRun]) -> CIStatus {
+    /// `format_ci_reaction` sent into the session's tmux, plus the symmetric
+    /// newly-ready transition → `PrReadyToMerge` notification +
+    /// `format_ready_to_merge_reaction`. Takes already-fetched checks (the
+    /// caller owns the `get_ci_checks` network call) so a non-REST caller can
+    /// reuse this. Returns the computed `CIStatus`.
+    async fn ingest_ci(
+        &self, session: &Session, pr_id: PrId, checks: &[CheckRun], mergeable: Option<bool>,
+    ) -> CIStatus {
         let ci = summarize_checks(pr_id, checks);
         let _ = self.engine.store.upsert_ci_status(&ci);
         self.engine.emit(Event::CiUpdated { pr_id, status: ci.clone() });
@@ -1702,6 +1742,40 @@ impl Poller {
             );
             if let Err(e) = self.engine.send_to_session(&session.id, &msg).await {
                 tracing::warn!("send ci reaction to {}: {e}", session.id);
+            }
+        }
+
+        // -- Detect the symmetric newly-ready transition --
+        let is_ready = ci.failing == 0 && ci.pending == 0 && mergeable == Some(true);
+        let (newly_ready, ready_reaction_already_sent) = {
+            let mut cache = self.enrichment_cache.lock().unwrap();
+            let state = cache.entry(session.id.clone()).or_default();
+
+            let newly_ready = state.prev_ready.is_none_or(|p| !p) && is_ready;
+            state.prev_ready = Some(is_ready);
+
+            let already_sent = state.ready_reaction_sent;
+            if newly_ready && !already_sent {
+                state.ready_reaction_sent = true;
+            }
+            if !is_ready {
+                state.ready_reaction_sent = false;
+            }
+            (newly_ready, already_sent)
+        };
+
+        if newly_ready && !ready_reaction_already_sent {
+            self.engine.emit(Event::Notification(Notification {
+                id:         format!("ready-{}", session.id),
+                kind:       NotificationKind::PrReadyToMerge,
+                title:      format!("Ready to merge — {}", session.name),
+                body:       format!("{}/{} checks passing, mergeable", ci.passing, ci.total),
+                session_id: Some(session.id.clone()),
+                created_at: now_millis(),
+            }));
+            let msg = crate::lifecycle::reactions::format_ready_to_merge_reaction(session, &ci);
+            if let Err(e) = self.engine.send_to_session(&session.id, &msg).await {
+                tracing::warn!("send ready-to-merge reaction to {}: {e}", session.id);
             }
         }
 
@@ -4659,6 +4733,59 @@ mod tests {
         );
     }
 
+    /// Symmetric counterpart to `batched_poll_ingests_ci_and_reviews_like_legacy`:
+    /// a session's own PR going all-passing + mergeable must emit
+    /// `PrReadyToMerge` exactly once per transition, the same dedup-per-cycle
+    /// shape as the newly-failing case.
+    #[tokio::test]
+    async fn batched_poll_notifies_ready_to_merge_for_own_pr() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&open_pr_session("s1", "/ws", 50)).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        let engine = batch_engine(store.clone(), batch.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        let tick = |conclusion: &str, mergeable: Option<bool>| {
+            let mut snap = open_snapshot(50);
+            snap.status.mergeable = mergeable;
+            snap.checks = vec![CheckRun {
+                name: "test".into(), status: "completed".into(), conclusion: Some(conclusion.into()),
+            }];
+            batch.result.lock().unwrap().prs.insert(pr_key("Owner/repo", 50), snap);
+        };
+
+        tick("success", Some(true));
+        poller.poll_github_batched(true).await;
+        let first = notifs(&drain_events(&mut rx), NotificationKind::PrReadyToMerge);
+        assert_eq!(first.len(), 1, "the first all-green + mergeable tick must notify");
+        assert_eq!(first[0].session_id.as_deref(), Some("s1"));
+        assert_eq!(first[0].body, "1/1 checks passing, mergeable");
+
+        poller.poll_github_batched(true).await;
+        assert!(
+            notifs(&drain_events(&mut rx), NotificationKind::PrReadyToMerge).is_empty(),
+            "a still-ready PR must not re-notify",
+        );
+
+        tick("success", Some(false));
+        poller.poll_github_batched(true).await;
+        assert!(
+            notifs(&drain_events(&mut rx), NotificationKind::PrReadyToMerge).is_empty(),
+            "green checks but not mergeable (conflicts) must not notify",
+        );
+
+        tick("success", Some(true));
+        poller.poll_github_batched(true).await;
+        assert_eq!(
+            notifs(&drain_events(&mut rx), NotificationKind::PrReadyToMerge).len(), 1,
+            "becoming ready again after a regression is a fresh transition and must notify",
+        );
+    }
+
     /// The batched path subsumes `poll_pr_reconciliation`: a session with no
     /// tracked PR contributes a branch key for every candidate remote, and
     /// whatever open PR comes back is adopted (number, repo, PrOpen).
@@ -5186,6 +5313,60 @@ mod tests {
         assert_eq!(
             store.list_pr_watches().unwrap().len(), 1,
             "a non-terminal PR keeps its watch registered",
+        );
+    }
+
+    /// Symmetric counterpart to `watch_ci_failure_notifies_once_until_recovery`:
+    /// an explicit `ninox open --pr` watch going all-passing + mergeable must
+    /// notify the opener exactly once per transition.
+    #[tokio::test]
+    async fn watch_ready_to_merge_notifies_once_until_regression() {
+        use crate::store::Store;
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_session(&test_session("sess-a", "/ws")).unwrap();
+        store.upsert_pr_watch(&watch_by("o/r", 7, "sess-a")).unwrap();
+
+        let batch = std::sync::Arc::new(FakeBatchApi::default());
+        let engine = batch_engine(store.clone(), batch.clone());
+        let mut rx = engine.subscribe();
+        let poller = Poller::new(engine);
+
+        let tick = |conclusion: &str, mergeable: Option<bool>| {
+            let mut snap = open_snapshot(7);
+            snap.status.mergeable = mergeable;
+            snap.checks = vec![CheckRun {
+                name: "test".into(), status: "completed".into(), conclusion: Some(conclusion.into()),
+            }];
+            batch.result.lock().unwrap().prs.insert(pr_key("o/r", 7), snap);
+        };
+
+        tick("success", Some(true));
+        poller.poll_github_batched(true).await;
+        let first = notifs(&drain_events(&mut rx), NotificationKind::PrReadyToMerge);
+        assert_eq!(first.len(), 1, "the first ready tick must notify the opener");
+        assert_eq!(first[0].session_id.as_deref(), Some("sess-a"));
+        assert!(first[0].title.contains("o/r#7"), "title must name the watched PR, got {:?}", first[0].title);
+        assert_eq!(first[0].body, "1/1 checks passing, mergeable");
+
+        poller.poll_github_batched(true).await;
+        assert!(
+            notifs(&drain_events(&mut rx), NotificationKind::PrReadyToMerge).is_empty(),
+            "a still-ready PR must not re-notify",
+        );
+
+        tick("failure", Some(true));
+        poller.poll_github_batched(true).await;
+        assert!(
+            notifs(&drain_events(&mut rx), NotificationKind::PrReadyToMerge).is_empty(),
+            "a regression back to failing must not emit a ready notification",
+        );
+
+        tick("success", Some(true));
+        poller.poll_github_batched(true).await;
+        assert_eq!(
+            notifs(&drain_events(&mut rx), NotificationKind::PrReadyToMerge).len(), 1,
+            "becoming ready again after a regression is a fresh transition and must notify",
         );
     }
 

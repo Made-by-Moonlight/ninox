@@ -14,6 +14,16 @@ pub fn format_ci_reaction(_session: &Session, ci: &CIStatus, failing_names: &[St
     msg
 }
 
+/// Format a ready-to-merge reaction message to send to the agent. Mirrors
+/// `format_ci_reaction`, but for the opposite transition: CI is green and
+/// GitHub reports the PR mergeable.
+pub fn format_ready_to_merge_reaction(_session: &Session, ci: &CIStatus) -> String {
+    format!(
+        "[Ninox] Your PR is ready to merge — all {} checks passing and mergeable.",
+        ci.total,
+    )
+}
+
 /// Format a review comment reaction message to send to the agent.
 /// Lists each new CHANGES_REQUESTED comment.
 pub fn format_review_reaction(_session: &Session, comments: &[Comment]) -> String {
@@ -160,6 +170,18 @@ pub fn format_watched_pr_ci(repo: &str, pr_number: u64, ci: &CIStatus, failing_n
     }
     msg.push_str(&watch_tail(repo, pr_number));
     msg
+}
+
+/// A watched PR became ready to merge. Mirrors `format_watched_pr_ci`, but
+/// for the opposite transition — says up front that the PR isn't the
+/// agent's own.
+pub fn format_watched_pr_ready(repo: &str, pr_number: u64, ci: &CIStatus) -> String {
+    format!(
+        "[Ninox] The PR you are watching, {repo}#{pr_number}, is ready to merge — \
+         all {} checks passing and mergeable.{tail}",
+        ci.total,
+        tail = watch_tail(repo, pr_number),
+    )
 }
 
 /// New CHANGES_REQUESTED review activity on a watched PR. Mirrors

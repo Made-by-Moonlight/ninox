@@ -30,6 +30,7 @@ fn kind_label(kind: &NotificationKind) -> &'static str {
         NotificationKind::CheckoutUnavailable => "Checkout",
         NotificationKind::RestartAllCompleted => "Restart",
         NotificationKind::RestartAllFailed    => "Restart",
+        NotificationKind::PrReadyToMerge  => "Ready",
     }
 }
 
@@ -50,6 +51,7 @@ fn kind_color(kind: &NotificationKind, s: &ColorScheme) -> Color {
         NotificationKind::CheckoutUnavailable => s.status_ci_failed,
         NotificationKind::RestartAllCompleted => s.status_done,
         NotificationKind::RestartAllFailed    => s.status_ci_failed,
+        NotificationKind::PrReadyToMerge  => s.status_done,
     }
 }
 

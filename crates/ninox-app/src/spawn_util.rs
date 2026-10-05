@@ -1299,11 +1299,12 @@ pub fn create_worktree_at(
     anyhow::bail!("{}", stderr.trim());
 }
 
-/// Write a minimal `.claude/settings.json` (`statusLine`, plus the inbox
-/// drain hooks when opt-in messaging is enabled) into a freshly created
-/// worker worktree, unless one already exists (e.g. checked into the
-/// branch). Best-effort: any failure here must never fail worktree
-/// creation itself, so errors are swallowed rather than propagated.
+/// Write a minimal `.claude/settings.json` (`statusLine`, the Stop/
+/// UserPromptSubmit activity hooks, plus any `PreToolUse` guard a worker
+/// capability installs) into a freshly created worker worktree, unless one
+/// already exists (e.g. checked into the branch). Best-effort: any failure
+/// here must never fail worktree creation itself, so errors are swallowed
+/// rather than propagated.
 ///
 /// The `Stop`/`UserPromptSubmit` hooks always carry the worker-status
 /// activity commands (`ninox worker-status hook-stop`/`hook-prompt` — see
@@ -1312,6 +1313,12 @@ pub fn create_worktree_at(
 /// `ninox_core::inbox`). The harness invokes all of them with
 /// `NINOX_SESSION`/`NINOX_DATA_DIR` already set (see
 /// `interactive_env_vars`/`worker_env_vars`).
+///
+/// `PreToolUse` entries come from `ninox_core::capabilities::hooks_for` —
+/// the same registry `seed_worker_skills` reads for skill markdown, gated
+/// the same way (today: `pr-watch-enforcement`, always-on). This is the
+/// worker-side counterpart to `orchestrator_root::setup_orchestrator_root`'s
+/// own hook seeding, and seeds the identical `ToolHook` value.
 fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bool) {
     let claude_dir = worktree_path.join(".claude");
     let settings_path = claude_dir.join("settings.json");
@@ -1372,11 +1379,43 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
         "Stop":             [{ "hooks": stop_hooks }],
         "UserPromptSubmit": [{ "hooks": prompt_hooks }]
     });
-    if std::fs::create_dir_all(&claude_dir).is_ok() {
-        if let Ok(body) = serde_json::to_string_pretty(&settings) {
-            if std::fs::write(&settings_path, body).is_ok() {
-                exclude_generated_provider_file(worktree_path, ".claude/settings.json");
-            }
+
+    if std::fs::create_dir_all(&claude_dir).is_err() {
+        return;
+    }
+
+    // Hook-bearing capabilities (today: `pr-watch-enforcement`) write their
+    // guard script alongside the always-on Stop/UserPromptSubmit hooks
+    // above — same registry gate `seed_worker_skills` applies to skill
+    // markdown, so a config-gated hook capability would be skipped here too.
+    //
+    // This loads the real on-disk config directly, unlike `inbox_enabled`
+    // above (deliberately threaded as a parameter so tests never touch the
+    // real config file). That's harmless today because `pr-watch-enforcement`
+    // is unconditionally enabled, but a future hook capability with a real
+    // gate (the `[pr_watch]`-style opt-in pattern) would need `config`
+    // threaded through `create_worker_worktree`/`create_worktree_at` the
+    // same way `inbox_enabled` is, to stay testable without touching
+    // `~/.config/ninox/config.toml`.
+    let config = ninox_core::config::AppConfig::load().unwrap_or_default();
+    let mut pre_tool_use = Vec::new();
+    for hook in ninox_core::capabilities::hooks_for(ninox_core::capabilities::Audience::Worker, &config) {
+        if std::fs::write(claude_dir.join(hook.script_name), hook.script).is_err() {
+            continue;
+        }
+        exclude_generated_provider_file(worktree_path, &format!(".claude/{}", hook.script_name));
+        pre_tool_use.push(serde_json::json!({
+            "matcher": hook.matcher,
+            "hooks": [{"type": "command", "command": format!("node .claude/{}", hook.script_name), "timeout": 5}]
+        }));
+    }
+    if !pre_tool_use.is_empty() {
+        settings["hooks"]["PreToolUse"] = serde_json::Value::Array(pre_tool_use);
+    }
+
+    if let Ok(body) = serde_json::to_string_pretty(&settings) {
+        if std::fs::write(&settings_path, body).is_ok() {
+            exclude_generated_provider_file(worktree_path, ".claude/settings.json");
         }
     }
 }
@@ -2174,6 +2213,37 @@ mod tests {
         let prompt_cmds = hook_commands(&settings, "UserPromptSubmit");
         assert_eq!(prompt_cmds.len(), 1, "{prompt_cmds:?}");
         assert!(prompt_cmds[0].ends_with("worker-status hook-prompt"), "{prompt_cmds:?}");
+    }
+
+    /// Parity is the point: a worker worktree must get the exact same
+    /// `pr-watch-enforcement` guard script `setup_orchestrator_root` seeds
+    /// for orchestrators — not a second hand-maintained copy.
+    #[tokio::test]
+    async fn create_worker_worktree_seeds_pr_watch_enforcement_hook() {
+        let repo = init_git_repo();
+        let worktree = create_worker_worktree(repo.to_str().unwrap(), "test-session-1", false).await.unwrap();
+        let claude_dir = std::path::Path::new(&worktree).join(".claude");
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(claude_dir.join("settings.json")).unwrap(),
+        ).unwrap();
+        let pre_tool_use = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            pre_tool_use.iter().any(|e| e["matcher"] == "Bash"
+                && e["hooks"][0]["command"] == "node .claude/pr-watch-enforcement.cjs"),
+            "pr-watch-enforcement hook entry missing: {pre_tool_use:?}",
+        );
+
+        let seeded = std::fs::read_to_string(claude_dir.join("pr-watch-enforcement.cjs")).unwrap();
+        let expected = ninox_core::capabilities::hooks_for(
+            ninox_core::capabilities::Audience::Worker,
+            &ninox_core::config::AppConfig::default(),
+        )
+        .into_iter()
+        .find(|h| h.script_name == "pr-watch-enforcement.cjs")
+        .unwrap()
+        .script;
+        assert_eq!(seeded, expected, "worker script must match the registry byte-for-byte");
     }
 
     /// Every hook command registered for `event`, across matcher groups.

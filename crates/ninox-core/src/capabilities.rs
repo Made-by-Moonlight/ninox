@@ -81,6 +81,28 @@ impl Audience {
     }
 }
 
+/// A `PreToolUse` (or other Claude Code hook event) guard a capability
+/// installs into `.claude/settings.json`, gated by the same `enabled` fn as
+/// its skill markdown. There is exactly one `ToolHook` value per capability,
+/// used verbatim for every audience it targets — unlike skill markdown
+/// (which has a separate `orchestrator_md`/`worker_md` body per audience
+/// because the wording usually differs), a hook's enforcement logic must
+/// not drift between audiences, so there is no per-audience copy to keep in
+/// sync.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolHook {
+    /// Claude Code hook event name, e.g. `"PreToolUse"`.
+    pub event: &'static str,
+    /// The settings.json hooks-array `matcher` (a tool-name glob/regex,
+    /// e.g. `"Bash"` — matched against `tool_name`, not the command text;
+    /// the script itself inspects `tool_input` for the command).
+    pub matcher: &'static str,
+    /// File name written under `.claude/`, e.g. `"pr-watch-enforcement.cjs"`.
+    pub script_name: &'static str,
+    /// The hook script body, written verbatim.
+    pub script: &'static str,
+}
+
 /// One agent-facing capability: the skill directory name, who it's for, the
 /// markdown seeded for each audience, and the config gate that decides
 /// whether it is currently live.
@@ -94,6 +116,9 @@ pub struct Capability {
     pub worker_md: Option<&'static str>,
     /// Gate against the live config; `|_| true` for always-on capabilities.
     pub enabled: fn(&AppConfig) -> bool,
+    /// An optional hook this capability also installs, alongside its skill
+    /// markdown.
+    pub hook: Option<ToolHook>,
 }
 
 impl Capability {
@@ -109,6 +134,64 @@ impl Capability {
     }
 }
 
+/// `PreToolUse` guard script for `pr-watch-enforcement`: denies the exact
+/// polling shapes `watch-pr`'s own markdown tells every agent never to run
+/// (`gh pr checks --watch`, `gh run watch`, or a loop/`sleep` wrapped around
+/// `gh pr checks`/`gh pr view`/`gh pr status`) — a single one-off
+/// `gh pr view` is left alone, matching that doc's own wording.
+///
+/// Two normalization passes run before any pattern match: backslash-newline
+/// line continuations collapse to a space (so a `--watch` flag wrapped onto
+/// its own continuation line is still seen on the same logical line), and
+/// quoted string contents are stripped (so a commit message or `--body`
+/// string that happens to mention "gh pr checks" isn't mistaken for an
+/// actual invocation). The `gh ... pr checks` / `gh ... run watch` patterns
+/// tolerate an arbitrary run of global flags between `gh` and the
+/// subcommand (`gh --repo owner/repo pr checks --watch`), bounded by the
+/// nearest command separator (`;`, `&&`, `||`, a pipe, or a newline) so it
+/// can't bridge into an unrelated chained command.
+const PR_WATCH_ENFORCEMENT_HOOK_SCRIPT: &str = r#"#!/usr/bin/env node
+const { readFileSync } = require("node:fs");
+let raw = "";
+try { raw = readFileSync(0, "utf-8"); } catch { process.exit(0); }
+let payload;
+try { payload = JSON.parse(raw || "{}"); } catch { process.exit(0); }
+if (payload.tool_name !== "Bash") process.exit(0);
+const rawCmd = (payload.tool_input && payload.tool_input.command) || "";
+const noContinuations = rawCmd.replace(/\\\r?\n/g, " ");
+const code = noContinuations.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "");
+
+const sameSeg = "(?:(?!;|&&|\\|\\||\\n).)*?";
+const ghPrStatusCmd = new RegExp(`\\bgh\\b${sameSeg}\\bpr\\s+(?:checks|view|status)\\b`);
+const ghRunWatch = new RegExp(`\\bgh\\b${sameSeg}\\brun\\s+watch\\b`);
+const ghPrChecksWatchFlag = new RegExp(`\\bgh\\b${sameSeg}\\bpr\\s+checks\\b${sameSeg}--watch\\b`);
+
+const denied =
+  ghPrChecksWatchFlag.test(code) ||
+  ghRunWatch.test(code) ||
+  (/\b(?:while|until|for)\b/.test(code) && ghPrStatusCmd.test(code)) ||
+  (/\bsleep\b/.test(code) && ghPrStatusCmd.test(code));
+if (!denied) process.exit(0);
+process.stdout.write(JSON.stringify({
+  hookSpecificOutput: {
+    hookEventName: "PreToolUse",
+    permissionDecision: "deny",
+    permissionDecisionReason:
+      "Raw gh CI/PR polling (gh pr checks --watch, gh run watch, or a loop/sleep " +
+      "around gh pr checks/gh pr view/gh pr status) is blocked — register a " +
+      "watch instead: `ninox open --pr <url>` (`ninox close --pr <url>` when done).",
+  },
+}) + "\n");
+process.exit(0);
+"#;
+
+const PR_WATCH_ENFORCEMENT_HOOK: ToolHook = ToolHook {
+    event:       "PreToolUse",
+    matcher:     "Bash",
+    script_name: "pr-watch-enforcement.cjs",
+    script:      PR_WATCH_ENFORCEMENT_HOOK_SCRIPT,
+};
+
 pub const REGISTRY: &[Capability] = &[
     Capability {
         name: "spawn-worker",
@@ -116,6 +199,7 @@ pub const REGISTRY: &[Capability] = &[
         orchestrator_md: Some(include_str!("../skills/orchestrator/spawn-worker.md")),
         worker_md: None,
         enabled: |_| true,
+        hook: None,
     },
     Capability {
         name: "reap-workers",
@@ -123,6 +207,7 @@ pub const REGISTRY: &[Capability] = &[
         orchestrator_md: Some(include_str!("../skills/orchestrator/reap-workers.md")),
         worker_md: None,
         enabled: |_| true,
+        hook: None,
     },
     Capability {
         name: "spawn-orchestrator",
@@ -130,6 +215,7 @@ pub const REGISTRY: &[Capability] = &[
         orchestrator_md: Some(include_str!("../skills/orchestrator/spawn-orchestrator.md")),
         worker_md: None,
         enabled: |_| true,
+        hook: None,
     },
     Capability {
         name: "set-agent-config",
@@ -137,6 +223,7 @@ pub const REGISTRY: &[Capability] = &[
         orchestrator_md: Some(include_str!("../skills/orchestrator/set-agent-config.md")),
         worker_md: None,
         enabled: |_| true,
+        hook: None,
     },
     Capability {
         name: "brain",
@@ -144,6 +231,7 @@ pub const REGISTRY: &[Capability] = &[
         orchestrator_md: Some(include_str!("../skills/orchestrator/brain.md")),
         worker_md: Some(include_str!("../skills/worker/brain.md")),
         enabled: |_| true,
+        hook: None,
     },
     // `watch-pr` is two entries, not one `Both`: the worker copy is gated on
     // `[pr_watch].enabled` (a worker told to `ninox open --pr` while the
@@ -156,6 +244,7 @@ pub const REGISTRY: &[Capability] = &[
         orchestrator_md: Some(include_str!("../skills/orchestrator/watch-pr.md")),
         worker_md: None,
         enabled: |_| true,
+        hook: None,
     },
     Capability {
         name: "watch-pr",
@@ -163,6 +252,7 @@ pub const REGISTRY: &[Capability] = &[
         orchestrator_md: None,
         worker_md: Some(include_str!("../skills/worker/watch-pr.md")),
         enabled: |cfg| cfg.pr_watch.enabled,
+        hook: None,
     },
     Capability {
         name: "plan",
@@ -170,6 +260,7 @@ pub const REGISTRY: &[Capability] = &[
         orchestrator_md: Some(include_str!("../skills/orchestrator/plan.md")),
         worker_md: None,
         enabled: |_| true,
+        hook: None,
     },
     Capability {
         name: "worker-status",
@@ -177,6 +268,7 @@ pub const REGISTRY: &[Capability] = &[
         orchestrator_md: Some(include_str!("../skills/orchestrator/worker-status.md")),
         worker_md: Some(include_str!("../skills/worker/worker-status.md")),
         enabled: |_| true,
+        hook: None,
     },
     Capability {
         name: "read-worker-screen",
@@ -184,6 +276,7 @@ pub const REGISTRY: &[Capability] = &[
         orchestrator_md: Some(include_str!("../skills/orchestrator/read-worker-screen.md")),
         worker_md: None,
         enabled: |_| true,
+        hook: None,
     },
     Capability {
         name: "fleet-recovery",
@@ -191,6 +284,7 @@ pub const REGISTRY: &[Capability] = &[
         orchestrator_md: Some(include_str!("../skills/orchestrator/fleet-recovery.md")),
         worker_md: Some(include_str!("../skills/worker/fleet-recovery.md")),
         enabled: |_| true,
+        hook: None,
     },
     Capability {
         name: "restart-session",
@@ -198,6 +292,22 @@ pub const REGISTRY: &[Capability] = &[
         orchestrator_md: Some(include_str!("../skills/orchestrator/restart-session.md")),
         worker_md: Some(include_str!("../skills/worker/restart-session.md")),
         enabled: |_| true,
+        hook: None,
+    },
+    // Both the skill (explains the hook) and the hook itself (enforces it)
+    // are seeded for both audiences unconditionally — true parity, not
+    // gated on `[pr_watch].enabled` like `watch-pr`'s worker copy, because
+    // the ban on loop/`--watch` polling holds even when the watch mechanism
+    // itself is off (the worker `watch-pr` skill's own fallback section
+    // says as much: a disabled watch still means "single one-off calls,
+    // never a watch loop").
+    Capability {
+        name: "pr-watch-enforcement",
+        audience: Audience::Both,
+        orchestrator_md: Some(include_str!("../skills/orchestrator/pr-watch-enforcement.md")),
+        worker_md: Some(include_str!("../skills/worker/pr-watch-enforcement.md")),
+        enabled: |_| true,
+        hook: Some(PR_WATCH_ENFORCEMENT_HOOK),
     },
 ];
 
@@ -232,6 +342,16 @@ pub fn description(md: &str) -> Option<&str> {
 /// The registry entries whose audience includes `aud`, in declaration order.
 pub fn for_audience(aud: Audience) -> impl Iterator<Item = &'static Capability> {
     REGISTRY.iter().filter(move |c| c.audience.includes(aud))
+}
+
+/// The hooks of every registry entry targeting `aud` that is currently
+/// enabled against `config`, in declaration order — the same gate
+/// `seed_orchestrator_skills`/`seed_worker_skills` apply to skill markdown.
+pub fn hooks_for(aud: Audience, config: &AppConfig) -> Vec<&'static ToolHook> {
+    for_audience(aud)
+        .filter(|c| (c.enabled)(config))
+        .filter_map(|c| c.hook.as_ref())
+        .collect()
 }
 
 #[cfg(test)]
@@ -304,10 +424,14 @@ mod tests {
                 "read-worker-screen",
                 "fleet-recovery",
                 "restart-session",
+                "pr-watch-enforcement",
             ]
         );
         let worker: Vec<_> = for_audience(Audience::Worker).map(|c| c.name).collect();
-        assert_eq!(worker, vec!["brain", "watch-pr", "worker-status", "fleet-recovery", "restart-session"]);
+        assert_eq!(
+            worker,
+            vec!["brain", "watch-pr", "worker-status", "fleet-recovery", "restart-session", "pr-watch-enforcement"]
+        );
     }
 
     #[test]
@@ -381,6 +505,104 @@ mod tests {
         for cap in for_audience(Audience::Worker) {
             let md = cap.worker_md.expect("checked above");
             assert!(!md.contains("{{"), "{} worker md must not need rendering", cap.name);
+        }
+    }
+
+    /// `hooks_for` must apply the same `enabled` gate as `for_audience` does
+    /// for skill markdown — a hook-bearing capability that's gated off must
+    /// not leak its hook through.
+    #[test]
+    fn hooks_for_skips_a_gated_off_hook_capability() {
+        let gated_off = Capability {
+            name: "gated-off-hook",
+            audience: Audience::Both,
+            orchestrator_md: Some("---\nname: gated-off-hook\ndescription: Off.\n---\n\nbody\n"),
+            worker_md: Some("---\nname: gated-off-hook\ndescription: Off.\n---\n\nbody\n"),
+            enabled: |_| false,
+            hook: Some(ToolHook {
+                event: "PreToolUse", matcher: "Bash",
+                script_name: "gated-off-hook.cjs", script: "#!/usr/bin/env node\n",
+            }),
+        };
+        let cfg = AppConfig::default();
+        let caps = [&gated_off];
+        let hooks: Vec<_> = caps
+            .into_iter()
+            .filter(|c| c.audience.includes(Audience::Worker))
+            .filter(|c| (c.enabled)(&cfg))
+            .filter_map(|c| c.hook.as_ref())
+            .collect();
+        assert!(hooks.is_empty(), "a disabled capability's hook must not surface");
+    }
+
+    /// The whole point of a shared `ToolHook` const: the orchestrator and
+    /// worker copies of `pr-watch-enforcement` must be the exact same bytes,
+    /// not two hand-synced strings.
+    #[test]
+    fn pr_watch_enforcement_hook_is_byte_identical_for_both_audiences() {
+        let cfg = AppConfig::default();
+        let orch = hooks_for(Audience::Orchestrator, &cfg);
+        let worker = hooks_for(Audience::Worker, &cfg);
+        assert_eq!(orch.len(), 1, "exactly one hook-bearing capability is registered for orchestrators");
+        assert_eq!(worker.len(), 1, "exactly one hook-bearing capability is registered for workers");
+        assert_eq!(orch[0].script, worker[0].script);
+        assert_eq!(orch[0].matcher, worker[0].matcher);
+        assert_eq!(orch[0].event, worker[0].event);
+        assert_eq!(orch[0].script_name, worker[0].script_name);
+    }
+
+    /// Exercises the actual guard script (not just its Rust wiring) against
+    /// the polling shapes `watch-pr`'s own markdown calls out by name, plus
+    /// the one-off calls that must stay allowed. Skips gracefully if `node`
+    /// isn't on PATH rather than failing CI environments that lack it.
+    #[test]
+    fn pr_watch_enforcement_script_denies_polling_and_allows_one_offs() {
+        if std::process::Command::new("node").arg("--version").output().is_err() {
+            eprintln!("skipping: node not found on PATH");
+            return;
+        }
+
+        let run = |command: &str| -> bool {
+            use std::io::Write;
+            let script = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(script.path(), PR_WATCH_ENFORCEMENT_HOOK_SCRIPT).unwrap();
+            let mut child = std::process::Command::new("node")
+                .arg(script.path())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}});
+            child.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+        };
+
+        for cmd in [
+            "gh pr checks 42 --watch",
+            "gh run watch 123456",
+            "while true; do gh pr checks 42; sleep 5; done",
+            "gh pr checks 42; sleep 10",
+            "for i in 1 2 3; do gh pr view 42; done",
+            // A `--watch` flag wrapped onto a backslash-continuation line.
+            "gh pr checks 42 \\\n    --watch",
+            // Global flags between `gh` and the subcommand must not evade detection.
+            "gh --repo owner/repo pr checks 42 --watch",
+            "gh --repo owner/repo run watch 123",
+        ] {
+            assert!(run(cmd), "must deny: {cmd}");
+        }
+
+        for cmd in [
+            "gh pr view 42",
+            "gh pr checks 42",
+            "git status",
+            "gh pr list",
+            // The literal substring "gh pr checks" inside a quoted argument
+            // (e.g. a commit message) must not be mistaken for an invocation.
+            "git commit -m \"fix for gh pr checks\"",
+        ] {
+            assert!(!run(cmd), "must allow: {cmd}");
         }
     }
 }

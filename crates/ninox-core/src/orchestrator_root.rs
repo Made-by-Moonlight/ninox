@@ -139,14 +139,30 @@ process.exit(0);
 "#;
     fs::write(claude_dir.join("subagent-blocker.cjs"), blocker).await?;
 
+    // Hook-bearing capabilities (today: `pr-watch-enforcement`) also write
+    // their guard script, gated the same way as their skill markdown —
+    // always overwritten, same as the subagent-blocker above, so an
+    // upgraded ninox re-seeds the current script even when settings.json
+    // itself already exists and is left alone below.
+    let mut capability_pre_tool_use = Vec::new();
+    for hook in capabilities::hooks_for(Audience::Orchestrator, config) {
+        fs::write(claude_dir.join(hook.script_name), hook.script).await?;
+        capability_pre_tool_use.push(serde_json::json!({
+            "matcher": hook.matcher,
+            "hooks": [{"type": "command", "command": format!("node .claude/{}", hook.script_name), "timeout": 5}]
+        }));
+    }
+
     let settings_path = claude_dir.join("settings.json");
     if !settings_path.exists() {
+        let mut pre_tool_use = vec![serde_json::json!({
+            "matcher": "Task|Agent",
+            "hooks": [{"type": "command", "command": "node .claude/subagent-blocker.cjs", "timeout": 2000}]
+        })];
+        pre_tool_use.extend(capability_pre_tool_use);
         let settings = serde_json::json!({
             "hooks": {
-                "PreToolUse": [{
-                    "matcher": "Task|Agent",
-                    "hooks": [{"type": "command", "command": "node .claude/subagent-blocker.cjs", "timeout": 2000}]
-                }]
+                "PreToolUse": pre_tool_use
             },
             "statusLine": {
                 "type": "command",
@@ -379,6 +395,7 @@ mod tests {
             orchestrator_md: Some("---\nname: always-on\ndescription: On.\n---\n\nbody\n"),
             worker_md: None,
             enabled: |_| true,
+            hook: None,
         };
         let off = Capability {
             name: "gated-off",
@@ -386,6 +403,7 @@ mod tests {
             orchestrator_md: Some("---\nname: gated-off\ndescription: Off.\n---\n\nbody\n"),
             worker_md: None,
             enabled: |_| false,
+            hook: None,
         };
 
         let dir = tempdir().unwrap().keep();
@@ -435,7 +453,19 @@ mod tests {
         assert_eq!(settings["statusLine"]["command"], "'/path/to/ninox' statusline");
         assert_eq!(settings["statusLine"]["refreshInterval"], 20);
         // The existing subagent-blocker hook must still be present.
-        assert!(settings["hooks"]["PreToolUse"].is_array());
+        let pre_tool_use = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            pre_tool_use.iter().any(|e| e["matcher"] == "Task|Agent"),
+            "subagent-blocker entry missing: {pre_tool_use:?}",
+        );
+        // `pr-watch-enforcement`'s hook must be registered alongside it, and
+        // its script written to disk.
+        assert!(
+            pre_tool_use.iter().any(|e| e["matcher"] == "Bash"
+                && e["hooks"][0]["command"] == "node .claude/pr-watch-enforcement.cjs"),
+            "pr-watch-enforcement hook entry missing: {pre_tool_use:?}",
+        );
+        assert!(root.join(".claude").join("pr-watch-enforcement.cjs").exists());
     }
 
     #[tokio::test]
@@ -449,5 +479,22 @@ mod tests {
 
         let contents = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
         assert_eq!(contents, r#"{"userCustom": true}"#, "pre-existing settings.json must be left byte-for-byte alone");
+    }
+
+    /// Same "always overwritten" contract as the subagent-blocker script:
+    /// the hook script itself is rewritten on every call, even when a
+    /// pre-existing settings.json means its PreToolUse entry is never
+    /// (re-)registered.
+    #[tokio::test]
+    async fn setup_orchestrator_root_always_rewrites_pr_watch_enforcement_script() {
+        let root = tempdir().unwrap().keep();
+        let claude_dir = root.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("settings.json"), r#"{"userCustom": true}"#).unwrap();
+        std::fs::write(claude_dir.join("pr-watch-enforcement.cjs"), "stale\n").unwrap();
+
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        assert_ne!(std::fs::read_to_string(claude_dir.join("pr-watch-enforcement.cjs")).unwrap(), "stale\n");
     }
 }

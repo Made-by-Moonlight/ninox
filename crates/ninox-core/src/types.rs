@@ -598,6 +598,11 @@ pub enum NotificationKind {
     /// A "restart all agents" batch finished with at least one session
     /// failing to restart.
     RestartAllFailed,
+    /// A tracked PR's status-check rollup transitioned into all-passing +
+    /// mergeable — the symmetric counterpart to `CiFailure`'s
+    /// newly-failing transition. Applies to both a session's own PR and an
+    /// explicit `ninox open --pr` watch.
+    PrReadyToMerge,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -648,6 +653,7 @@ mod tests {
                 NotificationKind::CheckoutUnavailable,
                 "\"checkout_unavailable\"",
             ),
+            (NotificationKind::PrReadyToMerge,  "\"pr_ready_to_merge\""),
         ] {
             assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
             let parsed: NotificationKind = serde_json::from_str(wire).unwrap();
