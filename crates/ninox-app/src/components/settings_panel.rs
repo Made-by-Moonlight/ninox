@@ -65,6 +65,7 @@ pub fn settings_panel(app: &App) -> Element<'_, Message> {
         messaging_card(app),
         runtime_card(app),
         version_card(app),
+        fleet_card(app),
     ]
     .spacing(18)
     .width(Length::Fixed(COLUMN_W));
@@ -551,4 +552,33 @@ fn version_card(app: &App) -> Element<'_, Message> {
     };
 
     card(app, "Version", column![version_line, Space::new(0, 8), status].spacing(0).into())
+}
+
+/// Fleet card: a "restart all agents" action — same batch path as
+/// `ninox restart --all`, for picking up a tooling-stack update across
+/// every live session at once without hunting each one down individually.
+/// Confirmation is a modal (`restart_all_modal`), not inline, since firing
+/// this interrupts every running agent's session simultaneously.
+fn fleet_card(app: &App) -> Element<'_, Message> {
+    let s = &app.scheme;
+    let live = crate::app::live_session_count(&app.sessions);
+
+    let status: Element<Message> = if live == 0 {
+        text("No live agents").size(11).font(MONO).color(s.faint).into()
+    } else {
+        let plural = if live == 1 { "" } else { "s" };
+        row![
+            text(format!("{live} live agent{plural}")).size(11).font(MONO).color(s.faint),
+            Space::new(10, 0),
+            pill_button(
+                if app.restart_all_in_progress { "Restarting…" } else { "Restart all agents" },
+                (!app.restart_all_in_progress).then_some(Message::RequestRestartAll),
+                s,
+            ),
+        ]
+        .align_y(Alignment::Center)
+        .into()
+    };
+
+    card(app, "Fleet", column![status].spacing(0).into())
 }

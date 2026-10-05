@@ -116,6 +116,9 @@ pub enum Pending {
     Reap(String),
     /// Delete a brain entry's markdown file (by entry id) and reindex.
     DeleteBrain(String),
+    /// Restart every live worker and orchestrator session (fleet-wide, not
+    /// scoped to the selected row) — same batch path as `ninox restart --all`.
+    RestartAll,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -426,6 +429,9 @@ pub enum Action {
     EditConfig,
     Restore,
     Yank(String),
+    /// Restart every live worker and orchestrator session — same batch path
+    /// as `ninox restart --all`.
+    RestartAll,
 }
 
 pub const NOTICE_MS: i64 = 5_000;
@@ -446,6 +452,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         ("x  (or click ✕)", "kill a live agent / remove an ended one; asks first"),
         ("", "removing an orchestrator removes its workers too"),
         ("r · O · R", "resume · open the PR · reap finished workers"),
+        ("Ctrl+R", "restart every live agent (tooling update); asks first"),
         ("n · g · o", "spawn orchestrator · go to · overview grid"),
         ("z · i · [", "zoom · inspector · scroll mode (j/k, g/G, y copies)"),
         ("a", "attach full-screen (tmux: Ctrl+b d returns)"),
@@ -1011,6 +1018,14 @@ impl TuiState {
         matches!(pending, Pending::Remove(id) if self.is_orchestrator_id(id) && self.remove_scope(id).live > 0)
     }
 
+    /// How many rows "restart all" would actually target — same definition
+    /// `restart --all` uses (anything not `is_terminal()`), checked against
+    /// the row cache rather than a live tmux probe, so it's only an
+    /// estimate for display; `restart::execute` re-checks liveness itself.
+    pub fn live_count(&self) -> usize {
+        self.rows.iter().filter(|r| !r.session.status.is_terminal()).count()
+    }
+
     /// The confirm modal's question and a line on what it does.
     pub fn confirm_text(&self, pending: &Pending) -> (String, String) {
         let name = |id: &str| self.rows.iter().find(|r| r.id() == id).map(|r| r.session.name.clone()).unwrap_or_else(|| id.to_string());
@@ -1044,6 +1059,13 @@ impl TuiState {
             Pending::Reap(id) => (format!("Reap the finished workers of {}?", name(id)), "removes every ended worker in the group".into()),
             Pending::DeleteBrain(id) => {
                 (format!("Delete brain entry {}?", self.brain.name_of(id)), "deletes its markdown file, reindexes, and syncs the removal to any remote".into())
+            }
+            Pending::RestartAll => {
+                let n = self.live_count();
+                (
+                    format!("Restart all {n} live agent{}?", plural(n)),
+                    "interrupts every running session at once to pick up tooling updates; conversations resume where possible".into(),
+                )
             }
         }
     }
@@ -1266,6 +1288,13 @@ fn command(st: &mut TuiState, key: KeyEvent) -> Action {
         }
         KeyCode::Char('n') => st.modal = Some(Modal::Spawn(SpawnModal::default())),
         KeyCode::Char('x') => st.ask_remove_or_kill(),
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if st.live_count() == 0 {
+                st.notify(Level::Info, "no live agents to restart");
+            } else {
+                st.modal = Some(Modal::Confirm(Pending::RestartAll));
+            }
+        }
         KeyCode::Char('r') => return st.resume_selected(),
         KeyCode::Char('O') => return st.open_selected_pr(),
         KeyCode::Char('R') => match st.selected_row().and_then(|r| r.group.clone()) {
@@ -1646,6 +1675,7 @@ fn confirmed(pending: Pending) -> Action {
         Pending::Remove(id) => Action::Remove(id),
         Pending::Reap(id) => Action::Reap(id),
         Pending::DeleteBrain(id) => Action::DeleteBrain(id),
+        Pending::RestartAll => Action::RestartAll,
     }
 }
 
@@ -2518,6 +2548,47 @@ mod tests {
         assert!(st.modal.is_some());
         assert_eq!(handle_key(&mut st, key('y')), Action::Kill("s0".into()));
         assert!(st.modal.is_none());
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn restart_all_requires_confirmation() {
+        let mut st = state_with_rows(2);
+        assert_eq!(handle_key(&mut st, ctrl('r')), Action::None);
+        assert_eq!(st.modal, Some(Modal::Confirm(Pending::RestartAll)));
+        assert_eq!(handle_key(&mut st, key('n')), Action::None, "n cancels");
+        assert!(st.modal.is_none());
+
+        assert_eq!(handle_key(&mut st, ctrl('r')), Action::None);
+        assert_eq!(handle_key(&mut st, key('y')), Action::RestartAll);
+        assert!(st.modal.is_none());
+    }
+
+    #[test]
+    fn restart_all_with_no_live_agents_skips_the_confirm() {
+        let mut st = state_with_rows(1);
+        st.rows[0].session.status = SessionStatus::Done;
+        assert_eq!(handle_key(&mut st, ctrl('r')), Action::None);
+        assert!(st.modal.is_none(), "nothing live — no point confirming");
+    }
+
+    #[test]
+    fn live_count_excludes_terminal_statuses() {
+        let mut st = state_with_rows(2);
+        assert_eq!(st.live_count(), 2);
+        st.rows[0].session.status = SessionStatus::Done;
+        assert_eq!(st.live_count(), 1);
+    }
+
+    #[test]
+    fn restart_all_confirm_text_names_the_live_count() {
+        let mut st = state_with_rows(3);
+        st.rows[0].session.status = SessionStatus::Terminated;
+        let (q, _) = st.confirm_text(&Pending::RestartAll);
+        assert_eq!(q, "Restart all 2 live agents?");
     }
 
     #[test]

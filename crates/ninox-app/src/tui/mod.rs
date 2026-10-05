@@ -806,6 +806,19 @@ async fn perform(
                 }
             }
         }),
+        Action::RestartAll => run_op(st, lp, "fleet-restart-all".to_string(), false, {
+            let store = Arc::clone(store);
+            let db_path = lp.db_path.clone();
+            move |_id| async move {
+                let config = AppConfig::load().unwrap_or_default();
+                let args = crate::restart::RestartArgs { session_ids: vec![], all: true, exec_detached: false };
+                match crate::restart::execute(args, store, config, db_path).await {
+                    Ok(outcomes) if crate::restart::had_trouble(&outcomes) => Err(crate::restart::summarize(&outcomes)),
+                    Ok(outcomes) => Ok(crate::restart::summarize(&outcomes)),
+                    Err(e) => Err(format!("restart all failed: {e}")),
+                }
+            }
+        }),
         Action::LoadBrain(_) => load_brain(st).await,
         Action::SearchBrain(query) => {
             st.brain.searching = Some(query.clone());

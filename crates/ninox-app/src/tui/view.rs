@@ -371,7 +371,11 @@ fn draw_footer(f: &mut Frame, area: Rect, st: &TuiState) {
                 if !st.needs_rows().is_empty() {
                     v.push(("!".into(), "needs you"));
                 }
-                v.extend([("space".into(), "fold"), ("g".into(), "go to"), ("n".into(), "new"), ("?".into(), "keys")]);
+                v.extend([("space".into(), "fold"), ("g".into(), "go to"), ("n".into(), "new")]);
+                if st.live_count() > 0 {
+                    v.push(("Ctrl+R".into(), "restart all"));
+                }
+                v.push(("?".into(), "keys"));
                 v
             }
         };
@@ -1435,6 +1439,7 @@ fn draw_modal(f: &mut Frame, area: Rect, st: &TuiState, modal: &Modal) {
                 Pending::Remove(_) => "remove",
                 Pending::Reap(_) => "reap",
                 Pending::DeleteBrain(_) => "delete",
+                Pending::RestartAll => "restart all",
             };
             let button = |key: &'static str, label: &'static str, primary: bool| {
                 let bg = Style::default().bg(if primary { p.paper_2 } else { p.paper });

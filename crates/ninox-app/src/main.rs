@@ -3827,7 +3827,7 @@ async fn run_tui(
         .font(include_bytes!("../assets/fonts/JetBrainsMono-Italic.ttf").as_slice())
         .font(include_bytes!("../assets/fonts/JetBrainsMono-BoldItalic.ttf").as_slice())
         .default_font(iced::Font::with_name("Archivo"))
-        .run_with(move || app::App::new(engine, orchestrator_root, orchestrator_agent, brain))?;
+        .run_with(move || app::App::new(engine, orchestrator_root, orchestrator_agent, brain, db_path))?;
 
     token.cancel();
     Ok(())

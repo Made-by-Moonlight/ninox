@@ -102,25 +102,78 @@ pub async fn run_cli(args: RestartArgs, store: Arc<Store>, config: AppConfig, db
         return Ok(());
     }
 
+    let outcomes = execute(args, store, config, db_path).await?;
+    if outcomes.is_empty() {
+        println!("nothing to restart");
+    }
+    for outcome in &outcomes {
+        println!("{}", render_outcome(outcome));
+    }
+    Ok(())
+}
+
+/// The batch restart itself, shared by the CLI (`run_cli`) and the desktop
+/// app / TUI "restart all" actions — same path, structured outcomes instead
+/// of printed lines, so a UI can summarize success/failure instead of
+/// scraping stdout.
+pub async fn execute(args: RestartArgs, store: Arc<Store>, config: AppConfig, db_path: PathBuf) -> anyhow::Result<Vec<RestartOutcome>> {
     let targets = resolve_targets(&store, &args).await?;
     if targets.is_empty() {
-        println!("nothing to restart");
-        return Ok(());
+        return Ok(Vec::new());
     }
     let self_id = env_nonempty("NINOX_SESSION");
     let orchestrators: std::collections::HashSet<String> =
         store.list_orchestrators()?.into_iter().map(|o| o.id).collect();
     let ordered = ordered_targets(targets, &orchestrators, self_id.as_deref());
 
+    let mut outcomes = Vec::with_capacity(ordered.len());
     for id in ordered {
         let outcome = if self_id.as_deref() == Some(id.as_str()) {
             spawn_detached_self_restart(&id, &db_path)
         } else {
             restart_one(&store, &config, &id).await
         };
-        println!("{}", render_outcome(&outcome));
+        outcomes.push(outcome);
     }
-    Ok(())
+    Ok(outcomes)
+}
+
+/// One-line human summary of a batch restart, for UI toasts/notifications
+/// that don't want to render every `render_outcome` line.
+/// True if any outcome didn't end in an actual restart — `Failed`, but also
+/// `NotLive`/`Unknown` (the session ended or vanished mid-batch before its
+/// own turn came up, since a sequential batch can take minutes and
+/// `resolve_targets`'s liveness check only ran once, up front). `summarize`
+/// and callers deciding whether "the batch had a problem" must agree on
+/// this definition, or a UI can report success for a batch that actually
+/// skipped sessions silently.
+pub fn had_trouble(outcomes: &[RestartOutcome]) -> bool {
+    outcomes.iter().any(|o| !matches!(o.result, RestartResult::Restarted(_) | RestartResult::Detached))
+}
+
+pub fn summarize(outcomes: &[RestartOutcome]) -> String {
+    let total = outcomes.len();
+    let mut restarted = 0usize;
+    let mut skipped: Vec<&str> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
+    for o in outcomes {
+        match &o.result {
+            RestartResult::Restarted(_) | RestartResult::Detached => restarted += 1,
+            RestartResult::NotLive | RestartResult::Unknown => skipped.push(o.session_id.as_str()),
+            RestartResult::Failed(_) => failed.push(o.session_id.as_str()),
+        }
+    }
+    if skipped.is_empty() && failed.is_empty() {
+        return format!("restarted {total} agent{}", if total == 1 { "" } else { "s" });
+    }
+    let mut msg = format!("restarted {restarted}/{total} agent{}", if total == 1 { "" } else { "s" });
+    if !skipped.is_empty() {
+        msg.push_str(&format!("; no longer live: {}", skipped.join(", ")));
+    }
+    if !failed.is_empty() {
+        msg.push_str(&format!("; failed: {}", failed.join(", ")));
+    }
+    msg
 }
 
 async fn resolve_targets(store: &Store, args: &RestartArgs) -> anyhow::Result<Vec<String>> {
@@ -345,6 +398,88 @@ mod tests {
         let ids = vec!["o".to_string(), "w".to_string()];
         let out = ordered_targets(ids, &orchestrators, Some("not-requested"));
         assert_eq!(out, vec!["w", "o"]);
+    }
+
+    #[test]
+    fn summarize_reports_a_clean_sweep() {
+        let outcomes = vec![
+            RestartOutcome { session_id: "w1".into(), result: RestartResult::Restarted(RestartedVia::Resumed) },
+            RestartOutcome { session_id: "w2".into(), result: RestartResult::Restarted(RestartedVia::Fresh) },
+        ];
+        assert_eq!(summarize(&outcomes), "restarted 2 agents");
+    }
+
+    #[test]
+    fn summarize_names_the_failures() {
+        let outcomes = vec![
+            RestartOutcome { session_id: "w1".into(), result: RestartResult::Restarted(RestartedVia::Resumed) },
+            RestartOutcome { session_id: "w2".into(), result: RestartResult::Failed("launch failed".into()) },
+        ];
+        assert_eq!(summarize(&outcomes), "restarted 1/2 agents; failed: w2");
+    }
+
+    /// A session that was live when `resolve_targets` ran can end (or
+    /// vanish from the store) before its own turn in a long sequential
+    /// batch — `NotLive`/`Unknown` must not be folded into the success
+    /// count the way a plain "restarted N agents" would imply.
+    #[test]
+    fn summarize_reports_sessions_that_stopped_being_live_mid_batch() {
+        let outcomes = vec![
+            RestartOutcome { session_id: "w1".into(), result: RestartResult::Restarted(RestartedVia::Resumed) },
+            RestartOutcome { session_id: "w2".into(), result: RestartResult::NotLive },
+            RestartOutcome { session_id: "w3".into(), result: RestartResult::Unknown },
+        ];
+        assert_eq!(summarize(&outcomes), "restarted 1/3 agents; no longer live: w2, w3");
+    }
+
+    #[test]
+    fn had_trouble_is_false_only_when_every_outcome_actually_restarted() {
+        let clean = vec![
+            RestartOutcome { session_id: "w1".into(), result: RestartResult::Restarted(RestartedVia::Resumed) },
+            RestartOutcome { session_id: "w2".into(), result: RestartResult::Detached },
+        ];
+        assert!(!had_trouble(&clean));
+
+        for result in [RestartResult::NotLive, RestartResult::Unknown, RestartResult::Failed("x".into())] {
+            assert!(had_trouble(&[RestartOutcome { session_id: "w".into(), result }]));
+        }
+    }
+
+    #[test]
+    fn summarize_handles_an_empty_batch() {
+        assert_eq!(summarize(&[]), "restarted 0 agents");
+    }
+
+    #[tokio::test]
+    async fn execute_restarts_every_live_session_and_skips_ended_ones() {
+        let st = store();
+        let ws = tempfile::tempdir().unwrap();
+        let wsp = ws.path().to_str().unwrap();
+        let mut config = AppConfig::default();
+        config.harnesses.insert("restart-fake-execute".into(), ninox_core::harness::HarnessSpec {
+            enabled: true,
+            binary: Some("sh".into()),
+            resume_args: vec!["-c".into(), "'printf \"❯ \\n\"; exec cat'".into(), "x".into(), "{session_id}".into()],
+            ..Default::default()
+        });
+        let live_id = format!("restart-execute-live-{}", std::process::id());
+        let mut live = session(&live_id, None, SessionStatus::Working, wsp);
+        live.agent_type = "restart-fake-execute".into();
+        st.upsert_session(&live).unwrap();
+        st.upsert_session(&session("restart-execute-done", None, SessionStatus::Done, wsp)).unwrap();
+
+        ninox_core::runtime::create_session(
+            ninox_core::runtime::configured_backend(), &live_id, wsp, "sh -c 'printf \"❯ \\n\"; exec cat'", &[],
+        ).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let args = RestartArgs { session_ids: vec![], all: true, exec_detached: false };
+        let outcomes = execute(args, st.clone(), config, PathBuf::from("/tmp/unused.db")).await.unwrap();
+        let _ = ninox_core::tmux::kill_session(&live_id).await;
+
+        assert_eq!(outcomes.len(), 1, "the Done session was never live, so --all never names it: {outcomes:?}");
+        assert_eq!(outcomes[0].session_id, live_id);
+        assert_eq!(outcomes[0].result, RestartResult::Restarted(RestartedVia::Resumed));
     }
 
     fn session(id: &str, orch: Option<&str>, status: SessionStatus, ws: &str) -> Session {

@@ -332,6 +332,10 @@ pub struct App {
     pub active_variant:     ThemeVariant,
     pub orchestrator_root:  std::path::PathBuf,
     pub orchestrator_agent: ninox_core::config::AgentConfig,
+    /// Where the store's sqlite file lives — threaded in at startup (mirrors
+    /// `tui::run`'s own `db_path` param) so `restart::execute` has it for the
+    /// rare self-restart branch; unused for every other action.
+    pub db_path:            std::path::PathBuf,
     pub orchestrators:      Vec<Orchestrator>,
     pub sessions:        HashMap<SessionId, Session>,
     /// Worker→worker dependency edges mirrored from the store — refreshed
@@ -378,6 +382,10 @@ pub struct App {
     /// Settings opens — drives the version line's "up to date"/"update
     /// available" state (spec: Settings panel).
     pub version_check:   VersionCheckState,
+    /// True while a `ConfirmRestartAll`-triggered batch restart is running —
+    /// disables the Fleet card's action and keeps a second click from
+    /// spawning a duplicate batch.
+    pub restart_all_in_progress: bool,
     pub sidebar:         SidebarState,
     pub view:            View,
     /// The user's preferred worker panel — global, not per-session: the
@@ -410,6 +418,11 @@ pub struct App {
     /// `spawn_modal` in practice (spawn lives in other views); when both are
     /// somehow set, rendering and Esc both give `spawn_modal` precedence.
     pub catalogue_modal: Option<CatalogueForm>,
+    /// "Restart all agents" confirmation modal (Fleet card, Settings) is
+    /// open. A plain bool rather than `Option<Form>` like the modals above —
+    /// there's no form data to carry; the live count it displays is read
+    /// straight from `sessions` at render time.
+    pub restart_all_confirm: bool,
     /// Current terminal canvas dimensions, kept in sync by WindowResized.
     /// Used as the source of truth for all start_streaming + TerminalState::new calls.
     pub terminal_cols:   u16,
@@ -603,6 +616,16 @@ pub enum Message {
     /// than the running one, `None` = already current, `Err` = the check
     /// itself failed (no registry configured, network error, ...).
     VersionCheckResult(Result<Option<String>, String>),
+    /// "Restart all agents" pressed on the Fleet card — opens the
+    /// confirmation modal rather than firing immediately.
+    RequestRestartAll,
+    /// The restart-all confirmation modal's Cancel, or Esc.
+    CancelRestartAll,
+    /// The restart-all confirmation modal's "Restart all" — fires
+    /// `restart::execute(..., all: true, ...)` against every live session.
+    ConfirmRestartAll,
+    /// The batch restart kicked off by `ConfirmRestartAll` finished.
+    RestartAllApplied(Result<Vec<crate::restart::RestartOutcome>, String>),
     FleetFilterQuery(String),
     ClearFleetFilter,
     /// Scroll a terminal by `delta` lines (positive = up into history).
@@ -751,6 +774,17 @@ pub struct RefilePlan {
 /// mid-respawn must not be able to undo it.
 fn adopts_terminal_status(known: &SessionStatus, from_store: &SessionStatus) -> bool {
     from_store.is_terminal() && from_store != known
+}
+
+/// An estimate of how many sessions "restart all" would target — the Fleet
+/// card's count and the confirm modal's question both read this, so they
+/// can't drift from each other. Based on the cached store status, not a
+/// live tmux probe, so it can disagree with `restart::execute`'s own
+/// `resolve_targets` (which checks `runtime::has_session` at fire time) if
+/// a session's pane died since the last poll; `summarize`'s result after
+/// the batch runs is the authoritative count.
+pub(crate) fn live_session_count(sessions: &HashMap<SessionId, Session>) -> usize {
+    sessions.values().filter(|s| !s.status.is_terminal()).count()
 }
 
 /// Apply a `text_editor` action to a Marginalia comment buffer while keeping
@@ -1023,6 +1057,7 @@ impl App {
         orchestrator_root: std::path::PathBuf,
         orchestrator_agent: ninox_core::config::AgentConfig,
         brain: Arc<BrainIndex>,
+        db_path: std::path::PathBuf,
     ) -> (Self, Task<Message>) {
         // Synchronously load persisted state from the DB so the UI isn't empty
         // on startup.
@@ -1088,6 +1123,7 @@ impl App {
             active_variant,
             orchestrator_root,
             orchestrator_agent,
+            db_path,
             orchestrators,
             sessions,
             session_deps:   Vec::new(),
@@ -1106,6 +1142,7 @@ impl App {
             unread_messages: HashMap::new(),
             update_in_progress: false,
             version_check:  VersionCheckState::NotChecked,
+            restart_all_in_progress: false,
             sidebar:        SidebarState::default(),
             view:           View::default(),
             worker_panel:   Default::default(),
@@ -1117,6 +1154,7 @@ impl App {
             settings,
             spawn_modal:    None,
             catalogue_modal: None,
+            restart_all_confirm: false,
             // Placeholders — corrected below by resize_terminals() using the
             // real default window size, so this never drifts out of sync with
             // main.rs's iced::window::Settings::default() (1024x768).
@@ -3076,6 +3114,15 @@ impl App {
                     return Task::none();
                 }
 
+                // Esc closes the restart-all confirm modal (Settings' Fleet
+                // card) at the same precedence level.
+                if state.restart_all_confirm {
+                    if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)) {
+                        state.restart_all_confirm = false;
+                    }
+                    return Task::none();
+                }
+
                 // Cmd/Ctrl+B toggles the sidebar from any view (IDE
                 // convention). `command()` maps to Cmd on macOS / Ctrl
                 // elsewhere, so it never shadows tmux's Ctrl-b prefix inside
@@ -3870,6 +3917,60 @@ impl App {
                 Task::none()
             }
 
+            Message::RequestRestartAll => {
+                if live_session_count(&state.sessions) > 0 {
+                    state.restart_all_confirm = true;
+                }
+                Task::none()
+            }
+            Message::CancelRestartAll => {
+                state.restart_all_confirm = false;
+                Task::none()
+            }
+            Message::ConfirmRestartAll => {
+                state.restart_all_confirm = false;
+                if state.restart_all_in_progress {
+                    return Task::none();
+                }
+                state.restart_all_in_progress = true;
+                let store = state.engine.store.clone();
+                let config = state.config.clone();
+                let db_path = state.db_path.clone();
+                Task::future(async move {
+                    let args = crate::restart::RestartArgs { session_ids: vec![], all: true, exec_detached: false };
+                    let result = crate::restart::execute(args, store, config, db_path).await.map_err(|e| e.to_string());
+                    Message::RestartAllApplied(result)
+                })
+            }
+            Message::RestartAllApplied(result) => {
+                state.restart_all_in_progress = false;
+                let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+                let (kind, title, body) = match result {
+                    Ok(outcomes) => {
+                        let failed = crate::restart::had_trouble(&outcomes);
+                        let body = crate::restart::summarize(&outcomes);
+                        if failed {
+                            (NotificationKind::RestartAllFailed, "Restart all: some agents failed".to_string(), body)
+                        } else {
+                            (NotificationKind::RestartAllCompleted, "Restart all agents".to_string(), body)
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("restart all failed: {e}");
+                        (NotificationKind::RestartAllFailed, "Restart all agents failed".to_string(), e)
+                    }
+                };
+                Self::push_notification(state, Notification {
+                    id: format!("restart-all-{ts}"),
+                    kind,
+                    title,
+                    body,
+                    session_id: None,
+                    created_at: ts,
+                });
+                Task::none()
+            }
+
             Message::FleetFilterQuery(q) => {
                 state.fleet_filter.query = q;
                 Task::none()
@@ -4265,6 +4366,7 @@ impl App {
             catalogue_modal::catalogue_modal,
             fleet_board::fleet_board,
             pr_list::pr_list,
+            restart_all_modal::restart_all_modal,
             session_detail::session_detail,
             settings_panel::settings_panel,
             sidebar::sidebar,
@@ -4311,6 +4413,8 @@ impl App {
             iced::widget::stack![base, spawn_modal(state, form)].into()
         } else if let Some(form) = &state.catalogue_modal {
             iced::widget::stack![base, catalogue_modal(state, form)].into()
+        } else if state.restart_all_confirm {
+            iced::widget::stack![base, restart_all_modal(state)].into()
         } else {
             base
         }
@@ -5162,6 +5266,7 @@ mod tests {
             active_variant:     ThemeVariant::Dark,
             orchestrator_root:  std::path::PathBuf::from("/tmp"),
             orchestrator_agent: ninox_core::config::AgentConfig::default(),
+            db_path:            std::path::PathBuf::from("/tmp/t.db"),
             orchestrators:      vec![],
             sessions:       HashMap::new(),
             session_deps:   Vec::new(),
@@ -5187,6 +5292,7 @@ mod tests {
             unread_messages: HashMap::new(),
             update_in_progress: false,
             version_check:  VersionCheckState::NotChecked,
+            restart_all_in_progress: false,
             sidebar:        SidebarState::default(),
             view:           View::FleetBoard { scope: None },
             worker_panel:   Default::default(),
@@ -5198,6 +5304,7 @@ mod tests {
             settings:       Default::default(),
             spawn_modal:    None,
             catalogue_modal: None,
+            restart_all_confirm: false,
             terminal_cols:  140,
             terminal_rows:  50,
             window_width:   0.0,
@@ -6016,7 +6123,7 @@ mod tests {
         }).unwrap();
         let engine = Engine::new(store);
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
-        let (app, _task) = App::new(engine, std::path::PathBuf::from("/tmp"), ninox_core::config::AgentConfig::default(), brain);
+        let (app, _task) = App::new(engine, std::path::PathBuf::from("/tmp"), ninox_core::config::AgentConfig::default(), brain, std::path::PathBuf::from("/tmp/t.db"));
         assert_eq!(app.orchestrators.len(), 1);
         assert_eq!(app.sessions.len(), 1);
         assert!(app.sessions.contains_key("s1"));
@@ -7732,6 +7839,7 @@ mod tests {
                 std::path::PathBuf::from("/tmp"),
                 ninox_core::config::AgentConfig::default(),
                 brain,
+                std::path::PathBuf::from("/tmp/t.db"),
             );
             // Both the runtime value AND the in-memory config are clamped, so
             // a later config.save() (e.g. a theme change) cannot re-persist
@@ -7831,6 +7939,7 @@ mod tests {
                 std::path::PathBuf::from("/tmp"),
                 ninox_core::config::AgentConfig::default(),
                 brain,
+                std::path::PathBuf::from("/tmp/t.db"),
             );
             assert_eq!(app.sidebar_width, 400.0);
             assert!(app.sidebar_hidden);
@@ -7860,6 +7969,7 @@ mod tests {
                 std::path::PathBuf::from("/tmp"),
                 ninox_core::config::AgentConfig::default(),
                 brain,
+                std::path::PathBuf::from("/tmp/t.db"),
             );
             assert_eq!(app.sidebar_width, 150.0);
             assert_eq!(app.config.sidebar_width, 150.0);
@@ -7951,6 +8061,7 @@ mod tests {
                 std::path::PathBuf::from("/tmp"),
                 ninox_core::config::AgentConfig::default(),
                 brain,
+                std::path::PathBuf::from("/tmp/t.db"),
             );
 
             let (app, _) = app.update(Message::SettingsToggleRustCache);
@@ -8144,6 +8255,105 @@ mod tests {
             text:      None,
         });
         assert!(m.catalogue_modal.is_none());
+    }
+
+    fn live_session(id: &str) -> Session {
+        Session { status: SessionStatus::Working, ..refile_session(id) }
+    }
+
+    #[test]
+    fn request_restart_all_noops_without_live_agents() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::RequestRestartAll);
+        assert!(!m.restart_all_confirm, "nothing live — no point confirming");
+    }
+
+    #[test]
+    fn request_restart_all_opens_the_confirm_modal_with_a_live_agent() {
+        let mut m = base(test_engine());
+        m.sessions.insert("s1".into(), live_session("s1"));
+        let (m, _) = m.update(Message::RequestRestartAll);
+        assert!(m.restart_all_confirm);
+    }
+
+    #[test]
+    fn cancel_and_esc_both_close_the_restart_all_modal() {
+        let mut m = base(test_engine());
+        m.sessions.insert("s1".into(), live_session("s1"));
+
+        let (m, _) = m.update(Message::RequestRestartAll);
+        assert!(m.restart_all_confirm);
+        let (m, _) = m.update(Message::CancelRestartAll);
+        assert!(!m.restart_all_confirm);
+
+        let (m, _) = m.update(Message::RequestRestartAll);
+        let (m, _) = m.update(Message::RawKey {
+            key:       iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+            modifiers: iced::keyboard::Modifiers::default(),
+            text:      None,
+        });
+        assert!(!m.restart_all_confirm);
+    }
+
+    #[test]
+    fn confirm_restart_all_closes_the_modal_and_marks_in_progress() {
+        let mut m = base(test_engine());
+        m.sessions.insert("s1".into(), live_session("s1"));
+        let (m, _) = m.update(Message::RequestRestartAll);
+        let (m, _) = m.update(Message::ConfirmRestartAll);
+        assert!(!m.restart_all_confirm);
+        assert!(m.restart_all_in_progress);
+
+        // A second confirm while one is already running must not kick off
+        // a duplicate batch — same guard `ApplyUpdate` uses.
+        let (m, _) = m.update(Message::ConfirmRestartAll);
+        assert!(m.restart_all_in_progress);
+    }
+
+    #[test]
+    fn restart_all_applied_pushes_a_completed_notification_on_a_clean_sweep() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::ConfirmRestartAll);
+        let outcomes = vec![crate::restart::RestartOutcome {
+            session_id: "w1".into(),
+            result: crate::restart::RestartResult::Restarted(crate::restart::RestartedVia::Resumed),
+        }];
+        let (m, _) = m.update(Message::RestartAllApplied(Ok(outcomes)));
+        assert!(!m.restart_all_in_progress);
+        let n = m.notifications.front().expect("a notification was pushed");
+        assert_eq!(n.kind, NotificationKind::RestartAllCompleted);
+        assert_eq!(n.body, "restarted 1 agent");
+    }
+
+    #[test]
+    fn restart_all_applied_pushes_a_failed_notification_on_partial_failure() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::ConfirmRestartAll);
+        let outcomes = vec![
+            crate::restart::RestartOutcome {
+                session_id: "w1".into(),
+                result: crate::restart::RestartResult::Restarted(crate::restart::RestartedVia::Resumed),
+            },
+            crate::restart::RestartOutcome {
+                session_id: "w2".into(),
+                result: crate::restart::RestartResult::Failed("launch failed".into()),
+            },
+        ];
+        let (m, _) = m.update(Message::RestartAllApplied(Ok(outcomes)));
+        let n = m.notifications.front().expect("a notification was pushed");
+        assert_eq!(n.kind, NotificationKind::RestartAllFailed);
+        assert_eq!(n.body, "restarted 1/2 agents; failed: w2");
+    }
+
+    #[test]
+    fn restart_all_applied_pushes_a_failed_notification_on_error() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::ConfirmRestartAll);
+        let (m, _) = m.update(Message::RestartAllApplied(Err("db unavailable".into())));
+        assert!(!m.restart_all_in_progress);
+        let n = m.notifications.front().expect("a notification was pushed");
+        assert_eq!(n.kind, NotificationKind::RestartAllFailed);
+        assert_eq!(n.body, "db unavailable");
     }
 
     #[test]

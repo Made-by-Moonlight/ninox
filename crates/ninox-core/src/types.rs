@@ -592,6 +592,12 @@ pub enum NotificationKind {
     UpdateFailed,
     /// A worker checkout could not be safely allocated or restored.
     CheckoutUnavailable,
+    /// A "restart all agents" batch (desktop or TUI) finished with every
+    /// targeted session restarted successfully.
+    RestartAllCompleted,
+    /// A "restart all agents" batch finished with at least one session
+    /// failing to restart.
+    RestartAllFailed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

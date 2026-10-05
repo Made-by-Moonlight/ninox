@@ -14,6 +14,7 @@ pub mod markdown_blocks;
 pub mod plan_block_highlighter;
 pub mod plan_panel;
 pub mod pr_list;
+pub mod restart_all_modal;
 pub mod scrollback;
 pub mod selectable_markdown;
 pub mod session_detail;
