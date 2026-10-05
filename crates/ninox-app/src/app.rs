@@ -1929,6 +1929,17 @@ impl App {
                             .as_millis();
                         let slug = slugify(&name);
                         let sid = if slug.is_empty() { format!("session-{ts}") } else { slug };
+                        if ninox_core::messaging::is_reserved_session_id(&sid) {
+                            // Reserved for ninox's own message attribution
+                            // (see `messaging::SYSTEM_SENDER`) — a session
+                            // literally named this would make its own `ninox
+                            // send` messages indistinguishable from ninox's
+                            // trusted, internally-generated ones.
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!("'{sid}' is reserved for ninox itself — pick another name"));
+                            }
+                            return Task::none();
+                        }
                         if state.sessions.contains_key(&sid) {
                             if let Some(f) = &mut state.spawn_modal {
                                 f.error = Some(format!(
@@ -2365,6 +2376,19 @@ impl App {
 
                         let slug = slugify(&name);
                         let orch_id = if slug.is_empty() { format!("orch-{ts}") } else { slug };
+
+                        if ninox_core::messaging::is_reserved_session_id(&orch_id) {
+                            // Reserved for ninox's own message attribution
+                            // (see `messaging::SYSTEM_SENDER`) — an
+                            // orchestrator literally named this would make
+                            // its own `ninox send` messages indistinguishable
+                            // from ninox's trusted, internally-generated
+                            // ones.
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!("'{orch_id}' is reserved for ninox itself — pick another name"));
+                            }
+                            return Task::none();
+                        }
 
                         if state.sessions.contains_key(&orch_id)
                             || state.orchestrators.iter().any(|o| o.id == orch_id)

@@ -24,11 +24,23 @@ pub struct InboxMessage {
     pub id:      String,
     pub text:    String,
     pub sent_at: i64,
+    /// The sender's own session id, captured server-side at send time from
+    /// the sending process's resolved identity — never a caller-suppliable
+    /// argument. `None` when the sender couldn't be resolved (e.g. a `ninox
+    /// send` invocation outside any known session). This is best-effort
+    /// attribution, not authentication: a process can still set its own
+    /// `NINOX_SESSION` to any live session id it has shell access to claim.
+    /// See `messaging::SYSTEM_SENDER` for ninox's own internally-generated
+    /// messages (poller reactions, recovery briefings), which carry that
+    /// sentinel rather than `None` — they are trusted, not unverified.
+    pub from:    Option<String>,
 }
 
-/// Write `text` as a new pending message for `session_id`. Atomic
-/// tmp-then-rename, mirroring `hooks::append_work_request`.
-pub fn write_message(dir: &Path, session_id: &str, text: &str) -> Result<InboxMessage> {
+/// Write `text` as a new pending message for `session_id`, attributed to
+/// `from` (the sender's own resolved identity, or `None` if unresolvable —
+/// see [`InboxMessage::from`]). Atomic tmp-then-rename, mirroring
+/// `hooks::append_work_request`.
+pub fn write_message(dir: &Path, session_id: &str, text: &str, from: Option<&str>) -> Result<InboxMessage> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -50,6 +62,7 @@ pub fn write_message(dir: &Path, session_id: &str, text: &str) -> Result<InboxMe
         ),
         text: text.to_string(),
         sent_at,
+        from: from.map(str::to_string),
     };
 
     let dir = inbox_dir(dir, session_id);
@@ -59,6 +72,7 @@ pub fn write_message(dir: &Path, session_id: &str, text: &str) -> Result<InboxMe
         "id":     message.id,
         "text":   message.text,
         "sentAt": message.sent_at,
+        "from":   message.from,
     });
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(&body)?)?;
@@ -83,6 +97,7 @@ pub fn read_pending_messages(dir: &Path, session_id: &str) -> Result<Vec<InboxMe
                 id:      v.get("id")?.as_str()?.to_string(),
                 text:    v.get("text")?.as_str()?.to_string(),
                 sent_at: v.get("sentAt").and_then(|t| t.as_i64()).unwrap_or(0),
+                from:    v.get("from").and_then(|f| f.as_str()).map(str::to_string),
             })
         })
         .collect();
@@ -127,21 +142,33 @@ fn inbox_dir(dir: &Path, session_id: &str) -> PathBuf {
     dir.join(format!("{session_id}.inbox"))
 }
 
+/// Prefix `msg`'s text with its recorded sender, so the delivered hook text
+/// always visibly attributes each message rather than letting an injected
+/// line read as if it came from the recipient's own orchestrator by default.
+fn attribute(msg: &InboxMessage) -> String {
+    match &msg.from {
+        Some(sender) => format!("[from {sender}] {}", msg.text),
+        None         => format!("[unverified sender] {}", msg.text),
+    }
+}
+
 /// Greedily join `pending` message bodies (oldest first, blank-line
-/// separated) up to `max_chars`, returning the joined text and exactly the
-/// ids of the messages that made it in. A message that alone exceeds
-/// `max_chars` is still included, truncated, rather than left permanently
-/// stuck — but nothing after it is added. Anything left out stays pending
-/// for the next drain, rather than being silently discarded.
+/// separated, each prefixed with its sender via [`attribute`]) up to
+/// `max_chars`, returning the joined text and exactly the ids of the
+/// messages that made it in. A message that alone exceeds `max_chars` is
+/// still included, truncated, rather than left permanently stuck — but
+/// nothing after it is added. Anything left out stays pending for the next
+/// drain, rather than being silently discarded.
 fn drain_batch(pending: Vec<InboxMessage>, max_chars: usize) -> (String, Vec<String>) {
     let mut joined = String::new();
     let mut ids = Vec::new();
     for msg in pending {
+        let text = attribute(&msg);
         let mut candidate = joined.clone();
         if !candidate.is_empty() {
             candidate.push_str("\n\n");
         }
-        candidate.push_str(&msg.text);
+        candidate.push_str(&text);
         if candidate.chars().count() > max_chars {
             if ids.is_empty() {
                 joined = candidate.chars().take(max_chars).collect();
@@ -220,9 +247,18 @@ mod tests {
     #[test]
     fn write_then_read_returns_the_message() {
         let dir = tempdir().unwrap();
-        let written = write_message(dir.path(), "sess-1", "hello worker").unwrap();
+        let written = write_message(dir.path(), "sess-1", "hello worker", None).unwrap();
         let pending = read_pending_messages(dir.path(), "sess-1").unwrap();
         assert_eq!(pending, vec![written]);
+    }
+
+    #[test]
+    fn write_then_read_round_trips_the_sender() {
+        let dir = tempdir().unwrap();
+        let written = write_message(dir.path(), "sess-1", "hello worker", Some("orch-123")).unwrap();
+        assert_eq!(written.from, Some("orch-123".to_string()));
+        let pending = read_pending_messages(dir.path(), "sess-1").unwrap();
+        assert_eq!(pending[0].from, Some("orch-123".to_string()));
     }
 
     #[test]
@@ -234,8 +270,8 @@ mod tests {
     #[test]
     fn messages_are_returned_oldest_first() {
         let dir = tempdir().unwrap();
-        let a = write_message(dir.path(), "sess-1", "first").unwrap();
-        let b = write_message(dir.path(), "sess-1", "second").unwrap();
+        let a = write_message(dir.path(), "sess-1", "first", None).unwrap();
+        let b = write_message(dir.path(), "sess-1", "second", None).unwrap();
         let pending = read_pending_messages(dir.path(), "sess-1").unwrap();
         assert_eq!(pending, vec![a, b]);
     }
@@ -243,7 +279,7 @@ mod tests {
     #[test]
     fn delivered_messages_are_no_longer_pending() {
         let dir = tempdir().unwrap();
-        let msg = write_message(dir.path(), "sess-1", "hello").unwrap();
+        let msg = write_message(dir.path(), "sess-1", "hello", None).unwrap();
         mark_messages_delivered(dir.path(), "sess-1", std::slice::from_ref(&msg.id)).unwrap();
         assert!(read_pending_messages(dir.path(), "sess-1").unwrap().is_empty());
         // Kept on disk as an audit trail, just renamed out of the pending set.
@@ -254,8 +290,8 @@ mod tests {
     #[test]
     fn messages_for_different_sessions_do_not_collide() {
         let dir = tempdir().unwrap();
-        write_message(dir.path(), "sess-1", "for one").unwrap();
-        write_message(dir.path(), "sess-2", "for two").unwrap();
+        write_message(dir.path(), "sess-1", "for one", None).unwrap();
+        write_message(dir.path(), "sess-2", "for two", None).unwrap();
         assert_eq!(read_pending_messages(dir.path(), "sess-1").unwrap().len(), 1);
         assert_eq!(read_pending_messages(dir.path(), "sess-2").unwrap().len(), 1);
     }
@@ -269,12 +305,12 @@ mod tests {
     #[test]
     fn drain_for_stop_blocks_with_joined_reason_and_delivers() {
         let dir = tempdir().unwrap();
-        write_message(dir.path(), "sess-1", "first").unwrap();
-        write_message(dir.path(), "sess-1", "second").unwrap();
+        write_message(dir.path(), "sess-1", "first", Some("orch-123")).unwrap();
+        write_message(dir.path(), "sess-1", "second", None).unwrap();
 
         let response = drain_for_stop(dir.path(), "sess-1").unwrap().unwrap();
         assert_eq!(response["decision"], "block");
-        assert_eq!(response["reason"], "first\n\nsecond");
+        assert_eq!(response["reason"], "[from orch-123] first\n\n[unverified sender] second");
         assert!(read_pending_messages(dir.path(), "sess-1").unwrap().is_empty());
     }
 
@@ -284,7 +320,7 @@ mod tests {
         // the second call must not re-block on the same already-delivered
         // batch.
         let dir = tempdir().unwrap();
-        write_message(dir.path(), "sess-1", "only message").unwrap();
+        write_message(dir.path(), "sess-1", "only message", None).unwrap();
         assert!(drain_for_stop(dir.path(), "sess-1").unwrap().is_some());
         assert!(drain_for_stop(dir.path(), "sess-1").unwrap().is_none());
     }
@@ -298,22 +334,34 @@ mod tests {
     #[test]
     fn drain_for_prompt_submit_shapes_hook_specific_output_and_delivers() {
         let dir = tempdir().unwrap();
-        write_message(dir.path(), "sess-1", "context for the next turn").unwrap();
+        write_message(dir.path(), "sess-1", "context for the next turn", Some("orch-123")).unwrap();
 
         let response = drain_for_prompt_submit(dir.path(), "sess-1").unwrap().unwrap();
         assert_eq!(response["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit");
         assert_eq!(
             response["hookSpecificOutput"]["additionalContext"],
-            "context for the next turn"
+            "[from orch-123] context for the next turn"
         );
         assert!(read_pending_messages(dir.path(), "sess-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn drain_for_prompt_submit_marks_an_unresolvable_sender_unverified() {
+        let dir = tempdir().unwrap();
+        write_message(dir.path(), "sess-1", "context for the next turn", None).unwrap();
+
+        let response = drain_for_prompt_submit(dir.path(), "sess-1").unwrap().unwrap();
+        assert_eq!(
+            response["hookSpecificOutput"]["additionalContext"],
+            "[unverified sender] context for the next turn"
+        );
     }
 
     #[test]
     fn drain_for_prompt_submit_truncates_a_single_oversized_message_and_delivers_it() {
         let dir = tempdir().unwrap();
         let long = "x".repeat(MAX_HOOK_PAYLOAD_CHARS + 500);
-        write_message(dir.path(), "sess-1", &long).unwrap();
+        write_message(dir.path(), "sess-1", &long, None).unwrap();
 
         let response = drain_for_prompt_submit(dir.path(), "sess-1").unwrap().unwrap();
         let context = response["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
@@ -323,16 +371,23 @@ mod tests {
         assert!(read_pending_messages(dir.path(), "sess-1").unwrap().is_empty());
     }
 
+    /// Length of [`attribute`]'s unverified-sender prefix, used to size a
+    /// test message that fills `MAX_HOOK_PAYLOAD_CHARS` exactly once
+    /// attributed.
+    fn unverified_prefix_len() -> usize {
+        attribute(&InboxMessage { id: String::new(), text: String::new(), sent_at: 0, from: None }).chars().count()
+    }
+
     #[test]
     fn drain_for_prompt_submit_leaves_overflow_messages_pending_instead_of_discarding_them() {
         let dir = tempdir().unwrap();
-        let big = "x".repeat(MAX_HOOK_PAYLOAD_CHARS);
-        write_message(dir.path(), "sess-1", &big).unwrap();
-        write_message(dir.path(), "sess-1", "second message").unwrap();
+        let big = "x".repeat(MAX_HOOK_PAYLOAD_CHARS - unverified_prefix_len());
+        write_message(dir.path(), "sess-1", &big, None).unwrap();
+        write_message(dir.path(), "sess-1", "second message", None).unwrap();
 
         let response = drain_for_prompt_submit(dir.path(), "sess-1").unwrap().unwrap();
         let context = response["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
-        assert_eq!(context, big, "only the first message should be in this batch");
+        assert_eq!(context, format!("[unverified sender] {big}"), "only the first message should be in this batch");
 
         let still_pending = read_pending_messages(dir.path(), "sess-1").unwrap();
         assert_eq!(still_pending.len(), 1, "the overflow message must stay pending, not be lost");
@@ -342,12 +397,12 @@ mod tests {
     #[test]
     fn drain_for_stop_leaves_overflow_messages_pending_instead_of_discarding_them() {
         let dir = tempdir().unwrap();
-        let big = "x".repeat(MAX_HOOK_PAYLOAD_CHARS);
-        write_message(dir.path(), "sess-1", &big).unwrap();
-        write_message(dir.path(), "sess-1", "second message").unwrap();
+        let big = "x".repeat(MAX_HOOK_PAYLOAD_CHARS - unverified_prefix_len());
+        write_message(dir.path(), "sess-1", &big, None).unwrap();
+        write_message(dir.path(), "sess-1", "second message", None).unwrap();
 
         let response = drain_for_stop(dir.path(), "sess-1").unwrap().unwrap();
-        assert_eq!(response["reason"], big);
+        assert_eq!(response["reason"], format!("[unverified sender] {big}"));
 
         let still_pending = read_pending_messages(dir.path(), "sess-1").unwrap();
         assert_eq!(still_pending.len(), 1, "the overflow message must stay pending, not be lost");
@@ -357,31 +412,33 @@ mod tests {
     #[test]
     fn drain_batch_includes_everything_that_fits() {
         let pending = vec![
-            InboxMessage { id: "a".into(), text: "first".into(), sent_at: 1 },
-            InboxMessage { id: "b".into(), text: "second".into(), sent_at: 2 },
+            InboxMessage { id: "a".into(), text: "first".into(), sent_at: 1, from: None },
+            InboxMessage { id: "b".into(), text: "second".into(), sent_at: 2, from: None },
         ];
-        let (joined, ids) = drain_batch(pending, 100);
-        assert_eq!(joined, "first\n\nsecond");
+        let (joined, ids) = drain_batch(pending, 1000);
+        assert_eq!(joined, "[unverified sender] first\n\n[unverified sender] second");
         assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]
     fn drain_batch_stops_before_a_message_that_would_overflow() {
-        let pending = vec![
-            InboxMessage { id: "a".into(), text: "12345".into(), sent_at: 1 },
-            InboxMessage { id: "b".into(), text: "67890".into(), sent_at: 2 },
-        ];
-        // "12345" fits; adding "\n\n67890" would exceed the cap.
-        let (joined, ids) = drain_batch(pending, 5);
-        assert_eq!(joined, "12345");
+        let msg_a = InboxMessage { id: "a".into(), text: "12345".into(), sent_at: 1, from: None };
+        let msg_b = InboxMessage { id: "b".into(), text: "67890".into(), sent_at: 2, from: None };
+        // Exactly enough room for the first attributed message; adding the
+        // second (plus the blank-line separator) would exceed the cap.
+        let cap = attribute(&msg_a).chars().count();
+        let (joined, ids) = drain_batch(vec![msg_a.clone(), msg_b], cap);
+        assert_eq!(joined, attribute(&msg_a));
         assert_eq!(ids, vec!["a".to_string()]);
     }
 
     #[test]
     fn drain_batch_truncates_a_single_message_that_alone_exceeds_the_cap() {
-        let pending = vec![InboxMessage { id: "a".into(), text: "1234567890".into(), sent_at: 1 }];
-        let (joined, ids) = drain_batch(pending, 5);
-        assert_eq!(joined, "12345");
+        let msg_a = InboxMessage { id: "a".into(), text: "1234567890".into(), sent_at: 1, from: None };
+        let full = attribute(&msg_a);
+        let cap = full.chars().count() - 5;
+        let (joined, ids) = drain_batch(vec![msg_a], cap);
+        assert_eq!(joined, full.chars().take(cap).collect::<String>());
         assert_eq!(ids, vec!["a".to_string()]);
     }
 }

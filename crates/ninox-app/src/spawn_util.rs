@@ -153,14 +153,10 @@ pub async fn launch_interactive_session(
         tracing::error!("session create failed for {sid}: {e}");
         // Surface the failure: without this the optimistically inserted
         // session would sit in Working forever.
-        if engine
-            .store
-            .update_session_status_snapshot(&sid, p.started_at, p.failure_status)
-            .unwrap_or(false)
-        {
-            if let Ok(Some(s)) = engine.store.get_session(&sid) {
-                engine.emit(Event::SessionUpdated(s, SessionFields::STATUS));
-            }
+        if let Ok(Some(mut s)) = engine.store.get_session(&sid) {
+            s.status = p.failure_status;
+            let _ = engine.store.upsert_session(&s);
+            engine.emit(Event::SessionUpdated(s, SessionFields::STATUS));
         }
         return None;
     }

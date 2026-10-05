@@ -771,8 +771,19 @@ async fn main() -> anyhow::Result<()> {
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(AppConfig::sessions_dir);
+            // The sender is the CALLING process's own resolved identity —
+            // same env-var + cwd resolution `worker-status` hooks use to
+            // identify themselves — never taken from a CLI argument, so a
+            // caller cannot simply claim to be any session it names.
+            let env_session = std::env::var("NINOX_SESSION").ok().filter(|s| !s.is_empty());
+            let cwd = std::env::current_dir().ok();
+            let from = ninox_core::worker_status::resolve_session_id(
+                &store, env_session.as_deref(), cwd.as_deref(),
+            )
+            .ok()
+            .flatten();
             ninox_core::messaging::deliver_message(
-                &store, &sessions_dir, &session_id, &message, config.send_mechanism(),
+                &store, &sessions_dir, &session_id, &message, config.send_mechanism(), from.as_deref(),
             )
             .await
         }
@@ -1238,6 +1249,13 @@ async fn run_spawn(
         .map(slugify)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("worker-{ts}"));
+    // Reserved for ninox's own message attribution (see
+    // `messaging::SYSTEM_SENDER`) — a worker literally named this would make
+    // its own `ninox send` messages indistinguishable from ninox's trusted,
+    // internally-generated ones.
+    if ninox_core::messaging::is_reserved_session_id(&id) {
+        anyhow::bail!("'{id}' is reserved for ninox itself — pick another name");
+    }
     // Refuse to reuse an existing session's id BEFORE any side effect
     // (worktree creation, upsert). The upsert below is a full-row write
     // keyed on `id`: reusing the name of a live worker — most dangerously a
@@ -2420,6 +2438,13 @@ pub(crate) async fn spawn_orchestrator_common(
     if id.is_empty() {
         anyhow::bail!("--name must contain at least one alphanumeric character");
     }
+    // Reserved for ninox's own message attribution (see
+    // `messaging::SYSTEM_SENDER`) — an orchestrator literally named this
+    // would make its own `ninox send` messages indistinguishable from
+    // ninox's trusted, internally-generated ones.
+    if ninox_core::messaging::is_reserved_session_id(&id) {
+        anyhow::bail!("'{id}' is reserved for ninox itself — pick another name");
+    }
     // Same hazard the app's modal guards: a duplicate id would upsert over an
     // existing record, then fail the tmux create and mark the hijacked
     // session Terminated.
@@ -2534,8 +2559,14 @@ pub(crate) async fn spawn_orchestrator_common(
         if !ninox_core::runtime::wait_for_input_prompt(&id, std::time::Duration::from_secs(90)).await {
             eprintln!("warning: {id} is still starting up — sending the brief anyway");
         }
+        // Unlike the fleet recovery briefing / poller-reaction call sites,
+        // this message's content is the caller-supplied `--prompt`, not text
+        // ninox's own logic produced — attribute it to the resolved spawner
+        // (or leave it unverified, same as a bare `ninox send`) rather than
+        // claiming `SYSTEM_SENDER` for content ninox didn't actually write.
         if let Err(e) = ninox_core::messaging::deliver_message(
             store, &sessions_dir, &id, &message, config.send_mechanism(),
+            spawner.as_deref(),
         ).await {
             eprintln!(
                 "warning: could not deliver the initial brief to {id}: {e}\n\
@@ -4093,6 +4124,32 @@ mod worker_env_tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_spawn_refuses_the_reserved_system_sender_name() {
+        use std::sync::Arc;
+        // "ninox" would slugify to the literal session id `messaging::SYSTEM_SENDER`
+        // uses for ninox's own trusted, internally-generated messages — a
+        // worker with that id could render its own `ninox send` messages
+        // identically to those.
+        let store = Arc::new(
+            ninox_core::store::Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap(),
+        );
+        let result = run_spawn(
+            store.clone(),
+            ninox_core::config::AppConfig::default(),
+            "do the task".into(),
+            "/some/dir".into(),
+            None,
+            Some("ninox".into()),
+            None,
+        )
+        .await;
+
+        let err = result.expect_err("must refuse the reserved name").to_string();
+        assert!(err.contains("reserved"), "{err}");
+        assert!(store.get_session("ninox").unwrap().is_none());
+    }
+
     #[test]
     fn worker_prompt_preserves_path_like_prose_without_parsing_it() {
         let prompt = "Explain why file:///Users/mu/dev/ninox/bad%GG is malformed.";
@@ -4723,6 +4780,27 @@ mod orchestrator_cli_tests {
         )
         .await;
         assert!(result.is_err(), "a nameless orchestrator has no addressable session id");
+    }
+
+    #[tokio::test]
+    async fn spawn_orchestrator_refuses_the_reserved_system_sender_name() {
+        // "ninox" would slugify to the literal session id `messaging::SYSTEM_SENDER`
+        // uses for ninox's own trusted, internally-generated messages — a
+        // spawned orchestrator with that id could render its own `ninox
+        // send` messages identically to those.
+        let store = store();
+        let result = run_spawn_orchestrator(
+            store.clone(),
+            ninox_core::config::AppConfig::default(),
+            "ninox".into(),
+            None,
+            true,
+        )
+        .await;
+
+        let err = result.expect_err("must refuse the reserved name").to_string();
+        assert!(err.contains("reserved"), "{err}");
+        assert!(store.get_session("ninox").unwrap().is_none());
     }
 
     #[tokio::test]

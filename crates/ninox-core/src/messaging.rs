@@ -7,7 +7,37 @@ use crate::{config::SendMechanism, inbox, runtime, session_socket, store::Store}
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-/// Deliver `message` to `session_id` by `mechanism`.
+/// The `from` ninox itself uses for messages whose content it generated
+/// internally (poller reactions, fleet recovery briefings) rather than
+/// relaying on behalf of some other caller. These are trusted — the
+/// engine's own code produced the text — so they are attributed to this
+/// sentinel rather than recorded as `None` (unverified), which is reserved
+/// for a case where the sender SHOULD be a resolvable session but couldn't
+/// be (e.g. a `ninox send` invocation outside any known session). Content
+/// that originated from an external caller — a spawned session's initial
+/// `--prompt` brief, for instance — is attributed to that caller's resolved
+/// identity (or left unverified) instead; `SYSTEM_SENDER` must never stand
+/// in for "we don't actually know who wrote this."
+pub const SYSTEM_SENDER: &str = "ninox";
+
+/// Whether `id` is reserved for ninox's own attribution and can therefore
+/// never be claimed as a spawned session's id — currently just
+/// [`SYSTEM_SENDER`] itself. Without this, a worker or orchestrator spawned
+/// with `--name ninox` would get the literal session id `"ninox"` (`slugify`
+/// is a no-op on it), and `inbox::attribute` would then render that
+/// session's own `ninox send` messages as `[from ninox]` — byte-identical to
+/// the tag this PR uses for ninox's own trusted, internally-generated
+/// messages, defeating the distinction entirely. Every spawn path (CLI
+/// worker/orchestrator spawn, the GUI spawn modal) must reject this id
+/// before it is ever assigned.
+pub fn is_reserved_session_id(id: &str) -> bool {
+    id == SYSTEM_SENDER
+}
+
+/// Deliver `message` to `session_id` by `mechanism`, attributed to `from`
+/// (only recorded by the inbox mechanism — see `inbox::InboxMessage::from`;
+/// the session-socket and keystroke mechanisms inject literal text with no
+/// sender-framing channel of their own).
 ///
 /// Both of the non-keystroke mechanisms need something to be true of the
 /// target that ninox does not control, so each is paired with a capability
@@ -53,8 +83,9 @@ pub async fn deliver_message(
     session_id:   &str,
     message:      &str,
     mechanism:    SendMechanism,
+    from:         Option<&str>,
 ) -> Result<()> {
-    deliver_by_mechanism(store, sessions_dir, session_id, message, mechanism).await?;
+    deliver_by_mechanism(store, sessions_dir, session_id, message, mechanism, from).await?;
     // The counter feeds the sidebar's unread badge (`Store::message_delivered_counts`);
     // a miss there must never turn an already-delivered message into an error.
     if let Err(e) = store.record_message_delivered(session_id) {
@@ -69,6 +100,7 @@ async fn deliver_by_mechanism(
     session_id:   &str,
     message:      &str,
     mechanism:    SendMechanism,
+    from:         Option<&str>,
 ) -> Result<()> {
     match mechanism {
         SendMechanism::SessionSocket => {
@@ -76,7 +108,7 @@ async fn deliver_by_mechanism(
             deliver_via_session_socket(session_socket::find_peer(session_id, pane_pid), session_id, message).await
         }
         SendMechanism::Inbox if target_can_drain_inbox(store, session_id) => {
-            inbox::write_message(sessions_dir, session_id, message)?;
+            inbox::write_message(sessions_dir, session_id, message, from)?;
             if let Err(e) = runtime::wake_idle_session(session_id).await {
                 tracing::warn!(
                     "idle-wake nudge failed for {session_id} (message already delivered via inbox): {e}"
@@ -203,6 +235,13 @@ mod tests {
     use super::*;
     use crate::{config::AgentConfig, types::{Session, SessionStatus}};
     use tempfile::tempdir;
+
+    #[test]
+    fn is_reserved_session_id_matches_only_the_system_sender() {
+        assert!(is_reserved_session_id(SYSTEM_SENDER));
+        assert!(!is_reserved_session_id("worker-1"));
+        assert!(!is_reserved_session_id("ninox-2"), "must be an exact match, not a prefix");
+    }
 
     fn session_with(id: &str, agent_type: &str, workspace_path: Option<String>) -> Session {
         Session {
@@ -344,13 +383,14 @@ mod tests {
         // No real tmux session named this exists — the best-effort idle-wake
         // nudge must degrade to a no-op rather than surfacing as an error,
         // since the message is already durably written by this point.
-        deliver_message(&store, sessions_dir.path(), "worker-1", "hello worker", SendMechanism::Inbox)
+        deliver_message(&store, sessions_dir.path(), "worker-1", "hello worker", SendMechanism::Inbox, Some("orch-1"))
             .await
             .unwrap();
 
         let pending = inbox::read_pending_messages(sessions_dir.path(), "worker-1").unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].text, "hello worker");
+        assert_eq!(pending[0].from, Some("orch-1".to_string()));
     }
 
     #[tokio::test]
@@ -361,8 +401,8 @@ mod tests {
         store.upsert_session(&session_with("worker-1", "claude-code", Some(ws.to_string_lossy().to_string()))).unwrap();
         let sessions_dir = tempdir().unwrap();
 
-        deliver_message(&store, sessions_dir.path(), "worker-1", "one", SendMechanism::Inbox).await.unwrap();
-        deliver_message(&store, sessions_dir.path(), "worker-1", "two", SendMechanism::Inbox).await.unwrap();
+        deliver_message(&store, sessions_dir.path(), "worker-1", "one", SendMechanism::Inbox, None).await.unwrap();
+        deliver_message(&store, sessions_dir.path(), "worker-1", "two", SendMechanism::Inbox, None).await.unwrap();
 
         assert_eq!(store.message_delivered_counts().unwrap().get("worker-1"), Some(&2));
     }
@@ -373,7 +413,7 @@ mod tests {
         let sessions_dir = tempdir().unwrap();
 
         let result =
-            deliver_message(&store, sessions_dir.path(), "orch-1", "hello", SendMechanism::Keystrokes).await;
+            deliver_message(&store, sessions_dir.path(), "orch-1", "hello", SendMechanism::Keystrokes, None).await;
 
         assert!(result.is_err(), "no tmux session named orch-1 exists, so keystrokes must fail");
         assert!(store.message_delivered_counts().unwrap().is_empty());
@@ -392,7 +432,7 @@ mod tests {
         let sessions_dir = tempdir().unwrap();
 
         let result =
-            deliver_message(&store, sessions_dir.path(), "orch-1", "hello", SendMechanism::Inbox).await;
+            deliver_message(&store, sessions_dir.path(), "orch-1", "hello", SendMechanism::Inbox, None).await;
 
         assert!(result.is_err(), "must fall back to (and surface failures from) send_keys");
         assert!(
@@ -414,7 +454,7 @@ mod tests {
         // keystrokes are selected, even though this target COULD drain an
         // inbox.
         let result =
-            deliver_message(&store, sessions_dir.path(), "worker-1", "hello", SendMechanism::Keystrokes).await;
+            deliver_message(&store, sessions_dir.path(), "worker-1", "hello", SendMechanism::Keystrokes, None).await;
         assert!(result.is_err());
         assert!(inbox::read_pending_messages(sessions_dir.path(), "worker-1").unwrap().is_empty());
     }

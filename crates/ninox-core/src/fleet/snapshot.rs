@@ -356,7 +356,7 @@ mod tests {
         store.upsert_ci_status(&CIStatus { pr_id: 9, total: 2, passing: 2, failing: 0, pending: 0 }).unwrap();
         store.record_spawn_facts("w", "the brief", Some("w")).unwrap();
         store.record_interruption("w", 10, &SessionStatus::PrOpen, Some("reboot")).unwrap();
-        crate::inbox::write_message(dir.path(), "o", "hello").unwrap();
+        crate::inbox::write_message(dir.path(), "o", "hello", None).unwrap();
 
         let registry = HarnessRegistry::from_config(&Default::default());
         let snap = FleetSnapshot::load(&store, &registry, &NoProbe, dir.path(), 99).unwrap();

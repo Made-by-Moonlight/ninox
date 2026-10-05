@@ -231,6 +231,7 @@ async fn restart_one_inner(store: &Arc<Store>, config: &AppConfig, id: &str) -> 
     // need a nudge, the same way `fleet::restore`'s own relaunch does.
     if let Err(e) = ninox_core::messaging::deliver_message(
         store, &AppConfig::sessions_dir(), id, &note, config.send_mechanism(),
+        Some(ninox_core::messaging::SYSTEM_SENDER),
     )
     .await
     {

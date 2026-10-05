@@ -453,6 +453,7 @@ async fn deliver_briefing(
     let Some(text) = briefing_for(snap, id) else { return false };
     let sent = ninox_core::messaging::deliver_message(
         store, &AppConfig::sessions_dir(), id, &text, config.send_mechanism(),
+        Some(ninox_core::messaging::SYSTEM_SENDER),
     )
     .await;
     match sent {
