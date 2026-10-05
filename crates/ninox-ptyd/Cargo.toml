@@ -1,6 +1,6 @@
 [package]
 name        = "ninox-ptyd"
-version     = "0.30.2"
+version     = "0.31.0"
 edition     = "2021"
 description = "PTY host for Ninox: owns agent PTYs and one terminal emulator per pane."
 license     = "MIT"
