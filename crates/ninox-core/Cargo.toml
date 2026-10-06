@@ -1,6 +1,6 @@
 [package]
 name        = "ninox-core"
-version     = "0.31.1"
+version     = "0.32.0"
 edition     = "2021"
 description = "Engine core for the Ninox native app: session lifecycle, config, and storage."
 license     = "MIT"
@@ -31,7 +31,7 @@ sha2       = { workspace = true }
 time       = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
-ninox-ptyd = { path = "../ninox-ptyd", version = "0.31.1" }
+ninox-ptyd = { path = "../ninox-ptyd", version = "0.32.0" }
 
 [build-dependencies]
 # Compiles src/ort_link_compat.cpp on gnu-Linux targets only — the iostream
