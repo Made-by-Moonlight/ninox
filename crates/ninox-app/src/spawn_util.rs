@@ -1403,7 +1403,7 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
         if std::fs::write(claude_dir.join(hook.script_name), hook.script).is_err() {
             continue;
         }
-        exclude_generated_provider_file(worktree_path, &format!(".claude/{}", hook.script_name));
+        let _ = git_exclude_add(worktree_path, &format!(".claude/{}", hook.script_name));
         pre_tool_use.push(serde_json::json!({
             "matcher": hook.matcher,
             "hooks": [{"type": "command", "command": format!("node .claude/{}", hook.script_name), "timeout": 5}]
@@ -1415,7 +1415,7 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
 
     if let Ok(body) = serde_json::to_string_pretty(&settings) {
         if std::fs::write(&settings_path, body).is_ok() {
-            exclude_generated_provider_file(worktree_path, ".claude/settings.json");
+            let _ = git_exclude_add(worktree_path, ".claude/settings.json");
         }
     }
 }
@@ -1429,45 +1429,64 @@ fn git_path_is_tracked(workspace: &std::path::Path, relative_path: &str) -> bool
         .is_ok_and(|output| output.status.success())
 }
 
-fn exclude_generated_provider_file(workspace: &std::path::Path, relative_path: &str) {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args(["rev-parse", "--git-common-dir"])
-        .output();
-    let Ok(output) = output else { return };
-    if !output.status.success() {
-        return;
+/// Idempotently append `rel_path` to the worktree's shared `.git/info/
+/// exclude` — git's own per-checkout, local-only ignore mechanism. Unlike a
+/// tracked `.gitignore`, this can never itself be committed and is enforced
+/// regardless of what the target repo's own `.gitignore` does or doesn't
+/// cover, so it's the one mechanism every seeded `.claude` path (settings,
+/// skill markdown, hook scripts) is excluded through — see
+/// [`ensure_statusline_settings`] and [`seed_worker_skill`].
+///
+/// Resolved via `git rev-parse --git-common-dir` from `workspace`, so a
+/// linked worktree's entry lands in the one exclude file shared by the whole
+/// repo/worktree set, not a per-worktree copy. Returns `Ok(())` without
+/// writing anything if `workspace` isn't a git repo at all (nothing to
+/// protect against a commit in that case).
+///
+/// Append-only (never a whole-file read-modify-write): even if two spawns
+/// race on the same shared `info/exclude`, the worst case is a harmless
+/// duplicate line, never a lost concurrent edit.
+fn git_exclude_add(workspace: &std::path::Path, rel_path: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::io::Write as _;
+
+    let out = std::process::Command::new("git")
+        .args(["-C", &workspace.to_string_lossy(), "rev-parse", "--git-common-dir"])
+        .output()
+        .context("git rev-parse --git-common-dir")?;
+    if !out.status.success() {
+        return Ok(());
     }
-    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let common_dir = if std::path::Path::new(&raw).is_absolute() {
-        std::path::PathBuf::from(raw)
+
+    let common_dir_raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let common_dir = if std::path::Path::new(&common_dir_raw).is_absolute() {
+        std::path::PathBuf::from(&common_dir_raw)
     } else {
-        workspace.join(raw)
+        workspace.join(&common_dir_raw)
     };
     let exclude_path = common_dir.join("info").join("exclude");
+
     let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
-    if existing.lines().any(|line| line.trim() == relative_path) {
-        return;
+    if existing.lines().any(|l| l.trim() == rel_path) {
+        return Ok(());
     }
-    let Some(parent) = exclude_path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
+
+    if let Some(parent) = exclude_path.parent() {
+        std::fs::create_dir_all(parent).context("create info dir")?;
     }
-    let Ok(mut file) = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(exclude_path)
-    else {
-        return;
-    };
-    use std::io::Write as _;
+        .open(&exclude_path)
+        .context("open info/exclude for append")?;
+    let mut buf = String::new();
     if !existing.is_empty() && !existing.ends_with('\n') {
-        let _ = file.write_all(b"\n");
+        buf.push('\n');
     }
-    let _ = writeln!(file, "{relative_path}");
+    buf.push_str(rel_path);
+    buf.push('\n');
+    file.write_all(buf.as_bytes()).context("append info/exclude")?;
+    Ok(())
 }
 
 /// Writes `content` as `SKILL.md` under `.claude/skills/<name>/` inside
@@ -1516,51 +1535,15 @@ async fn seed_worker_skill(workspace: &str, name: &str, content: &str) -> anyhow
         .await
         .context("write SKILL.md")?;
 
-    let out = tokio::process::Command::new("git")
-        .args(["-C", workspace, "rev-parse", "--git-common-dir"])
-        .output()
+    // `git_exclude_add` shells out and does blocking fs I/O — spawn_blocking
+    // keeps this `async fn` from tying up a tokio worker thread for the
+    // duration of the git subprocess, same reasoning as why
+    // `create_worker_worktree` wraps the (also blocking) `create_worktree_at`.
+    let workspace = workspace.to_string();
+    let rel_path = format!(".claude/skills/{name}/");
+    tokio::task::spawn_blocking(move || git_exclude_add(std::path::Path::new(&workspace), &rel_path))
         .await
-        .context("git rev-parse --git-common-dir")?;
-    if !out.status.success() {
-        // Not a git repo (or git unavailable) — nothing to protect against
-        // a commit; the skill file itself is still written above.
-        return Ok(());
-    }
-
-    let common_dir_raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let common_dir = if std::path::Path::new(&common_dir_raw).is_absolute() {
-        std::path::PathBuf::from(&common_dir_raw)
-    } else {
-        std::path::Path::new(workspace).join(&common_dir_raw)
-    };
-    let exclude_path = common_dir.join("info").join("exclude");
-
-    let exclude_line = format!(".claude/skills/{name}/");
-    let existing = fs::read_to_string(&exclude_path).await.unwrap_or_default();
-    if !existing.lines().any(|l| l.trim() == exclude_line) {
-        if let Some(parent) = exclude_path.parent() {
-            fs::create_dir_all(parent).await.context("create info dir")?;
-        }
-        // Append-only (never a whole-file read-modify-write): even if two
-        // spawns race on the same shared `info/exclude`, the worst case is
-        // a harmless duplicate line, never a lost concurrent edit.
-        use tokio::io::AsyncWriteExt;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&exclude_path)
-            .await
-            .context("open info/exclude for append")?;
-        let mut buf = String::new();
-        if !existing.is_empty() && !existing.ends_with('\n') {
-            buf.push('\n');
-        }
-        buf.push_str(&exclude_line);
-        buf.push('\n');
-        file.write_all(buf.as_bytes()).await.context("append info/exclude")?;
-    }
-
-    Ok(())
+        .context("git_exclude_add task panicked")?
 }
 
 /// Seeds every worker-facing capability that `config` currently enables
@@ -2303,16 +2286,21 @@ mod tests {
         let first = create_worker_worktree(repo.to_str().unwrap(), "test-session-2", false).await.unwrap();
         let settings_path = std::path::Path::new(&first).join(".claude").join("settings.json");
         std::fs::write(&settings_path, r#"{"userCustom": true}"#).unwrap();
-        let status = std::process::Command::new("git")
+        // `-f`: MLOPS-4716 now excludes `.claude/settings.json` via
+        // `.git/info/exclude` the moment it's first written, so a plain
+        // `git add` here would be refused as "ignored by one of your
+        // .gitignore files" — matching real git behavior for any
+        // intentional override of a gitignored generated file.
+        let add_status = std::process::Command::new("git")
             .args(["-C", &first, "add", "-f", ".claude/settings.json"])
             .status()
             .unwrap();
-        assert!(status.success());
-        let status = std::process::Command::new("git")
+        assert!(add_status.success(), "git add -f must succeed to simulate a deliberately committed settings.json");
+        let commit_status = std::process::Command::new("git")
             .args(["-C", &first, "commit", "-q", "-m", "custom settings"])
             .status()
             .unwrap();
-        assert!(status.success());
+        assert!(commit_status.success(), "git commit must succeed to simulate a tracked settings.json");
 
         std::process::Command::new("git")
             .args(["-C", repo.to_str().unwrap(), "worktree", "remove", "--force", &first])
@@ -2324,6 +2312,42 @@ mod tests {
             std::path::Path::new(&second).join(".claude").join("settings.json"),
         ).unwrap();
         assert_eq!(contents, r#"{"userCustom": true}"#);
+    }
+
+    /// MLOPS-4716: a worker worktree's seeded `.claude` files (settings.json,
+    /// skill markdown) must be invisible to git regardless of the target
+    /// repo's own `.gitignore` — `init_git_repo` deliberately writes none, so
+    /// this exercises the real-world case of a repo with zero `.claude`
+    /// entries in its tracked ignore rules.
+    #[tokio::test]
+    async fn create_worker_worktree_excludes_seeded_files_from_git_status() {
+        let repo = init_git_repo();
+        let worktree = create_worker_worktree(repo.to_str().unwrap(), "test-session-exclude", false).await.unwrap();
+        seed_worker_skills(&worktree, &cfg(true)).await;
+
+        let status = std::process::Command::new("git")
+            .args(["-C", &worktree, "status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "seeded .claude files must be excluded from git status even with no .gitignore in the target repo: {:?}",
+            String::from_utf8_lossy(&status.stdout),
+        );
+
+        std::process::Command::new("git")
+            .args(["-C", &worktree, "add", "-A"])
+            .status()
+            .unwrap();
+        let staged = std::process::Command::new("git")
+            .args(["-C", &worktree, "diff", "--cached", "--name-only"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+            "git add -A must not stage any seeded .claude files: {:?}",
+            String::from_utf8_lossy(&staged.stdout),
+        );
     }
 
     #[tokio::test]
