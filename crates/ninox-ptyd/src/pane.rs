@@ -210,7 +210,7 @@ impl Pane {
     pub fn send(&self, msg: WriterMsg) -> Result<(), QueueFull> {
         let len = msg.queued_len();
         self.queued
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |q| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |q| {
                 (q == 0 || q.saturating_add(len) <= MAX_QUEUED_INPUT).then_some(q + len)
             })
             .map_err(|_| QueueFull)?;
