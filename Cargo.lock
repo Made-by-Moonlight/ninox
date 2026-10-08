@@ -4160,7 +4160,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "ninox"
-version = "0.32.1"
+version = "0.33.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4199,7 +4199,7 @@ dependencies = [
 
 [[package]]
 name = "ninox-core"
-version = "0.32.1"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4234,7 +4234,7 @@ dependencies = [
 
 [[package]]
 name = "ninox-ptyd"
-version = "0.32.1"
+version = "0.33.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4251,7 +4251,7 @@ dependencies = [
 
 [[package]]
 name = "ninox-server"
-version = "0.32.1"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "axum",
