@@ -35,10 +35,11 @@ pub fn tarball_asset(version: &str) -> String {
     format!("{}.tar.gz", tarball_stem(version))
 }
 
-/// Where the published package lives. Defaults match the CodeArtifact
-/// registry the README's private-registry section documents; the owner
-/// account is derived from the caller's identity when unset so no account
-/// id is baked in.
+/// Where the published package lives. No built-in default domain or
+/// repository — every publisher of this binary names their own CodeArtifact
+/// coordinates, so both must come from the environment. The owner account is
+/// derived from the caller's identity when unset so no account id is baked
+/// in either.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeArtifactCoords {
     pub domain: String,
@@ -48,17 +49,21 @@ pub struct CodeArtifactCoords {
 }
 
 impl CodeArtifactCoords {
-    pub fn from_env_with(get: impl Fn(&str) -> Option<String>) -> Self {
+    pub fn from_env_with(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let get = |k: &str| get(k).filter(|v| !v.is_empty());
-        Self {
-            domain: get("NINOX_CODEARTIFACT_DOMAIN").unwrap_or_else(|| "synthesia-build".into()),
+        let domain = get("NINOX_CODEARTIFACT_DOMAIN")
+            .context("NINOX_CODEARTIFACT_DOMAIN must be set to your CodeArtifact domain")?;
+        let repository = get("NINOX_CODEARTIFACT_REPOSITORY")
+            .context("NINOX_CODEARTIFACT_REPOSITORY must be set to your CodeArtifact repository")?;
+        Ok(Self {
+            domain,
             domain_owner: get("NINOX_CODEARTIFACT_DOMAIN_OWNER"),
-            repository: get("NINOX_CODEARTIFACT_REPOSITORY").unwrap_or_else(|| "synthesia-cargo".into()),
+            repository,
             region: get("NINOX_CODEARTIFACT_REGION").unwrap_or_else(|| "eu-west-1".into()),
-        }
+        })
     }
 
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self> {
         Self::from_env_with(|k| std::env::var(k).ok())
     }
 
@@ -398,7 +403,12 @@ mod tests {
     use super::*;
 
     fn coords() -> CodeArtifactCoords {
-        CodeArtifactCoords::from_env_with(|_| None)
+        CodeArtifactCoords::from_env_with(|k| match k {
+            "NINOX_CODEARTIFACT_DOMAIN" => Some("acme-build".into()),
+            "NINOX_CODEARTIFACT_REPOSITORY" => Some("acme-cargo".into()),
+            _ => None,
+        })
+        .unwrap()
     }
 
     #[test]
@@ -417,20 +427,35 @@ mod tests {
     #[test]
     fn coords_default_and_override_from_env() {
         let c = coords();
-        assert_eq!(c.domain, "synthesia-build");
-        assert_eq!(c.repository, "synthesia-cargo");
+        assert_eq!(c.domain, "acme-build");
+        assert_eq!(c.repository, "acme-cargo");
         assert_eq!(c.region, "eu-west-1");
         assert_eq!(c.domain_owner, None);
 
         let c = CodeArtifactCoords::from_env_with(|k| match k {
             "NINOX_CODEARTIFACT_DOMAIN" => Some("d".into()),
             "NINOX_CODEARTIFACT_DOMAIN_OWNER" => Some("123".into()),
-            "NINOX_CODEARTIFACT_REPOSITORY" => Some("".into()),
+            "NINOX_CODEARTIFACT_REPOSITORY" => Some("r".into()),
             _ => None,
-        });
+        })
+        .unwrap();
         assert_eq!(c.domain, "d");
         assert_eq!(c.domain_owner.as_deref(), Some("123"));
-        assert_eq!(c.repository, "synthesia-cargo");
+        assert_eq!(c.repository, "r");
+    }
+
+    #[test]
+    fn coords_requires_domain_and_repository() {
+        let err = CodeArtifactCoords::from_env_with(|_| None).unwrap_err().to_string();
+        assert!(err.contains("NINOX_CODEARTIFACT_DOMAIN"), "{err}");
+
+        let err = CodeArtifactCoords::from_env_with(|k| match k {
+            "NINOX_CODEARTIFACT_DOMAIN" => Some("d".into()),
+            _ => None,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("NINOX_CODEARTIFACT_REPOSITORY"), "{err}");
     }
 
     #[test]
@@ -445,7 +470,7 @@ mod tests {
     fn aws_args_target_the_generic_package() {
         let args = coords().get_asset_args("123", "0.29.0", "Ninox.app.zip", Path::new("/tmp/out"));
         let joined = args.join(" ");
-        assert!(joined.starts_with("codeartifact get-package-version-asset --domain synthesia-build --domain-owner 123"));
+        assert!(joined.starts_with("codeartifact get-package-version-asset --domain acme-build --domain-owner 123"));
         assert!(joined.contains("--format generic --namespace ninox --package ninox-macos"));
         assert!(joined.contains("--package-version 0.29.0 --asset Ninox.app.zip"));
         assert_eq!(args.last().unwrap(), "/tmp/out");

@@ -66,11 +66,12 @@ pub fn run(args: UpdateArgs) -> Result<()> {
         bail!(
             "prebuilt ninox binaries are only published for Apple silicon macOS ({}); \
              update from source with `cargo install --force ninox` \
-             (or `cargo install --force --registry synthesia-cargo ninox`)",
+             (or `cargo install --force --registry <your-configured-registry> ninox`, \
+             if you've set one up)",
             bu::TARGET_TRIPLE
         );
     }
-    let coords = CodeArtifactCoords::from_env();
+    let coords = CodeArtifactCoords::from_env()?;
     let owner = resolve_owner(&coords)?;
     let current = env!("CARGO_PKG_VERSION");
 
