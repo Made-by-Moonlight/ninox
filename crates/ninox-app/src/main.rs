@@ -1,6 +1,7 @@
 mod app;
 mod components;
 mod connect;
+mod editor;
 mod fleet;
 mod input;
 mod machine;

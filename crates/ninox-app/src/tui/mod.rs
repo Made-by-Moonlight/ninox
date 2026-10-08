@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::editor;
 use ninox_core::{config::AppConfig, events::Engine, store::Store};
 use ratatui::layout::Rect;
 use state::{Action, Level, PtydState, Row, TuiState, View};
@@ -783,18 +784,26 @@ async fn perform(
         }
         Action::OpenUrl(url) => {
             let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-            let child = tokio::process::Command::new(opener)
-                .arg(&url)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-            match child {
-                Ok(mut c) => {
-                    tokio::spawn(async move { c.wait().await });
-                    st.notify(Level::Info, format!("opened {url}"));
+            spawn_detached(st, opener, &url, format!("opened {url}"));
+        }
+        Action::OpenInEditor(id) => {
+            let Some(path) = st.rows.iter().find(|r| r.id() == id).and_then(|r| r.session.workspace_path.clone()) else {
+                st.notify(Level::Warn, format!("{id} has no recorded workspace to open"));
+                return Ok(false);
+            };
+            let choice = AppConfig::load().unwrap_or_default().editor;
+            let program = editor::program(choice);
+            if editor::is_terminal(choice) {
+                // Neovim has no window of its own: run it on the real
+                // terminal, blocking, like the full-screen tmux attach.
+                *events = None;
+                match open_terminal_editor_suspended(terminal, program, &path) {
+                    Some(note) => st.notify(Level::Warn, note),
+                    None => st.notify(Level::Info, format!("back from {program}")),
                 }
-                Err(e) => st.notify(Level::Error, format!("{opener} {url}: {e}")),
+            } else {
+                let note = format!("opened {path} in {program}");
+                spawn_detached(st, program, &path, note);
             }
         }
         Action::Reap(orch_id) => run_op(st, lp, orch_id, false, {
@@ -1102,6 +1111,37 @@ fn apply_live_setting(st: &mut TuiState, lp: &mut Loop, id: &settings::FieldId, 
     }
 }
 
+/// Spawn `program arg` detached (stdio silenced, not awaited inline),
+/// notifying `st` with `on_success` if it starts or the spawn error
+/// otherwise. Shared by `Action::OpenUrl` and the GUI-editor branch of
+/// `Action::OpenInEditor` — both fire-and-forget a program on a path/URL
+/// the same way.
+fn spawn_detached(st: &mut TuiState, program: &str, arg: &str, on_success: String) {
+    let child = tokio::process::Command::new(program)
+        .arg(arg)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match child {
+        Ok(mut c) => {
+            tokio::spawn(async move { c.wait().await });
+            st.notify(Level::Info, on_success);
+        }
+        Err(e) => st.notify(Level::Error, format!("{program} {arg}: {e}")),
+    }
+}
+
+/// Pulled out of the `suspended` closures below so it's testable without
+/// actually spawning anything.
+fn status_note(label: &str, result: std::io::Result<std::process::ExitStatus>) -> Option<String> {
+    match result {
+        Ok(s) if s.success() => None,
+        Ok(s) => Some(format!("{label} exited {s}")),
+        Err(e) => Some(format!("could not run {label}: {e}")),
+    }
+}
+
 /// Suspend the TUI while `$VISUAL`/`$EDITOR` (else `vi`) edits `path`, like
 /// the full-screen tmux attach. `Some` describes a failure.
 fn edit_suspended(terminal: &mut Term, path: &std::path::Path) -> Option<String> {
@@ -1111,12 +1151,15 @@ fn edit_suspended(terminal: &mut Term, path: &std::path::Path) -> Option<String>
     }
     suspended(terminal, || {
         // Through sh so an editor setting with arguments (`code -w`) works.
-        match std::process::Command::new("sh").arg("-c").arg(format!("{editor} \"$1\"")).arg("sh").arg(path).status() {
-            Ok(s) if s.success() => None,
-            Ok(s) => Some(format!("{editor} exited {s}")),
-            Err(e) => Some(format!("could not run {editor}: {e}")),
-        }
+        status_note(&editor, std::process::Command::new("sh").arg("-c").arg(format!("{editor} \"$1\"")).arg("sh").arg(path).status())
     })
+}
+
+/// Suspend the TUI to run the configured editor's `program` on `path`, like
+/// the full-screen tmux attach — for Neovim, which has no window of its own
+/// to open detached into. `Some` describes a failure.
+fn open_terminal_editor_suspended(terminal: &mut Term, program: &str, path: &str) -> Option<String> {
+    suspended(terminal, || status_note(program, std::process::Command::new(program).arg(path).status()))
 }
 
 /// Leave the TUI's terminal modes, run `child` on the real terminal, and
@@ -1167,11 +1210,7 @@ fn attach_suspended(terminal: &mut Term, argv: Vec<String>) -> Option<String> {
     suspended(terminal, || {
         // A TUI run inside tmux would otherwise have the attach refuse to nest;
         // ninox's server is a separate socket, so nesting is what the user asked.
-        match std::process::Command::new(&argv[0]).args(&argv[1..]).env_remove("TMUX").status() {
-            Ok(s) if s.success() => None,
-            Ok(s) => Some(format!("tmux attach exited {s}")),
-            Err(e) => Some(format!("could not run tmux attach: {e}")),
-        }
+        status_note("tmux attach", std::process::Command::new(&argv[0]).args(&argv[1..]).env_remove("TMUX").status())
     })
 }
 
@@ -1221,6 +1260,31 @@ mod tests {
         for (input, want) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foobar", "Zm9vYmFy")] {
             assert_eq!(base64(input.as_bytes()), want);
         }
+    }
+
+    /// `status_note` is the pure boundary `edit_suspended` / `attach_suspended`
+    /// / `open_terminal_editor_suspended` all funnel their child process's
+    /// result through — exercised here without spawning anything, including
+    /// nvim crashing or not existing (the two failure modes the "open in
+    /// editor" acceptance criteria call out for terminal restoration).
+    #[test]
+    fn status_note_reports_a_clean_exit_as_none() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status_note("nvim", Ok(std::process::ExitStatus::from_raw(0))), None);
+    }
+
+    #[test]
+    fn status_note_describes_a_nonzero_exit() {
+        use std::os::unix::process::ExitStatusExt;
+        let note = status_note("nvim", Ok(std::process::ExitStatus::from_raw(1 << 8))).unwrap();
+        assert!(note.contains("nvim") && note.contains("exited"), "{note}");
+    }
+
+    #[test]
+    fn status_note_describes_a_missing_binary() {
+        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let note = status_note("nvim", Err(err)).unwrap();
+        assert!(note.contains("nvim") && note.contains("could not run"), "{note}");
     }
 
     #[test]

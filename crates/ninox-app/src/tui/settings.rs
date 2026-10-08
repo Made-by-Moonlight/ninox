@@ -240,7 +240,9 @@ pub fn fields(cfg: &AppConfig) -> Vec<Field> {
             cfg.editor.to_string(),
             Kind::Choice,
             EditorChoice::ALL.iter().map(|e| e.to_string()).collect(),
-            "The editor the desktop app's \"Open in editor\" launches on a worker's workspace.",
+            "The editor \"open in editor\" launches on a worker's workspace — the desktop app's button, or \
+             nx's e key. Neovim is terminal-only: nx suspends and runs it there; the desktop button is \
+             disabled for it.",
         ),
     ];
     for name in reg.names() {
@@ -505,6 +507,10 @@ mod tests {
         assert_eq!(cfg.tui.colors, TuiColors::FieldNotes);
         let msg = step(&mut cfg, FieldId::Editor, false).unwrap();
         assert_eq!((cfg.editor, msg.as_str()), (EditorChoice::Cursor, "Open workspaces in → Cursor"));
+        let msg = step(&mut cfg, FieldId::Editor, false).unwrap();
+        assert_eq!((cfg.editor, msg.as_str()), (EditorChoice::Neovim, "Open workspaces in → Neovim"));
+        let msg = step(&mut cfg, FieldId::Editor, false).unwrap();
+        assert_eq!((cfg.editor, msg.as_str()), (EditorChoice::VsCode, "Open workspaces in → VS Code"), "wraps back around");
     }
 
     #[test]

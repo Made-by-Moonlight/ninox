@@ -34,6 +34,7 @@ pub enum EditorChoice {
     #[default]
     VsCode,
     Cursor,
+    Neovim,
 }
 
 impl std::fmt::Display for EditorChoice {
@@ -41,13 +42,14 @@ impl std::fmt::Display for EditorChoice {
         f.write_str(match self {
             EditorChoice::VsCode => "VS Code",
             EditorChoice::Cursor => "Cursor",
+            EditorChoice::Neovim => "Neovim",
         })
     }
 }
 
 impl EditorChoice {
     /// All variants, in display order — for the settings dropdown.
-    pub const ALL: [EditorChoice; 2] = [EditorChoice::VsCode, EditorChoice::Cursor];
+    pub const ALL: [EditorChoice; 3] = [EditorChoice::VsCode, EditorChoice::Cursor, EditorChoice::Neovim];
 }
 
 // ---------------------------------------------------------------------------

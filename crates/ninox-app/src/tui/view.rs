@@ -371,7 +371,7 @@ fn draw_footer(f: &mut Frame, area: Rect, st: &TuiState) {
                 if !st.needs_rows().is_empty() {
                     v.push(("!".into(), "needs you"));
                 }
-                v.extend([("space".into(), "fold"), ("g".into(), "go to"), ("n".into(), "new")]);
+                v.extend([("space".into(), "fold"), ("g".into(), "go to"), ("n".into(), "new"), ("e".into(), "open in editor")]);
                 if st.live_count() > 0 {
                     v.push(("Ctrl+R".into(), "restart all"));
                 }
@@ -1608,6 +1608,14 @@ mod tests {
         assert!(out.contains("alpha") && out.contains("beta"));
         assert!(out.contains("hello from agent"));
         assert!(out.contains("tmux"), "beta is not in ptyd → tagged tmux");
+    }
+
+    #[test]
+    fn the_fleet_footer_advertises_open_in_editor() {
+        let st = st_with(&["alpha"]);
+        let out = render(&st, 100, 20);
+        let footer = out.lines().last().unwrap();
+        assert!(footer.contains("e open in editor"), "{footer}");
     }
 
     fn live_pane(st: &mut TuiState, id: &str) {

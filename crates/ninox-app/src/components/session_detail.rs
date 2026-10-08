@@ -1,5 +1,5 @@
 use iced::{
-    widget::{button, column, container, row, scrollable, text, Space},
+    widget::{button, column, container, row, scrollable, text, tooltip, Space},
     Alignment, Background, Border, Color, Element, Length, Padding,
 };
 
@@ -461,12 +461,17 @@ pub fn session_detail<'a>(
                 )
             })
     };
+    // Neovim is a terminal editor with nowhere to run from the desktop app
+    // (see `crate::editor::is_terminal`): the button is disabled rather than
+    // spawning it detached, with a tooltip explaining where it does work.
+    let editor_is_terminal = crate::editor::is_terminal(app.config.editor);
     let open_in_editor_btn: Element<Message> = {
         let workspace = session.workspace_path.clone();
-        let can_open = workspace.is_some();
+        let can_open = workspace.is_some() && !editor_is_terminal;
         let label_color = if can_open { s.accent } else { s.faint };
-        button(crate::style::micro_label("Open in editor", label_color).size(10.0))
-            .on_press_maybe(workspace.map(Message::OpenInEditor))
+        let press = if can_open { workspace.map(Message::OpenInEditor) } else { None };
+        let btn = button(crate::style::micro_label("Open in editor", label_color).size(10.0))
+            .on_press_maybe(press)
             .padding([6, 16])
             .style(move |_theme, status| {
                 let hovered = can_open && matches!(status, button::Status::Hovered);
@@ -480,8 +485,27 @@ pub fn session_detail<'a>(
                     },
                     shadow: crate::style::hard_shadow(s, 2.0, 2.0, crate::style::shadow_alpha(s).0),
                 }
-            })
-            .into()
+            });
+        if editor_is_terminal {
+            let (card_a, _, _) = crate::style::shadow_alpha(s);
+            let body = container(
+                text("Neovim is a terminal editor — open this workspace from the nx TUI's e key instead")
+                    .size(11)
+                    .font(crate::style::SANS)
+                    .color(s.ink_2),
+            )
+            .width(Length::Fixed(220.0))
+            .padding([10, 12])
+            .style(move |_theme| container::Style {
+                background: Some(Background::Color(s.paper_2)),
+                border: Border { color: s.ink, width: 1.5, radius: 2.0.into() },
+                shadow: crate::style::hard_shadow(s, 3.0, 3.0, card_a),
+                ..Default::default()
+            });
+            tooltip(btn, body, tooltip::Position::Top).gap(6).into()
+        } else {
+            btn.into()
+        }
     };
 
     let resume_btn: Element<Message> =

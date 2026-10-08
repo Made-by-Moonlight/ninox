@@ -4075,10 +4075,16 @@ impl App {
             Message::OpenInEditor(path) => {
                 // Fire-and-forget, exactly like OpenUrl: no error surfacing.
                 // If the configured editor isn't on PATH this silently
-                // no-ops, which is the accepted product behaviour.
-                let _ = std::process::Command::new(editor_program(state.config.editor))
-                    .arg(&path)
-                    .spawn();
+                // no-ops, which is the accepted product behaviour. Neovim is
+                // scoped out here (see `can_open` in session_detail.rs): the
+                // desktop app has no attached terminal for it to run in, so
+                // the button is disabled rather than spawning a useless
+                // detached process.
+                if !crate::editor::is_terminal(state.config.editor) {
+                    let _ = std::process::Command::new(crate::editor::program(state.config.editor))
+                        .arg(&path)
+                        .spawn();
+                }
                 Task::none()
             }
 
@@ -4697,16 +4703,6 @@ fn open_url_program() -> &'static str {
     { "xdg-open" }
 }
 
-/// The CLI binary that opens a directory in the configured editor. Both
-/// VS Code (`code`) and Cursor (`cursor`) ship a `PATH` launcher that opens
-/// the given path.
-fn editor_program(choice: EditorChoice) -> &'static str {
-    match choice {
-        EditorChoice::VsCode => "code",
-        EditorChoice::Cursor => "cursor",
-    }
-}
-
 /// Best browser URL for a session's tracked PR: the recorded PR's own URL
 /// when GitHub enrichment has produced one, otherwise constructed from the
 /// session's repo slug (works before enrichment / without a token). `None`
@@ -5262,14 +5258,6 @@ mod tests {
         assert_eq!(open_url_program(), "open");
         #[cfg(target_os = "linux")]
         assert_eq!(open_url_program(), "xdg-open");
-    }
-
-    /// The "Open in editor" action must map each `EditorChoice` to the
-    /// matching PATH launcher.
-    #[test]
-    fn editor_program_maps_each_choice() {
-        assert_eq!(editor_program(EditorChoice::VsCode), "code");
-        assert_eq!(editor_program(EditorChoice::Cursor), "cursor");
     }
 
     fn test_engine() -> Arc<Engine> {

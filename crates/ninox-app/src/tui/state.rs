@@ -409,6 +409,9 @@ pub enum Action {
     /// Relaunch an ended session under its own id, `--resume`d.
     Resume(String),
     OpenUrl(String),
+    /// Open a session's workspace in the configured editor (`e`). Fire-and-
+    /// forget for a GUI editor; suspends the TUI for Neovim.
+    OpenInEditor(String),
     Spawn { name: String, prompt: Option<String> },
     Write { pane: String, bytes: Vec<u8> },
     LoadBrain(String),
@@ -456,6 +459,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         ("n · g · o", "spawn orchestrator · go to · overview grid"),
         ("z · i · [", "zoom · inspector · scroll mode (j/k, g/G, y copies)"),
         ("a", "attach full-screen (tmux: Ctrl+b d returns)"),
+        ("e", "open the workspace in the configured editor"),
         ("1-5  (p b s)", "tabs: fleet · overview · PRs · brain · settings"),
         ("d / q", "detach (agents keep running)"),
     ]),
@@ -500,6 +504,21 @@ impl TuiState {
 
     pub fn selected_id(&self) -> Option<String> {
         self.selected_row().map(|r| r.session.id.clone())
+    }
+
+    /// The row a bare key should act on: the highlighted tile in the
+    /// Overview grid (`overview_sel`, moved independently by `move_tile` and
+    /// never written back to `selected` until it's opened), or `selected_row`
+    /// everywhere else. `command()`'s bare keys (reached from Overview too,
+    /// via `overview_key`'s fallthrough) must use this, not `selected_row`
+    /// directly, or they act on a stale Board row the Overview highlight has
+    /// since moved away from.
+    pub fn current_row(&self) -> Option<&Row> {
+        if self.view == View::Overview {
+            self.overview_rows().get(self.overview_sel).and_then(|&i| self.rows.get(i))
+        } else {
+            self.selected_row()
+        }
     }
 
     pub fn backend_of(&self, id: &str) -> Backend {
@@ -1335,6 +1354,11 @@ fn command(st: &mut TuiState, key: KeyEvent) -> Action {
                 return Action::Connect(id);
             }
         }
+        KeyCode::Char('e') => match st.current_row() {
+            Some(row) if row.session.workspace_path.is_some() => return Action::OpenInEditor(row.id().to_string()),
+            Some(_) => st.notify(Level::Info, "no recorded workspace to open in an editor"),
+            None => {}
+        },
         KeyCode::Char('1'..='5') => {
             if let Some(v) = tab_key(&key) {
                 return st.switch_view(v);
@@ -2637,6 +2661,26 @@ mod tests {
         st.selected = 1;
         handle_key(&mut st, key('x'));
         assert_eq!(st.modal, Some(Modal::Confirm(Pending::Kill("s1".into()))));
+    }
+
+    #[test]
+    fn e_opens_the_selected_sessions_workspace_or_says_why_not() {
+        let mut st = state_with_rows(1);
+        assert_eq!(handle_key(&mut st, key('e')), Action::None, "no recorded workspace yet");
+        assert!(st.notice.as_ref().is_some_and(|n| n.text.contains("no recorded workspace")));
+        st.rows[0].session.workspace_path = Some("/work/s0".into());
+        assert_eq!(handle_key(&mut st, key('e')), Action::OpenInEditor("s0".into()));
+    }
+
+    #[test]
+    fn e_in_overview_acts_on_the_highlighted_tile_not_the_stale_board_selection() {
+        let mut st = state_with_rows(2);
+        st.rows[0].session.workspace_path = Some("/work/s0".into());
+        st.rows[1].session.workspace_path = Some("/work/s1".into());
+        st.view = View::Overview;
+        st.selected = 0; // the Board's own selection, untouched by move_tile
+        st.overview_sel = 1; // h/j/k/l moved the highlight onto s1
+        assert_eq!(handle_key(&mut st, key('e')), Action::OpenInEditor("s1".into()));
     }
 
     #[test]

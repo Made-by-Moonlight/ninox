@@ -18,7 +18,7 @@
 //! clickable chips beneath it instead — routed to `Message::OpenUrl` for
 //! web URLs and `Message::OpenInEditor` for local file paths.
 
-use iced::widget::{button, column, container, row, scrollable, text, text_editor, Space};
+use iced::widget::{button, column, container, row, scrollable, text, text_editor, tooltip, Space};
 use iced::{Background, Border, Color, Element, Length};
 
 use crate::app::{App, Message, PlanBlockView};
@@ -41,22 +41,27 @@ fn is_web_url(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:")
 }
 
-fn link_chips<'a>(links: &'a [(String, String)], s: &ColorScheme) -> Element<'a, Message> {
+fn link_chips<'a>(links: &'a [(String, String)], s: &ColorScheme, editor_is_terminal: bool) -> Element<'a, Message> {
     let chips: Vec<Element<Message>> = links
         .iter()
         .map(|(label, url)| {
-            let message =
-                if is_web_url(url) { Message::OpenUrl(url.clone()) } else { Message::OpenInEditor(url.clone()) };
+            let web = is_web_url(url);
+            // A local-file link is just as useless to click as the "Open in
+            // editor" button when Neovim is selected (see session_detail.rs):
+            // the desktop app has nowhere to run it.
+            let can_open = web || !editor_is_terminal;
+            let color = if can_open { s.accent } else { s.faint };
+            let message = if web { Message::OpenUrl(url.clone()) } else { Message::OpenInEditor(url.clone()) };
             // "↗" isn't covered by the bundled Newsreader/Archivo/Spline Sans
             // Mono fonts — same tofu-box problem `style::GLYPH` exists to
             // solve for the app's other dingbats, so route it through that
             // font specifically rather than the label's own MONO font.
             let icon_label = row![
-                text("↗").font(crate::style::GLYPH).size(11).color(s.accent),
-                text(format!(" {label}")).size(11).font(crate::style::MONO).color(s.accent),
+                text("↗").font(crate::style::GLYPH).size(11).color(color),
+                text(format!(" {label}")).size(11).font(crate::style::MONO).color(color),
             ];
             button(icon_label)
-                .on_press(message)
+                .on_press_maybe(can_open.then_some(message))
                 .padding(0)
                 .style(|_theme, _status| button::Style {
                     background: None,
@@ -88,6 +93,7 @@ fn block_widget<'a>(
     index: usize,
     block: &'a PlanBlockView,
     s: &'a ColorScheme,
+    editor_is_terminal: bool,
 ) -> Element<'a, Message> {
     let (size, font) = style_for(block.kind);
     let scheme = *s;
@@ -117,13 +123,15 @@ fn block_widget<'a>(
     if block.links.is_empty() {
         editor
     } else {
-        column![editor, link_chips(&block.links, s)].spacing(6).into()
+        column![editor, link_chips(&block.links, s, editor_is_terminal)].spacing(6).into()
     }
 }
 
 pub fn plan_pane<'a>(app: &'a App, orchestrator_id: &str, s: &'a ColorScheme) -> Element<'a, Message> {
     let doc = app.plan_docs.get(orchestrator_id);
     let registration = app.engine.store.get_orchestrator_plan(orchestrator_id).ok().flatten();
+    // See session_detail.rs: Neovim has nowhere to run from the desktop app.
+    let editor_is_terminal = crate::editor::is_terminal(app.config.editor);
 
     let header: Element<Message> = match (&registration, doc.and_then(|d| d.error.as_ref())) {
         (None, _) => Space::new(0, 0).into(),
@@ -144,15 +152,41 @@ pub fn plan_pane<'a>(app: &'a App, orchestrator_id: &str, s: &'a ColorScheme) ->
                     .wrapping(iced::widget::text::Wrapping::None)
                     .into(),
                 Space::new(10, 0).into(),
-                button(text("Open").size(12).color(s.accent))
-                    .on_press(Message::OpenInEditor(reg.file_path.clone()))
-                    .style(|_theme, _status| button::Style {
-                        background: None,
-                        border: Border::default(),
-                        ..Default::default()
-                    })
-                    .padding(0)
-                    .into(),
+                {
+                    let color = if editor_is_terminal { s.faint } else { s.accent };
+                    let open_btn = button(text("Open").size(12).color(color))
+                        .on_press_maybe((!editor_is_terminal).then(|| Message::OpenInEditor(reg.file_path.clone())))
+                        .style(|_theme, _status| button::Style {
+                            background: None,
+                            border: Border::default(),
+                            ..Default::default()
+                        })
+                        .padding(0);
+                    if editor_is_terminal {
+                        tooltip(
+                            open_btn,
+                            container(
+                                text("Neovim is a terminal editor — open this file from the nx TUI's e key instead")
+                                    .size(11)
+                                    .font(crate::style::SANS)
+                                    .color(s.ink_2),
+                            )
+                            .width(Length::Fixed(220.0))
+                            .padding([10, 12])
+                            .style(move |_theme| container::Style {
+                                background: Some(Background::Color(s.paper_2)),
+                                border: Border { color: s.ink, width: 1.5, radius: 2.0.into() },
+                                shadow: crate::style::hard_shadow(s, 3.0, 3.0, crate::style::shadow_alpha(s).0),
+                                ..Default::default()
+                            }),
+                            tooltip::Position::Top,
+                        )
+                        .gap(6)
+                        .into()
+                    } else {
+                        open_btn.into()
+                    }
+                },
                 Space::new(Length::Fill, 0).into(),
                 text(format!("updated {}", format_timestamp(reg.updated_at)))
                     .size(11)
@@ -204,7 +238,7 @@ pub fn plan_pane<'a>(app: &'a App, orchestrator_id: &str, s: &'a ColorScheme) ->
                 .blocks
                 .iter()
                 .enumerate()
-                .map(|(i, block)| block_widget(orchestrator_id, i, block, s))
+                .map(|(i, block)| block_widget(orchestrator_id, i, block, s, editor_is_terminal))
                 .collect();
             scrollable(container(column(blocks).spacing(10)).width(Length::Fill).padding(16))
                 .width(Length::Fill)
