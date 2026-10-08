@@ -276,6 +276,60 @@ pub struct PrWatchConfig {
     pub enabled: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Remote machines configuration
+// ---------------------------------------------------------------------------
+
+/// Opt-in (default OFF) SSH-connected remote machines — see
+/// `docs/superpowers/specs/2026-10-05-remote-sessions-design.md`.
+///
+/// Mirrors Herdr's security model exactly: ninox implements no auth of its
+/// own here. Every field below is opaque connection *identity*, never
+/// session content or secrets — authentication is delegated entirely to the
+/// user's own SSH setup (`~/.ssh/config`, agent, keys, `known_hosts`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemoteMachinesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub machines: Vec<MachineProfile>,
+}
+
+/// A saved remote machine connection. Pure connection metadata — no
+/// session content, no credentials, no secrets of any kind. Never store
+/// anything else on this struct; `ninox_core::config::tests` asserts its
+/// serialized field set stays exactly this shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineProfile {
+    /// Opaque, generated at `machine add` time (a UUIDv4). Never parsed or
+    /// derived from anything — purely a local handle.
+    pub id: String,
+    /// Human-readable label shown in `ninox machine list` / the sidebar /
+    /// TUI. Defaults to the host portion of `ssh_target`.
+    pub label: String,
+    /// `user@host` or a `~/.ssh/config` alias — passed to `ssh`/`scp`
+    /// verbatim. This is the only thing that identifies the machine; ninox
+    /// never resolves or stores an IP/fingerprint itself.
+    pub ssh_target: String,
+    /// The remote orchestrator/session name this profile tracks (e.g.
+    /// `"default"`), chosen at `machine add` time from the remote host's
+    /// own `ninox list --json`.
+    pub remote_session: String,
+    /// Whether this profile is currently active. `machine remove` deletes
+    /// the entry outright; this flag is for a user who wants to pause a
+    /// machine without losing its saved connection metadata.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl MachineProfile {
+    /// A fresh opaque id for a new profile — purely a local handle, never
+    /// parsed or derived from the SSH target.
+    pub fn new_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+}
+
 /// What engine startup does with sessions reconciliation found interrupted
 /// (spec §5.4). See `crate::fleet::startup`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -669,6 +723,10 @@ pub struct AppConfig {
     /// Terminal UI settings — see `TuiConfig`.
     #[serde(default)]
     pub tui: TuiConfig,
+    /// SSH-connected remote machines. Opt-in, default off — see
+    /// `RemoteMachinesConfig`.
+    #[serde(default)]
+    pub remote_machines: RemoteMachinesConfig,
     /// Agent-harness registry overrides/extensions (`[harnesses.<name>]`).
     /// Builtin specs for claude-code/codex/opencode/aider/freebuff apply
     /// when a name is absent here. See `crate::harness`. Kept last so TOML
@@ -714,6 +772,7 @@ impl Default for AppConfig {
             auto_reap:        AutoReapConfig::default(),
             fleet:            FleetConfig::default(),
             tui:              TuiConfig::default(),
+            remote_machines:  RemoteMachinesConfig::default(),
         }
     }
 }
@@ -1147,6 +1206,55 @@ mod tests {
         assert_eq!(loaded.port, 9090);
         assert_eq!(loaded.theme, ThemeVariant::Light);
         assert!(loaded.orchestrator_root.is_none());
+    }
+
+    /// `MachineProfile` must persist only opaque connection metadata — no
+    /// session content, no credentials. Asserts the exact serialized key
+    /// set so a future field addition is a deliberate, reviewed decision
+    /// rather than an accidental leak.
+    #[test]
+    fn machine_profile_serializes_only_opaque_metadata() {
+        let profile = MachineProfile {
+            id: "11111111-1111-1111-1111-111111111111".into(),
+            label: "build-box".into(),
+            ssh_target: "ethan@10.0.0.5".into(),
+            remote_session: "default".into(),
+            enabled: true,
+        };
+        let value = toml::Value::try_from(&profile).unwrap();
+        let table = value.as_table().unwrap();
+        let mut keys: Vec<&str> = table.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["enabled", "id", "label", "remote_session", "ssh_target"]);
+    }
+
+    #[test]
+    fn machine_profile_round_trips_through_app_config() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = AppConfig::default();
+        cfg.remote_machines.enabled = true;
+        cfg.remote_machines.machines.push(MachineProfile {
+            id: "m1".into(),
+            label: "laptop".into(),
+            ssh_target: "me@laptop.local".into(),
+            remote_session: "default".into(),
+            enabled: true,
+        });
+        fs::write(&path, toml::to_string(&cfg).unwrap()).unwrap();
+        let loaded: AppConfig = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(loaded.remote_machines.enabled);
+        assert_eq!(loaded.remote_machines.machines.len(), 1);
+        assert_eq!(loaded.remote_machines.machines[0].ssh_target, "me@laptop.local");
+    }
+
+    /// Default config has the feature off and no machines — an untouched
+    /// install stays exactly as before this feature existed.
+    #[test]
+    fn remote_machines_defaults_to_disabled_and_empty() {
+        let cfg = AppConfig::default();
+        assert!(!cfg.remote_machines.enabled);
+        assert!(cfg.remote_machines.machines.is_empty());
     }
 
     #[test]

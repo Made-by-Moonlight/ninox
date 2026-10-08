@@ -2008,6 +2008,7 @@ impl App {
                             terminal_at:         None, gate_status: None, merged_at: None,
                             activity: ninox_core::types::ActivityState::Unknown,
                             activity_note: None, activity_since: None,
+                            machine_id: None,
                         };
                         match state.engine.store.insert_spawning_session(&session) {
                             Ok(true) => {}
@@ -2153,6 +2154,30 @@ impl App {
                             Self::persist_config(state, "agent preselection", |c| c.orchestrator = agent.clone());
                         }
 
+                        let session = Session {
+                            id:              sid.clone(),
+                            orchestrator_id: None,
+                            name:            name.clone(),
+                            repo:            String::new(),
+                            status:          SessionStatus::Working,
+                            agent_type:      agent.harness.clone(),
+                            cost_usd:        0.0,
+                            started_at:      ts as i64,
+                            pr_number:       None,
+                            pr_id:           None,
+                            workspace_path:  Some(workspace.clone()),
+                            pid:             None,
+                            model:           agent.model.clone(),
+                            context_tokens:  None,
+                            catalogue_path:  Some(catalogue_path.clone()),
+                            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+                            claude_session_id: Some(claude_session_id.clone()),
+                            summary:         None,
+                            terminal_at:         None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
+        };
+                        let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
                         state.engine.emit(Event::SessionSpawned(session));
 
@@ -2493,7 +2518,8 @@ impl App {
                             summary:         None,
                             terminal_at:         None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
-                        };
+            machine_id: None,
+        };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
                         state.engine.emit(Event::SessionSpawned(session));
@@ -5155,6 +5181,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         }
     }
 
@@ -5334,6 +5361,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         }
     }
 
@@ -5841,6 +5869,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (updated, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         assert!(updated.sessions.contains_key("s1"));
@@ -5864,6 +5893,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (updated, _) = app.update(Message::EngineEvent(Box::new(
             Event::SessionSpawned(session.clone()),
@@ -5964,6 +5994,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         m.sessions.insert("w1".into(), w.clone());
         w.id = "other".into();
@@ -6069,6 +6100,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;
@@ -6120,6 +6152,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         }).unwrap();
         let engine = Engine::new(store);
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
@@ -6146,6 +6179,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = m2;
@@ -6186,6 +6220,7 @@ mod tests {
             summary: None,
             terminal_at: Some(0), gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let _ = m.engine.store.upsert_session(&worker);
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(worker))));
@@ -6240,6 +6275,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         });
 
         let (next, _) = m.update(Message::PollSessions);
@@ -6265,6 +6301,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: Some(0), gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let _ = m.engine.store.upsert_session(&s);
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -6303,6 +6340,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorSpawned(o))));
         m = m2;
@@ -7137,6 +7175,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -7159,6 +7198,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -7205,7 +7245,8 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
-            };
+            machine_id: None,
+        };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
@@ -7260,6 +7301,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         // NavigateSession defaults to the Split panel, so switch to Terminal
@@ -7394,7 +7436,8 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
-            };
+            machine_id: None,
+        };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
@@ -7478,6 +7521,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m, _) = m.update(Message::NavigateSession("s1".into()));
@@ -7533,7 +7577,8 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
-            };
+            machine_id: None,
+        };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
@@ -7634,7 +7679,8 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
-            };
+            machine_id: None,
+        };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
@@ -8888,6 +8934,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;

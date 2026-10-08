@@ -338,6 +338,13 @@ pub struct Session {
     /// first report.
     #[serde(default)]
     pub activity_since: Option<i64>,
+    /// `None` = this session runs on the local machine (the overwhelming
+    /// common case). `Some(id)` names the `MachineProfile::id` (see
+    /// `ninox_core::config::MachineProfile`) of the SSH-connected remote
+    /// machine it was discovered on or spawned on. `#[serde(default)]` for
+    /// wire/DB back-compat with sessions recorded before this field existed.
+    #[serde(default)]
+    pub machine_id: Option<String>,
 }
 
 /// Which fields of a `Session` a particular `Event::SessionUpdated` carries
@@ -696,6 +703,7 @@ mod tests {
             gate_status: None, merged_at: None,
             activity: ActivityState::Unknown,
             activity_note: None, activity_since: None,
+            machine_id: None,
         }
     }
 

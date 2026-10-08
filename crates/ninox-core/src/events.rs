@@ -935,6 +935,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(store);
@@ -979,6 +980,7 @@ mod tests {
             summary: None,
             terminal_at: Some(1_000), gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(Arc::clone(&store));
@@ -1012,6 +1014,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(Arc::clone(&store));
@@ -1071,6 +1074,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&session).unwrap();
         let engine = Engine::new(Arc::clone(&store));
@@ -1164,6 +1168,7 @@ mod tests {
                 activity: crate::types::ActivityState::Unknown,
                 activity_note: None,
                 activity_since: None,
+                machine_id: None,
             })
             .unwrap();
         let engine = Engine::new(store.clone());
@@ -1225,6 +1230,7 @@ mod tests {
             context_window_size: None, claude_session_id: None, summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         }
     }
 

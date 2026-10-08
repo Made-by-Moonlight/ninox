@@ -347,7 +347,12 @@ mod tests {
     async fn setup_orchestrator_root_seeds_every_registry_orchestrator_skill() {
         use crate::capabilities::{self, Audience};
         let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, &AppConfig::default(), "/path/to/ninox", "/cfg.toml").await.unwrap();
+        // Flip every opt-in gate on so this test's "every registry
+        // orchestrator skill" claim actually covers gated entries
+        // (`remote-machines`) too, not just the always-on ones.
+        let mut config = AppConfig::default();
+        config.remote_machines.enabled = true;
+        setup_orchestrator_root(&root, &config, "/path/to/ninox", "/cfg.toml").await.unwrap();
 
         let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
         for cap in capabilities::for_audience(Audience::Orchestrator) {

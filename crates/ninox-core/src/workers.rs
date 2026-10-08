@@ -633,6 +633,7 @@ mod tests {
             activity: ActivityState::Unknown,
             activity_note: None,
             activity_since: None,
+            machine_id: None,
         }
     }
 

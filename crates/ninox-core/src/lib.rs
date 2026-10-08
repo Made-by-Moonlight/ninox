@@ -19,6 +19,7 @@ pub mod orchestrator_auth;
 pub mod orchestrator_root;
 pub mod plugin;
 pub mod pty;
+pub mod remote;
 pub mod runtime;
 pub mod rust_cache;
 pub mod session_socket;

@@ -3,6 +3,7 @@ mod components;
 mod connect;
 mod fleet;
 mod input;
+mod machine;
 mod models;
 mod restart;
 mod runtime_cli;
@@ -243,6 +244,13 @@ enum Command {
     Service {
         #[command(subcommand)]
         action: service::ServiceAction,
+    },
+    /// SSH-connected remote machines: add, list, or remove a tracked
+    /// machine profile (opaque connection metadata only — see
+    /// `ninox_core::config::MachineProfile`).
+    Machine {
+        #[command(subcommand)]
+        action: machine::MachineAction,
     },
     /// Open the desktop app, even when run from a terminal.
     Gui,
@@ -710,6 +718,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(Command::Service { action }) = command {
         return service::run(action);
     }
+    if let Some(Command::Machine { action }) = command {
+        return machine::run(action);
+    }
     if let Some(Command::Update { check, force, version, app }) = command {
         return update_cli::run(update_cli::UpdateArgs { check, force, version, app });
     }
@@ -802,6 +813,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Complete { .. } | Command::ReceiveCompletion { .. }) => {
             unreachable!("completion commands short-circuit and return earlier in main()")
+        }
+        Some(Command::Machine { .. }) => {
+            unreachable!("Machine short-circuits and returns earlier in main()")
         }
         Some(Command::Update { .. }) => {
             unreachable!("Update short-circuits and returns earlier in main()")
@@ -1319,6 +1333,7 @@ async fn run_spawn(
         activity: ninox_core::types::ActivityState::Unknown,
         activity_note: None,
         activity_since: None,
+        machine_id: None,
     };
     anyhow::ensure!(
         store.insert_spawning_session(&pending)?,
@@ -1499,7 +1514,8 @@ async fn run_spawn(
         summary,
         terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
-    };
+            machine_id: None,
+        };
 
     if let Err(error) = store.upsert_session(&session) {
         rollback_worker_incarnation(
@@ -2518,7 +2534,8 @@ pub(crate) async fn spawn_orchestrator_common(
         summary:         None,
         terminal_at:     None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
-    };
+            machine_id: None,
+        };
     store.upsert_session(&session)?;
 
     let sessions_dir = ninox_core::config::AppConfig::sessions_dir();
@@ -3559,6 +3576,7 @@ mod discover_repos_tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         }
     }
 
@@ -4100,6 +4118,7 @@ mod worker_env_tests {
             terminal_at: None, gate_status: None,
             merged_at: Some(1_000),
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&kept_alive).unwrap();
 
@@ -4463,6 +4482,7 @@ mod release_cli_tests {
                 activity: ninox_core::types::ActivityState::Unknown,
                 activity_note: None,
                 activity_since: None,
+                machine_id: None,
             })
             .unwrap();
         let worker = store
@@ -4818,6 +4838,7 @@ mod orchestrator_cli_tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         }).unwrap();
 
         let result = run_spawn_orchestrator(
@@ -5147,6 +5168,7 @@ mod worker_status_cli_tests {
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         }).unwrap();
     }
 
@@ -5432,6 +5454,7 @@ pub(crate) mod test_fixtures {
             activity: ninox_core::ActivityState::Unknown,
             activity_note: None,
             activity_since: None,
+            machine_id: None,
         }
     }
 }

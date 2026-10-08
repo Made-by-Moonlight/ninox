@@ -228,6 +228,7 @@ pub(crate) mod test_support {
             claude_session_id: Some(format!("uuid-{id}")), summary: Some(format!("task of {id}")),
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         }
     }
 

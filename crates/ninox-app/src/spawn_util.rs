@@ -224,6 +224,10 @@ pub async fn launch_interactive_session(
         activity:        Default::default(),
         activity_note:   None,
         activity_since:  None,
+        // Carried: a respawn/resume is still the same session on whatever
+        // machine spawned it — hardcoding `None` here would silently wipe a
+        // remote session's machine affiliation back to "local".
+        machine_id:      prior.and_then(|s| s.machine_id.clone()),
     };
     let _ = engine.store.upsert_session(&updated);
     engine.emit(Event::SessionUpdated(updated, SessionFields::ALL));
@@ -2707,6 +2711,7 @@ mod tests {
             activity: ninox_core::types::ActivityState::Blocked,
             activity_note: Some("stale note from the previous incarnation".into()),
             activity_since: Some(50),
+            machine_id: None,
         }).unwrap();
 
         let attach = spawn_interactive_session(
@@ -2772,6 +2777,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         }).unwrap();
 
         let ws = tempdir().unwrap().keep().to_string_lossy().to_string();

@@ -38,6 +38,7 @@ fn session(id: &str, orchestrator_id: &str, workspace: &Path) -> Session {
         activity: ActivityState::Unknown,
         activity_note: None,
         activity_since: None,
+        machine_id: None,
     }
 }
 

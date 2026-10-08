@@ -309,6 +309,18 @@ pub const REGISTRY: &[Capability] = &[
         enabled: |_| true,
         hook: Some(PR_WATCH_ENFORCEMENT_HOOK),
     },
+    // Machine management (`ninox machine add/list/remove`) is a fleet-level
+    // concern an orchestrator drives, not something a worker needs to know
+    // about mid-task — mirrors `plan`/`spawn-worker`'s orchestrator-only shape
+    // rather than `watch-pr`'s two-entries-per-audience split.
+    Capability {
+        name: "remote-machines",
+        audience: Audience::Orchestrator,
+        orchestrator_md: Some(include_str!("../skills/orchestrator/remote-machines.md")),
+        worker_md: None,
+        enabled: |cfg| cfg.remote_machines.enabled,
+        hook: None,
+    },
 ];
 
 /// Placeholder for the invoking `ninox` binary path in orchestrator markdown.
@@ -425,6 +437,7 @@ mod tests {
                 "fleet-recovery",
                 "restart-session",
                 "pr-watch-enforcement",
+                "remote-machines",
             ]
         );
         let worker: Vec<_> = for_audience(Audience::Worker).map(|c| c.name).collect();
@@ -477,9 +490,23 @@ mod tests {
     #[test]
     fn everything_else_is_always_enabled() {
         let cfg = AppConfig::default();
-        for cap in REGISTRY.iter().filter(|c| c.name != "watch-pr") {
+        for cap in REGISTRY.iter().filter(|c| c.name != "watch-pr" && c.name != "remote-machines") {
             assert!((cap.enabled)(&cfg), "{} must be always-on", cap.name);
         }
+    }
+
+    /// `remote-machines` is gated on `[remote_machines].enabled`, matching
+    /// the opt-in shape of `[pr_watch].enabled`.
+    #[test]
+    fn remote_machines_capability_is_gated_on_its_own_config() {
+        let mut cfg = AppConfig::default();
+        cfg.remote_machines.enabled = false;
+        let cap = for_audience(Audience::Orchestrator)
+            .find(|c| c.name == "remote-machines")
+            .expect("remote-machines entry");
+        assert!(!(cap.enabled)(&cfg));
+        cfg.remote_machines.enabled = true;
+        assert!((cap.enabled)(&cfg));
     }
 
     #[test]

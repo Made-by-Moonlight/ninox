@@ -674,6 +674,7 @@ impl Store {
             ("activity",             "ALTER TABLE sessions ADD COLUMN activity TEXT"),
             ("activity_note",        "ALTER TABLE sessions ADD COLUMN activity_note TEXT"),
             ("activity_since",       "ALTER TABLE sessions ADD COLUMN activity_since INTEGER"),
+            ("machine_id",           "ALTER TABLE sessions ADD COLUMN machine_id TEXT"),
         ] {
             if !Self::column_exists(&conn, "sessions", col)? {
                 conn.execute(ddl, [])?;
@@ -1083,8 +1084,8 @@ impl Store {
              cost_usd,started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
              claude_session_id,summary,terminal_at,gate_status,merged_at,
-             activity,activity_note,activity_since)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)
+             activity,activity_note,activity_since,machine_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)
              ON CONFLICT(id) DO UPDATE SET
              repo=excluded.repo,
              status=excluded.status,cost_usd=excluded.cost_usd,
@@ -1103,14 +1104,16 @@ impl Store {
              merged_at=excluded.merged_at,
              activity=excluded.activity,
              activity_note=excluded.activity_note,
-             activity_since=excluded.activity_since",
+             activity_since=excluded.activity_since,
+             machine_id=excluded.machine_id",
             params![
                 s.id, s.orchestrator_id, s.name, s.repo, status, s.agent_type,
                 s.cost_usd, s.started_at, s.pr_number, s.pr_id,
                 s.workspace_path, s.pid, s.model, s.context_tokens,
                 s.catalogue_path, s.context_used_pct, s.context_total_tokens,
                 s.context_window_size, s.claude_session_id, s.summary, s.terminal_at,
-                gate_status, s.merged_at, activity, s.activity_note, s.activity_since
+                gate_status, s.merged_at, activity, s.activity_note, s.activity_since,
+                s.machine_id
             ],
         )?;
         Ok(())
@@ -1270,7 +1273,7 @@ impl Store {
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
              claude_session_id,summary,terminal_at,gate_status,merged_at,
-             activity,activity_note,activity_since
+             activity,activity_note,activity_since,machine_id
              FROM sessions ORDER BY started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1301,6 +1304,7 @@ impl Store {
                 r.get::<_, Option<String>>(23)?,
                 r.get::<_, Option<String>>(24)?,
                 r.get::<_, Option<i64>>(25)?,
+                r.get::<_, Option<String>>(26)?,
             ))
         })?;
         rows.map(|r| {
@@ -1309,7 +1313,7 @@ impl Store {
                  model, context_tokens, catalogue_path, context_used_pct,
                  context_total_tokens, context_window_size, claude_session_id,
                  summary, terminal_at, gate_status_str, merged_at,
-                 activity_str, activity_note, activity_since) = r?;
+                 activity_str, activity_note, activity_since, machine_id) = r?;
             let status = serde_json::from_str(&format!("\"{status_str}\""))
                 .unwrap_or(SessionStatus::Working);
             let gate_status = gate_status_str
@@ -1330,6 +1334,7 @@ impl Store {
                 activity: Self::parse_activity(activity_str),
                 activity_note,
                 activity_since,
+                machine_id,
             })
         })
         .collect()
@@ -1342,7 +1347,7 @@ impl Store {
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
              claude_session_id,summary,terminal_at,gate_status,merged_at,
-             activity,activity_note,activity_since
+             activity,activity_note,activity_since,machine_id
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], |r| {
@@ -1373,6 +1378,7 @@ impl Store {
                 r.get::<_, Option<String>>(23)?,
                 r.get::<_, Option<String>>(24)?,
                 r.get::<_, Option<i64>>(25)?,
+                r.get::<_, Option<String>>(26)?,
             ))
         })?;
         match rows.next() {
@@ -1383,7 +1389,7 @@ impl Store {
                      model, context_tokens, catalogue_path, context_used_pct,
                      context_total_tokens, context_window_size, claude_session_id,
                      summary, terminal_at, gate_status_str, merged_at,
-                     activity_str, activity_note, activity_since) = r?;
+                     activity_str, activity_note, activity_since, machine_id) = r?;
                 let status = serde_json::from_str(&format!("\"{status_str}\""))
                     .unwrap_or(SessionStatus::Working);
                 let gate_status = gate_status_str
@@ -1404,6 +1410,7 @@ impl Store {
                     activity: Self::parse_activity(activity_str),
                     activity_note,
                     activity_since,
+                    machine_id,
                 }))
             }
         }
@@ -4813,6 +4820,7 @@ mod tests {
             activity: ActivityState::Unknown,
             activity_note: None,
             activity_since: None,
+            machine_id: None,
         }
     }
 
@@ -5158,6 +5166,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&session).unwrap();
         let list = store.list_sessions().unwrap();
@@ -5179,6 +5188,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         s.status = SessionStatus::Done;
@@ -5206,6 +5216,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         s.repo = "OwnerB/repoB".into();
@@ -5228,6 +5239,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap();
@@ -5250,6 +5262,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap().unwrap();
@@ -5272,6 +5285,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2").unwrap().unwrap();
@@ -5294,6 +5308,7 @@ mod tests {
             summary: Some("Fix flaky CI on the auth suite".into()),
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2b").unwrap().unwrap();
@@ -5326,6 +5341,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s3").unwrap().unwrap();
@@ -5358,6 +5374,7 @@ mod tests {
             summary: None,
             terminal_at: Some(1_720_000_000_000), gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s5").unwrap().unwrap();
@@ -5393,6 +5410,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         s.started_at = 200;
@@ -5460,6 +5478,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap().unwrap();
@@ -5484,6 +5503,7 @@ mod tests {
             summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2").unwrap().unwrap();
@@ -5512,7 +5532,8 @@ mod tests {
                 claude_session_id: None, summary: None,
                 terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
-            }).unwrap();
+            machine_id: None,
+        }).unwrap();
         }
         let samples = store.cost_samples("claude-code", Some("claude-fable-5")).unwrap();
         assert_eq!(samples.len(), 2);
@@ -5532,6 +5553,7 @@ mod tests {
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         session.gate_status = Some(crate::types::GateStatus {
             ci: crate::types::GateCheck::Failing,
@@ -5564,6 +5586,7 @@ mod tests {
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&session).unwrap();
         let fetched = store.get_session("s2").unwrap().unwrap();
@@ -6836,6 +6859,7 @@ mod tests {
             activity: ActivityState::Unknown,
             activity_note: None,
             activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&session).unwrap();
 
@@ -6879,6 +6903,7 @@ mod tests {
             activity: ActivityState::Unknown,
             activity_note: None,
             activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&session).unwrap();
         session.started_at = 2;
@@ -7543,6 +7568,7 @@ mod tests {
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         session.activity = ActivityState::Blocked;
         session.activity_note = Some("waiting on schema migration".into());
@@ -7649,6 +7675,7 @@ mod tests {
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         assert!(store.update_session_activity("s1", ActivityState::Blocked, Some("stuck"), Some(42)).unwrap());
@@ -7683,6 +7710,7 @@ mod tests {
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&w).unwrap();
         w.id = "w2".into();
@@ -7837,6 +7865,7 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&worker).unwrap();
         worker.id = "unrelated".into();

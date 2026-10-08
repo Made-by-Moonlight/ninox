@@ -275,6 +275,7 @@ mod tests {
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
             activity, activity_note: None, activity_since: None,
+            machine_id: None,
         }
     }
 
