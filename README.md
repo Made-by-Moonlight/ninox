@@ -136,14 +136,15 @@ This is the private mirror of ninox — the sections above cover the public
 build/install paths (crates.io, the public repo's GitHub Releases). Internal
 engineers have additional options: prebuilt Apple silicon binaries (no
 compile), building from source against this repo's history, and pulling
-prebuilt crates from Synthesia's private Cargo registry.
+prebuilt crates from the team's private Cargo registry.
 
 ### Prebuilt macOS binaries (Apple silicon)
 
 Every release publishes a prebuilt `aarch64-apple-darwin` `ninox` binary and
-`Ninox.app` to CodeArtifact (generic package `ninox/ninox-macos` in the
-`synthesia-cargo` repository, `synthesia-build` domain, `eu-west-1`). You need
-the `aws` CLI and an SSO session for the account that owns that domain:
+`Ninox.app` to CodeArtifact (generic package `ninox/ninox-macos`, coordinates
+set by `NINOX_CODEARTIFACT_DOMAIN` / `_REPOSITORY` / `_REGION` — see
+[`scripts/install-macos.sh`](scripts/install-macos.sh)). You need the `aws`
+CLI and an SSO session for the account that owns that domain:
 
 ```bash
 aws sso login --profile <your-build-profile>
@@ -159,11 +160,11 @@ No checkout? The script is published alongside each release, so fetch the
 latest copy straight from CodeArtifact:
 
 ```bash
-v=$(aws codeartifact list-package-versions --domain synthesia-build --repository synthesia-cargo \
-      --region eu-west-1 --format generic --namespace ninox --package ninox-macos \
+v=$(aws codeartifact list-package-versions --domain "$NINOX_CODEARTIFACT_DOMAIN" --repository "$NINOX_CODEARTIFACT_REPOSITORY" \
+      --region "${NINOX_CODEARTIFACT_REGION:-eu-west-1}" --format generic --namespace ninox --package ninox-macos \
       --status Published --query 'versions[].version' --output text | tr '\t' '\n' | sort -V | tail -n1)
-aws codeartifact get-package-version-asset --domain synthesia-build --repository synthesia-cargo \
-  --region eu-west-1 --format generic --namespace ninox --package ninox-macos \
+aws codeartifact get-package-version-asset --domain "$NINOX_CODEARTIFACT_DOMAIN" --repository "$NINOX_CODEARTIFACT_REPOSITORY" \
+  --region "${NINOX_CODEARTIFACT_REGION:-eu-west-1}" --format generic --namespace ninox --package ninox-macos \
   --package-version "$v" --asset install-macos.sh /tmp/install-ninox.sh > /dev/null
 bash /tmp/install-ninox.sh
 ```
