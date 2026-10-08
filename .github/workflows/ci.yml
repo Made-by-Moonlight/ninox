@@ -44,7 +44,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: ${{ runner.os }}-cargo-
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -111,7 +111,7 @@ jobs:
             ~/.cargo/git
             ~/.cache/ninox
             target
-          key: ubuntu2204-core-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ubuntu2204-core-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: ubuntu2204-core-cargo-
       - name: Build ninox-core
         run: cargo build --locked -p ninox-core
@@ -146,7 +146,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ubuntu2204-app-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ubuntu2204-app-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: ubuntu2204-app-cargo-
       - name: Build ninox
         run: cargo build --locked -p ninox
@@ -176,7 +176,7 @@ jobs:
           # because its `target/` fingerprint looks up to date — the actual
           # bug behind the "library 'clang_rt.osx' not found" / missing
           # ort.pyke.io search-path link failures.
-          key: ${{ runner.os }}-cargo-bundle-v2-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-bundle-v2-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: ${{ runner.os }}-cargo-bundle-v2-
       - name: Build, sign & verify Ninox.app
         uses: ./.github/actions/build-macos-bundle

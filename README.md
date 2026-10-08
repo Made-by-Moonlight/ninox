@@ -191,14 +191,12 @@ ninox processes keep the old version until restarted.
 
 ### Build from source
 
-MSRV is rustc **1.94.0** (pinned in `Cargo.toml` — a transitive `aws-config`
-dependency bump requires 1.94.1+, so the workspace stays on 1.94.0 until the
-toolchain catches up). Install it and build as in [Build and
-run](#build-and-run) above:
+The Rust toolchain version is pinned in `rust-toolchain.toml`; rustup
+auto-selects it for any `cargo` command run from the repo, installing it
+first if needed. Build as in [Build and run](#build-and-run) above:
 
 ```bash
-rustup install 1.94.0
-cargo +1.94.0 build --release -p ninox
+cargo build --release -p ninox
 ```
 
 ### Prebuilt macOS bundle (private mirror)
