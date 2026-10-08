@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install prebuilt ninox (Apple silicon macOS) from Synthesia's CodeArtifact.
+# Install prebuilt ninox (Apple silicon macOS) from your CodeArtifact
+# registry.
 #
 # Downloads the `ninox-macos` generic package that publish-codeartifact.yml
 # publishes on every release, verifies each asset against the SHA-256
@@ -9,19 +10,20 @@
 #
 # Usage: scripts/install-macos.sh [--version X.Y.Z] [--app | --no-app] [--user-apps]
 #
-# Environment:
+# Environment (NINOX_CODEARTIFACT_DOMAIN / _REPOSITORY required — no default,
+# every publisher of this binary names their own CodeArtifact coordinates):
 #   NINOX_INSTALL_DIR               binary install dir (default ~/.local/bin)
-#   NINOX_CODEARTIFACT_DOMAIN       default synthesia-build
+#   NINOX_CODEARTIFACT_DOMAIN       your CodeArtifact domain (required)
 #   NINOX_CODEARTIFACT_DOMAIN_OWNER default: from the CodeArtifact registry URL in
 #                                   ~/.cargo/config.toml, else your AWS session's account
-#   NINOX_CODEARTIFACT_REPOSITORY   default synthesia-cargo
+#   NINOX_CODEARTIFACT_REPOSITORY   your CodeArtifact repository (required)
 #   NINOX_CODEARTIFACT_REGION       default eu-west-1
 #   AWS_PROFILE                     the SSO profile to use, as for any aws call
 set -euo pipefail
 
-DOMAIN="${NINOX_CODEARTIFACT_DOMAIN:-synthesia-build}"
+DOMAIN="${NINOX_CODEARTIFACT_DOMAIN:-}"
 DOMAIN_OWNER="${NINOX_CODEARTIFACT_DOMAIN_OWNER:-}"
-REPOSITORY="${NINOX_CODEARTIFACT_REPOSITORY:-synthesia-cargo}"
+REPOSITORY="${NINOX_CODEARTIFACT_REPOSITORY:-}"
 REGION="${NINOX_CODEARTIFACT_REGION:-eu-west-1}"
 INSTALL_DIR="${NINOX_INSTALL_DIR:-$HOME/.local/bin}"
 NAMESPACE=ninox
@@ -52,10 +54,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+[ -n "$DOMAIN" ] || die "NINOX_CODEARTIFACT_DOMAIN must be set to your CodeArtifact domain"
+[ -n "$REPOSITORY" ] || die "NINOX_CODEARTIFACT_REPOSITORY must be set to your CodeArtifact repository"
+
 # Rosetta shells report x86_64 from uname -m, so also ask the hardware.
 if [ "$(uname -s)" != Darwin ] || { [ "$(uname -m)" != arm64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" != 1 ]; }; then
   die "prebuilt ninox binaries are only published for Apple silicon macOS ($TRIPLE).
-Build from source instead: cargo install ninox   (or: cargo install --registry synthesia-cargo ninox)"
+Build from source instead: cargo install ninox   (or: cargo install --registry <your-configured-registry> ninox, if you've set one up)"
 fi
 
 command -v aws >/dev/null 2>&1 || die "the aws CLI is required (brew install awscli)"
