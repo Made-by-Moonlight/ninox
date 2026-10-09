@@ -1,8 +1,8 @@
 name: Publish to crates.io
 
-# Publishes ninox-core, ninox-server, and ninox (the native app binary crate)
-# to crates.io in dependency order using crates.io Trusted Publishing (OIDC)
-# — no long-lived CARGO_REGISTRY_TOKEN secret required.
+# Publishes ninox-ptyd, ninox-core, ninox-server, and ninox (the native app
+# binary crate) to crates.io in dependency order using crates.io Trusted
+# Publishing (OIDC) — no long-lived CARGO_REGISTRY_TOKEN secret required.
 #
 # Trigger: every push to main (i.e. on merge), a `v*` tag push, or manual
 # workflow_dispatch. Each crate is only actually published if its current
@@ -16,9 +16,9 @@ name: Publish to crates.io
 # existing owner from a crate's own settings page, so the very first
 # publish of each crate must happen manually.
 #   1. Publish each crate manually once, in dependency order, using a
-#      personal API token (`cargo login`, then `cargo publish -p ninox-core`,
-#      wait for it to appear on crates.io, then `-p ninox-server`, then
-#      `-p ninox`). This makes you the crate's owner.
+#      personal API token (`cargo login`, then `cargo publish -p ninox-ptyd`,
+#      wait for it to appear on crates.io, then `-p ninox-core`, then
+#      `-p ninox-server`, then `-p ninox`). This makes you the crate's owner.
 #   2. For each crate, go to https://crates.io/crates/<crate-name>/settings,
 #      find "Trusted Publishing", and add a GitHub publisher:
 #        Repository owner:  Made-by-Moonlight
@@ -28,9 +28,10 @@ name: Publish to crates.io
 #   3. After that, this workflow publishes all subsequent version bumps via
 #      OIDC — no token needed.
 #
-# Publish order matters: ninox-server depends on ninox-core, and ninox
-# depends on both. Each step waits for its crate to become visible in the
-# crates.io index before the next dependent crate publishes.
+# Publish order matters: ninox-core depends on ninox-ptyd, ninox-server
+# depends on ninox-core, and ninox depends on all three. Each step waits for
+# its crate to become visible in the crates.io index before the next
+# dependent crate publishes.
 
 on:
   workflow_dispatch:
@@ -88,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           metadata=$(cargo metadata --no-deps --format-version 1)
-          for entry in core:ninox-core server:ninox-server app:ninox; do
+          for entry in ptyd:ninox-ptyd core:ninox-core server:ninox-server app:ninox; do
             key="${entry%%:*}"
             crate="${entry##*:}"
             version=$(echo "$metadata" | jq -r --arg n "$crate" '.packages[] | select(.name==$n) | .version')
@@ -101,6 +102,21 @@ jobs:
               echo "${key}_publish=true" >> "$GITHUB_OUTPUT"
             fi
           done
+
+      - name: Authenticate to crates.io (ninox-ptyd)
+        id: auth-ptyd
+        if: steps.plan.outputs.ptyd_publish == 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        with:
+          crate: ninox-ptyd
+
+      - name: Publish ninox-ptyd
+        if: steps.plan.outputs.ptyd_publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-ptyd.outputs.token }}
+        run: |
+          cargo publish -p ninox-ptyd
+          /tmp/wait-for-crate.sh ninox-ptyd "${{ steps.plan.outputs.ptyd_version }}"
 
       - name: Authenticate to crates.io (ninox-core)
         id: auth-core
