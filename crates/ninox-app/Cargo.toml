@@ -1,14 +1,16 @@
 [package]
 name        = "ninox"
-version     = "0.21.0"
+version     = "0.33.0"
 edition     = "2021"
 description = "Ninox native desktop app: GPU-accelerated Rust/Iced UI for the Ninox orchestrator engine."
 license     = "MIT"
 repository  = "https://github.com/Made-by-Moonlight/ninox"
 
 [dependencies]
-ninox-core   = { path = "../ninox-core", version = "0.21.0" }
-ninox-server = { path = "../ninox-server", version = "0.21.0" }
+ninox-core   = { path = "../ninox-core", version = "0.33.0" }
+ninox-server = { path = "../ninox-server", version = "0.33.0" }
+ninox-ptyd   = { path = "../ninox-ptyd", version = "0.33.0" }
+semver       = { workspace = true }
 tokio         = { workspace = true }
 anyhow        = { workspace = true }
 tracing       = { workspace = true }
@@ -16,9 +18,11 @@ tracing-subscriber = { workspace = true }
 tokio-util    = { workspace = true }
 clap          = { version = "4", features = ["derive"] }
 dirs          = { workspace = true }
+serde         = { workspace = true }
 serde_json    = { workspace = true }
 toml          = { workspace = true }
 iced = { version = "0.13", features = ["tokio", "canvas", "advanced", "wgpu", "markdown", "lazy"] }
+pulldown-cmark = "0.11"
 chrono = "0.4"
 notify-rust = "4"
 alacritty_terminal = "0.26"
@@ -26,6 +30,10 @@ async-stream = "0.3.6"
 arboard = "3"
 ttf-parser = "0.25"
 unicode-bidi = "0.3"
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+futures-util = { workspace = true }
+unicode-width = "0.2"
 
 [package.metadata.bundle]
 name = "Ninox"

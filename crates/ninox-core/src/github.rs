@@ -17,6 +17,11 @@ pub struct PrStatus {
     pub title:     String,
     pub number:    u64,
     pub head_sha:  String,
+    /// Head/base branch names — consumed by the poller's stacked-dependency
+    /// derivation (session B stacks on A when B's base is A's head). Empty
+    /// when the API response omitted them.
+    pub head_ref:  String,
+    pub base_ref:  String,
 }
 
 /// A PR found by searching for an existing head branch (`find_open_pr_for_branch`),
@@ -52,6 +57,14 @@ pub struct ReviewThread {
 #[derive(Deserialize)]
 struct GhPrHead {
     sha: String,
+    #[serde(rename = "ref", default)]
+    branch: String,
+}
+
+#[derive(Deserialize)]
+struct GhPrBase {
+    #[serde(rename = "ref", default)]
+    branch: String,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +75,7 @@ struct GhPr {
     merged:    bool,
     mergeable: Option<bool>,
     head:      GhPrHead,
+    base:      Option<GhPrBase>,
 }
 
 #[derive(Deserialize)]
@@ -199,6 +213,8 @@ impl GithubApi for GitHubClient {
             title:     gh.title,
             number:    gh.number,
             head_sha:  gh.head.sha,
+            head_ref:  gh.head.branch,
+            base_ref:  gh.base.map(|b| b.branch).unwrap_or_default(),
         })
     }
 
@@ -369,6 +385,30 @@ pub fn split_repo(s: &str) -> Option<(String, String)> {
     Some((owner, repo))
 }
 
+/// Parse a GitHub PR URL (`https://github.com/{owner}/{repo}/pull/{n}`,
+/// tolerating `www.`, a trailing slash, and PR sub-pages like `/files`)
+/// into `("owner/repo", n)`. Returns `None` for anything else — including
+/// non-GitHub hosts and issue URLs — so `ninox open --pr` can refuse
+/// unwatchable input loudly instead of registering a dud row.
+pub fn parse_pr_url(url: &str) -> Option<(String, u64)> {
+    let rest = url
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| url.trim().strip_prefix("http://"))?;
+    let rest = rest.strip_prefix("www.").unwrap_or(rest);
+    let rest = rest.strip_prefix("github.com/")?;
+    let mut parts = rest.split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    if parts.next()? != "pull" {
+        return None;
+    }
+    let seg = parts.next()?;
+    let num = seg.split(['?', '#']).next()?;
+    let number: u64 = num.parse().ok()?;
+    Some((format!("{owner}/{repo}"), number))
+}
+
 /// Every configured git remote's GitHub repo slug (`owner/repo`) for
 /// `workspace`, `origin` first (the common case, tried with no extra
 /// requests) then any other remote in `git remote` order. Repos here
@@ -447,7 +487,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// Parse a GitHub API timestamp (`"2024-01-02T03:04:05Z"`, always UTC) into
 /// Unix epoch milliseconds. Returns `0` for anything unparseable rather than
 /// failing the whole fetch over one bad timestamp.
-fn parse_github_timestamp(s: &str) -> i64 {
+pub(crate) fn parse_github_timestamp(s: &str) -> i64 {
     let b = s.as_bytes();
     if b.len() < 19 {
         return 0;
@@ -536,6 +576,46 @@ mod tests {
         let (owner, repo) = split_repo("https://github.com/Made-by-Moonlight/Athene.git").unwrap();
         assert_eq!(owner, "Made-by-Moonlight");
         assert_eq!(repo, "Athene");
+    }
+
+    #[test]
+    fn parse_pr_url_extracts_slug_and_number() {
+        assert_eq!(
+            parse_pr_url("https://github.com/Synthesia-Technologies/ninox/pull/42"),
+            Some(("Synthesia-Technologies/ninox".to_string(), 42))
+        );
+    }
+
+    #[test]
+    fn parse_pr_url_tolerates_trailing_slash_www_and_subpaths() {
+        assert_eq!(parse_pr_url("https://www.github.com/o/r/pull/7/"), Some(("o/r".to_string(), 7)));
+        assert_eq!(parse_pr_url("https://github.com/o/r/pull/7/files"), Some(("o/r".to_string(), 7)));
+    }
+
+    #[test]
+    fn parse_pr_url_strips_query_and_fragment() {
+        assert_eq!(
+            parse_pr_url("https://github.com/o/r/pull/7#discussion_r123"),
+            Some(("o/r".to_string(), 7))
+        );
+        assert_eq!(
+            parse_pr_url("https://github.com/o/r/pull/7?diff=split"),
+            Some(("o/r".to_string(), 7))
+        );
+    }
+
+    #[test]
+    fn parse_pr_url_still_rejects_non_numeric_after_stripping() {
+        assert_eq!(parse_pr_url("https://github.com/o/r/pull/abc#x"), None);
+        assert_eq!(parse_pr_url("https://github.com/o/r/pull/?x=1"), None);
+    }
+
+    #[test]
+    fn parse_pr_url_rejects_non_pr_urls() {
+        assert_eq!(parse_pr_url("https://github.com/o/r"), None);
+        assert_eq!(parse_pr_url("https://github.com/o/r/issues/7"), None);
+        assert_eq!(parse_pr_url("https://gitlab.com/o/r/pull/7"), None);
+        assert_eq!(parse_pr_url("https://github.com/o/r/pull/not-a-number"), None);
     }
 
     #[test]

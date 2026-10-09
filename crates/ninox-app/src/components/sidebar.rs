@@ -18,6 +18,11 @@ fn worker_count_label(count: usize) -> String {
     if count == 1 { "1 worker".to_string() } else { format!("{count} workers") }
 }
 
+/// Two digits at most, so the pill can't stretch the row.
+fn unread_badge_text(count: u64) -> String {
+    count.min(99).to_string()
+}
+
 /// Status dot: filled circle, 1.5px border in the status color.
 /// Done/terminated renders hollow (transparent fill).
 fn status_dot(color: Color, hollow: bool) -> Element<'static, Message> {
@@ -86,6 +91,20 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     #[cfg(not(target_os = "macos"))]
     let masthead_padding = Padding { top: 20.0, right: 18.0, bottom: 14.0, left: 18.0 };
 
+    // Collapse control: hides the sidebar (also bound to Cmd/Ctrl+B). When
+    // hidden the whole sidebar is replaced by a slim reveal rail (see
+    // `App::sidebar_reveal_rail`), so this control only ever shows "«".
+    let collapse_btn = button(text("«").size(14).color(s.ink_2))
+        .on_press(Message::ToggleSidebar)
+        .padding([2, 6])
+        .style(move |_t, status| button::Style {
+            background: matches!(status, button::Status::Hovered)
+                .then_some(Background::Color(s.card)),
+            text_color: s.ink_2,
+            border: Border::default(),
+            ..Default::default()
+        });
+
     // ── 1. Masthead ──────────────────────────────────────────────────────────
     let masthead = container(
         column![
@@ -93,6 +112,8 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
                 text("Nin").size(27).font(SERIF_MEDIUM).color(s.ink),
                 text("ox").size(27).font(SERIF_ITALIC).color(s.ink),
                 text(" ⬡").size(20).font(crate::style::GLYPH).color(s.ink),
+                Space::new(Length::Fill, 0),
+                collapse_btn,
             ]
             .align_y(Alignment::End),
             Space::new(0, 6),
@@ -106,12 +127,14 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     let on_fleet = matches!(app.view, View::FleetBoard { .. });
     let on_prs = matches!(app.view, View::PrList);
     let on_brain = matches!(app.view, View::Brain);
+    let on_workers = matches!(app.view, View::Workers);
     let toc = column![
         toc_item(app, "I.", "Fleet board", "1", Message::NavigateFleet { scope: None }, on_fleet),
         // No "Session" entry: the session tree below IS the session
         // navigation — a TOC alias for "last session" was redundant.
         toc_item(app, "II.", "Pull requests", "2", Message::NavigatePrList, on_prs),
         toc_item(app, "III.", "Brain", "3", Message::NavigateBrain, on_brain),
+        toc_item(app, "IV.", "Workers", "4", Message::NavigateWorkers, on_workers),
     ]
     .padding(Padding { top: 10.0, right: 0.0, bottom: 10.0, left: 0.0 });
 
@@ -184,6 +207,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
             &orch.name,
             &worker_count_label(worker_count),
             app.sessions.get(&orch.id).map(|se| &se.status),
+            app.unread_messages.get(orch.id.as_str()).copied().unwrap_or(0),
             true,  // bold
             false, // not indented
             Some((orch.id.clone(), is_expanded)), // chevron: toggle this orchestrator
@@ -199,7 +223,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
             for w in workers {
                 items.push(tree_row(
                     app, &w.id, &w.name, repo_short(&w.repo),
-                    Some(&w.status), false, true, None,
+                    Some(&w.status), 0, false, true, None,
                     Some(Message::RemoveSession(w.id.clone())),
                 ));
             }
@@ -223,7 +247,7 @@ pub fn sidebar(app: &App) -> Element<'_, Message> {
     for w in standalone {
         items.push(tree_row(
             app, &w.id, &w.name, repo_short(&w.repo),
-            Some(&w.status), false, false, None,
+            Some(&w.status), 0, false, false, None,
             Some(Message::RemoveSession(w.id.clone())),
         ));
     }
@@ -273,6 +297,7 @@ fn tree_row<'a>(
     name: &'a str,
     right: &str,
     status: Option<&ninox_core::types::SessionStatus>,
+    unread: u64,
     bold: bool,
     indented: bool,
     chevron_toggle: Option<(ninox_core::types::OrchestratorId, bool)>,
@@ -344,6 +369,22 @@ fn tree_row<'a>(
         .width(Length::Fill)
         .clip(true)
         .into(),
+    ];
+    if unread > 0 {
+        nav_row_items.push(Space::new(6, 0).into());
+        // Same accent pill as the Alerts count in the action row.
+        nav_row_items.push(
+            container(text(unread_badge_text(unread)).size(8).font(SANS_BOLD).color(s.card))
+                .padding([1, 4])
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(s.accent)),
+                    border: Border { radius: 7.0.into(), ..Default::default() },
+                    ..Default::default()
+                })
+                .into(),
+        );
+    }
+    nav_row_items.extend([
         Space::new(6, 0).into(),
         text(right.to_owned())
             .size(10)
@@ -351,7 +392,7 @@ fn tree_row<'a>(
             .color(s.faint)
             .wrapping(iced::widget::text::Wrapping::None)
             .into(),
-    ];
+    ]);
     if let Some(badge) = retention_badge {
         nav_row_items.push(Space::new(6, 0).into());
         nav_row_items.push(badge);
@@ -375,20 +416,34 @@ fn tree_row<'a>(
     if let Some((toggle_id, is_open)) = chevron_toggle {
         row_items.push(Space::new(4, 0).into());
         row_items.push(
-            button(text(if is_open { "▾" } else { "▸" }).size(9).color(s.faint))
+            // Chunky filled triangles (▶/▼, not the small ▸/▾ which read tiny
+            // inside their em box) at size 15 — visibly larger/heavier than
+            // the ~12.5 row name and the size-12 × so the expander is obvious
+            // at a glance. Legible secondary tone, accent on hover; the text
+            // inherits the button's `text_color` (no explicit `.color()`) so
+            // hover can recolor it. Row is `align_y(Center)`, so the taller
+            // glyph stays vertically centered; padding keeps the hit-target.
+            button(text(if is_open { "▼" } else { "▶" }).size(15))
                 .on_press(Message::SelectOrchestrator(toggle_id))
-                .style(move |_t, status| button::Style {
-                    background: row_bg(matches!(status, button::Status::Hovered)),
-                    border: Border::default(),
-                    ..Default::default()
+                .style(move |_t, status| {
+                    let hovered = matches!(status, button::Status::Hovered);
+                    button::Style {
+                        background: row_bg(hovered),
+                        text_color: if hovered { s.accent } else { s.ink_2 },
+                        border: Border::default(),
+                        ..Default::default()
+                    }
                 })
-                .padding([2, 4])
+                .padding([2, 5])
                 .into(),
         );
     }
     if let Some(remove_msg) = remove {
         row_items.push(
-            button(text("×").size(12).color(s.faint))
+            // `×` (U+00D7) at size 15 to balance with the size-15 chevron —
+            // the old size-12 close read undersized next to the chunky
+            // expander. Keeps the existing faint color + row-bg hover.
+            button(text("×").size(15).color(s.faint))
                 .on_press(remove_msg)
                 .style(move |_t, status| button::Style {
                     background: row_bg(matches!(status, button::Status::Hovered)),
@@ -442,5 +497,12 @@ mod tests {
         assert_eq!(worker_count_label(1), "1 worker");
         assert_eq!(worker_count_label(2), "2 workers");
         assert_eq!(worker_count_label(11), "11 workers");
+    }
+
+    #[test]
+    fn unread_badge_text_caps_at_two_digits() {
+        assert_eq!(unread_badge_text(1), "1");
+        assert_eq!(unread_badge_text(99), "99");
+        assert_eq!(unread_badge_text(150), "99");
     }
 }

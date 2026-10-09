@@ -230,6 +230,61 @@ pub fn install_self_shim(current_exe: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Name of the TUI alias: `nx` is the same binary, and bare `nx` opens the
+/// terminal UI where bare `ninox` keeps opening the desktop app.
+pub const NX_ALIAS: &str = "nx";
+
+/// Ensure an `nx` symlink sits next to the running `ninox` executable, so
+/// `cargo install` users get the alias without a second binary. `exe` must
+/// already be canonical (see [`canonical_exe`]). Only created when `exe`'s
+/// directory is on `path_var` and no other `nx` is reachable through it (the
+/// Nx monorepo CLI is commonly installed as `nx`), and never inside a macOS
+/// `.app` bundle, where an extra file breaks the code signature.
+pub fn install_nx_alias(exe: &Path, path_var: Option<&std::ffi::OsStr>) -> Result<()> {
+    let Some(dir) = exe.parent() else { return Ok(()) };
+    let Some(exe_name) = exe.file_name() else { return Ok(()) };
+    if exe_name == NX_ALIAS {
+        return Ok(());
+    }
+    anyhow::ensure!(!inside_app_bundle(exe), "{} is inside an app bundle", exe.display());
+    let path_dirs: Vec<std::path::PathBuf> = path_var.map(|p| std::env::split_paths(p).collect()).unwrap_or_default();
+    let same_dir = |d: &Path| d.canonicalize().is_ok_and(|d| d == dir);
+    anyhow::ensure!(path_dirs.iter().any(|d| same_dir(d)), "{} is not on PATH", dir.display());
+    for candidate in path_dirs.iter().map(|d| d.join(NX_ALIAS)) {
+        let Ok(target) = candidate.canonicalize() else { continue };
+        anyhow::ensure!(target == exe, "{} is another program; leaving `nx` to it", candidate.display());
+    }
+    let link = dir.join(NX_ALIAS);
+    match std::fs::symlink_metadata(&link) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+        Ok(meta) => {
+            let ours = meta.file_type().is_symlink()
+                && std::fs::read_link(&link).is_ok_and(|t| t == Path::new(exe_name) || t == exe);
+            if ours {
+                return Ok(());
+            }
+            anyhow::bail!("{} exists and is not ninox's alias; leaving it alone", link.display());
+        }
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(exe_name, &link)?;
+    Ok(())
+}
+
+/// The running executable with symlinks resolved. macOS reports the path it
+/// was invoked through, so a TUI launched as `nx` would otherwise point the
+/// self-shim and the alias at `nx` instead of the real `ninox`.
+pub fn canonical_exe() -> std::io::Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(exe.canonicalize().unwrap_or(exe))
+}
+
+pub fn inside_app_bundle(path: &Path) -> bool {
+    let parts: Vec<_> = path.components().map(|c| c.as_os_str()).collect();
+    parts.windows(2).any(|w| w[0].to_string_lossy().ends_with(".app") && w[1] == "Contents")
+}
+
 /// Read session metadata from `{dir}/{session_id}.json`.
 /// Returns empty `SessionMetadata` if the file does not exist or is malformed.
 pub fn read_session_metadata(dir: &Path, session_id: &str) -> Result<SessionMetadata> {
@@ -443,6 +498,72 @@ fn write_executable(path: PathBuf, content: &str) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn canonical_tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        (dir, path)
+    }
+
+    fn fake_exe(dir: &Path) -> std::path::PathBuf {
+        let exe = dir.join("ninox");
+        std::fs::write(&exe, "bin").unwrap();
+        exe
+    }
+
+    fn path_of(dirs: &[&Path]) -> std::ffi::OsString {
+        std::env::join_paths(dirs).unwrap()
+    }
+
+    #[test]
+    fn nx_alias_is_a_relative_symlink_and_never_clobbers() {
+        let (_d, dir) = canonical_tempdir();
+        let exe = fake_exe(&dir);
+        let path = path_of(&[&dir]);
+        install_nx_alias(&exe, Some(&path)).unwrap();
+        let link = dir.join("nx");
+        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("ninox"));
+        install_nx_alias(&exe, Some(&path)).unwrap();
+
+        let (_o, other) = canonical_tempdir();
+        let exe2 = fake_exe(&other);
+        std::fs::write(other.join("nx"), "someone else's nx").unwrap();
+        assert!(install_nx_alias(&exe2, Some(&path_of(&[&other]))).is_err());
+        assert_eq!(std::fs::read_to_string(other.join("nx")).unwrap(), "someone else's nx");
+    }
+
+    #[test]
+    fn nx_alias_skipped_when_exe_dir_is_not_on_path() {
+        let (_d, dir) = canonical_tempdir();
+        let (_e, elsewhere) = canonical_tempdir();
+        let exe = fake_exe(&dir);
+        assert!(install_nx_alias(&exe, Some(&path_of(&[&elsewhere]))).is_err());
+        assert!(install_nx_alias(&exe, None).is_err());
+        assert!(std::fs::symlink_metadata(dir.join("nx")).is_err());
+    }
+
+    #[test]
+    fn nx_alias_never_shadows_another_nx_on_path() {
+        let (_d, dir) = canonical_tempdir();
+        let (_n, node_bin) = canonical_tempdir();
+        let exe = fake_exe(&dir);
+        std::fs::write(node_bin.join("nx"), "nx monorepo cli").unwrap();
+        for order in [[&node_bin, &dir], [&dir, &node_bin]] {
+            let path = path_of(&[order[0].as_path(), order[1].as_path()]);
+            assert!(install_nx_alias(&exe, Some(&path)).is_err());
+        }
+        assert!(std::fs::symlink_metadata(dir.join("nx")).is_err());
+    }
+
+    #[test]
+    fn nx_alias_never_written_inside_an_app_bundle() {
+        let (_d, root) = canonical_tempdir();
+        let macos = root.join("Ninox.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        let exe = fake_exe(&macos);
+        assert!(install_nx_alias(&exe, Some(&path_of(&[&macos]))).is_err());
+        assert!(std::fs::symlink_metadata(macos.join("nx")).is_err());
+    }
 
     #[test]
     fn install_wrappers_creates_executables() {

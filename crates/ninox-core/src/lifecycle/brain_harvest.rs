@@ -187,13 +187,20 @@ async fn detect_default_branch(workspace: &Path) -> String {
     "main".to_string()
 }
 
+/// Flags forcing `git diff` to emit a real unified diff regardless of the
+/// user's local git config (e.g. a `diff.external` wrapper, which would
+/// otherwise replace the diff text with that tool's own output).
+const SAFE_DIFF_FLAGS: [&str; 2] = ["--no-ext-diff", "--no-color"];
+
 /// Filenames changed by `workspace`'s branch against its default branch, or
 /// `None` on a git error. Shared name-only lookup behind both
 /// [`compute_diff`] and [`compute_nontrivial_diff`].
 async fn changed_files(workspace: &Path, range: &str) -> Option<Vec<String>> {
     let ws = workspace.to_string_lossy();
     let names_out = Command::new("git")
-        .args(["-C", &ws, "diff", "--name-only", range])
+        .args(["-C", &ws, "diff"])
+        .args(SAFE_DIFF_FLAGS)
+        .args(["--name-only", range])
         .output()
         .await
         .ok()?;
@@ -210,7 +217,9 @@ async fn changed_files(workspace: &Path, range: &str) -> Option<Vec<String>> {
 async fn diff_text(workspace: &Path, range: &str) -> Option<String> {
     let ws = workspace.to_string_lossy();
     let diff_out = Command::new("git")
-        .args(["-C", &ws, "diff", range])
+        .args(["-C", &ws, "diff"])
+        .args(SAFE_DIFF_FLAGS)
+        .args([range])
         .output()
         .await
         .ok()?;
@@ -257,8 +266,8 @@ pub async fn compute_nontrivial_diff(workspace: &Path) -> Option<String> {
     diff_text(workspace, &range).await
 }
 
-/// Build the one-shot harvest prompt. Inlines the same brain workflow
-/// `WORKER_BRAIN_SKILL` teaches an interactive worker — query before
+/// Build the one-shot harvest prompt. Inlines the same brain workflow the
+/// worker `brain` capability teaches an interactive worker — query before
 /// writing, categorized Markdown with YAML frontmatter, reindex when done —
 /// since a headless `-p` invocation has no skill-loading step of its own.
 pub fn build_harvest_prompt(session_id: &str, diff: &str) -> String {
@@ -461,6 +470,30 @@ mod tests {
         let diff = compute_diff(&repo).await.expect("non-empty diff");
         assert!(diff.contains("src.rs"));
         assert!(diff.contains("fn main()"));
+    }
+
+    /// Regression test for a `diff.external` wrapper replacing the real diff
+    /// text with its own output — reproduced hermetically by setting the
+    /// config on the test repo itself, rather than relying on whatever the
+    /// machine running this test happens to have globally configured.
+    #[tokio::test]
+    async fn diff_gathering_ignores_a_configured_external_diff_tool() {
+        let repo = init_repo();
+        checkout_feature_branch(&repo, "feature-8");
+        write_and_commit(&repo, "src.rs", "fn main() {}\n", "add source file");
+
+        std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "config", "diff.external", "echo EXTERNAL_DIFF_RAN"])
+            .output()
+            .unwrap();
+
+        let diff = compute_diff(&repo).await.expect("non-empty diff");
+        assert!(diff.contains("src.rs"));
+        assert!(diff.contains("fn main()"));
+        assert!(!diff.contains("EXTERNAL_DIFF_RAN"));
+
+        let names = changed_files(&repo, "main...HEAD").await.expect("changed file names");
+        assert_eq!(names, vec!["src.rs".to_string()]);
     }
 
     #[test]

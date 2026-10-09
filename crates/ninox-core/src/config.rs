@@ -23,6 +23,36 @@ pub enum ThemeVariant {
 }
 
 // ---------------------------------------------------------------------------
+// Editor
+// ---------------------------------------------------------------------------
+
+/// Which external editor the "Open in editor" action launches on a worker's
+/// workspace directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorChoice {
+    #[default]
+    VsCode,
+    Cursor,
+    Neovim,
+}
+
+impl std::fmt::Display for EditorChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EditorChoice::VsCode => "VS Code",
+            EditorChoice::Cursor => "Cursor",
+            EditorChoice::Neovim => "Neovim",
+        })
+    }
+}
+
+impl EditorChoice {
+    /// All variants, in display order — for the settings dropdown.
+    pub const ALL: [EditorChoice; 3] = [EditorChoice::VsCode, EditorChoice::Cursor, EditorChoice::Neovim];
+}
+
+// ---------------------------------------------------------------------------
 // Agent configuration
 // ---------------------------------------------------------------------------
 
@@ -55,6 +85,19 @@ fn default_harness() -> String {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self { harness: default_harness(), model: None }
+    }
+}
+
+impl AgentConfig {
+    /// Switch harness, clearing the model: ids from one harness must not
+    /// leak into another's launch command. Returns whether it changed.
+    pub fn set_harness(&mut self, harness: &str) -> bool {
+        if self.harness == harness {
+            return false;
+        }
+        self.harness = harness.to_string();
+        self.model = None;
+        true
     }
 }
 
@@ -124,23 +167,225 @@ impl Default for BrainHarvestConfig {
 // Inbox messaging configuration
 // ---------------------------------------------------------------------------
 
-/// Opt-in (default OFF) file-based inbox for orchestrator↔worker messaging.
+/// How `ninox send` and `Engine::send_to_session` get a message into a
+/// running agent session. Exactly one of these is in effect at a time —
+/// see `crate::messaging::deliver_message` for the dispatch and for what
+/// each path falls back to when the target cannot accept it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendMechanism {
+    /// `tmux::send_keys` — the message is typed at the target's prompt as
+    /// verified keyboard input (hardened in PR #69 with a pre-Enter delay
+    /// and verify/retry). Works against any harness in a tmux session, and
+    /// is what the other two mechanisms fall back to.
+    Keystrokes,
+    /// The per-session file-based inbox (`crate::inbox`), drained by the
+    /// Stop/UserPromptSubmit hooks installed in the worker's worktree
+    /// settings (see `ninox_app::spawn_util::ensure_statusline_settings`).
+    /// Keystrokes are then only a best-effort idle-wake nudge
+    /// (`tmux::wake_idle_session`), not the message itself.
+    Inbox,
+    /// Claude Code's own cross-session messaging socket
+    /// (`crate::session_socket`) — the transport its `SendMessage` tool
+    /// uses between sessions. The message is written as one JSON line to
+    /// the Unix socket the target session advertises in its registry
+    /// record, and is enqueued for its next turn.
+    ///
+    /// The default: unlike keystrokes it cannot collide with whatever the
+    /// human happens to be typing, and unlike the inbox it needs no hooks
+    /// installed ahead of time and reaches an idle session without relying
+    /// on a nudge landing.
+    #[default]
+    SessionSocket,
+}
+
+impl SendMechanism {
+    /// Every mechanism, in the order the settings picker offers them.
+    pub const ALL: [SendMechanism; 3] =
+        [SendMechanism::SessionSocket, SendMechanism::Inbox, SendMechanism::Keystrokes];
+
+    /// One line on what this mechanism does, for the settings card.
+    pub fn description(&self) -> &'static str {
+        match self {
+            SendMechanism::SessionSocket =>
+                "Writes to the target's Claude Code messaging socket, the same transport its \
+                 SendMessage tool uses between sessions. Nothing is typed, so nothing can collide \
+                 with what you are typing, and an idle session receives the message immediately. \
+                 Falls back to keystrokes for sessions that advertise no socket.",
+            SendMechanism::Inbox =>
+                "Writes the message to a per-session file drained by Stop/UserPromptSubmit hooks, \
+                 installed into worker worktrees created from now on. Keystrokes are used only to \
+                 wake an idle session, and a message can sit undelivered if that nudge misses.",
+            SendMechanism::Keystrokes =>
+                "Types the message into the session's prompt as verified keyboard input. Works \
+                 with every harness, and is what the other two fall back to.",
+        }
+    }
+}
+
+impl std::fmt::Display for SendMechanism {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SendMechanism::Keystrokes    => "Keystrokes",
+            SendMechanism::Inbox         => "File-based inbox",
+            SendMechanism::SessionSocket => "Session socket",
+        })
+    }
+}
+
+/// Which delivery mechanism orchestrator↔worker messaging uses.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct MessagingConfig {
+    #[serde(default)]
+    pub mechanism: SendMechanism,
+}
+
+/// Superseded by [`MessagingConfig`] — retained only so an existing
+/// `[inbox_messaging].enabled = true` keeps selecting
+/// [`SendMechanism::Inbox`] after upgrading, rather than silently moving
+/// that user onto the new default. See `AppConfig::send_mechanism`.
 ///
-/// Off (default): `ninox send` and `Engine::send_to_session` behave exactly
-/// as before — the message is injected directly as verified keyboard input
-/// (`tmux::send_keys`, hardened in PR #69 with a pre-Enter delay and
-/// verify/retry).
-///
-/// On: the message is instead written durably to the target session's
-/// file-based inbox (`ninox_core::inbox`), drained by the Stop/
-/// UserPromptSubmit hooks installed in the worker's worktree settings (see
-/// `ninox_app::spawn_util::ensure_statusline_settings`) — keystrokes are
-/// then only a best-effort idle-wake nudge (`tmux::wake_idle_session`), not
-/// the message itself.
+/// Never written back once the mechanism is set explicitly
+/// (`AppConfig::set_send_mechanism` clears it), and omitted from a saved
+/// config entirely while it holds its default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InboxMessagingConfig {
     #[serde(default)]
     pub enabled: bool,
+}
+
+impl InboxMessagingConfig {
+    fn is_default(&self) -> bool {
+        !self.enabled
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR watch configuration
+// ---------------------------------------------------------------------------
+
+/// Opt-in (default OFF) consolidated PR watching.
+///
+/// Off (default): the poller's per-session REST polling
+/// (`poll_github` + `poll_pr_reconciliation`) runs exactly as before.
+///
+/// On: one batched GraphQL query per tick covers every watched PR —
+/// session-attached PRs plus explicit `ninox open --pr` registry entries
+/// (see `store::PrWatch`) — via `github_graphql::GithubBatchApi`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrWatchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Remote machines configuration
+// ---------------------------------------------------------------------------
+
+/// Opt-in (default OFF) SSH-connected remote machines — see
+/// `docs/superpowers/specs/2026-10-05-remote-sessions-design.md`.
+///
+/// Mirrors Herdr's security model exactly: ninox implements no auth of its
+/// own here. Every field below is opaque connection *identity*, never
+/// session content or secrets — authentication is delegated entirely to the
+/// user's own SSH setup (`~/.ssh/config`, agent, keys, `known_hosts`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemoteMachinesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub machines: Vec<MachineProfile>,
+}
+
+/// A saved remote machine connection. Pure connection metadata — no
+/// session content, no credentials, no secrets of any kind. Never store
+/// anything else on this struct; `ninox_core::config::tests` asserts its
+/// serialized field set stays exactly this shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineProfile {
+    /// Opaque, generated at `machine add` time (a UUIDv4). Never parsed or
+    /// derived from anything — purely a local handle.
+    pub id: String,
+    /// Human-readable label shown in `ninox machine list` / the sidebar /
+    /// TUI. Defaults to the host portion of `ssh_target`.
+    pub label: String,
+    /// `user@host` or a `~/.ssh/config` alias — passed to `ssh`/`scp`
+    /// verbatim. This is the only thing that identifies the machine; ninox
+    /// never resolves or stores an IP/fingerprint itself.
+    pub ssh_target: String,
+    /// The remote orchestrator/session name this profile tracks (e.g.
+    /// `"default"`), chosen at `machine add` time from the remote host's
+    /// own `ninox list --json`.
+    pub remote_session: String,
+    /// Whether this profile is currently active. `machine remove` deletes
+    /// the entry outright; this flag is for a user who wants to pause a
+    /// machine without losing its saved connection metadata.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl MachineProfile {
+    /// A fresh opaque id for a new profile — purely a local handle, never
+    /// parsed or derived from the SSH target.
+    pub fn new_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+}
+
+/// What engine startup does with sessions reconciliation found interrupted
+/// (spec §5.4). See `crate::fleet::startup`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RestorePolicy {
+    /// Nothing happens until someone runs `ninox fleet restore`. Default:
+    /// an orchestrator must never act unattended without consent.
+    #[default]
+    Manual,
+    /// Record a pending-restore flag that the TUI offers to act on.
+    Prompt,
+    /// Restore the fleet immediately after startup reconciliation.
+    Auto,
+}
+
+/// `[fleet]` — durable-fleet behaviour. Opt-in, default `manual`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FleetConfig {
+    #[serde(default)]
+    pub restore_policy: RestorePolicy,
+}
+
+// ---------------------------------------------------------------------------
+// Auto-reap configuration
+// ---------------------------------------------------------------------------
+
+/// Opt-out (default ON) automatic reaping of a worker the moment its PR
+/// merges. Default-on preserves the unconditional behavior that predates
+/// this toggle, so existing setups are unaffected — only someone who wants
+/// the post-merge validation window turns it off.
+///
+/// On (default): merge detection immediately runs `Engine::cleanup_session`
+/// — kills the worker's tmux session, removes its worktree, and marks it
+/// `Done`.
+///
+/// Off: the merged notification and worker-done reaction still fire (once —
+/// see `Session::merged_at`), but the worker session and its worktree
+/// survive, so the orchestrator can run post-merge validation in the same
+/// worker that produced the PR and reap it explicitly afterwards
+/// (`ninox reap <id> --force`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoReapConfig {
+    #[serde(default = "default_auto_reap_enabled")]
+    pub enabled: bool,
+}
+
+fn default_auto_reap_enabled() -> bool {
+    true
+}
+
+impl Default for AutoReapConfig {
+    fn default() -> Self {
+        Self { enabled: default_auto_reap_enabled() }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +498,109 @@ impl RustCacheConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Session runtime configuration
+// ---------------------------------------------------------------------------
+
+/// Which runtime hosts newly created agent sessions. Existing sessions stay
+/// on whichever runtime holds them — see `crate::runtime`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    #[serde(default)]
+    pub backend: crate::runtime::Backend,
+}
+
+// ---------------------------------------------------------------------------
+// TUI configuration
+// ---------------------------------------------------------------------------
+
+/// `[tui]`: settings for the terminal UI and the `ninox pane attach` bridge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TuiConfig {
+    /// Prefix chord, written `Ctrl+<key>` (e.g. `Ctrl+Space`, `Ctrl+g`, `Ctrl+\\`; the older `C-<key>` form also parses).
+    /// Defaults to `C-\\` on macOS, where the system claims Ctrl-Space for
+    /// switching input sources, and `C-Space` elsewhere; neither is bound by
+    /// Claude Code or Codex. `C-a`/`C-b` are rejected because they
+    /// collide with users' own screen/tmux, as are chords that alias
+    /// Tab/Enter/Escape/interrupt (`C-i`, `C-m`, `C-[`, `C-c`).
+    /// Left out of a saved config while it holds the platform default, so
+    /// saving settings never pins one platform's default on another.
+    #[serde(default = "default_tui_prefix", skip_serializing_if = "is_default_tui_prefix")]
+    pub prefix: String,
+    /// `terminal` (default) draws the chrome in the host terminal's own
+    /// default colours and 16-colour ANSI palette; `field-notes` paints the
+    /// desktop app's theme in RGB.
+    #[serde(default)]
+    pub colors: TuiColors,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TuiColors {
+    #[default]
+    Terminal,
+    FieldNotes,
+}
+
+/// The default `[tui] prefix` spelling for this platform.
+pub const DEFAULT_PREFIX: &str = if cfg!(target_os = "macos") { "Ctrl+\\" } else { "Ctrl+Space" };
+
+fn default_tui_prefix() -> String {
+    DEFAULT_PREFIX.to_string()
+}
+
+/// Any spelling of the default chord (`Ctrl+\\`, `C-\\`, …) counts, so a
+/// save never pins it.
+fn is_default_tui_prefix(prefix: &str) -> bool {
+    parse_prefix(prefix) == Ok(DEFAULT_PREFIX_BYTE)
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self { prefix: default_tui_prefix(), colors: TuiColors::default() }
+    }
+}
+
+/// The control byte for `DEFAULT_PREFIX` (Ctrl-\ is FS, Ctrl-Space NUL);
+/// what the prefix falls back to.
+pub const DEFAULT_PREFIX_BYTE: u8 = if cfg!(target_os = "macos") { 0x1c } else { 0x00 };
+
+impl TuiConfig {
+    /// The prefix as the control byte a terminal sends for it, or `Err`
+    /// with a reason when the setting is unparseable or disallowed.
+    pub fn prefix_byte(&self) -> Result<u8, String> {
+        parse_prefix(&self.prefix)
+    }
+
+    /// `prefix_byte`, falling back to the platform default on a bad setting.
+    pub fn prefix_byte_or_default(&self) -> u8 {
+        self.prefix_byte().unwrap_or(DEFAULT_PREFIX_BYTE)
+    }
+}
+
+fn parse_prefix(spec: &str) -> Result<u8, String> {
+    let lower = spec.trim().to_ascii_lowercase();
+    let key = ["c-", "ctrl-", "ctrl+", "control-", "^"]
+        .iter()
+        .find_map(|p| lower.strip_prefix(p))
+        .ok_or_else(|| format!("prefix {spec:?} must be a Ctrl chord like Ctrl+Space"))?;
+    let byte = match key {
+        "space" | "spc" | " " | "@" | "2" => 0x00,
+        "\\" => 0x1c,
+        "]" => 0x1d,
+        "^" | "6" => 0x1e,
+        "_" | "-" => 0x1f,
+        k if k.len() == 1 && k.as_bytes()[0].is_ascii_lowercase() => k.as_bytes()[0] - b'a' + 1,
+        "[" => 0x1b,
+        _ => return Err(format!("prefix {spec:?} is not a recognised Ctrl chord")),
+    };
+    match byte {
+        0x01 | 0x02 => Err(format!("prefix {spec:?} collides with screen/tmux; pick another (default {DEFAULT_PREFIX})")),
+        0x03 | 0x09 | 0x0d | 0x1b => Err(format!("prefix {spec:?} aliases interrupt/Tab/Enter/Escape")),
+        b => Ok(b),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App configuration
 // ---------------------------------------------------------------------------
 
@@ -275,15 +623,27 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Default UI zoom factor (`AppConfig::zoom`) — 1.0 is unscaled. Used by
+/// serde when the field is absent from an older config file.
+fn default_zoom() -> f64 { 1.0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub port:      u16,
     pub font_size: f32,
+    /// Global UI zoom factor applied via Iced's native `scale_factor`,
+    /// driven by the Cmd/Ctrl +/-/0 shortcuts. Persisted so the zoom
+    /// level survives app restarts. Clamped to `[0.5, 3.0]` in the app.
+    #[serde(default = "default_zoom")]
+    pub zoom:      f64,
     #[serde(default)]
     pub theme:     ThemeVariant,
+    /// External editor launched by the "Open in editor" action on a worker's
+    /// workspace directory. Default: VS Code.
+    #[serde(default)]
+    pub editor:    EditorChoice,
     /// Override for the orchestrator root directory.
-    /// Defaults to `~/.config/ninox/orchestrator`.
+    /// Defaults to `~/ninox/orchestrators` (see `resolved_orchestrator_root`).
     #[serde(default)]
     pub orchestrator_root: Option<PathBuf>,
     /// Root for Ninox-managed worker worktrees.
@@ -321,18 +681,54 @@ pub struct AppConfig {
     /// `SessionRetentionConfig`.
     #[serde(default)]
     pub session_retention: SessionRetentionConfig,
-    /// File-based inbox toggle for orchestrator↔worker messaging. Opt-in,
-    /// default off — see `InboxMessagingConfig`.
+    /// Which mechanism orchestrator↔worker messages are delivered by.
+    /// Absent means "never chosen explicitly" — resolved by
+    /// `send_mechanism()`, which is the only thing that should read this.
     #[serde(default)]
+    pub messaging: Option<MessagingConfig>,
+    /// Legacy pre-`[messaging]` toggle, kept for migration only — see
+    /// `InboxMessagingConfig` and `send_mechanism()`.
+    #[serde(default, skip_serializing_if = "InboxMessagingConfig::is_default")]
     pub inbox_messaging: InboxMessagingConfig,
     /// Bounded worker-only shared sccache and release-pruning policy.
     #[serde(default)]
     pub rust_cache: RustCacheConfig,
+    /// Consolidated batched-GraphQL PR watching. Opt-in, default off — see
+    /// `PrWatchConfig`.
+    #[serde(default)]
+    pub pr_watch: PrWatchConfig,
+    /// Reap a worker automatically the moment its PR merges. Opt-out,
+    /// default on — see `AutoReapConfig`.
+    #[serde(default)]
+    pub auto_reap: AutoReapConfig,
+    /// Durable-fleet restore policy — see `FleetConfig`.
+    #[serde(default)]
+    pub fleet: FleetConfig,
     /// Theme file name (resolves to `~/.config/ninox/themes/<name>.toml`) or
     /// an absolute/`~`-relative path. `None` uses `themes/field-notes.toml`
     /// if present, else the built-in Field Notes palettes.
     #[serde(default)]
     pub theme_file: Option<String>,
+    /// Width in logical pixels of the left sidebar. Persisted when a resize
+    /// drag commits (see `app::App::update`'s `MouseReleased` arm) and
+    /// clamped to the 150–400 drag range on load. Default 220.
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
+    /// Whether the left sidebar is collapsed/hidden. Toggled by the sidebar
+    /// header control and Cmd/Ctrl+B; the last-used width is retained in
+    /// `sidebar_width` so showing it again restores the prior size.
+    #[serde(default)]
+    pub sidebar_hidden: bool,
+    /// `[runtime] backend = "ptyd" | "tmux"` — see `RuntimeConfig`.
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
+    /// Terminal UI settings — see `TuiConfig`.
+    #[serde(default)]
+    pub tui: TuiConfig,
+    /// SSH-connected remote machines. Opt-in, default off — see
+    /// `RemoteMachinesConfig`.
+    #[serde(default)]
+    pub remote_machines: RemoteMachinesConfig,
     /// Agent-harness registry overrides/extensions (`[harnesses.<name>]`).
     /// Builtin specs for claude-code/codex/opencode/aider/freebuff apply
     /// when a name is absent here. See `crate::harness`. Kept last so TOML
@@ -341,12 +737,20 @@ pub struct AppConfig {
     pub harnesses: BTreeMap<String, HarnessSpec>,
 }
 
+/// Default left-sidebar width in logical pixels. Matches the historical
+/// hard-coded startup width and sits inside the 150–400 drag range.
+fn default_sidebar_width() -> f32 {
+    220.0
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             port:             8080,
             font_size:        13.0,
+            zoom:             default_zoom(),
             theme:            ThemeVariant::Dark,
+            editor:           EditorChoice::default(),
             orchestrator_root: None,
             worktree_root:    None,
             repositories_root: None,
@@ -359,9 +763,18 @@ impl Default for AppConfig {
             brain_harvest:    BrainHarvestConfig::default(),
             session_retention: SessionRetentionConfig::default(),
             theme_file:       None,
+            sidebar_width:    default_sidebar_width(),
+            sidebar_hidden:   false,
+            runtime:          RuntimeConfig::default(),
             harnesses:        BTreeMap::new(),
+            messaging:        None,
             inbox_messaging:  InboxMessagingConfig::default(),
             rust_cache:       RustCacheConfig::default(),
+            pr_watch:         PrWatchConfig::default(),
+            auto_reap:        AutoReapConfig::default(),
+            fleet:            FleetConfig::default(),
+            tui:              TuiConfig::default(),
+            remote_machines:  RemoteMachinesConfig::default(),
         }
     }
 }
@@ -480,6 +893,51 @@ impl AppConfig {
         HarnessRegistry::from_config(&self.harnesses)
     }
 
+    /// The harness `claude-code`: always enabled, its toggle is inert.
+    pub const LOCKED_HARNESS: &'static str = "claude-code";
+
+    /// Flip a harness's `enabled`, writing the FULL effective spec — config
+    /// entries replace builtin specs wholesale, so a bare `{ enabled }`
+    /// would wipe the builtin's args. Returns false (no change) for
+    /// `LOCKED_HARNESS`.
+    pub fn toggle_harness(&mut self, name: &str) -> bool {
+        if name == Self::LOCKED_HARNESS {
+            return false;
+        }
+        let mut spec = self.registry().spec(name);
+        spec.enabled = !spec.enabled;
+        self.harnesses.insert(name.to_string(), spec);
+        true
+    }
+
+    /// Which mechanism to deliver orchestrator↔worker messages by.
+    ///
+    /// An explicit `[messaging] mechanism` always wins. Failing that, a
+    /// config written before `[messaging]` existed is migrated by its
+    /// legacy `[inbox_messaging].enabled` flag: someone who had opted into
+    /// the file-based inbox stays on it rather than being moved onto the
+    /// new default behind their back. Everything else — including a config
+    /// that never mentioned messaging at all — gets
+    /// [`SendMechanism::default()`].
+    ///
+    /// Read this rather than either field directly; the fields alone don't
+    /// tell you what will actually happen.
+    pub fn send_mechanism(&self) -> SendMechanism {
+        match self.messaging {
+            Some(m) => m.mechanism,
+            None if self.inbox_messaging.enabled => SendMechanism::Inbox,
+            None => SendMechanism::default(),
+        }
+    }
+
+    /// Choose the delivery mechanism, retiring the legacy inbox flag so the
+    /// two can never disagree — after this, `send_mechanism()` is answered
+    /// entirely by `[messaging]`.
+    pub fn set_send_mechanism(&mut self, mechanism: SendMechanism) {
+        self.messaging = Some(MessagingConfig { mechanism });
+        self.inbox_messaging.enabled = false;
+    }
+
     /// Path to the knowledge-base (brain) directory.
     ///
     /// Honors the `NINOX_BRAIN` environment variable as an override: if
@@ -552,12 +1010,19 @@ impl AppConfig {
             .and_then(|c| build(&c.remote, &c.endpoint, &c.region, &c.cache_ttl_secs))
     }
 
+    /// Falls back to `~/ninox/orchestrators` when `orchestrator_root` is
+    /// unset. This moved off `<config_dir>/ninox/orchestrator` (an
+    /// OS-private, easy-to-miss location) in MLOPS-4659; the change only
+    /// affects the fallback, not the `[orchestrator_root]` override, and
+    /// existing users on the old default simply start fresh at the new path
+    /// on next launch — their old orchestrator directory is left in place
+    /// untouched, not migrated or deleted.
     pub fn resolved_orchestrator_root(&self) -> PathBuf {
         self.orchestrator_root.clone().unwrap_or_else(|| {
-            dirs::config_dir()
+            dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("ninox")
-                .join("orchestrator")
+                .join("orchestrators")
         })
     }
 
@@ -660,6 +1125,20 @@ impl AppConfig {
         fs::write(p, toml::to_string(self)?)?;
         Ok(())
     }
+
+    /// Read → apply → write against the file on disk, so a change made by
+    /// one process never clobbers another's edits with a stale in-memory
+    /// copy. A file that doesn't parse is left untouched (the error is
+    /// returned), and an `f` that changes nothing writes nothing.
+    pub fn update<R>(f: impl FnOnce(&mut Self) -> R) -> Result<(Self, R)> {
+        let mut cfg = Self::load()?;
+        let before = toml::to_string(&cfg)?;
+        let r = f(&mut cfg);
+        if toml::to_string(&cfg)? != before || !Self::path().exists() {
+            cfg.save()?;
+        }
+        Ok((cfg, r))
+    }
 }
 
 /// Serializes tests that mutate process-global env vars (`NINOX_CONFIG`,
@@ -699,6 +1178,27 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn update_applies_to_the_file_not_a_stale_copy() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        with_env_override("NINOX_CONFIG", &path, || {
+            let stale = AppConfig::load().unwrap();
+            let mut other = stale.clone();
+            other.zoom = 1.3;
+            other.save().unwrap();
+
+            let (saved, ()) = AppConfig::update(|c| c.pr_watch.enabled = true).unwrap();
+            assert!(saved.pr_watch.enabled);
+            assert_eq!(saved.zoom, 1.3, "another process's edit survives");
+            assert_eq!(AppConfig::load().unwrap().zoom, 1.3);
+
+            std::fs::write(&path, "not = [valid").unwrap();
+            assert!(AppConfig::update(|c| c.pr_watch.enabled = false).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "not = [valid", "a broken file is never overwritten");
+        });
+    }
+
+    #[test]
     fn round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -710,9 +1210,98 @@ mod tests {
         assert!(loaded.orchestrator_root.is_none());
     }
 
+    /// `MachineProfile` must persist only opaque connection metadata — no
+    /// session content, no credentials. Asserts the exact serialized key
+    /// set so a future field addition is a deliberate, reviewed decision
+    /// rather than an accidental leak.
+    #[test]
+    fn machine_profile_serializes_only_opaque_metadata() {
+        let profile = MachineProfile {
+            id: "11111111-1111-1111-1111-111111111111".into(),
+            label: "build-box".into(),
+            ssh_target: "ethan@10.0.0.5".into(),
+            remote_session: "default".into(),
+            enabled: true,
+        };
+        let value = toml::Value::try_from(&profile).unwrap();
+        let table = value.as_table().unwrap();
+        let mut keys: Vec<&str> = table.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["enabled", "id", "label", "remote_session", "ssh_target"]);
+    }
+
+    #[test]
+    fn machine_profile_round_trips_through_app_config() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = AppConfig::default();
+        cfg.remote_machines.enabled = true;
+        cfg.remote_machines.machines.push(MachineProfile {
+            id: "m1".into(),
+            label: "laptop".into(),
+            ssh_target: "me@laptop.local".into(),
+            remote_session: "default".into(),
+            enabled: true,
+        });
+        fs::write(&path, toml::to_string(&cfg).unwrap()).unwrap();
+        let loaded: AppConfig = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(loaded.remote_machines.enabled);
+        assert_eq!(loaded.remote_machines.machines.len(), 1);
+        assert_eq!(loaded.remote_machines.machines[0].ssh_target, "me@laptop.local");
+    }
+
+    /// Default config has the feature off and no machines — an untouched
+    /// install stays exactly as before this feature existed.
+    #[test]
+    fn remote_machines_defaults_to_disabled_and_empty() {
+        let cfg = AppConfig::default();
+        assert!(!cfg.remote_machines.enabled);
+        assert!(cfg.remote_machines.machines.is_empty());
+    }
+
+    #[test]
+    fn runtime_backend_defaults_to_tmux_and_round_trips() {
+        use crate::runtime::Backend;
+        assert_eq!(AppConfig::default().runtime.backend, Backend::Tmux);
+        let legacy: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert_eq!(legacy.runtime.backend, Backend::Tmux);
+
+        let cfg = AppConfig { runtime: RuntimeConfig { backend: Backend::Ptyd }, ..AppConfig::default() };
+        let serialized = toml::to_string(&cfg).unwrap();
+        assert!(serialized.contains("[runtime]\nbackend = \"ptyd\""), "{serialized}");
+        let loaded: AppConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(loaded.runtime.backend, Backend::Ptyd);
+
+        let with_harness = AppConfig {
+            harnesses: [("x".to_string(), crate::harness::HarnessSpec::default())].into(),
+            ..cfg
+        };
+        let loaded: AppConfig = toml::from_str(&toml::to_string(&with_harness).unwrap()).unwrap();
+        assert_eq!(loaded.runtime.backend, Backend::Ptyd);
+    }
+
     #[test]
     fn default_theme_is_dark() {
         assert_eq!(AppConfig::default().theme, ThemeVariant::Dark);
+    }
+
+    #[test]
+    fn sidebar_geometry_round_trips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = AppConfig { sidebar_width: 275.0, sidebar_hidden: true, ..AppConfig::default() };
+        fs::write(&path, toml::to_string(&cfg).unwrap()).unwrap();
+        let loaded: AppConfig = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(loaded.sidebar_width, 275.0);
+        assert!(loaded.sidebar_hidden);
+    }
+
+    #[test]
+    fn missing_sidebar_fields_default() {
+        // Configs written before these fields existed must still load.
+        let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert_eq!(cfg.sidebar_width, default_sidebar_width());
+        assert!(!cfg.sidebar_hidden);
     }
 
     #[test]
@@ -750,7 +1339,7 @@ mod tests {
     #[test]
     fn resolved_orchestrator_root_default() {
         let cfg = AppConfig::default();
-        assert!(cfg.resolved_orchestrator_root().ends_with("ninox/orchestrator"));
+        assert!(cfg.resolved_orchestrator_root().ends_with("ninox/orchestrators"));
     }
 
     #[test]
@@ -985,21 +1574,127 @@ mod tests {
     }
 
     #[test]
-    fn inbox_messaging_defaults_to_disabled() {
-        assert!(!AppConfig::default().inbox_messaging.enabled);
+    fn send_mechanism_defaults_to_the_session_socket() {
+        assert_eq!(AppConfig::default().send_mechanism(), SendMechanism::SessionSocket);
     }
 
     #[test]
-    fn inbox_messaging_missing_table_defaults_to_disabled() {
+    fn send_mechanism_missing_tables_default_to_the_session_socket() {
         let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert_eq!(cfg.send_mechanism(), SendMechanism::SessionSocket);
+    }
+
+    #[test]
+    fn send_mechanism_reads_an_explicit_choice() {
+        for (value, expected) in [
+            ("keystrokes", SendMechanism::Keystrokes),
+            ("inbox", SendMechanism::Inbox),
+            ("session_socket", SendMechanism::SessionSocket),
+        ] {
+            let toml_src = format!("port = 8080\nfont_size = 13.0\n\n[messaging]\nmechanism = \"{value}\"\n");
+            let cfg: AppConfig = toml::from_str(&toml_src).unwrap();
+            assert_eq!(cfg.send_mechanism(), expected, "for mechanism = {value:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_inbox_toggle_still_selects_the_inbox() {
+        // Someone who opted into the file-based inbox before [messaging]
+        // existed must stay on it across the upgrade, not be moved onto the
+        // new default behind their back.
+        let toml_src = "port = 8080\nfont_size = 13.0\n\n[inbox_messaging]\nenabled = true\n";
+        let cfg: AppConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.send_mechanism(), SendMechanism::Inbox);
+    }
+
+    #[test]
+    fn an_explicit_mechanism_overrides_the_legacy_inbox_toggle() {
+        let toml_src = "port = 8080\nfont_size = 13.0\n\n[messaging]\nmechanism = \"keystrokes\"\n\n[inbox_messaging]\nenabled = true\n";
+        let cfg: AppConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.send_mechanism(), SendMechanism::Keystrokes);
+    }
+
+    #[test]
+    fn setting_a_mechanism_retires_the_legacy_inbox_toggle() {
+        // Otherwise a config could carry `enabled = true` alongside an
+        // explicit non-inbox mechanism — two fields disagreeing about one
+        // choice, with the answer depending on which one you happened to read.
+        let mut cfg: AppConfig =
+            toml::from_str("port = 8080\nfont_size = 13.0\n\n[inbox_messaging]\nenabled = true\n").unwrap();
+        cfg.set_send_mechanism(SendMechanism::Keystrokes);
+        assert_eq!(cfg.send_mechanism(), SendMechanism::Keystrokes);
         assert!(!cfg.inbox_messaging.enabled);
     }
 
     #[test]
-    fn inbox_messaging_can_be_enabled_via_config() {
-        let toml_src = "port = 8080\nfont_size = 13.0\n\n[inbox_messaging]\nenabled = true\n";
+    fn a_chosen_mechanism_survives_a_save_load_round_trip() {
+        // Guards the TOML shape as much as the value: `toml::to_string`
+        // rejects a plain value emitted after a table, so a new table field
+        // landing in the wrong position breaks saving for everyone.
+        let mut cfg = AppConfig::default();
+        cfg.set_send_mechanism(SendMechanism::Inbox);
+        let serialized = toml::to_string(&cfg).unwrap();
+        let reloaded: AppConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reloaded.send_mechanism(), SendMechanism::Inbox);
+    }
+
+    #[test]
+    fn a_default_config_does_not_write_the_legacy_inbox_table() {
+        let serialized = toml::to_string(&AppConfig::default()).unwrap();
+        assert!(
+            !serialized.contains("inbox_messaging"),
+            "the legacy table is migration-only and should not be re-emitted:\n{serialized}"
+        );
+    }
+
+    #[test]
+    fn fleet_restore_policy_defaults_to_manual_and_parses() {
+        assert_eq!(AppConfig::default().fleet.restore_policy, RestorePolicy::Manual);
+        let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert_eq!(cfg.fleet.restore_policy, RestorePolicy::Manual);
+        let cfg: AppConfig =
+            toml::from_str("port = 8080\nfont_size = 13.0\n\n[fleet]\nrestore_policy = \"auto\"\n").unwrap();
+        assert_eq!(cfg.fleet.restore_policy, RestorePolicy::Auto);
+        let serialized = toml::to_string(&cfg).unwrap();
+        let back: AppConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(back.fleet.restore_policy, RestorePolicy::Auto);
+    }
+
+    #[test]
+    fn pr_watch_defaults_to_disabled() {
+        assert!(!AppConfig::default().pr_watch.enabled);
+    }
+
+    #[test]
+    fn pr_watch_missing_table_defaults_to_disabled() {
+        let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert!(!cfg.pr_watch.enabled);
+    }
+
+    #[test]
+    fn pr_watch_can_be_enabled_via_config() {
+        let toml_src = "port = 8080\nfont_size = 13.0\n\n[pr_watch]\nenabled = true\n";
         let cfg: AppConfig = toml::from_str(toml_src).unwrap();
-        assert!(cfg.inbox_messaging.enabled);
+        assert!(cfg.pr_watch.enabled);
+    }
+
+    #[test]
+    fn auto_reap_defaults_to_enabled() {
+        // Opt-out: default on preserves the pre-toggle cleanup-on-merge
+        // behavior, both when the whole table is absent and when the table
+        // is present without `enabled`.
+        assert!(AppConfig::default().auto_reap.enabled);
+        let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert!(cfg.auto_reap.enabled);
+        let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n\n[auto_reap]\n").unwrap();
+        assert!(cfg.auto_reap.enabled, "an empty [auto_reap] table must still default enabled");
+    }
+
+    #[test]
+    fn auto_reap_can_be_disabled_via_config() {
+        let toml_src = "port = 8080\nfont_size = 13.0\n\n[auto_reap]\nenabled = false\n";
+        let cfg: AppConfig = toml::from_str(toml_src).unwrap();
+        assert!(!cfg.auto_reap.enabled);
     }
 
     #[test]
@@ -1065,5 +1760,58 @@ mod tests {
         let cfg: AppConfig = toml::from_str(toml_src).unwrap();
         assert!(cfg.brain.catalogues[0].remote.is_none());
         assert!(cfg.brain.catalogues[0].cache_ttl_secs.is_none());
+    }
+}
+
+#[cfg(test)]
+mod tui_config_tests {
+    use super::*;
+
+    fn byte(s: &str) -> Result<u8, String> {
+        TuiConfig { prefix: s.into(), ..Default::default() }.prefix_byte()
+    }
+
+    #[test]
+    fn default_prefix_is_ctrl_backslash_on_macos_and_ctrl_space_elsewhere() {
+        let want = if cfg!(target_os = "macos") { 0x1c } else { 0x00 };
+        assert_eq!(TuiConfig::default().prefix_byte(), Ok(want));
+        assert_eq!(DEFAULT_PREFIX_BYTE, want);
+        let cfg: AppConfig = toml::from_str("port = 1\nfont_size = 12.0\n").unwrap();
+        assert_eq!(cfg.tui, TuiConfig::default());
+    }
+
+    #[test]
+    fn the_default_prefix_is_not_pinned_by_a_save_but_a_choice_is() {
+        let text = toml::to_string(&AppConfig::default()).unwrap();
+        assert!(!text.contains("prefix"), "{text}");
+        let mut cfg = AppConfig::default();
+        cfg.tui.prefix = "C-g".into();
+        let back: AppConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.tui.prefix, "C-g");
+    }
+
+    #[test]
+    fn parses_ctrl_chords() {
+        assert_eq!(byte("C-g"), Ok(0x07));
+        assert_eq!(byte("ctrl+G"), Ok(0x07));
+        assert_eq!(byte("C-\\"), Ok(0x1c));
+        assert_eq!(byte("^]"), Ok(0x1d));
+    }
+
+    #[test]
+    fn rejects_colliding_and_unusable_prefixes() {
+        for bad in ["C-b", "C-a", "C-c", "C-i", "C-m", "C-[", "g", "C-F1"] {
+            assert!(byte(bad).is_err(), "{bad} must be rejected");
+        }
+        assert_eq!(TuiConfig { prefix: "C-b".into(), ..Default::default() }.prefix_byte_or_default(), DEFAULT_PREFIX_BYTE);
+    }
+
+    #[test]
+    fn tui_table_round_trips_after_scalars() {
+        let mut cfg = AppConfig::default();
+        cfg.tui.prefix = "C-g".into();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: AppConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.tui.prefix, "C-g");
     }
 }

@@ -1,6 +1,6 @@
 use ninox_core::{
     store::Store,
-    types::{Orchestrator, OrchestratorRuntimeIdentity, Session, SessionStatus},
+    types::{ActivityState, Orchestrator, OrchestratorRuntimeIdentity, Session, SessionStatus},
 };
 use serde_json::Value;
 use std::{
@@ -34,6 +34,11 @@ fn session(id: &str, orchestrator_id: &str, workspace: &Path) -> Session {
         summary: None,
         terminal_at: None,
         gate_status: None,
+        merged_at: None,
+        activity: ActivityState::Unknown,
+        activity_note: None,
+        activity_since: None,
+        machine_id: None,
     }
 }
 

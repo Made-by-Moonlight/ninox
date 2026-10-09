@@ -1,7 +1,7 @@
 use std::{collections::{HashMap, VecDeque}, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use ninox_core::{
-    config::{AppConfig, ThemeVariant},
+    config::{AppConfig, EditorChoice, SendMechanism, ThemeVariant},
     events::{Engine, Event},
     slugify,
     types::*,
@@ -24,6 +24,11 @@ const CLIENT_OUTPUT_MAX_COALESCE_INTERVAL: Duration = Duration::from_millis(8);
 const CLIENT_OUTPUT_EVENTS_PER_SCHEDULER_TURN: usize = 32;
 // tmux uses the same bound for an inner DEC 2026 frame that never closes.
 const TERMINAL_OUTPUT_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Width (logical px) of the slim reveal rail shown in place of the sidebar
+/// when it is collapsed. Kept in sync between the view (`sidebar_reveal_rail`)
+/// and the terminal-size budget (`resize_terminals`).
+const SIDEBAR_REVEAL_RAIL_W: f32 = 22.0;
 
 /// The running binary's own version — shown in Settings and used as the
 /// baseline for `ensure_version_check`. This crate's `CARGO_PKG_VERSION`,
@@ -226,6 +231,31 @@ pub enum VersionCheckState {
     Failed,
 }
 
+/// One orchestrator's registered goals/plan doc, as last read from disk.
+/// Keyed by `orchestrator_id` on `App::plan_docs` — see
+/// `docs/superpowers/specs/2026-08-26-orchestrator-plan-tracking-design.md`.
+/// Not `Clone`/`Debug`-derived: `text_editor::Content` supports neither.
+#[derive(Default)]
+pub struct PlanDocState {
+    pub file_path:  Option<String>,
+    pub blocks:     Vec<PlanBlockView>,
+    last_mtime:     Option<std::time::SystemTime>,
+    /// Set when the row exists but the file itself is missing/unreadable —
+    /// distinct from "nothing registered" so the panel can say so.
+    pub error:      Option<String>,
+}
+
+/// One rendered markdown block (heading/paragraph/list-item/code) — the
+/// displayed text already has bullet/checkbox prefixes applied and
+/// markdown syntax stripped (see `components::markdown_blocks`), paired
+/// with a `text_editor::Content` so it's independently selectable.
+pub struct PlanBlockView {
+    pub kind:    crate::components::markdown_blocks::BlockKind,
+    pub content: iced::widget::text_editor::Content,
+    pub spans:   Vec<(std::ops::Range<usize>, crate::components::markdown_blocks::InlineStyle)>,
+    pub links:   Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BrainViewState {
     pub entries:  Vec<BrainEntry>,
@@ -257,13 +287,15 @@ pub struct BrainViewState {
     /// `App::refresh_brain_graph` and `brain_pinboard::resolve_edges`.
     /// Never re-derived per canvas draw.
     pub edges: Vec<(usize, usize)>,
-    /// Force-directed pinboard layout: each entry id's normalized `(x, y)`
-    /// position in `[0.05, 0.95]`, computed once per data change by
-    /// `brain_pinboard::force_layout` alongside `edges` (same triggers,
-    /// same `App::refresh_brain_graph`) — never recomputed per canvas
-    /// draw. `Pinboard::nodes()` falls back to the old hash-based position
-    /// for any id missing here (e.g. a reindex race).
-    pub layout: HashMap<String, (f32, f32)>,
+    /// Live force-directed layout for the pinboard canvas — positions in
+    /// normalized `[0,1]^2` space, stepped by `Message::BrainPhysicsTick`.
+    /// Session-only: discarded wholesale by `reload_brain_entries`, so
+    /// every reindex/catalogue switch (and every app restart) reseeds from
+    /// the hash scatter. Never persisted to disk.
+    pub layout: crate::components::force_layout::ForceLayout,
+    /// Id of the pinboard node currently being dragged, if any — excluded
+    /// from `layout`'s force integration while set (see `BrainDragMove`).
+    pub dragging: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +304,7 @@ pub enum View {
     SessionDetail { session_id: SessionId, panel: DetailPanel },
     PrList,
     Brain,
+    Workers,
     Settings,
 }
 
@@ -285,6 +318,12 @@ impl Default for View {
 // App model
 // ---------------------------------------------------------------------------
 
+/// UI zoom bounds and step for the Cmd/Ctrl +/-/0 shortcuts. `zoom` feeds
+/// Iced's native `scale_factor` (see `main.rs`), so it scales the whole UI.
+const ZOOM_MIN:  f64 = 0.5;
+const ZOOM_MAX:  f64 = 3.0;
+const ZOOM_STEP: f64 = 0.1;
+
 pub struct App {
     pub engine:             Arc<Engine>,
     pub config:             AppConfig,
@@ -293,8 +332,21 @@ pub struct App {
     pub active_variant:     ThemeVariant,
     pub orchestrator_root:  std::path::PathBuf,
     pub orchestrator_agent: ninox_core::config::AgentConfig,
+    /// Where the store's sqlite file lives — threaded in at startup (mirrors
+    /// `tui::run`'s own `db_path` param) so `restart::execute` has it for the
+    /// rare self-restart branch; unused for every other action.
+    pub db_path:            std::path::PathBuf,
     pub orchestrators:      Vec<Orchestrator>,
     pub sessions:        HashMap<SessionId, Session>,
+    /// Worker→worker dependency edges mirrored from the store — refreshed
+    /// by `refresh_worker_registry` on entering the Workers view and on
+    /// each `PollSessions` tick while it's open (the 3s tick is this
+    /// codebase's freshness bar; no event carries dep changes).
+    pub session_deps:    Vec<ninox_core::SessionDep>,
+    /// Per-session result of `worker_status::worker_status_hooks_installed`
+    /// — whether the worktree can report activity at all. Refreshed with
+    /// `session_deps`; missing entry means "can't report".
+    pub status_probe:    HashMap<SessionId, bool>,
     pub brain:           Arc<BrainIndex>,
     pub brain_view:      BrainViewState,
     /// All selectable knowledge-base catalogues (`AppConfig::catalogue_options()`,
@@ -305,11 +357,23 @@ pub struct App {
     pub prs:             HashMap<PrId, PR>,
     pub ci_status:       HashMap<PrId, CIStatus>,
     pub review_threads:  HashMap<PrId, Vec<Comment>>,
+    /// Read-only `text_editor` buffer per comment id, so Marginalia comment
+    /// bodies can be selected and copied. Populated alongside
+    /// `review_threads`; iced needs the buffer to outlive the view, so it
+    /// cannot be built on the fly while rendering.
+    pub comment_editors: HashMap<i64, iced::widget::text_editor::Content>,
     /// On-demand `git diff` text per session's workspace (`ensure_diff`).
     /// Absent = not fetched yet (render "Loading…"); `Some(None)` = fetched,
     /// no diff (no workspace recorded, or a clean working tree).
     pub diffs:           HashMap<SessionId, Option<String>>,
+    /// Registered goals/plan doc per orchestrator, refreshed by
+    /// `ensure_plan` — see `PlanDocState`.
+    pub plan_docs:       HashMap<OrchestratorId, PlanDocState>,
     pub notifications:   VecDeque<Notification>,
+    /// Messages delivered to each session since the user last had it open
+    /// (`Event::MessagesDelivered`). Drives the sidebar's per-row badge;
+    /// cleared by `NavigateSession`.
+    pub unread_messages: HashMap<SessionId, u64>,
     /// True while an `ApplyUpdate`-triggered `cargo install` subprocess is
     /// running — disables the "Update now" action so a second click can't
     /// spawn a duplicate install.
@@ -318,6 +382,10 @@ pub struct App {
     /// Settings opens — drives the version line's "up to date"/"update
     /// available" state (spec: Settings panel).
     pub version_check:   VersionCheckState,
+    /// True while a `ConfirmRestartAll`-triggered batch restart is running —
+    /// disables the Fleet card's action and keeps a second click from
+    /// spawning a duplicate batch.
+    pub restart_all_in_progress: bool,
     pub sidebar:         SidebarState,
     pub view:            View,
     /// The user's preferred worker panel — global, not per-session: the
@@ -350,6 +418,11 @@ pub struct App {
     /// `spawn_modal` in practice (spawn lives in other views); when both are
     /// somehow set, rendering and Esc both give `spawn_modal` precedence.
     pub catalogue_modal: Option<CatalogueForm>,
+    /// "Restart all agents" confirmation modal (Fleet card, Settings) is
+    /// open. A plain bool rather than `Option<Form>` like the modals above —
+    /// there's no form data to carry; the live count it displays is read
+    /// straight from `sessions` at render time.
+    pub restart_all_confirm: bool,
     /// Current terminal canvas dimensions, kept in sync by WindowResized.
     /// Used as the source of truth for all start_streaming + TerminalState::new calls.
     pub terminal_cols:   u16,
@@ -357,10 +430,18 @@ pub struct App {
     pub window_width:    f32,
     pub window_height:   f32,
     pub sidebar_width:   f32,
+    /// When true the left sidebar (and its drag handle) is collapsed; the
+    /// main content expands and a slim reveal rail is shown in its place.
+    /// `sidebar_width` is preserved so un-hiding restores the prior size.
+    pub sidebar_hidden:  bool,
     pub info_width:      f32,
     pub drag:            Option<DragTarget>,
     pub fleet_filter:    FleetFilter,
     pub last_fleet_scope: Option<OrchestratorId>,
+    /// Global UI zoom factor fed to Iced's native `scale_factor`. Driven by
+    /// the Cmd/Ctrl +/-/0 shortcuts, clamped to `[ZOOM_MIN, ZOOM_MAX]`, and
+    /// mirrored into `config.zoom` so it persists across restarts.
+    pub zoom:            f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +495,15 @@ pub enum Message {
     CatalogueFormConfirm,
     CatalogueFormCancel,
     SwitchDetailPanel(crate::components::session_detail::DetailPanel),
+    /// A non-edit `text_editor::Action` (click/drag/select/scroll) from one
+    /// of the read-only per-block widgets in the Plan panel — applied to
+    /// `plan_docs[orchestrator_id].blocks[block].content` so
+    /// selection/copy work; `Action::Edit(_)` is deliberately dropped.
+    PlanEditorAction {
+        orchestrator_id: OrchestratorId,
+        block: usize,
+        action: iced::widget::text_editor::Action,
+    },
     RemoveOrchestrator(OrchestratorId),
     RemoveSession(SessionId),
     /// Kill the tmux session and respawn the same name/workspace with the
@@ -441,30 +531,56 @@ pub enum Message {
     MouseMoved(iced::Point),
     MouseReleased,
     CopyToClipboard(String),
+    /// A `text_editor` interaction inside a Marginalia comment card, keyed by
+    /// `Comment::id`. Selection/scroll actions are applied; edit actions are
+    /// dropped, which is what keeps the comment bodies read-only.
+    CommentAction(i64, iced::widget::text_editor::Action),
     PollSessions,
     NavigatePrList,
     NavigateBrain,
+    NavigateWorkers,
     /// Opened from the sidebar footer's `Settings ▸` row.
     NavigateSettings,
     /// Flip a harness's enabled flag (inert for the locked-on claude-code).
     SettingsToggleHarness(String),
     /// Workers card — the `[worker]` default `ninox spawn` launches.
     SettingsWorkerHarness(String),
+    /// External editor for the "Open in editor" action (`AppConfig::editor`).
+    SettingsEditor(EditorChoice),
     SettingsWorkerModel(String),
     SettingsWorkerCustomModel(String),
     SettingsWorkerCustomCommit,
-    /// Flip the opt-in file-based inbox toggle (`[inbox_messaging].enabled`,
-    /// default off — see `ninox_core::config::InboxMessagingConfig`).
-    SettingsToggleInboxMessaging,
     SettingsToggleRustCache,
     SettingsRustCacheExecutable(String),
     SettingsRustCacheDir(String),
     SettingsRustCacheSize(String),
     SettingsToggleRustCachePrune,
+    /// Choose how orchestrator↔worker messages are delivered
+    /// (`[messaging].mechanism` — see `ninox_core::config::SendMechanism`).
+    /// Replaces the `SettingsToggleInboxMessaging` bool: the inbox is now
+    /// one of three mutually exclusive mechanisms rather than on/off.
+    SettingsSetSendMechanism(SendMechanism),
+    SettingsSetRuntimeBackend(ninox_core::runtime::Backend),
+    /// Flip the opt-in consolidated PR-watching toggle (`[pr_watch].enabled`,
+    /// default off — see `ninox_core::config::PrWatchConfig`).
+    SettingsTogglePrWatch,
     BrainSelectEntry(String),
     /// The pinboard canvas's hovered node changed (including to/from `None`)
     /// — emitted only on change, never on every mouse move.
     BrainHoverEntry(Option<String>),
+    /// One physics step of the pinboard's live force-directed layout —
+    /// ticked by `App::subscription`'s physics subscription, only while
+    /// the Brain view is open in Pinboard mode.
+    BrainPhysicsTick,
+    /// A pinboard node's press crossed the drag threshold — pins it so the
+    /// physics tick stops integrating forces onto it directly (it still
+    /// exerts forces on its neighbors).
+    BrainDragStart(String),
+    /// The dragged node's cursor-driven position, in normalized `[0,1]^2`
+    /// pinboard-space.
+    BrainDragMove(String, f32, f32),
+    /// The drag ended — release the node back to the simulation.
+    BrainDragEnd,
     BrainFilterQuery(String),
     BrainReindex,
     BrainSetMode(BrainMode),
@@ -482,6 +598,8 @@ pub enum Message {
     /// inside the task and still arrive here as `Ok`).
     BrainReindexed { path: std::path::PathBuf, result: Result<usize, String> },
     ToggleNotifications,
+    /// Collapse/expand the left sidebar (header control + Cmd/Ctrl+B).
+    ToggleSidebar,
     DismissNotification(String),
     DismissAllNotifications,
     NavigateNotification(SessionId),
@@ -498,6 +616,16 @@ pub enum Message {
     /// than the running one, `None` = already current, `Err` = the check
     /// itself failed (no registry configured, network error, ...).
     VersionCheckResult(Result<Option<String>, String>),
+    /// "Restart all agents" pressed on the Fleet card — opens the
+    /// confirmation modal rather than firing immediately.
+    RequestRestartAll,
+    /// The restart-all confirmation modal's Cancel, or Esc.
+    CancelRestartAll,
+    /// The restart-all confirmation modal's "Restart all" — fires
+    /// `restart::execute(..., all: true, ...)` against every live session.
+    ConfirmRestartAll,
+    /// The batch restart kicked off by `ConfirmRestartAll` finished.
+    RestartAllApplied(Result<Vec<crate::restart::RestartOutcome>, String>),
     FleetFilterQuery(String),
     ClearFleetFilter,
     /// Scroll a terminal by `delta` lines (positive = up into history).
@@ -520,6 +648,9 @@ pub enum Message {
         truncated: bool,
     },
     OpenUrl(String),
+    /// Open a worker's workspace directory in the configured editor
+    /// (`AppConfig::editor`). Fire-and-forget, like `OpenUrl`.
+    OpenInEditor(String),
     /// `models_cmd` discovery finished for a harness (`None` = failed —
     /// cached so pickers fall through to known_models without retrying).
     ModelListLoaded { harness: String, models: Option<Vec<String>> },
@@ -620,261 +751,198 @@ pub struct RefilePlan {
     pub extra_env:      Vec<(String, String)>,
 }
 
-/// Decide what a session's status becomes when its tmux pane is found
-/// gone at startup. `has_resume_args` is the harness's capability (from
-/// `HarnessRegistry::resume_cmd(...).is_some()` against a placeholder id —
-/// callers don't have a real command to build yet, just the capability
-/// check), not whether resume has ever been attempted.
-fn reconciled_status_for_dead_session(
-    claude_session_id: &Option<String>,
-    has_resume_args:   bool,
-) -> SessionStatus {
-    if claude_session_id.is_some() && has_resume_args {
-        SessionStatus::Interrupted
-    } else {
-        SessionStatus::Terminated
-    }
+/// Whether `Message::PollSessions` should overwrite a tracked session's
+/// status with the one the store now holds.
+///
+/// True whenever the store holds a *different terminal* status than app
+/// memory. Those are the changes the app can't hear about any other way: an
+/// out-of-process mutation (today, `ninox reap`) writes the store directly
+/// and its `Event`s never reach this process.
+///
+/// Both directions matter, and the second is easy to miss:
+/// - live → terminal: a worker was killed out from under us.
+/// - terminal → terminal: force-reaping an `Interrupted` worker writes
+///   `Terminated`, because its worktree is gone and it can no longer be
+///   resumed. Ignoring that leaves the card sitting in the Working column
+///   (`fleet_board::session_matches_column`), counted as interrupted, and —
+///   worst of all — still picked up by `Message::ResumeAllSessions`, which
+///   filters on the in-memory status and would silently resurrect a session
+///   the orchestrator deliberately reaped.
+///
+/// A *live* status from the store is never adopted: terminal → live is the
+/// app's own transition (Resume/Re-file), so a store snapshot read
+/// mid-respawn must not be able to undo it.
+fn adopts_terminal_status(known: &SessionStatus, from_store: &SessionStatus) -> bool {
+    from_store.is_terminal() && from_store != known
 }
 
-async fn reconcile_live_sessions_at_startup_with<F, Fut>(
-    engine: &Engine,
-    registry: &ninox_core::harness::HarnessRegistry,
-    exact_legacy_lookup: F,
-) where
-    F: Fn(String) -> Fut,
-    Fut: std::future::Future<
-        Output = anyhow::Result<Option<ninox_core::tmux::ExactTmuxSession>>,
-    >,
-{
-    use ninox_core::{tmux, Event as CoreEvent};
+/// An estimate of how many sessions "restart all" would target — the Fleet
+/// card's count and the confirm modal's question both read this, so they
+/// can't drift from each other. Based on the cached store status, not a
+/// live tmux probe, so it can disagree with `restart::execute`'s own
+/// `resolve_targets` (which checks `runtime::has_session` at fire time) if
+/// a session's pane died since the last poll; `summarize`'s result after
+/// the batch runs is the authoritative count.
+pub(crate) fn live_session_count(sessions: &HashMap<SessionId, Session>) -> usize {
+    sessions.values().filter(|s| !s.status.is_terminal()).count()
+}
 
-    let sessions = match engine.store.list_sessions() {
-        Ok(sessions) => sessions,
-        Err(error) => {
-            tracing::error!("restore: list_sessions: {error}");
-            return;
-        }
-    };
-    for session in sessions {
-        if matches!(
-            session.status,
-            SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted
-        ) {
-            continue;
-        }
-
-        let runtime_alive = match engine.store.legacy_worker_runtime(&session.id) {
-            Ok(Some(capability)) => {
-                if session.pid != Some(capability.pane_pid) {
-                    continue;
-                }
-                match exact_legacy_lookup(capability.physical_tmux_name.clone()).await {
-                    Ok(Some(runtime))
-                        if runtime.physical_tmux_name == capability.physical_tmux_name
-                            && runtime.pane_id == capability.pane_id
-                            && runtime.pane_pid == capability.pane_pid =>
-                    {
-                        true
-                    }
-                    Ok(None) => false,
-                    // A live but mismatched runtime, multiple panes, or lookup
-                    // failure is uncertain. Never bless it or mutate status.
-                    Ok(Some(_)) | Err(_) => continue,
-                }
-            }
-            Ok(None) => tmux::has_session(&session.id).await,
-            Err(_) => continue,
-        };
-        if runtime_alive {
-            continue;
-        }
-
-        let agent = ninox_core::config::AgentConfig {
-            harness: session.agent_type.clone(),
-            model: session.model.clone(),
-        };
-        let has_resume_args = registry.resume_cmd(&agent, "placeholder").is_some();
-        let mut dead = session.clone();
-        dead.status =
-            reconciled_status_for_dead_session(&session.claude_session_id, has_resume_args);
-        let _ = engine.store.upsert_session(&dead);
-        engine.emit(CoreEvent::SessionUpdated(dead, SessionFields::STATUS));
+/// Apply a `text_editor` action to a Marginalia comment buffer while keeping
+/// it read-only: selection, navigation and scrolling are applied, edits are
+/// dropped. Copy is handled inside the widget itself (it writes the clipboard
+/// directly and emits no action), so filtering edits here does not break
+/// Cmd+C — which is the whole point of rendering comments as editors.
+fn apply_comment_action(
+    content: &mut iced::widget::text_editor::Content,
+    action: iced::widget::text_editor::Action,
+) {
+    if !action.is_edit() {
+        content.perform(action);
     }
 }
 
 #[cfg(test)]
-mod reconciliation_tests {
+mod comment_editor_tests {
+    use iced::widget::text_editor::{Action, Content, Edit, Motion};
+
+    use super::apply_comment_action;
+
+    #[test]
+    fn edits_never_mutate_a_comment_buffer() {
+        let mut content = Content::with_text("hello");
+        for edit in [
+            Edit::Insert('x'),
+            Edit::Backspace,
+            Edit::Delete,
+            Edit::Enter,
+            Edit::Paste(std::sync::Arc::new("pasted".to_string())),
+        ] {
+            apply_comment_action(&mut content, Action::Edit(edit));
+        }
+        // `Content::text()` always terminates with a newline.
+        assert_eq!(
+            content.text(),
+            "hello\n",
+            "comment cards are read-only; no edit action may change the body"
+        );
+    }
+
+    #[test]
+    fn selection_actions_are_applied() {
+        let mut content = Content::with_text("hello");
+        assert!(content.selection().is_none(), "nothing selected initially");
+
+        apply_comment_action(&mut content, Action::SelectAll);
+        assert_eq!(
+            content.selection().as_deref(),
+            Some("hello"),
+            "select-all must reach the buffer, otherwise text isn't selectable"
+        );
+
+        // Selecting must not have altered the text itself.
+        assert_eq!(content.text(), "hello\n");
+    }
+
+    #[test]
+    fn navigation_is_applied_and_clears_selection() {
+        let mut content = Content::with_text("hello");
+        apply_comment_action(&mut content, Action::SelectAll);
+        assert!(content.selection().is_some());
+
+        apply_comment_action(&mut content, Action::Move(Motion::DocumentEnd));
+        assert!(
+            content.selection().is_none(),
+            "a plain move collapses the selection"
+        );
+        assert_eq!(content.text(), "hello\n");
+    }
+}
+
+#[cfg(test)]
+mod poll_adoption_tests {
     use super::*;
 
-    fn migrated_live_legacy_worker() -> (tempfile::TempDir, Arc<Engine>) {
-        let root = tempfile::tempdir().unwrap();
-        let db = root.path().join("legacy.db");
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE sessions (
-                id TEXT PRIMARY KEY, orchestrator_id TEXT,
-                name TEXT NOT NULL, repo TEXT NOT NULL,
-                status TEXT NOT NULL, agent_type TEXT NOT NULL,
-                cost_usd REAL NOT NULL DEFAULT 0, started_at INTEGER NOT NULL,
-                pr_number INTEGER, pr_id INTEGER, workspace_path TEXT, pid INTEGER,
-                model TEXT, context_tokens INTEGER, current_incarnation_id TEXT,
-                incarnation TEXT NOT NULL DEFAULT ''
-            );
-            INSERT INTO sessions(
-                id,orchestrator_id,name,repo,status,agent_type,started_at,
-                workspace_path,pid,current_incarnation_id,incarnation
-            ) VALUES (
-                'legacy-live','orch','legacy-live','org/repo','working','cursor-agent',
-                100,'/repo-w1',4242,'inc-live','inc-live'
-            );
-            CREATE TABLE pooled_checkouts (
-                path TEXT PRIMARY KEY, source_repo TEXT NOT NULL,
-                common_git_dir TEXT NOT NULL, slot INTEGER NOT NULL,
-                path_kind TEXT NOT NULL, worktree_git_dir TEXT,
-                worktree_identity TEXT, state TEXT NOT NULL, session_id TEXT,
-                owner_incarnation_id TEXT, lease_id TEXT, branch TEXT,
-                quarantine_reason TEXT
-            );
-            INSERT INTO pooled_checkouts(
-                path,source_repo,common_git_dir,slot,path_kind,state,session_id,
-                owner_incarnation_id,lease_id,branch
-            ) VALUES (
-                '/repo-w1','/repo','/repo/.git',0,'explicit','leased',
-                'legacy-live','inc-live','lease-live','worker-branch'
-            );
-            CREATE TABLE worker_retention (
-                session_id TEXT NOT NULL, orchestrator_id TEXT NOT NULL,
-                incarnation TEXT NOT NULL, retained_at INTEGER NOT NULL,
-                finalized_at INTEGER,
-                PRIMARY KEY(session_id,incarnation)
-            );
-            CREATE TABLE worker_incarnations (
-                session_id TEXT NOT NULL, incarnation_id TEXT NOT NULL,
-                phase TEXT NOT NULL, ui_outcome TEXT,
-                physical_tmux_name TEXT NOT NULL, pane_id TEXT, pane_pid INTEGER,
-                workspace_path TEXT, pool_path TEXT, lease_id TEXT,
-                worktree_identity TEXT, artifact_dir TEXT NOT NULL,
-                started_at INTEGER NOT NULL, terminal_at INTEGER,
-                migration_hold INTEGER NOT NULL DEFAULT 0,
-                allocator_pid INTEGER, allocator_token TEXT,
-                orchestrator_id TEXT, source_workspace TEXT,
-                checkout_backed INTEGER, state TEXT,
-                PRIMARY KEY(session_id,incarnation_id),
-                UNIQUE(physical_tmux_name)
-            );
-            INSERT INTO worker_incarnations VALUES (
-                'legacy-live','inc-live','running',NULL,'nxw-live-inc','%42',4242,
-                '/repo-w1','/repo-w1','lease-live','identity','/sessions/inc-live',
-                100,NULL,0,NULL,NULL,'orch','/repo',1,'active'
-            );
-            ",
-        )
-        .unwrap();
-        drop(conn);
-        let store = Arc::new(ninox_core::store::Store::open(&db).unwrap());
-        (root, Engine::new(store))
+    /// The gap `ninox reap` exposed: a CLI process writes the store directly
+    /// and its `Event`s never reach the running app, so without adopting the
+    /// store's terminal status on poll a reaped worker keeps rendering as
+    /// live on the fleet board for the whole retention window.
+    #[test]
+    fn adopts_a_terminal_status_the_store_has_and_app_memory_does_not() {
+        assert!(adopts_terminal_status(&SessionStatus::Working, &SessionStatus::Terminated));
+        assert!(adopts_terminal_status(&SessionStatus::PrOpen,  &SessionStatus::Done));
+        assert!(adopts_terminal_status(&SessionStatus::CiFailed, &SessionStatus::Interrupted));
     }
 
-    #[tokio::test]
-    async fn startup_preserves_working_for_exact_live_legacy_runtime() {
-        let (_root, engine) = migrated_live_legacy_worker();
-        let registry = AppConfig::default().registry();
-
-        reconcile_live_sessions_at_startup_with(&engine, &registry, |physical| async move {
-            assert_eq!(physical, "nxw-live-inc");
-            Ok(Some(ninox_core::tmux::ExactTmuxSession {
-                physical_tmux_name: physical,
-                pane_id: "%42".into(),
-                pane_pid: 4242,
-            }))
-        })
-        .await;
-
-        let session = engine.store.get_session("legacy-live").unwrap().unwrap();
-        assert_eq!(session.status, SessionStatus::Working);
-        assert_eq!(session.pid, Some(4242));
-    }
-
-    #[tokio::test]
-    async fn startup_does_not_adopt_ambiguous_legacy_runtime() {
-        let (_root, engine) = migrated_live_legacy_worker();
-        let registry = AppConfig::default().registry();
-
-        reconcile_live_sessions_at_startup_with(&engine, &registry, |_physical| async move {
-            anyhow::bail!("exact physical runtime has multiple panes")
-        })
-        .await;
-
-        assert_eq!(
-            engine.store.get_session("legacy-live").unwrap().unwrap().status,
-            SessionStatus::Working
-        );
-    }
-
-    #[tokio::test]
-    async fn startup_does_not_fall_back_when_legacy_pid_capability_mismatches() {
-        let (_root, engine) = migrated_live_legacy_worker();
-        let registry = AppConfig::default().registry();
-        let mut session = engine.store.get_session("legacy-live").unwrap().unwrap();
-        session.pid = Some(9999);
-        engine.store.upsert_session(&session).unwrap();
-
-        reconcile_live_sessions_at_startup_with(&engine, &registry, |_physical| async move {
-            panic!("mismatched DB capability must not probe or fall back");
-        })
-        .await;
-
-        assert_eq!(
-            engine.store.get_session("legacy-live").unwrap().unwrap().status,
-            SessionStatus::Working
-        );
-    }
-
-    #[tokio::test]
-    async fn startup_interrupts_confirmed_missing_legacy_runtime() {
-        let (_root, engine) = migrated_live_legacy_worker();
-        let registry = AppConfig::default().registry();
-
-        reconcile_live_sessions_at_startup_with(&engine, &registry, |_physical| async move {
-            Ok(None)
-        })
-        .await;
-
-        assert_ne!(
-            engine.store.get_session("legacy-live").unwrap().unwrap().status,
-            SessionStatus::Working
-        );
+    /// Terminal → live is the app's OWN transition (Resume/Re-file). A store
+    /// snapshot read mid-respawn must never undo it, or the poll tick would
+    /// fight the spawn it just started.
+    #[test]
+    fn never_reverts_a_session_the_app_just_respawned() {
+        assert!(!adopts_terminal_status(&SessionStatus::Terminated, &SessionStatus::Working));
+        assert!(!adopts_terminal_status(&SessionStatus::Interrupted, &SessionStatus::Working));
     }
 
     #[test]
-    fn session_with_id_and_resumable_harness_becomes_interrupted() {
-        assert_eq!(
-            reconciled_status_for_dead_session(&Some("uuid-1".into()), true),
-            SessionStatus::Interrupted,
-        );
+    fn ignores_live_to_live_churn() {
+        // CI flipping, a review landing — all of that already arrives as
+        // events; re-adopting it here would add a second, racier path.
+        assert!(!adopts_terminal_status(&SessionStatus::Working, &SessionStatus::PrOpen));
     }
 
     #[test]
-    fn legacy_session_without_id_becomes_terminated() {
-        assert_eq!(
-            reconciled_status_for_dead_session(&None, true),
-            SessionStatus::Terminated,
-        );
+    fn ignores_a_status_that_has_not_changed() {
+        for s in [SessionStatus::Done, SessionStatus::Terminated, SessionStatus::Interrupted] {
+            assert!(!adopts_terminal_status(&s, &s), "{s:?} → {s:?} is not a change");
+        }
     }
 
+    /// Force-reaping an `Interrupted` worker writes `Terminated` out of
+    /// process. Missing that transition leaves the card in the Working
+    /// column, counted as interrupted, and still selected by
+    /// `Message::ResumeAllSessions` — which filters on the in-memory status
+    /// and would resurrect a session the orchestrator deliberately reaped.
     #[test]
-    fn session_under_non_resumable_harness_becomes_terminated_even_with_an_id() {
-        assert_eq!(
-            reconciled_status_for_dead_session(&Some("uuid-1".into()), false),
-            SessionStatus::Terminated,
-        );
+    fn adopts_a_force_reaped_interrupted_worker_becoming_terminated() {
+        assert!(adopts_terminal_status(&SessionStatus::Interrupted, &SessionStatus::Terminated));
     }
+}
+
+/// The `AgentConfig` a relaunch (re-file / resume) should run under.
+///
+/// The persisted row's `model` is a snapshot of what the session *last ran
+/// on* — the usage poller keeps it synced to the transcript's actual model
+/// — so relaunching from it means a `[orchestrator]`/`[worker] model`
+/// edit in `config.toml` never takes effect for any session that already
+/// exists: the stale row wins and then re-perpetuates itself. The
+/// configured default is the user's current intent, so it takes
+/// precedence whenever it applies: the session's harness is still the
+/// configured harness for this session kind AND a model is configured.
+/// Otherwise (harness switched since the session was filed — a model id
+/// is harness-specific — or no configured model) fall back to the row.
+///
+/// "This session kind" follows what filed the session: orchestrators and
+/// standalone sessions (no `orchestrator_id`) come from the Spawn modal,
+/// whose remembered preselection is `[orchestrator]`; only sessions an
+/// orchestrator spawned via `ninox spawn` are `[worker]` sessions.
+fn relaunch_agent(
+    session: &Session,
+    is_orchestrator: bool,
+    config: &AppConfig,
+) -> ninox_core::config::AgentConfig {
+    let filed_from_spawn_modal = is_orchestrator || session.orchestrator_id.is_none();
+    let configured = if filed_from_spawn_modal { &config.orchestrator } else { &config.worker };
+    let model = match &configured.model {
+        Some(m) if configured.harness == session.agent_type => Some(m.clone()),
+        _ => session.model.clone(),
+    };
+    ninox_core::config::AgentConfig { harness: session.agent_type.clone(), model }
 }
 
 /// `None` when the session has no recorded workspace (nothing to respawn
 /// into). A worker re-files interactively — its original spawn prompt is
 /// not stored — but keeps its orchestrator attachment for the tree.
+/// Runs under the configured default model when it applies (see
+/// `relaunch_agent`).
 pub fn refile_plan(
     session: &Session,
     is_orchestrator: bool,
@@ -882,10 +950,7 @@ pub fn refile_plan(
     claude_session_id: &str,
 ) -> Option<RefilePlan> {
     let workspace = session.workspace_path.clone()?;
-    let agent = ninox_core::config::AgentConfig {
-        harness: session.agent_type.clone(),
-        model:   session.model.clone(),
-    };
+    let agent = relaunch_agent(session, is_orchestrator, config);
     let base_cmd = config.registry().interactive_cmd(&agent, claude_session_id);
     let catalogue_path = session.catalogue_path.clone()
         .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
@@ -912,6 +977,11 @@ pub fn refile_plan(
 /// fresh). `None` when there's no workspace to resume into OR no stored
 /// `claude_session_id` OR the harness can't resume (`resume_cmd` returns
 /// `None`) — any of which means there's nothing to relaunch into.
+///
+/// Also applies the configured default model (see `relaunch_agent`):
+/// claude-code carries a conversation across a `--model` change on
+/// `--resume`, and the user's expectation is that the configured default
+/// applies whenever they start an orchestrator/worker, resumed or not.
 pub fn resume_plan(
     session: &Session,
     is_orchestrator: bool,
@@ -919,10 +989,7 @@ pub fn resume_plan(
 ) -> Option<RefilePlan> {
     let workspace = session.workspace_path.clone()?;
     let claude_session_id = session.claude_session_id.as_deref()?;
-    let agent = ninox_core::config::AgentConfig {
-        harness: session.agent_type.clone(),
-        model:   session.model.clone(),
-    };
+    let agent = relaunch_agent(session, is_orchestrator, config);
     let base_cmd = config.registry().resume_cmd(&agent, claude_session_id)?;
     let catalogue_path = session.catalogue_path.clone()
         .unwrap_or_else(|| config.resolved_brain_path().to_string_lossy().to_string());
@@ -990,6 +1057,7 @@ impl App {
         orchestrator_root: std::path::PathBuf,
         orchestrator_agent: ninox_core::config::AgentConfig,
         brain: Arc<BrainIndex>,
+        db_path: std::path::PathBuf,
     ) -> (Self, Task<Message>) {
         // Synchronously load persisted state from the DB so the UI isn't empty
         // on startup.
@@ -1007,11 +1075,16 @@ impl App {
         // `list_comments` already orders by `created_at`, so each group's
         // insertion order is already the display order.
         let mut review_threads: HashMap<PrId, Vec<Comment>> = HashMap::new();
+        let mut comment_editors: HashMap<i64, iced::widget::text_editor::Content> = HashMap::new();
         for comment in engine.store.list_comments().unwrap_or_default() {
+            comment_editors.insert(
+                comment.id,
+                iced::widget::text_editor::Content::with_text(&comment.body),
+            );
             review_threads.entry(comment.pr_id).or_default().push(comment);
         }
 
-        let config = AppConfig::load().unwrap_or_default();
+        let mut config = AppConfig::load().unwrap_or_default();
 
         // First run: seed a complete, editable default theme file so users
         // have a working example to customize rather than a blank slate.
@@ -1023,8 +1096,24 @@ impl App {
         let themes = Themes::load(config.theme_file.as_deref());
         let scheme = themes.scheme(config.theme);
         let active_variant = config.theme;
+        // Restore the persisted zoom, guarding against a hand-edited config
+        // with an out-of-range value. Write the clamped value back into
+        // `config` so a later `config.save()` (e.g. a theme change) persists
+        // the normalized zoom rather than the stale out-of-range one — keeping
+        // disk and runtime in sync.
+        let zoom = config.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        config.zoom = zoom;
         let catalogues = config.catalogue_options();
         let settings = crate::components::settings_panel::SettingsState::from_config(&config);
+        // Restore persisted sidebar geometry; clamp width to the same range
+        // the live drag enforces so a hand-edited config can't wedge layout.
+        // Write the clamped value straight back into `config` so a later
+        // `config.save()` persists the same width the UI renders, rather than
+        // the raw out-of-range value (disk and runtime stay in sync).
+        // `sidebar_hidden` is a bool — no normalization needed.
+        config.sidebar_width = config.sidebar_width.clamp(150.0, 400.0);
+        let sidebar_width_init = config.sidebar_width;
+        let sidebar_hidden_init = config.sidebar_hidden;
 
         let mut app = Self {
             engine:             engine.clone(),
@@ -1034,8 +1123,11 @@ impl App {
             active_variant,
             orchestrator_root,
             orchestrator_agent,
+            db_path,
             orchestrators,
             sessions,
+            session_deps:   Vec::new(),
+            status_probe:   HashMap::new(),
             brain,
             brain_view:     BrainViewState::default(),
             catalogues,
@@ -1043,10 +1135,14 @@ impl App {
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads,
+            comment_editors,
             diffs:          HashMap::new(),
+            plan_docs:      HashMap::new(),
             notifications:  VecDeque::new(),
+            unread_messages: HashMap::new(),
             update_in_progress: false,
             version_check:  VersionCheckState::NotChecked,
+            restart_all_in_progress: false,
             sidebar:        SidebarState::default(),
             view:           View::default(),
             worker_panel:   Default::default(),
@@ -1058,6 +1154,7 @@ impl App {
             settings,
             spawn_modal:    None,
             catalogue_modal: None,
+            restart_all_confirm: false,
             // Placeholders — corrected below by resize_terminals() using the
             // real default window size, so this never drifts out of sync with
             // main.rs's iced::window::Settings::default() (1024x768).
@@ -1065,29 +1162,22 @@ impl App {
             terminal_rows:  50,
             window_width:   1024.0,
             window_height:  768.0,
-            sidebar_width:  220.0,
+            // Restore the persisted sidebar width, clamped to the live drag
+            // range so a stale/edited config can't wedge the layout.
+            sidebar_width:  sidebar_width_init,
+            sidebar_hidden: sidebar_hidden_init,
             info_width:     300.0,
             drag:            None,
             fleet_filter:    FleetFilter::default(),
             last_fleet_scope: None,
+            zoom,
         };
         Self::resize_terminals(&mut app);
 
-        // Asynchronously mark dead sessions as Terminated.
-        // PTY streaming is NOT started here — we stream on demand when the user
-        // navigates to a session (NavigateSession).  Eagerly streaming at startup
-        // with the wrong default dimensions (140×50) creates competing FIFO readers
-        // that race with NavigateSession and re-populate state.terminals with
-        // wrong-dimension content, causing the garbled-terminal bug.
-        let task = Task::future(async move {
-            let registry = AppConfig::load().unwrap_or_default().registry();
-            reconcile_live_sessions_at_startup_with(&engine, &registry, |physical| async move {
-                ninox_core::tmux::exact_private_session(&physical).await
-            })
-            .await;
-
-            Message::Noop
-        });
+        // Dead-session reconciliation now runs in `Poller::start`
+        // (`reconcile_dead_sessions`) so every host of the poller — GUI and
+        // the headless daemon alike — gets it, not just this startup task.
+        let task = Task::none();
 
         (app, task)
     }
@@ -1122,6 +1212,23 @@ impl App {
     /// harness in-flight immediately (as a `None` entry — pickers fall
     /// through to known_models until the result lands) so a second trigger
     /// before completion doesn't spawn a duplicate subprocess.
+    /// Persist a config change read → apply → write against the file, so an
+    /// edit made meanwhile (e.g. in `nx`'s settings) is never clobbered by
+    /// this process's stale copy; `state.config` becomes the saved result.
+    /// If the file can't be read back, the change only applies in memory.
+    fn persist_config<R>(state: &mut App, what: &str, f: impl Fn(&mut AppConfig) -> R) -> R {
+        match AppConfig::update(&f) {
+            Ok((saved, r)) => {
+                state.config = saved;
+                r
+            }
+            Err(e) => {
+                tracing::warn!("failed to save config ({what}): {e}");
+                f(&mut state.config)
+            }
+        }
+    }
+
     fn ensure_models(state: &mut App, harness: &str) -> Task<Message> {
         if state.model_lists.contains_key(harness) {
             return Task::none();
@@ -1157,6 +1264,91 @@ impl App {
         })
     }
 
+    /// Refreshes the Workers view's inputs synchronously: dependency edges
+    /// from the store (one small sqlite query) and the per-session "can
+    /// this worktree report activity" probe (one tiny settings.json read
+    /// per live session with a workspace). Called on entering the view and
+    /// on each `PollSessions` tick while it's open — same freshness model
+    /// as `ensure_plan` below.
+    fn refresh_worker_registry(state: &mut App) {
+        state.session_deps = state.engine.store.list_session_deps().unwrap_or_default();
+        state.status_probe = state.sessions.values()
+            .filter(|s| !s.status.is_terminal())
+            .filter_map(|s| s.workspace_path.as_deref().map(|ws| (
+                s.id.clone(),
+                ninox_core::worker_status::worker_status_hooks_installed(std::path::Path::new(ws)),
+            )))
+            .collect();
+    }
+
+    /// Refreshes `state.plan_docs[orchestrator_id]` from the store + disk,
+    /// synchronously — no async round-trip, since this is a local sqlite
+    /// lookup plus a small markdown file read, not a subprocess. Called
+    /// on-demand when the Plan panel is opened, and on every `PollSessions`
+    /// tick while it stays open (no file-watcher; see the design doc).
+    /// Skips the disk read entirely when the file's mtime hasn't moved.
+    fn ensure_plan(state: &mut App, orchestrator_id: &str) -> Task<Message> {
+        let Ok(Some(registration)) = state.engine.store.get_orchestrator_plan(orchestrator_id)
+        else {
+            state.plan_docs.remove(orchestrator_id);
+            return Task::none();
+        };
+        let mtime = std::fs::metadata(&registration.file_path).and_then(|m| m.modified()).ok();
+        let doc = state.plan_docs.entry(orchestrator_id.to_string()).or_default();
+        let unchanged = mtime.is_some()
+            && mtime == doc.last_mtime
+            && doc.file_path.as_deref() == Some(registration.file_path.as_str());
+        if unchanged {
+            return Task::none();
+        }
+        doc.file_path = Some(registration.file_path.clone());
+        doc.last_mtime = mtime;
+        match std::fs::read_to_string(&registration.file_path) {
+            Ok(text) => {
+                use crate::components::markdown_blocks::{parse_blocks, BlockKind};
+                doc.blocks = parse_blocks(&text)
+                    .into_iter()
+                    .map(|block| {
+                        let is_checkbox = matches!(block.kind, BlockKind::ListItem { checked: Some(_), .. });
+                        let prefix = match block.kind {
+                            BlockKind::ListItem { checked: Some(true), .. } => "☑ ".to_string(),
+                            BlockKind::ListItem { checked: Some(false), .. } => "☐ ".to_string(),
+                            BlockKind::ListItem { ordinal: Some(n), checked: None } => format!("{n}. "),
+                            BlockKind::ListItem { ordinal: None, checked: None } => "• ".to_string(),
+                            _ => String::new(),
+                        };
+                        let display_text = format!("{prefix}{}", block.text);
+                        let offset = prefix.len();
+                        let mut spans: Vec<_> = block
+                            .spans
+                            .into_iter()
+                            .map(|(range, style)| (range.start + offset..range.end + offset, style))
+                            .collect();
+                        if is_checkbox {
+                            // ☐/☑ aren't covered by the bundled Newsreader/
+                            // Archivo/Spline Sans Mono fonts — route them
+                            // through the app's dingbat font instead of the
+                            // list item's normal (sans) font.
+                            use crate::components::markdown_blocks::InlineStyle;
+                            spans.push((0..offset, InlineStyle { glyph: true, ..Default::default() }));
+                        }
+                        PlanBlockView {
+                            kind: block.kind,
+                            content: iced::widget::text_editor::Content::with_text(&display_text),
+                            spans,
+                            links: block.links,
+                        }
+                    })
+                    .collect();
+                doc.error = None;
+            }
+            Err(error) => {
+                doc.error = Some(error.to_string());
+            }
+        }
+        Task::none()
+    }
+
     /// Kicks off an on-demand registry check for Settings' version line.
     /// Always re-runs on every `NavigateSettings` (unlike `ensure_models`'s
     /// cache-on-first-success) — the whole point is a fresh answer each
@@ -1179,7 +1371,13 @@ impl App {
         let (cell_w, cell_h) = crate::components::terminal::cell_size(
             crate::components::terminal::FONT_SIZE,
         );
-        let sidebar_w = state.sidebar_width + 5.0; // +5 for drag handle
+        // When hidden, the sidebar+divider collapse to the slim reveal rail;
+        // otherwise it's the sidebar width plus the 5px drag handle.
+        let sidebar_w = if state.sidebar_hidden {
+            SIDEBAR_REVEAL_RAIL_W
+        } else {
+            state.sidebar_width + 5.0 // +5 for drag handle
+        };
         let info_w    = state.info_width + 5.0; // +5 for drag handle
 
         // Background sizing: what any session shows once Split (the default
@@ -1198,6 +1396,12 @@ impl App {
                 panel: crate::components::session_detail::DetailPanel::Split,
             } if active == session_id
                 && !state.orchestrators.iter().any(|orchestrator| &orchestrator.id == active)
+        ) || matches!(
+            &state.view,
+            View::SessionDetail {
+                session_id: active,
+                panel: crate::components::session_detail::DetailPanel::Plan,
+            } if active == session_id
         );
         let active = matches!(
             &state.view,
@@ -1232,23 +1436,19 @@ impl App {
         resized
     }
 
-    /// Re-derive pinboard edges (node-index pairs into `brain_view.entries`)
-    /// and the force-directed layout built from them. Called once per data
-    /// change — `NavigateBrain`'s initial load and every
+    /// Re-derive pinboard edges (node-index pairs into `brain_view.entries`).
+    /// Called once per data change — `NavigateBrain`'s initial load and every
     /// `reload_brain_entries` (reindex, catalogue switch, background
-    /// freshen) — never per canvas draw. A DB error is tolerated: warn and
-    /// leave the pinboard edge-less (and layout unchanged) rather than
+    /// freshen) — never per canvas draw. The live force layout is stepped
+    /// separately (`Message::BrainPhysicsTick`), not recomputed here. A DB
+    /// error is tolerated: warn and leave the pinboard edge-less rather than
     /// panic.
-    fn refresh_brain_graph(state: &mut Self) {
+    fn refresh_brain_edges(state: &mut Self) {
         match state.brain.links_all() {
             Ok(links) => {
                 state.brain_view.edges = crate::components::brain_pinboard::resolve_edges(
                     &state.brain_view.entries,
                     &links,
-                );
-                state.brain_view.layout = crate::components::brain_pinboard::force_layout(
-                    &state.brain_view.entries,
-                    &state.brain_view.edges,
                 );
             }
             Err(e) => {
@@ -1299,7 +1499,15 @@ impl App {
         match state.brain.query("", None, QueryFilters::default()) {
             Ok(entries) => {
                 state.brain_view.entries = entries;
-                Self::refresh_brain_graph(state);
+                Self::refresh_brain_edges(state);
+                // Drags are session-only and scoped to one entry set:
+                // reseed the board from scratch rather than carrying
+                // hand-placed positions across a reindex or a switch to a
+                // different catalogue entirely. Clearing `dragging` too
+                // keeps a drag that was in flight when the reload landed
+                // from pinning a node that no longer exists.
+                state.brain_view.layout = Default::default();
+                state.brain_view.dragging = None;
                 // The selected entry may have been renamed or deleted by
                 // whatever changed the entry set — if it no longer resolves,
                 // clear the pane instead of showing a ghost selection.
@@ -1394,6 +1602,7 @@ impl App {
                     session_id: id.clone(),
                     panel: state.worker_panel,
                 };
+                state.unread_messages.remove(&id);
                 // Drop every client that is no longer on screen — the tmux
                 // sessions stay detached and running.
                 state.clients.retain(|sid, _| sid == &id);
@@ -1413,15 +1622,22 @@ impl App {
                 let engine = state.engine.clone();
                 let (viewport_cols, viewport_rows) = Self::terminal_size_for(state, &id);
                 let attach_task = Task::future(async move {
-                    if !ninox_core::tmux::has_session(&id).await {
-                        if let Ok(Some(mut s)) = engine.store.get_session(&id) {
-                            s.status = ninox_core::types::SessionStatus::Terminated;
-                            let _ = engine.store.upsert_session(&s);
-                            engine.emit(ninox_core::events::Event::SessionUpdated(
-                                s, ninox_core::types::SessionFields::STATUS,
-                            ));
+                    match ninox_core::runtime::liveness(&id).await {
+                        ninox_core::runtime::Liveness::Live => {}
+                        // ptyd not answering (upgrade, slow start): nothing
+                        // to attach to yet, but no evidence the pane is gone.
+                        ninox_core::runtime::Liveness::Unknown => return Message::Noop,
+                        ninox_core::runtime::Liveness::Dead => {
+                            // Same rule as the poller: Interrupted when the
+                            // harness can resume it, re-reading the row.
+                            let registry = ninox_core::config::AppConfig::load().unwrap_or_default().registry();
+                            if let Ok(Some(s)) = ninox_core::lifecycle::poller::reconcile_dead_session(&engine.store, &registry, &id) {
+                                engine.emit(ninox_core::events::Event::SessionUpdated(
+                                    s, ninox_core::types::SessionFields::STATUS,
+                                ));
+                            }
+                            return Message::Noop;
                         }
-                        return Message::Noop;
                     }
                     let Some(initial_tail) = ninox_core::tmux::prepare_viewport_tail(
                         &id,
@@ -1437,7 +1653,7 @@ impl App {
                     if let Err(e) = ninox_core::pty::start_streaming(engine.clone(), id.clone(), &id).await {
                         tracing::warn!("pipe-pane tap for {id}: {e}");
                     }
-                    let argv = ninox_core::tmux::attach_args(&id).await;
+                    let argv = ninox_core::runtime::attach_args(&id).await;
                     Message::ClientAttach { session_id: id, argv, initial_tail: Some(initial_tail) }
                 });
                 Task::batch(vec![diff_task, attach_task])
@@ -1462,6 +1678,7 @@ impl App {
                 let prepared_at_final_size = initial_tail.is_some();
                 let generation = state.next_client_generation;
                 state.next_client_generation += 1;
+                let argv = ninox_core::runtime::embedded_attach_args(argv);
                 match ninox_core::client::AttachedClient::spawn(
                     state.engine.clone(), session_id.clone(), argv, cols, rows, generation,
                 ) {
@@ -1665,17 +1882,16 @@ impl App {
                     return Task::none();
                 }
 
-                state.config.brain.catalogues.push(ninox_core::config::CatalogueRef {
-                    name: name.clone(),
-                    path: path.clone(),
-                    remote: None,
-                    endpoint: None,
-                    region: None,
-                    cache_ttl_secs: None,
+                Self::persist_config(state, "add catalogue", |c| {
+                    c.brain.catalogues.push(ninox_core::config::CatalogueRef {
+                        name: name.clone(),
+                        path: path.clone(),
+                        remote: None,
+                        endpoint: None,
+                        region: None,
+                        cache_ttl_secs: None,
+                    })
                 });
-                if let Err(e) = state.config.save() {
-                    tracing::warn!("failed to save config after adding catalogue '{name}': {e}");
-                }
                 state.catalogues = state.config.catalogue_options();
                 let idx = state
                     .catalogues
@@ -1751,6 +1967,17 @@ impl App {
                             .as_millis();
                         let slug = slugify(&name);
                         let sid = if slug.is_empty() { format!("session-{ts}") } else { slug };
+                        if ninox_core::messaging::is_reserved_session_id(&sid) {
+                            // Reserved for ninox's own message attribution
+                            // (see `messaging::SYSTEM_SENDER`) — a session
+                            // literally named this would make its own `ninox
+                            // send` messages indistinguishable from ninox's
+                            // trusted, internally-generated ones.
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!("'{sid}' is reserved for ninox itself — pick another name"));
+                            }
+                            return Task::none();
+                        }
                         if state.sessions.contains_key(&sid) {
                             if let Some(f) = &mut state.spawn_modal {
                                 f.error = Some(format!(
@@ -1778,7 +2005,10 @@ impl App {
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
                             summary:         None,
-                            terminal_at:         None, gate_status: None,
+                            terminal_at:         None, gate_status: None, merged_at: None,
+                            activity: ninox_core::types::ActivityState::Unknown,
+                            activity_note: None, activity_since: None,
+                            machine_id: None,
                         };
                         match state.engine.store.insert_spawning_session(&session) {
                             Ok(true) => {}
@@ -1862,7 +2092,7 @@ impl App {
                                             &ws_path,
                                             &sid,
                                             &incarnation.incarnation_id,
-                                            state.config.inbox_messaging.enabled,
+                                            state.config.send_mechanism() == SendMechanism::Inbox,
                                         )
                                     {
                                         Ok(checkout) => {
@@ -1921,12 +2151,33 @@ impl App {
                             || state.config.orchestrator.model != agent.model
                         {
                             state.orchestrator_agent = agent.clone();
-                            state.config.orchestrator = agent.clone();
-                            if let Err(e) = state.config.save() {
-                                tracing::warn!("failed to save remembered agent preselection: {e}");
-                            }
+                            Self::persist_config(state, "agent preselection", |c| c.orchestrator = agent.clone());
                         }
 
+                        let session = Session {
+                            id:              sid.clone(),
+                            orchestrator_id: None,
+                            name:            name.clone(),
+                            repo:            String::new(),
+                            status:          SessionStatus::Working,
+                            agent_type:      agent.harness.clone(),
+                            cost_usd:        0.0,
+                            started_at:      ts as i64,
+                            pr_number:       None,
+                            pr_id:           None,
+                            workspace_path:  Some(workspace.clone()),
+                            pid:             None,
+                            model:           agent.model.clone(),
+                            context_tokens:  None,
+                            catalogue_path:  Some(catalogue_path.clone()),
+                            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+                            claude_session_id: Some(claude_session_id.clone()),
+                            summary:         None,
+                            terminal_at:         None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
+        };
+                        let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
                         state.engine.emit(Event::SessionSpawned(session));
 
@@ -1939,7 +2190,7 @@ impl App {
                         let nm     = name;
                         let ts_i64 = ts as i64;
                         let config = state.config.clone();
-                        let inbox_enabled = state.config.inbox_messaging.enabled;
+                        let inbox_enabled = state.config.send_mechanism() == SendMechanism::Inbox;
                         let repositories_root = state.config.resolved_repositories_root();
                         let worktree_root = state.config.resolved_worktree_root();
 
@@ -2103,9 +2354,7 @@ impl App {
                                     Message::Noop
                                 };
                             }
-                            if let Err(e) = crate::spawn_util::seed_worker_brain_skill(&effective_ws).await {
-                                tracing::warn!("failed to seed brain skill for {sid}: {e}");
-                            }
+                            crate::spawn_util::seed_worker_skills(&effective_ws, &config).await;
 
                             // Repo slug from the base workspace's git remote so
                             // poll_github can talk to the right owner/repo.
@@ -2191,6 +2440,19 @@ impl App {
                         let slug = slugify(&name);
                         let orch_id = if slug.is_empty() { format!("orch-{ts}") } else { slug };
 
+                        if ninox_core::messaging::is_reserved_session_id(&orch_id) {
+                            // Reserved for ninox's own message attribution
+                            // (see `messaging::SYSTEM_SENDER`) — an
+                            // orchestrator literally named this would make
+                            // its own `ninox send` messages indistinguishable
+                            // from ninox's trusted, internally-generated
+                            // ones.
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!("'{orch_id}' is reserved for ninox itself — pick another name"));
+                            }
+                            return Task::none();
+                        }
+
                         if state.sessions.contains_key(&orch_id)
                             || state.orchestrators.iter().any(|o| o.id == orch_id)
                         {
@@ -2215,10 +2477,7 @@ impl App {
                             || state.config.orchestrator.model != agent.model
                         {
                             state.orchestrator_agent = agent.clone();
-                            state.config.orchestrator = agent.clone();
-                            if let Err(e) = state.config.save() {
-                                tracing::warn!("failed to save remembered agent preselection: {e}");
-                            }
+                            Self::persist_config(state, "agent preselection", |c| c.orchestrator = agent.clone());
                         }
 
                         let orch = Orchestrator {
@@ -2257,8 +2516,10 @@ impl App {
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
                             summary:         None,
-                            terminal_at:         None, gate_status: None,
-                        };
+                            terminal_at:         None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
+        };
                         let _ = state.engine.store.upsert_session(&session);
                         state.sessions.insert(session.id.clone(), session.clone());
                         state.engine.emit(Event::SessionSpawned(session));
@@ -2341,8 +2602,20 @@ impl App {
                 }
                 match (new_panel, session_id) {
                     (DetailPanel::Diff, Some(sid)) => Self::ensure_diff(state, &sid),
+                    (DetailPanel::Plan, Some(sid)) => Self::ensure_plan(state, &sid),
                     _ => Task::none(),
                 }
+            }
+
+            Message::PlanEditorAction { orchestrator_id, block, action } => {
+                if !action.is_edit() {
+                    if let Some(doc) = state.plan_docs.get_mut(&orchestrator_id) {
+                        if let Some(b) = doc.blocks.get_mut(block) {
+                            b.content.perform(action);
+                        }
+                    }
+                }
+                Task::none()
             }
 
             Message::RemoveOrchestrator(id) => {
@@ -2358,6 +2631,7 @@ impl App {
                     k != &id && s.orchestrator_id.as_deref() != Some(id.as_str())
                 });
                 state.terminals.remove(&id);
+                state.plan_docs.remove(&id);
                 state.diffs.remove(&id);
                 // Drop clients for the orchestrator itself and any worker
                 // sessions removed above — only surviving sessions keep theirs.
@@ -2425,7 +2699,7 @@ impl App {
                 let orch_id = session.orchestrator_id.clone();
                 let summary = session.summary.clone();
                 let config = state.config.clone();
-                let inbox_enabled = state.config.inbox_messaging.enabled;
+                let inbox_enabled = state.config.send_mechanism() == SendMechanism::Inbox;
                 let repositories_root = state.config.resolved_repositories_root();
                 let worktree_root = state.config.resolved_worktree_root();
                 Task::future(async move {
@@ -2446,11 +2720,11 @@ impl App {
                             return Message::Noop;
                         }
                     } else if is_orch {
-                        if let Err(error) = ninox_core::tmux::kill_session(&id).await {
+                        if let Err(error) = ninox_core::runtime::kill_session(&id).await {
                             emit_checkout_unavailable(&engine, &id, &name, &error);
                             return Message::Noop;
                         }
-                    } else if ninox_core::tmux::has_session(&id).await {
+                    } else if ninox_core::runtime::has_session(&id).await {
                         let error = anyhow::anyhow!(
                             "cannot verify legacy worker runtime capability before Re-file"
                         );
@@ -2576,7 +2850,7 @@ impl App {
                         &plan.workspace,
                         &id,
                         is_orch,
-                        inbox_enabled,
+                        &config,
                     ).await {
                         tracing::warn!("re-file {id}: cannot restore workspace: {e}");
                         emit_checkout_unavailable(&engine, &id, &name, &e);
@@ -2759,10 +3033,10 @@ impl App {
                 let repo    = session.repo.clone();
                 let orch_id = session.orchestrator_id.clone();
                 let summary = session.summary.clone();
-                let inbox_enabled = state.config.inbox_messaging.enabled;
+                let config = state.config.clone();
                 Task::future(async move {
                     let mut runtime_claim = runtime_claim;
-                    if let Err(error) = ninox_core::tmux::kill_session(&id).await {
+                    if let Err(error) = ninox_core::runtime::kill_session(&id).await {
                         tracing::warn!("resume {id}: cannot stop prior runtime: {error}");
                         return Message::Noop;
                     }
@@ -2779,7 +3053,7 @@ impl App {
                         &plan.workspace,
                         &id,
                         is_orch,
-                        inbox_enabled,
+                        &config,
                     ).await {
                         tracing::warn!("resume {id}: cannot restore workspace: {e}");
                         emit_checkout_unavailable(&engine, &id, &name, &e);
@@ -2866,10 +3140,31 @@ impl App {
                     return Task::none();
                 }
 
+                // Esc closes the restart-all confirm modal (Settings' Fleet
+                // card) at the same precedence level.
+                if state.restart_all_confirm {
+                    if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)) {
+                        state.restart_all_confirm = false;
+                    }
+                    return Task::none();
+                }
+
+                // Cmd/Ctrl+B toggles the sidebar from any view (IDE
+                // convention). `command()` maps to Cmd on macOS / Ctrl
+                // elsewhere, so it never shadows tmux's Ctrl-b prefix inside
+                // a terminal pane. Handled before the terminal-capture path
+                // below so it works while a session terminal is focused.
+                if modifiers.command()
+                    && matches!(&key, iced::keyboard::Key::Character(c)
+                        if c.as_str().eq_ignore_ascii_case("b"))
+                {
+                    return App::apply(state, Message::ToggleSidebar);
+                }
+
                 let terminal_capturing = matches!(
                     &state.view,
                     View::SessionDetail { panel, .. }
-                        if matches!(panel, DetailPanel::Terminal | DetailPanel::Split)
+                        if matches!(panel, DetailPanel::Terminal | DetailPanel::Split | DetailPanel::Plan)
                 );
                 if !terminal_capturing && !modifiers.command() && !modifiers.control() && !modifiers.alt() {
                     if let iced::keyboard::Key::Character(c) = &key {
@@ -2877,6 +3172,7 @@ impl App {
                             "1" => return App::apply(state, Message::NavigateFleet { scope: None }),
                             "2" => return App::apply(state, Message::NavigatePrList),
                             "3" => return App::apply(state, Message::NavigateBrain),
+                            "4" => return App::apply(state, Message::NavigateWorkers),
                             "t" => {
                                 let next = match state.active_variant {
                                     ThemeVariant::Dark | ThemeVariant::Ninox => ThemeVariant::Light,
@@ -2890,10 +3186,39 @@ impl App {
                     return Task::none();
                 }
 
+                // UI zoom: Cmd (macOS) / Ctrl (elsewhere) with +/-/0, like
+                // macOS Terminal.app. `modifiers.command()` is logo on macOS
+                // and control on other platforms. Intercepted BEFORE the
+                // terminal encode path below so the terminal panel does not
+                // swallow these keys. '+' and '=' both zoom in (on most
+                // layouts '+' is Shift+'='); '-' zooms out; '0' resets. The
+                // level is mirrored into config and persisted across restarts.
+                if modifiers.command() {
+                    if let iced::keyboard::Key::Character(c) = &key {
+                        let new_zoom = match c.as_str() {
+                            "+" | "=" => Some((state.zoom + ZOOM_STEP).min(ZOOM_MAX)),
+                            "-" | "_" => Some((state.zoom - ZOOM_STEP).max(ZOOM_MIN)),
+                            "0"       => Some(1.0),
+                            _         => None,
+                        };
+                        if let Some(z) = new_zoom {
+                            // Snap to the nearest 0.1 to keep repeated steps
+                            // free of binary-float drift (1.0 → 1.1 → 1.2 …).
+                            let z = (z * 10.0).round() / 10.0;
+                            if (z - state.zoom).abs() > f64::EPSILON {
+                                state.zoom = z;
+                                Self::persist_config(state, "zoom", |c| c.zoom = z);
+                            }
+                            return Task::none();
+                        }
+                    }
+                }
+
                 if let View::SessionDetail {
                     session_id,
                     panel: crate::components::session_detail::DetailPanel::Terminal
-                        | crate::components::session_detail::DetailPanel::Split,
+                        | crate::components::session_detail::DetailPanel::Split
+                        | crate::components::session_detail::DetailPanel::Plan,
                 } = &state.view {
                     let session_id = session_id.clone();
                     let mode = state.terminals.get(&session_id)
@@ -2946,18 +3271,30 @@ impl App {
             Message::SwitchTheme(variant) => {
                 state.active_variant = variant;
                 state.scheme = state.themes.scheme(variant);
-                state.config.theme = variant;
                 for term in state.terminals.values_mut() {
                     term.cache.clear();
                 }
-                if let Err(e) = state.config.save() {
-                    tracing::error!("failed to save theme config: {e}");
-                }
+                Self::persist_config(state, "theme", |c| c.theme = variant);
                 Task::none()
             }
 
             Message::StartDrag(target) => {
                 state.drag = Some(target);
+                Task::none()
+            }
+
+            Message::ToggleSidebar => {
+                state.sidebar_hidden = !state.sidebar_hidden;
+                let hidden = state.sidebar_hidden;
+                Self::persist_config(state, "sidebar", |c| c.sidebar_hidden = hidden);
+                // Content width changed, so reflow terminals and sync the
+                // backing tmux panes (same as a completed resize drag).
+                let resized = Self::resize_terminals(state);
+                for (sid, cols, rows) in resized {
+                    if let Some(client) = state.clients.get(&sid) {
+                        client.resize(cols, rows);
+                    }
+                }
                 Task::none()
             }
 
@@ -2981,14 +3318,21 @@ impl App {
             }
 
             Message::MouseReleased => {
-                let was_dragging = state.drag.is_some();
-                state.drag = None;
-                if was_dragging {
+                let target = state.drag.take();
+                if let Some(target) = target {
                     let resized = Self::resize_terminals(state);
                     for (sid, cols, rows) in resized {
                         if let Some(client) = state.clients.get(&sid) {
                             client.resize(cols, rows);
                         }
+                    }
+                    // Persist the new sidebar width once the drag commits
+                    // (not on every MouseMoved frame). Mirrors the
+                    // SwitchTheme config-save pattern. InfoPanel width is
+                    // session-local and intentionally not persisted.
+                    if matches!(target, DragTarget::Sidebar) {
+                        let width = state.sidebar_width;
+                        Self::persist_config(state, "sidebar width", |c| c.sidebar_width = width);
                     }
                 }
                 Task::none()
@@ -2997,6 +3341,15 @@ impl App {
             Message::CopyToClipboard(text) => {
                 if let Ok(mut cb) = arboard::Clipboard::new() {
                     let _ = cb.set_text(text);
+                }
+                Task::none()
+            }
+
+            // See `apply_comment_action`: edits are dropped so the cards stay
+            // read-only while still being selectable and copyable.
+            Message::CommentAction(comment_id, action) => {
+                if let Some(content) = state.comment_editors.get_mut(&comment_id) {
+                    apply_comment_action(content, action);
                 }
                 Task::none()
             }
@@ -3042,18 +3395,49 @@ impl App {
                 // above purges their store record. PTY streaming is NOT
                 // started here — NavigateSession handles that on demand with
                 // the correct window dimensions.
+                //
+                // For sessions already tracked, adopt a terminal status the
+                // store has but app memory doesn't. Everything else in this
+                // process learns about status changes from `Event`s, but an
+                // out-of-process mutation (`ninox reap` runs in its own CLI
+                // process, whose `Engine` has no subscribers here) emits into
+                // the void — without this, a reaped worker would keep
+                // rendering as live on the fleet board for the whole
+                // retention window. Deliberately narrow: only terminal
+                // statuses, and only in the live → terminal direction, so
+                // this can never fight the app's own in-flight updates or
+                // resurrect a session the app just respawned.
                 for session in db_sessions {
-                    if !state.sessions.contains_key(&session.id) {
-                        state.sessions.insert(session.id.clone(), session);
+                    match state.sessions.get(&session.id) {
+                        None => {
+                            state.sessions.insert(session.id.clone(), session);
+                        }
+                        Some(known) if adopts_terminal_status(&known.status, &session.status) => {
+                            state.sessions.insert(session.id.clone(), session);
+                        }
+                        Some(_) => {}
                     }
                 }
 
                 // Refresh the diff for whatever session is on the Diff panel
                 // right now — a live session's diff changes as the worker
                 // commits, so this is the "keeps updating" tick for it.
+                // Same idea for the Plan panel: no file-watcher exists in
+                // this codebase, so this 3s tick doubles as the plan doc's
+                // freshness bar too (see docs/superpowers/specs/2026-08-26-
+                // orchestrator-plan-tracking-design.md).
                 match &state.view {
                     View::SessionDetail { session_id, panel: DetailPanel::Diff } => {
                         Self::ensure_diff(state, &session_id.clone())
+                    }
+                    View::SessionDetail { session_id, panel: DetailPanel::Plan } => {
+                        Self::ensure_plan(state, &session_id.clone())
+                    }
+                    // The Workers view's dep edges and hook probes have no
+                    // event source — this tick is their freshness bar too.
+                    View::Workers => {
+                        Self::refresh_worker_registry(state);
+                        Task::none()
                     }
                     _ => Task::none(),
                 }
@@ -3062,6 +3446,14 @@ impl App {
             Message::NavigatePrList => {
                 state.view = View::PrList;
                 // No session is on screen in the PR list; drop all view clients.
+                state.clients.clear();
+                Task::none()
+            }
+
+            Message::NavigateWorkers => {
+                Self::refresh_worker_registry(state);
+                state.view = View::Workers;
+                // No session is on screen here either; drop all view clients.
                 state.clients.clear();
                 Task::none()
             }
@@ -3075,7 +3467,7 @@ impl App {
                         Ok(entries) => {
                             state.brain_view.entries = entries;
                             state.brain_view.loaded = true;
-                            Self::refresh_brain_graph(state);
+                            Self::refresh_brain_edges(state);
                         }
                         Err(e) => tracing::error!("brain query: {e}"),
                     }
@@ -3100,38 +3492,23 @@ impl App {
             }
 
             Message::SettingsToggleHarness(name) => {
-                // claude-code is the locked-on default — inert by design.
-                if name == "claude-code" {
-                    return Task::none();
-                }
-                // Write the FULL effective spec with `enabled` flipped —
-                // config entries replace builtin specs wholesale, so a bare
-                // `{ enabled: true }` would wipe the builtin's args.
-                let mut spec = state.config.registry().spec(&name);
-                spec.enabled = !spec.enabled;
-                state.config.harnesses.insert(name.clone(), spec);
-                if let Err(e) = state.config.save() {
-                    tracing::warn!("failed to save config after toggling harness {name}: {e}");
-                }
+                Self::persist_config(state, "toggle harness", |c| c.toggle_harness(&name));
                 Task::none()
             }
 
             Message::SettingsWorkerHarness(h) => {
                 // pick_list fires on re-selecting the current value — don't
                 // wipe (and re-save) the model for a no-op selection.
-                if state.config.worker.harness == h {
+                if !Self::persist_config(state, "worker harness", |c| c.worker.set_harness(&h)) {
                     return Task::none();
                 }
-                let task = Self::ensure_models(state, &h);
-                state.config.worker.harness = h;
-                // Clear the model — ids from one harness must not leak into
-                // another's launch command.
-                state.config.worker.model = None;
                 state.settings.worker_custom = None;
-                if let Err(e) = state.config.save() {
-                    tracing::warn!("failed to save worker harness: {e}");
-                }
-                task
+                Self::ensure_models(state, &h)
+            }
+
+            Message::SettingsEditor(editor) => {
+                Self::persist_config(state, "editor", |c| c.editor = editor);
+                Task::none()
             }
 
             Message::SettingsWorkerModel(v) => {
@@ -3141,10 +3518,7 @@ impl App {
                     return Task::none();
                 }
                 state.settings.worker_custom = None;
-                state.config.worker.model = Some(v);
-                if let Err(e) = state.config.save() {
-                    tracing::warn!("failed to save worker model: {e}");
-                }
+                Self::persist_config(state, "worker model", |c| c.worker.model = Some(v.clone()));
                 Task::none()
             }
 
@@ -3155,20 +3529,14 @@ impl App {
 
             Message::SettingsWorkerCustomCommit => {
                 if let Some(v) = state.settings.worker_custom.take() {
-                    let t = v.trim();
-                    state.config.worker.model = (!t.is_empty()).then(|| t.to_string());
-                    if let Err(e) = state.config.save() {
-                        tracing::warn!("failed to save worker model: {e}");
-                    }
+                    let model = Some(v.trim().to_string()).filter(|t| !t.is_empty());
+                    Self::persist_config(state, "worker model", |c| c.worker.model = model.clone());
                 }
                 Task::none()
             }
 
-            Message::SettingsToggleInboxMessaging => {
-                state.config.inbox_messaging.enabled = !state.config.inbox_messaging.enabled;
-                if let Err(e) = state.config.save() {
-                    tracing::warn!("failed to save config after toggling inbox messaging: {e}");
-                }
+            Message::SettingsSetSendMechanism(mechanism) => {
+                Self::persist_config(state, "send mechanism", |c| c.set_send_mechanism(mechanism));
                 Task::none()
             }
 
@@ -3257,6 +3625,27 @@ impl App {
                 Task::none()
             }
 
+            Message::SettingsTogglePrWatch => {
+                Self::persist_config(state, "PR watch", |c| c.pr_watch.enabled = !c.pr_watch.enabled);
+                Task::none()
+            }
+
+            Message::SettingsSetRuntimeBackend(backend) => {
+                Self::persist_config(state, "session runtime", |c| c.runtime.backend = backend);
+                if backend != ninox_core::runtime::Backend::Ptyd {
+                    return Task::none();
+                }
+                // Start the host now so the first new session doesn't pay for it.
+                Task::future(async move {
+                    if let Ok(exe) = std::env::current_exe() {
+                        if let Err(e) = ninox_core::runtime::ensure_ptyd_host(&exe).await {
+                            tracing::warn!("could not start the ptyd host: {e}");
+                        }
+                    }
+                    Message::Noop
+                })
+            }
+
             Message::BrainSelectEntry(id) => {
                 if let Some(e) = state.brain_view.entries.iter().find(|e| e.id == id) {
                     state.brain_view.markdown = iced::widget::markdown::parse(
@@ -3271,6 +3660,35 @@ impl App {
 
             Message::BrainHoverEntry(id) => {
                 state.brain_view.hovered = id;
+                Task::none()
+            }
+
+            Message::BrainPhysicsTick => {
+                state.brain_view.layout.sync_entries(&state.brain_view.entries);
+                let pinned = state.brain_view.dragging.clone();
+                state.brain_view.layout.step(
+                    &state.brain_view.entries,
+                    &state.brain_view.edges,
+                    pinned.as_deref(),
+                    1.0 / 60.0,
+                );
+                Task::none()
+            }
+
+            Message::BrainDragStart(id) => {
+                state.brain_view.dragging = Some(id);
+                Task::none()
+            }
+
+            Message::BrainDragMove(id, x, y) => {
+                if state.brain_view.dragging.as_deref() == Some(id.as_str()) {
+                    state.brain_view.layout.set_position(&id, (x, y));
+                }
+                Task::none()
+            }
+
+            Message::BrainDragEnd => {
+                state.brain_view.dragging = None;
                 Task::none()
             }
 
@@ -3340,6 +3758,12 @@ impl App {
             Message::BrainSetMode(m) => {
                 state.brain_view.mode = m;
                 state.brain_view.hovered = None;
+                // Leaving Pinboard mode drops the canvas's `PinboardState`
+                // without ever delivering the `ButtonReleased` that would
+                // have ended an in-flight drag, which would otherwise leave
+                // the node pinned out of physics for the rest of the
+                // session.
+                state.brain_view.dragging = None;
                 Task::none()
             }
 
@@ -3387,7 +3811,6 @@ impl App {
                             state.brain_view.backlinks.clear();
                             state.brain_view.related.clear();
                             state.brain_view.edges.clear();
-                            state.brain_view.layout.clear();
                             state.brain_view.loaded = false;
                             Self::reload_brain_entries(state);
                             // The local open above keeps the switch instant;
@@ -3520,6 +3943,60 @@ impl App {
                 Task::none()
             }
 
+            Message::RequestRestartAll => {
+                if live_session_count(&state.sessions) > 0 {
+                    state.restart_all_confirm = true;
+                }
+                Task::none()
+            }
+            Message::CancelRestartAll => {
+                state.restart_all_confirm = false;
+                Task::none()
+            }
+            Message::ConfirmRestartAll => {
+                state.restart_all_confirm = false;
+                if state.restart_all_in_progress {
+                    return Task::none();
+                }
+                state.restart_all_in_progress = true;
+                let store = state.engine.store.clone();
+                let config = state.config.clone();
+                let db_path = state.db_path.clone();
+                Task::future(async move {
+                    let args = crate::restart::RestartArgs { session_ids: vec![], all: true, exec_detached: false };
+                    let result = crate::restart::execute(args, store, config, db_path).await.map_err(|e| e.to_string());
+                    Message::RestartAllApplied(result)
+                })
+            }
+            Message::RestartAllApplied(result) => {
+                state.restart_all_in_progress = false;
+                let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+                let (kind, title, body) = match result {
+                    Ok(outcomes) => {
+                        let failed = crate::restart::had_trouble(&outcomes);
+                        let body = crate::restart::summarize(&outcomes);
+                        if failed {
+                            (NotificationKind::RestartAllFailed, "Restart all: some agents failed".to_string(), body)
+                        } else {
+                            (NotificationKind::RestartAllCompleted, "Restart all agents".to_string(), body)
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("restart all failed: {e}");
+                        (NotificationKind::RestartAllFailed, "Restart all agents failed".to_string(), e)
+                    }
+                };
+                Self::push_notification(state, Notification {
+                    id: format!("restart-all-{ts}"),
+                    kind,
+                    title,
+                    body,
+                    session_id: None,
+                    created_at: ts,
+                });
+                Task::none()
+            }
+
             Message::FleetFilterQuery(q) => {
                 state.fleet_filter.query = q;
                 Task::none()
@@ -3595,6 +4072,22 @@ impl App {
                 Task::none()
             }
 
+            Message::OpenInEditor(path) => {
+                // Fire-and-forget, exactly like OpenUrl: no error surfacing.
+                // If the configured editor isn't on PATH this silently
+                // no-ops, which is the accepted product behaviour. Neovim is
+                // scoped out here (see `can_open` in session_detail.rs): the
+                // desktop app has no attached terminal for it to run in, so
+                // the button is disabled rather than spawning a useless
+                // detached process.
+                if !crate::editor::is_terminal(state.config.editor) {
+                    let _ = std::process::Command::new(crate::editor::program(state.config.editor))
+                        .arg(&path)
+                        .spawn();
+                }
+                Task::none()
+            }
+
             Message::ModelListLoaded { harness, models } => {
                 state.model_lists.insert(harness, models);
                 Task::none()
@@ -3637,7 +4130,12 @@ impl App {
 
             Event::OrchestratorRemoved(id) => {
                 state.orchestrators.retain(|o| o.id != id);
-                state.sessions.retain(|_, s| s.orchestrator_id.as_deref() != Some(id.as_str()));
+                let sessions = &mut state.sessions;
+                state.unread_messages.retain(|sid, _| {
+                    sid != &id
+                        && sessions.get(sid).and_then(|s| s.orchestrator_id.as_deref()) != Some(id.as_str())
+                });
+                sessions.retain(|_, s| s.orchestrator_id.as_deref() != Some(id.as_str()));
                 Task::none()
             }
 
@@ -3658,6 +4156,7 @@ impl App {
                 if let Some(s) = state.sessions.get_mut(&id) {
                     s.status = SessionStatus::Done;
                 }
+                state.unread_messages.remove(&id);
                 state.terminals.remove(&id);
                 // A done session is definitionally not viewable.
                 state.clients.remove(&id);
@@ -3718,7 +4217,7 @@ impl App {
                     let (viewport_cols, viewport_rows) =
                         Self::terminal_size_for(state, &session_id);
                     return Task::future(async move {
-                        if !ninox_core::tmux::has_session(&session_id).await {
+                        if !ninox_core::runtime::has_session(&session_id).await {
                             return Message::Noop;
                         }
                         let Some(initial_tail) = ninox_core::tmux::prepare_viewport_tail(
@@ -3731,7 +4230,7 @@ impl App {
                             tracing::warn!("prepare terminal viewport for {session_id} failed");
                             return Message::Noop;
                         };
-                        let argv = ninox_core::tmux::attach_args(&session_id).await;
+                        let argv = ninox_core::runtime::attach_args(&session_id).await;
                         Message::ClientAttach {
                             session_id,
                             argv,
@@ -3773,6 +4272,10 @@ impl App {
                 // guard here too so a repeated emit doesn't duplicate the
                 // in-memory feed the way it would upsert-replace the DB row.
                 if !thread.iter().any(|c| c.id == comment.id) {
+                    state.comment_editors.insert(
+                        comment.id,
+                        iced::widget::text_editor::Content::with_text(&comment.body),
+                    );
                     thread.push(comment);
                     thread.sort_by_key(|c| c.created_at);
                 }
@@ -3781,6 +4284,15 @@ impl App {
 
             Event::Notification(n) => {
                 Self::push_notification(state, n);
+                Task::none()
+            }
+
+            Event::MessagesDelivered { session_id, count } => {
+                let on_screen = matches!(&state.view,
+                    View::SessionDetail { session_id: sid, .. } if sid == &session_id);
+                if !on_screen {
+                    *state.unread_messages.entry(session_id).or_insert(0) += count;
+                }
                 Task::none()
             }
         }
@@ -3819,7 +4331,8 @@ impl App {
         }
     }
 
-    /// A 5px drag handle strip between resizable panels.
+    /// A 5px drag handle strip between resizable panels. Shows a
+    /// horizontal-resize cursor on hover so the divider reads as draggable.
     pub fn drag_handle<'a>(target: DragTarget, border: iced::Color) -> Element<'a, Message> {
         use iced::widget::{container, mouse_area, Space};
         use iced::{Background, Length};
@@ -3831,7 +4344,49 @@ impl App {
                     ..Default::default()
                 }),
         )
+        .interaction(iced::mouse::Interaction::ResizingHorizontally)
         .on_press(Message::StartDrag(target))
+        .into()
+    }
+
+    /// Slim clickable rail shown at the far left when the sidebar is hidden;
+    /// clicking it (or Cmd/Ctrl+B) reveals the sidebar again. Its width is
+    /// accounted for in `resize_terminals` via `SIDEBAR_REVEAL_RAIL_W`.
+    fn sidebar_reveal_rail<'a>(scheme: &crate::theme::ColorScheme) -> Element<'a, Message> {
+        use iced::widget::{button, container, text};
+        use iced::{Background, Border, Length, Padding};
+        let (paper_2, ink_2, card, faint) =
+            (scheme.paper_2, scheme.ink_2, scheme.card, scheme.faint);
+        // Mirror the open sidebar masthead's top padding so the reveal button
+        // clears the macOS traffic lights (the window is titlebar-transparent,
+        // so content runs under the title bar) and lines up vertically with
+        // the open state's collapse control. Keep in sync with
+        // `components::sidebar::masthead_padding`.
+        #[cfg(target_os = "macos")]
+        let top_inset = 40.0;
+        #[cfg(not(target_os = "macos"))]
+        let top_inset = 20.0;
+        container(
+            button(text("»").size(13).color(ink_2))
+                .on_press(Message::ToggleSidebar)
+                .padding([2, 4])
+                .style(move |_t, status| button::Style {
+                    background: Some(Background::Color(
+                        if matches!(status, button::Status::Hovered) { card } else { paper_2 },
+                    )),
+                    text_color: ink_2,
+                    border: Border::default(),
+                    ..Default::default()
+                }),
+        )
+        .padding(Padding { top: top_inset, right: 0.0, bottom: 0.0, left: 0.0 })
+        .width(Length::Fixed(SIDEBAR_REVEAL_RAIL_W))
+        .height(Length::Fill)
+        .style(move |_t| container::Style {
+            background: Some(Background::Color(paper_2)),
+            border: Border { color: faint, width: 1.0, radius: 0.0.into() },
+            ..Default::default()
+        })
         .into()
     }
 
@@ -3843,6 +4398,7 @@ impl App {
             catalogue_modal::catalogue_modal,
             fleet_board::fleet_board,
             pr_list::pr_list,
+            restart_all_modal::restart_all_modal,
             session_detail::session_detail,
             settings_panel::settings_panel,
             sidebar::sidebar,
@@ -3856,16 +4412,25 @@ impl App {
             View::SessionDetail { session_id, panel } => session_detail(state, session_id, panel),
             View::PrList => pr_list(state),
             View::Brain => brain_panel(state),
+            View::Workers => crate::components::workers_view::workers_view(state),
             View::Settings => settings_panel(state),
         };
 
-        let base: Element<Message> = container(
+        // Hidden: main content expands to (near) full width behind a slim
+        // reveal rail. Shown: sidebar + draggable divider + content.
+        let chrome = if state.sidebar_hidden {
+            row![
+                App::sidebar_reveal_rail(&state.scheme),
+                main,
+            ]
+        } else {
             row![
                 sidebar(state),
                 App::drag_handle(DragTarget::Sidebar, state.scheme.rule_dark),
                 main,
-            ].height(Length::Fill),
-        )
+            ]
+        };
+        let base: Element<Message> = container(chrome.height(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {
@@ -3880,6 +4445,8 @@ impl App {
             iced::widget::stack![base, spawn_modal(state, form)].into()
         } else if let Some(form) = &state.catalogue_modal {
             iced::widget::stack![base, catalogue_modal(state, form)].into()
+        } else if state.restart_all_confirm {
+            iced::widget::stack![base, restart_all_modal(state)].into()
         } else {
             base
         }
@@ -4070,7 +4637,14 @@ impl ClientOutputCoalescer {
 }
 
 impl App {
-    /// Subscription that drives engine event batches into one iced update.
+    /// Whether the pinboard's physics subscription should be running —
+    /// pulled out of `subscription()` so the (View, BrainMode) predicate is
+    /// directly unit-testable without going through `Subscription` itself.
+    fn wants_physics_tick(view: &View, mode: BrainMode) -> bool {
+        matches!(view, View::Brain) && mode == BrainMode::Pinboard
+    }
+
+    /// Subscription that drives `Message::EngineEvent` from the engine broadcast channel.
     pub fn subscription(state: &Self) -> Subscription<Message> {
         let mut rx: broadcast::Receiver<Event> = state.engine.subscribe();
         let engine_sub = Subscription::run_with_id(
@@ -4102,7 +4676,13 @@ impl App {
             },
         );
 
-        Subscription::batch([engine_sub, keyboard_sub, poll_sub])
+        let physics_sub = if Self::wants_physics_tick(&state.view, state.brain_view.mode) {
+            iced::time::every(std::time::Duration::from_millis(16)).map(|_| Message::BrainPhysicsTick)
+        } else {
+            Subscription::none()
+        };
+
+        Subscription::batch([engine_sub, keyboard_sub, poll_sub, physics_sub])
     }
 
     /// Theme accessor for the iced `.theme()` builder.
@@ -4146,333 +4726,6 @@ pub fn pr_url_for_session(
     Some(format!("https://github.com/{}/pull/{number}", session.repo))
 }
 
-/// Seeds `~/.config/ninox/orchestrator/` (or the configured root) with the
-/// files that orchestrator sessions need: AGENTS.md (canonical, CLAUDE.md
-/// symlinks to it), spawn-worker skill, set-agent-config skill, brain skill,
-/// and the subagent-blocker PreToolUse hook.
-///
-/// AGENTS.md and settings.json are skipped if already present (user-editable).
-/// Generated skills are refreshed while untouched; user-modified skills and
-/// unrelated files are preserved. The blocker is always overwritten.
-pub async fn setup_orchestrator_root(
-    root: &std::path::Path,
-    ninox_bin: &str,
-    config_path: &str,
-) -> anyhow::Result<()> {
-    use tokio::fs;
-
-    let claude_dir        = root.join(".claude");
-    let claude_skills_dir = claude_dir.join("skills");
-    let spawn_skill_dir   = claude_skills_dir.join("spawn-worker");
-    let config_skill_dir  = claude_skills_dir.join("set-agent-config");
-    let brain_skill_dir   = claude_skills_dir.join("brain");
-    fs::create_dir_all(&claude_dir).await?;
-    fs::create_dir_all(&spawn_skill_dir).await?;
-    fs::create_dir_all(&config_skill_dir).await?;
-    fs::create_dir_all(&brain_skill_dir).await?;
-
-    let spawn_skill_path  = spawn_skill_dir.join("SKILL.md");
-    let config_skill_path = config_skill_dir.join("SKILL.md");
-    let brain_skill_path  = brain_skill_dir.join("SKILL.md");
-
-    // AGENTS.md is canonical; CLAUDE.md symlinks to it.
-    let agents_md_path = root.join("AGENTS.md");
-    if !agents_md_path.exists() {
-        let body = format!(
-            "# Ninox Orchestrator\n\n\
-             Before doing anything else, read and follow: `{spawn_skill}`\n\n\
-             ## Available Skills\n\n\
-             - `{spawn_skill}` — spawning worker sessions\n\
-             - `{config_skill}` — changing agent harness or model\n\
-             - `{brain_skill}` — reading and writing the shared knowledge brain\n",
-            spawn_skill  = spawn_skill_path.display(),
-            config_skill = config_skill_path.display(),
-            brain_skill  = brain_skill_path.display(),
-        );
-        fs::write(&agents_md_path, body).await?;
-    }
-    let claude_md_path = root.join("CLAUDE.md");
-    if !claude_md_path.exists() {
-        #[cfg(unix)]
-        tokio::fs::symlink("AGENTS.md", &claude_md_path).await?;
-        #[cfg(not(unix))]
-        {
-            let body = fs::read_to_string(&agents_md_path).await?;
-            fs::write(&claude_md_path, body).await?;
-        }
-    }
-
-    // spawn-worker skill — always overwritten.
-    let spawn_skill_content = format!(
-        r#"---
-name: spawn-worker
-description: Use before starting any implementation task as a Ninox orchestrator — spawn a worker session instead of doing the work yourself.
----
-
-# Spawn a Worker, Not a Subagent
-
-You are a **Ninox orchestrator agent**. You coordinate — you do not implement.
-
-## Your Role
-
-- Spawn worker sessions for all implementation tasks
-- Monitor worker progress; direct workers when they get stuck
-- Never implement code, run tests, or create PRs yourself
-
-## Spawning Workers
-
-Name workers after the ticket or task so they are easy to reference:
-
-```bash
-{ninox_bin} spawn \
-  --name "ath-123-auth-fix" \
-  --prompt "Complete task description with acceptance criteria, repo path, and branch" \
-  --workspace /absolute/path/to/repo \
-  --delivery pr
-```
-
-`--name` becomes the session ID. Names are slugified automatically (`"ATH-123 auth"` → `"ath-123-auth"`).
-Omitting `--name` generates a timestamp ID (`worker-…`).
-
-`NINOX_ORCHESTRATOR_ID` is set in your environment and picked up automatically.
-Each spawn prints the session ID (`spawned ath-123-auth-fix`) — use it to send follow-ups.
-
-## Choosing Delivery
-
-Choose the contract explicitly:
-
-- `--delivery pr` — code changes that must be delivered through a branch,
-  commit, push, and pull request.
-- `--delivery direct` — research, operational tasks, direct-file/artifact
-  work, and all non-Git workspaces. The worker validates its artifacts or
-  direct changes and reports either a blocker or completion; it does not
-  create branches, remotes, commits, or PRs.
-
-When `--delivery` is omitted, Ninox preserves PR delivery for Git repositories
-and selects direct delivery for non-Git workspaces. Prefer an explicit choice
-so the worker contract reflects the task rather than only the workspace type.
-
-For PR delivery, always pass the primary repository checkout to `--workspace`.
-When that checkout is directly under Ninox's configured repositories root,
-Ninox leases a warm sibling checkout (`<repo>-w1`, `<repo>-w2`, …). Ninox
-chooses and manages the pool slot; never pass a `-wN` path yourself. The
-primary checkout remains untouched.
-
-## Messaging Workers (Orchestrator → Worker)
-
-Send instructions or follow-ups to a worker using its session ID:
-
-```bash
-{ninox_bin} send ath-123-auth-fix "Focus on the token refresh path first"
-```
-
-## Work Requests (Worker → Orchestrator)
-
-Workers are scoped to one task and one delivery. When a worker discovers
-additional work, it runs `{ninox_bin} request-work "<description>"` and
-Ninox forwards the request to you as a
-`[Ninox] Worker … requested additional work` message.
-
-When one arrives: decide whether the work is worth doing, and if so
-spawn a new worker for it with `{ninox_bin} spawn`. **Never** tell a worker to widen
-its own task or delivery — extra scope always gets its own worker. For PR
-delivery, Ninox will also warn you (`[Ninox] Worker … opened N PRs beyond its
-tracked PR`) if a worker opens extra PRs anyway; review each extra PR and
-either close it or hand it to a dedicated worker.
-
-## The Rule
-
-**Never use the Agent tool for implementation work.** All implementation goes
-through `{ninox_bin} spawn`. Read-only Explore/Plan agents are permitted.
-
-| Thought | Reality |
-|---|---|
-| "The task is small" | Size doesn't matter. Workers handle small tasks fine. |
-| "I'm already mid-context" | Offload work to preserve orchestrator context. |
-| "It's just a push/PR" | Pushes need auth wiring subagents don't have. |
-| "The Agent tool is easier" | It's always easier. That's why this rule exists. |
-"#,
-        ninox_bin = ninox_bin,
-    );
-    fs::write(&spawn_skill_path, spawn_skill_content).await?;
-
-    // set-agent-config skill — always overwritten.
-    let config_skill_content = format!(
-        r#"---
-name: set-agent-config
-description: Use when the user asks to change the orchestrator's or worker's agent harness or model.
----
-
-# Set Ninox Agent Config
-
-Use this skill when the user asks to change the agent harness or model.
-
-## Config file
-
-```
-{config_path}
-```
-
-## Format
-
-```toml
-[orchestrator]
-harness = "claude-code"   # claude-code | codex | aider | opencode
-model = "model-name"      # omit to use the harness default
-
-[worker]
-harness = "claude-code"
-model = "model-name"
-```
-
-Use the Edit tool to update the relevant field. Changes take effect on the next spawn.
-"#,
-        config_path = config_path,
-    );
-    fs::write(&config_skill_path, config_skill_content).await?;
-
-    // brain skill — always overwritten.
-    let brain_skill_content = format!(
-        r#"---
-name: brain
-description: Read and write Ninox's shared knowledge brain. Use before exploring unfamiliar code (query first) and as soon as you learn something worth keeping — write it down, don't wait until the end.
----
-
-# Read and Write the Brain
-
-The brain is Ninox's persistent, shared knowledge store. As you explore
-codebases you discover things — where a type is defined, how two repos
-relate, why a decision was made. Without a place to put that, every new
-session starts cold. Write it down so the next orchestrator doesn't have to
-rediscover it.
-
-Your session's brain is already resolved — these commands act on it with no
-extra configuration.
-
-## 1. Query first
-
-`brain query` blends keyword and semantic matches automatically — no new
-syntax needed. Before writing a new entry, check whether one already exists:
-
-```bash
-{ninox_bin} brain query "<name or concept>"
-```
-
-Narrow with filters:
-
-```bash
-{ninox_bin} brain query "<text>" --entry-type repo
-{ninox_bin} brain query "<text>" --tag auth
-```
-
-If a relevant entry exists, update it instead of creating a duplicate.
-
-## 2. Write a fact
-
-Create or update a Markdown file under the section that fits, then rebuild
-the index:
-
-```
-repos/          where repositories live, their purpose, entry points
-symbols/        where types, functions, and modules are defined
-concepts/       domain terminology and mental models
-patterns/       conventions and recurring implementation shapes
-decisions/      why something was built a certain way (ADRs)
-architecture/   how the system is structured — components, data flows
-relationships/  how repos, services, and teams connect
-errors/         known failure modes and how to resolve them
-```
-
-Each file needs YAML frontmatter followed by Markdown body:
-
-```markdown
----
-type: repo
-name: my-crate
-tags: [auth, core]
-repos: [my-crate]
-updated: 2026-07-06
----
-
-# my-crate
-
-Entry point: `src/main.rs`
-Build: `cargo build`
-
-Facts, not prose. Link related entries with `[[other-entry]]`.
-```
-
-Then rebuild the index so the write becomes queryable:
-
-```bash
-{ninox_bin} brain index
-```
-
-## 3. Read for context
-
-At the start of work in unfamiliar territory, query before exploring:
-
-```bash
-{ninox_bin} brain query "" --entry-type architecture
-{ninox_bin} brain query "" --entry-type repo
-{ninox_bin} brain show <path-from-a-query-result>
-```
-
-## The Rule
-
-**Before exploring anything unfamiliar, query first.** As soon as you learn
-something a future session would want to know — don't wait until the end
-of your session — write it down and index it. A stale or empty brain is no
-better than no brain at all.
-"#,
-        ninox_bin = ninox_bin,
-    );
-    fs::write(&brain_skill_path, brain_skill_content).await?;
-
-    // subagent-blocker hook — always overwritten.
-    let blocker = r#"#!/usr/bin/env node
-const { readFileSync } = require("node:fs");
-const callerType = process.env.NINOX_CALLER_TYPE || "";
-if (callerType !== "orchestrator") process.exit(0);
-let raw = "";
-try { raw = readFileSync(0, "utf-8"); } catch { process.exit(0); }
-let payload;
-try { payload = JSON.parse(raw || "{}"); } catch { process.exit(0); }
-const toolName = typeof payload.tool_name === "string" ? payload.tool_name : "";
-if (toolName !== "Task" && toolName !== "Agent") process.exit(0);
-const sub = (payload.tool_input?.subagent_type || "").toLowerCase();
-if (sub === "explore" || sub === "plan") process.exit(0);
-process.stdout.write(JSON.stringify({
-  hookSpecificOutput: {
-    hookEventName: "PreToolUse",
-    permissionDecision: "deny",
-    permissionDecisionReason: "Use `${NINOX_BIN:-ninox} spawn` instead of native subagents.",
-  },
-}) + "\n");
-process.exit(0);
-"#;
-    fs::write(claude_dir.join("subagent-blocker.cjs"), blocker).await?;
-
-    let settings_path = claude_dir.join("settings.json");
-    if !settings_path.exists() {
-        let settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": "Task|Agent",
-                    "hooks": [{"type": "command", "command": "node .claude/subagent-blocker.cjs", "timeout": 2000}]
-                }]
-            },
-            "statusLine": {
-                "type": "command",
-                "command": format!("'{}' statusline", ninox_bin.replace('\'', "'\\''")),
-                "refreshInterval": 20
-            }
-        });
-        fs::write(&settings_path, serde_json::to_string_pretty(&settings)?).await?;
-    }
-
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -4922,7 +5175,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         }
     }
 
@@ -5026,8 +5281,11 @@ mod tests {
             active_variant:     ThemeVariant::Dark,
             orchestrator_root:  std::path::PathBuf::from("/tmp"),
             orchestrator_agent: ninox_core::config::AgentConfig::default(),
+            db_path:            std::path::PathBuf::from("/tmp/t.db"),
             orchestrators:      vec![],
             sessions:       HashMap::new(),
+            session_deps:   Vec::new(),
+            status_probe:   HashMap::new(),
             brain,
             brain_view:     BrainViewState::default(),
             catalogues:      vec![ninox_core::config::CatalogueRef {
@@ -5042,10 +5300,14 @@ mod tests {
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
             review_threads: HashMap::new(),
+            comment_editors: HashMap::new(),
             diffs:          HashMap::new(),
+            plan_docs:      HashMap::new(),
             notifications:  VecDeque::new(),
+            unread_messages: HashMap::new(),
             update_in_progress: false,
             version_check:  VersionCheckState::NotChecked,
+            restart_all_in_progress: false,
             sidebar:        SidebarState::default(),
             view:           View::FleetBoard { scope: None },
             worker_panel:   Default::default(),
@@ -5057,21 +5319,26 @@ mod tests {
             settings:       Default::default(),
             spawn_modal:    None,
             catalogue_modal: None,
+            restart_all_confirm: false,
             terminal_cols:  140,
             terminal_rows:  50,
             window_width:   0.0,
             window_height:  0.0,
             sidebar_width:  0.0,
+            sidebar_hidden: false,
             info_width:     0.0,
             drag:            None,
             fleet_filter:    FleetFilter::default(),
             last_fleet_scope: None,
+            zoom:            1.0,
         }
     }
 
+    /// A worker row (attached to an orchestrator). Set `orchestrator_id`
+    /// to `None` for a standalone session.
     fn refile_session(id: &str) -> Session {
         Session {
-            id: id.into(), orchestrator_id: None, name: id.into(), repo: String::new(),
+            id: id.into(), orchestrator_id: Some("orch".into()), name: id.into(), repo: String::new(),
             status: SessionStatus::Terminated, agent_type: "claude-code".into(),
             cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None,
             workspace_path: Some("/tmp/ws".into()), pid: None,
@@ -5080,7 +5347,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         }
     }
 
@@ -5104,6 +5373,83 @@ mod tests {
                 && value == crate::spawn_util::WORKER_EXECUTION_ROLE
         }));
         assert_eq!(plan.agent.harness, "claude-code");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn refile_plan_stale_row_model_is_replaced_by_the_configured_default() {
+        // The row still says the model the session last ran on; the user
+        // has since changed `[worker] model` in config.toml. Re-file must
+        // launch on the configured model, not the stale snapshot.
+        let mut cfg = ninox_core::config::AppConfig::default();
+        cfg.worker.model = Some("claude-fable-5-1".into());
+        let session = refile_session("s1"); // row: claude-opus-4-8
+        let plan = refile_plan(&session, false, &cfg, "fresh-uuid").expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-fable-5-1"));
+        assert!(plan.base_cmd.contains("claude-fable-5-1"));
+        assert!(!plan.base_cmd.contains("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn refile_plan_picks_the_default_for_the_session_kind() {
+        // An orchestrator row follows `[orchestrator]`, a worker row (one an
+        // orchestrator spawned) follows `[worker]` — never the other way
+        // round.
+        let mut cfg = ninox_core::config::AppConfig::default();
+        cfg.orchestrator.model = Some("orch-model".into());
+        cfg.worker.model       = Some("worker-model".into());
+        let session = refile_session("s1");
+        let orch   = refile_plan(&session, true,  &cfg, "u").expect("plan");
+        let worker = refile_plan(&session, false, &cfg, "u").expect("plan");
+        assert_eq!(orch.agent.model.as_deref(),   Some("orch-model"));
+        assert_eq!(worker.agent.model.as_deref(), Some("worker-model"));
+    }
+
+    #[test]
+    fn refile_plan_standalone_session_follows_the_orchestrator_default() {
+        // Standalone sessions are filed from the Spawn modal, whose
+        // remembered preselection is `[orchestrator]` — relaunch must not
+        // silently move them onto `[worker] model` just because they are
+        // not in the orchestrators list.
+        let mut cfg = ninox_core::config::AppConfig::default();
+        cfg.orchestrator.model = Some("orch-model".into());
+        cfg.worker.model       = Some("worker-model".into());
+        let mut session = refile_session("s1");
+        session.orchestrator_id = None;
+        let plan = refile_plan(&session, false, &cfg, "u").expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("orch-model"));
+
+        // ...and the harness-mismatch guard is evaluated against
+        // `[orchestrator]` for them too.
+        cfg.orchestrator.harness = "codex".into();
+        let plan = refile_plan(&session, false, &cfg, "u").expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
+
+        session.claude_session_id = Some("stored-uuid".into());
+        cfg.orchestrator.harness = "claude-code".into();
+        let plan = resume_plan(&session, false, &cfg).expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("orch-model"));
+    }
+
+    #[test]
+    fn refile_plan_harness_mismatch_keeps_the_session_model() {
+        // Model ids are harness-specific: a `[worker] model` set for codex
+        // must not be pushed onto a claude-code session.
+        let mut cfg = ninox_core::config::AppConfig::default();
+        cfg.worker.harness = "codex".into();
+        cfg.worker.model   = Some("gpt-5-codex".into());
+        let session = refile_session("s1"); // agent_type: claude-code
+        let plan = refile_plan(&session, false, &cfg, "fresh-uuid").expect("plan");
+        assert_eq!(plan.agent.harness, "claude-code");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
+        assert!(!plan.base_cmd.contains("gpt-5-codex"));
+    }
+
+    #[test]
+    fn refile_plan_unset_config_model_keeps_the_session_model() {
+        let cfg = ninox_core::config::AppConfig::default(); // worker.model: None
+        let session = refile_session("s1");
+        let plan = refile_plan(&session, false, &cfg, "fresh-uuid").expect("plan");
         assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
     }
 
@@ -5215,6 +5561,35 @@ mod tests {
             key == crate::spawn_util::EXECUTION_ROLE_ENV
                 && value == crate::spawn_util::WORKER_EXECUTION_ROLE
         }));
+    }
+
+    #[test]
+    fn resume_plan_applies_the_configured_default_model() {
+        let mut cfg = ninox_core::config::AppConfig::default();
+        cfg.orchestrator.model = Some("claude-fable-5-1".into());
+        let mut session = refile_session("o1"); // row: claude-opus-4-8
+        session.claude_session_id = Some("stored-uuid".into());
+        let plan = resume_plan(&session, true, &cfg).expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-fable-5-1"));
+        assert!(plan.base_cmd.contains("--resume"));
+        assert!(plan.base_cmd.contains("claude-fable-5-1"));
+        assert!(!plan.base_cmd.contains("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn resume_plan_keeps_the_session_model_on_harness_mismatch_or_unset_default() {
+        let mut session = refile_session("s1");
+        session.claude_session_id = Some("stored-uuid".into());
+
+        let cfg = ninox_core::config::AppConfig::default();
+        let plan = resume_plan(&session, false, &cfg).expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
+
+        let mut cfg = ninox_core::config::AppConfig::default();
+        cfg.worker.harness = "codex".into();
+        cfg.worker.model   = Some("gpt-5-codex".into());
+        let plan = resume_plan(&session, false, &cfg).expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-4-8"));
     }
 
     #[test]
@@ -5372,6 +5747,69 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn resume_message_relaunches_a_terminated_orchestrator_end_to_end() {
+        // `resume_message_relaunches_and_attaches` above only checks the
+        // synchronous state `update()` mutates; nothing else in this file
+        // drives `Message::ResumeSession`'s `Task` to completion for a
+        // Terminated *orchestrator* (as opposed to
+        // `resume_message_keeps_status_interrupted_when_tmux_create_fails`,
+        // which forces the failure path for a plain worker session). This
+        // exercises the success path end-to-end: a persisted orchestrator
+        // whose session is Terminated with a dead pid but a live workspace +
+        // stored `claude_session_id` — Resume must relaunch it (ClientAttach)
+        // and land on `Working`, not silently no-op.
+        use futures::StreamExt;
+
+        let e = test_engine();
+        let mut m = base(e);
+        // Harness override: run a harmless long-lived command instead of the
+        // real `claude` binary so the pane survives the attach handshake.
+        m.config.harnesses.insert("claude-code".to_string(), ninox_core::harness::HarnessSpec {
+            enabled: true,
+            binary: Some("sleep".into()),
+            resume_args: vec!["30".into()],
+            ..Default::default()
+        });
+        let ws = tempdir().unwrap().keep();
+        let sid = "orch-resume-reboot-test";
+        let orch = ninox_core::types::Orchestrator {
+            id: sid.into(), name: "O".into(), created_at: 0,
+        };
+        m.engine.store.upsert_orchestrator(&orch).unwrap();
+        m.orchestrators.push(orch);
+        let mut s = refile_session(sid);
+        s.status = SessionStatus::Terminated;
+        s.claude_session_id = Some("stored-uuid".into());
+        s.workspace_path = Some(ws.to_string_lossy().to_string());
+        s.pid = Some(u32::MAX); // pane pid from before the reboot — dead
+        s.terminal_at = Some(1);
+        m.engine.store.upsert_session(&s).unwrap();
+        m.sessions.insert(sid.into(), s);
+
+        let (m, task) = m.update(Message::ResumeSession(sid.into()));
+        let mut stream = iced_runtime::task::into_stream(task)
+            .expect("ResumeSession must produce a real Task, not Task::none()");
+        let out = stream.next().await;
+        // Clean up the test-socket tmux session regardless of outcome.
+        let _ = ninox_core::tmux::kill_session(sid).await;
+        let attached = matches!(
+            &out,
+            Some(iced_runtime::Action::Output(Message::ClientAttach { session_id, .. }))
+                if session_id == sid
+        );
+        assert!(
+            attached,
+            "resume of a terminated orchestrator must relaunch and attach; got {:?}",
+            out.map(|a| match a {
+                iced_runtime::Action::Output(msg) => format!("{msg:?}").chars().take(200).collect::<String>(),
+                _ => "non-output action".into(),
+            })
+        );
+        let session = m.engine.store.get_session(sid).unwrap().unwrap();
+        assert!(matches!(session.status, SessionStatus::Working));
+    }
+
     #[test]
     fn navigate_settings_switches_view() {
         let m = base(test_engine());
@@ -5417,7 +5855,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (updated, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         assert!(updated.sessions.contains_key("s1"));
@@ -5439,7 +5879,9 @@ mod tests {
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
-            claude_session_id: None, summary: None, terminal_at: None, gate_status: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (updated, _) = app.update(Message::EngineEvent(Box::new(
             Event::SessionSpawned(session.clone()),
@@ -5495,6 +5937,74 @@ mod tests {
         let session = updated.sessions.get("s1").unwrap();
         assert_eq!(session.pr_number, Some(42), "tracked PR must not change");
         assert_eq!(session.pr_id, Some(42), "tracked PR must not change");
+    }
+
+    fn messages_delivered(session_id: &str, count: u64) -> Message {
+        Message::EngineEvent(Box::new(Event::MessagesDelivered { session_id: session_id.into(), count }))
+    }
+
+    #[test]
+    fn messages_delivered_to_a_session_not_on_screen_accumulate_as_unread() {
+        let m = base(test_engine());
+        let (m, _) = m.update(messages_delivered("orch-1", 1));
+        let (m, _) = m.update(messages_delivered("orch-1", 2));
+        assert_eq!(m.unread_messages.get("orch-1"), Some(&3));
+    }
+
+    #[test]
+    fn messages_delivered_to_the_session_on_screen_are_not_unread() {
+        let mut m = base(test_engine());
+        m.view = View::SessionDetail { session_id: "orch-1".into(), panel: DetailPanel::Split };
+        let (m, _) = m.update(messages_delivered("orch-1", 1));
+        assert_eq!(m.unread_messages.get("orch-1"), None);
+    }
+
+    #[test]
+    fn opening_a_session_clears_its_unread_messages() {
+        let m = base(test_engine());
+        let (m, _) = m.update(messages_delivered("orch-1", 4));
+        let (m, _) = m.update(messages_delivered("orch-2", 1));
+        let (m, _) = m.update(Message::NavigateSession("orch-1".into()));
+        assert_eq!(m.unread_messages.get("orch-1"), None);
+        assert_eq!(m.unread_messages.get("orch-2"), Some(&1), "other sessions keep their badge");
+    }
+
+    #[test]
+    fn removing_an_orchestrator_clears_unread_for_it_and_its_workers() {
+        let mut m = base(test_engine());
+        m.orchestrators.push(Orchestrator { id: "o1".into(), name: "orch".into(), created_at: 0 });
+        let mut w = Session {
+            id: "w1".into(), orchestrator_id: Some("o1".into()), name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
+        };
+        m.sessions.insert("w1".into(), w.clone());
+        w.id = "other".into();
+        w.orchestrator_id = None;
+        m.sessions.insert("other".into(), w);
+        let (m, _) = m.update(messages_delivered("o1", 1));
+        let (m, _) = m.update(messages_delivered("w1", 1));
+        let (m, _) = m.update(messages_delivered("other", 1));
+
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorRemoved("o1".into()))));
+
+        assert_eq!(m.unread_messages.get("o1"), None);
+        assert_eq!(m.unread_messages.get("w1"), None);
+        assert_eq!(m.unread_messages.get("other"), Some(&1));
+    }
+
+    #[test]
+    fn a_finished_session_drops_its_unread_messages() {
+        let m = base(test_engine());
+        let (m, _) = m.update(messages_delivered("w1", 2));
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionDone("w1".into()))));
+        assert_eq!(m.unread_messages.get("w1"), None);
     }
 
     #[test]
@@ -5576,7 +6086,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;
@@ -5626,11 +6138,13 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         }).unwrap();
         let engine = Engine::new(store);
         let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
-        let (app, _task) = App::new(engine, std::path::PathBuf::from("/tmp"), ninox_core::config::AgentConfig::default(), brain);
+        let (app, _task) = App::new(engine, std::path::PathBuf::from("/tmp"), ninox_core::config::AgentConfig::default(), brain, std::path::PathBuf::from("/tmp/t.db"));
         assert_eq!(app.orchestrators.len(), 1);
         assert_eq!(app.sessions.len(), 1);
         assert!(app.sessions.contains_key("s1"));
@@ -5651,7 +6165,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = m2;
@@ -5690,7 +6206,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: Some(0), gate_status: None,
+            terminal_at: Some(0), gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let _ = m.engine.store.upsert_session(&worker);
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(worker))));
@@ -5743,7 +6261,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         });
 
         let (next, _) = m.update(Message::PollSessions);
@@ -5767,7 +6287,9 @@ mod tests {
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
-            claude_session_id: None, summary: None, terminal_at: Some(0), gate_status: None,
+            claude_session_id: None, summary: None, terminal_at: Some(0), gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let _ = m.engine.store.upsert_session(&s);
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
@@ -5804,7 +6326,9 @@ mod tests {
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
-            claude_session_id: None, summary: None, terminal_at: None, gate_status: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (m2, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorSpawned(o))));
         m = m2;
@@ -6004,6 +6528,149 @@ mod tests {
         assert_eq!(m3.brain_view.hovered, None);
     }
 
+    /// Leaving Pinboard mode mid-drag never delivers a `BrainDragEnd`, so
+    /// the mode switch itself has to release the pin — otherwise the node
+    /// sits out physics for the rest of the session.
+    #[test]
+    fn switching_mode_clears_dragging() {
+        let e = test_engine();
+        let m = base(e);
+        let (m, _) = m.update(Message::BrainSetMode(BrainMode::Pinboard));
+        let (m, _) = m.update(Message::BrainDragStart("symbols/x.md".into()));
+        assert_eq!(m.brain_view.dragging.as_deref(), Some("symbols/x.md"));
+        let (m, _) = m.update(Message::BrainSetMode(BrainMode::Catalogue));
+        assert_eq!(m.brain_view.dragging, None);
+    }
+
+    #[test]
+    fn physics_tick_seeds_and_positions_new_entries() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("concepts")).unwrap();
+        std::fs::write(brain_dir.join("concepts").join("note.md"), "---\nname: Note\n---\nbody").unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild(None).unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m, _) = m.update(Message::NavigateBrain);
+        assert!(m.brain_view.layout.position("concepts/note.md").is_none());
+
+        let (m, _) = m.update(Message::BrainPhysicsTick);
+        assert!(m.brain_view.layout.position("concepts/note.md").is_some());
+    }
+
+    #[test]
+    fn drag_start_move_end_pins_then_releases_a_node() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("concepts")).unwrap();
+        std::fs::write(brain_dir.join("concepts").join("note.md"), "---\nname: Note\n---\nbody").unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild(None).unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m, _) = m.update(Message::NavigateBrain);
+        let (m, _) = m.update(Message::BrainPhysicsTick); // seeds the layout
+
+        let (m, _) = m.update(Message::BrainDragStart("concepts/note.md".into()));
+        assert_eq!(m.brain_view.dragging.as_deref(), Some("concepts/note.md"));
+
+        let (m, _) = m.update(Message::BrainDragMove("concepts/note.md".into(), 0.9, 0.1));
+        assert_eq!(m.brain_view.layout.position("concepts/note.md"), Some((0.9, 0.1)));
+
+        let (m, _) = m.update(Message::BrainDragEnd);
+        assert_eq!(m.brain_view.dragging, None);
+        assert_eq!(m.brain_view.layout.position("concepts/note.md"), Some((0.9, 0.1)));
+    }
+
+    /// Drag positions are session-only and scoped to one entry set, so a
+    /// reindex drops them back to the deterministic hash seed instead of
+    /// carrying hand-placed coordinates across the reload.
+    #[test]
+    fn reindexing_reseeds_the_layout_and_releases_a_drag() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("concepts")).unwrap();
+        std::fs::write(brain_dir.join("concepts").join("note.md"), "---\nname: Note\n---\nbody").unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild(None).unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m, _) = m.update(Message::NavigateBrain);
+        let (m, _) = m.update(Message::BrainPhysicsTick);
+        let seeded = m.brain_view.layout.position("concepts/note.md").unwrap();
+
+        let (m, _) = m.update(Message::BrainDragStart("concepts/note.md".into()));
+        let (m, _) = m.update(Message::BrainDragMove("concepts/note.md".into(), 0.9, 0.1));
+        assert_eq!(m.brain_view.layout.position("concepts/note.md"), Some((0.9, 0.1)));
+
+        let path = m.brain.path().to_path_buf();
+        let (m, _) = m.update(Message::BrainReindexed { path, result: Ok(1) });
+        assert_eq!(m.brain_view.dragging, None);
+        assert_eq!(m.brain_view.layout.position("concepts/note.md"), None);
+
+        let (m, _) = m.update(Message::BrainPhysicsTick);
+        assert_eq!(m.brain_view.layout.position("concepts/note.md"), Some(seeded));
+    }
+
+    /// Same reset via the other door into `reload_brain_entries`: switching
+    /// catalogues entirely.
+    #[test]
+    fn switching_catalogue_reseeds_the_layout() {
+        let dir_a = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_a.join("concepts")).unwrap();
+        std::fs::write(dir_a.join("concepts").join("a.md"), "a body").unwrap();
+        let dir_b = tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir_b.join("concepts")).unwrap();
+        std::fs::write(dir_b.join("concepts").join("b.md"), "b body").unwrap();
+
+        let brain_a = Arc::new(BrainIndex::open(&dir_a).unwrap());
+        brain_a.rebuild(None).unwrap();
+        BrainIndex::open(&dir_b).unwrap().rebuild(None).unwrap();
+
+        let e = test_engine();
+        let mut app = base_with_brain(e, brain_a);
+        app.catalogues = vec![
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
+        ];
+        let (app, _) = app.update(Message::NavigateBrain);
+        let (app, _) = app.update(Message::BrainPhysicsTick);
+        let (app, _) = app.update(Message::BrainDragStart("concepts/a.md".into()));
+        let (app, _) = app.update(Message::BrainDragMove("concepts/a.md".into(), 0.9, 0.1));
+
+        let (app, _) = app.update(Message::BrainSwitchCatalogue(1));
+        assert_eq!(app.brain_view.dragging, None);
+        assert!(app.brain_view.layout.position("concepts/a.md").is_none());
+    }
+
+    #[test]
+    fn drag_move_for_a_different_id_than_dragging_is_ignored() {
+        let brain_dir = tempdir().unwrap().keep();
+        std::fs::create_dir_all(brain_dir.join("concepts")).unwrap();
+        std::fs::write(brain_dir.join("concepts").join("a.md"), "---\nname: A\n---\nbody").unwrap();
+        std::fs::write(brain_dir.join("concepts").join("b.md"), "---\nname: B\n---\nbody").unwrap();
+        let brain = Arc::new(BrainIndex::open(&brain_dir).unwrap());
+        brain.rebuild(None).unwrap();
+
+        let e = test_engine();
+        let m = base_with_brain(e, brain);
+        let (m, _) = m.update(Message::NavigateBrain);
+        let (m, _) = m.update(Message::BrainPhysicsTick);
+        let before = m.brain_view.layout.position("concepts/b.md").unwrap();
+
+        let (m, _) = m.update(Message::BrainDragStart("concepts/a.md".into()));
+        let (m, _) = m.update(Message::BrainDragMove("concepts/b.md".into(), 0.5, 0.5));
+        assert_eq!(m.brain_view.layout.position("concepts/b.md"), Some(before));
+    }
+
+    #[test]
+    fn wants_physics_tick_only_for_brain_pinboard() {
+        assert!(App::wants_physics_tick(&View::Brain, BrainMode::Pinboard));
+        assert!(!App::wants_physics_tick(&View::Brain, BrainMode::Catalogue));
+        assert!(!App::wants_physics_tick(&View::FleetBoard { scope: None }, BrainMode::Pinboard));
+    }
+
     #[test]
     fn switching_catalogue_resets_selection_and_active_index() {
         let dir_a = tempdir().unwrap().keep();
@@ -6199,12 +6866,13 @@ mod tests {
 
         let e = test_engine();
         let m = base_with_brain(e, brain);
-        assert!(m.brain_view.layout.is_empty());
+        assert!(m.brain_view.entries.is_empty());
 
-        let (m2, _) = m.update(Message::NavigateBrain);
-        assert_eq!(m2.brain_view.layout.len(), 2);
+        let (m, _) = m.update(Message::NavigateBrain);
+        let (m2, _) = m.update(Message::BrainPhysicsTick); // seeds the layout
+        assert_eq!(m2.brain_view.entries.len(), 2);
         for entry in &m2.brain_view.entries {
-            let (x, y) = m2.brain_view.layout[&entry.id];
+            let (x, y) = m2.brain_view.layout.position(&entry.id).unwrap();
             assert!((0.05..=0.95).contains(&x));
             assert!((0.05..=0.95).contains(&y));
         }
@@ -6433,15 +7101,20 @@ mod tests {
             ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None },
         ];
         let (app, _) = app.update(Message::NavigateBrain);
-        assert_eq!(app.brain_view.layout.len(), 2);
+        let (app, _) = app.update(Message::BrainPhysicsTick); // seeds the layout
+        assert!(app.brain_view.layout.position("people/alice.md").is_some());
+        assert!(app.brain_view.layout.position("people/bob.md").is_some());
 
         let (app, _) = app.update(Message::BrainSwitchCatalogue(1));
-        assert_eq!(
-            app.brain_view.layout.len(),
-            1,
+        assert!(
+            app.brain_view.layout.position("people/alice.md").is_none(),
+            "catalogue B's reload must clear catalogue A's layout, not leave it stale"
+        );
+        let (app, _) = app.update(Message::BrainPhysicsTick); // repopulates for catalogue B
+        assert!(
+            app.brain_view.layout.position("people/carol.md").is_some(),
             "catalogue B has one entry -- layout must be repopulated for it, not left over from A"
         );
-        assert!(app.brain_view.layout.contains_key("people/carol.md"));
     }
 
     #[test]
@@ -6488,7 +7161,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -6509,7 +7184,9 @@ mod tests {
             workspace_path: None, pid: None,
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
-            claude_session_id: None, summary: None, terminal_at: None, gate_status: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m2, _) = m.update(Message::NavigateSession("s1".into()));
@@ -6554,8 +7231,10 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
-            };
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
+        };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
@@ -6608,7 +7287,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         // NavigateSession defaults to the Split panel, so switch to Terminal
@@ -6635,6 +7316,90 @@ mod tests {
         assert_eq!(term.term.grid().columns(), m2.terminal_cols as usize);
     }
 
+    /// Regression test: `resize_terminals` used to treat every orchestrator
+    /// session as terminal-only-at-full-width regardless of panel, which
+    /// predates the `Plan` tab. Once an orchestrator can show `Plan`
+    /// (terminal + plan pane side by side, same layout as `Split`), its
+    /// terminal must narrow exactly like a worker's `Split` panel does —
+    /// otherwise the PTY renders at full width while the plan pane visually
+    /// overlaps it.
+    #[test]
+    fn opening_the_plan_panel_narrows_an_orchestrators_terminal() {
+        use crate::components::session_detail::DetailPanel;
+        use alacritty_terminal::grid::Dimensions;
+        let e = test_engine();
+        let mut m = base(e);
+        m.window_width  = 1200.0;
+        m.window_height = 800.0;
+        m.sidebar_width = 220.0;
+        m.info_width    = 300.0;
+
+        let o = Orchestrator { id: "orch1".into(), name: "orch".into(), created_at: 0 };
+        let _ = m.engine.store.upsert_orchestrator(&o);
+        let (m, _) = m.update(Message::EngineEvent(Box::new(Event::OrchestratorSpawned(o))));
+
+        let (m, _) = m.update(Message::NavigateSession("orch1".into()));
+        let (mut m, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
+        m.terminals.insert(
+            "orch1".into(),
+            crate::components::terminal::TerminalState::new(m.terminal_cols, m.terminal_rows, None),
+        );
+        let (m, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Terminal));
+        let full_width_cols = m.terminals.get("orch1").unwrap().term.grid().columns();
+
+        let (m2, _) = m.update(Message::SwitchDetailPanel(DetailPanel::Plan));
+
+        let term = m2.terminals.get("orch1").unwrap();
+        assert!(
+            term.term.grid().columns() < full_width_cols,
+            "opening the Plan panel should narrow an orchestrator's terminal grid, \
+             not leave it full-width under the plan pane"
+        );
+        assert_eq!(term.term.grid().columns(), m2.terminal_cols as usize);
+    }
+
+    #[test]
+    fn plan_editor_action_drops_edits_but_applies_non_edit_actions() {
+        use iced::widget::text_editor::{Action, Edit};
+
+        use crate::components::markdown_blocks::BlockKind;
+
+        let e = test_engine();
+        let mut m = base(e);
+        m.plan_docs.insert(
+            "orch".into(),
+            PlanDocState {
+                file_path: Some("/plan.md".into()),
+                blocks: vec![PlanBlockView {
+                    kind: BlockKind::Paragraph,
+                    content: iced::widget::text_editor::Content::with_text("hello"),
+                    spans: Vec::new(),
+                    links: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        );
+        let before = m.plan_docs.get("orch").unwrap().blocks[0].content.text();
+
+        let (m, _) = m.update(Message::PlanEditorAction {
+            orchestrator_id: "orch".into(),
+            block: 0,
+            action: Action::Edit(Edit::Insert('x')),
+        });
+        assert_eq!(
+            m.plan_docs.get("orch").unwrap().blocks[0].content.text(),
+            before,
+            "an Edit action must never mutate a read-only plan doc"
+        );
+
+        let (m, _) = m.update(Message::PlanEditorAction {
+            orchestrator_id: "orch".into(),
+            block: 0,
+            action: Action::SelectAll,
+        });
+        assert_eq!(m.plan_docs.get("orch").unwrap().blocks[0].content.text(), before);
+    }
+
     #[test]
     fn active_sessions_non_split_panel_does_not_widen_background_sessions() {
         use crate::components::session_detail::DetailPanel;
@@ -6657,8 +7422,10 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
-            };
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
+        };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
@@ -6740,7 +7507,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (m, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         let (m, _) = m.update(Message::NavigateSession("s1".into()));
@@ -6794,8 +7563,10 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
-            };
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
+        };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
@@ -6894,8 +7665,10 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
-            };
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
+        };
             let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
             m = next;
         }
@@ -6925,33 +7698,192 @@ mod tests {
         assert!(matches!(m.view, View::FleetBoard { .. }));
     }
 
-    /// Serializes tests that mutate process-global env vars (`NINOX_CONFIG`)
-    /// against each other — `cargo test` runs test fns on parallel threads,
-    /// so without this guard one test's env mutation could leak into
-    /// another's read.
-    static ENV_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Set `key=value` for the duration of `f`, restoring the prior value
-    /// (or unsetting it) afterward. Serialized via `ENV_TEST_GUARD` since
-    /// env vars are process-global state shared across parallel test
-    /// threads. Mirrors `ninox_core::config::tests::with_env_override`.
-    fn with_env_override<T>(
-        key: &str,
-        value: impl AsRef<std::ffi::OsStr>,
-        f: impl FnOnce() -> T,
-    ) -> T {
-        let _guard = ENV_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var(key).ok();
-        std::env::set_var(key, value);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-
-        match prior {
-            Some(v) => std::env::set_var(key, v),
-            None    => std::env::remove_var(key),
-        }
-        result.unwrap()
+    /// The zoom modifier: Cmd (⌘, `LOGO`) on macOS, Ctrl elsewhere — the
+    /// combination `Modifiers::command()` reports as pressed.
+    fn zoom_mods() -> iced::keyboard::Modifiers {
+        #[cfg(target_os = "macos")]
+        { iced::keyboard::Modifiers::LOGO }
+        #[cfg(not(target_os = "macos"))]
+        { iced::keyboard::Modifiers::CTRL }
     }
+
+    /// Press `ch` with the platform zoom modifier held.
+    fn press_cmd(app: App, ch: &str) -> App {
+        let (next, _) = app.update(Message::RawKey {
+            key:       iced::keyboard::Key::Character(ch.into()),
+            modifiers: zoom_mods(),
+            text:      Some(ch.to_string()),
+        });
+        next
+    }
+
+    fn approx(a: f64, b: f64) -> bool { (a - b).abs() < 1e-9 }
+
+    #[test]
+    fn cmd_zoom_steps_and_persists() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("zoom_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            assert!(approx(m.zoom, 1.0));
+            // '+' zooms in by one step.
+            let m = press_cmd(m, "+");
+            assert!(approx(m.zoom, 1.1), "got {}", m.zoom);
+            // '=' also zooms in (on many layouts '+' is Shift+'=').
+            let m = press_cmd(m, "=");
+            assert!(approx(m.zoom, 1.2), "got {}", m.zoom);
+            // Mirrored into config and persisted to disk.
+            assert!(approx(m.config.zoom, 1.2));
+            let loaded = ninox_core::config::AppConfig::load().unwrap();
+            assert!(approx(loaded.zoom, 1.2), "persisted {}", loaded.zoom);
+            // '-' zooms out; '0' resets.
+            let m = press_cmd(m, "-");
+            assert!(approx(m.zoom, 1.1), "got {}", m.zoom);
+            let m = press_cmd(m, "0");
+            assert!(approx(m.zoom, 1.0), "got {}", m.zoom);
+            assert!(approx(ninox_core::config::AppConfig::load().unwrap().zoom, 1.0));
+        });
+    }
+
+    #[test]
+    fn cmd_zoom_clamps_to_range() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("zoom_clamp_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let mut m = base(test_engine());
+            for _ in 0..40 { m = press_cmd(m, "-"); }
+            assert!(approx(m.zoom, ZOOM_MIN), "min clamp got {}", m.zoom);
+            for _ in 0..60 { m = press_cmd(m, "+"); }
+            assert!(approx(m.zoom, ZOOM_MAX), "max clamp got {}", m.zoom);
+        });
+    }
+
+    #[test]
+    fn zoom_keys_survive_focused_terminal() {
+        // With a terminal/split panel focused the terminal normally
+        // swallows keystrokes; zoom must be intercepted first.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("zoom_terminal_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let mut m = base(test_engine());
+            m.view = View::SessionDetail {
+                session_id: "s1".into(),
+                panel: crate::components::session_detail::DetailPanel::Terminal,
+            };
+            let m = press_cmd(m, "+");
+            assert!(approx(m.zoom, 1.1), "terminal swallowed zoom key: {}", m.zoom);
+        });
+    }
+
+    /// Regression test: the `Message::RawKey` handler's `terminal_capturing`
+    /// gate listed only `DetailPanel::Terminal | DetailPanel::Split`, so a
+    /// bare keystroke with the Plan tab open fell through to the "no
+    /// terminal focused" branch and got hijacked as a `1`/`2`/`3`/`t`
+    /// navigation/theme shortcut instead of reaching the terminal — the
+    /// reported "can't type in the terminal with Plan open" bug.
+    /// `DetailPanel::Plan` must capture bare keys exactly like `Split` does.
+    #[test]
+    fn plan_panel_keeps_capturing_bare_keys_for_the_terminal() {
+        let mut m = base(test_engine());
+        m.view = View::SessionDetail {
+            session_id: "orch1".into(),
+            panel: crate::components::session_detail::DetailPanel::Plan,
+        };
+        let m = press(m, "1");
+        assert!(
+            matches!(
+                m.view,
+                View::SessionDetail {
+                    panel: crate::components::session_detail::DetailPanel::Plan,
+                    ..
+                }
+            ),
+            "a bare key with the Plan tab open must not be hijacked by the \
+             navigation-shortcut branch: {:?}",
+            m.view
+        );
+    }
+
+    /// Complements `plan_panel_keeps_capturing_bare_keys_for_the_terminal`:
+    /// that test only proves the `terminal_capturing` gate (guarding the
+    /// bare 1/2/3/t shortcuts) includes `DetailPanel::Plan` — it can't tell
+    /// "the key reached the terminal" apart from "the key was silently
+    /// dropped", since `state.view` is unaffected either way. This exercises
+    /// the actual PTY-write gate end to end against a real tmux pane.
+    #[tokio::test]
+    async fn raw_key_reaches_the_pty_when_the_plan_tab_is_open() {
+        fn tmux_available() -> bool {
+            std::process::Command::new("tmux").args(["-V"]).output()
+                .map(|o| o.status.success()).unwrap_or(false)
+        }
+        if !tmux_available() { return; }
+
+        let e = test_engine();
+        let m = base(e);
+        let sid = format!(
+            "plan-rawkey-test-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+        );
+        ninox_core::tmux::create_session(&sid, "/tmp", "cat", &[]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let (mut m, _) = m.update(Message::NavigateSession(sid.clone()));
+        let argv = ninox_core::tmux::attach_args(&sid).await;
+        let (m2, _) = m.update(Message::ClientAttach { session_id: sid.clone(), argv, initial_tail: None });
+        m = m2;
+        assert!(m.clients.contains_key(&sid), "attach must succeed");
+
+        m.view = View::SessionDetail {
+            session_id: sid.clone(),
+            panel: crate::components::session_detail::DetailPanel::Plan,
+        };
+
+        // Bound (not discarded): dropping the returned `App` would drop its
+        // `AttachedClient`, killing the PTY attach before the byte we just
+        // queued has a chance to land. Keep it alive past the capture below.
+        let (_m, _) = m.update(Message::RawKey {
+            key:       iced::keyboard::Key::Character("z".into()),
+            modifiers: iced::keyboard::Modifiers::default(),
+            text:      Some("z".into()),
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let captured = ninox_core::tmux::capture_history(&sid, 0, 5).await;
+        let text = String::from_utf8_lossy(&captured);
+        assert!(
+            text.contains('z'),
+            "a keystroke with the Plan tab open must reach the PTY: {text:?}"
+        );
+
+        ninox_core::tmux::kill_session(&sid).await.unwrap();
+    }
+
+    #[test]
+    fn out_of_range_config_zoom_normalized_on_load() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("zoom_load_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            // Persist a config with an out-of-range zoom, as a hand-edit would.
+            let cfg = ninox_core::config::AppConfig { zoom: 99.0, ..Default::default() };
+            cfg.save().unwrap();
+
+            let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
+            let (app, _task) = App::new(
+                test_engine(),
+                std::path::PathBuf::from("/tmp"),
+                ninox_core::config::AgentConfig::default(),
+                brain,
+                std::path::PathBuf::from("/tmp/t.db"),
+            );
+            // Both the runtime value AND the in-memory config are clamped, so
+            // a later config.save() (e.g. a theme change) cannot re-persist
+            // the invalid value — disk and runtime stay in sync.
+            assert!(approx(app.zoom, ZOOM_MAX), "runtime zoom {}", app.zoom);
+            assert!(approx(app.config.zoom, ZOOM_MAX), "config zoom {}", app.config.zoom);
+        });
+    }
+
+    use crate::test_fixtures::with_env_override;
 
     #[test]
     fn t_toggles_light_dark() {
@@ -6973,6 +7905,112 @@ mod tests {
     }
 
     #[test]
+    fn toggle_sidebar_flips_and_persists_hidden_state() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("toggle_sidebar_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            assert!(!m.sidebar_hidden);
+            let (m, _) = m.update(Message::ToggleSidebar);
+            assert!(m.sidebar_hidden);
+            // Persisted: a fresh load sees the hidden state too.
+            assert!(ninox_core::config::AppConfig::load().unwrap().sidebar_hidden);
+            let (m, _) = m.update(Message::ToggleSidebar);
+            assert!(!m.sidebar_hidden);
+            assert!(!ninox_core::config::AppConfig::load().unwrap().sidebar_hidden);
+        });
+    }
+
+    #[test]
+    fn cmd_b_toggles_sidebar() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("cmd_b_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            let (m, _) = m.update(Message::RawKey {
+                key:       iced::keyboard::Key::Character("b".into()),
+                modifiers: iced::keyboard::Modifiers::COMMAND,
+                text:      Some("b".to_string()),
+            });
+            assert!(m.sidebar_hidden, "Cmd/Ctrl+B should collapse the sidebar");
+        });
+    }
+
+    #[test]
+    fn sidebar_width_persists_on_drag_release() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("sidebar_width_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let mut m = base(test_engine());
+            // Simulate an in-flight sidebar drag that settled at 305px.
+            m.drag = Some(DragTarget::Sidebar);
+            m.sidebar_width = 305.0;
+            let (_m, _) = m.update(Message::MouseReleased);
+            let loaded = ninox_core::config::AppConfig::load().unwrap();
+            assert_eq!(loaded.sidebar_width, 305.0);
+        });
+    }
+
+    #[test]
+    fn startup_restores_persisted_sidebar_geometry_clamped() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("restore_sidebar_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            // An over-range width must clamp into the 150–400 drag band; the
+            // hidden flag round-trips verbatim.
+            let cfg = ninox_core::config::AppConfig {
+                sidebar_width: 999.0,
+                sidebar_hidden: true,
+                ..ninox_core::config::AppConfig::default()
+            };
+            cfg.save().unwrap();
+
+            let store = Arc::new(Store::open(dir.path().join("t.db")).unwrap());
+            let engine = Engine::new(store);
+            let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
+            let (app, _task) = App::new(
+                engine,
+                std::path::PathBuf::from("/tmp"),
+                ninox_core::config::AgentConfig::default(),
+                brain,
+                std::path::PathBuf::from("/tmp/t.db"),
+            );
+            assert_eq!(app.sidebar_width, 400.0);
+            assert!(app.sidebar_hidden);
+            // The in-memory config that a later `config.save()` writes back
+            // must hold the clamped width too — not the raw out-of-range
+            // 999.0 — so disk never drifts from what the UI renders.
+            assert_eq!(app.config.sidebar_width, 400.0);
+        });
+    }
+
+    #[test]
+    fn startup_clamps_below_range_width() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("restore_sidebar_low_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let cfg = ninox_core::config::AppConfig {
+                sidebar_width: 10.0,
+                ..ninox_core::config::AppConfig::default()
+            };
+            cfg.save().unwrap();
+
+            let store = Arc::new(Store::open(dir.path().join("t.db")).unwrap());
+            let engine = Engine::new(store);
+            let brain = Arc::new(BrainIndex::open(tempdir().unwrap().keep()).unwrap());
+            let (app, _task) = App::new(
+                engine,
+                std::path::PathBuf::from("/tmp"),
+                ninox_core::config::AgentConfig::default(),
+                brain,
+                std::path::PathBuf::from("/tmp/t.db"),
+            );
+            assert_eq!(app.sidebar_width, 150.0);
+            assert_eq!(app.config.sidebar_width, 150.0);
+        });
+    }
+
+    #[test]
     fn toggling_a_harness_enables_it_and_persists() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("toggle_harness_config.toml");
@@ -6989,6 +8027,47 @@ mod tests {
             // toggling back disables
             let (m, _) = m.update(Message::SettingsToggleHarness("codex".into()));
             assert!(!m.config.registry().enabled_names().contains(&"codex".to_string()));
+        });
+    }
+
+    #[test]
+    fn choosing_the_session_runtime_persists_it() {
+        use ninox_core::runtime::Backend;
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("runtime_backend_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            assert_eq!(m.config.runtime.backend, Backend::Tmux);
+            // Tmux needs no host, so this stays a pure config write.
+            let (m, _) = m.update(Message::SettingsSetRuntimeBackend(Backend::Tmux));
+            assert_eq!(m.config.runtime.backend, Backend::Tmux);
+            let mut m = m;
+            m.config.runtime.backend = Backend::Ptyd;
+            m.config.save().unwrap();
+            assert_eq!(ninox_core::config::AppConfig::load().unwrap().runtime.backend, Backend::Ptyd);
+            let (m, _) = m.update(Message::SettingsSetRuntimeBackend(Backend::Tmux));
+            assert_eq!(m.config.runtime.backend, Backend::Tmux);
+            assert_eq!(ninox_core::config::AppConfig::load().unwrap().runtime.backend, Backend::Tmux);
+        });
+    }
+
+    #[test]
+    fn settings_changes_keep_edits_made_on_disk_meanwhile() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("concurrent_edit_config.toml");
+        with_env_override("NINOX_CONFIG", &config_path, || {
+            let m = base(test_engine());
+            // `nx`'s settings form writes the file while the app is open.
+            let mut on_disk = ninox_core::config::AppConfig::load().unwrap();
+            on_disk.tui.prefix = "C-a".into();
+            on_disk.save().unwrap();
+
+            let (m, _) = m.update(Message::SettingsTogglePrWatch);
+            let (m, _) = m.update(Message::SettingsSetRuntimeBackend(ninox_core::runtime::Backend::Tmux));
+            let loaded = ninox_core::config::AppConfig::load().unwrap();
+            assert!(loaded.pr_watch.enabled);
+            assert_eq!(loaded.tui.prefix, "C-a", "the app must not write back its stale copy");
+            assert_eq!(m.config.tui.prefix, "C-a", "the app adopts what it saved");
         });
     }
 
@@ -7016,6 +8095,7 @@ mod tests {
                 std::path::PathBuf::from("/tmp"),
                 ninox_core::config::AgentConfig::default(),
                 brain,
+                std::path::PathBuf::from("/tmp/t.db"),
             );
 
             let (app, _) = app.update(Message::SettingsToggleRustCache);
@@ -7209,6 +8289,105 @@ mod tests {
             text:      None,
         });
         assert!(m.catalogue_modal.is_none());
+    }
+
+    fn live_session(id: &str) -> Session {
+        Session { status: SessionStatus::Working, ..refile_session(id) }
+    }
+
+    #[test]
+    fn request_restart_all_noops_without_live_agents() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::RequestRestartAll);
+        assert!(!m.restart_all_confirm, "nothing live — no point confirming");
+    }
+
+    #[test]
+    fn request_restart_all_opens_the_confirm_modal_with_a_live_agent() {
+        let mut m = base(test_engine());
+        m.sessions.insert("s1".into(), live_session("s1"));
+        let (m, _) = m.update(Message::RequestRestartAll);
+        assert!(m.restart_all_confirm);
+    }
+
+    #[test]
+    fn cancel_and_esc_both_close_the_restart_all_modal() {
+        let mut m = base(test_engine());
+        m.sessions.insert("s1".into(), live_session("s1"));
+
+        let (m, _) = m.update(Message::RequestRestartAll);
+        assert!(m.restart_all_confirm);
+        let (m, _) = m.update(Message::CancelRestartAll);
+        assert!(!m.restart_all_confirm);
+
+        let (m, _) = m.update(Message::RequestRestartAll);
+        let (m, _) = m.update(Message::RawKey {
+            key:       iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+            modifiers: iced::keyboard::Modifiers::default(),
+            text:      None,
+        });
+        assert!(!m.restart_all_confirm);
+    }
+
+    #[test]
+    fn confirm_restart_all_closes_the_modal_and_marks_in_progress() {
+        let mut m = base(test_engine());
+        m.sessions.insert("s1".into(), live_session("s1"));
+        let (m, _) = m.update(Message::RequestRestartAll);
+        let (m, _) = m.update(Message::ConfirmRestartAll);
+        assert!(!m.restart_all_confirm);
+        assert!(m.restart_all_in_progress);
+
+        // A second confirm while one is already running must not kick off
+        // a duplicate batch — same guard `ApplyUpdate` uses.
+        let (m, _) = m.update(Message::ConfirmRestartAll);
+        assert!(m.restart_all_in_progress);
+    }
+
+    #[test]
+    fn restart_all_applied_pushes_a_completed_notification_on_a_clean_sweep() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::ConfirmRestartAll);
+        let outcomes = vec![crate::restart::RestartOutcome {
+            session_id: "w1".into(),
+            result: crate::restart::RestartResult::Restarted(crate::restart::RestartedVia::Resumed),
+        }];
+        let (m, _) = m.update(Message::RestartAllApplied(Ok(outcomes)));
+        assert!(!m.restart_all_in_progress);
+        let n = m.notifications.front().expect("a notification was pushed");
+        assert_eq!(n.kind, NotificationKind::RestartAllCompleted);
+        assert_eq!(n.body, "restarted 1 agent");
+    }
+
+    #[test]
+    fn restart_all_applied_pushes_a_failed_notification_on_partial_failure() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::ConfirmRestartAll);
+        let outcomes = vec![
+            crate::restart::RestartOutcome {
+                session_id: "w1".into(),
+                result: crate::restart::RestartResult::Restarted(crate::restart::RestartedVia::Resumed),
+            },
+            crate::restart::RestartOutcome {
+                session_id: "w2".into(),
+                result: crate::restart::RestartResult::Failed("launch failed".into()),
+            },
+        ];
+        let (m, _) = m.update(Message::RestartAllApplied(Ok(outcomes)));
+        let n = m.notifications.front().expect("a notification was pushed");
+        assert_eq!(n.kind, NotificationKind::RestartAllFailed);
+        assert_eq!(n.body, "restarted 1/2 agents; failed: w2");
+    }
+
+    #[test]
+    fn restart_all_applied_pushes_a_failed_notification_on_error() {
+        let m = base(test_engine());
+        let (m, _) = m.update(Message::ConfirmRestartAll);
+        let (m, _) = m.update(Message::RestartAllApplied(Err("db unavailable".into())));
+        assert!(!m.restart_all_in_progress);
+        let n = m.notifications.front().expect("a notification was pushed");
+        assert_eq!(n.kind, NotificationKind::RestartAllFailed);
+        assert_eq!(n.body, "db unavailable");
     }
 
     #[test]
@@ -7741,7 +8920,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         let (next, _) = m.update(Message::EngineEvent(Box::new(Event::SessionSpawned(s))));
         m = next;
@@ -7770,97 +8951,5 @@ mod tests {
             matches!(m.view, View::PrList),
             "\"1\" must not navigate while the spawn modal is open"
         );
-    }
-
-    #[tokio::test]
-    async fn spawn_skill_teaches_work_request_handling() {
-        let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
-
-        let skill = std::fs::read_to_string(
-            root.join(".claude").join("skills").join("spawn-worker").join("SKILL.md"),
-        ).unwrap();
-        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
-        assert!(skill.contains("name: spawn-worker"));
-        assert!(skill.contains("description:"));
-        assert!(skill.contains("--delivery pr"));
-        assert!(skill.contains("--delivery direct"));
-        assert!(skill.contains("primary repository checkout"));
-        assert!(skill.contains("<repo>-w1"));
-        assert!(
-            skill.contains("request-work"),
-            "skill must explain the worker→orchestrator work-request channel"
-        );
-        assert!(
-            skill.contains("spawn a new worker") || skill.contains("spawn a dedicated worker"),
-            "skill must tell the orchestrator to spawn a worker for requested work"
-        );
-        assert!(
-            skill.to_lowercase().contains("never") && skill.to_lowercase().contains("widen"),
-            "skill must forbid widening an existing worker's scope"
-        );
-    }
-
-    #[tokio::test]
-    async fn set_agent_config_skill_has_frontmatter() {
-        let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
-
-        let skill = std::fs::read_to_string(
-            root.join(".claude").join("skills").join("set-agent-config").join("SKILL.md"),
-        ).unwrap();
-        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
-        assert!(skill.contains("name: set-agent-config"));
-        assert!(skill.contains("description:"));
-    }
-
-    #[tokio::test]
-    async fn setup_orchestrator_root_seeds_brain_skill() {
-        let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
-
-        let skill_path = root.join(".claude").join("skills").join("brain").join("SKILL.md");
-        let skill = std::fs::read_to_string(&skill_path).unwrap();
-        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
-        assert!(skill.contains("name: brain"));
-        assert!(skill.contains("description:"));
-        assert!(skill.contains("ninox brain query"));
-        assert!(skill.contains("ninox brain index"));
-        assert!(skill.contains("ninox brain show"));
-        assert!(skill.contains("blends keyword and semantic matches"));
-
-        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
-        assert!(
-            agents_md.contains(&skill_path.display().to_string()),
-            "AGENTS.md should point orchestrators at the brain skill"
-        );
-    }
-
-    #[tokio::test]
-    async fn setup_orchestrator_root_configures_statusline() {
-        let root = tempdir().unwrap().keep();
-        setup_orchestrator_root(&root, "/path/to/ninox", "/cfg.toml").await.unwrap();
-
-        let settings: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(root.join(".claude").join("settings.json")).unwrap(),
-        ).unwrap();
-        assert_eq!(settings["statusLine"]["type"], "command");
-        assert_eq!(settings["statusLine"]["command"], "'/path/to/ninox' statusline");
-        assert_eq!(settings["statusLine"]["refreshInterval"], 20);
-        // The existing subagent-blocker hook must still be present.
-        assert!(settings["hooks"]["PreToolUse"].is_array());
-    }
-
-    #[tokio::test]
-    async fn setup_orchestrator_root_never_overwrites_existing_settings_json() {
-        let root = tempdir().unwrap().keep();
-        let claude_dir = root.join(".claude");
-        std::fs::create_dir_all(&claude_dir).unwrap();
-        std::fs::write(claude_dir.join("settings.json"), r#"{"userCustom": true}"#).unwrap();
-
-        setup_orchestrator_root(&root, "ninox", "/cfg.toml").await.unwrap();
-
-        let contents = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
-        assert_eq!(contents, r#"{"userCustom": true}"#, "pre-existing settings.json must be left byte-for-byte alone");
     }
 }

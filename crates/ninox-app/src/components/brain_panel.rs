@@ -219,9 +219,9 @@ pub fn resolve_link<'a>(entries: &'a [BrainEntry], link: &str) -> Option<&'a Bra
 }
 
 /// (category, count), taxonomy order first, then alphabetic for unknown types.
-pub fn categories(entries: &[BrainEntry]) -> Vec<(String, usize)> {
+pub fn categories<E: std::borrow::Borrow<BrainEntry>>(entries: &[E]) -> Vec<(String, usize)> {
     let mut counts: std::collections::HashMap<&str, usize> = Default::default();
-    for e in entries { *counts.entry(e.entry_type.as_str()).or_default() += 1; }
+    for e in entries { *counts.entry(e.borrow().entry_type.as_str()).or_default() += 1; }
     let mut out: Vec<(String, usize)> = Vec::new();
     for t in TAXONOMY {
         if let Some(n) = counts.remove(t) { out.push(((*t).to_string(), n)); }
@@ -472,6 +472,8 @@ fn hover_preview_slip<'a>(s: &'a ColorScheme, entry: &'a BrainEntry) -> Element<
         .into()
 }
 
+/// Pinboard mode: the same drawers rail catalogue mode uses, beside the
+/// specimen-board canvas.
 fn pinboard_body(app: &App) -> Element<'_, Message> {
     let s = &app.scheme;
 
@@ -520,12 +522,14 @@ fn catalogue_body(app: &App) -> Element<'_, Message> {
 fn drawers_rail(app: &App) -> Element<'_, Message> {
     let s = &app.scheme;
 
-    let filtered_entries: Vec<BrainEntry> = app
+    // Borrowed, not cloned: the pinboard's 60Hz physics subscription
+    // re-renders this rail every frame, and `BrainEntry` carries each
+    // note's full markdown body.
+    let filtered_entries: Vec<&BrainEntry> = app
         .brain_view
         .entries
         .iter()
         .filter(|e| matches_filter(e, &app.brain_view.filter))
-        .cloned()
         .collect();
 
     let body: Element<Message> = if filtered_entries.is_empty() {
@@ -562,7 +566,7 @@ fn drawer<'a>(
     app: &'a App,
     cat: &str,
     count: usize,
-    filtered_entries: &[BrainEntry],
+    filtered_entries: &[&BrainEntry],
 ) -> Element<'a, Message> {
     let s = &app.scheme;
     let color = category_color(s, cat);
@@ -603,7 +607,7 @@ fn drawer<'a>(
 
     if is_open {
         let mut entries: Vec<&BrainEntry> =
-            filtered_entries.iter().filter(|e| e.entry_type == cat).collect();
+            filtered_entries.iter().copied().filter(|e| e.entry_type == cat).collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         children.extend(entries.into_iter().map(|e| dentry_row(app, e)));
     }
@@ -613,35 +617,42 @@ fn drawer<'a>(
     column(children).into()
 }
 
-/// One entry in an open drawer. Selected = accent 3px left bar + `card` bg
-/// + `MONO_MEDIUM`; hovered = `paper_2` bg (visibly distinct from the
-///   transparent resting state) — an old regression collapsed hover to a
-///   no-op, so this must render differently in all three states. Also
-///   dispatches `BrainHoverEntry` on mouse-enter/exit so the pinboard
-///   canvas's hover ring/preview slip react to a drawer hover the same way
-///   they react to hovering the node directly — a no-op in Catalogue mode,
-///   which doesn't read `hovered`.
+/// One drawer entry row. An old regression collapsed hover to a no-op, so
+/// all four states — resting, local-hover, cross-hover, selected — must
+/// stay visually distinct from each other. Also dispatches
+/// `BrainHoverEntry` on mouse-enter/exit so the pinboard canvas's hover
+/// ring/preview slip react to a drawer hover the same way they react to
+/// hovering the node directly — a no-op in Catalogue mode, which doesn't
+/// read `hovered`.
 fn dentry_row<'a>(app: &'a App, entry: &BrainEntry) -> Element<'a, Message> {
     let s = &app.scheme;
     let is_selected = app.brain_view.selected.as_deref() == Some(entry.id.as_str());
+    // Hovered via the *pinboard* canvas, not this row's own mouse-over —
+    // rendered as a lighter tint so it reads differently from both the
+    // selected accent bar and the local button-hover background below.
+    let is_cross_hovered =
+        !is_selected && app.brain_view.hovered.as_deref() == Some(entry.id.as_str());
     let id = entry.id.clone();
     let hover_id = entry.id.clone();
     let name = entry.name.clone();
+    let dot_color = category_color(s, &entry.entry_type);
     let updated: String = entry.updated.as_deref().unwrap_or("").chars().take(10).collect();
     let bar_color = if is_selected { s.accent } else { Color::TRANSPARENT };
 
-    let row = button(
+    let row_button = button(
         row![
             vline(bar_color, 3.0),
             container(
                 row![
+                    text("●").size(8).color(dot_color),
+                    Space::new(8, 0),
                     text(name).size(10.5).font(if is_selected { MONO_MEDIUM } else { MONO }),
                     Space::new(Length::Fill, 0),
                     text(updated).size(8.5).font(MONO).color(s.faint),
                 ]
                 .align_y(Alignment::Center),
             )
-            .padding(iced::Padding { top: 4.0, right: 16.0, bottom: 4.0, left: 44.0 })
+            .padding(iced::Padding { top: 4.0, right: 16.0, bottom: 4.0, left: 36.0 })
             .width(Length::Fill),
         ]
         .height(Length::Fixed(22.0)),
@@ -652,10 +663,15 @@ fn dentry_row<'a>(app: &'a App, entry: &BrainEntry) -> Element<'a, Message> {
     .style(move |_theme, status| {
         let hovered = matches!(status, button::Status::Hovered);
         button::Style {
+            // `hovered` is checked before `is_cross_hovered` because the
+            // `mouse_area` below drives `brain_view.hovered` too, so a
+            // plain local hover makes both true — local hover wins.
             background: Some(Background::Color(if is_selected {
                 s.card
             } else if hovered {
                 s.paper_2
+            } else if is_cross_hovered {
+                Color { a: 0.45, ..s.paper_2 }
             } else {
                 Color::TRANSPARENT
             })),
@@ -665,8 +681,8 @@ fn dentry_row<'a>(app: &'a App, entry: &BrainEntry) -> Element<'a, Message> {
         }
     });
 
-    mouse_area(row)
-        .on_enter(Message::BrainHoverEntry(Some(hover_id)))
+    mouse_area(row_button)
+        .on_enter(Message::BrainHoverEntry(Some(hover_id.clone())))
         .on_exit(Message::BrainHoverEntry(None))
         .into()
 }

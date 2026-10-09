@@ -56,7 +56,7 @@ A brain directory becomes remote-backed by a `.sync.toml` file inside
 it, next to `.index.db` (and, like it, gitignored and never synced):
 
 ```toml
-remote = "s3://synthesia-brains/team"
+remote = "s3://example-brains/team"
 endpoint = "https://<accountid>.r2.cloudflarestorage.com"  # optional
 region = "eu-west-1"                                        # optional
 cache_ttl_secs = 0   # 0 (default) = freshness-check every lookup
@@ -74,7 +74,7 @@ brain) gain the same optional fields:
 [[brain.catalogues]]
 name = "team"
 path = "~/.config/ninox/brains/team"
-remote = "s3://synthesia-brains/team"
+remote = "s3://example-brains/team"
 endpoint = "..."       # optional
 region = "..."         # optional
 cache_ttl_secs = 0     # optional

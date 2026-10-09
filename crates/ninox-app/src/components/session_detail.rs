@@ -1,5 +1,5 @@
 use iced::{
-    widget::{button, column, container, row, scrollable, text, Space},
+    widget::{button, column, container, row, scrollable, text, tooltip, Space},
     Alignment, Background, Border, Color, Element, Length, Padding,
 };
 
@@ -196,6 +196,10 @@ pub enum DetailPanel {
     Info,
     Inspector,
     Diff,
+    /// Orchestrator-only: terminal + the registered plan doc, side by side —
+    /// the same layout/resize mechanics as `Split`, with `plan_pane`
+    /// instead of `info_pane`.
+    Plan,
 }
 
 /// Diff view — unified `git diff` text for the session's workspace
@@ -457,6 +461,53 @@ pub fn session_detail<'a>(
                 )
             })
     };
+    // Neovim is a terminal editor with nowhere to run from the desktop app
+    // (see `crate::editor::is_terminal`): the button is disabled rather than
+    // spawning it detached, with a tooltip explaining where it does work.
+    let editor_is_terminal = crate::editor::is_terminal(app.config.editor);
+    let open_in_editor_btn: Element<Message> = {
+        let workspace = session.workspace_path.clone();
+        let can_open = workspace.is_some() && !editor_is_terminal;
+        let label_color = if can_open { s.accent } else { s.faint };
+        let press = if can_open { workspace.map(Message::OpenInEditor) } else { None };
+        let btn = button(crate::style::micro_label("Open in editor", label_color).size(10.0))
+            .on_press_maybe(press)
+            .padding([6, 16])
+            .style(move |_theme, status| {
+                let hovered = can_open && matches!(status, button::Status::Hovered);
+                button::Style {
+                    background: hovered.then_some(Background::Color(s.accent)),
+                    text_color: if hovered { s.card } else { label_color },
+                    border: Border {
+                        color: if can_open { s.accent } else { s.rule_dark },
+                        width: 1.5,
+                        radius: 2.0.into(),
+                    },
+                    shadow: crate::style::hard_shadow(s, 2.0, 2.0, crate::style::shadow_alpha(s).0),
+                }
+            });
+        if editor_is_terminal {
+            let (card_a, _, _) = crate::style::shadow_alpha(s);
+            let body = container(
+                text("Neovim is a terminal editor — open this workspace from the nx TUI's e key instead")
+                    .size(11)
+                    .font(crate::style::SANS)
+                    .color(s.ink_2),
+            )
+            .width(Length::Fixed(220.0))
+            .padding([10, 12])
+            .style(move |_theme| container::Style {
+                background: Some(Background::Color(s.paper_2)),
+                border: Border { color: s.ink, width: 1.5, radius: 2.0.into() },
+                shadow: crate::style::hard_shadow(s, 3.0, 3.0, card_a),
+                ..Default::default()
+            });
+            tooltip(btn, body, tooltip::Position::Top).gap(6).into()
+        } else {
+            btn.into()
+        }
+    };
+
     let resume_btn: Element<Message> =
         if can_resume(
             session,
@@ -515,6 +566,8 @@ pub fn session_detail<'a>(
             Space::new(14, 0),
             refile_btn,
             Space::new(10, 0),
+            open_in_editor_btn,
+            Space::new(10, 0),
             resume_btn,
             Space::new(10, 0),
             kill_btn,
@@ -530,31 +583,37 @@ pub fn session_detail<'a>(
     });
 
     // ── Panel tabs ────────────────────────────────────────────────────────────
-    let tabs_block: Element<Message> = if is_orchestrator {
-        Space::new(0, 0).into()
+    // Orchestrator sessions get a reduced tab set (no Split/Info/Inspector/
+    // Diff — those are worker/PR concepts) plus the orchestrator-only Plan
+    // tab.
+    let tab_row: Element<Message> = if is_orchestrator {
+        row![
+            panel_btn(app, "Terminal", DetailPanel::Terminal, *panel),
+            panel_btn(app, "Plan", DetailPanel::Plan, *panel),
+        ]
+        .spacing(22)
+        .align_y(Alignment::Center)
+        .into()
     } else {
-        container(
-            column![
-                row![
-                    panel_btn(app, "Terminal", DetailPanel::Terminal, *panel),
-                    panel_btn(app, "Split", DetailPanel::Split, *panel),
-                    panel_btn(app, "Info", DetailPanel::Info, *panel),
-                    panel_btn(app, "Inspector", DetailPanel::Inspector, *panel),
-                    panel_btn(app, "Diff", DetailPanel::Diff, *panel),
-                ]
-                .spacing(22)
-                .align_y(Alignment::Center),
-                crate::style::hline(s.ink, 2.0),
-            ],
-        )
+        row![
+            panel_btn(app, "Terminal", DetailPanel::Terminal, *panel),
+            panel_btn(app, "Split", DetailPanel::Split, *panel),
+            panel_btn(app, "Info", DetailPanel::Info, *panel),
+            panel_btn(app, "Inspector", DetailPanel::Inspector, *panel),
+            panel_btn(app, "Diff", DetailPanel::Diff, *panel),
+        ]
+        .spacing(22)
+        .align_y(Alignment::Center)
+        .into()
+    };
+    let tabs_block: Element<Message> = container(column![tab_row, crate::style::hline(s.ink, 2.0)])
         .padding(Padding { top: 10.0, right: 28.0, bottom: 0.0, left: 28.0 })
         .width(Length::Fill)
         .style(move |_theme| container::Style {
             background: Some(Background::Color(s.card)),
             ..Default::default()
         })
-        .into()
-    };
+        .into();
 
     // ── Terminal pane ─────────────────────────────────────────────────────────
     let terminal_bg = s.term_bg;
@@ -632,7 +691,7 @@ pub fn session_detail<'a>(
     // ── Info pane ─────────────────────────────────────────────────────────────
     let info_width = app.info_width;
     let info_pane: Element<Message> = container(
-        info_panel(session, pr, ci, comments, s),
+        info_panel(session, pr, ci, comments, &app.comment_editors, s),
     )
     .width(Length::Fixed(info_width))
     .height(Length::Fill)
@@ -644,7 +703,24 @@ pub fn session_detail<'a>(
     .into();
 
     // ── Panel routing ─────────────────────────────────────────────────────────
-    let effective_panel = if is_orchestrator { &DetailPanel::Terminal } else { panel };
+    // Orchestrators only ever see Terminal or Plan; anything else (a stale
+    // `worker_panel` global carried over from a worker session) falls back
+    // to Terminal rather than rendering a worker-only panel for an
+    // orchestrator.
+    let effective_panel = if is_orchestrator {
+        match panel {
+            DetailPanel::Plan => &DetailPanel::Plan,
+            _ => &DetailPanel::Terminal,
+        }
+    } else {
+        // The sticky global `worker_panel` can carry `Plan` over from an
+        // orchestrator session; Plan isn't offered in a worker's tab row,
+        // so fall back to Split rather than showing an always-empty panel.
+        match panel {
+            DetailPanel::Plan => &DetailPanel::Split,
+            _ => panel,
+        }
+    };
     let content: Element<Message> = match effective_panel {
         DetailPanel::Terminal => {
             term_stage(s, term_frame(s, color, tmux_line, status_word, terminal_pane))
@@ -659,6 +735,15 @@ pub fn session_detail<'a>(
         DetailPanel::Info => info_pane,
         DetailPanel::Inspector => inspector_panel(app, session),
         DetailPanel::Diff => diff_panel(app, session_id, s),
+        DetailPanel::Plan => row![
+            term_stage(s, term_frame(s, color, tmux_line, status_word, terminal_pane)),
+            App::drag_handle(DragTarget::InfoPanel, s.rule_dark),
+            container(crate::components::plan_panel::plan_pane(app, session_id, s))
+                .width(Length::Fixed(info_width))
+                .height(Length::Fill),
+        ]
+        .height(Length::Fill)
+        .into(),
     };
 
     column![header, tabs_block, content]
@@ -686,7 +771,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: claude_session_id.map(String::from),
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         }
     }
 

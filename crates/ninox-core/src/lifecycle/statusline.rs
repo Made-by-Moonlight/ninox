@@ -59,31 +59,25 @@ pub fn apply_update(store: &crate::store::Store, payload: &ParsedPayload) -> any
     let Some(workspace) = &payload.workspace_dir else { return Ok(false) };
 
     let sessions = store.list_sessions()?;
-    let Some(mut session) = sessions.into_iter()
+    let Some(session) = sessions.into_iter()
         .find(|s| s.workspace_path.as_deref() == Some(workspace.as_str()))
     else {
         return Ok(false);
     };
 
-    if let Some(cost) = payload.cost_usd {
-        session.cost_usd = cost;
-    }
-    if let Some(pct) = payload.context_used_pct {
-        session.context_used_pct = Some(pct);
-    }
-    if let Some(tokens) = payload.context_total_tokens {
-        session.context_total_tokens = Some(tokens);
-    }
-    if let Some(size) = payload.context_window_size {
-        session.context_window_size = Some(size);
-    }
-    if session.model.is_none() {
-        if let Some(model) = &payload.model {
-            session.model = Some(model.clone());
-        }
-    }
-
-    store.upsert_session(&session)?;
+    // Column-scoped write, not a full-row upsert of `session`: this runs in
+    // a separate process and fires continuously, so a read-modify-write
+    // would revert any poller-owned field (`merged_at`, `status`, …)
+    // written between the `list_sessions` read above and the write below.
+    // See `Store::update_statusline_metrics`.
+    store.update_statusline_metrics(
+        &session.id,
+        payload.cost_usd,
+        payload.context_used_pct,
+        payload.context_total_tokens,
+        payload.context_window_size,
+        payload.model.as_deref(),
+    )?;
     Ok(true)
 }
 
@@ -202,7 +196,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         }
     }
 
@@ -277,6 +273,39 @@ mod tests {
         let s = store.get_session("s1").unwrap().unwrap();
         assert_eq!(s.cost_usd, 5.0);
         assert_eq!(s.context_used_pct, Some(10.0), "untouched, payload didn't carry this field");
+    }
+
+    /// The statusline hook fires continuously from a separate process, so
+    /// its write must be column-scoped — it must never revert a poller-owned
+    /// field like `merged_at` (stamped on a kept-alive merged worker whose
+    /// statusline keeps firing during validation). A full-row upsert of the
+    /// statusline's own snapshot would; a scoped UPDATE doesn't.
+    #[test]
+    fn apply_update_does_not_clobber_merged_at_or_status() {
+        let store = test_store();
+        let mut seed = test_session("s1", "/ws");
+        seed.status = SessionStatus::Mergeable;
+        seed.merged_at = Some(1_000);
+        seed.pr_number = Some(9);
+        store.upsert_session(&seed).unwrap();
+
+        let payload = ParsedPayload {
+            workspace_dir: Some("/ws".into()),
+            cost_usd: Some(3.0),
+            context_used_pct: Some(50.0),
+            ..Default::default()
+        };
+        apply_update(&store, &payload).unwrap();
+
+        let s = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(s.cost_usd, 3.0, "the statusline's own fields are still written");
+        assert_eq!(s.context_used_pct, Some(50.0));
+        assert_eq!(s.merged_at, Some(1_000), "merged_at must survive a statusline write");
+        assert_eq!(s.pr_number, Some(9), "pr_number must survive a statusline write");
+        assert!(
+            matches!(s.status, SessionStatus::Mergeable),
+            "status must survive a statusline write, got {:?}", s.status,
+        );
     }
 
     #[test]

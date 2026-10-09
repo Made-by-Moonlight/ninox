@@ -463,6 +463,10 @@ fn migrate_legacy_worker_incarnations(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+#[path = "store_fleet.rs"]
+mod fleet;
+pub use fleet::{FleetRecord, RecoveryRecord, WorkRequestRow};
+
 pub struct Store {
     conn: Mutex<Connection>,
     allocator_lock_dir: PathBuf,
@@ -616,6 +620,41 @@ impl Store {
                 ON worker_completion_outbox(acknowledged_at,next_attempt_at);
             CREATE INDEX IF NOT EXISTS worker_completion_attempts_completion
                 ON worker_completion_delivery_attempts(completion_id,attempt);
+            CREATE TABLE IF NOT EXISTS pr_watches (
+                repo TEXT NOT NULL, pr_number INTEGER NOT NULL,
+                pr_url TEXT NOT NULL,
+                opener_session_id TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (repo, pr_number, opener_session_id)
+            );
+            CREATE TABLE IF NOT EXISTS orchestrator_runtimes (
+                orchestrator_id TEXT PRIMARY KEY,
+                runtime_id TEXT NOT NULL UNIQUE,
+                server_epoch TEXT NOT NULL,
+                physical_tmux_name TEXT NOT NULL,
+                pane_id TEXT NOT NULL,
+                root_pid INTEGER NOT NULL,
+                root_created_at INTEGER NOT NULL,
+                registered_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS orchestrator_plans (
+                orchestrator_id TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                registered_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session_deps (
+                session_id TEXT NOT NULL,
+                depends_on TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                note TEXT,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (session_id, depends_on, kind)
+            );
+            CREATE TABLE IF NOT EXISTS session_messages (
+                session_id TEXT PRIMARY KEY,
+                delivered_count INTEGER NOT NULL
+            );
         ")?;
         migrate_legacy_worker_incarnations(&mut conn)?;
         // Migrations for columns added after initial release — idempotent so
@@ -631,6 +670,11 @@ impl Store {
             ("summary",              "ALTER TABLE sessions ADD COLUMN summary TEXT"),
             ("terminal_at",          "ALTER TABLE sessions ADD COLUMN terminal_at INTEGER"),
             ("gate_status",          "ALTER TABLE sessions ADD COLUMN gate_status TEXT"),
+            ("merged_at",            "ALTER TABLE sessions ADD COLUMN merged_at INTEGER"),
+            ("activity",             "ALTER TABLE sessions ADD COLUMN activity TEXT"),
+            ("activity_note",        "ALTER TABLE sessions ADD COLUMN activity_note TEXT"),
+            ("activity_since",       "ALTER TABLE sessions ADD COLUMN activity_since INTEGER"),
+            ("machine_id",           "ALTER TABLE sessions ADD COLUMN machine_id TEXT"),
         ] {
             if !Self::column_exists(&conn, "sessions", col)? {
                 conn.execute(ddl, [])?;
@@ -713,6 +757,7 @@ impl Store {
         Self::reclaim_dead_runtime_claims(&mut conn, &allocator_lock_dir)?;
         Self::backfill_legacy_managed_workers(&conn)?;
         Self::remove_orphan_spawning_sessions(&mut conn)?;
+        fleet::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             allocator_lock_dir,
@@ -1032,13 +1077,15 @@ impl Store {
         let gate_status = s.gate_status.as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let activity = serde_json::to_string(&s.activity)?.replace('"', "");
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO sessions (id,orchestrator_id,name,repo,status,agent_type,
              cost_usd,started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id,summary,terminal_at,gate_status)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
+             claude_session_id,summary,terminal_at,gate_status,merged_at,
+             activity,activity_note,activity_since,machine_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)
              ON CONFLICT(id) DO UPDATE SET
              repo=excluded.repo,
              status=excluded.status,cost_usd=excluded.cost_usd,
@@ -1053,14 +1100,20 @@ impl Store {
              claude_session_id=excluded.claude_session_id,
              summary=excluded.summary,
              terminal_at=excluded.terminal_at,
-             gate_status=excluded.gate_status",
+             gate_status=excluded.gate_status,
+             merged_at=excluded.merged_at,
+             activity=excluded.activity,
+             activity_note=excluded.activity_note,
+             activity_since=excluded.activity_since,
+             machine_id=excluded.machine_id",
             params![
                 s.id, s.orchestrator_id, s.name, s.repo, status, s.agent_type,
                 s.cost_usd, s.started_at, s.pr_number, s.pr_id,
                 s.workspace_path, s.pid, s.model, s.context_tokens,
                 s.catalogue_path, s.context_used_pct, s.context_total_tokens,
                 s.context_window_size, s.claude_session_id, s.summary, s.terminal_at,
-                gate_status
+                gate_status, s.merged_at, activity, s.activity_note, s.activity_since,
+                s.machine_id
             ],
         )?;
         Ok(())
@@ -1219,7 +1272,8 @@ impl Store {
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id,summary,terminal_at,gate_status
+             claude_session_id,summary,terminal_at,gate_status,merged_at,
+             activity,activity_note,activity_since,machine_id
              FROM sessions ORDER BY started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1246,6 +1300,11 @@ impl Store {
                 r.get::<_, Option<String>>(19)?,
                 r.get::<_, Option<i64>>(20)?,
                 r.get::<_, Option<String>>(21)?,
+                r.get::<_, Option<i64>>(22)?,
+                r.get::<_, Option<String>>(23)?,
+                r.get::<_, Option<String>>(24)?,
+                r.get::<_, Option<i64>>(25)?,
+                r.get::<_, Option<String>>(26)?,
             ))
         })?;
         rows.map(|r| {
@@ -1253,7 +1312,8 @@ impl Store {
                  cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                  model, context_tokens, catalogue_path, context_used_pct,
                  context_total_tokens, context_window_size, claude_session_id,
-                 summary, terminal_at, gate_status_str) = r?;
+                 summary, terminal_at, gate_status_str, merged_at,
+                 activity_str, activity_note, activity_since, machine_id) = r?;
             let status = serde_json::from_str(&format!("\"{status_str}\""))
                 .unwrap_or(SessionStatus::Working);
             let gate_status = gate_status_str
@@ -1270,6 +1330,11 @@ impl Store {
                 summary,
                 terminal_at,
                 gate_status,
+                merged_at,
+                activity: Self::parse_activity(activity_str),
+                activity_note,
+                activity_since,
+                machine_id,
             })
         })
         .collect()
@@ -1281,7 +1346,8 @@ impl Store {
             "SELECT id,orchestrator_id,name,repo,status,agent_type,cost_usd,
              started_at,pr_number,pr_id,workspace_path,pid,model,context_tokens,
              catalogue_path,context_used_pct,context_total_tokens,context_window_size,
-             claude_session_id,summary,terminal_at,gate_status
+             claude_session_id,summary,terminal_at,gate_status,merged_at,
+             activity,activity_note,activity_since,machine_id
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], |r| {
@@ -1308,6 +1374,11 @@ impl Store {
                 r.get::<_, Option<String>>(19)?,
                 r.get::<_, Option<i64>>(20)?,
                 r.get::<_, Option<String>>(21)?,
+                r.get::<_, Option<i64>>(22)?,
+                r.get::<_, Option<String>>(23)?,
+                r.get::<_, Option<String>>(24)?,
+                r.get::<_, Option<i64>>(25)?,
+                r.get::<_, Option<String>>(26)?,
             ))
         })?;
         match rows.next() {
@@ -1317,7 +1388,8 @@ impl Store {
                      cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
                      model, context_tokens, catalogue_path, context_used_pct,
                      context_total_tokens, context_window_size, claude_session_id,
-                     summary, terminal_at, gate_status_str) = r?;
+                     summary, terminal_at, gate_status_str, merged_at,
+                     activity_str, activity_note, activity_since, machine_id) = r?;
                 let status = serde_json::from_str(&format!("\"{status_str}\""))
                     .unwrap_or(SessionStatus::Working);
                 let gate_status = gate_status_str
@@ -1334,9 +1406,183 @@ impl Store {
                     summary,
                     terminal_at,
                     gate_status,
+                    merged_at,
+                    activity: Self::parse_activity(activity_str),
+                    activity_note,
+                    activity_since,
+                    machine_id,
                 }))
             }
         }
+    }
+
+    /// NULL (legacy row) and unrecognized values both collapse to `Unknown` —
+    /// same defensive posture as `status`'s `unwrap_or(Working)` above.
+    fn parse_activity(raw: Option<String>) -> ActivityState {
+        raw.and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
+            .unwrap_or_default()
+    }
+
+    /// Targeted write of only the activity columns. The `worker-status`
+    /// hook process runs concurrently with the poller's and GUI's full-row
+    /// upserts — a read→full-row-write from that process could revert their
+    /// fresher fields (status, terminal_at, cost) or re-INSERT a
+    /// just-deleted row; an UPDATE can do neither. The status guard repeats
+    /// `apply_activity`'s terminal check *at write time*, closing the
+    /// read-then-reap window. Returns whether a live row was written.
+    pub fn update_session_activity(
+        &self,
+        id: &str,
+        activity: ActivityState,
+        note: Option<&str>,
+        since: Option<i64>,
+    ) -> Result<bool> {
+        let activity_str = serde_json::to_string(&activity)?.replace('"', "");
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE sessions SET activity=?2, activity_note=?3, activity_since=?4
+             WHERE id=?1 AND status NOT IN ('done','terminated','interrupted')",
+            params![id, activity_str, note, since],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn add_session_dep(&self, dep: &SessionDep) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO session_deps (session_id, depends_on, kind, note, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session_id, depends_on, kind) DO UPDATE SET
+             note=excluded.note",
+            params![dep.session_id, dep.depends_on, dep.kind.as_str(), dep.note, dep.created_at],
+        )?;
+        Ok(())
+    }
+
+    /// Returns whether an edge actually existed and was removed.
+    pub fn remove_session_dep(&self, session_id: &str, depends_on: &str, kind: DepKind) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM session_deps WHERE session_id=?1 AND depends_on=?2 AND kind=?3",
+            params![session_id, depends_on, kind.as_str()],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn list_session_deps(&self) -> Result<Vec<SessionDep>> {
+        self.query_deps("SELECT session_id, depends_on, kind, note, created_at
+                         FROM session_deps ORDER BY created_at", &[])
+    }
+
+    /// Edges *from* `session_id` (what it depends on), both kinds.
+    pub fn deps_for_session(&self, session_id: &str) -> Result<Vec<SessionDep>> {
+        self.query_deps("SELECT session_id, depends_on, kind, note, created_at
+                         FROM session_deps WHERE session_id=?1 ORDER BY created_at",
+                        &[&session_id])
+    }
+
+    fn query_deps(&self, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<SessionDep>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(args, |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (session_id, depends_on, kind_str, note, created_at) = r?;
+            Ok(SessionDep {
+                session_id, depends_on,
+                // An unrecognized kind (from a future version's row) is
+                // surfaced as Declared rather than dropped: better a
+                // mislabeled edge than a silently missing one.
+                kind: DepKind::parse(&kind_str).unwrap_or(DepKind::Declared),
+                note, created_at,
+            })
+        })
+        .collect()
+    }
+
+    /// Reconcile the *stacked* edge set for `session_id` against a fresh
+    /// derivation from PR branch topology: insert what's missing, delete
+    /// what no longer holds, leave `Declared` edges alone. Returns whether
+    /// anything changed — no event carries dep changes today (the Workers
+    /// view re-reads on its poll tick), but callers that want to react to
+    /// churn have the signal.
+    pub fn set_stacked_deps(&self, session_id: &str, depends_on: &[SessionId], now: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT depends_on FROM session_deps WHERE session_id=?1 AND kind='stacked'",
+        )?;
+        let current: Vec<String> = stmt
+            .query_map([session_id], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        let mut changed = false;
+        for stale in current.iter().filter(|c| !depends_on.contains(c)) {
+            conn.execute(
+                "DELETE FROM session_deps WHERE session_id=?1 AND depends_on=?2 AND kind='stacked'",
+                params![session_id, stale],
+            )?;
+            changed = true;
+        }
+        for fresh in depends_on.iter().filter(|d| !current.contains(d)) {
+            conn.execute(
+                "INSERT INTO session_deps (session_id, depends_on, kind, note, created_at)
+                 VALUES (?1, ?2, 'stacked', NULL, ?3)",
+                params![session_id, fresh, now],
+            )?;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+
+    /// Column-scoped write of the fields the external `ninox statusline`
+    /// process owns (cost + context readout, and `model` only when not
+    /// already set). Deliberately NOT a `upsert_session` full-row write: the
+    /// statusline hook fires continuously and from a *separate process*, so
+    /// a read-modify-write there would revert any field the in-app poller
+    /// stamped between the read and the write — most visibly `merged_at` on
+    /// a kept-alive merged worker (whose statusline keeps firing during
+    /// post-merge validation), re-triggering its one-shot merge
+    /// notification. A single UPDATE touching only these columns can't
+    /// stomp `status`/`pr_number`/`gate_status`/`merged_at`. Each `None`
+    /// argument leaves its column untouched. Returns whether a row matched.
+    pub fn update_statusline_metrics(
+        &self,
+        session_id:           &str,
+        cost_usd:             Option<f64>,
+        context_used_pct:     Option<f64>,
+        context_total_tokens: Option<u64>,
+        context_window_size:  Option<u64>,
+        model:                Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE sessions SET
+                cost_usd             = COALESCE(?2, cost_usd),
+                context_used_pct     = COALESCE(?3, context_used_pct),
+                context_total_tokens = COALESCE(?4, context_total_tokens),
+                context_window_size  = COALESCE(?5, context_window_size),
+                model                = COALESCE(model, ?6)
+             WHERE id = ?1",
+            params![
+                session_id,
+                cost_usd,
+                context_used_pct,
+                context_total_tokens,
+                context_window_size,
+                model,
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Non-zero `cost_usd` samples recorded for sessions matching the given
@@ -1417,6 +1663,13 @@ impl Store {
         Ok(())
     }
 
+    /// Self-registers an orchestrator's runtime identity the first time it
+    /// authorizes from a pane whose physical name matches its own id — the
+    /// lazy bootstrap path `authorize_orchestrator` falls back to when no
+    /// runtime has been persisted yet. Requires the caller's session row to
+    /// already record `pid` as this exact pane's root pid (set at spawn
+    /// time), and only fires once per orchestrator (`ON CONFLICT DO NOTHING`).
+    /// Returns whether a row was actually created.
     pub fn register_migrated_orchestrator_runtime(
         &self,
         runtime: &OrchestratorRuntimeIdentity,
@@ -1495,6 +1748,72 @@ impl Store {
         .map_err(Into::into)
     }
 
+    /// Register (or re-register) `orchestrator_id`'s goals/plan doc. Upsert:
+    /// re-registering bumps `updated_at` but leaves the original
+    /// `registered_at` untouched.
+    pub fn register_orchestrator_plan(&self, orchestrator_id: &str, file_path: &str, now: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO orchestrator_plans(orchestrator_id,file_path,registered_at,updated_at)
+             VALUES(?1,?2,?3,?3)
+             ON CONFLICT(orchestrator_id) DO UPDATE SET
+                file_path=excluded.file_path,
+                updated_at=excluded.updated_at",
+            params![orchestrator_id, file_path, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_orchestrator_plan(&self, orchestrator_id: &str) -> Result<Option<OrchestratorPlan>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT orchestrator_id,file_path,registered_at,updated_at
+             FROM orchestrator_plans WHERE orchestrator_id=?1",
+            [orchestrator_id],
+            |row| {
+                Ok(OrchestratorPlan {
+                    orchestrator_id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    registered_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Returns whether a row was actually removed.
+    pub fn unregister_orchestrator_plan(&self, orchestrator_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "DELETE FROM orchestrator_plans WHERE orchestrator_id=?1",
+            [orchestrator_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Count one more message delivered to `session_id` (see
+    /// `messaging::deliver_message`). Lives in its own table rather than on
+    /// the `sessions` row because `upsert_session` is a full-row write and
+    /// several processes hold stale snapshots of that row.
+    pub fn record_message_delivered(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO session_messages (session_id, delivered_count) VALUES (?1, 1)
+             ON CONFLICT(session_id) DO UPDATE SET delivered_count = delivered_count + 1",
+            [session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn message_delivered_counts(&self) -> Result<HashMap<String, u64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT session_id, delivered_count FROM session_messages")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     pub fn sessions_by_orchestrator(&self, orchestrator_id: &str) -> Result<Vec<Session>> {
         let sessions = self.list_sessions()?;
         Ok(sessions.into_iter().filter(|s| s.orchestrator_id.as_deref() == Some(orchestrator_id)).collect())
@@ -1535,14 +1854,50 @@ impl Store {
              WHERE session_id=?1 AND state IN ('cleanup_claimed','release_claimed','released')",
             [id],
         )?;
+        // Edges in either direction would otherwise dangle forever — no
+        // poller pass re-derives *declared* edges.
+        tx.execute("DELETE FROM session_deps WHERE session_id=?1 OR depends_on=?1", [id])?;
+        tx.execute("DELETE FROM session_messages WHERE session_id = ?1", [id])?;
+        Self::purge_fleet_rows(&tx, id)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Make `session_id` a standalone session, so deleting its orchestrator
+    /// leaves its row (and its messages and dependency edges) alone.
+    pub fn detach_from_orchestrator(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE sessions SET orchestrator_id = NULL WHERE id = ?1", [session_id])?;
         Ok(())
     }
 
     pub fn delete_orchestrator(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // Edge purge must run while the session rows still exist — it keys
+        // off them to find the orchestrator's workers.
+        conn.execute(
+            "DELETE FROM session_deps WHERE session_id IN
+               (SELECT id FROM sessions WHERE orchestrator_id=?1 OR id=?1)
+             OR depends_on IN
+               (SELECT id FROM sessions WHERE orchestrator_id=?1 OR id=?1)",
+            [id],
+        )?;
+        conn.execute(
+            "DELETE FROM session_messages WHERE session_id = ?1
+             OR session_id IN (SELECT id FROM sessions WHERE orchestrator_id = ?1)",
+            [id],
+        )?;
+        conn.execute(
+            "DELETE FROM fleet_sessions WHERE session_id IN
+               (SELECT id FROM sessions WHERE orchestrator_id=?1)",
+            [id],
+        )?;
+        Self::purge_fleet_rows(&conn, id)?;
+        conn.execute("DELETE FROM work_requests WHERE orchestrator_id=?1", [id])?;
+        conn.execute("DELETE FROM sessions WHERE orchestrator_id = ?1", [id])?;
         conn.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         conn.execute("DELETE FROM orchestrator_runtimes WHERE orchestrator_id=?1", [id])?;
+        conn.execute("DELETE FROM orchestrator_plans WHERE orchestrator_id=?1", [id])?;
         conn.execute("DELETE FROM orchestrators WHERE id = ?1", [id])?;
         Ok(())
     }
@@ -1619,6 +1974,56 @@ impl Store {
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    pub fn upsert_pr_watch(&self, w: &PrWatch) -> Result<()> {
+        let opener = w.opener_session_id.as_deref().unwrap_or("");
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO pr_watches (repo, pr_number, pr_url, opener_session_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(repo, pr_number, opener_session_id) DO UPDATE SET
+             pr_url = excluded.pr_url",
+            params![w.repo, w.pr_number, w.pr_url, opener, w.created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_pr_watch(&self, repo: &str, pr_number: u64, opener: Option<&str>) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM pr_watches WHERE repo = ?1 AND pr_number = ?2 AND opener_session_id = ?3",
+            params![repo, pr_number, opener.unwrap_or("")],
+        )?;
+        Ok(n)
+    }
+
+    pub fn delete_pr_watches_for_pr(&self, repo: &str, pr_number: u64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM pr_watches WHERE repo = ?1 AND pr_number = ?2",
+            params![repo, pr_number],
+        )?;
+        Ok(n)
+    }
+
+    pub fn list_pr_watches(&self) -> Result<Vec<PrWatch>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT repo, pr_number, pr_url, opener_session_id, created_at
+             FROM pr_watches ORDER BY repo, pr_number, opener_session_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let opener: String = r.get(3)?;
+            Ok(PrWatch {
+                repo:              r.get(0)?,
+                pr_number:         r.get(1)?,
+                pr_url:            r.get(2)?,
+                opener_session_id: if opener.is_empty() { None } else { Some(opener) },
+                created_at:        r.get(4)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn list_orchestrators(&self) -> Result<Vec<Orchestrator>> {
@@ -4411,6 +4816,11 @@ mod tests {
             summary: None,
             terminal_at: None,
             gate_status: None,
+            merged_at: None,
+            activity: ActivityState::Unknown,
+            activity_note: None,
+            activity_since: None,
+            machine_id: None,
         }
     }
 
@@ -4754,7 +5164,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&session).unwrap();
         let list = store.list_sessions().unwrap();
@@ -4774,7 +5186,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         s.status = SessionStatus::Done;
@@ -4800,7 +5214,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         s.repo = "OwnerB/repoB".into();
@@ -4821,7 +5237,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap();
@@ -4842,7 +5260,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap().unwrap();
@@ -4863,7 +5283,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2").unwrap().unwrap();
@@ -4884,7 +5306,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: Some("Fix flaky CI on the auth suite".into()),
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2b").unwrap().unwrap();
@@ -4915,7 +5339,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some("b7e0b3a0-0000-4000-8000-000000000001".into()),
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s3").unwrap().unwrap();
@@ -4946,7 +5372,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: Some(1_720_000_000_000), gate_status: None,
+            terminal_at: Some(1_720_000_000_000), gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s5").unwrap().unwrap();
@@ -4980,7 +5408,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         s.started_at = 200;
@@ -5046,7 +5476,9 @@ mod tests {
             context_window_size: Some(200_000),
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s1").unwrap().unwrap();
@@ -5069,7 +5501,9 @@ mod tests {
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
-            terminal_at: None, gate_status: None,
+            terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&s).unwrap();
         let found = store.get_session("s2").unwrap().unwrap();
@@ -5096,8 +5530,10 @@ mod tests {
                 model: model.map(String::from), context_tokens: None, catalogue_path: None,
                 context_used_pct: None, context_total_tokens: None, context_window_size: None,
                 claude_session_id: None, summary: None,
-                terminal_at: None, gate_status: None,
-            }).unwrap();
+                terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
+        }).unwrap();
         }
         let samples = store.cost_samples("claude-code", Some("claude-fable-5")).unwrap();
         assert_eq!(samples.len(), 2);
@@ -5115,7 +5551,9 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
-            gate_status: None,
+            gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         session.gate_status = Some(crate::types::GateStatus {
             ci: crate::types::GateCheck::Failing,
@@ -5146,7 +5584,9 @@ mod tests {
             model: None, context_tokens: None, catalogue_path: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
-            gate_status: None,
+            gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&session).unwrap();
         let fetched = store.get_session("s2").unwrap().unwrap();
@@ -6415,6 +6855,11 @@ mod tests {
             summary: None,
             terminal_at: Some(1),
             gate_status: None,
+            merged_at: None,
+            activity: ActivityState::Unknown,
+            activity_note: None,
+            activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&session).unwrap();
 
@@ -6454,6 +6899,11 @@ mod tests {
             summary: None,
             terminal_at: Some(1),
             gate_status: None,
+            merged_at: None,
+            activity: ActivityState::Unknown,
+            activity_note: None,
+            activity_since: None,
+            machine_id: None,
         };
         store.upsert_session(&session).unwrap();
         session.started_at = 2;
@@ -7103,5 +7553,332 @@ mod tests {
                 .incarnation_id,
             "inc-live",
         );
+    }
+
+    #[test]
+    fn upsert_and_fetch_session_round_trips_activity() {
+        let store = test_store();
+        let mut session = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None,
+            gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
+        };
+        session.activity = ActivityState::Blocked;
+        session.activity_note = Some("waiting on schema migration".into());
+        session.activity_since = Some(12_345);
+        store.upsert_session(&session).unwrap();
+
+        let fetched = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(fetched.activity, ActivityState::Blocked);
+        assert_eq!(fetched.activity_note.as_deref(), Some("waiting on schema migration"));
+        assert_eq!(fetched.activity_since, Some(12_345));
+
+        let listed = store.list_sessions().unwrap();
+        assert_eq!(listed[0].activity, ActivityState::Blocked);
+        assert_eq!(listed[0].activity_note, session.activity_note);
+        assert_eq!(listed[0].activity_since, Some(12_345));
+    }
+
+    #[test]
+    fn session_dep_add_list_and_dedup_on_same_edge() {
+        let store = test_store();
+        let dep = SessionDep {
+            session_id: "b".into(), depends_on: "a".into(),
+            kind: DepKind::Declared, note: Some("needs a's schema".into()),
+            created_at: 100,
+        };
+        store.add_session_dep(&dep).unwrap();
+        // Same (session, depends_on, kind) again — must not duplicate; the
+        // fresher note wins.
+        store.add_session_dep(&SessionDep { note: Some("updated".into()), ..dep.clone() }).unwrap();
+
+        let all = store.list_session_deps().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].note.as_deref(), Some("updated"));
+
+        let for_b = store.deps_for_session("b").unwrap();
+        assert_eq!(for_b.len(), 1);
+        assert_eq!(for_b[0].depends_on, "a");
+        assert!(store.deps_for_session("a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_session_dep_reports_whether_an_edge_was_removed() {
+        let store = test_store();
+        let dep = SessionDep {
+            session_id: "b".into(), depends_on: "a".into(),
+            kind: DepKind::Declared, note: None, created_at: 100,
+        };
+        store.add_session_dep(&dep).unwrap();
+        assert!(store.remove_session_dep("b", "a", DepKind::Declared).unwrap());
+        assert!(!store.remove_session_dep("b", "a", DepKind::Declared).unwrap(), "second removal finds nothing");
+        assert!(store.list_session_deps().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_stacked_deps_replaces_stacked_but_preserves_declared() {
+        let store = test_store();
+        store.add_session_dep(&SessionDep {
+            session_id: "b".into(), depends_on: "a".into(),
+            kind: DepKind::Declared, note: None, created_at: 1,
+        }).unwrap();
+        store.add_session_dep(&SessionDep {
+            session_id: "b".into(), depends_on: "old".into(),
+            kind: DepKind::Stacked, note: None, created_at: 1,
+        }).unwrap();
+
+        // Re-derivation: b now stacks on "a" only — "old" must go, the
+        // declared edge must survive, and the same stacked target as a
+        // declared one is a distinct row.
+        let changed = store.set_stacked_deps("b", &["a".to_string()], 2).unwrap();
+        assert!(changed);
+
+        let mut kinds: Vec<(String, DepKind)> = store.deps_for_session("b").unwrap()
+            .into_iter().map(|d| (d.depends_on, d.kind)).collect();
+        kinds.sort();
+        assert_eq!(kinds, vec![
+            ("a".to_string(), DepKind::Declared),
+            ("a".to_string(), DepKind::Stacked),
+        ]);
+
+        // Unchanged re-derivation reports no change.
+        assert!(!store.set_stacked_deps("b", &["a".to_string()], 3).unwrap());
+        // Empty re-derivation drops all stacked edges, keeps declared.
+        assert!(store.set_stacked_deps("b", &[], 4).unwrap());
+        let remaining = store.deps_for_session("b").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].kind, DepKind::Declared);
+    }
+
+    #[test]
+    fn update_session_activity_targets_columns_and_never_inserts_or_touches_terminal_rows() {
+        let store = test_store();
+        // Missing row: no write, and crucially no INSERT — a full-row upsert
+        // here is how a concurrently-deleted session got resurrected.
+        assert!(!store.update_session_activity("ghost", ActivityState::Working, None, Some(1)).unwrap());
+        assert!(store.get_session("ghost").unwrap().is_none());
+
+        let mut s = Session {
+            id: "s1".into(), orchestrator_id: None, name: "w".into(),
+            repo: "r".into(), status: SessionStatus::PrOpen,
+            agent_type: "c".into(), cost_usd: 3.5, started_at: 0,
+            pr_number: Some(9), pr_id: Some(9), workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None,
+            gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
+        };
+        store.upsert_session(&s).unwrap();
+        assert!(store.update_session_activity("s1", ActivityState::Blocked, Some("stuck"), Some(42)).unwrap());
+        let fetched = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(fetched.activity, ActivityState::Blocked);
+        assert_eq!(fetched.activity_note.as_deref(), Some("stuck"));
+        assert_eq!(fetched.activity_since, Some(42));
+        assert!(matches!(fetched.status, SessionStatus::PrOpen), "non-activity columns untouched");
+        assert_eq!(fetched.cost_usd, 3.5);
+
+        // Terminal row: guarded at write time, not just at the read that
+        // preceded it in another process.
+        s.status = SessionStatus::Terminated;
+        s.activity = ActivityState::Blocked;
+        s.activity_note = Some("stuck".into());
+        s.activity_since = Some(42);
+        store.upsert_session(&s).unwrap();
+        assert!(!store.update_session_activity("s1", ActivityState::Working, None, Some(99)).unwrap());
+        assert_eq!(store.get_session("s1").unwrap().unwrap().activity, ActivityState::Blocked);
+    }
+
+    #[test]
+    fn deleting_an_orchestrator_purges_its_workers_edges() {
+        let store = test_store();
+        let mut w = Session {
+            id: "w1".into(), orchestrator_id: Some("orch".into()), name: "w1".into(),
+            repo: "r".into(), status: SessionStatus::Working,
+            agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None,
+            gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
+        };
+        store.upsert_session(&w).unwrap();
+        w.id = "w2".into();
+        w.name = "w2".into();
+        store.upsert_session(&w).unwrap();
+        store.add_session_dep(&SessionDep {
+            session_id: "w2".into(), depends_on: "w1".into(),
+            kind: DepKind::Declared, note: None, created_at: 1,
+        }).unwrap();
+
+        store.delete_orchestrator("orch").unwrap();
+        assert!(store.list_session_deps().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_session_purges_edges_in_both_directions() {
+        let store = test_store();
+        for (from, to) in [("b", "a"), ("a", "c")] {
+            store.add_session_dep(&SessionDep {
+                session_id: from.into(), depends_on: to.into(),
+                kind: DepKind::Declared, note: None, created_at: 1,
+            }).unwrap();
+        }
+        store.delete_session("a").unwrap();
+        assert!(store.list_session_deps().unwrap().is_empty(),
+                "edges from AND to the deleted session must go");
+    }
+
+    #[test]
+    fn pr_watch_upsert_is_idempotent_and_lists() {
+        let store = test_store();
+        let w = PrWatch {
+            repo: "o/r".into(), pr_number: 7,
+            pr_url: "https://github.com/o/r/pull/7".into(),
+            opener_session_id: Some("sess-a".into()), created_at: 1000,
+        };
+        store.upsert_pr_watch(&w).unwrap();
+        store.upsert_pr_watch(&w).unwrap(); // same key — must not duplicate
+        assert_eq!(store.list_pr_watches().unwrap(), vec![w]);
+    }
+
+    #[test]
+    fn pr_watch_same_pr_different_openers_are_distinct_rows() {
+        let store = test_store();
+        let a = PrWatch { repo: "o/r".into(), pr_number: 7, pr_url: "u".into(), opener_session_id: Some("sess-a".into()), created_at: 1 };
+        let b = PrWatch { opener_session_id: Some("sess-b".into()), ..a.clone() };
+        let unowned = PrWatch { opener_session_id: None, ..a.clone() };
+        store.upsert_pr_watch(&a).unwrap();
+        store.upsert_pr_watch(&b).unwrap();
+        store.upsert_pr_watch(&unowned).unwrap();
+        store.upsert_pr_watch(&unowned).unwrap(); // unowned must dedup too
+        assert_eq!(store.list_pr_watches().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn pr_watch_delete_removes_only_the_callers_row() {
+        let store = test_store();
+        let a = PrWatch { repo: "o/r".into(), pr_number: 7, pr_url: "u".into(), opener_session_id: Some("sess-a".into()), created_at: 1 };
+        let b = PrWatch { opener_session_id: Some("sess-b".into()), ..a.clone() };
+        store.upsert_pr_watch(&a).unwrap();
+        store.upsert_pr_watch(&b).unwrap();
+        assert_eq!(store.delete_pr_watch("o/r", 7, Some("sess-a")).unwrap(), 1);
+        assert_eq!(store.list_pr_watches().unwrap(), vec![b]);
+    }
+
+    #[test]
+    fn pr_watch_delete_for_pr_removes_all_openers() {
+        let store = test_store();
+        let a = PrWatch { repo: "o/r".into(), pr_number: 7, pr_url: "u".into(), opener_session_id: Some("sess-a".into()), created_at: 1 };
+        let b = PrWatch { opener_session_id: None, ..a.clone() };
+        let other = PrWatch { pr_number: 8, ..a.clone() };
+        store.upsert_pr_watch(&a).unwrap();
+        store.upsert_pr_watch(&b).unwrap();
+        store.upsert_pr_watch(&other).unwrap();
+        assert_eq!(store.delete_pr_watches_for_pr("o/r", 7).unwrap(), 2);
+        assert_eq!(store.list_pr_watches().unwrap(), vec![other]);
+    }
+
+    #[test]
+    fn orchestrator_plan_round_trips_and_upsert_preserves_registered_at() {
+        let store = test_store();
+        assert!(store.get_orchestrator_plan("orch").unwrap().is_none());
+
+        store.register_orchestrator_plan("orch", "/plan.md", 100).unwrap();
+        let plan = store.get_orchestrator_plan("orch").unwrap().unwrap();
+        assert_eq!(plan.file_path, "/plan.md");
+        assert_eq!(plan.registered_at, 100);
+        assert_eq!(plan.updated_at, 100);
+
+        store.register_orchestrator_plan("orch", "/other-plan.md", 200).unwrap();
+        let plan = store.get_orchestrator_plan("orch").unwrap().unwrap();
+        assert_eq!(plan.file_path, "/other-plan.md");
+        assert_eq!(plan.registered_at, 100, "registered_at must not move on re-register");
+        assert_eq!(plan.updated_at, 200);
+
+        assert!(store.unregister_orchestrator_plan("orch").unwrap());
+        assert!(store.get_orchestrator_plan("orch").unwrap().is_none());
+        assert!(!store.unregister_orchestrator_plan("orch").unwrap());
+    }
+
+    #[test]
+    fn register_orchestrator_runtime_requires_persisted_orchestrator() {
+        let store = test_store();
+        let runtime = OrchestratorRuntimeIdentity {
+            orchestrator_id: "orch".into(),
+            runtime_id: "r1".into(),
+            server_epoch: "1:1".into(),
+            physical_tmux_name: "orch".into(),
+            pane_id: "%1".into(),
+            root_pid: 100,
+            root_created_at: 0,
+            registered_at: 0,
+        };
+        assert!(store.register_orchestrator_runtime(&runtime).is_err());
+
+        store.upsert_orchestrator(&Orchestrator { id: "orch".into(), name: "orch".into(), created_at: 0 }).unwrap();
+        store.register_orchestrator_runtime(&runtime).unwrap();
+        let persisted = store.orchestrator_runtime_identity("orch").unwrap().unwrap();
+        assert_eq!(persisted, runtime);
+    }
+
+    #[test]
+    fn record_message_delivered_counts_per_session() {
+        let store = test_store();
+        store.record_message_delivered("orch-1").unwrap();
+        store.record_message_delivered("orch-1").unwrap();
+        store.record_message_delivered("worker-1").unwrap();
+
+        let counts = store.message_delivered_counts().unwrap();
+        assert_eq!(counts.get("orch-1"), Some(&2));
+        assert_eq!(counts.get("worker-1"), Some(&1));
+        assert_eq!(counts.get("never-sent"), None);
+    }
+
+    #[test]
+    fn deleting_a_session_drops_its_message_counter() {
+        let store = test_store();
+        store.record_message_delivered("worker-1").unwrap();
+        store.delete_session("worker-1").unwrap();
+        assert!(store.message_delivered_counts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_an_orchestrator_drops_its_own_and_its_workers_message_counters() {
+        let store = test_store();
+        let mut worker = crate::types::Session {
+            id: "w1".into(), orchestrator_id: Some("orch".into()), name: "w1".into(),
+            repo: String::new(), status: crate::types::SessionStatus::Working,
+            agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
+            pr_number: None, pr_id: None, workspace_path: None, pid: None,
+            model: None, context_tokens: None, catalogue_path: None,
+            context_used_pct: None, context_total_tokens: None, context_window_size: None,
+            claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
+            activity: Default::default(), activity_note: None, activity_since: None,
+            machine_id: None,
+        };
+        store.upsert_session(&worker).unwrap();
+        worker.id = "unrelated".into();
+        worker.orchestrator_id = None;
+        store.upsert_session(&worker).unwrap();
+        store.record_message_delivered("orch").unwrap();
+        store.record_message_delivered("w1").unwrap();
+        store.record_message_delivered("unrelated").unwrap();
+
+        store.delete_orchestrator("orch").unwrap();
+
+        let counts = store.message_delivered_counts().unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get("unrelated"), Some(&1));
     }
 }

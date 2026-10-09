@@ -1,0 +1,5 @@
+# To bump deliberately: `rustup toolchain install <version>`, update `channel`
+# below, then run `cargo build/test/clippy --workspace` locally before pushing.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy"]

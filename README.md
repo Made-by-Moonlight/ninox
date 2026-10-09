@@ -29,13 +29,25 @@ Use Ninox when you've outgrown a single agent in a single terminal:
 
 - Rust toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - tmux 3.2+ (3.5+ recommended for full extended-keyboard support)
-- macOS or Linux (Windows not yet supported)
+- macOS or Linux (Windows not yet supported). Ubuntu 22.04 and newer are
+  supported and covered by CI; on Debian/Ubuntu install the build
+  dependencies first:
+
+  ```bash
+  sudo apt-get install -y build-essential pkg-config cmake \
+    libxkbcommon-dev libwayland-dev
+  ```
+
+  No OpenSSL headers are required — all TLS goes through rustls.
 
 ## Install
 
 ```bash
 cargo install ninox
 ```
+
+On an Apple silicon Mac with Synthesia AWS access, skip the compile: see
+[Prebuilt macOS binaries](#prebuilt-macos-binaries-apple-silicon) below.
 
 ## Build and run
 
@@ -53,6 +65,30 @@ cargo build --release -p ninox
 ```
 
 The HTTP server always starts on `127.0.0.1:8080` (or `--port`), exposing the engine's HTTP/WebSocket API — so everything the UI does is also scriptable.
+
+## Terminal mode
+
+Ninox also offers a terminal UI (TUI) for SSH access or headless environments. The TUI is available via `ninox tui` on any platform; on Linux and SSH (where there is no display), `ninox` with no arguments automatically opens the TUI instead of the native window.
+
+On macOS, `has_display()` is hardcoded `true`, so bare `ninox` always opens the native GUI — use `ninox tui` explicitly if you want the terminal interface instead.
+
+### Terminal commands
+
+```bash
+# Start the terminal UI
+ninox tui
+
+# List running sessions (--json for machine-readable output)
+ninox list [--json]
+
+# Connect to an existing session
+ninox connect <session-id>
+
+# Spawn a new orchestrator session
+ninox orchestrate <name> [--prompt <brief>] [--no-attach]
+```
+
+The daemon automatically starts in the background on first use and logs to `~/.local/share/ninox/daemon.log` (Linux) or `~/Library/Application Support/ninox/daemon.log` (macOS). Quitting the TUI doesn't shut down the daemon — sessions continue running in the background.
 
 ## macOS app bundle
 
@@ -93,6 +129,85 @@ done
 iconutil -c icns Ninox.iconset -o Ninox.icns
 rm -rf Ninox.iconset
 ```
+
+## Installation
+
+This is the private mirror of ninox — the sections above cover the public
+build/install paths (crates.io, the public repo's GitHub Releases). Internal
+engineers have additional options: prebuilt Apple silicon binaries (no
+compile), building from source against this repo's history, and pulling
+prebuilt crates from the team's private Cargo registry.
+
+### Prebuilt macOS binaries (Apple silicon)
+
+Every release publishes a prebuilt `aarch64-apple-darwin` `ninox` binary and
+`Ninox.app` to CodeArtifact (generic package `ninox/ninox-macos`, coordinates
+set by `NINOX_CODEARTIFACT_DOMAIN` / `_REPOSITORY` / `_REGION` — see
+[`scripts/install-macos.sh`](scripts/install-macos.sh)). You need the `aws`
+CLI and an SSO session for the account that owns that domain:
+
+```bash
+aws sso login --profile <your-build-profile>
+export AWS_PROFILE=<your-build-profile>
+
+# From a checkout of this repo:
+scripts/install-macos.sh            # latest; prompts for Ninox.app when interactive
+scripts/install-macos.sh --app      # also install Ninox.app into /Applications
+scripts/install-macos.sh --version 0.29.0 --app --user-apps   # pin; ~/Applications
+```
+
+No checkout? The script is published alongside each release, so fetch the
+latest copy straight from CodeArtifact:
+
+```bash
+v=$(aws codeartifact list-package-versions --domain "$NINOX_CODEARTIFACT_DOMAIN" --repository "$NINOX_CODEARTIFACT_REPOSITORY" \
+      --region "${NINOX_CODEARTIFACT_REGION:-eu-west-1}" --format generic --namespace ninox --package ninox-macos \
+      --status Published --query 'versions[].version' --output text | tr '\t' '\n' | sort -V | tail -n1)
+aws codeartifact get-package-version-asset --domain "$NINOX_CODEARTIFACT_DOMAIN" --repository "$NINOX_CODEARTIFACT_REPOSITORY" \
+  --region "${NINOX_CODEARTIFACT_REGION:-eu-west-1}" --format generic --namespace ninox --package ninox-macos \
+  --package-version "$v" --asset install-macos.sh /tmp/install-ninox.sh > /dev/null
+bash /tmp/install-ninox.sh
+```
+
+The script verifies every download against the SHA-256 CodeArtifact recorded
+at publish time, installs `ninox` to `${NINOX_INSTALL_DIR:-~/.local/bin}`
+with an `nx` symlink beside it, clears the quarantine attribute, and tells
+you if another `ninox` (e.g. a `cargo install`ed `~/.cargo/bin/ninox`) would
+win on your `PATH`. Override the registry coordinates with
+`NINOX_CODEARTIFACT_DOMAIN` / `_DOMAIN_OWNER` / `_REPOSITORY` / `_REGION`.
+
+To update later:
+
+```bash
+ninox update --check   # report only
+ninox update           # replace the running binary with the latest release
+ninox update --app     # also refresh an installed Ninox.app
+ninox update --version 0.28.1   # install an exact version (downgrades allowed)
+```
+
+`ninox update` uses the same `aws` session and verification, swaps the binary
+atomically, and refuses to run anywhere but Apple silicon macOS — on Intel
+Macs and Linux, keep using `cargo install --force` (below). Already-running
+ninox processes keep the old version until restarted.
+
+### Build from source
+
+The Rust toolchain version is pinned in `rust-toolchain.toml`; rustup
+auto-selects it for any `cargo` command run from the repo, installing it
+first if needed. Build as in [Build and run](#build-and-run) above:
+
+```bash
+cargo build --release -p ninox
+```
+
+### Prebuilt macOS bundle (private mirror)
+
+This repo publishes its own GitHub Releases too — the `release` job in
+[`.github/workflows/publish-codeartifact.yml`](.github/workflows/publish-codeartifact.yml)
+builds, ad-hoc signs, and attaches `Ninox.app.zip` to a release on *this*
+repo for every version tag, so internal engineers don't need to go to the
+public repo for it. Same install steps as [macOS app bundle](#macos-app-bundle)
+above, just from this repo's Releases page instead.
 
 ## Configuration
 

@@ -11,6 +11,13 @@ pub struct EnrichmentState {
     pub seen_comment_ids: std::collections::HashSet<i64>,
     /// Whether a reaction has already been sent for current CI failure set.
     pub ci_reaction_sent: bool,
+    /// Whether the PR was all-passing + mergeable last cycle. None = first
+    /// cycle. Mirrors `prev_failing`, but for the opposite transition.
+    pub prev_ready: Option<bool>,
+    /// Whether a reaction has already been sent for the current all-passing
+    /// + mergeable run — cleared as soon as the PR is no longer ready,
+    ///   mirroring `ci_reaction_sent`'s reset-on-recovery behavior.
+    pub ready_reaction_sent: bool,
     /// Whether a reaction has already been sent for current review set.
     pub review_reaction_sent: bool,
     /// Whether a `GithubLookupFailed` notification has already been sent

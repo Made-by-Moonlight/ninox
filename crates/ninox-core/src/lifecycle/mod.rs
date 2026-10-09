@@ -1,3 +1,4 @@
+pub mod binary_update;
 pub mod brain_harvest;
 pub mod enrichment;
 pub mod poller;

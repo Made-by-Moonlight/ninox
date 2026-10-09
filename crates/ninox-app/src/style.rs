@@ -29,6 +29,7 @@ pub const SANS: Font = Font {
     weight: Weight::Normal, stretch: Stretch::Normal, style: FontStyle::Normal,
 };
 pub const SANS_BOLD: Font = Font { weight: Weight::Bold, ..SANS };
+pub const SANS_ITALIC: Font = Font { style: FontStyle::Italic, ..SANS };
 pub const MONO: Font = Font {
     family: Family::Name("Spline Sans Mono"),
     weight: Weight::Normal, stretch: Stretch::Normal, style: FontStyle::Normal,

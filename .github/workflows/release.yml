@@ -63,6 +63,18 @@ jobs:
           fetch-depth: 0
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
+      - name: Sync to latest main
+        # actions/checkout pins HEAD to this run's triggering SHA. Queued
+        # runs from near-simultaneous pushes execute sequentially (see the
+        # concurrency group above), so by the time a later run starts, an
+        # earlier one may have already pushed a release commit + tag to
+        # main. Reset to the live tip so last_tag/bump/next below are always
+        # computed from main's current state, not this run's stale trigger.
+        run: |
+          set -euo pipefail
+          git fetch origin main --tags
+          git reset --hard origin/main
+
       - name: Decide the bump from angular commits
         id: decide
         run: |
@@ -81,12 +93,18 @@ jobs:
           subjects=$(git log --format='%s' "$range")
           bodies=$(git log --format='%b' "$range")
 
+          # Merge/squash titles often carry a Linear ticket ID before the
+          # conventional-commit type (e.g. "MLOPS-4222 feat(sidebar): ..." or
+          # "MLOPS-3916: fix(spawn): ...") — tolerate that prefix everywhere
+          # we match a commit type.
+          ticket='([A-Z][A-Z0-9]*-[0-9]+:? )?'
+
           bump=none
-          if grep -qE '^[a-z]+(\([^)]*\))?!: ' <<<"$subjects" || grep -q 'BREAKING CHANGE' <<<"$bodies"; then
+          if grep -qE "^${ticket}[a-z]+(\([^)]*\))?!: " <<<"$subjects" || grep -q 'BREAKING CHANGE' <<<"$bodies"; then
             bump=major
-          elif grep -qE '^feat(\([^)]*\))?: ' <<<"$subjects"; then
+          elif grep -qE "^${ticket}feat(\([^)]*\))?: " <<<"$subjects"; then
             bump=minor
-          elif grep -qE '^(fix|perf)(\([^)]*\))?: ' <<<"$subjects"; then
+          elif grep -qE "^${ticket}(fix|perf)(\([^)]*\))?: " <<<"$subjects"; then
             bump=patch
           fi
           echo "Bump level: $bump"
@@ -118,20 +136,22 @@ jobs:
           echo "Releasing v$next (was $current, bump: $BUMP)"
 
           # Crate versions (hand-aligned manifests — preserve the spacing)
-          # and the ninox-core/ninox-server pins in dependent crates.
+          # and the ninox-ptyd/ninox-core/ninox-server pins in dependent crates.
           perl -pi -e "s/^version(\s+)= \"\Q$current\E\"/version\${1}= \"$next\"/" \
+            crates/ninox-ptyd/Cargo.toml crates/ninox-core/Cargo.toml crates/ninox-server/Cargo.toml crates/ninox-app/Cargo.toml
+          perl -pi -e "s/(ninox-(?:ptyd|core|server)\s*=\s*\{[^}]*version = )\"\Q$current\E\"/\${1}\"$next\"/" \
             crates/ninox-core/Cargo.toml crates/ninox-server/Cargo.toml crates/ninox-app/Cargo.toml
-          perl -pi -e "s/(ninox-(?:core|server)\s*=\s*\{[^}]*version = )\"\Q$current\E\"/\${1}\"$next\"/" \
-            crates/ninox-server/Cargo.toml crates/ninox-app/Cargo.toml
           cargo update --workspace
 
-          # Release notes grouped angular-style.
+          # Release notes grouped angular-style. Tolerate the same leading
+          # Linear-ticket prefix as the bump decision above.
+          ticket='([A-Z][A-Z0-9]*-[0-9]+:? )?'
           {
-            breaking=$( (git log --format='- %s' "$range" | grep -E '^- [a-z]+(\([^)]*\))?!: ' || true) )
+            breaking=$( (git log --format='- %s' "$range" | grep -E "^- ${ticket}[a-z]+(\([^)]*\))?!: " || true) )
             [ -n "$breaking" ] && printf '### Breaking\n%s\n\n' "$breaking"
             for entry in 'feat:Features' 'fix:Fixes' 'perf:Performance'; do
               type="${entry%%:*}"; title="${entry##*:}"
-              lines=$( (git log --format='- %s' "$range" | grep -E "^- ${type}(\([^)]*\))?: " | sed -E "s/^- ${type}(\([^)]*\))?: /- /" || true) )
+              lines=$( (git log --format='- %s' "$range" | grep -E "^- ${ticket}${type}(\([^)]*\))?: " | sed -E "s/^- ${ticket}${type}(\([^)]*\))?: /- /" || true) )
               [ -n "$lines" ] && printf '### %s\n%s\n\n' "$title" "$lines"
             done
           } > /tmp/release-notes.md

@@ -285,13 +285,24 @@ fn session_card<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> 
     } else {
         None
     };
+    // A kept-alive merged worker ([auto_reap] off) otherwise sits in the
+    // Mergeable/PR-open column reading "ready to merge", when its PR has in
+    // fact already merged and it's only waiting to be reaped. Mutually
+    // exclusive with `retention_badge` (that one is terminal-only).
+    let merged_badge: Option<Element<Message>> = if session.merged_at.is_some()
+        && !session.status.is_terminal()
+    {
+        Some(text("merged · reap").size(9.5).font(crate::style::MONO).color(s.ink_2).into())
+    } else {
+        None
+    };
     let mut bottom_row: Vec<Element<Message>> = vec![
         stamp_with_tooltip,
         Space::new(Length::Fill, 0).into(),
         text(format!("${:.2}", session.cost_usd))
             .size(11.5).font(crate::style::MONO_MEDIUM).color(s.ink).into(),
     ];
-    if let Some(badge) = retention_badge {
+    if let Some(badge) = retention_badge.or(merged_badge) {
         bottom_row.insert(1, badge);
         bottom_row.insert(2, Space::new(8, 0).into());
     }
