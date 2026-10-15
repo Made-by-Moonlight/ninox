@@ -54,7 +54,28 @@ pub struct HarnessSpec {
 #[derive(Debug, Clone)]
 pub struct HarnessRegistry {
     specs: BTreeMap<String, HarnessSpec>,
+    /// Launch every [`CLAUDE_CODE`] session with
+    /// [`CLAUDE_ACCEPT_INBOUND_SETTINGS`] — see
+    /// `AppConfig::auto_accept_inbound`. Off for a bare `from_config`;
+    /// `AppConfig::registry` sets it from `[messaging]`.
+    accept_inbound: bool,
 }
+
+/// The harness name whose launches get Claude Code-specific flags.
+pub const CLAUDE_CODE: &str = "claude-code";
+
+/// The `--settings` payload that makes a Claude Code session deliver
+/// messages from other sessions without holding them for approval.
+///
+/// Claude Code resolves its `crossSessionInbound` policy from managed,
+/// `--settings` and user settings in that order, then lets a project's
+/// `.claude/settings.json` only tighten the result — so a launch flag is
+/// the one place ninox can switch a session it starts to `accept` without
+/// editing the user's global settings. Without an explicit value, a session
+/// that bypasses permission prompts (every ninox worker) holds any message
+/// whose sender did not attest a matching permission mode, which is every
+/// frame ninox writes to the socket.
+pub const CLAUDE_ACCEPT_INBOUND_SETTINGS: &str = r#"{"crossSessionInbound":"accept"}"#;
 
 /// Compiled-in default specs. Launch shapes preserve the exact commands the
 /// old `AgentConfig::interactive_cmd`/`worker_cmd` built (regression-tested
@@ -121,10 +142,30 @@ impl HarnessRegistry {
         for (name, spec) in overrides {
             specs.insert(name.clone(), spec.clone());
         }
-        if let Some(cc) = specs.get_mut("claude-code") {
+        if let Some(cc) = specs.get_mut(CLAUDE_CODE) {
             cc.enabled = true;
         }
-        Self { specs }
+        Self { specs, accept_inbound: false }
+    }
+
+    /// Whether claude-code launches carry [`CLAUDE_ACCEPT_INBOUND_SETTINGS`].
+    /// Other harnesses are never touched: the flag is Claude Code's own.
+    pub fn accept_inbound_messages(mut self, on: bool) -> Self {
+        self.accept_inbound = on;
+        self
+    }
+
+    /// Flags that go right after the binary on a claude-code launch, ahead
+    /// of the spec's own args — in particular ahead of `worker_args`'
+    /// trailing `-- {prompt}`, after which nothing is parsed as a flag. A
+    /// custom `[harnesses.claude-code]` spec that passes its own
+    /// `--settings` later on the line wins over this one.
+    fn launch_prefix(&self, harness: &str) -> Vec<String> {
+        if self.accept_inbound && harness == CLAUDE_CODE {
+            vec!["--settings".into(), shell_quote(CLAUDE_ACCEPT_INBOUND_SETTINGS)]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Effective spec for a harness name. Unknown names run verbatim as the
@@ -160,7 +201,9 @@ impl HarnessRegistry {
         let spec   = self.spec(&agent.harness);
         let binary = spec.binary.clone().unwrap_or_else(|| agent.harness.clone());
         let model  = agent.model.as_deref().or(spec.model.as_deref());
-        join_cmd(binary, expand_args(&spec.interactive_args, model, None, claude_session_id))
+        let mut args = self.launch_prefix(&agent.harness);
+        args.extend(expand_args(&spec.interactive_args, model, None, claude_session_id));
+        join_cmd(binary, args)
     }
 
     /// Worker launch command, or `None` when the spec has no `worker_args`
@@ -170,7 +213,9 @@ impl HarnessRegistry {
         let wargs  = spec.worker_args.as_ref()?;
         let binary = spec.binary.clone().unwrap_or_else(|| agent.harness.clone());
         let model  = agent.model.as_deref().or(spec.model.as_deref());
-        Some(join_cmd(binary, expand_args(wargs, model, Some(prompt), claude_session_id)))
+        let mut args = self.launch_prefix(&agent.harness);
+        args.extend(expand_args(wargs, model, Some(prompt), claude_session_id));
+        Some(join_cmd(binary, args))
     }
 
     /// Resume command for a previously-interrupted session, or `None` when
@@ -186,7 +231,9 @@ impl HarnessRegistry {
         }
         let binary = spec.binary.clone().unwrap_or_else(|| agent.harness.clone());
         let model  = agent.model.as_deref().or(spec.model.as_deref());
-        Some(join_cmd(binary, expand_args(&spec.resume_args, model, None, claude_session_id)))
+        let mut args = self.launch_prefix(&agent.harness);
+        args.extend(expand_args(&spec.resume_args, model, None, claude_session_id));
+        Some(join_cmd(binary, args))
     }
 }
 
@@ -396,6 +443,57 @@ mod tests {
     fn resume_cmd_none_for_harness_without_resume_args() {
         // codex's builtin spec has no resume_args — resuming isn't supported.
         assert!(reg().resume_cmd(&agent("codex", Some("gpt-4o")), "sess-1").is_none());
+    }
+
+    // ── Inbound auto-accept (`--settings '{"crossSessionInbound":"accept"}'`) ──
+
+    const ACCEPT: &str = "--settings '{\"crossSessionInbound\":\"accept\"}'";
+
+    #[test]
+    fn accept_inbound_is_off_for_a_bare_registry() {
+        assert!(!reg().interactive_cmd(&agent("claude-code", None), "sess-1").contains("--settings"));
+    }
+
+    #[test]
+    fn accept_inbound_flags_every_claude_code_launch_shape_right_after_the_binary() {
+        let r = reg().accept_inbound_messages(true);
+        let a = agent("claude-code", Some("claude-opus-4-5"));
+        assert_eq!(r.interactive_cmd(&a, "sess-1"),
+                   format!("claude {ACCEPT} --session-id 'sess-1' --model 'claude-opus-4-5'"));
+        // Ahead of `-- {prompt}`: anything after `--` is the prompt, not a flag.
+        assert_eq!(r.worker_cmd(&a, "Fix the bug", "sess-1").unwrap(),
+                   format!("claude {ACCEPT} --dangerously-skip-permissions --session-id 'sess-1' --model 'claude-opus-4-5' -- 'Fix the bug'"));
+        assert_eq!(r.resume_cmd(&a, "sess-1").unwrap(),
+                   format!("claude {ACCEPT} --dangerously-skip-permissions --resume 'sess-1' --model 'claude-opus-4-5'"));
+    }
+
+    #[test]
+    fn accept_inbound_leaves_other_harnesses_alone() {
+        let r = reg().accept_inbound_messages(true);
+        assert_eq!(r.worker_cmd(&agent("codex", Some("gpt-4o")), "do the thing", "sess-1").unwrap(),
+                   "codex --model 'gpt-4o' -p 'do the thing'");
+        assert_eq!(r.interactive_cmd(&agent("mytool", None), "sess-1"), "mytool");
+    }
+
+    #[test]
+    fn accept_inbound_applies_to_a_custom_claude_code_spec_too() {
+        // A `[harnesses.claude-code]` override replaces the builtin spec, but
+        // it is still Claude Code, so the flag still belongs on the line.
+        let mut over = BTreeMap::new();
+        over.insert("claude-code".to_string(), HarnessSpec {
+            binary: Some("claude-nightly".into()),
+            interactive_args: vec!["--model".into(), "{model}".into()],
+            ..HarnessSpec::default()
+        });
+        let r = HarnessRegistry::from_config(&over).accept_inbound_messages(true);
+        assert_eq!(r.interactive_cmd(&agent("claude-code", Some("m")), "sess-1"),
+                   format!("claude-nightly {ACCEPT} --model 'm'"));
+    }
+
+    #[test]
+    fn accept_inbound_settings_is_the_json_claude_code_expects() {
+        let v: serde_json::Value = serde_json::from_str(CLAUDE_ACCEPT_INBOUND_SETTINGS).unwrap();
+        assert_eq!(v["crossSessionInbound"], "accept");
     }
 
     #[test]

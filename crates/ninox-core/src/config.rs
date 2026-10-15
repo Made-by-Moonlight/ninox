@@ -233,11 +233,44 @@ impl std::fmt::Display for SendMechanism {
     }
 }
 
-/// Which delivery mechanism orchestrator↔worker messaging uses.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+/// Which delivery mechanism orchestrator↔worker messaging uses, and
+/// whether the Claude Code sessions ninox launches accept what arrives
+/// without asking.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct MessagingConfig {
     #[serde(default)]
     pub mechanism: SendMechanism,
+    /// Deliver messages from other sessions straight to the agent, without
+    /// Claude Code first holding each one for the human to approve.
+    ///
+    /// Claude Code's own `crossSessionInbound` policy parks a message that
+    /// arrives over its cross-session socket — the [`SendMechanism::SessionSocket`]
+    /// transport — behind a "Deliver this message to Claude" prompt whenever
+    /// the receiving session bypasses permission prompts and the sender did
+    /// not attest a matching permission mode. Every worker ninox spawns runs
+    /// with `--dangerously-skip-permissions`, and nothing ninox writes to the
+    /// socket attests a mode, so by default every `ninox send` to a worker
+    /// stalls until someone presses Deliver in that worker's pane.
+    ///
+    /// On (the default): every claude-code session ninox launches is started
+    /// with `--settings '{"crossSessionInbound":"accept"}'` (see
+    /// `crate::harness::CLAUDE_ACCEPT_INBOUND_SETTINGS`), which is the one
+    /// settings source Claude Code lets loosen that policy from a launch —
+    /// a `.claude/settings.json` in the worktree may only tighten it. Only
+    /// sessions started after the change pick it up. Off: Claude Code's own
+    /// default applies and held messages wait for approval.
+    #[serde(default = "default_true")]
+    pub auto_accept_inbound: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for MessagingConfig {
+    fn default() -> Self {
+        Self { mechanism: SendMechanism::default(), auto_accept_inbound: true }
+    }
 }
 
 /// Superseded by [`MessagingConfig`] — retained only so an existing
@@ -888,9 +921,11 @@ impl AppConfig {
     }
 
     /// The effective harness registry: builtin specs overlaid by this
-    /// config's `[harnesses.*]` entries.
+    /// config's `[harnesses.*]` entries, launching claude-code with inbound
+    /// cross-session messages auto-accepted when `auto_accept_inbound()`
+    /// says so.
     pub fn registry(&self) -> HarnessRegistry {
-        HarnessRegistry::from_config(&self.harnesses)
+        HarnessRegistry::from_config(&self.harnesses).accept_inbound_messages(self.auto_accept_inbound())
     }
 
     /// The harness `claude-code`: always enabled, its toggle is inert.
@@ -932,10 +967,35 @@ impl AppConfig {
 
     /// Choose the delivery mechanism, retiring the legacy inbox flag so the
     /// two can never disagree — after this, `send_mechanism()` is answered
-    /// entirely by `[messaging]`.
+    /// entirely by `[messaging]`. The auto-accept choice is kept as it was.
     pub fn set_send_mechanism(&mut self, mechanism: SendMechanism) {
-        self.messaging = Some(MessagingConfig { mechanism });
+        self.messaging = Some(MessagingConfig { mechanism, ..self.messaging_or_default() });
         self.inbox_messaging.enabled = false;
+    }
+
+    /// Whether claude-code sessions ninox launches accept messages from
+    /// other sessions without holding them for approval — see
+    /// `MessagingConfig::auto_accept_inbound`. On unless `[messaging]`
+    /// says otherwise, so a config that never mentions it gets delivery
+    /// without the prompt.
+    pub fn auto_accept_inbound(&self) -> bool {
+        self.messaging_or_default().auto_accept_inbound
+    }
+
+    /// Turn auto-accept on or off. Writes `[messaging]` with the mechanism
+    /// `send_mechanism()` currently resolves to (migrating the legacy inbox
+    /// flag the same way `set_send_mechanism` does) so the table is complete
+    /// once it exists.
+    pub fn set_auto_accept_inbound(&mut self, on: bool) {
+        self.messaging = Some(MessagingConfig { mechanism: self.send_mechanism(), auto_accept_inbound: on });
+        self.inbox_messaging.enabled = false;
+    }
+
+    /// `[messaging]` as written, or the defaults with the mechanism
+    /// `send_mechanism()` resolves (so the legacy inbox flag is honored).
+    fn messaging_or_default(&self) -> MessagingConfig {
+        self.messaging
+            .unwrap_or(MessagingConfig { mechanism: self.send_mechanism(), ..MessagingConfig::default() })
     }
 
     /// Path to the knowledge-base (brain) directory.
@@ -1636,6 +1696,52 @@ mod tests {
         let serialized = toml::to_string(&cfg).unwrap();
         let reloaded: AppConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(reloaded.send_mechanism(), SendMechanism::Inbox);
+    }
+
+    #[test]
+    fn auto_accept_inbound_is_on_unless_the_config_turns_it_off() {
+        // Never mentioned: on, so messages reach workers without a prompt.
+        let cfg: AppConfig = toml::from_str("port = 8080\nfont_size = 13.0\n").unwrap();
+        assert!(cfg.auto_accept_inbound());
+        // A [messaging] table written before the field existed: still on.
+        let cfg: AppConfig =
+            toml::from_str("port = 8080\nfont_size = 13.0\n\n[messaging]\nmechanism = \"inbox\"\n").unwrap();
+        assert!(cfg.auto_accept_inbound());
+        let cfg: AppConfig = toml::from_str(
+            "port = 8080\nfont_size = 13.0\n\n[messaging]\nmechanism = \"inbox\"\nauto_accept_inbound = false\n",
+        )
+        .unwrap();
+        assert!(!cfg.auto_accept_inbound());
+        assert_eq!(cfg.send_mechanism(), SendMechanism::Inbox);
+    }
+
+    #[test]
+    fn auto_accept_inbound_drives_the_registry_and_round_trips() {
+        let mut cfg = AppConfig::default();
+        let agent = AgentConfig::default();
+        assert!(cfg.registry().interactive_cmd(&agent, "s").contains("--settings"));
+        cfg.set_auto_accept_inbound(false);
+        assert!(!cfg.registry().interactive_cmd(&agent, "s").contains("--settings"));
+        let serialized = toml::to_string(&cfg).unwrap();
+        let reloaded: AppConfig = toml::from_str(&serialized).unwrap();
+        assert!(!reloaded.auto_accept_inbound());
+        assert_eq!(reloaded.send_mechanism(), SendMechanism::SessionSocket);
+    }
+
+    #[test]
+    fn the_two_messaging_setters_keep_each_others_choice() {
+        // Someone on the legacy inbox flag who turns auto-accept off must
+        // stay on the inbox, and choosing a mechanism must not flip the
+        // auto-accept choice back.
+        let mut cfg: AppConfig =
+            toml::from_str("port = 8080\nfont_size = 13.0\n\n[inbox_messaging]\nenabled = true\n").unwrap();
+        cfg.set_auto_accept_inbound(false);
+        assert_eq!(cfg.send_mechanism(), SendMechanism::Inbox);
+        assert!(!cfg.inbox_messaging.enabled, "the legacy flag is retired once [messaging] is written");
+        cfg.set_send_mechanism(SendMechanism::Keystrokes);
+        assert!(!cfg.auto_accept_inbound());
+        cfg.set_auto_accept_inbound(true);
+        assert_eq!(cfg.send_mechanism(), SendMechanism::Keystrokes);
     }
 
     #[test]
