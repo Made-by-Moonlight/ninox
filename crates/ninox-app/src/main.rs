@@ -325,6 +325,15 @@ enum WorkerStatusAction {
     /// itself blocked). Installed in a worker's worktree settings; not
     /// intended for direct use.
     HookStop,
+    /// PreToolUse hook entry point (matcher: AskUserQuestion, ExitPlanMode):
+    /// marks the session as awaiting a human's answer to an interactive
+    /// prompt. Installed in a worker's worktree settings; not intended for
+    /// direct use.
+    HookNeedsInput,
+    /// PermissionRequest hook entry point: marks the session as awaiting a
+    /// permission decision. Installed in a worker's worktree settings; not
+    /// intended for direct use.
+    HookPermission,
     /// Declare that a session depends on another session
     Depend {
         /// The session (id or name) being depended on
@@ -679,6 +688,14 @@ async fn main() -> anyhow::Result<()> {
                 run_worker_status_hook(db_path, WorkerStatusHookKind::Stop, now);
                 return Ok(());
             }
+            WorkerStatusAction::HookNeedsInput => {
+                run_worker_status_hook(db_path, WorkerStatusHookKind::NeedsInput, now);
+                return Ok(());
+            }
+            WorkerStatusAction::HookPermission => {
+                run_worker_status_hook(db_path, WorkerStatusHookKind::Permission, now);
+                return Ok(());
+            }
             action => {
                 std::fs::create_dir_all(db_path.parent().unwrap())?;
                 let store = Store::open(&db_path)?;
@@ -696,7 +713,10 @@ async fn main() -> anyhow::Result<()> {
                         WorkerStatusCliAction::Undepend { target, source },
                     WorkerStatusAction::List { json } =>
                         WorkerStatusCliAction::List { json },
-                    WorkerStatusAction::HookPrompt | WorkerStatusAction::HookStop =>
+                    WorkerStatusAction::HookPrompt
+                    | WorkerStatusAction::HookStop
+                    | WorkerStatusAction::HookNeedsInput
+                    | WorkerStatusAction::HookPermission =>
                         unreachable!("hook verbs return above"),
                 };
                 println!("{}", run_worker_status(&store, parsed, self_session, now)?);
@@ -2744,19 +2764,34 @@ fn run_inbox(action: InboxAction, db_path: PathBuf) {
 
 /// Which hook invoked `run_worker_status_hook` — the `ActivityEvent` is
 /// built inside the handler because Stop's meaning depends on per-session
-/// state (pending inbox messages).
+/// state (pending inbox messages), and NeedsInput/Permission's depend on the
+/// payload's `tool_name`/`tool_input`.
 enum WorkerStatusHookKind {
     Prompt,
     Stop,
+    /// `PreToolUse`, registered with matcher `AskUserQuestion|ExitPlanMode`
+    /// only — see `ensure_statusline_settings`. Worker worktrees only: no
+    /// equivalent is registered for the orchestrator root, which has no
+    /// Stop/UserPromptSubmit hooks either and so no way to ever clear a
+    /// `Blocked` this would set.
+    NeedsInput,
+    /// `PermissionRequest`, registered with matcher
+    /// `spawn_util::PERMISSION_REQUEST_MATCHER` (the tools that can actually
+    /// need permission — not every tool call). Worker worktrees only, same
+    /// reason as `NeedsInput`.
+    Permission,
 }
 
-/// Handler for `ninox worker-status hook-prompt`/`hook-stop` — the
-/// UserPromptSubmit/Stop hooks installed in a worker's worktree settings
-/// (`ensure_statusline_settings`). Same contract as `run_inbox`: never
-/// returns an error and never panics, because a broken status write must
-/// never wedge the human's Claude Code session — any failure degrades to
-/// doing nothing, with the error on stderr. Prints nothing: these hooks
-/// have no output contract.
+/// Handler for `ninox worker-status hook-prompt`/`hook-stop`/
+/// `hook-needs-input`/`hook-permission` — the UserPromptSubmit/Stop/
+/// PreToolUse/PermissionRequest hooks installed in a worker's worktree
+/// settings (`ensure_statusline_settings`). Same contract as `run_inbox`:
+/// never returns an error and never panics, because a broken status write
+/// must never wedge the human's Claude Code session — any failure degrades
+/// to doing nothing, with the error on stderr. Prints nothing: these hooks
+/// have no output contract, and must never emit a `permissionDecision` —
+/// they only observe, they never allow/deny the tool call they're reporting
+/// on.
 fn run_worker_status_hook(
     db_path: PathBuf,
     kind: WorkerStatusHookKind,
@@ -2804,6 +2839,22 @@ fn run_worker_status_hook(
                     .map(|msgs| !msgs.is_empty())
                     .unwrap_or(false);
             ninox_core::worker_status::ActivityEvent::HookStop { turn_continues }
+        }
+        WorkerStatusHookKind::NeedsInput => {
+            // Missing tool_name means a payload shape we don't recognize —
+            // no-op rather than guess, same as an unidentifiable session.
+            let Some(tool_name) = ninox_core::worker_status::hook_payload_tool_name(&input) else {
+                return;
+            };
+            ninox_core::worker_status::ActivityEvent::HookAwaitingInput { tool_name }
+        }
+        WorkerStatusHookKind::Permission => {
+            let Some(tool_name) = ninox_core::worker_status::hook_payload_tool_name(&input) else {
+                return;
+            };
+            let tool_input = ninox_core::worker_status::hook_payload_tool_input(&input)
+                .unwrap_or(serde_json::Value::Null);
+            ninox_core::worker_status::ActivityEvent::HookAwaitingPermission { tool_name, tool_input }
         }
     };
     if let Err(e) = ninox_core::worker_status::apply_activity(&store, &session_id, event, now) {

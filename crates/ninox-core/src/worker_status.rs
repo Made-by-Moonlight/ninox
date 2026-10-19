@@ -1,7 +1,8 @@
 //! Worker activity reporting: the single write path behind
 //! `ninox worker-status` (explicit `set` and the Claude Code
-//! `UserPromptSubmit`/`Stop` hook verbs). All transition rules live in
-//! [`apply_activity`] — the CLI entry points in `main.rs` are dumb pipes.
+//! `UserPromptSubmit`/`Stop`/`PreToolUse`/`PermissionRequest` hook verbs).
+//! All transition rules live in [`apply_activity`] — the CLI entry points in
+//! `main.rs` are dumb pipes.
 //!
 //! The writer is a short-lived external process (like `ninox statusline`),
 //! so the GUI learns about these writes via the poller's external-write
@@ -25,6 +26,69 @@ pub enum ActivityEvent {
     /// sibling `inbox drain-stop` hook will block the Stop and the agent
     /// keeps working on the injected instructions.
     HookStop { turn_continues: bool },
+    /// `PreToolUse` fired for a synchronous interactive tool
+    /// (`AskUserQuestion`, `ExitPlanMode`) that's about to show the human a
+    /// prompt mid-turn. Applies like `Explicit` *except* over an explicit,
+    /// self-declared `Blocked`, which it never overwrites (see
+    /// `apply_activity`'s rules).
+    HookAwaitingInput { tool_name: String },
+    /// `PermissionRequest` fired: Claude Code is about to ask for (or
+    /// auto-deny) permission to run `tool_name` with `tool_input`. Same
+    /// explicit-`Blocked` exception as `HookAwaitingInput`.
+    HookAwaitingPermission { tool_name: String, tool_input: serde_json::Value },
+}
+
+/// Marks an `activity_note` as written by [`ActivityEvent::HookAwaitingInput`]
+/// or [`ActivityEvent::HookAwaitingPermission`] rather than an operator's own
+/// `ninox worker-status set blocked --note …`. Claude Code cannot fire `Stop`
+/// while a synchronous interactive tool call is still waiting on a human, so
+/// `Stop` firing at all is proof such a prompt already resolved — unlike an
+/// explicit self-declared `Blocked`, which has no such liveness guarantee and
+/// must survive `Stop` until a human (or the orchestrator) addresses it. This
+/// prefix is how [`apply_activity`] tells the two apart without a dedicated
+/// persisted field: a deliberate trade-off against a schema migration, with
+/// one known sharp edge — an operator whose own `--note` happens to start
+/// with this exact prefix would be misclassified as hook-driven. Picked to
+/// be distinctive enough that's unlikely in practice.
+const HOOK_AWAITING_MARKER: &str = "[awaiting] ";
+
+fn is_hook_awaiting_note(note: &str) -> bool {
+    note.starts_with(HOOK_AWAITING_MARKER)
+}
+
+/// Whether `session` is currently an *explicit*, self-declared `Blocked` —
+/// i.e. `Blocked` with no [`HOOK_AWAITING_MARKER`] note. This must never be
+/// overwritten by a hook-driven awaiting event (which would silently lose
+/// the operator's declaration) or cleared by `HookStop` (which exists to
+/// preserve it past turn end in the first place).
+fn is_explicit_blocked(session: &Session) -> bool {
+    session.activity == ActivityState::Blocked
+        && !session.activity_note.as_deref().is_some_and(is_hook_awaiting_note)
+}
+
+/// Build the `activity_note` for a `PermissionRequest` hook: pulls a short,
+/// human-readable detail out of common `tool_input` shapes (`command` for
+/// Bash, `file_path`/`path` for file and search tools) and falls back to the
+/// compact JSON, truncated so one runaway field can't blow up the note.
+fn format_permission_note(tool_name: &str, tool_input: &serde_json::Value) -> String {
+    const MAX_CHARS: usize = 80;
+    let detail = tool_input.get("command")
+        .or_else(|| tool_input.get("file_path"))
+        .or_else(|| tool_input.get("path"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| tool_input.to_string());
+    let detail = if detail.chars().count() > MAX_CHARS {
+        let truncated: String = detail.chars().take(MAX_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        detail
+    };
+    // Keep it single-line and free of backticks so an arbitrary command
+    // (e.g. containing its own backtick or newline) can't make the note
+    // read as if it ended early or spanned lines.
+    let detail = detail.replace(['\n', '\r'], " ").replace('`', "'");
+    format!("{HOOK_AWAITING_MARKER}permission: {tool_name} `{detail}`")
 }
 
 /// Apply `event` to the session's activity fields. Returns the updated row
@@ -36,9 +100,14 @@ pub enum ActivityEvent {
 /// - `HookPrompt` sets `Working` — a new turn supersedes a stale `Blocked`.
 ///   If already `Working` it's a no-op, so a self-reported working note
 ///   isn't clobbered by the next prompt.
-/// - `HookStop` sets `Idle` from `Working`/`Unknown` but never overwrites
+/// - `HookStop` sets `Idle` from `Working`/`Unknown`/a hook-driven `Blocked`
+///   (see [`is_explicit_blocked`]) but never overwrites an *explicit*
 ///   `Blocked` — an agent that declared itself blocked mid-turn stays
 ///   blocked past turn end, which is the whole point of declaring it.
+/// - `HookAwaitingInput`/`HookAwaitingPermission` behave like `Explicit`
+///   `Blocked` *except* they never overwrite an explicit `Blocked` either —
+///   doing so would both lose the operator's note and (since the new note
+///   would carry the hook marker) make the next `Stop` wrongly clear it.
 /// - `activity_since` resets only when the state value actually changes,
 ///   mirroring `GateStatus::since`.
 /// - The note is cleared on any state change that doesn't bring its own.
@@ -63,12 +132,33 @@ pub fn apply_activity(
             (ActivityState::Working, None)
         }
         ActivityEvent::HookStop { turn_continues: false } => {
-            if session.activity == ActivityState::Blocked
-                || session.activity == ActivityState::Idle
-            {
+            if session.activity == ActivityState::Idle {
+                return Ok(None);
+            }
+            // A hook-driven "awaiting" Blocked (tagged via
+            // HOOK_AWAITING_MARKER) is cleared like any other state — see
+            // the marker's doc comment for why that's safe. An explicit,
+            // self-declared Blocked is preserved exactly as before.
+            if is_explicit_blocked(&session) {
                 return Ok(None);
             }
             (ActivityState::Idle, None)
+        }
+        ActivityEvent::HookAwaitingInput { tool_name } => {
+            // Never clobber an explicit Blocked -- it's meant to survive
+            // until a human addresses it, and overwriting it here would also
+            // make the next Stop wrongly clear it (the new note would carry
+            // the hook marker).
+            if is_explicit_blocked(&session) {
+                return Ok(None);
+            }
+            (ActivityState::Blocked, Some(format!("{HOOK_AWAITING_MARKER}input: {tool_name}")))
+        }
+        ActivityEvent::HookAwaitingPermission { tool_name, tool_input } => {
+            if is_explicit_blocked(&session) {
+                return Ok(None);
+            }
+            (ActivityState::Blocked, Some(format_permission_note(&tool_name, &tool_input)))
         }
     };
     if session.activity == state && session.activity_note == note {
@@ -169,6 +259,27 @@ pub fn hook_payload_cwd(payload: &str) -> Option<String> {
         .pointer("/cwd")?
         .as_str()
         .map(String::from)
+}
+
+/// Extract `tool_name` from a `PreToolUse`/`PermissionRequest` hook stdin
+/// payload. Malformed or unexpected JSON yields `None` — hook handlers must
+/// never fail.
+pub fn hook_payload_tool_name(payload: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()?
+        .pointer("/tool_name")?
+        .as_str()
+        .map(String::from)
+}
+
+/// Extract `tool_input` from a `PreToolUse`/`PermissionRequest` hook stdin
+/// payload. Malformed or unexpected JSON yields `None` — hook handlers must
+/// never fail.
+pub fn hook_payload_tool_input(payload: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()?
+        .pointer("/tool_input")
+        .cloned()
 }
 
 #[cfg(test)]
@@ -397,5 +508,234 @@ mod tests {
         assert_eq!(hook_payload_cwd("not json at all"), None);
         assert_eq!(hook_payload_cwd(r#"{"cwd": 42}"#), None);
         assert_eq!(hook_payload_cwd(""), None);
+    }
+
+    #[test]
+    fn hook_awaiting_input_marks_blocked_with_the_tool_name() {
+        let store = test_store();
+        seed(&store, "s1", None, SessionStatus::Working, 0);
+        apply_activity(&store, "s1", ActivityEvent::HookPrompt, 100).unwrap();
+
+        let updated = apply_activity(
+            &store, "s1",
+            ActivityEvent::HookAwaitingInput { tool_name: "AskUserQuestion".into() },
+            200,
+        ).unwrap();
+        assert!(updated.is_some());
+        let (state, note, since) = activity_of(&store, "s1");
+        assert_eq!(state, ActivityState::Blocked);
+        assert_eq!(note.as_deref(), Some("[awaiting] input: AskUserQuestion"));
+        assert_eq!(since, Some(200));
+    }
+
+    #[test]
+    fn hook_awaiting_permission_describes_the_tool_call() {
+        let store = test_store();
+        seed(&store, "s1", None, SessionStatus::Working, 0);
+
+        let updated = apply_activity(
+            &store, "s1",
+            ActivityEvent::HookAwaitingPermission {
+                tool_name: "Bash".into(),
+                tool_input: serde_json::json!({"command": "rm -rf node_modules"}),
+            },
+            100,
+        ).unwrap();
+        assert!(updated.is_some());
+        let (state, note, _) = activity_of(&store, "s1");
+        assert_eq!(state, ActivityState::Blocked);
+        assert_eq!(
+            note.as_deref(),
+            Some("[awaiting] permission: Bash `rm -rf node_modules`"),
+        );
+    }
+
+    #[test]
+    fn hook_awaiting_permission_falls_back_to_raw_input_without_a_known_field() {
+        let store = test_store();
+        seed(&store, "s1", None, SessionStatus::Working, 0);
+
+        apply_activity(
+            &store, "s1",
+            ActivityEvent::HookAwaitingPermission {
+                tool_name: "WebFetch".into(),
+                tool_input: serde_json::json!({"url": "https://example.com"}),
+            },
+            100,
+        ).unwrap();
+        let (_, note, _) = activity_of(&store, "s1");
+        assert_eq!(
+            note.as_deref(),
+            Some(r#"[awaiting] permission: WebFetch `{"url":"https://example.com"}`"#),
+        );
+    }
+
+    #[test]
+    fn hook_awaiting_permission_truncates_a_long_command() {
+        let store = test_store();
+        seed(&store, "s1", None, SessionStatus::Working, 0);
+        let long_command = "x".repeat(200);
+
+        apply_activity(
+            &store, "s1",
+            ActivityEvent::HookAwaitingPermission {
+                tool_name: "Bash".into(),
+                tool_input: serde_json::json!({"command": long_command}),
+            },
+            100,
+        ).unwrap();
+        let (_, note, _) = activity_of(&store, "s1");
+        let note = note.unwrap();
+        assert!(
+            note.chars().count() < 200,
+            "a long command field must be truncated like the JSON-fallback branch is: {note}",
+        );
+        assert!(note.ends_with('…') || note.ends_with("…`"), "note: {note}");
+    }
+
+    #[test]
+    fn hook_awaiting_permission_sanitizes_backticks_and_newlines_in_the_detail() {
+        let store = test_store();
+        seed(&store, "s1", None, SessionStatus::Working, 0);
+
+        apply_activity(
+            &store, "s1",
+            ActivityEvent::HookAwaitingPermission {
+                tool_name: "Bash".into(),
+                tool_input: serde_json::json!({"command": "echo `whoami`\nls"}),
+            },
+            100,
+        ).unwrap();
+        let (_, note, _) = activity_of(&store, "s1");
+        assert_eq!(
+            note.as_deref(),
+            Some("[awaiting] permission: Bash `echo 'whoami' ls`"),
+            "a backtick or newline in the command must not break the note's own backtick-quoting",
+        );
+    }
+
+    #[test]
+    fn hook_prompt_supersedes_an_awaiting_input_state() {
+        // "the next UserPromptSubmit ... should supersede it like any other
+        // state" — no special-casing needed, HookPrompt already overwrites
+        // anything but Working.
+        let store = test_store();
+        seed(&store, "s1", None, SessionStatus::Working, 0);
+        apply_activity(&store, "s1", ActivityEvent::HookAwaitingInput {
+            tool_name: "AskUserQuestion".into(),
+        }, 100).unwrap();
+
+        apply_activity(&store, "s1", ActivityEvent::HookPrompt, 200).unwrap();
+        assert_eq!(activity_of(&store, "s1"), (ActivityState::Working, None, Some(200)));
+    }
+
+    #[test]
+    fn hook_stop_clears_a_hook_driven_awaiting_state() {
+        // Unlike an explicit Blocked, a hook-driven "awaiting" state must
+        // clear on the very next Stop: Claude Code cannot fire Stop while a
+        // synchronous interactive tool call (AskUserQuestion/ExitPlanMode,
+        // or a permission prompt) is still outstanding, so Stop firing at
+        // all is proof the prompt already resolved.
+        let store = test_store();
+        seed(&store, "s1", None, SessionStatus::Working, 0);
+        apply_activity(&store, "s1", ActivityEvent::HookAwaitingPermission {
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({"command": "rm -rf node_modules"}),
+        }, 100).unwrap();
+
+        let updated = apply_activity(&store, "s1", ActivityEvent::HookStop { turn_continues: false }, 200).unwrap();
+        assert!(updated.is_some(), "stop must clear a resolved hook-driven awaiting state");
+        assert_eq!(activity_of(&store, "s1"), (ActivityState::Idle, None, Some(200)));
+    }
+
+    #[test]
+    fn hook_stop_still_preserves_an_explicit_blocked_alongside_awaiting_support() {
+        // Regression guard: adding the awaiting-state clear path must not
+        // weaken the original explicit-Blocked guarantee.
+        let store = test_store();
+        seed(&store, "s1", None, SessionStatus::Working, 0);
+        apply_activity(&store, "s1", ActivityEvent::Explicit {
+            state: ActivityState::Blocked, note: Some("waiting on review of #12".into()),
+        }, 100).unwrap();
+
+        let updated = apply_activity(&store, "s1", ActivityEvent::HookStop { turn_continues: false }, 200).unwrap();
+        assert!(updated.is_none(), "stop must not clear a declared blocked state");
+        assert_eq!(
+            activity_of(&store, "s1"),
+            (ActivityState::Blocked, Some("waiting on review of #12".into()), Some(100)),
+        );
+    }
+
+    #[test]
+    fn an_awaiting_input_event_does_not_clobber_an_explicit_blocked() {
+        // An operator's explicit Blocked must survive to Stop unchanged (see
+        // the test above) -- which only holds if a hook-driven awaiting
+        // event arriving *first* doesn't overwrite it with a marked note
+        // that the next Stop would then (correctly, for a hook-driven note)
+        // clear. Without this guard the explicit declaration is lost the
+        // moment any interactive tool call happens mid-turn.
+        let store = test_store();
+        seed(&store, "s1", None, SessionStatus::Working, 0);
+        apply_activity(&store, "s1", ActivityEvent::Explicit {
+            state: ActivityState::Blocked, note: Some("waiting on review of #12".into()),
+        }, 100).unwrap();
+
+        let updated = apply_activity(&store, "s1", ActivityEvent::HookAwaitingInput {
+            tool_name: "AskUserQuestion".into(),
+        }, 200).unwrap();
+        assert!(updated.is_none(), "an awaiting-input signal must not overwrite an explicit blocked");
+        assert_eq!(
+            activity_of(&store, "s1"),
+            (ActivityState::Blocked, Some("waiting on review of #12".into()), Some(100)),
+        );
+
+        // And it still survives the following Stop, same as if the
+        // awaiting-input event had never fired.
+        let updated = apply_activity(&store, "s1", ActivityEvent::HookStop { turn_continues: false }, 300).unwrap();
+        assert!(updated.is_none());
+        assert_eq!(
+            activity_of(&store, "s1"),
+            (ActivityState::Blocked, Some("waiting on review of #12".into()), Some(100)),
+        );
+    }
+
+    #[test]
+    fn an_awaiting_permission_event_does_not_clobber_an_explicit_blocked() {
+        let store = test_store();
+        seed(&store, "s1", None, SessionStatus::Working, 0);
+        apply_activity(&store, "s1", ActivityEvent::Explicit {
+            state: ActivityState::Blocked, note: Some("waiting on review of #12".into()),
+        }, 100).unwrap();
+
+        let updated = apply_activity(&store, "s1", ActivityEvent::HookAwaitingPermission {
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({"command": "rm -rf node_modules"}),
+        }, 200).unwrap();
+        assert!(updated.is_none(), "an awaiting-permission signal must not overwrite an explicit blocked");
+        assert_eq!(
+            activity_of(&store, "s1"),
+            (ActivityState::Blocked, Some("waiting on review of #12".into()), Some(100)),
+        );
+    }
+
+    #[test]
+    fn hook_payload_tool_name_is_tolerant_of_malformed_input() {
+        assert_eq!(
+            hook_payload_tool_name(r#"{"tool_name":"Bash","tool_input":{}}"#),
+            Some("Bash".into()),
+        );
+        assert_eq!(hook_payload_tool_name("not json"), None);
+        assert_eq!(hook_payload_tool_name(r#"{"tool_name": 42}"#), None);
+        assert_eq!(hook_payload_tool_name(""), None);
+    }
+
+    #[test]
+    fn hook_payload_tool_input_extracts_the_object() {
+        assert_eq!(
+            hook_payload_tool_input(r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#),
+            Some(serde_json::json!({"command": "ls"})),
+        );
+        assert_eq!(hook_payload_tool_input("not json"), None);
+        assert_eq!(hook_payload_tool_input(r#"{"tool_name":"Bash"}"#), None);
     }
 }

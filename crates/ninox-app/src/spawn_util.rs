@@ -1304,11 +1304,11 @@ pub fn create_worktree_at(
 }
 
 /// Write a minimal `.claude/settings.json` (`statusLine`, the Stop/
-/// UserPromptSubmit activity hooks, plus any `PreToolUse` guard a worker
-/// capability installs) into a freshly created worker worktree, unless one
-/// already exists (e.g. checked into the branch). Best-effort: any failure
-/// here must never fail worktree creation itself, so errors are swallowed
-/// rather than propagated.
+/// UserPromptSubmit/PreToolUse/PermissionRequest activity hooks, plus any
+/// `PreToolUse` guard a worker capability installs) into a freshly created
+/// worker worktree, unless one already exists (e.g. checked into the
+/// branch). Best-effort: any failure here must never fail worktree creation
+/// itself, so errors are swallowed rather than propagated.
 ///
 /// The `Stop`/`UserPromptSubmit` hooks always carry the worker-status
 /// activity commands (`ninox worker-status hook-stop`/`hook-prompt` — see
@@ -1318,11 +1318,26 @@ pub fn create_worktree_at(
 /// `NINOX_SESSION`/`NINOX_DATA_DIR` already set (see
 /// `interactive_env_vars`/`worker_env_vars`).
 ///
+/// `PreToolUse` (matched on `AskUserQuestion|ExitPlanMode`) and
+/// `PermissionRequest` (matched on [`PERMISSION_REQUEST_MATCHER`]) are also
+/// always-on: they report a session waiting on a synchronous interactive
+/// prompt mid-turn, the gap `UserPromptSubmit`/`Stop` alone can't see (the
+/// turn hasn't ended while the agent is sitting at the prompt). See
+/// `ninox worker-status hook-needs-input`/`hook-permission`.
+///
 /// `PreToolUse` entries come from `ninox_core::capabilities::hooks_for` —
 /// the same registry `seed_worker_skills` reads for skill markdown, gated
 /// the same way (today: `pr-watch-enforcement`, always-on). This is the
 /// worker-side counterpart to `orchestrator_root::setup_orchestrator_root`'s
 /// own hook seeding, and seeds the identical `ToolHook` value.
+/// Tool names that can actually prompt for permission. Left unmatched, a
+/// `PermissionRequest` hook entry fires on *every* tool call (Read, Grep,
+/// TodoWrite, …), not just ones that could ever need a human's okay — a
+/// subprocess-plus-sqlite round trip per call, fleet-wide. `AskUserQuestion`/
+/// `ExitPlanMode` are deliberately excluded: those are covered by the
+/// `PreToolUse` entry above, not by `PermissionRequest`.
+const PERMISSION_REQUEST_MATCHER: &str = "Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch";
+
 fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bool) {
     let claude_dir = worktree_path.join(".claude");
     let settings_path = claude_dir.join("settings.json");
@@ -1381,7 +1396,11 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
     prompt_hooks.push(hook("worker-status hook-prompt"));
     settings["hooks"] = serde_json::json!({
         "Stop":             [{ "hooks": stop_hooks }],
-        "UserPromptSubmit": [{ "hooks": prompt_hooks }]
+        "UserPromptSubmit": [{ "hooks": prompt_hooks }],
+        "PermissionRequest": [{
+            "matcher": PERMISSION_REQUEST_MATCHER,
+            "hooks": [hook("worker-status hook-permission")]
+        }]
     });
 
     if std::fs::create_dir_all(&claude_dir).is_err() {
@@ -1402,7 +1421,14 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
     // same way `inbox_enabled` is, to stay testable without touching
     // `~/.config/ninox/config.toml`.
     let config = ninox_core::config::AppConfig::load().unwrap_or_default();
-    let mut pre_tool_use = Vec::new();
+    // Always-on, same as the Stop/UserPromptSubmit activity hooks above —
+    // not gated through the capability registry since this isn't an
+    // agent-facing capability, just making the existing activity signal
+    // correct for a case it currently misses entirely.
+    let mut pre_tool_use = vec![serde_json::json!({
+        "matcher": "AskUserQuestion|ExitPlanMode",
+        "hooks": [hook("worker-status hook-needs-input")]
+    })];
     for hook in ninox_core::capabilities::hooks_for(ninox_core::capabilities::Audience::Worker, &config) {
         if std::fs::write(claude_dir.join(hook.script_name), hook.script).is_err() {
             continue;
@@ -1413,9 +1439,7 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
             "hooks": [{"type": "command", "command": format!("node .claude/{}", hook.script_name), "timeout": 5}]
         }));
     }
-    if !pre_tool_use.is_empty() {
-        settings["hooks"]["PreToolUse"] = serde_json::Value::Array(pre_tool_use);
-    }
+    settings["hooks"]["PreToolUse"] = serde_json::Value::Array(pre_tool_use);
 
     if let Ok(body) = serde_json::to_string_pretty(&settings) {
         if std::fs::write(&settings_path, body).is_ok() {
@@ -2200,6 +2224,35 @@ mod tests {
         let prompt_cmds = hook_commands(&settings, "UserPromptSubmit");
         assert_eq!(prompt_cmds.len(), 1, "{prompt_cmds:?}");
         assert!(prompt_cmds[0].ends_with("worker-status hook-prompt"), "{prompt_cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn create_worker_worktree_installs_needs_input_and_permission_hooks() {
+        let repo = init_git_repo();
+        let worktree = create_worker_worktree(repo.to_str().unwrap(), "test-session-needs-input", false).await.unwrap();
+
+        let settings_path = std::path::Path::new(&worktree).join(".claude").join("settings.json");
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&settings_path).unwrap(),
+        ).unwrap();
+
+        let pre_tool_use = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            pre_tool_use.iter().any(|e| e["matcher"] == "AskUserQuestion|ExitPlanMode"
+                && e["hooks"][0]["command"].as_str().unwrap().ends_with("worker-status hook-needs-input")),
+            "needs-input PreToolUse entry missing: {pre_tool_use:?}",
+        );
+
+        let permission_cmds = hook_commands(&settings, "PermissionRequest");
+        assert_eq!(permission_cmds.len(), 1, "{permission_cmds:?}");
+        assert!(permission_cmds[0].ends_with("worker-status hook-permission"), "{permission_cmds:?}");
+
+        let permission_entry = &settings["hooks"]["PermissionRequest"][0];
+        assert_eq!(
+            permission_entry["matcher"], "Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch",
+            "PermissionRequest must be scoped to tools that can actually need permission, \
+             not left unmatched (which fires the hook subprocess on every tool call): {permission_entry:?}",
+        );
     }
 
     /// Parity is the point: a worker worktree must get the exact same
