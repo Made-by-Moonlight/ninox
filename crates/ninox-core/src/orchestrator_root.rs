@@ -41,8 +41,15 @@ async fn seed_orchestrator_skills<'a>(
 /// Seeds `~/ninox/orchestrators/` (or the configured root) with the
 /// files that orchestrator sessions need: AGENTS.md (canonical, CLAUDE.md
 /// symlinks to it), one SKILL.md per *enabled* orchestrator-facing capability
-/// in `ninox_core::capabilities::REGISTRY`, and the subagent-blocker
-/// PreToolUse hook.
+/// in `ninox_core::capabilities::REGISTRY`, the subagent-blocker
+/// PreToolUse hook, and the same `worker-status` activity hooks
+/// (`ninox_core::worker_status`) a worker worktree gets via
+/// `spawn_util::ensure_statusline_settings` — `PreToolUse`
+/// (`AskUserQuestion|ExitPlanMode`) and `PermissionRequest` to detect an
+/// orchestrator sitting at a synchronous prompt, `Stop`/`UserPromptSubmit`
+/// to clear it again once the prompt resolves. Orchestrators previously had
+/// none of this wiring, so hitting their own prompt left them Blocked with
+/// no signal and no way to recover without a human intervening by hand.
 ///
 /// Both the seeded skills and AGENTS.md's "Available Skills" list are driven
 /// by that registry, so adding a capability needs no edit here — and both are
@@ -155,18 +162,56 @@ process.exit(0);
 
     let settings_path = claude_dir.join("settings.json");
     if !settings_path.exists() {
-        let mut pre_tool_use = vec![serde_json::json!({
-            "matcher": "Task|Agent",
-            "hooks": [{"type": "command", "command": "node .claude/subagent-blocker.cjs", "timeout": 2000}]
-        })];
+        // An orchestrator has no worktree-cleanup moment to ever uninstall a
+        // stale hook from, so these are only ever written here, on first
+        // seed — identical reasoning to the subagent-blocker/statusLine
+        // entries already guarded by this same `!settings_path.exists()`.
+        let ninox_bin_quoted = format!("'{}'", ninox_bin.replace('\'', "'\\''"));
+        let hook = |cmd: &str| crate::worker_status::hook_entry(&ninox_bin_quoted, cmd);
+
+        let mut pre_tool_use = vec![
+            serde_json::json!({
+                "matcher": "Task|Agent",
+                "hooks": [{"type": "command", "command": "node .claude/subagent-blocker.cjs", "timeout": 2000}]
+            }),
+            // Mirrors the worker-worktree `hook-needs-input` entry
+            // (`spawn_util::ensure_statusline_settings`): reports an
+            // orchestrator sitting at an `AskUserQuestion`/`ExitPlanMode`
+            // prompt as Blocked, the gap `Stop`/`UserPromptSubmit` alone
+            // can't see since the turn hasn't ended while the agent waits.
+            serde_json::json!({
+                "matcher": "AskUserQuestion|ExitPlanMode",
+                "hooks": [hook("worker-status hook-needs-input")]
+            }),
+        ];
         pre_tool_use.extend(capability_pre_tool_use);
         let settings = serde_json::json!({
             "hooks": {
-                "PreToolUse": pre_tool_use
+                "PreToolUse": pre_tool_use,
+                // Same `hook-permission` detection, scoped to the same
+                // [`crate::worker_status::PERMISSION_REQUEST_MATCHER`] worker
+                // worktrees use — not every tool call, just the ones that can
+                // actually trigger a permission prompt.
+                "PermissionRequest": [{
+                    "matcher": crate::worker_status::PERMISSION_REQUEST_MATCHER,
+                    "hooks": [hook("worker-status hook-permission")]
+                }],
+                // The only way a hook-driven Blocked above ever clears:
+                // Claude Code cannot fire `Stop` while a synchronous
+                // interactive prompt is still waiting on a human (see
+                // `worker_status::HOOK_AWAITING_MARKER`), so `Stop` firing
+                // at all is proof the prompt already resolved. An
+                // orchestrator-declared *explicit* Blocked (`ninox
+                // worker-status set blocked`) is unaffected — `apply_activity`
+                // never lets a hook clear that. `UserPromptSubmit` is the
+                // same belt-and-suspenders pairing workers get: a fresh
+                // human message also supersedes a stale Blocked.
+                "Stop":             [{ "hooks": [hook("worker-status hook-stop")] }],
+                "UserPromptSubmit": [{ "hooks": [hook("worker-status hook-prompt")] }]
             },
             "statusLine": {
                 "type": "command",
-                "command": format!("'{}' statusline", ninox_bin.replace('\'', "'\\''")),
+                "command": format!("{ninox_bin_quoted} statusline"),
                 "refreshInterval": 20
             }
         });
@@ -471,6 +516,60 @@ mod tests {
             "pr-watch-enforcement hook entry missing: {pre_tool_use:?}",
         );
         assert!(root.join(".claude").join("pr-watch-enforcement.cjs").exists());
+    }
+
+    /// Every hook command registered for `event`, across matcher groups —
+    /// same helper as `spawn_util`'s worker-worktree tests.
+    fn hook_commands(settings: &serde_json::Value, event: &str) -> Vec<String> {
+        settings["hooks"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|group| group["hooks"].as_array())
+            .flatten()
+            .filter_map(|hook| hook["command"].as_str().map(String::from))
+            .collect()
+    }
+
+    /// Parity with `create_worker_worktree_installs_needs_input_and_permission_hooks`
+    /// in `spawn_util` — an orchestrator hitting its own `AskUserQuestion`/
+    /// `ExitPlanMode` prompt or a permission prompt must be detectable the
+    /// same way a worker's is, and recoverable via the same `Stop`/
+    /// `UserPromptSubmit` pair that clears a hook-driven Blocked.
+    #[tokio::test]
+    async fn setup_orchestrator_root_installs_needs_input_and_permission_hooks() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".claude").join("settings.json")).unwrap(),
+        ).unwrap();
+
+        let pre_tool_use = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            pre_tool_use.iter().any(|e| e["matcher"] == "AskUserQuestion|ExitPlanMode"
+                && e["hooks"][0]["command"].as_str().unwrap().ends_with("worker-status hook-needs-input")),
+            "needs-input PreToolUse entry missing: {pre_tool_use:?}",
+        );
+        // The subagent-blocker entry must still be present alongside it.
+        assert!(pre_tool_use.iter().any(|e| e["matcher"] == "Task|Agent"));
+
+        let permission_cmds = hook_commands(&settings, "PermissionRequest");
+        assert_eq!(permission_cmds.len(), 1, "{permission_cmds:?}");
+        assert!(permission_cmds[0].ends_with("worker-status hook-permission"), "{permission_cmds:?}");
+        assert_eq!(
+            settings["hooks"]["PermissionRequest"][0]["matcher"],
+            crate::worker_status::PERMISSION_REQUEST_MATCHER,
+            "orchestrator PermissionRequest must be scoped identically to the worker-worktree entry",
+        );
+
+        let stop_cmds = hook_commands(&settings, "Stop");
+        assert_eq!(stop_cmds.len(), 1, "{stop_cmds:?}");
+        assert!(stop_cmds[0].ends_with("worker-status hook-stop"), "{stop_cmds:?}");
+
+        let prompt_cmds = hook_commands(&settings, "UserPromptSubmit");
+        assert_eq!(prompt_cmds.len(), 1, "{prompt_cmds:?}");
+        assert!(prompt_cmds[0].ends_with("worker-status hook-prompt"), "{prompt_cmds:?}");
     }
 
     #[tokio::test]

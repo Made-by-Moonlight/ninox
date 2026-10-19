@@ -319,20 +319,21 @@ enum WorkerStatusAction {
         note: Option<String>,
     },
     /// UserPromptSubmit hook entry point: marks the session working.
-    /// Installed in a worker's worktree settings; not intended for direct use.
+    /// Installed in both a worker's worktree settings and an orchestrator
+    /// root's settings; not intended for direct use.
     HookPrompt,
     /// Stop hook entry point: marks the session idle (unless it declared
-    /// itself blocked). Installed in a worker's worktree settings; not
-    /// intended for direct use.
+    /// itself blocked). Installed in both a worker's worktree settings and
+    /// an orchestrator root's settings; not intended for direct use.
     HookStop,
     /// PreToolUse hook entry point (matcher: AskUserQuestion, ExitPlanMode):
     /// marks the session as awaiting a human's answer to an interactive
-    /// prompt. Installed in a worker's worktree settings; not intended for
-    /// direct use.
+    /// prompt. Installed in both a worker's worktree settings and an
+    /// orchestrator root's settings; not intended for direct use.
     HookNeedsInput,
     /// PermissionRequest hook entry point: marks the session as awaiting a
-    /// permission decision. Installed in a worker's worktree settings; not
-    /// intended for direct use.
+    /// permission decision. Installed in both a worker's worktree settings
+    /// and an orchestrator root's settings; not intended for direct use.
     HookPermission,
     /// Declare that a session depends on another session
     Depend {
@@ -2770,15 +2771,15 @@ enum WorkerStatusHookKind {
     Prompt,
     Stop,
     /// `PreToolUse`, registered with matcher `AskUserQuestion|ExitPlanMode`
-    /// only — see `ensure_statusline_settings`. Worker worktrees only: no
-    /// equivalent is registered for the orchestrator root, which has no
-    /// Stop/UserPromptSubmit hooks either and so no way to ever clear a
-    /// `Blocked` this would set.
+    /// only — see `ensure_statusline_settings` (worker worktrees) and
+    /// `orchestrator_root::setup_orchestrator_root` (orchestrator roots),
+    /// which install the identical entry. Both also install `Stop`/
+    /// `UserPromptSubmit`, which is what clears the `Blocked` this sets.
     NeedsInput,
     /// `PermissionRequest`, registered with matcher
-    /// `spawn_util::PERMISSION_REQUEST_MATCHER` (the tools that can actually
-    /// need permission — not every tool call). Worker worktrees only, same
-    /// reason as `NeedsInput`.
+    /// `ninox_core::worker_status::PERMISSION_REQUEST_MATCHER` (the tools
+    /// that can actually need permission — not every tool call). Same two
+    /// install sites as `NeedsInput`.
     Permission,
 }
 

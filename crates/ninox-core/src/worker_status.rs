@@ -282,6 +282,40 @@ pub fn hook_payload_tool_input(payload: &str) -> Option<serde_json::Value> {
         .cloned()
 }
 
+/// Build a Claude Code hook-entry JSON object invoking `ninox worker-status
+/// <cmd>` — one of the `hook-prompt`/`hook-stop`/`hook-needs-input`/
+/// `hook-permission` verbs above. `ninox_bin_quoted` is the ninox binary
+/// path, already single-quoted by the caller (the default macOS config dir
+/// contains a space, so an unquoted path would be split into two argv
+/// tokens by the shell that ultimately runs this command). `timeout` is in
+/// SECONDS, not milliseconds, per Claude Code's hook contract — 5 gives
+/// these fast, local-filesystem-only handlers a generous margin without
+/// risking an accidental multi-minute hang on a hook error.
+///
+/// Shared by the two places that seed these hooks — worker worktrees
+/// (`spawn_util::ensure_statusline_settings`) and orchestrator roots
+/// (`orchestrator_root::setup_orchestrator_root`) — so the command shape
+/// can't drift between the two install sites.
+pub fn hook_entry(ninox_bin_quoted: &str, cmd: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "command",
+        "command": format!("{ninox_bin_quoted} {cmd}"),
+        "timeout": 5
+    })
+}
+
+/// Tool names that can actually prompt for permission. Left unmatched, a
+/// `PermissionRequest` hook entry fires on *every* tool call (Read, Grep,
+/// TodoWrite, …), not just ones that could ever need a human's okay — a
+/// subprocess-plus-sqlite round trip per call, fleet-wide. `AskUserQuestion`/
+/// `ExitPlanMode` are deliberately excluded: those are covered by the
+/// `PreToolUse` `hook-needs-input` entry, not by `PermissionRequest`.
+///
+/// Shared by the same two install sites as [`hook_entry`], for the same
+/// reason: the worker and orchestrator `PermissionRequest` entries must stay
+/// scoped identically, not drift into one being broader than the other.
+pub const PERMISSION_REQUEST_MATCHER: &str = "Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch";
+
 #[cfg(test)]
 mod tests {
     use super::*;

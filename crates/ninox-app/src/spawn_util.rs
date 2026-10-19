@@ -1319,7 +1319,8 @@ pub fn create_worktree_at(
 /// `interactive_env_vars`/`worker_env_vars`).
 ///
 /// `PreToolUse` (matched on `AskUserQuestion|ExitPlanMode`) and
-/// `PermissionRequest` (matched on [`PERMISSION_REQUEST_MATCHER`]) are also
+/// `PermissionRequest` (matched on
+/// [`ninox_core::worker_status::PERMISSION_REQUEST_MATCHER`]) are also
 /// always-on: they report a session waiting on a synchronous interactive
 /// prompt mid-turn, the gap `UserPromptSubmit`/`Stop` alone can't see (the
 /// turn hasn't ended while the agent is sitting at the prompt). See
@@ -1330,14 +1331,6 @@ pub fn create_worktree_at(
 /// the same way (today: `pr-watch-enforcement`, always-on). This is the
 /// worker-side counterpart to `orchestrator_root::setup_orchestrator_root`'s
 /// own hook seeding, and seeds the identical `ToolHook` value.
-/// Tool names that can actually prompt for permission. Left unmatched, a
-/// `PermissionRequest` hook entry fires on *every* tool call (Read, Grep,
-/// TodoWrite, …), not just ones that could ever need a human's okay — a
-/// subprocess-plus-sqlite round trip per call, fleet-wide. `AskUserQuestion`/
-/// `ExitPlanMode` are deliberately excluded: those are covered by the
-/// `PreToolUse` entry above, not by `PermissionRequest`.
-const PERMISSION_REQUEST_MATCHER: &str = "Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch";
-
 fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bool) {
     let claude_dir = worktree_path.join(".claude");
     let settings_path = claude_dir.join("settings.json");
@@ -1372,20 +1365,12 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
             "refreshInterval": 20
         }
     });
-    // Claude Code hook `timeout` is in SECONDS, not milliseconds — 5 gives
-    // these fast, local-filesystem-only handlers a generous margin without
-    // risking an accidental multi-minute hang on a hook error.
-    //
     // Claude Code runs every entry in an event's `hooks` array, so the
     // opt-in inbox drains and the always-on worker-status activity hooks
     // compose as siblings here — this is the single place the `hooks`
     // object is written (write-if-absent, per the early return above), so
     // there is no merge path that could duplicate entries.
-    let hook = |cmd: &str| serde_json::json!({
-        "type": "command",
-        "command": format!("{ninox_bin_quoted} {cmd}"),
-        "timeout": 5
-    });
+    let hook = |cmd: &str| ninox_core::worker_status::hook_entry(&ninox_bin_quoted, cmd);
     let mut stop_hooks = Vec::new();
     let mut prompt_hooks = Vec::new();
     if inbox_enabled {
@@ -1398,7 +1383,7 @@ fn ensure_statusline_settings(worktree_path: &std::path::Path, inbox_enabled: bo
         "Stop":             [{ "hooks": stop_hooks }],
         "UserPromptSubmit": [{ "hooks": prompt_hooks }],
         "PermissionRequest": [{
-            "matcher": PERMISSION_REQUEST_MATCHER,
+            "matcher": ninox_core::worker_status::PERMISSION_REQUEST_MATCHER,
             "hooks": [hook("worker-status hook-permission")]
         }]
     });
