@@ -31,8 +31,8 @@ sha2       = { workspace = true }
 time       = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+tempfile   = "3"
 
 [dev-dependencies]
-tempfile           = "3"
 tokio-test         = "0.4"
 tracing-subscriber = { workspace = true }

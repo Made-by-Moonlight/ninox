@@ -137,14 +137,20 @@ enum BrainAction {
         content: Option<String>,
     },
     /// Package the brain's Markdown source into a portable .tar.gz archive
-    /// (excludes the derived .index.db)
+    /// (excludes the derived .index.db) and write it to a local path, S3, or
+    /// a GitHub wiki
     Export {
-        /// Output path for the archive, e.g. brain.tar.gz
+        /// Destination for the archive — a local path (e.g. brain.tar.gz),
+        /// an S3 URI (s3://bucket/key), or a GitHub wiki
+        /// (wiki:owner/repo, i.e. the owner/repo.wiki.git remote)
         output: PathBuf,
     },
-    /// Extract a `ninox brain export` archive and rebuild the index
+    /// Extract a `ninox brain export` archive and rebuild the index. The
+    /// source may be a local path, an S3 URI, or a GitHub wiki — same forms
+    /// as `export`'s destination
     Import {
-        /// Path to the archive to import
+        /// Source archive — a local path, an S3 URI (s3://bucket/key), or a
+        /// GitHub wiki (wiki:owner/repo)
         input: PathBuf,
         /// Import into this brain path instead of the resolved default
         #[arg(long)]
@@ -630,12 +636,16 @@ async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()>
             );
         }
         BrainAction::Export { output } => {
-            let stats = ninox_core::brain_archive::export(&brain_path, &output)?;
+            let stats =
+                ninox_core::brain_archive_remote::export_to(&brain_path, &output, config.github_token.clone())
+                    .await?;
             println!("exported {} entries to {}", stats.files, output.display());
         }
         BrainAction::Import { input, into, force } => {
             let target = into.unwrap_or(brain_path);
-            let stats = ninox_core::brain_archive::import(&input, &target, force)?;
+            let stats =
+                ninox_core::brain_archive_remote::import_from(&input, &target, force, config.github_token.clone())
+                    .await?;
             println!("imported {} entries into {}", stats.imported, target.display());
             if !stats.skipped.is_empty() {
                 eprintln!(
