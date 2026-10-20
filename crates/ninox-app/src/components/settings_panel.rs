@@ -405,6 +405,29 @@ fn messaging_card(app: &App) -> Element<'_, Message> {
     .padding([6, 10])
     .style(crate::style::pick_style(s));
 
+    let accept_inbound = app.config.auto_accept_inbound();
+
+    let accept_inbound_toggle = button(Space::new(0, 0))
+        .on_press(Message::SettingsToggleAutoAcceptInbound)
+        .width(Length::Fixed(30.0))
+        .height(Length::Fixed(16.0))
+        .padding(0)
+        .style(move |_t, status| button::Style {
+            background: accept_inbound.then_some(Background::Color(s.ink)),
+            text_color: s.ink,
+            border: Border {
+                color: if matches!(status, button::Status::Hovered) { s.accent } else { s.ink },
+                width: 1.5,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        });
+
+    let accept_inbound_label = text("Deliver messages without asking").size(14).font(SERIF)
+        .color(if accept_inbound { s.ink } else { s.ink_2 });
+    let accept_inbound_state_label =
+        text(if accept_inbound { "on" } else { "off" }).size(10).font(MONO).color(s.faint);
+
     let pr_watch_enabled = app.config.pr_watch.enabled;
 
     let pr_watch_toggle = button(Space::new(0, 0))
@@ -435,6 +458,25 @@ fn messaging_card(app: &App) -> Element<'_, Message> {
         // of the bool this replaced, so it cannot survive the mechanism
         // becoming a three-way choice.
         text(mechanism.description()).size(10).font(MONO).color(s.faint),
+        Space::new(0, 14),
+        row![
+            accept_inbound_toggle,
+            Space::new(12, 0),
+            accept_inbound_label,
+            Space::new(Length::Fill, 0),
+            accept_inbound_state_label,
+        ]
+        .align_y(Alignment::Center),
+        Space::new(0, 10),
+        text(
+            "On: claude-code sessions ninox starts are launched with crossSessionInbound = accept, \
+             so a message from another session reaches the agent at once. Off: Claude Code holds \
+             each one behind a \"Deliver this message\" prompt in the receiving pane. Applies to \
+             sessions started from now on."
+        )
+        .size(10)
+        .font(MONO)
+        .color(s.faint),
         Space::new(0, 14),
         row![
             pr_watch_toggle,

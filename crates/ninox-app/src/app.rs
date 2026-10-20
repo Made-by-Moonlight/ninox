@@ -564,6 +564,11 @@ pub enum Message {
     /// Flip the opt-in consolidated PR-watching toggle (`[pr_watch].enabled`,
     /// default off — see `ninox_core::config::PrWatchConfig`).
     SettingsTogglePrWatch,
+    /// Flip whether claude-code sessions ninox launches deliver messages
+    /// from other sessions without holding them for approval
+    /// (`[messaging].auto_accept_inbound`, default on — see
+    /// `ninox_core::config::MessagingConfig`).
+    SettingsToggleAutoAcceptInbound,
     BrainSelectEntry(String),
     /// The pinboard canvas's hovered node changed (including to/from `None`)
     /// — emitted only on change, never on every mouse move.
@@ -3630,6 +3635,13 @@ impl App {
                 Task::none()
             }
 
+            Message::SettingsToggleAutoAcceptInbound => {
+                Self::persist_config(state, "inbound auto-accept", |c| {
+                    c.set_auto_accept_inbound(!c.auto_accept_inbound())
+                });
+                Task::none()
+            }
+
             Message::SettingsSetRuntimeBackend(backend) => {
                 Self::persist_config(state, "session runtime", |c| c.runtime.backend = backend);
                 if backend != ninox_core::runtime::Backend::Ptyd {
@@ -5365,7 +5377,14 @@ mod tests {
         });
         let session = refile_session("s1");
         let plan = refile_plan(&session, false, &cfg, "fresh-uuid").expect("plan");
-        assert_eq!(plan.base_cmd, "claude-nightly --model 'claude-opus-4-8'");
+        // Still Claude Code, so the default inbound auto-accept flag leads.
+        assert_eq!(
+            plan.base_cmd,
+            format!(
+                "claude-nightly --settings '{}' --model 'claude-opus-4-8'",
+                ninox_core::harness::CLAUDE_ACCEPT_INBOUND_SETTINGS
+            )
+        );
         assert_eq!(plan.workspace, "/tmp/ws");
         assert_eq!(plan.catalogue_path, "/brains/b");
         assert!(plan.extra_env.iter().any(|(key, value)| {
@@ -8063,9 +8082,11 @@ mod tests {
             on_disk.save().unwrap();
 
             let (m, _) = m.update(Message::SettingsTogglePrWatch);
+            let (m, _) = m.update(Message::SettingsToggleAutoAcceptInbound);
             let (m, _) = m.update(Message::SettingsSetRuntimeBackend(ninox_core::runtime::Backend::Tmux));
             let loaded = ninox_core::config::AppConfig::load().unwrap();
             assert!(loaded.pr_watch.enabled);
+            assert!(!loaded.auto_accept_inbound(), "on by default, so one toggle turns it off");
             assert_eq!(loaded.tui.prefix, "C-a", "the app must not write back its stale copy");
             assert_eq!(m.config.tui.prefix, "C-a", "the app adopts what it saved");
         });

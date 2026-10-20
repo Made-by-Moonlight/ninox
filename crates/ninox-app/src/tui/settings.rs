@@ -22,6 +22,7 @@ pub enum FieldId {
     Editor,
     Harness(String),
     SendMechanism,
+    AutoAcceptInbound,
     PrWatch,
     RestorePolicy,
     AutoReap,
@@ -276,6 +277,18 @@ pub fn fields(cfg: &AppConfig) -> Vec<Field> {
             mechanism.description(),
         ),
         f(
+            FieldId::AutoAcceptInbound,
+            "Messaging",
+            "Deliver messages without asking",
+            on_off(cfg.auto_accept_inbound()),
+            Kind::Toggle,
+            strs(&ON_OFF),
+            "On: claude-code sessions ninox starts are launched with crossSessionInbound = accept, so a \
+             message from another session reaches the agent at once. Off: Claude Code holds each one \
+             behind a \"Deliver this message\" prompt in the receiving pane. Applies to sessions started \
+             from now on.",
+        ),
+        f(
             FieldId::PrWatch,
             "Messaging",
             "Consolidated PR watching",
@@ -408,6 +421,7 @@ fn set(cfg: &mut AppConfig, field: &Field, s: &str) -> Result<(), String> {
             }
         }
         FieldId::SendMechanism => cfg.set_send_mechanism(pick(&SendMechanism::ALL, s).ok_or_else(bad)?),
+        FieldId::AutoAcceptInbound => cfg.set_auto_accept_inbound(s == "on"),
         FieldId::PrWatch => cfg.pr_watch.enabled = s == "on",
         FieldId::RestorePolicy => cfg.fleet.restore_policy = pick(&POLICIES, s).ok_or_else(bad)?,
         FieldId::AutoReap => cfg.auto_reap.enabled = s == "on",
@@ -467,6 +481,7 @@ mod tests {
             FieldId::Harness("claude-code".into()),
             FieldId::Harness("codex".into()),
             FieldId::SendMechanism,
+            FieldId::AutoAcceptInbound,
             FieldId::PrWatch,
             FieldId::RestorePolicy,
             FieldId::RetentionDays,
@@ -503,6 +518,10 @@ mod tests {
         assert_eq!(cfg.send_mechanism(), SendMechanism::Inbox);
         step(&mut cfg, FieldId::PrWatch, false).unwrap();
         assert!(cfg.pr_watch.enabled);
+        assert!(cfg.auto_accept_inbound(), "on by default");
+        step(&mut cfg, FieldId::AutoAcceptInbound, false).unwrap();
+        assert!(!cfg.auto_accept_inbound());
+        assert_eq!(cfg.send_mechanism(), SendMechanism::Inbox, "the mechanism chosen above survives");
         step(&mut cfg, FieldId::Colors, false).unwrap();
         assert_eq!(cfg.tui.colors, TuiColors::FieldNotes);
         let msg = step(&mut cfg, FieldId::Editor, false).unwrap();
