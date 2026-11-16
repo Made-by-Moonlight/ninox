@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ninox Fleet Overview — TUI at scale</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#9db4ff}a:hover{color:#c3d2ff}
+.tt{font-family:"JetBrains Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:12.5px;line-height:19.2px;color:#e8e9ed;background:#0b0e14;font-variant-ligatures:none;box-sizing:border-box}
+.tt *{box-sizing:border-box}
+.ln{white-space:pre;overflow:hidden;text-overflow:clip}
+.dim{color:#5b6478}.mid{color:#8b92a5}.teal{color:#4fd1c5}.amber{color:#e8a33d}.green{color:#4ade80}.gray{color:#6b7280}.red{color:#f0506e}.violet{color:#a99cff}.blue{color:#9db4ff}
+.box{border:1px solid #2a3142;margin:0 0 9.6px;padding:0 8px;break-inside:avoid}
+.box-sel{border-color:#4fd1c5}
+.box-remote{border-color:#4a3f80}
+.boxhead{display:flex;gap:8px;white-space:pre;margin-top:-10px;background:#0b0e14;width:max-content;max-width:100%;padding:0 4px;overflow:hidden}
+.tab{padding:0 8px}
+.tab-on{background:#4fd1c5;color:#0b0e14;font-weight:700}
+.sel{background:#1b2236}
+</style>
+</helmet>
+<div class="tt" style="width:1600px;height:960px;display:flex;flex-direction:column">
+  <div class="ln" style="padding:0 16px;height:38.4px;display:flex;align-items:center;gap:4px;border-bottom:1px solid #1d2230">
+    <span class="tab tab-on">1 Fleet</span><span class="tab mid">2 Board</span><span class="tab mid">3 Plans</span><span class="tab mid">4 Brain</span><span class="tab mid">5 Types</span><span class="tab mid">6 Remotes</span>
+    <span style="flex:1"></span>
+    <span class="mid">69 workers · 19 trees · </span><span class="amber">3 need you</span><span class="dim"> · ptyd </span><span class="green">●</span><span class="dim"> engine </span><span class="green">●</span>
+  </div>
+
+  <div style="flex:1;display:flex;min-height:0">
+    <div style="width:272px;flex-shrink:0;border-right:1px solid #1d2230;padding:9.6px 12px;overflow:hidden">
+      <div class="ln dim">SESSIONS  <span class="mid">[ hide</span></div>
+      <div class="ln mid">this machine</div>
+      <sc-for list="{{tree}}" as="t" hint-placeholder-count="18">
+        <div class="{{t.cls}}"><span class="dim">{{t.caret}} </span><span class="{{t.dotCls}}">●</span> {{t.name}}<span class="dim">{{t.count}}</span></div>
+        <sc-if value="{{t.open}}" hint-placeholder-val="{{false}}">
+          <sc-for list="{{t.kids}}" as="k" hint-placeholder-count="3"><div class="ln"><span class="dim">  {{k.rail}}</span><span class="{{k.dotCls}}">●</span> {{k.short}}</div></sc-for>
+        </sc-if>
+      </sc-for>
+      <div class="ln violet" style="margin-top:9.6px">⌁ eu1-ptyd <span class="amber">● reconnecting</span></div>
+      <div class="ln"><span class="dim">▸ </span><span class="teal">●</span> gpu-eval-sweep<span class="dim"> 3</span></div>
+    </div>
+
+    <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+      <div class="ln mid" style="padding:4.8px 16px;border-bottom:1px solid #1d2230">sort: <span class="teal">needs-you</span> · view: <span class="teal">compact</span> · finished: <span class="teal">folded</span>   <span class="dim">s sort  m compact  f fold  enter expand  / prompt</span></div>
+      <div style="flex:1;min-height:0;overflow:hidden;padding:19.2px 16px 0;column-count:4;column-gap:16px">
+        <sc-for list="{{islands}}" as="o" hint-placeholder-count="18">
+          <div class="{{o.cls}}">
+            <sc-if value="{{o.machine}}" hint-placeholder-val="{{false}}"><div class="ln violet" style="background:#1c1833;margin:0 -8px;padding:0 8px">⌁ REMOTE {{o.machine}} <span class="{{o.healthCls}}">● {{o.health}}</span></div></sc-if>
+            <div class="boxhead"><span class="teal">●</span><span style="font-weight:700">{{o.title}}</span><sc-if value="{{o.needs}}" hint-placeholder-val="{{false}}"><span class="amber">{{o.needs}}</span></sc-if><span class="dim">{{o.meta}}</span></div>
+            <sc-for list="{{o.workers}}" as="w" hint-placeholder-count="3">
+              <div class="ln"><span class="dim">{{w.rail}}</span><span class="{{w.dotCls}}">●</span> {{w.short}}<span class="{{w.tagCls}}">{{w.tag}}</span></div>
+            </sc-for>
+            <sc-if value="{{o.fold}}" hint-placeholder-val="{{false}}"><div class="ln dim">└ {{o.fold}}</div></sc-if>
+            <sc-if value="{{o.empty}}" hint-placeholder-val="{{false}}"><div class="ln dim">└ no workers</div></sc-if>
+          </div>
+        </sc-for>
+      </div>
+      <div class="ln" style="padding:0 16px;height:38.4px;display:flex;align-items:center;border-top:1px solid #1d2230"><span class="violet">❯ </span><span class="mid">ask ninox — "what's blocking dind-gpu-sharing?"</span></div>
+    </div>
+  </div>
+  <div class="ln dim" style="padding:0 16px;height:19.2px;background:#12161f">↑↓ move  ←→ tree/graph  [ hide tree  enter open island  esc back  m compact  f fold finished  / prompt  c connect  ? help</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1600,"height":960}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const cut = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+    const W = (name, st, pr) => {
+      const m = {
+        working:   { dotCls: 'teal' },
+        pr_open:   { dotCls: 'gray', tag: ' PR' + (pr ? ' ' + pr : ''), tagCls: 'blue' },
+        mergeable: { dotCls: 'gray', tag: ' ✓merge', tagCls: 'green' },
+        ci_failed: { dotCls: 'amber', tag: ' ✗CI', tagCls: 'red' },
+        needs_you: { dotCls: 'amber', tag: ' !you', tagCls: 'amber' },
+        paused:    { dotCls: 'amber', tag: ' paused', tagCls: 'amber' },
+      }[st];
+      const tag = m.tag || '';
+      return { name, dotCls: m.dotCls, tag, tagCls: m.tagCls || 'dim', short: cut(name, 34 - tag.length) };
+    };
+    const orchs = [
+      { name: 'Ray rolout teething', needs: '✗CI', workers: [W('rnd-44-workspace-uv-sync','working'), W('mlops-4749-nightly-publish-fix','ci_failed'), W('mlops-5348-resolve-new-version-tag-push','mergeable')] },
+      { name: 'Ninox', needs: '!2', sel: true, done: 17, stopped: 2, workers: [W('v1-user-request-design','needs_you'), W('v1-mlops-5339-gui-fleet-overview','paused'), W('v1-mlops-5309-auto-planning','working')] },
+      { name: 'gpu-eval-sweep', machine: 'eu1-ptyd', health: 'reconnecting', remote: true, workers: [W('eval-sweep-shard-a','working'), W('eval-sweep-shard-b','working'), W('eval-sweep-report','pr_open','#412')] },
+      { name: 'dind-gpu-sharing', workers: [W('mlops-5137-gpu-slot-multi-tenant-proof','working'), W('mlops-5182-cgroup-shareprocessns-fix','working'), W('cdi-nested-gpu-quicktest','working'), W('cdi-fix-verify-real-k8s-pod','working'), W('bottlerocket-selinux-mount-propagation-test','working'), W('al2023-nested-gpu-mount-propagation-test','working'), W('mlops-5182-runc-systemd-version-check','mergeable'), W('mlops-5306-al2023-interactivesession-validate','pr_open','#1084')] },
+      { name: 'Clean up approved PRs', workers: [W('mlops-adjective-owl-rebase','working'), W('mlops-4109-placement-preview-rebase','working'), W('mlops-3067-workload-filter-rebase','working'), W('mlops-cloudin-1120-base-domain-rebase','working'), W('mlops-3066-history-server-rebase','mergeable'), W('mlops-4156-cli-skill-docs-update','mergeable'), W('mlops-3486-readme-kargo-fix','pr_open','#48'), W('mlops-4245-typed-config-rebase','pr_open','#1007')] },
+      { name: 'interactive-sessions', workers: [W('mlops-unstick-abdo-evicted-session','working'), W('mlops-4803-skill-docs','mergeable'), W('mlops-4752-ca-keyring-pip-fix','pr_open','#78'), W('mlops-4809-stuck-session-visibility','pr_open','#901'), W('mlops-4772-numa-sysfs','pr_open','#899'), W('mlops-4783-4784-session-iam-grants','pr_open','#897')] },
+      { name: 'dockerjobs', workers: [W('mlops-4076-jobset-batch-ui-visibility','pr_open','#863'), W('mlops-4812-spot-placement-score','pr_open','#900'), W('mlops-5174-parallelize-remaining-loops','pr_open','#1067'), W('mlops-5175-pod-evidence-sweep-deletion-driven','pr_open','#1066')] },
+      { name: 'ray-jobs', workers: [W('mlops-4696-graceful-shutdown-log-flush','working'), W('mlops-5151-postmerge-verify','working'), W('mlops-4753-exclude-ray-otel','pr_open','#249')] },
+      { name: 'Interactive avatar training in radisson', workers: [W('mlops-5016-turbo-exp3-rebase-resume','mergeable'), W('mlops-4995-ia-radisson-training','pr_open','#720')] },
+      { name: 'mlops-cluster-infra', workers: [W('mlops-argocd-degraded-investigation','working'), W('mlops-4797-bellhop-overlays','pr_open','#894')] },
+      { name: 'Archipellago', done: 1, workers: [W('mlops-4771-s3-third-party-models','working')] },
+      { name: 'Fix datadog logs', workers: [W('mlops-4817-gpu-datadog-logs','working')] },
+      { name: 'user-issues', workers: [W('mlops-4709-codex-mirror-fix','working')] },
+      { name: 'Meta orchestrator', workers: [W('dithree-radisson-adoption','pr_open','#1278')] },
+      { name: 'radisson-cli skill', workers: [W('radisson-cli-skill-docs-stack','pr_open','#243')] },
+      { name: 'Archipelago', workers: [W('mlops-4619-single-island','pr_open','#3')] },
+      { name: 'Fix hello world temporal', done: 1, workers: [] },
+      { name: 'Plan the rollout and architecture of the bellhop in production', workers: [] },
+      { name: 'New scheduler for GPUs', workers: [] },
+      { name: 'unparented', unparented: true, workers: [W('nexttts-gradio-app-down','working')] },
+    ];
+    const islands = orchs.map((o) => {
+      const total = o.workers.length + (o.done || 0) + (o.stopped || 0);
+      const foldParts = [];
+      if (o.done) foldParts.push(o.done + ' done');
+      if (o.stopped) foldParts.push(o.stopped + ' stopped');
+      const fold = foldParts.length ? '▸ ' + foldParts.join(' · ') : '';
+      const lastIdx = o.workers.length - 1;
+      return {
+        title: cut(o.name, 26),
+        cls: 'box' + (o.sel ? ' box-sel' : '') + (o.machine ? ' box-remote' : ''),
+        machine: o.machine || '',
+        health: o.health || '',
+        healthCls: { connected: 'green', reconnecting: 'amber', unreachable: 'red' }[o.health] || 'dim',
+        needs: o.needs || '',
+        meta: total ? String(total) : '',
+        workers: o.workers.map((w, i) => ({ ...w, rail: (i === lastIdx && !fold ? '└ ' : '├ ') })),
+        fold,
+        empty: total === 0,
+      };
+    });
+    const tree = orchs.filter((o) => !o.unparented && !o.remote).map((o) => {
+      const total = o.workers.length + (o.done || 0) + (o.stopped || 0);
+      return {
+        name: cut(o.name, 22),
+        open: !!o.sel,
+        caret: o.sel ? '▾' : '▸',
+        cls: o.sel ? 'ln sel' : 'ln',
+        dotCls: o.needs ? 'amber' : 'teal',
+        count: total ? ' ' + total : '',
+        kids: o.sel ? o.workers.map((w) => ({ ...w, rail: '├ ', short: cut(w.name, 26) })).concat([{ rail: '└ ', dotCls: 'dim', short: '▸ 17 done · 2 stopped' }]) : [],
+      };
+    });
+    return { islands, tree };
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ninox Fleet Overview — island opened</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0}
+a{color:#9db4ff}a:hover{color:#c3d2ff}
+.ninox{--bg:#0b0e14;--panel:#12161f;--panel2:#171c28;--border:#242a3a;--text:#e8e9ed;--dim:#8b92a5;--dim2:#5b6478;--teal:#4fd1c5;--amber:#e8a33d;--green:#4ade80;--gray:#6b7280;--red:#f0506e;--violet:#9b8cff;
+  font-family:-apple-system,"Segoe UI",Inter,system-ui,sans-serif;color:var(--text);background:var(--bg);box-sizing:border-box}
+.ninox *{box-sizing:border-box}
+.mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+.badge{display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:.02em;white-space:nowrap}
+.badge-type{background:#1e2740;color:#9db4ff}
+.badge-harness{background:#15231d;color:#7fd8a8}
+.badge-wait{background:#3a2a12;color:#f3c27a}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;flex-shrink:0}
+.card{position:absolute;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px 11px;overflow:hidden;box-shadow:0 3px 14px rgba(0,0,0,.4)}
+.card-bar{position:absolute;top:0;left:0;right:0;height:4px;border-radius:8px 8px 0 0}
+.card-sel{border-color:#c98a2e;box-shadow:0 0 0 1px #c98a2e,0 3px 14px rgba(0,0,0,.4)}
+.stack{position:absolute;border:1px solid var(--border);border-radius:8px;background:var(--panel)}
+.name{font-size:12.5px;font-weight:700;margin:6px 0 3px;line-height:1.2;overflow-wrap:anywhere}
+.brief{font-size:10.5px;color:var(--dim);line-height:1.35}
+.meta{font-size:9.5px;color:var(--dim2);margin-top:6px}
+.activity{font-size:10.5px;margin-top:6px;color:var(--teal)}
+.tree-row{font-size:12px;padding:3px 0;white-space:nowrap;display:flex;align-items:center;gap:6px;overflow:hidden}
+.tree-count{margin-left:auto;font-size:10.5px;color:var(--dim2)}
+.tree-selected{background:#1b2236;border-radius:4px;margin:0 -8px;padding:3px 8px}
+.panel-title{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim2);margin-bottom:10px;font-weight:700}
+.btn{background:var(--panel2);border:1px solid var(--border);color:var(--text);font-size:12px;padding:7px 14px;border-radius:6px;font-weight:600;font-family:inherit}
+.btn-primary{background:#1f3a6e;border-color:#30548f;color:#cfe0ff}
+.field-label{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim2);margin:12px 0 4px}
+.field-box{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11.5px;color:var(--dim);line-height:1.4}
+.nav{height:44px;flex-shrink:0;display:flex;align-items:stretch;gap:2px;padding:0 12px 0 16px;background:var(--panel);border-bottom:1px solid var(--border)}
+.nav-brand{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:800;color:var(--text);text-decoration:none;padding-right:14px;margin-right:6px;border-right:1px solid var(--border)}
+.nav-link{display:flex;align-items:center;gap:7px;padding:0 13px;font-size:12.5px;font-weight:600;color:#a3aabb;text-decoration:none;border-bottom:2px solid transparent;border-top:2px solid transparent}
+.nav-active{color:var(--text);background:#1b2236;border-bottom-color:var(--teal)}
+.nav-key{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:10px;color:#8b92a5}
+.nav-count{font-size:10px;font-weight:700;padding:1px 6px;border-radius:9px;background:#3a2a12;color:#f3c27a}
+.crumb{display:flex;align-items:center;gap:8px;padding:9px 18px;border-bottom:1px solid var(--border);font-size:12px}
+.crumb a{color:#9db4ff;text-decoration:none;font-weight:600}
+.key{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:10px;color:var(--dim);border:1px solid var(--border);border-radius:4px;padding:1px 5px}
+.rail-btn{width:26px;height:26px;display:flex;align-items:center;justify-content:center;background:transparent;border:1px solid var(--border);border-radius:6px;color:#a3aabb;padding:0}
+.seg{display:flex;background:var(--panel2);border:1px solid var(--border);border-radius:6px;overflow:hidden;font-size:10.5px}
+.seg span{padding:5px 10px;color:var(--dim)}
+.seg .on{background:#1f3a6e;color:#cfe0ff}
+</style>
+</helmet>
+
+<div class="ninox" style="width:1440px;height:944px;display:flex;flex-direction:column">
+  <nav class="nav" aria-label="Primary">
+    <a class="nav-brand" href="#"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M7 1 13 7 7 13 1 7z" fill="#4fd1c5"/></svg>ninox</a>
+    <a class="nav-link nav-active" href="FleetAtScale.dc.html" aria-current="page">Fleet<span class="nav-count" aria-label="3 need you">3</span><span class="nav-key">1</span></a>
+    <a class="nav-link" href="#">Board<span class="nav-key">2</span></a>
+    <a class="nav-link" href="#">Plans<span class="nav-key">3</span></a>
+    <a class="nav-link" href="#">Brain<span class="nav-key">4</span></a>
+    <a class="nav-link" href="#">Worker Types<span class="nav-key">5</span></a>
+    <a class="nav-link" href="#">Remotes<span class="nav-key">6</span></a>
+    <div style="flex:1"></div>
+  </nav>
+
+  <div style="flex:1;display:flex;min-height:0">
+
+    <!-- TREE: same tree as the fleet view; Ninox expanded and selected -->
+    <div style="width:238px;flex-shrink:0;border-right:1px solid var(--border);background:var(--panel);padding:14px 16px;overflow:hidden">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px"><span class="panel-title" style="margin:0">Sessions</span><span style="margin-left:auto;font-size:10px;color:var(--dim2)">19 orch · 69 workers</span><button type="button" class="rail-btn" aria-label="Hide session tree"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="M6 2.5v11M11 6l-2 2 2 2"/></svg></button></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--amber);margin:0"></span>Ray rolout teething<span class="tree-count">3</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▾</span><span class="dot" style="background:var(--amber);margin:0"></span><b>Ninox</b><span class="tree-count">22</span></div>
+      <div class="tree-row tree-selected" style="padding-left:28px"><span class="dot" style="background:var(--amber);margin:0"></span>v1-user-request-design</div>
+      <div class="tree-row" style="padding-left:20px"><span class="dot" style="background:var(--amber);margin:0"></span>v1-mlops-5339-gui-fleet-ove…</div>
+      <div class="tree-row" style="padding-left:20px"><span class="dot" style="background:var(--teal);margin:0"></span>v1-mlops-5309-auto-planning</div>
+      <div class="tree-row" style="padding-left:20px;color:var(--dim2);font-size:11px">▸ 17 done · 2 stopped</div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>dind-gpu-sharing<span class="tree-count">8</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>Clean up approved PRs<span class="tree-count">8</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>interactive-sessions<span class="tree-count">6</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>dockerjobs<span class="tree-count">4</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>ray-jobs<span class="tree-count">3</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>Interactive avatar training…<span class="tree-count">2</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>mlops-cluster-infra<span class="tree-count">2</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>Archipellago<span class="tree-count">2</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>Fix datadog logs<span class="tree-count">1</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>user-issues<span class="tree-count">1</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>Meta orchestrator<span class="tree-count">1</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>radisson-cli skill<span class="tree-count">1</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>Archipelago<span class="tree-count">1</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>Fix hello world temporal<span class="tree-count">1</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>Plan the rollout and archit…</div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>New scheduler for GPUs</div>
+      <div style="font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:#c9c2ff;margin:10px 0 3px;display:flex;align-items:center;gap:6px">⌁ eu1-ptyd<span class="dot" style="background:var(--amber);margin:0"></span><span style="text-transform:none;letter-spacing:0;color:var(--dim2)">reconnecting</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal);margin:0"></span>gpu-eval-sweep<span class="tree-count">3</span></div>
+    </div>
+
+    <!-- CENTER -->
+    <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+      <div class="crumb">
+        <a href="FleetAtScale.dc.html">Fleet</a><span style="color:var(--dim2)">›</span><b>Ninox</b>
+        <span style="color:var(--dim2);font-size:11px">· 3 active · 17 done · 2 stopped</span>
+        <span class="key" style="margin-left:6px">esc</span><span style="font-size:10.5px;color:var(--dim2)">back to fleet</span>
+        <div style="flex:1"></div>
+        <div class="seg"><span class="on">Full cards</span><span>Compact</span></div>
+      </div>
+
+      <div style="flex:1;position:relative;background:var(--bg);border-bottom:1px solid var(--border);overflow:hidden">
+
+        <!-- ROOT: Ninox orchestrator -->
+        <div class="card" style="left:349px;top:22px;width:204px;height:98px">
+          <div class="card-bar" style="background:var(--teal)"></div>
+          <span class="badge badge-type">Orchestrator</span>&nbsp;<span class="badge badge-harness">claude-code</span>
+          <div class="name">Ninox</div>
+          <div class="brief">Ninox v1 next-gen line — coordinating workers</div>
+          <div class="activity">⚒ reviewing PR #249</div>
+        </div>
+
+        <!-- hierarchy trunk -->
+        <div style="position:absolute;left:450px;top:120px;width:2px;height:22px;background:var(--dim2)"></div>
+        <div style="position:absolute;left:136px;top:142px;width:632px;height:2px;background:var(--dim2)"></div>
+        <div style="position:absolute;left:135px;top:142px;width:2px;height:22px;background:var(--dim2)"></div>
+        <div style="position:absolute;left:345px;top:142px;width:2px;height:22px;background:var(--dim2)"></div>
+        <div style="position:absolute;left:555px;top:142px;width:2px;height:22px;background:var(--dim2)"></div>
+        <div style="position:absolute;left:767px;top:142px;width:2px;height:22px;background:var(--dim2)"></div>
+
+        <!-- CHILD 1: needs you (selected) -->
+        <div class="card card-sel" style="left:41px;top:164px;width:190px;height:122px">
+          <div class="card-bar" style="background:var(--amber)"></div>
+          <span class="badge badge-type">Implementation</span>&nbsp;<span class="badge badge-harness">claude-code</span>
+          <div class="name">v1-user-request-design</div>
+          <div class="brief">ninox user-request — sign-off and questions routed to you</div>
+          <div class="meta"><span class="badge badge-wait">NEEDS YOU</span>&nbsp; waiting on your answer</div>
+        </div>
+
+        <!-- CHILD 2: paused -->
+        <div class="card" style="left:251px;top:164px;width:190px;height:122px">
+          <div class="card-bar" style="background:var(--amber)"></div>
+          <span class="badge badge-type">Implementation</span>&nbsp;<span class="badge badge-harness">claude-code</span>
+          <div class="name">v1-mlops-5339-gui-fleet-overview</div>
+          <div class="brief">Port the fleet overview to ninox-gui</div>
+          <div class="meta">paused by orchestrator · no PR</div>
+        </div>
+
+        <!-- CHILD 3: working -->
+        <div class="card" style="left:461px;top:164px;width:190px;height:122px">
+          <div class="card-bar" style="background:var(--teal)"></div>
+          <span class="badge badge-type">Implementation</span>&nbsp;<span class="badge badge-harness">claude-code</span>
+          <div class="name">v1-mlops-5309-auto-planning</div>
+          <div class="brief">Auto-planning backend</div>
+          <div class="activity">⚒ cargo test -p ninox-core</div>
+        </div>
+
+        <!-- CHILD 4: folded finished workers -->
+        <div class="stack" style="left:681px;top:172px;width:180px;height:106px;opacity:.5"></div>
+        <div class="stack" style="left:676px;top:168px;width:180px;height:106px;opacity:.75"></div>
+        <a class="card" href="#" style="left:671px;top:164px;width:180px;height:106px;text-decoration:none;color:inherit">
+          <div class="card-bar" style="background:var(--green)"></div>
+          <span class="badge" style="background:#15291f;color:#7fd8a8">19 FINISHED</span>
+          <div class="name">17 done · 2 stopped</div>
+          <div class="brief">PRs #235–#249 merged · folded</div>
+          <div class="meta">click to unfold</div>
+        </a>
+
+        <div style="position:absolute;left:41px;top:318px;font-size:10.5px;color:var(--dim2)">Only Ninox's own tree is drawn here — other orchestrators stay in the fleet view and the tree. No line ever joins two orchestrators.</div>
+      </div>
+
+      <div style="height:54px;flex-shrink:0;background:var(--panel);display:flex;align-items:center;padding:0 16px;gap:10px">
+        <span class="mono" style="color:var(--violet);font-size:14px">❯</span>
+        <div class="mono" style="flex:1;font-size:12.5px;color:var(--dim)">ask ninox about Ninox — "why is 5339 paused?"</div>
+        <span style="font-size:10px;color:var(--dim2)">scoped to this tree</span>
+      </div>
+    </div>
+
+    <!-- DETAIL PANEL -->
+    <div style="width:300px;flex-shrink:0;border-left:1px solid var(--border);background:var(--panel);padding:16px">
+      <div class="panel-title">Detail — selected node</div>
+      <span class="badge badge-wait">NEEDS YOU</span>
+      <div class="name" style="font-size:15px;margin-top:8px">v1-user-request-design</div>
+      <div class="meta">Ninox › v1-user-request-design (depth 1 of 3)</div>
+
+      <div class="field-label">Waiting on</div>
+      <div class="field-box" style="color:#f3c27a">Keep the TUI hardening (ancestry check + GUI-only sync sign-offs), or drop it and document the residual risk?</div>
+
+      <div class="field-label">Brief</div>
+      <div class="field-box">Design and build ninox user-request: agents ask the user for sign-off; answers only via typed input.</div>
+
+      <div class="field-label">Worker type · harness</div>
+      <div class="field-box">Implementation · claude-code · Sonnet 5</div>
+
+      <div class="field-label">Artifacts</div>
+      <div class="field-box">branch v1-user-request-design · spec 2026-10-26-user-request-design.md · no PR yet</div>
+    </div>
+  </div>
+
+  <div style="height:62px;flex-shrink:0;background:var(--panel);border-top:1px solid var(--border);display:flex;align-items:center;padding:0 20px;gap:10px">
+    <button class="btn btn-primary" type="button">Answer in pane</button>
+    <button class="btn" type="button">Connect</button>
+    <button class="btn" type="button">Send message</button>
+    <button class="btn" type="button" style="color:var(--red);border-color:#5a2c38">Reap</button>
+    <div style="flex:1"></div>
+    <div style="font-size:11px;color:var(--dim2)">Worker actions · selection: v1-user-request-design</div>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":944}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {};
+  }
+}
+</script>
+</body>
+</html>

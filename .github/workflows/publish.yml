@@ -1,0 +1,204 @@
+name: Publish to crates.io
+
+# Publish each workspace crate in dependency order using crates.io Trusted
+# Publishing. Configure this workflow as a trusted publisher for every crate;
+# crates that have never been published must first be published by an owner.
+# Each upload waits for the index before a dependent crate is published.
+# Only version tags trigger publishing; the tag must match every crate version
+# and point to a commit on main. A manual run can retry an existing tag.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # crates.io trusted publishing via OIDC
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Verify tag and main ancestry
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+          cargo metadata --locked --no-deps --format-version 1 | jq -e --arg version "${RELEASE_TAG#v}" \
+            '[.packages[].version] | all(. == $version)' >/dev/null
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            pkg-config
+
+      - name: Install wait-for-crate helper
+        run: |
+          cat <<'SCRIPT' > /tmp/wait-for-crate.sh
+          #!/usr/bin/env bash
+          set -euo pipefail
+          crate="$1"
+          version="$2"
+          for i in $(seq 1 30); do
+            status=$(curl -sS -o /dev/null -w '%{http_code}' -A "ninox-ci-publish-workflow" "https://crates.io/api/v1/crates/${crate}/${version}")
+            if [ "$status" = 200 ]; then
+              echo "${crate} ${version} is live."
+              exit 0
+            fi
+            echo "Waiting for ${crate} ${version} to appear (attempt ${i})..."
+            sleep 10
+          done
+          echo "Timed out waiting for ${crate} ${version}." >&2
+          exit 1
+          SCRIPT
+          chmod +x /tmp/wait-for-crate.sh
+
+      - name: Determine publish plan
+        id: plan
+        run: |
+          set -euo pipefail
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          for entry in ptyd:ninox-ptyd core:ninox-core server:ninox-server ui:ninox-ui-shared overview:ninox-overview gui:ninox-gui tui:ninox-tui; do
+            key="${entry%%:*}"
+            crate="${entry##*:}"
+            version=$(echo "$metadata" | jq -er --arg n "$crate" '.packages[] | select(.name==$n) | .version')
+            echo "${key}_version=${version}" >> "$GITHUB_OUTPUT"
+            if curl -sf -A "ninox-ci-publish-workflow" "https://crates.io/api/v1/crates/${crate}/${version}" > /dev/null; then
+              echo "${crate} ${version} is already published — skipping."
+              echo "${key}_publish=false" >> "$GITHUB_OUTPUT"
+            elif [ "$status" = 404 ]; then
+              echo "${crate} ${version} is not yet published — will publish."
+              echo "${key}_publish=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "crates.io returned HTTP $status for ${crate} ${version}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Authenticate to crates.io (ninox-ptyd)
+        id: auth-ptyd
+        if: steps.plan.outputs.ptyd_publish == 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        with:
+          crate: ninox-ptyd
+
+      - name: Publish ninox-ptyd
+        if: steps.plan.outputs.ptyd_publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-ptyd.outputs.token }}
+        run: |
+          cargo publish --locked -p ninox-ptyd
+          /tmp/wait-for-crate.sh ninox-ptyd "${{ steps.plan.outputs.ptyd_version }}"
+
+      - name: Authenticate to crates.io (ninox-core)
+        id: auth-core
+        if: steps.plan.outputs.core_publish == 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        with:
+          crate: ninox-core
+
+      - name: Publish ninox-core
+        if: steps.plan.outputs.core_publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-core.outputs.token }}
+        run: |
+          cargo publish --locked -p ninox-core
+          /tmp/wait-for-crate.sh ninox-core "${{ steps.plan.outputs.core_version }}"
+
+      - name: Authenticate to crates.io (ninox-server)
+        id: auth-server
+        if: steps.plan.outputs.server_publish == 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        with:
+          crate: ninox-server
+
+      - name: Publish ninox-server
+        if: steps.plan.outputs.server_publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-server.outputs.token }}
+        run: |
+          cargo publish --locked -p ninox-server
+          /tmp/wait-for-crate.sh ninox-server "${{ steps.plan.outputs.server_version }}"
+
+      - name: Authenticate to crates.io (ninox-ui-shared)
+        id: auth-ui
+        if: steps.plan.outputs.ui_publish == 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        with:
+          crate: ninox-ui-shared
+
+      - name: Publish ninox-ui-shared
+        if: steps.plan.outputs.ui_publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-ui.outputs.token }}
+        run: |
+          cargo publish --locked -p ninox-ui-shared
+          /tmp/wait-for-crate.sh ninox-ui-shared "${{ steps.plan.outputs.ui_version }}"
+
+      - name: Authenticate to crates.io (ninox-overview)
+        id: auth-overview
+        if: steps.plan.outputs.overview_publish == 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        with:
+          crate: ninox-overview
+
+      - name: Publish ninox-overview
+        if: steps.plan.outputs.overview_publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-overview.outputs.token }}
+        run: |
+          cargo publish --locked -p ninox-overview
+          /tmp/wait-for-crate.sh ninox-overview "${{ steps.plan.outputs.overview_version }}"
+
+      - name: Authenticate to crates.io (ninox-gui)
+        id: auth-gui
+        if: steps.plan.outputs.gui_publish == 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        with:
+          crate: ninox-gui
+
+      - name: Publish ninox-gui
+        if: steps.plan.outputs.gui_publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-gui.outputs.token }}
+        run: |
+          cargo publish --locked -p ninox-gui
+          /tmp/wait-for-crate.sh ninox-gui "${{ steps.plan.outputs.gui_version }}"
+
+      - name: Authenticate to crates.io (ninox-tui)
+        id: auth-tui
+        if: steps.plan.outputs.tui_publish == 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        with:
+          crate: ninox-tui
+
+      - name: Publish ninox-tui
+        if: steps.plan.outputs.tui_publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-tui.outputs.token }}
+        run: |
+          cargo publish --locked -p ninox-tui
+          /tmp/wait-for-crate.sh ninox-tui "${{ steps.plan.outputs.tui_version }}"

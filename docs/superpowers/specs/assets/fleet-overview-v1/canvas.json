@@ -1,0 +1,118 @@
+{
+  "v": 3,
+  "attachments": {},
+  "boards": {
+    "Artboard-bbia.dc.html": {
+      "h": 600,
+      "page": "page-bbq6pq",
+      "title": "Artboard 1",
+      "w": 800,
+      "x": 0,
+      "y": 0
+    },
+    "GUI-Inspect.dc.html": {
+      "h": 944,
+      "title": "GUI — Node Inspection",
+      "w": 1440,
+      "x": 0,
+      "y": 1122
+    },
+    "Legend.dc.html": {
+      "h": 760,
+      "title": "Legend — nodes, edges, states",
+      "w": 980,
+      "x": -1179,
+      "y": 1214
+    },
+    "Main.dc.html": {
+      "h": 944,
+      "title": "GUI — Fleet Overview",
+      "w": 1440,
+      "x": 0,
+      "y": 0
+    },
+    "TUI-Inspect.dc.html": {
+      "h": 960,
+      "title": "TUI — Node Inspection",
+      "w": 1600,
+      "x": 1703,
+      "y": 1214
+    },
+    "TUI.dc.html": {
+      "h": 960,
+      "title": "TUI — Fleet Overview",
+      "w": 1600,
+      "x": 1703,
+      "y": 0
+    },
+    "FleetAtScale.dc.html": {
+      "h": 944,
+      "title": "GUI — 1. Fleet at scale (real state 27 Oct + example remote eu1), tree collapsed",
+      "w": 1440,
+      "x": 0,
+      "y": 3332
+    },
+    "TUIAtScale.dc.html": {
+      "h": 960,
+      "title": "TUI — 1. Fleet at scale (same state)",
+      "w": 1600,
+      "x": 1703,
+      "y": 3332
+    },
+    "FleetFocused.dc.html": {
+      "h": 944,
+      "title": "GUI — 2. Island opened: Fleet › Ninox (esc returns to 1)",
+      "w": 1440,
+      "x": 0,
+      "y": 4396
+    },
+    "WorkerTypes.dc.html": {
+      "h": 844,
+      "title": "GUI — Worker Types (settings)",
+      "w": 1280,
+      "x": 0,
+      "y": 2368
+    }
+  },
+  "createdOnFiles": {
+    "at": "2026-10-23T12:00:00Z",
+    "v": 1
+  },
+  "designSystems": [],
+  "launch": {
+    "view": "canvas"
+  },
+  "notes": {
+    "scaleflow": {
+      "x": -1179,
+      "y": 3332,
+      "w": 900,
+      "size": "m",
+      "fill": "teal",
+      "text": "Fleet at scale: two levels, one view\n\n1. FLEET (boards 1): one island per orchestrator tree. Hierarchy is drawn only inside an island (orchestrator on top, workers on a tree rail). No edge ever joins two orchestrators. Islands pack into columns: vertical scroll only, never horizontal.\n- Sort: needs-you first (CI failed, blocked on the user), then most active.\n- Finished workers (done/stopped) fold into one '▸ N done · M stopped' row.\n- Remote trees carry a REMOTE · <machine> band with the connection dot (green connected / amber reconnecting / red unreachable); the tree groups orchestrators under their machine; toolbar has a Machine filter.\n- The session tree duplicates the islands here, so it starts collapsed to a rail ([ toggles it).\n\n2. ISLAND OPENED (board 2): click an island / Enter on it, or click an orchestrator in the tree. Shows only that orchestrator's tree as full cards with hierarchy edges, sub-orchestrators and ghost plan nodes; finished workers become one stacked card. Breadcrumb Fleet › <orchestrator>; Esc or the breadcrumb returns to 1 with the island still selected. Clicking a worker in the tree opens its orchestrator with that worker selected. Detail panel + bottom action row are context-sensitive to the selection.\n\nThis replaces the old shell (sidebar sections, Workers, the 'Fleet overview' section, the TUI Graph tab). It is not an extra section.\n\nDecisions (27 Oct):\n- Top nav: Fleet 1 · Board 2 · Plans 3 · Brain 4 · Worker Types 5 · Remotes 6.\n- Board = the existing Kanban (Working / PR Open / CI Failed / Review / Mergeable / Done), kept as its own tab, restyled to this design.\n- The Pull requests list is removed: PR state shows on each node.\n- PR review and Marginalia comments live in the detail panel when a worker is selected."
+    }
+  },
+  "order": [
+    "Main.dc.html",
+    "TUI.dc.html",
+    "Legend.dc.html",
+    "WorkerTypes.dc.html",
+    "TUI-Inspect.dc.html",
+    "GUI-Inspect.dc.html",
+    "FleetAtScale.dc.html",
+    "TUIAtScale.dc.html",
+    "FleetFocused.dc.html",
+    "Artboard-bbia.dc.html"
+  ],
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "GUI"
+    },
+    {
+      "id": "page-bbq6pq",
+      "name": "Page 2"
+    }
+  ],
+  "title": "Ninox Fleet Overview — GUI & TUI"
+}

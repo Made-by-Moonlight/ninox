@@ -1,0 +1,14 @@
+pub mod auto_plan;
+pub mod binary_update;
+pub mod brain_harvest;
+pub mod completion;
+pub mod enrichment;
+pub mod pane_pid;
+pub mod poller;
+pub mod probe;
+pub mod reactions;
+pub mod remote_health;
+pub mod repo_discovery;
+pub mod statusline;
+pub mod update_check;
+pub mod usage;

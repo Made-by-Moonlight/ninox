@@ -1,0 +1,41 @@
+[package]
+name        = "ninox-ui-shared"
+version     = "0.37.0"
+edition     = "2021"
+description = "Framework-agnostic session/lifecycle logic shared by ninox-gui and ninox-tui."
+license     = "MIT"
+repository  = "https://github.com/Made-by-Moonlight/ninox"
+
+[dependencies]
+ninox-core   = { path = "../ninox-core", version = "0.37.0" }
+ninox-server = { path = "../ninox-server", version = "0.37.0" }
+ninox-ptyd   = { path = "../ninox-ptyd", version = "0.37.0" }
+tokio        = { workspace = true }
+anyhow       = { workspace = true }
+tracing      = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio-util   = { workspace = true }
+clap         = { version = "4", features = ["derive"] }
+dirs         = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+libc         = { workspace = true }
+toml         = { workspace = true }
+semver       = { workspace = true }
+chrono       = "0.4"
+alacritty_terminal = "0.26"
+futures-util = { workspace = true }
+
+[features]
+# Exposes `cli::test_fixtures` to other crates' test builds, which compile
+# this crate as an ordinary (non-test) dependency and so can't reach
+# anything gated on this crate's own `cfg(test)`. Off by default so the
+# published crate never ships these env-mutating helpers as real API —
+# only `[dev-dependencies]` in ninox-gui/ninox-tui enable it.
+test-support = []
+
+[dev-dependencies]
+ninox-core  = { path = "../ninox-core", version = "0.37.0", features = ["test-isolation"] }
+tempfile    = "3.27.0"
+async-trait = { workspace = true }
+rusqlite    = { workspace = true }

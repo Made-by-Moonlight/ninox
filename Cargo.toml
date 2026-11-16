@@ -1,0 +1,57 @@
+[workspace]
+members = [
+    "crates/ninox-core",
+    "crates/ninox-server",
+    "crates/ninox-ui-shared",
+    "crates/ninox-overview",
+    "crates/ninox-gui",
+    "crates/ninox-tui",
+    "crates/ninox-ptyd",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio       = { version = "1",    features = ["full"] }
+serde       = { version = "1",    features = ["derive"] }
+serde_json  = { version = "1", features = ["preserve_order"] }
+axum        = { version = "0.7",  features = ["ws"] }
+rusqlite    = { version = "0.31", features = ["bundled"] }
+anyhow      = "1"
+toml        = "0.8"
+dirs        = "5"
+# fastembed's default features select the native-tls variants of its hf-hub
+# and ort-binary-download transports, which pull native-tls → openssl-sys and
+# make the build require system OpenSSL headers (absent on stock Ubuntu — CI
+# only passed because GitHub runner images preinstall libssl-dev). Select the
+# rustls variants instead so the whole workspace stays on rustls with no
+# system OpenSSL requirement.
+fastembed   = { version = "5", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls", "image-models"] }
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-util  = { version = "0.7",  features = ["codec"] }
+libc        = "0.2"
+reqwest     = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+walkdir     = "2"
+rayon       = "1"
+async-trait = "0.1"
+tar         = "0.4"
+flate2      = "1"
+semver      = "1"
+sha2        = "0.10"
+time        = { version = "0.3", features = ["formatting"] }
+# Pinned to aws-config 1.6.3 (see Cargo.lock) rather than the latest 1.x wave:
+# newer releases (1.9+) bump transitive aws-smithy-* MSRV to rustc 1.94.1, which
+# is newer than the toolchain this workspace builds with (1.94.0). Unpin once the
+# toolchain is >= 1.94.1.
+#
+# Feature note: aws-sdk-s3's "rustls" feature name is a legacy alias that pulls in
+# aws-smithy-runtime's `tls-rustls` feature, which still drags in the unmaintained
+# hyper 0.14 / rustls 0.21 / h2 0.3 client-hyper connector for backwards
+# compatibility. We instead select `default-https-client`, the modern
+# hyper 1.x / rustls 0.23 (aws-lc-rs) transport, so real S3 traffic (including
+# SigV4-signed requests) rides the same TLS stack as the rest of the workspace.
+aws-config  = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls", "sso"] }
+aws-sdk-s3  = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+ratatui     = "0.30"
+crossterm   = { version = "0.29", features = ["event-stream"] }
+futures-util = "0.3"

@@ -1,0 +1,56 @@
+name: Release
+
+# Tag a commit already merged to main as vX.Y.Z. Failed builds leave a draft;
+# rerun this workflow with the same tag to finish publishing.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Verify release tag and main ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "ninox-gui") | .version')
+          test "$RELEASE_TAG" = "v$version"
+
+      - name: Ensure release exists
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --draft --title "$RELEASE_TAG" --generate-notes --verify-tag
+
+      - name: Build and sign app bundle
+        id: bundle
+        uses: ./.github/actions/build-macos-bundle
+
+      - name: Publish bundle
+        run: |
+          gh release upload "$RELEASE_TAG" --clobber "${{ steps.bundle.outputs.zip-path }}"
+          gh release edit "$RELEASE_TAG" --draft=false

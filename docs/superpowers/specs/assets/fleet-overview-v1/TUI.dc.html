@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ninox Fleet Overview — TUI</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,700;1,400&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#9db4ff}a:hover{color:#c3d2ff}
+.tt svg{display:block}
+.tt text{font-family:"JetBrains Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:13px;white-space:pre;font-variant-ligatures:none}
+</style>
+</helmet>
+<div class="tt" style="width: 1600px; height: 960px; background: #0b0e14; overflow: hidden">
+<svg width="1600" height="960" viewBox="0 0 1600 960" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Ninox fleet overview rendered as a ratatui terminal UI: tabs, sessions tree, node graph with a selected ghost plan, activity log, prompt, detail pane and keybinding status line"><rect x="0" y="0" width="1600" height="960" fill="#0b0e14"/>
+<rect x="24" y="19.2" width="56" height="19.6" fill="#4fd1c5"/>
+<rect x="608" y="76.8" width="288" height="19.6" fill="#12161f"/>
+<rect x="1232" y="76.8" width="144" height="19.6" fill="#a99cff"/>
+<rect x="1384" y="76.8" width="80" height="19.6" fill="#1e2740"/>
+<rect x="296" y="96" width="208" height="19.6" fill="#12161f"/>
+<rect x="608" y="96" width="8" height="19.6" fill="#12161f"/>
+<rect x="616" y="96" width="272" height="19.6" fill="#103331"/>
+<rect x="888" y="96" width="8" height="19.6" fill="#12161f"/>
+<rect x="296" y="115.2" width="8" height="19.6" fill="#12161f"/>
+<rect x="304" y="115.2" width="192" height="19.6" fill="#33270f"/>
+<rect x="496" y="115.2" width="8" height="19.6" fill="#12161f"/>
+<rect x="608" y="115.2" width="288" height="19.6" fill="#12161f"/>
+<rect x="296" y="134.4" width="208" height="19.6" fill="#12161f"/>
+<rect x="608" y="134.4" width="288" height="19.6" fill="#12161f"/>
+<rect x="296" y="153.6" width="208" height="19.6" fill="#12161f"/>
+<rect x="608" y="153.6" width="288" height="19.6" fill="#12161f"/>
+<rect x="296" y="172.8" width="208" height="19.6" fill="#12161f"/>
+<rect x="608" y="172.8" width="288" height="19.6" fill="#12161f"/>
+<rect x="296" y="192" width="208" height="19.6" fill="#12161f"/>
+<rect x="608" y="192" width="288" height="19.6" fill="#12161f"/>
+<rect x="8" y="211.2" width="256" height="19.6" fill="#221c40"/>
+<rect x="304" y="268.8" width="208" height="19.6" fill="#12161f"/>
+<rect x="536" y="268.8" width="208" height="19.6" fill="#12161f"/>
+<rect x="768" y="268.8" width="208" height="19.6" fill="#12161f"/>
+<rect x="1000" y="268.8" width="208" height="19.6" fill="#17142a"/>
+<rect x="304" y="288" width="8" height="19.6" fill="#12161f"/>
+<rect x="312" y="288" width="192" height="19.6" fill="#12301f"/>
+<rect x="504" y="288" width="8" height="19.6" fill="#12161f"/>
+<rect x="536" y="288" width="8" height="19.6" fill="#12161f"/>
+<rect x="544" y="288" width="192" height="19.6" fill="#103331"/>
+<rect x="736" y="288" width="8" height="19.6" fill="#12161f"/>
+<rect x="768" y="288" width="8" height="19.6" fill="#12161f"/>
+<rect x="776" y="288" width="192" height="19.6" fill="#1e222b"/>
+<rect x="968" y="288" width="8" height="19.6" fill="#12161f"/>
+<rect x="1000" y="288" width="8" height="19.6" fill="#17142a"/>
+<rect x="1008" y="288" width="192" height="19.6" fill="#2a2150"/>
+<rect x="1200" y="288" width="8" height="19.6" fill="#17142a"/>
+<rect x="304" y="307.2" width="208" height="19.6" fill="#12161f"/>
+<rect x="536" y="307.2" width="208" height="19.6" fill="#12161f"/>
+<rect x="768" y="307.2" width="208" height="19.6" fill="#12161f"/>
+<rect x="1000" y="307.2" width="208" height="19.6" fill="#17142a"/>
+<rect x="304" y="326.4" width="208" height="19.6" fill="#12161f"/>
+<rect x="536" y="326.4" width="208" height="19.6" fill="#12161f"/>
+<rect x="768" y="326.4" width="208" height="19.6" fill="#12161f"/>
+<rect x="1000" y="326.4" width="208" height="19.6" fill="#17142a"/>
+<rect x="304" y="345.6" width="208" height="19.6" fill="#12161f"/>
+<rect x="536" y="345.6" width="208" height="19.6" fill="#12161f"/>
+<rect x="768" y="345.6" width="208" height="19.6" fill="#12161f"/>
+<rect x="1000" y="345.6" width="208" height="19.6" fill="#17142a"/>
+<rect x="304" y="364.8" width="208" height="19.6" fill="#12161f"/>
+<rect x="536" y="364.8" width="208" height="19.6" fill="#12161f"/>
+<rect x="768" y="364.8" width="208" height="19.6" fill="#12161f"/>
+<rect x="1000" y="364.8" width="208" height="19.6" fill="#17142a"/>
+<rect x="304" y="384" width="208" height="19.6" fill="#12161f"/>
+<rect x="536" y="384" width="208" height="19.6" fill="#12161f"/>
+<rect x="768" y="384" width="208" height="19.6" fill="#12161f"/>
+<rect x="1000" y="384" width="208" height="19.6" fill="#17142a"/>
+<rect x="352" y="460.8" width="160" height="19.6" fill="#18203a"/>
+<rect x="352" y="480" width="160" height="19.6" fill="#18203a"/>
+<rect x="832" y="480" width="176" height="19.6" fill="#14121f"/>
+<rect x="1024" y="480" width="184" height="19.6" fill="#14121f"/>
+<rect x="352" y="499.2" width="160" height="19.6" fill="#18203a"/>
+<rect x="832" y="499.2" width="8" height="19.6" fill="#14121f"/>
+<rect x="840" y="499.2" width="160" height="19.6" fill="#211a3d"/>
+<rect x="1000" y="499.2" width="8" height="19.6" fill="#14121f"/>
+<rect x="1024" y="499.2" width="8" height="19.6" fill="#14121f"/>
+<rect x="1032" y="499.2" width="168" height="19.6" fill="#211a3d"/>
+<rect x="1200" y="499.2" width="8" height="19.6" fill="#14121f"/>
+<rect x="352" y="518.4" width="160" height="19.6" fill="#18203a"/>
+<rect x="832" y="518.4" width="176" height="19.6" fill="#14121f"/>
+<rect x="1024" y="518.4" width="184" height="19.6" fill="#14121f"/>
+<rect x="352" y="537.6" width="160" height="19.6" fill="#18203a"/>
+<rect x="832" y="537.6" width="176" height="19.6" fill="#14121f"/>
+<rect x="1024" y="537.6" width="184" height="19.6" fill="#14121f"/>
+<rect x="352" y="556.8" width="160" height="19.6" fill="#18203a"/>
+<rect x="832" y="556.8" width="176" height="19.6" fill="#14121f"/>
+<rect x="1024" y="556.8" width="184" height="19.6" fill="#14121f"/>
+<rect x="280" y="691.2" width="680" height="19.6" fill="#16203a"/>
+<rect x="1048" y="748.8" width="96" height="19.6" fill="#23605b"/>
+<rect x="1144" y="748.8" width="56" height="19.6" fill="#232836"/>
+<rect x="1224" y="748.8" width="368" height="19.6" fill="#1c2c52"/>
+<rect x="0" y="940.8" width="64" height="19.2" fill="#4fd1c5"/>
+<rect x="64" y="940.8" width="56" height="19.2" fill="#1f2a44"/>
+<rect x="120" y="940.8" width="1480" height="19.2" fill="#12161f"/>
+<rect x="1208" y="115.2" width="8.3" height="19.2" fill="#46506a"/>
+<rect x="1208" y="134.4" width="8.3" height="19.2" fill="#46506a"/>
+<rect x="1208" y="153.6" width="8.3" height="19.2" fill="#46506a"/>
+<rect x="1208" y="172.8" width="8.3" height="19.2" fill="#46506a"/>
+<rect x="1208" y="192" width="8.3" height="19.2" fill="#46506a"/>
+<rect x="8" y="211.2" width="4" height="19.5" fill="#a99cff"/>
+<rect x="1208" y="211.2" width="8.3" height="19.2" fill="#46506a"/>
+<rect x="1208" y="230.4" width="8.3" height="19.2" fill="#46506a"/>
+<rect x="1208" y="249.6" width="8.3" height="19.2" fill="#46506a"/>
+<rect x="1208" y="268.8" width="8.3" height="19.2" fill="#46506a"/>
+<rect x="1208" y="288" width="8.3" height="19.2" fill="#46506a"/>
+<rect x="416.5" y="467.4" width="7" height="6" rx="1" fill="#4fd1c5"/>
+<rect x="424.5" y="467.4" width="7" height="6" rx="1" fill="#4fd1c5"/>
+<rect x="432.5" y="467.4" width="7" height="6" rx="1" fill="#4fd1c5"/>
+<rect x="376.5" y="505.8" width="7" height="6" rx="1" fill="#4ade80"/>
+<rect x="384.5" y="505.8" width="7" height="6" rx="1" fill="#4ade80"/>
+<rect x="408.5" y="505.8" width="7" height="6" rx="1" fill="#4fd1c5"/>
+<rect x="416.5" y="505.8" width="7" height="6" rx="1" fill="#4fd1c5"/>
+<rect x="440.5" y="505.8" width="7" height="6" rx="1" fill="#a3a9b5"/>
+<rect x="448.5" y="505.8" width="7" height="6" rx="1" fill="#a3a9b5"/>
+<rect x="472.5" y="505.8" width="7" height="6" rx="1" fill="#a99cff"/>
+<rect x="480.5" y="505.8" width="7" height="6" rx="1" fill="#a99cff"/>
+<rect x="464.5" y="544.2" width="7" height="6" rx="1" fill="#7366c4"/>
+<rect x="488.5" y="544.2" width="7" height="6" rx="1" fill="#7366c4"/>
+<rect x="280" y="691.2" width="4" height="19.5" fill="#4fd1c5"/>
+<rect x="1048" y="708" width="8.3" height="2.4" fill="#4fd1c5"/>
+<rect x="1056" y="705.6" width="8.3" height="4.8" fill="#4fd1c5"/>
+<rect x="1064" y="703.2" width="8.3" height="7.2" fill="#4fd1c5"/>
+<rect x="1072" y="698.4" width="8.3" height="12" fill="#4fd1c5"/>
+<rect x="1080" y="700.8" width="8.3" height="9.6" fill="#4fd1c5"/>
+<rect x="1088" y="696" width="8.3" height="14.4" fill="#4fd1c5"/>
+<rect x="1096" y="693.6" width="8.3" height="16.8" fill="#4fd1c5"/>
+<rect x="1104" y="698.4" width="8.3" height="12" fill="#4fd1c5"/>
+<rect x="1112" y="700.8" width="8.3" height="9.6" fill="#4fd1c5"/>
+<rect x="1120" y="703.2" width="8.3" height="7.2" fill="#4fd1c5"/>
+<rect x="1128" y="698.4" width="8.3" height="12" fill="#4fd1c5"/>
+<rect x="1136" y="696" width="8.3" height="14.4" fill="#4fd1c5"/>
+<rect x="1144" y="693.6" width="8.3" height="16.8" fill="#4fd1c5"/>
+<rect x="1152" y="691.2" width="8.3" height="19.2" fill="#4fd1c5"/>
+<rect x="1160" y="696" width="8.3" height="14.4" fill="#4fd1c5"/>
+<rect x="1168" y="698.4" width="8.3" height="12" fill="#4fd1c5"/>
+<rect x="1176" y="700.8" width="8.3" height="9.6" fill="#4fd1c5"/>
+<rect x="1184" y="696" width="8.3" height="14.4" fill="#4fd1c5"/>
+<rect x="1192" y="693.6" width="8.3" height="16.8" fill="#4fd1c5"/>
+<rect x="1048" y="727.2" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="1056" y="727.2" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="1064" y="724.8" width="8.3" height="4.8" fill="#9db4ff"/>
+<rect x="1072" y="727.2" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="1080" y="722.4" width="8.3" height="7.2" fill="#9db4ff"/>
+<rect x="1088" y="724.8" width="8.3" height="4.8" fill="#9db4ff"/>
+<rect x="1096" y="727.2" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="1104" y="720" width="8.3" height="9.6" fill="#9db4ff"/>
+<rect x="1112" y="724.8" width="8.3" height="4.8" fill="#9db4ff"/>
+<rect x="1120" y="727.2" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="1128" y="724.8" width="8.3" height="4.8" fill="#9db4ff"/>
+<rect x="1136" y="717.6" width="8.3" height="12" fill="#9db4ff"/>
+<rect x="1144" y="722.4" width="8.3" height="7.2" fill="#9db4ff"/>
+<rect x="1152" y="727.2" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="1160" y="724.8" width="8.3" height="4.8" fill="#9db4ff"/>
+<rect x="1168" y="722.4" width="8.3" height="7.2" fill="#9db4ff"/>
+<rect x="1176" y="727.2" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="1184" y="724.8" width="8.3" height="4.8" fill="#9db4ff"/>
+<rect x="1192" y="720" width="8.3" height="9.6" fill="#9db4ff"/>
+<rect x="1224" y="748.8" width="4" height="19.5" fill="#4fd1c5"/>
+<rect x="72" y="820.8" width="8.3" height="4.8" fill="#4fd1c5"/>
+<rect x="80" y="818.4" width="8.3" height="7.2" fill="#4fd1c5"/>
+<rect x="88" y="818.4" width="8.3" height="7.2" fill="#4fd1c5"/>
+<rect x="96" y="813.6" width="8.3" height="12" fill="#4fd1c5"/>
+<rect x="104" y="816" width="8.3" height="9.6" fill="#4fd1c5"/>
+<rect x="112" y="811.2" width="8.3" height="14.4" fill="#4fd1c5"/>
+<rect x="120" y="808.8" width="8.3" height="16.8" fill="#4fd1c5"/>
+<rect x="128" y="813.6" width="8.3" height="12" fill="#4fd1c5"/>
+<rect x="136" y="816" width="8.3" height="9.6" fill="#4fd1c5"/>
+<rect x="144" y="818.4" width="8.3" height="7.2" fill="#4fd1c5"/>
+<rect x="152" y="813.6" width="8.3" height="12" fill="#4fd1c5"/>
+<rect x="160" y="811.2" width="8.3" height="14.4" fill="#4fd1c5"/>
+<rect x="168" y="808.8" width="8.3" height="16.8" fill="#4fd1c5"/>
+<rect x="176" y="806.4" width="8.3" height="19.2" fill="#4fd1c5"/>
+<rect x="184" y="811.2" width="8.3" height="14.4" fill="#4fd1c5"/>
+<rect x="192" y="813.6" width="8.3" height="12" fill="#4fd1c5"/>
+<rect x="200" y="816" width="8.3" height="9.6" fill="#4fd1c5"/>
+<rect x="208" y="811.2" width="8.3" height="14.4" fill="#4fd1c5"/>
+<rect x="216" y="808.8" width="8.3" height="16.8" fill="#4fd1c5"/>
+<rect x="224" y="811.2" width="8.3" height="14.4" fill="#4fd1c5"/>
+<rect x="232" y="813.6" width="8.3" height="12" fill="#4fd1c5"/>
+<rect x="240" y="816" width="8.3" height="9.6" fill="#4fd1c5"/>
+<rect x="248" y="818.4" width="8.3" height="7.2" fill="#4fd1c5"/>
+<rect x="72" y="842.4" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="80" y="842.4" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="88" y="840" width="8.3" height="4.8" fill="#9db4ff"/>
+<rect x="96" y="842.4" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="104" y="837.6" width="8.3" height="7.2" fill="#9db4ff"/>
+<rect x="112" y="840" width="8.3" height="4.8" fill="#9db4ff"/>
+<rect x="120" y="842.4" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="128" y="835.2" width="8.3" height="9.6" fill="#9db4ff"/>
+<rect x="136" y="840" width="8.3" height="4.8" fill="#9db4ff"/>
+<rect x="144" y="842.4" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="152" y="840" width="8.3" height="4.8" fill="#9db4ff"/>
+<rect x="160" y="832.8" width="8.3" height="12" fill="#9db4ff"/>
+<rect x="168" y="837.6" width="8.3" height="7.2" fill="#9db4ff"/>
+<rect x="176" y="842.4" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="184" y="840" width="8.3" height="4.8" fill="#9db4ff"/>
+<rect x="192" y="837.6" width="8.3" height="7.2" fill="#9db4ff"/>
+<rect x="200" y="842.4" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="208" y="840" width="8.3" height="4.8" fill="#9db4ff"/>
+<rect x="216" y="835.2" width="8.3" height="9.6" fill="#9db4ff"/>
+<rect x="224" y="840" width="8.3" height="4.8" fill="#9db4ff"/>
+<rect x="232" y="842.4" width="8.3" height="2.4" fill="#9db4ff"/>
+<rect x="240" y="837.6" width="8.3" height="7.2" fill="#9db4ff"/>
+<rect x="248" y="840" width="8.3" height="4.8" fill="#9db4ff"/>
+<rect x="288" y="902.4" width="1.44" height="19.5" fill="#4fd1c5"/>
+<path fill="none" stroke="#2e3546" stroke-width="1" d="M80 9.6H1512M8 48H1592M88 67.2H240M1288 67.2H1512M4 105.6H268M1288 201.6H1520M776 278.4H968M1232 297.6H1584M1336 316.8H1512M1232 355.2H1584M1344 374.4H1520M776 393.6H968M376 451.2H520M1232 508.8H1584M1336 528H1584M304 585.6H544M1232 604.8H1584M4 643.2H8M64 643.2H268M360 643.2H1144M1312 662.4H1536M144 681.6H216M276 681.6H968M1464 681.6H1536M104 700.8H216M168 720H216M1220 720H1232M1304 720H1596M512 873.6H1208M352 892.8H1120M256 931.2H264M280 931.2H1208M1224 931.2H1592M4 19.2V38.4M4 76.8V921.6M92 19.2V38.4M188 19.2V38.4M268 19.2V38.4M268 76.8V921.6M404 19.2V38.4M532 19.2V38.4M1596 19.2V38.4M1596 76.8V921.6M1220 76.8V921.6M1212 96V115.2M1212 307.2V595.2M1212 652.8V864M1212 902.4V921.6M1228 211.2V288M1228 326.4V345.6M1228 384V499.2M1228 537.6V595.2M1588 211.2V288M1588 326.4V345.6M1588 384V499.2M1588 537.6V595.2M876 268.8V278.4M772 288V384M972 288V384M972 643.2V873.6M300 460.8V576M548 460.8V576M276 652.8V864M276 902.4V921.6M8 9.6L8.5 9.6Q4 9.6 4 14.1L4 19.2M1592 9.6L1591.5 9.6Q1596 9.6 1596 14.1L1596 19.2M8 48L8.5 48Q4 48 4 43.5L4 38.4M1592 48L1591.5 48Q1596 48 1596 43.5L1596 38.4M8 67.2L8.5 67.2Q4 67.2 4 71.7L4 76.8M264 67.2L263.5 67.2Q268 67.2 268 71.7L268 76.8M1224 67.2L1224.5 67.2Q1220 67.2 1220 71.7L1220 76.8M1592 67.2L1591.5 67.2Q1596 67.2 1596 71.7L1596 76.8M1232 201.6L1232.5 201.6Q1228 201.6 1228 206.1L1228 211.2M1584 201.6L1583.5 201.6Q1588 201.6 1588 206.1L1588 211.2M776 278.4L776.5 278.4Q772 278.4 772 282.9L772 288M968 278.4L967.5 278.4Q972 278.4 972 282.9L972 288M1232 297.6L1232.5 297.6Q1228 297.6 1228 293.1L1228 288M1584 297.6L1583.5 297.6Q1588 297.6 1588 293.1L1588 288M1232 316.8L1232.5 316.8Q1228 316.8 1228 321.3L1228 326.4M1584 316.8L1583.5 316.8Q1588 316.8 1588 321.3L1588 326.4M1232 355.2L1232.5 355.2Q1228 355.2 1228 350.7L1228 345.6M1584 355.2L1583.5 355.2Q1588 355.2 1588 350.7L1588 345.6M1232 374.4L1232.5 374.4Q1228 374.4 1228 378.9L1228 384M1584 374.4L1583.5 374.4Q1588 374.4 1588 378.9L1588 384M776 393.6L776.5 393.6Q772 393.6 772 389.1L772 384M968 393.6L967.5 393.6Q972 393.6 972 389.1L972 384M304 451.2L304.5 451.2Q300 451.2 300 455.7L300 460.8M544 451.2L543.5 451.2Q548 451.2 548 455.7L548 460.8M1232 508.8L1232.5 508.8Q1228 508.8 1228 504.3L1228 499.2M1584 508.8L1583.5 508.8Q1588 508.8 1588 504.3L1588 499.2M1232 528L1232.5 528Q1228 528 1228 532.5L1228 537.6M1584 528L1583.5 528Q1588 528 1588 532.5L1588 537.6M304 585.6L304.5 585.6Q300 585.6 300 581.1L300 576M544 585.6L543.5 585.6Q548 585.6 548 581.1L548 576M1232 604.8L1232.5 604.8Q1228 604.8 1228 600.3L1228 595.2M1584 604.8L1583.5 604.8Q1588 604.8 1588 600.3L1588 595.2M280 643.2L280.5 643.2Q276 643.2 276 647.7L276 652.8M1208 643.2L1207.5 643.2Q1212 643.2 1212 647.7L1212 652.8M280 873.6L280.5 873.6Q276 873.6 276 869.1L276 864M1208 873.6L1207.5 873.6Q1212 873.6 1212 869.1L1212 864M280 892.8L280.5 892.8Q276 892.8 276 897.3L276 902.4M1208 892.8L1207.5 892.8Q1212 892.8 1212 897.3L1212 902.4M8 931.2L8.5 931.2Q4 931.2 4 926.7L4 921.6M264 931.2L263.5 931.2Q268 931.2 268 926.7L268 921.6M280 931.2L280.5 931.2Q276 931.2 276 926.7L276 921.6M1208 931.2L1207.5 931.2Q1212 931.2 1212 926.7L1212 921.6M1224 931.2L1224.5 931.2Q1220 931.2 1220 926.7L1220 921.6M1592 931.2L1591.5 931.2Q1596 931.2 1596 926.7L1596 921.6"/>
+<path fill="none" stroke="#4fd1c5" stroke-width="1" d="M480 67.2H992M688 624H1208M276 76.8V614.4M280 67.2L280.5 67.2Q276 67.2 276 71.7L276 76.8M1208 67.2L1207.5 67.2Q1212 67.2 1212 71.7L1212 76.8M280 624L280.5 624Q276 624 276 619.5L276 614.4M1208 624L1207.5 624Q1212 624 1212 619.5L1212 614.4"/>
+<path fill="none" stroke="#23605b" stroke-width="1" d="M616 86.4H888M616 201.6H888M544 278.4H736M544 393.6H640M648 393.6H736M612 96V192M892 96V192M756 201.6V211.2M644 268.8V278.4M540 288V384M740 288V384M616 86.4L616.5 86.4Q612 86.4 612 90.9L612 96M888 86.4L887.5 86.4Q892 86.4 892 90.9L892 96M616 201.6L616.5 201.6Q612 201.6 612 197.1L612 192M888 201.6L887.5 201.6Q892 201.6 892 197.1L892 192M544 278.4L544.5 278.4Q540 278.4 540 282.9L540 288M736 278.4L735.5 278.4Q740 278.4 740 282.9L740 288M544 393.6L544.5 393.6Q540 393.6 540 389.1L540 384M736 393.6L735.5 393.6Q740 393.6 740 389.1L740 384"/>
+<path fill="none" stroke="#6a5226" stroke-width="1" stroke-dasharray="3 3" d="M304 105.6H496M304 201.6H496M300 115.2V192M500 115.2V192"/>
+<path fill="none" stroke="#7a8398" stroke-width="1" d="M36 163.2H40M36 182.4H40M36 201.6H40M36 220.8H40M60 240H64M60 259.2H64M288 624H296M36 153.6V220.8M60 230.4V259.2"/>
+<path fill="none" stroke="#5a6378" stroke-width="1" d="M416 240H880M756 211.2V240M644 240V268.8M876 240V268.8M412 249.6V268.8M416 240L416.5 240Q412 240 412 244.5L412 249.6"/>
+<path fill="none" stroke="#a99cff" stroke-width="1" stroke-dasharray="3 3" d="M880 240H1104M928 451.2H1104M1112 451.2H1120M1108 249.6V268.8M1108 403.2V441.6M924 460.8V480M1124 460.8V480"/>
+<path fill="none" stroke="#2a5a40" stroke-width="1" d="M312 278.4H504M312 393.6H504M412 268.8V278.4M308 288V384M508 288V384M312 278.4L312.5 278.4Q308 278.4 308 282.9L308 288M504 278.4L503.5 278.4Q508 278.4 508 282.9L508 288M312 393.6L312.5 393.6Q308 393.6 308 389.1L308 384M504 393.6L503.5 393.6Q508 393.6 508 389.1L508 384"/>
+<path fill="none" stroke="#a99cff" stroke-width="2.2" d="M1004 278.4H1204M1004 393.6H1204M1312 681.6H1464M72 720H168M1004 278.4V393.6M1108 268.8V278.4M1108 393.6V403.2M1204 278.4V393.6"/>
+<path fill="none" stroke="#e8a33d" stroke-width="1" d="M640 393.6H648M644 393.6V403.2M648 432L648.5 432Q644 432 644 427.5L644 422.4M872 432L871.5 432Q876 432 876 427.5L876 422.4"/>
+<path fill="none" stroke="#e8a33d" stroke-width="1.2" stroke-dasharray="5 3" d="M648 432H872M584 816H592M644 403.2V422.4"/>
+<path fill="none" stroke="#a99cff" stroke-width="1" d="M1104 451.2H1112M1108 441.6V451.2M1104 240L1103.5 240Q1108 240 1108 244.5L1108 249.6M928 451.2L928.5 451.2Q924 451.2 924 455.7L924 460.8M1120 451.2L1119.5 451.2Q1124 451.2 1124 455.7L1124 460.8"/>
+<path fill="none" stroke="#7366c4" stroke-width="1" stroke-dasharray="3 3" d="M840 489.6H1000M1032 489.6H1200M840 566.4H1000M1032 566.4H1200M836 499.2V556.8M1004 499.2V556.8M1028 499.2V556.8M1204 499.2V556.8"/>
+<path fill="none" stroke="#7366c4" stroke-width="1.2" stroke-dasharray="5 3" d="M1008 528H1016"/>
+<path fill="none" stroke="#7a8398" stroke-width="1" stroke-dasharray="3 3" d="M392 624H400"/>
+<path fill="none" stroke="#7a8398" stroke-width="1.2" stroke-dasharray="5 3" d="M464 624H472"/>
+<path fill="none" stroke="#4fd1c5" stroke-width="2.2" d="M72 681.6H144"/>
+<path fill="none" stroke="#4ade80" stroke-width="2.2" d="M72 700.8H104"/>
+<path fill="none" stroke="#7a8398" stroke-width="2.2" d="M604 614.4V633.6"/>
+<path fill="none" stroke="#6a5226" stroke-width="1" d="M304 105.6L304.5 105.6Q300 105.6 300 110.1L300 115.2M496 105.6L495.5 105.6Q500 105.6 500 110.1L500 115.2M304 201.6L304.5 201.6Q300 201.6 300 197.1L300 192M496 201.6L495.5 201.6Q500 201.6 500 197.1L500 192"/>
+<path fill="none" stroke="#7366c4" stroke-width="1" d="M840 489.6L840.5 489.6Q836 489.6 836 494.1L836 499.2M1000 489.6L999.5 489.6Q1004 489.6 1004 494.1L1004 499.2M1032 489.6L1032.5 489.6Q1028 489.6 1028 494.1L1028 499.2M1200 489.6L1199.5 489.6Q1204 489.6 1204 494.1L1204 499.2M840 566.4L840.5 566.4Q836 566.4 836 561.9L836 556.8M1000 566.4L999.5 566.4Q1004 566.4 1004 561.9L1004 556.8M1032 566.4L1032.5 566.4Q1028 566.4 1028 561.9L1028 556.8M1200 566.4L1199.5 566.4Q1204 566.4 1204 561.9L1204 556.8"/>
+<text x="16" y="13.63" fill="#4fd1c5" textLength="56" lengthAdjust="spacingAndGlyphs" font-weight="700">◆ ninox</text>
+<text x="1520" y="13.63" fill="#9aa1b2" textLength="64" lengthAdjust="spacingAndGlyphs">14:32:07</text>
+<text x="16" y="32.83" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">1</text>
+<text x="32" y="32.83" fill="#0b0e14" textLength="40" lengthAdjust="spacingAndGlyphs" font-weight="700">Fleet</text>
+<text x="104" y="32.83" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">2</text>
+<text x="120" y="32.83" fill="#9aa1b2" textLength="40" lengthAdjust="spacingAndGlyphs">Plans</text>
+<text x="168" y="32.83" fill="#a99cff" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">1</text>
+<text x="200" y="32.83" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">3</text>
+<text x="216" y="32.83" fill="#9aa1b2" textLength="40" lengthAdjust="spacingAndGlyphs">Brain</text>
+<text x="280" y="32.83" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">4</text>
+<text x="296" y="32.83" fill="#9aa1b2" textLength="96" lengthAdjust="spacingAndGlyphs">Worker Types</text>
+<text x="416" y="32.83" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">5</text>
+<text x="432" y="32.83" fill="#9aa1b2" textLength="56" lengthAdjust="spacingAndGlyphs">Remotes</text>
+<text x="496" y="32.83" fill="#e8a33d" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">◐</text>
+<text x="552" y="32.83" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">/</text>
+<text x="568" y="32.83" fill="#7a8398" textLength="240" lengthAdjust="spacingAndGlyphs" font-style="italic">search sessions, plans, brain…</text>
+<text x="1064" y="32.83" fill="#9aa1b2" textLength="368" lengthAdjust="spacingAndGlyphs">orchestrator-v1 · 4 workers · 1 plan pending ·</text>
+<text x="1440" y="32.83" fill="#e8a33d" textLength="144" lengthAdjust="spacingAndGlyphs">◐ eu1 reconnecting</text>
+<text x="16" y="71.23" fill="#9aa1b2" textLength="64" lengthAdjust="spacingAndGlyphs" font-weight="700">Sessions</text>
+<text x="248" y="71.23" fill="#9aa1b2" textLength="8" lengthAdjust="spacingAndGlyphs">7</text>
+<text x="288" y="71.23" fill="#4fd1c5" textLength="40" lengthAdjust="spacingAndGlyphs" font-weight="700">Graph</text>
+<text x="336" y="71.23" fill="#9aa1b2" textLength="136" lengthAdjust="spacingAndGlyphs">· orchestrator-v1</text>
+<text x="1000" y="71.23" fill="#9aa1b2" textLength="200" lengthAdjust="spacingAndGlyphs">c compact · F full · 100%</text>
+<text x="1232" y="71.23" fill="#9aa1b2" textLength="48" lengthAdjust="spacingAndGlyphs" font-weight="700">Detail</text>
+<text x="1520" y="71.23" fill="#9aa1b2" textLength="64" lengthAdjust="spacingAndGlyphs">selected</text>
+<text x="16" y="90.43" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">/</text>
+<text x="32" y="90.43" fill="#7a8398" textLength="56" lengthAdjust="spacingAndGlyphs" font-style="italic">filter…</text>
+<text x="296" y="90.43" fill="#7a8398" textLength="144" lengthAdjust="spacingAndGlyphs" font-style="italic">— unrelated tree —</text>
+<text x="1208" y="90.43" fill="#9aa1b2" textLength="8" lengthAdjust="spacingAndGlyphs">▲</text>
+<text x="1240" y="90.43" fill="#0b0e14" textLength="128" lengthAdjust="spacingAndGlyphs" font-weight="700">GHOST · PROPOSED</text>
+<text x="1392" y="90.43" fill="#9db4ff" textLength="64" lengthAdjust="spacingAndGlyphs" font-weight="700">sub-orch</text>
+<text x="624" y="109.63" fill="#4fd1c5" textLength="224" lengthAdjust="spacingAndGlyphs" font-weight="700">● ORCHESTRATOR · claude-code</text>
+<text x="16" y="128.83" fill="#7a8398" textLength="40" lengthAdjust="spacingAndGlyphs" font-weight="700">LOCAL</text>
+<text x="312" y="128.83" fill="#e8a33d" textLength="152" lengthAdjust="spacingAndGlyphs" font-weight="700">◐ REMOTE · eu1-ptyd</text>
+<text x="624" y="128.83" fill="#e8e9ed" textLength="168" lengthAdjust="spacingAndGlyphs" font-weight="700">orchestrator-v1 (you)</text>
+<text x="1232" y="128.83" fill="#e8e9ed" textLength="136" lengthAdjust="spacingAndGlyphs" font-weight="700">billing-migration</text>
+<text x="16" y="148.03" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">▾</text>
+<text x="32" y="148.03" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="48" y="148.03" fill="#e8e9ed" textLength="120" lengthAdjust="spacingAndGlyphs" font-weight="700">orchestrator-v1</text>
+<text x="232" y="148.03" fill="#7a8398" textLength="24" lengthAdjust="spacingAndGlyphs">you</text>
+<text x="312" y="148.03" fill="#e8e9ed" textLength="128" lengthAdjust="spacingAndGlyphs" font-weight="700">orchestrator-eu1</text>
+<text x="624" y="148.03" fill="#9aa1b2" textLength="256" lengthAdjust="spacingAndGlyphs">Next-gen refactor — full backlog</text>
+<text x="1232" y="148.03" fill="#9aa1b2" textLength="280" lengthAdjust="spacingAndGlyphs">orchestrator-v1 › billing-migration</text>
+<text x="48" y="167.23" fill="#4ade80" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="64" y="167.23" fill="#e8e9ed" textLength="176" lengthAdjust="spacingAndGlyphs">v1-config-command-impl</text>
+<text x="312" y="167.23" fill="#e8a33d" textLength="136" lengthAdjust="spacingAndGlyphs" font-style="italic">reconnecting… 3/5</text>
+<text x="624" y="167.23" fill="#4fd1c5" textLength="192" lengthAdjust="spacingAndGlyphs">▸ coordinating 4 workers</text>
+<text x="1232" y="167.23" fill="#7a8398" textLength="248" lengthAdjust="spacingAndGlyphs">depth 1 of 3 · created by ninox</text>
+<text x="48" y="186.43" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="64" y="186.43" fill="#e8e9ed" textLength="184" lengthAdjust="spacingAndGlyphs">v1-worker-types-be-impl</text>
+<text x="624" y="186.43" fill="#7a8398" textLength="160" lengthAdjust="spacingAndGlyphs">depth 0 · 4 children</text>
+<text x="48" y="205.63" fill="#a3a9b5" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="64" y="205.63" fill="#9aa1b2" textLength="160" lengthAdjust="spacingAndGlyphs">v1-hooks-etxtbsy-fix</text>
+<text x="1240" y="205.63" fill="#9aa1b2" textLength="40" lengthAdjust="spacingAndGlyphs" font-weight="700">Brief</text>
+<text x="1528" y="205.63" fill="#4fd1c5" textLength="48" lengthAdjust="spacingAndGlyphs">e edit</text>
+<text x="16" y="224.83" fill="#a99cff" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">»</text>
+<text x="40" y="224.83" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">▾</text>
+<text x="48" y="224.83" fill="#a99cff" textLength="8" lengthAdjust="spacingAndGlyphs">○</text>
+<text x="64" y="224.83" fill="#a99cff" textLength="136" lengthAdjust="spacingAndGlyphs" font-style="italic">billing-migration</text>
+<text x="224" y="224.83" fill="#7a8398" textLength="32" lengthAdjust="spacingAndGlyphs">plan</text>
+<text x="1240" y="224.83" fill="#e8e9ed" textLength="336" lengthAdjust="spacingAndGlyphs">Own the billing migration: schema changes,</text>
+<text x="72" y="244.03" fill="#a99cff" textLength="8" lengthAdjust="spacingAndGlyphs">○</text>
+<text x="88" y="244.03" fill="#a99cff" textLength="96" lengthAdjust="spacingAndGlyphs" font-style="italic">backfill-job</text>
+<text x="1240" y="244.03" fill="#e8e9ed" textLength="320" lengthAdjust="spacingAndGlyphs">backfill, rollout, and canary monitoring</text>
+<text x="72" y="263.23" fill="#a99cff" textLength="8" lengthAdjust="spacingAndGlyphs">○</text>
+<text x="88" y="263.23" fill="#a99cff" textLength="152" lengthAdjust="spacingAndGlyphs" font-style="italic">api-contract-update</text>
+<text x="1240" y="263.23" fill="#e8e9ed" textLength="144" lengthAdjust="spacingAndGlyphs">across 3 sections.</text>
+<text x="16" y="301.63" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">▸</text>
+<text x="32" y="301.63" fill="#a3a9b5" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="48" y="301.63" fill="#9aa1b2" textLength="168" lengthAdjust="spacingAndGlyphs">orchestrator-payments</text>
+<text x="248" y="301.63" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">3</text>
+<text x="320" y="301.63" fill="#4ade80" textLength="160" lengthAdjust="spacingAndGlyphs" font-weight="700">● IMPL · claude-code</text>
+<text x="552" y="301.63" fill="#4fd1c5" textLength="160" lengthAdjust="spacingAndGlyphs" font-weight="700">● IMPL · claude-code</text>
+<text x="784" y="301.63" fill="#a3a9b5" textLength="160" lengthAdjust="spacingAndGlyphs" font-weight="700">● IMPL · claude-code</text>
+<text x="1016" y="301.63" fill="#a99cff" textLength="144" lengthAdjust="spacingAndGlyphs" font-weight="700">○ GHOST · proposed</text>
+<text x="320" y="320.83" fill="#e8e9ed" textLength="176" lengthAdjust="spacingAndGlyphs" font-weight="700">v1-config-command-impl</text>
+<text x="552" y="320.83" fill="#e8e9ed" textLength="176" lengthAdjust="spacingAndGlyphs" font-weight="700">v1-worker-types-be-im…</text>
+<text x="784" y="320.83" fill="#e8e9ed" textLength="160" lengthAdjust="spacingAndGlyphs" font-weight="700">v1-hooks-etxtbsy-fix</text>
+<text x="1016" y="320.83" fill="#e8e9ed" textLength="136" lengthAdjust="spacingAndGlyphs" font-weight="700">billing-migration</text>
+<text x="1240" y="320.83" fill="#9aa1b2" textLength="88" lengthAdjust="spacingAndGlyphs" font-weight="700">Worker type</text>
+<text x="1520" y="320.83" fill="#4fd1c5" textLength="56" lengthAdjust="spacingAndGlyphs">⇥ cycle</text>
+<text x="16" y="340.03" fill="#7a8398" textLength="48" lengthAdjust="spacingAndGlyphs" font-weight="700">REMOTE</text>
+<text x="320" y="340.03" fill="#9aa1b2" textLength="152" lengthAdjust="spacingAndGlyphs">config get/set/show</text>
+<text x="552" y="340.03" fill="#9aa1b2" textLength="160" lengthAdjust="spacingAndGlyphs">worker-type registry</text>
+<text x="784" y="340.03" fill="#9aa1b2" textLength="176" lengthAdjust="spacingAndGlyphs">ETXTBSY race in wrapp…</text>
+<text x="992" y="340.03" fill="#a99cff" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">▶</text>
+<text x="1016" y="340.03" fill="#9aa1b2" textLength="168" lengthAdjust="spacingAndGlyphs">sub-orch · 3 sections</text>
+<text x="1240" y="340.03" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">‹</text>
+<text x="1256" y="340.03" fill="#e8e9ed" textLength="248" lengthAdjust="spacingAndGlyphs">Orchestrator (sub-orchestrator)</text>
+<text x="1568" y="340.03" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">›</text>
+<text x="16" y="359.23" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">▸</text>
+<text x="32" y="359.23" fill="#e8a33d" textLength="8" lengthAdjust="spacingAndGlyphs">◐</text>
+<text x="48" y="359.23" fill="#e8e9ed" textLength="128" lengthAdjust="spacingAndGlyphs">orchestrator-eu1</text>
+<text x="320" y="359.23" fill="#4ade80" textLength="128" lengthAdjust="spacingAndGlyphs">✓ PR #210 · done</text>
+<text x="552" y="359.23" fill="#4fd1c5" textLength="168" lengthAdjust="spacingAndGlyphs">▸ cargo clippy --wksp</text>
+<text x="784" y="359.23" fill="#a3a9b5" textLength="32" lengthAdjust="spacingAndGlyphs">idle</text>
+<text x="1016" y="359.23" fill="#a99cff" textLength="136" lengthAdjust="spacingAndGlyphs" font-style="italic">awaiting approval</text>
+<text x="48" y="378.43" fill="#e8a33d" textLength="192" lengthAdjust="spacingAndGlyphs" font-style="italic">eu1-ptyd · reconnecting…</text>
+<text x="320" y="378.43" fill="#7a8398" textLength="96" lengthAdjust="spacingAndGlyphs">checks 14/14</text>
+<text x="552" y="378.43" fill="#7a8398" textLength="104" lengthAdjust="spacingAndGlyphs">running 00:41</text>
+<text x="784" y="378.43" fill="#7a8398" textLength="152" lengthAdjust="spacingAndGlyphs">via work request #1</text>
+<text x="1016" y="378.43" fill="#7a8398" textLength="168" lengthAdjust="spacingAndGlyphs">a approve · d discard</text>
+<text x="1240" y="378.43" fill="#9aa1b2" textLength="96" lengthAdjust="spacingAndGlyphs" font-weight="700">Dependencies</text>
+<text x="1528" y="378.43" fill="#4fd1c5" textLength="48" lengthAdjust="spacingAndGlyphs">e edit</text>
+<text x="1240" y="397.63" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">1</text>
+<text x="1256" y="397.63" fill="#a99cff" textLength="8" lengthAdjust="spacingAndGlyphs">○</text>
+<text x="1272" y="397.63" fill="#a99cff" textLength="96" lengthAdjust="spacingAndGlyphs" font-style="italic">backfill-job</text>
+<text x="1536" y="397.63" fill="#7a8398" textLength="40" lengthAdjust="spacingAndGlyphs">ghost</text>
+<text x="16" y="416.83" fill="#7a8398" textLength="48" lengthAdjust="spacingAndGlyphs" font-weight="700">RECENT</text>
+<text x="664" y="416.83" fill="#e8a33d" textLength="120" lengthAdjust="spacingAndGlyphs" font-weight="700">#1 work request</text>
+<text x="872" y="416.83" fill="#e8a33d" textLength="8" lengthAdjust="spacingAndGlyphs">▲</text>
+<text x="1256" y="416.83" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">↓</text>
+<text x="32" y="436.03" fill="#9aa1b2" textLength="136" lengthAdjust="spacingAndGlyphs">✓ v0-cli-skeleton</text>
+<text x="208" y="436.03" fill="#7a8398" textLength="48" lengthAdjust="spacingAndGlyphs">merged</text>
+<text x="1240" y="436.03" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">2</text>
+<text x="1256" y="436.03" fill="#a99cff" textLength="8" lengthAdjust="spacingAndGlyphs">○</text>
+<text x="1272" y="436.03" fill="#a99cff" textLength="152" lengthAdjust="spacingAndGlyphs" font-style="italic">api-contract-update</text>
+<text x="1536" y="436.03" fill="#7a8398" textLength="40" lengthAdjust="spacingAndGlyphs">ghost</text>
+<text x="32" y="455.23" fill="#9aa1b2" textLength="128" lengthAdjust="spacingAndGlyphs">✓ v0-hooks-spike</text>
+<text x="208" y="455.23" fill="#7a8398" textLength="48" lengthAdjust="spacingAndGlyphs">merged</text>
+<text x="312" y="455.23" fill="#7a8398" textLength="56" lengthAdjust="spacingAndGlyphs" font-weight="700">minimap</text>
+<text x="528" y="455.23" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs">m</text>
+<text x="1256" y="455.23" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">↓</text>
+<text x="32" y="474.43" fill="#9aa1b2" textLength="112" lengthAdjust="spacingAndGlyphs">✗ v0-pty-relay</text>
+<text x="184" y="474.43" fill="#7a8398" textLength="72" lengthAdjust="spacingAndGlyphs">abandoned</text>
+<text x="320" y="474.43" fill="#e8a33d" textLength="8" lengthAdjust="spacingAndGlyphs">▪</text>
+<text x="1240" y="474.43" fill="#7a8398" textLength="8" lengthAdjust="spacingAndGlyphs">3</text>
+<text x="1256" y="474.43" fill="#9aa1b2" textLength="72" lengthAdjust="spacingAndGlyphs">◌ rollout</text>
+<text x="1488" y="474.43" fill="#7a8398" textLength="88" lengthAdjust="spacingAndGlyphs">not planned</text>
+<text x="848" y="512.83" fill="#a99cff" textLength="56" lengthAdjust="spacingAndGlyphs" font-weight="700">○ GHOST</text>
+<text x="1040" y="512.83" fill="#a99cff" textLength="56" lengthAdjust="spacingAndGlyphs" font-weight="700">○ GHOST</text>
+<text x="848" y="532.03" fill="#c9c2ff" textLength="96" lengthAdjust="spacingAndGlyphs" font-style="italic">backfill-job</text>
+<text x="1016" y="532.03" fill="#7366c4" textLength="8" lengthAdjust="spacingAndGlyphs">▸</text>
+<text x="1040" y="532.03" fill="#c9c2ff" textLength="152" lengthAdjust="spacingAndGlyphs" font-style="italic">api-contract-update</text>
+<text x="1240" y="532.03" fill="#9aa1b2" textLength="88" lengthAdjust="spacingAndGlyphs" font-weight="700">Proposed by</text>
+<text x="848" y="551.23" fill="#7a8398" textLength="104" lengthAdjust="spacingAndGlyphs">needs: schema</text>
+<text x="1040" y="551.23" fill="#7a8398" textLength="152" lengthAdjust="spacingAndGlyphs">needs: backfill-job</text>
+<text x="1240" y="551.23" fill="#9db4ff" textLength="96" lengthAdjust="spacingAndGlyphs">ninox prompt</text>
+<text x="1344" y="551.23" fill="#7a8398" textLength="80" lengthAdjust="spacingAndGlyphs">· 14:31:22</text>
+<text x="360" y="570.43" fill="#7a8398" textLength="64" lengthAdjust="spacingAndGlyphs" font-style="italic">viewport</text>
+<text x="1240" y="570.43" fill="#9aa1b2" textLength="264" lengthAdjust="spacingAndGlyphs" font-style="italic">“plan the billing migration epic”</text>
+<text x="1240" y="589.63" fill="#7a8398" textLength="104" lengthAdjust="spacingAndGlyphs">prompt by you</text>
+<text x="1208" y="608.83" fill="#9aa1b2" textLength="8" lengthAdjust="spacingAndGlyphs">▼</text>
+<text x="304" y="628.03" fill="#7a8398" textLength="72" lengthAdjust="spacingAndGlyphs">hierarchy</text>
+<text x="408" y="628.03" fill="#7a8398" textLength="40" lengthAdjust="spacingAndGlyphs">ghost</text>
+<text x="472" y="628.03" fill="#7a8398" textLength="112" lengthAdjust="spacingAndGlyphs">▸ work request</text>
+<text x="616" y="628.03" fill="#7a8398" textLength="64" lengthAdjust="spacingAndGlyphs">selected</text>
+<text x="16" y="647.23" fill="#9aa1b2" textLength="40" lengthAdjust="spacingAndGlyphs" font-weight="700">Fleet</text>
+<text x="288" y="647.23" fill="#9aa1b2" textLength="64" lengthAdjust="spacingAndGlyphs" font-weight="700">Activity</text>
+<text x="1152" y="647.23" fill="#4ade80" textLength="48" lengthAdjust="spacingAndGlyphs">● live</text>
+<text x="1232" y="647.23" fill="#7a8398" textLength="32" lengthAdjust="spacingAndGlyphs" font-weight="700">PLAN</text>
+<text x="288" y="666.43" fill="#7a8398" textLength="320" lengthAdjust="spacingAndGlyphs" font-weight="700">TIME      NODE                     EVENT</text>
+<text x="984" y="666.43" fill="#7a8398" textLength="80" lengthAdjust="spacingAndGlyphs" font-weight="700">THROUGHPUT</text>
+<text x="1232" y="666.43" fill="#9aa1b2" textLength="64" lengthAdjust="spacingAndGlyphs">approved</text>
+<text x="1544" y="666.43" fill="#e8e9ed" textLength="24" lengthAdjust="spacingAndGlyphs" font-weight="700">0/3</text>
+<text x="16" y="685.63" fill="#9aa1b2" textLength="32" lengthAdjust="spacingAndGlyphs">busy</text>
+<text x="224" y="685.63" fill="#e8e9ed" textLength="24" lengthAdjust="spacingAndGlyphs" font-weight="700">2/4</text>
+<text x="1232" y="685.63" fill="#9aa1b2" textLength="40" lengthAdjust="spacingAndGlyphs">depth</text>
+<text x="1544" y="685.63" fill="#e8e9ed" textLength="24" lengthAdjust="spacingAndGlyphs" font-weight="700">2/3</text>
+<text x="16" y="704.83" fill="#9aa1b2" textLength="32" lengthAdjust="spacingAndGlyphs">done</text>
+<text x="224" y="704.83" fill="#e8e9ed" textLength="24" lengthAdjust="spacingAndGlyphs" font-weight="700">1/4</text>
+<text x="288" y="704.83" fill="#7a8398" textLength="64" lengthAdjust="spacingAndGlyphs">14:32:07</text>
+<text x="368" y="704.83" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="384" y="704.83" fill="#9aa1b2" textLength="184" lengthAdjust="spacingAndGlyphs">v1-worker-types-be-impl</text>
+<text x="584" y="704.83" fill="#e8e9ed" textLength="248" lengthAdjust="spacingAndGlyphs">▸ run  cargo clippy --workspace</text>
+<text x="984" y="704.83" fill="#9aa1b2" textLength="40" lengthAdjust="spacingAndGlyphs">tok/s</text>
+<text x="16" y="724.03" fill="#9aa1b2" textLength="40" lengthAdjust="spacingAndGlyphs">depth</text>
+<text x="224" y="724.03" fill="#e8e9ed" textLength="24" lengthAdjust="spacingAndGlyphs" font-weight="700">2/3</text>
+<text x="288" y="724.03" fill="#7a8398" textLength="64" lengthAdjust="spacingAndGlyphs">14:31:58</text>
+<text x="368" y="724.03" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="384" y="724.03" fill="#9aa1b2" textLength="184" lengthAdjust="spacingAndGlyphs">v1-worker-types-be-impl</text>
+<text x="584" y="724.03" fill="#e8e9ed" textLength="296" lengthAdjust="spacingAndGlyphs">edit  worker/src/registry.rs  +84 −12</text>
+<text x="984" y="724.03" fill="#9aa1b2" textLength="40" lengthAdjust="spacingAndGlyphs">tools</text>
+<text x="1240" y="724.03" fill="#7a8398" textLength="56" lengthAdjust="spacingAndGlyphs" font-weight="700">ACTIONS</text>
+<text x="288" y="743.23" fill="#7a8398" textLength="64" lengthAdjust="spacingAndGlyphs">14:31:40</text>
+<text x="368" y="743.23" fill="#e8a33d" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="384" y="743.23" fill="#9aa1b2" textLength="128" lengthAdjust="spacingAndGlyphs">orchestrator-eu1</text>
+<text x="584" y="743.23" fill="#e8a33d" textLength="288" lengthAdjust="spacingAndGlyphs">◐ reconnect attempt 3/5 · backoff 8s</text>
+<text x="16" y="762.43" fill="#4ade80" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="32" y="762.43" fill="#9aa1b2" textLength="48" lengthAdjust="spacingAndGlyphs">done 1</text>
+<text x="96" y="762.43" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="112" y="762.43" fill="#9aa1b2" textLength="48" lengthAdjust="spacingAndGlyphs">busy 1</text>
+<text x="176" y="762.43" fill="#a3a9b5" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="192" y="762.43" fill="#9aa1b2" textLength="48" lengthAdjust="spacingAndGlyphs">idle 1</text>
+<text x="288" y="762.43" fill="#7a8398" textLength="64" lengthAdjust="spacingAndGlyphs">14:31:22</text>
+<text x="368" y="762.43" fill="#9db4ff" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="384" y="762.43" fill="#9aa1b2" textLength="40" lengthAdjust="spacingAndGlyphs">ninox</text>
+<text x="584" y="762.43" fill="#a99cff" textLength="360" lengthAdjust="spacingAndGlyphs">plan proposed  billing-migration · 3 sections</text>
+<text x="984" y="762.43" fill="#9aa1b2" textLength="56" lengthAdjust="spacingAndGlyphs">context</text>
+<text x="1112" y="762.43" fill="#e8e9ed" textLength="24" lengthAdjust="spacingAndGlyphs" font-weight="700">61%</text>
+<text x="1232" y="762.43" fill="#4fd1c5" textLength="24" lengthAdjust="spacingAndGlyphs" font-weight="700">[a]</text>
+<text x="1264" y="762.43" fill="#e8e9ed" textLength="152" lengthAdjust="spacingAndGlyphs" font-weight="700">Approve &amp; spawn all</text>
+<text x="16" y="781.63" fill="#a99cff" textLength="8" lengthAdjust="spacingAndGlyphs">○</text>
+<text x="32" y="781.63" fill="#9aa1b2" textLength="56" lengthAdjust="spacingAndGlyphs">ghost 3</text>
+<text x="96" y="781.63" fill="#e8a33d" textLength="8" lengthAdjust="spacingAndGlyphs">◐</text>
+<text x="112" y="781.63" fill="#9aa1b2" textLength="64" lengthAdjust="spacingAndGlyphs">remote 1</text>
+<text x="288" y="781.63" fill="#7a8398" textLength="64" lengthAdjust="spacingAndGlyphs">14:30:51</text>
+<text x="368" y="781.63" fill="#4ade80" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="384" y="781.63" fill="#9aa1b2" textLength="176" lengthAdjust="spacingAndGlyphs">v1-config-command-impl</text>
+<text x="584" y="781.63" fill="#4ade80" textLength="264" lengthAdjust="spacingAndGlyphs">✓ PR #210 opened · checks passing</text>
+<text x="1232" y="781.63" fill="#4fd1c5" textLength="24" lengthAdjust="spacingAndGlyphs" font-weight="700">[s]</text>
+<text x="1264" y="781.63" fill="#e8e9ed" textLength="168" lengthAdjust="spacingAndGlyphs">Approve selected only</text>
+<text x="288" y="800.83" fill="#7a8398" textLength="64" lengthAdjust="spacingAndGlyphs">14:30:12</text>
+<text x="368" y="800.83" fill="#a3a9b5" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="384" y="800.83" fill="#9aa1b2" textLength="440" lengthAdjust="spacingAndGlyphs">v1-hooks-etxtbsy-fix     idle — waiting on work request</text>
+<text x="984" y="800.83" fill="#9aa1b2" textLength="64" lengthAdjust="spacingAndGlyphs">selected</text>
+<text x="1056" y="800.83" fill="#a99cff" textLength="136" lengthAdjust="spacingAndGlyphs" font-style="italic">billing-migration</text>
+<text x="1232" y="800.83" fill="#4fd1c5" textLength="24" lengthAdjust="spacingAndGlyphs" font-weight="700">[+]</text>
+<text x="1264" y="800.83" fill="#e8e9ed" textLength="88" lengthAdjust="spacingAndGlyphs">Add section</text>
+<text x="16" y="820.03" fill="#9aa1b2" textLength="40" lengthAdjust="spacingAndGlyphs">tok/s</text>
+<text x="288" y="820.03" fill="#7a8398" textLength="64" lengthAdjust="spacingAndGlyphs">14:29:47</text>
+<text x="368" y="820.03" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="384" y="820.03" fill="#9aa1b2" textLength="184" lengthAdjust="spacingAndGlyphs">v1-worker-types-be-impl</text>
+<text x="592" y="820.03" fill="#e8a33d" textLength="320" lengthAdjust="spacingAndGlyphs">▸ work request #1 → v1-hooks-etxtbsy-fix</text>
+<text x="984" y="820.03" fill="#9aa1b2" textLength="64" lengthAdjust="spacingAndGlyphs">sections</text>
+<text x="1056" y="820.03" fill="#e8e9ed" textLength="96" lengthAdjust="spacingAndGlyphs">0/3 approved</text>
+<text x="1232" y="820.03" fill="#f0506e" textLength="24" lengthAdjust="spacingAndGlyphs" font-weight="700">[d]</text>
+<text x="1264" y="820.03" fill="#f0506e" textLength="96" lengthAdjust="spacingAndGlyphs">Discard plan</text>
+<text x="16" y="839.23" fill="#9aa1b2" textLength="40" lengthAdjust="spacingAndGlyphs">tools</text>
+<text x="288" y="839.23" fill="#7a8398" textLength="64" lengthAdjust="spacingAndGlyphs">14:29:03</text>
+<text x="368" y="839.23" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="384" y="839.23" fill="#9aa1b2" textLength="120" lengthAdjust="spacingAndGlyphs">orchestrator-v1</text>
+<text x="584" y="839.23" fill="#e8e9ed" textLength="216" lengthAdjust="spacingAndGlyphs">spawn  v1-hooks-etxtbsy-fix</text>
+<text x="984" y="839.23" fill="#9aa1b2" textLength="40" lengthAdjust="spacingAndGlyphs">queue</text>
+<text x="1056" y="839.23" fill="#e8e9ed" textLength="136" lengthAdjust="spacingAndGlyphs">1 plan · 3 ghosts</text>
+<text x="72" y="858.43" fill="#7a8398" textLength="64" lengthAdjust="spacingAndGlyphs" font-style="italic">last 60s</text>
+<text x="288" y="858.43" fill="#7a8398" textLength="64" lengthAdjust="spacingAndGlyphs">14:28:30</text>
+<text x="368" y="858.43" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs">●</text>
+<text x="384" y="858.43" fill="#9aa1b2" textLength="120" lengthAdjust="spacingAndGlyphs">orchestrator-v1</text>
+<text x="584" y="858.43" fill="#e8e9ed" textLength="240" lengthAdjust="spacingAndGlyphs">spawn  v1-worker-types-be-impl</text>
+<text x="1232" y="858.43" fill="#7a8398" textLength="304" lengthAdjust="spacingAndGlyphs" font-style="italic">spawns 3 workers under orchestrator-v1</text>
+<text x="288" y="877.63" fill="#7a8398" textLength="216" lengthAdjust="spacingAndGlyphs">PgUp/PgDn scroll · f follow</text>
+<text x="288" y="896.83" fill="#4fd1c5" textLength="56" lengthAdjust="spacingAndGlyphs" font-weight="700">ninox ❯</text>
+<text x="1128" y="896.83" fill="#9aa1b2" textLength="72" lengthAdjust="spacingAndGlyphs">always on</text>
+<text x="296" y="916.03" fill="#7a8398" textLength="656" lengthAdjust="spacingAndGlyphs" font-style="italic">ask ninox — “what’s blocking the webhook rewrite?” or “spawn an orchestrator for…”</text>
+<text x="1024" y="916.03" fill="#7a8398" textLength="168" lengthAdjust="spacingAndGlyphs">⏎ submit · ↑↓ history</text>
+<text x="16" y="935.23" fill="#7a8398" textLength="232" lengthAdjust="spacingAndGlyphs">↑↓ move · ⏎ open · space fold</text>
+<text x="8" y="954.43" fill="#0b0e14" textLength="48" lengthAdjust="spacingAndGlyphs" font-weight="700">NORMAL</text>
+<text x="72" y="954.43" fill="#e8e9ed" textLength="40" lengthAdjust="spacingAndGlyphs" font-weight="700">GRAPH</text>
+<text x="136" y="954.43" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">a</text>
+<text x="152" y="954.43" fill="#e8e9ed" textLength="88" lengthAdjust="spacingAndGlyphs">approve all</text>
+<text x="264" y="954.43" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">s</text>
+<text x="280" y="954.43" fill="#e8e9ed" textLength="88" lengthAdjust="spacingAndGlyphs">approve sel</text>
+<text x="392" y="954.43" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">+</text>
+<text x="408" y="954.43" fill="#e8e9ed" textLength="88" lengthAdjust="spacingAndGlyphs">add section</text>
+<text x="520" y="954.43" fill="#f0506e" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">d</text>
+<text x="536" y="954.43" fill="#9aa1b2" textLength="56" lengthAdjust="spacingAndGlyphs">discard</text>
+<text x="616" y="954.43" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">⏎</text>
+<text x="632" y="954.43" fill="#9aa1b2" textLength="56" lengthAdjust="spacingAndGlyphs">inspect</text>
+<text x="712" y="954.43" fill="#4fd1c5" textLength="24" lengthAdjust="spacingAndGlyphs" font-weight="700">1-5</text>
+<text x="744" y="954.43" fill="#9aa1b2" textLength="40" lengthAdjust="spacingAndGlyphs">views</text>
+<text x="808" y="954.43" fill="#4fd1c5" textLength="24" lengthAdjust="spacingAndGlyphs" font-weight="700">Tab</text>
+<text x="840" y="954.43" fill="#9aa1b2" textLength="40" lengthAdjust="spacingAndGlyphs">focus</text>
+<text x="904" y="954.43" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">/</text>
+<text x="920" y="954.43" fill="#9aa1b2" textLength="48" lengthAdjust="spacingAndGlyphs">prompt</text>
+<text x="992" y="954.43" fill="#4fd1c5" textLength="8" lengthAdjust="spacingAndGlyphs" font-weight="700">q</text>
+<text x="1008" y="954.43" fill="#9aa1b2" textLength="584" lengthAdjust="spacingAndGlyphs">quit                      plan billing-migration · 3 sections · depth 2/3</text></svg>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {};
+  }
+}
+</script>
+</body>
+</html>

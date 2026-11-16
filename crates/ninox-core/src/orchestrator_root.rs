@@ -1,0 +1,718 @@
+use crate::config::AppConfig;
+
+/// Writes one `<skills_dir>/<name>/SKILL.md` per entry in `caps` whose
+/// [`Capability::enabled`] gate is satisfied by `config`, with the seed-time
+/// placeholders substituted, and returns the entries actually seeded (in the
+/// order given) so callers can advertise exactly what landed on disk.
+///
+/// Split out of [`setup_orchestrator_root`] so the gating loop can be tested
+/// against a caller-supplied capability slice — the real `REGISTRY` is a
+/// `const`, so a deliberately-disabled entry can't be injected into it.
+///
+/// Files are always overwritten: an upgraded ninox re-seeds the current
+/// wording over whatever the previous version wrote. Note that a
+/// now-disabled capability's *stale* file is left in place rather than
+/// deleted — removing files from a directory the user may have added their
+/// own skills to is not this function's call to make.
+async fn seed_orchestrator_skills<'a>(
+    skills_dir: &std::path::Path,
+    config: &AppConfig,
+    caps: &[&'a crate::capabilities::Capability],
+    ninox_bin: &str,
+    config_path: &str,
+) -> anyhow::Result<Vec<&'a crate::capabilities::Capability>> {
+    use crate::capabilities;
+    use tokio::fs;
+
+    let mut seeded = Vec::new();
+    for cap in caps {
+        let Some(md) = cap.orchestrator_md else { continue };
+        if !(cap.enabled)(config) {
+            continue;
+        }
+        let dir = skills_dir.join(cap.name);
+        fs::create_dir_all(&dir).await?;
+        fs::write(dir.join("SKILL.md"), capabilities::render(md, ninox_bin, config_path)).await?;
+        seeded.push(*cap);
+    }
+    Ok(seeded)
+}
+
+/// Seeds `~/ninox/orchestrators/` (or the configured root) with the
+/// files that orchestrator sessions need: AGENTS.md (canonical, CLAUDE.md
+/// symlinks to it), one SKILL.md per *enabled* orchestrator-facing capability
+/// in `ninox_core::capabilities::REGISTRY`, the subagent-blocker
+/// PreToolUse hook, and the same `worker-status` activity hooks
+/// (`ninox_core::worker_status`) a worker worktree gets via
+/// `spawn_util::ensure_statusline_settings` — `PreToolUse`
+/// (`AskUserQuestion|ExitPlanMode`) and `PermissionRequest` to detect an
+/// orchestrator sitting at a synchronous prompt, `Stop`/`UserPromptSubmit`
+/// to clear it again once the prompt resolves. Orchestrators previously had
+/// none of this wiring, so hitting their own prompt left them Blocked with
+/// no signal and no way to recover without a human intervening by hand.
+///
+/// Both the seeded skills and AGENTS.md's "Available Skills" list are driven
+/// by that registry, so adding a capability needs no edit here — and both are
+/// filtered by each capability's `enabled` gate against `config`, evaluated
+/// once per call (every orchestrator entry is currently ungated, so this
+/// changes nothing today). Skill bodies go through `capabilities::render` to
+/// substitute the seed-time placeholders (`{{NINOX_BIN}}`, `{{CONFIG_PATH}}`)
+/// — see the `ninox_core::capabilities` module docs.
+///
+/// AGENTS.md is skipped if already present (user-editable). Skill files and
+/// the blocker are always overwritten to stay in sync, and ninox's
+/// statusLine/hooks are merged into `.claude/settings.local.json` (see
+/// `crate::claude_settings`).
+pub async fn setup_orchestrator_root(
+    root: &std::path::Path,
+    config: &AppConfig,
+    ninox_bin: &str,
+    config_path: &str,
+) -> anyhow::Result<()> {
+    use crate::capabilities::{self, Audience};
+    use tokio::fs;
+
+    let claude_dir        = root.join(".claude");
+    let claude_skills_dir = claude_dir.join("skills");
+    fs::create_dir_all(&claude_dir).await?;
+
+    let skill_path = |name: &str| claude_skills_dir.join(name).join("SKILL.md");
+
+    let caps: Vec<_> = capabilities::for_audience(Audience::Orchestrator).collect();
+    let seeded =
+        seed_orchestrator_skills(&claude_skills_dir, config, &caps, ninox_bin, config_path).await?;
+
+    // pi scans `.agents/skills`, not `.claude/skills`: link it to the one
+    // seeded copy so the two cannot drift.
+    #[cfg(unix)]
+    {
+        let agents_skills = root.join(".agents").join("skills");
+        if agents_skills.symlink_metadata().is_err() {
+            fs::create_dir_all(root.join(".agents")).await?;
+            fs::symlink("../.claude/skills", &agents_skills).await?;
+        }
+    }
+
+    // AGENTS.md is canonical; CLAUDE.md symlinks to it.
+    let agents_md_path = root.join("AGENTS.md");
+    if !agents_md_path.exists() {
+        let mut skills = String::new();
+        for cap in &seeded {
+            let Some(md) = cap.orchestrator_md else { continue };
+            skills.push_str(&format!(
+                "- `{}` — {}\n",
+                skill_path(cap.name).display(),
+                capabilities::description(md).unwrap_or(""),
+            ));
+        }
+        // The preamble points at whichever entry owns the spawn-worker
+        // capability rather than a hand-typed directory name, so a rename in
+        // the registry can't silently leave a dangling path here.
+        let spawn_skill = seeded
+            .iter()
+            .find(|c| c.name == "spawn-worker")
+            .expect("registry must declare an orchestrator spawn-worker capability");
+        let body = format!(
+            "# Ninox Orchestrator\n\n\
+             Before doing anything else, read and follow: `{spawn_skill}`\n\n\
+             ## Available Skills\n\n\
+             {skills}\n\
+             Run `{ninox_bin} capabilities --orchestrator` to list what ninox can currently do.\n",
+            spawn_skill = skill_path(spawn_skill.name).display(),
+            skills      = skills,
+            ninox_bin   = ninox_bin,
+        );
+        fs::write(&agents_md_path, body).await?;
+    }
+    let claude_md_path = root.join("CLAUDE.md");
+    if !claude_md_path.exists() {
+        #[cfg(unix)]
+        tokio::fs::symlink("AGENTS.md", &claude_md_path).await?;
+        #[cfg(not(unix))]
+        {
+            let body = fs::read_to_string(&agents_md_path).await?;
+            fs::write(&claude_md_path, body).await?;
+        }
+    }
+
+    // subagent-blocker hook — always overwritten.
+    let blocker = r#"#!/usr/bin/env node
+const { readFileSync } = require("node:fs");
+const callerType = process.env.NINOX_CALLER_TYPE || "";
+if (callerType !== "orchestrator") process.exit(0);
+let raw = "";
+try { raw = readFileSync(0, "utf-8"); } catch { process.exit(0); }
+let payload;
+try { payload = JSON.parse(raw || "{}"); } catch { process.exit(0); }
+const toolName = typeof payload.tool_name === "string" ? payload.tool_name : "";
+if (toolName !== "Task" && toolName !== "Agent") process.exit(0);
+const sub = (payload.tool_input?.subagent_type || "").toLowerCase();
+if (sub === "explore" || sub === "plan") process.exit(0);
+process.stdout.write(JSON.stringify({
+  hookSpecificOutput: {
+    hookEventName: "PreToolUse",
+    permissionDecision: "deny",
+    permissionDecisionReason: "Use `${NINOX_BIN:-ninox} spawn` instead of native subagents.",
+  },
+}) + "\n");
+process.exit(0);
+"#;
+    fs::write(claude_dir.join(crate::claude_settings::SUBAGENT_BLOCKER_SCRIPT), blocker).await?;
+
+    // Hook-bearing capabilities (today: `pr-watch-enforcement`) also write
+    // their guard script, gated the same way as their skill markdown —
+    // always overwritten, same as the subagent-blocker above, so an
+    // upgraded ninox re-seeds the current script.
+    let mut capability_pre_tool_use = Vec::new();
+    for hook in capabilities::hooks_for(Audience::Orchestrator, config) {
+        fs::write(claude_dir.join(hook.script_name), hook.script).await?;
+        capability_pre_tool_use.push(serde_json::json!({
+            "matcher": hook.matcher,
+            "hooks": [{"type": "command", "command": format!("node .claude/{}", hook.script_name), "timeout": 5}]
+        }));
+    }
+
+    // Machine-specific (absolute binary path), so it goes in the per-user
+    // `settings.local.json`, merged with whatever the user keeps there and
+    // refreshed on every call (so a root seeded by an older build picks up
+    // newly added hooks). Older builds wrote it to `settings.json`; prune
+    // ninox's own entries from there, leaving the user's.
+    let ninox_bin_quoted = format!("'{}'", ninox_bin.replace('\'', "'\\''"));
+    let hook = |cmd: &str| crate::worker_status::hook_entry(&ninox_bin_quoted, cmd);
+
+    let mut pre_tool_use = vec![
+        serde_json::json!({
+            "matcher": "Task|Agent",
+            "hooks": [{"type": "command", "command": format!("node .claude/{}", crate::claude_settings::SUBAGENT_BLOCKER_SCRIPT), "timeout": 2000}]
+        }),
+        // Mirrors the worker-worktree `hook-needs-input` entry
+        // (`spawn_util::ensure_statusline_settings`): reports an
+        // orchestrator sitting at an `AskUserQuestion`/`ExitPlanMode`
+        // prompt as Blocked, the gap `Stop`/`UserPromptSubmit` alone
+        // can't see since the turn hasn't ended while the agent waits.
+        serde_json::json!({
+            "matcher": "AskUserQuestion|ExitPlanMode",
+            "hooks": [hook("worker-status hook-needs-input")]
+        }),
+    ];
+    pre_tool_use.extend(capability_pre_tool_use);
+    let mut prompt_hooks = vec![hook("worker-status hook-prompt")];
+    // Sibling entry on the same `UserPromptSubmit` event, gated on
+    // `[role_rehydration].enabled` — shared with the matching worker-worktree
+    // wiring in `ninox_app::spawn_util::ensure_statusline_settings` via
+    // `crate::identity::push_prompt_hook`, so the entry can't drift between
+    // the two install sites.
+    crate::identity::push_prompt_hook(config, &ninox_bin_quoted, &mut prompt_hooks);
+    let mut hooks = serde_json::json!({
+        "PreToolUse": pre_tool_use,
+        // Same `hook-permission` detection, scoped to the same
+        // [`crate::worker_status::PERMISSION_REQUEST_MATCHER`] worker
+        // worktrees use — not every tool call, just the ones that can
+        // actually trigger a permission prompt.
+        "PermissionRequest": [{
+            "matcher": crate::worker_status::PERMISSION_REQUEST_MATCHER,
+            "hooks": [hook("worker-status hook-permission")]
+        }],
+        // The only way a hook-driven Blocked above ever clears:
+        // Claude Code cannot fire `Stop` while a synchronous
+        // interactive prompt is still waiting on a human (see
+        // `worker_status::HOOK_AWAITING_MARKER`), so `Stop` firing
+        // at all is proof the prompt already resolved. An
+        // orchestrator-declared *explicit* Blocked (`ninox
+        // worker-status set blocked`) is unaffected — `apply_activity`
+        // never lets a hook clear that. `UserPromptSubmit` is the
+        // same belt-and-suspenders pairing workers get: a fresh
+        // human message also supersedes a stale Blocked.
+        "Stop":             [{ "hooks": [hook("worker-status hook-stop")] }],
+        "UserPromptSubmit": [{ "hooks": prompt_hooks }]
+    });
+    crate::identity::set_session_start_hook(config, &ninox_bin_quoted, &mut hooks);
+    let settings = serde_json::json!({
+        "hooks": hooks,
+        "statusLine": {
+            "type": "command",
+            "command": format!("{ninox_bin_quoted} statusline"),
+            "refreshInterval": 20
+        }
+    });
+    // A user's unparsable settings file is left alone (never clobbered) and
+    // must not fail the rest of the root setup.
+    if let Err(e) = crate::claude_settings::strip_legacy(&claude_dir) {
+        tracing::warn!("orchestrator root: {e:#}");
+    }
+    if let Err(e) = crate::claude_settings::install_local(&claude_dir, &settings) {
+        tracing::warn!("orchestrator root: {e:#}");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn spawn_skill_teaches_work_request_handling() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        let skill = std::fs::read_to_string(
+            root.join(".claude").join("skills").join("spawn-worker").join("SKILL.md"),
+        ).unwrap();
+        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
+        assert!(skill.contains("name: spawn-worker"));
+        assert!(skill.contains("description:"));
+        assert!(
+            skill.contains("request-work"),
+            "skill must explain the worker→orchestrator work-request channel"
+        );
+        assert!(
+            skill.contains("spawn a new worker") || skill.contains("spawn a dedicated worker"),
+            "skill must tell the orchestrator to spawn a worker for requested work"
+        );
+        assert!(
+            skill.to_lowercase().contains("never") && skill.to_lowercase().contains("widen"),
+            "skill must forbid widening an existing worker's scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_seeds_watch_pr_skill() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        let skill_path = root.join(".claude").join("skills").join("watch-pr").join("SKILL.md");
+        let skill = std::fs::read_to_string(&skill_path).unwrap();
+        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
+        assert!(skill.contains("name: watch-pr"));
+        assert!(skill.contains("description:"));
+        assert!(skill.contains("ninox open --pr"));
+        assert!(skill.contains("ninox close --pr"));
+        assert!(skill.contains("ninox list --prs"));
+
+        let spawn_skill = std::fs::read_to_string(
+            root.join(".claude").join("skills").join("spawn-worker").join("SKILL.md"),
+        ).unwrap();
+        assert!(
+            spawn_skill.contains("see the `watch-pr` skill"),
+            "spawn-worker skill must cross-link the watch-pr skill"
+        );
+
+        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(
+            agents_md.contains(&skill_path.display().to_string()),
+            "AGENTS.md should list the watch-pr skill in Available Skills"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_seeds_reap_skill() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        let skill_path = root.join(".claude").join("skills").join("reap-workers").join("SKILL.md");
+        let skill = std::fs::read_to_string(&skill_path).unwrap();
+        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
+        assert!(skill.contains("name: reap-workers"));
+        assert!(skill.contains("description:"));
+        assert!(skill.contains("ninox reap"));
+        assert!(
+            skill.contains("--force"),
+            "skill must document the flag that reaping a live worker needs"
+        );
+        assert!(
+            skill.to_lowercase().contains("not while a worker is still working"),
+            "skill must warn against force-reaping live work"
+        );
+
+        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(
+            agents_md.contains(&skill_path.display().to_string()),
+            "AGENTS.md should point orchestrators at the reap skill"
+        );
+    }
+
+    /// The spawn-worker skill is rewritten on every startup, so it reaches
+    /// orchestrator roots whose (user-editable, never-overwritten) AGENTS.md
+    /// predates reaping and will never list the new skill.
+    #[tokio::test]
+    async fn spawn_skill_points_at_reaping() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        let skill = std::fs::read_to_string(
+            root.join(".claude").join("skills").join("spawn-worker").join("SKILL.md"),
+        ).unwrap();
+        assert!(skill.contains("ninox reap"));
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_seeds_spawn_orchestrator_skill() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        let skill_path = root.join(".claude").join("skills").join("spawn-orchestrator").join("SKILL.md");
+        let skill = std::fs::read_to_string(&skill_path).unwrap();
+        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
+        assert!(skill.contains("name: spawn-orchestrator"));
+        assert!(skill.contains("ninox spawn-orchestrator"));
+        assert!(
+            skill.contains("--user-requested"),
+            "skill must name the flag the command requires"
+        );
+        // The whole point of this skill is the restraint, not the mechanics.
+        let lower = skill.to_lowercase();
+        assert!(
+            lower.contains("only when the user explicitly asks"),
+            "skill must state the by-request-only rule"
+        );
+        assert!(
+            skill.contains("--description") || skill.contains("description:"),
+            "skill must carry a description for discovery"
+        );
+
+        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(agents_md.contains(&skill_path.display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn set_agent_config_skill_has_frontmatter() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        let skill = std::fs::read_to_string(
+            root.join(".claude").join("skills").join("set-agent-config").join("SKILL.md"),
+        ).unwrap();
+        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
+        assert!(skill.contains("name: set-agent-config"));
+        assert!(skill.contains("description:"));
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_seeds_brain_skill() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        let skill_path = root.join(".claude").join("skills").join("brain").join("SKILL.md");
+        let skill = std::fs::read_to_string(&skill_path).unwrap();
+        assert!(skill.starts_with("---\n"), "skill must start with YAML frontmatter");
+        assert!(skill.contains("name: brain"));
+        assert!(skill.contains("description:"));
+        assert!(skill.contains("ninox brain query"));
+        assert!(skill.contains("ninox brain index"));
+        assert!(skill.contains("ninox brain show"));
+        assert!(skill.contains("blends keyword and semantic matches"));
+
+        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(
+            agents_md.contains(&skill_path.display().to_string()),
+            "AGENTS.md should point orchestrators at the brain skill"
+        );
+    }
+
+    /// Seeding is registry-driven: every orchestrator-facing capability gets
+    /// a SKILL.md whose body is that entry's markdown with the seed-time
+    /// placeholders substituted, and AGENTS.md lists all of them.
+    #[tokio::test]
+    async fn setup_orchestrator_root_seeds_every_registry_orchestrator_skill() {
+        use crate::capabilities::{self, Audience};
+        let root = tempdir().unwrap().keep();
+        // Flip every opt-in gate on so this test's "every registry
+        // orchestrator skill" claim actually covers gated entries
+        // (`remote-machines`, `whoami`) too, not just the always-on ones.
+        let mut config = AppConfig::default();
+        config.remote_machines.enabled = true;
+        config.role_rehydration.enabled = true;
+        setup_orchestrator_root(&root, &config, "/path/to/ninox", "/cfg.toml").await.unwrap();
+
+        let agents_md = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        for cap in capabilities::for_audience(Audience::Orchestrator) {
+            let md = cap.orchestrator_md.expect("orchestrator entry has markdown");
+            let path = root.join(".claude").join("skills").join(cap.name).join("SKILL.md");
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{} not seeded: {e}", cap.name));
+            assert_eq!(
+                body,
+                capabilities::render(md, "/path/to/ninox", "/cfg.toml"),
+                "{} must be seeded as the rendered registry markdown",
+                cap.name,
+            );
+            assert!(!body.contains("{{"), "{} left an unsubstituted placeholder", cap.name);
+            assert!(
+                agents_md.contains(&path.display().to_string()),
+                "AGENTS.md must list {} under Available Skills",
+                cap.name,
+            );
+            assert!(
+                agents_md.contains(capabilities::description(md).unwrap()),
+                "AGENTS.md must describe {} from its frontmatter",
+                cap.name,
+            );
+        }
+        // Audience-scoped: an unfiltered listing would show the orchestrator
+        // the worker-only variants of skills it shares (e.g. watch-pr).
+        assert!(
+            agents_md.contains("/path/to/ninox capabilities --orchestrator"),
+            "AGENTS.md must point at the orchestrator-scoped capabilities command"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agents_skills_is_a_link_to_the_claude_skills_so_pi_sees_every_skill() {
+        let _iso = crate::test_isolation::isolate();
+        let root = tempfile::tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+        let link = root.join(".agents").join("skills");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(link.join("brain").join("SKILL.md").exists());
+    }
+
+    /// The `enabled` gate is honored on the orchestrator side too, not just
+    /// the worker side. `REGISTRY` is a `const` whose entries are all
+    /// ungated today, so this drives the extracted seeding loop with a
+    /// locally-built capability slice instead.
+    #[tokio::test]
+    async fn seed_orchestrator_skills_skips_gated_off_capabilities() {
+        use crate::capabilities::{Audience, Capability};
+
+        let on = Capability {
+            name: "always-on",
+            audience: Audience::Orchestrator,
+            orchestrator_md: Some("---\nname: always-on\ndescription: On.\n---\n\nbody\n"),
+            worker_md: None,
+            enabled: |_| true,
+            hook: None,
+        };
+        let off = Capability {
+            name: "gated-off",
+            audience: Audience::Orchestrator,
+            orchestrator_md: Some("---\nname: gated-off\ndescription: Off.\n---\n\nbody\n"),
+            worker_md: None,
+            enabled: |_| false,
+            hook: None,
+        };
+
+        let dir = tempdir().unwrap().keep();
+        let seeded = seed_orchestrator_skills(
+            &dir, &AppConfig::default(), &[&on, &off], "ninox", "/cfg.toml",
+        )
+        .await
+        .unwrap();
+
+        assert!(dir.join("always-on").join("SKILL.md").exists(), "enabled entry must be seeded");
+        assert!(
+            !dir.join("gated-off").join("SKILL.md").exists(),
+            "a capability whose gate is off must not be seeded"
+        );
+        // The returned set is what AGENTS.md advertises — a disabled
+        // capability must not be listed there either.
+        assert_eq!(seeded.iter().map(|c| c.name).collect::<Vec<_>>(), vec!["always-on"]);
+    }
+
+    /// The skills are always re-seeded, so a stale copy from an older ninox
+    /// is replaced rather than left in place (AGENTS.md, by contrast, stays
+    /// user-editable and is only written when absent).
+    #[tokio::test]
+    async fn setup_orchestrator_root_overwrites_stale_skills_but_not_agents_md() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        let skill = root.join(".claude").join("skills").join("brain").join("SKILL.md");
+        std::fs::write(&skill, "stale\n").unwrap();
+        std::fs::write(root.join("AGENTS.md"), "hand-edited\n").unwrap();
+
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        assert_ne!(std::fs::read_to_string(&skill).unwrap(), "stale\n");
+        assert_eq!(std::fs::read_to_string(root.join("AGENTS.md")).unwrap(), "hand-edited\n");
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_configures_statusline() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, &AppConfig::default(), "/path/to/ninox", "/cfg.toml").await.unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".claude").join("settings.local.json")).unwrap(),
+        ).unwrap();
+        assert!(!root.join(".claude").join("settings.json").exists(), "ninox must not seed the shared settings.json");
+        assert_eq!(settings["statusLine"]["type"], "command");
+        assert_eq!(settings["statusLine"]["command"], "'/path/to/ninox' statusline");
+        assert_eq!(settings["statusLine"]["refreshInterval"], 20);
+        // The existing subagent-blocker hook must still be present.
+        let pre_tool_use = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            pre_tool_use.iter().any(|e| e["matcher"] == "Task|Agent"),
+            "subagent-blocker entry missing: {pre_tool_use:?}",
+        );
+        // `pr-watch-enforcement`'s hook must be registered alongside it, and
+        // its script written to disk.
+        assert!(
+            pre_tool_use.iter().any(|e| e["matcher"] == "Bash"
+                && e["hooks"][0]["command"] == "node .claude/pr-watch-enforcement.cjs"),
+            "pr-watch-enforcement hook entry missing: {pre_tool_use:?}",
+        );
+        assert!(root.join(".claude").join("pr-watch-enforcement.cjs").exists());
+    }
+
+    /// Every hook command registered for `event`, across matcher groups —
+    /// same helper as `spawn_util`'s worker-worktree tests.
+    fn hook_commands(settings: &serde_json::Value, event: &str) -> Vec<String> {
+        settings["hooks"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|group| group["hooks"].as_array())
+            .flatten()
+            .filter_map(|hook| hook["command"].as_str().map(String::from))
+            .collect()
+    }
+
+    /// Parity with `create_worker_worktree_installs_needs_input_and_permission_hooks`
+    /// in `spawn_util` — an orchestrator hitting its own `AskUserQuestion`/
+    /// `ExitPlanMode` prompt or a permission prompt must be detectable the
+    /// same way a worker's is, and recoverable via the same `Stop`/
+    /// `UserPromptSubmit` pair that clears a hook-driven Blocked.
+    #[tokio::test]
+    async fn setup_orchestrator_root_installs_needs_input_and_permission_hooks() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".claude").join("settings.local.json")).unwrap(),
+        ).unwrap();
+
+        let pre_tool_use = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            pre_tool_use.iter().any(|e| e["matcher"] == "AskUserQuestion|ExitPlanMode"
+                && e["hooks"][0]["command"].as_str().unwrap().ends_with("worker-status hook-needs-input")),
+            "needs-input PreToolUse entry missing: {pre_tool_use:?}",
+        );
+        // The subagent-blocker entry must still be present alongside it.
+        assert!(pre_tool_use.iter().any(|e| e["matcher"] == "Task|Agent"));
+
+        let permission_cmds = hook_commands(&settings, "PermissionRequest");
+        assert_eq!(permission_cmds.len(), 1, "{permission_cmds:?}");
+        assert!(permission_cmds[0].ends_with("worker-status hook-permission"), "{permission_cmds:?}");
+        assert_eq!(
+            settings["hooks"]["PermissionRequest"][0]["matcher"],
+            crate::worker_status::PERMISSION_REQUEST_MATCHER,
+            "orchestrator PermissionRequest must be scoped identically to the worker-worktree entry",
+        );
+
+        let stop_cmds = hook_commands(&settings, "Stop");
+        assert_eq!(stop_cmds.len(), 1, "{stop_cmds:?}");
+        assert!(stop_cmds[0].ends_with("worker-status hook-stop"), "{stop_cmds:?}");
+
+        let prompt_cmds = hook_commands(&settings, "UserPromptSubmit");
+        assert_eq!(prompt_cmds.len(), 1, "{prompt_cmds:?}");
+        assert!(prompt_cmds[0].ends_with("worker-status hook-prompt"), "{prompt_cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_installs_identity_hooks_when_role_rehydration_enabled() {
+        let root = tempdir().unwrap().keep();
+        let mut config = AppConfig::default();
+        config.role_rehydration.enabled = true;
+        setup_orchestrator_root(&root, &config, "ninox", "/cfg.toml").await.unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".claude").join("settings.local.json")).unwrap(),
+        ).unwrap();
+
+        let prompt_cmds = hook_commands(&settings, "UserPromptSubmit");
+        assert!(prompt_cmds.iter().any(|c| c.ends_with("identity-hook prompt")), "{prompt_cmds:?}");
+        assert!(prompt_cmds.iter().any(|c| c.ends_with("worker-status hook-prompt")), "{prompt_cmds:?}");
+        let session_start_cmds = hook_commands(&settings, "SessionStart");
+        assert!(session_start_cmds.iter().any(|c| c.ends_with("identity-hook session-start")), "{session_start_cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_omits_identity_hooks_when_role_rehydration_disabled() {
+        let root = tempdir().unwrap().keep();
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".claude").join("settings.local.json")).unwrap(),
+        ).unwrap();
+
+        let prompt_cmds = hook_commands(&settings, "UserPromptSubmit");
+        assert!(!prompt_cmds.iter().any(|c| c.contains("identity-hook")), "{prompt_cmds:?}");
+        assert!(settings["hooks"]["SessionStart"].is_null(), "SessionStart must not be installed when disabled");
+    }
+
+    #[tokio::test]
+    async fn setup_orchestrator_root_never_overwrites_existing_settings_json() {
+        let root = tempdir().unwrap().keep();
+        let claude_dir = root.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("settings.json"), r#"{"userCustom": true}"#).unwrap();
+
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        let contents = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        assert_eq!(contents, r#"{"userCustom": true}"#, "pre-existing settings.json must be left byte-for-byte alone");
+    }
+
+    /// A root seeded by an older build has ninox's entries in settings.json:
+    /// they move to settings.local.json, the user's entries stay put, and the
+    /// user's own settings.local.json content survives the merge.
+    #[tokio::test]
+    async fn setup_orchestrator_root_migrates_ninox_entries_out_of_settings_json() {
+        let root = tempdir().unwrap().keep();
+        let claude_dir = root.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("settings.json"), serde_json::json!({
+            "hooks": {"PreToolUse": [
+                {"matcher": "Task|Agent", "hooks": [{"type": "command", "command": "node .claude/subagent-blocker.cjs", "timeout": 2000}]},
+                {"matcher": "AskUserQuestion|ExitPlanMode", "hooks": [{"type": "command", "command": "'/old/ninox' worker-status hook-needs-input", "timeout": 5}]},
+                {"matcher": "Edit", "hooks": [{"type": "command", "command": "my-guard"}]}
+            ],
+            "PermissionRequest": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "'/old/ninox' worker-status hook-permission", "timeout": 5}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": "'/old/ninox' worker-status hook-stop", "timeout": 5}]}]},
+            "statusLine": {"type": "command", "command": "'/old/ninox' statusline", "refreshInterval": 20}
+        }).to_string()).unwrap();
+        std::fs::write(claude_dir.join("settings.local.json"), r#"{"permissions": {"allow": ["Read"]}}"#).unwrap();
+
+        for _ in 0..2 {
+            setup_orchestrator_root(&root, &AppConfig::default(), "/new/ninox", "/cfg.toml").await.unwrap();
+        }
+
+        let legacy: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(claude_dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(legacy, serde_json::json!({
+            "hooks": {"PreToolUse": [{"matcher": "Edit", "hooks": [{"type": "command", "command": "my-guard"}]}]}
+        }));
+        let local: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(claude_dir.join("settings.local.json")).unwrap()).unwrap();
+        assert_eq!(local["permissions"], serde_json::json!({"allow": ["Read"]}));
+        assert_eq!(local["statusLine"]["command"], "'/new/ninox' statusline");
+        let blockers = local["hooks"]["PreToolUse"].as_array().unwrap().iter()
+            .filter(|e| e["matcher"] == "Task|Agent").count();
+        assert_eq!(blockers, 1, "re-running setup must not duplicate ninox's hooks");
+        let needs_input = local["hooks"]["PreToolUse"].as_array().unwrap().iter()
+            .filter(|e| e["matcher"] == "AskUserQuestion|ExitPlanMode").count();
+        assert_eq!(needs_input, 1, "re-running setup must not duplicate ninox's hooks");
+        assert_eq!(hook_commands(&local, "PermissionRequest"), ["'/new/ninox' worker-status hook-permission"]);
+        assert_eq!(hook_commands(&local, "Stop"), ["'/new/ninox' worker-status hook-stop"]);
+    }
+
+    /// Same "always overwritten" contract as the subagent-blocker script:
+    /// the hook script itself is rewritten on every call, even alongside a
+    /// pre-existing user settings.json.
+    #[tokio::test]
+    async fn setup_orchestrator_root_always_rewrites_pr_watch_enforcement_script() {
+        let root = tempdir().unwrap().keep();
+        let claude_dir = root.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("settings.json"), r#"{"userCustom": true}"#).unwrap();
+        std::fs::write(claude_dir.join("pr-watch-enforcement.cjs"), "stale\n").unwrap();
+
+        setup_orchestrator_root(&root, &AppConfig::default(), "ninox", "/cfg.toml").await.unwrap();
+
+        assert_ne!(std::fs::read_to_string(claude_dir.join("pr-watch-enforcement.cjs")).unwrap(), "stale\n");
+    }
+}

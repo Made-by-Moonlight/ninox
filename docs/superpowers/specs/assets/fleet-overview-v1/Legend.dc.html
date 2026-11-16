@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ninox Fleet Overview — Legend</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0}
+a{color:#9db4ff}a:hover{color:#c3d2ff}
+.ninox{--bg:#0b0e14;--panel:#12161f;--panel2:#171c28;--border:#242a3a;--text:#e8e9ed;--dim:#8b92a5;--dim2:#5b6478;--teal:#4fd1c5;--amber:#e8a33d;--green:#4ade80;--gray:#6b7280;--red:#f0506e;--violet:#9b8cff;
+  font-family:-apple-system,"Segoe UI",Inter,system-ui,sans-serif;color:var(--text);background:var(--bg);box-sizing:border-box}
+.ninox *{box-sizing:border-box}
+.h1{font-size:18px;font-weight:800;margin:0 0 4px}
+.sub{font-size:12px;color:var(--dim);margin:0 0 20px}
+.section-title{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim2);font-weight:700;margin:0 0 10px}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+.row{display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+.dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.swatch-card{width:34px;height:26px;border-radius:5px;flex-shrink:0}
+.lbl{font-size:12px;font-weight:600}
+.desc{font-size:10.5px;color:var(--dim)}
+.line{width:40px;height:0;border-top:2px solid var(--dim2);flex-shrink:0}
+.line-dash{width:40px;height:0;border-top:2px dashed var(--violet);flex-shrink:0}
+.card{position:relative;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 10px;width:150px}
+.card-ghost{background:repeating-linear-gradient(135deg,#171428,#171428 7px,#1d1836 7px,#1d1836 14px);border:1.5px dashed var(--violet)}
+.badge{display:inline-block;padding:2px 7px;border-radius:4px;font-size:9.5px;font-weight:700}
+</style>
+</helmet>
+
+<div class="ninox" style="width:980px;height:760px;padding:28px">
+  <div class="h1">Fleet Overview — Legend</div>
+  <div class="sub">Reference key for the GUI and TUI mockups · one core drives both renderers identically</div>
+
+  <div class="grid">
+
+    <div style="grid-column:1/3">
+      <div class="section-title">Agent status (card top bar / tree dot)</div>
+      <div class="grid" style="grid-template-columns:repeat(4,1fr)">
+        <div class="row"><span class="dot" style="background:var(--teal)"></span><div><div class="lbl">Working</div><div class="desc">actively running a tool</div></div></div>
+        <div class="row"><span class="dot" style="background:var(--amber)"></span><div><div class="lbl">Blocked</div><div class="desc">waiting on input/approval</div></div></div>
+        <div class="row"><span class="dot" style="background:var(--gray)"></span><div><div class="lbl">Idle</div><div class="desc">spawned, not yet started</div></div></div>
+        <div class="row"><span class="dot" style="background:var(--green)"></span><div><div class="lbl">Done</div><div class="desc">finished / PR merged</div></div></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="section-title">Connection badge (remote nodes)</div>
+      <div class="row"><span class="dot" style="background:var(--green)"></span><span class="lbl">Connected</span></div>
+      <div style="height:8px"></div>
+      <div class="row"><span class="dot" style="background:var(--amber)"></span><span class="lbl">Reconnecting</span></div>
+      <div style="height:8px"></div>
+      <div class="row"><span class="dot" style="background:var(--red)"></span><span class="lbl">Unreachable</span></div>
+    </div>
+
+    <div>
+      <div class="section-title">Edge types</div>
+      <div class="row"><span class="line"></span><div><div class="lbl">Hierarchy</div><div class="desc">solid, fixed — who spawned whom</div></div></div>
+      <div style="height:8px"></div>
+      <div class="row"><span class="line-dash"></span><div><div class="lbl">Communication</div><div class="desc">transient dashed line, fades ~1s — only drawn when no hierarchy edge exists. Parent↔child messages flash the existing boundary instead (no new line)</div></div></div>
+    </div>
+
+    <div>
+      <div class="section-title">Node styles</div>
+      <div class="card" style="margin-bottom:10px">
+        <span class="badge" style="background:#1e2740;color:#9db4ff">Implementation</span>
+        <div style="font-size:11px;font-weight:700;margin-top:5px">real, running worker</div>
+      </div>
+      <div class="card card-ghost">
+        <span class="badge" style="background:#241d3a;color:#b7a6ff;border:1px dashed #9b8cff">GHOST · proposed</span>
+        <div style="font-size:11px;font-weight:700;margin-top:5px;color:#d8d3f5">dashed border + hatch fill — not running yet, editable brief/type/deps</div>
+      </div>
+    </div>
+
+    <div>
+      <div class="section-title">Depth cap (default 3, configurable)</div>
+      <div class="card" style="outline:2px solid var(--red);outline-offset:2px">
+        <span class="badge" style="background:#3a1f26;color:#f0506e">depth 3/3</span>
+        <div style="font-size:11px;margin-top:5px">red ring — hit the cap: spawns a plain worker that reports back up via a message instead of spawning another orchestrator</div>
+      </div>
+    </div>
+
+    <div style="grid-column:1/3">
+      <div class="section-title">Screen skeleton (identical in TUI and GUI)</div>
+      <div style="display:flex;gap:10px;font-size:11px;color:var(--dim)">
+        <div class="row" style="flex:1">Tree (left, always on) — full hierarchy, hollow ○ markers for ghosts</div>
+        <div class="row" style="flex:2">Graph canvas (center) + ninox prompt docked underneath (always visible)</div>
+        <div class="row" style="flex:1">Detail panel (right) — appears on selection, never overlays the tree</div>
+      </div>
+      <div class="row" style="margin-top:8px">Bottom controls (full width) — context-sensitive action row; shows plan-review controls (Approve &amp; spawn all / Approve selected / Add section / Discard) whenever a ghost node or pending plan is selected</div>
+    </div>
+
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {};
+  }
+}
+</script>
+</body>
+</html>

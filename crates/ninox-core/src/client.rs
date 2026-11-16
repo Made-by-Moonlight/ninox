@@ -1,0 +1,447 @@
+//! A hidden tmux client: `tmux attach` running on a PTY pair the app owns.
+//! From tmux's perspective this is a normal terminal, so attach triggers a
+//! full repaint, PTY resize drives window size (window-size latest), and
+//! keyboard bytes written to the master are real terminal input.
+
+use crate::events::{Engine, Event};
+use crate::types::SessionId;
+use anyhow::{Context, Result};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+
+/// How long a dropped client's process gets to die from SIGHUP before it is
+/// SIGKILLed; one that ignores SIGHUP would otherwise hold its pty forever.
+const KILL_GRACE: Duration = Duration::from_secs(2);
+
+pub struct AttachedClient {
+    input:  mpsc::UnboundedSender<Vec<u8>>,
+    master: Box<dyn MasterPty + Send>,
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    pid:    Option<u32>,
+    /// Set once the process has exited and been reaped, before
+    /// `ClientClosed` is emitted. `ClientClosed` travels on a bounded
+    /// broadcast channel that drops events when a receiver lags, so an
+    /// owner that must not miss an exit polls this instead.
+    exited: Arc<AtomicBool>,
+    /// Set when the first output arrives, for the same reason as `exited`.
+    output: Arc<AtomicBool>,
+    /// Identity stamped on every event this client's threads emit — lets
+    /// consumers tell this client's events apart from a superseding one
+    /// attached to the same session_id after a stale-close race.
+    pub generation: u64,
+}
+
+impl AttachedClient {
+    /// Spawn `argv` (from `tmux::attach_args`) on a fresh PTY sized
+    /// cols x rows. Output is emitted as `Event::ClientOutput`; exactly one
+    /// `Event::ClientClosed` follows when the process exits. `generation`
+    /// is echoed on both events so a caller can distinguish this client's
+    /// events from a different generation's after a replace/reattach race.
+    pub fn spawn(
+        engine:     Arc<Engine>,
+        session_id: SessionId,
+        argv:       Vec<String>,
+        cols:       u16,
+        rows:       u16,
+        generation: u64,
+    ) -> Result<Self> {
+        anyhow::ensure!(!argv.is_empty(), "attach argv must not be empty");
+        let pair = native_pty_system()
+            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .context("openpty for attached client")?;
+
+        let mut cmd = CommandBuilder::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        cmd.env("TERM", "xterm-256color");
+        let mut child = pair.slave.spawn_command(cmd).context("spawn tmux attach")?;
+        let mut killer = child.clone_killer();
+        let pid = child.process_id();
+        drop(pair.slave);
+
+        // Acquire both PTY handles before spawning any thread. Once a
+        // thread exists it owns `child` and is the sole emitter of the
+        // exactly-once `ClientClosed` event; if we spawned the reader
+        // first and then failed to get the writer, a caller retry after
+        // our Err would leave that thread running and orphan a second
+        // reader on top of it. So: get both handles, and if either is
+        // missing, kill+reap the child ourselves since no thread exists
+        // yet to do it.
+        let reader = pair.master.try_clone_reader();
+        let writer = pair.master.take_writer();
+        let (mut reader, mut writer) = match (reader, writer) {
+            (Ok(r), Ok(w)) => (r, w),
+            (r, w) => {
+                // Never leak the attach process: no thread owns it yet.
+                let _ = killer.kill();
+                let _ = child.wait();
+                r.context("clone PTY reader")?;
+                w.context("take PTY writer")?;
+                unreachable!("one of reader/writer must have errored");
+            }
+        };
+
+        // Reader thread: PTY master → ClientOutput events. Blocking reads on
+        // a dedicated thread; Engine::emit is sync so no runtime needed here.
+        let engine_out = engine.clone();
+        let sid = session_id.clone();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_reader = exited.clone();
+        let output = Arc::new(AtomicBool::new(false));
+        let output_reader = output.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match std::io::Read::read(&mut reader, &mut buf) {
+                    Ok(0) => break,
+                    // A signal interrupted the blocking read (e.g. SIGWINCH
+                    // from a concurrent resize) — not a real error, retry
+                    // rather than tearing down the client and emitting a
+                    // spurious ClientClosed.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                    Ok(n) => {
+                        output_reader.store(true, Ordering::Release);
+                        engine_out.emit(Event::ClientOutput {
+                            session_id: sid.clone(),
+                            generation,
+                            bytes:      buf[..n].to_vec(),
+                        });
+                    }
+                }
+            }
+            let _ = child.wait();
+            exited_reader.store(true, Ordering::Release);
+            engine_out.emit(Event::ClientClosed { session_id: sid, generation });
+        });
+
+        // Writer thread: mpsc → PTY master (real keyboard input path).
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            while let Some(bytes) = input_rx.blocking_recv() {
+                if writer.write_all(&bytes).is_err() { break; }
+                let _ = writer.flush();
+            }
+        });
+
+        Ok(Self { input: input_tx, master: pair.master, killer, pid, exited, output, generation })
+    }
+
+    /// The process has exited, whether or not `ClientClosed` was delivered.
+    pub fn has_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
+    }
+
+    /// The process has printed something, whether or not `ClientOutput` was
+    /// delivered.
+    pub fn has_output(&self) -> bool {
+        self.output.load(Ordering::Acquire)
+    }
+
+    pub fn write(&self, bytes: Vec<u8>) {
+        let _ = self.input.send(bytes);
+    }
+
+    /// A cloneable sender for the input path — handed to the emulator's
+    /// event proxy so query responses (DSR, DA, kitty) reach the PTY.
+    pub fn input_sender(&self) -> mpsc::UnboundedSender<Vec<u8>> {
+        self.input.clone()
+    }
+
+    /// Resize the client PTY; tmux follows via `window-size latest` and
+    /// repaints — no explicit resize-window call needed.
+    pub fn resize(&self, cols: u16, rows: u16) {
+        let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+    }
+
+    /// Signal the client as if its size had changed (the kernel only does
+    /// so on a real change): a `ninox pane attach` bridge re-sends its size,
+    /// taking a shared ptyd pane back from whichever client resized it last.
+    pub fn reclaim_size(&self) {
+        if let Some(pid) = self.pid.and_then(|p| i32::try_from(p).ok()) {
+            unsafe { libc::kill(pid, libc::SIGWINCH) };
+        }
+    }
+}
+
+impl Drop for AttachedClient {
+    fn drop(&mut self) {
+        let _ = self.killer.kill();
+        let (Some(pid), false) = (self.pid.and_then(|p| i32::try_from(p).ok()), self.has_exited()) else { return };
+        let exited = self.exited.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(KILL_GRACE);
+            if !exited.load(Ordering::Acquire) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{events::Event, store::Store, tmux};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::time::{sleep, Duration};
+
+    fn tmux_available() -> bool {
+        std::process::Command::new("tmux").args(["-V"]).output()
+            .map(|o| o.status.success()).unwrap_or(false)
+    }
+
+    fn unique_id() -> String {
+        // Millis alone collide when parallel test threads start within the
+        // same tick, producing duplicate tmux session names; a per-process
+        // counter guarantees uniqueness regardless of clock resolution.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        format!("ac-{}-{millis}-{n}", std::process::id())
+    }
+
+    fn test_engine() -> Arc<crate::events::Engine> {
+        let store = Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
+        crate::events::Engine::new(store)
+    }
+
+    async fn collect_client_output(
+        rx: &mut tokio::sync::broadcast::Receiver<Event>,
+        session_id: &str,
+        timeout_ms: u64,
+    ) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let mut all = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() { break; }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(Event::ClientOutput { session_id: sid, bytes, .. })) if sid == session_id => {
+                    all.extend_from_slice(&bytes);
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        all
+    }
+
+    fn open_fds() -> usize {
+        std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0)
+    }
+
+    fn child_count() -> usize {
+        let out = std::process::Command::new("pgrep").args(["-P", &std::process::id().to_string(), "-f", "sleep"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().count()
+    }
+
+    #[tokio::test]
+    async fn repeated_attach_and_drop_leaves_no_fds_or_children_behind() {
+        let engine = test_engine();
+        let spawn_one = |n: u64| {
+            AttachedClient::spawn(
+                engine.clone(), format!("leak-{n}"), vec!["sleep".into(), "300".into()], 80, 24, n,
+            ).unwrap()
+        };
+        // Warm up lazily-opened descriptors so the baseline is steady.
+        drop(spawn_one(0));
+        sleep(Duration::from_millis(500)).await;
+        let (fds_before, kids_before) = (open_fds(), child_count());
+
+        for n in 1..=20 {
+            let client = spawn_one(n);
+            sleep(Duration::from_millis(20)).await;
+            drop(client);
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let (fds, kids) = (open_fds(), child_count());
+            if fds <= fds_before && kids <= kids_before { break; }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "20 attach/drop cycles leaked: fds {fds_before} -> {fds}, children {kids_before} -> {kids}"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_ignores_sighup_is_killed_after_the_grace_period() {
+        let engine = test_engine();
+        let client = AttachedClient::spawn(
+            engine, "stubborn".into(),
+            vec!["sh".into(), "-c".into(), "trap '' HUP; while :; do sleep 1; done".into()], 80, 24, 1,
+        ).unwrap();
+        sleep(Duration::from_millis(300)).await;
+        let exited = client.exited.clone();
+        drop(client);
+        let deadline = tokio::time::Instant::now() + KILL_GRACE + Duration::from_secs(5);
+        while !exited.load(Ordering::Acquire) {
+            assert!(tokio::time::Instant::now() < deadline, "SIGHUP-ignoring client outlived the grace period");
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_repaints_and_round_trips_input() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        let engine = test_engine();
+        let mut rx = engine.subscribe();
+
+        tmux::create_session(&id, "/tmp", "bash", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        let argv = tmux::attach_args(&id).await;
+        let client = AttachedClient::spawn(engine.clone(), id.clone(), argv, 100, 30, 1).unwrap();
+
+        // Attach must repaint the current screen (shell prompt) unprompted.
+        let repaint = collect_client_output(&mut rx, &id, 2000).await;
+        assert!(!repaint.is_empty(), "attach should trigger a full repaint");
+
+        // Input written to the client PTY reaches the inner shell.
+        client.write(b"echo attach-round-trip\r".to_vec());
+        let out = collect_client_output(&mut rx, &id, 3000).await;
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("attach-round-trip"), "echo output missing: {text}");
+
+        drop(client);
+        tmux::kill_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resize_drives_tmux_window_size() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        let engine = test_engine();
+        tmux::create_session(&id, "/tmp", "sleep 30", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        let argv = tmux::attach_args(&id).await;
+        let client = AttachedClient::spawn(engine.clone(), id.clone(), argv, 97, 41, 1).unwrap();
+        sleep(Duration::from_millis(500)).await;
+
+        // window-size latest: the window follows the (only) client's PTY size.
+        let out = tokio::process::Command::new("tmux")
+            .args(["-L", tmux::socket(), "display-message", "-p", "-t", &id, "#{window_width}x#{window_height}"])
+            .output().await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "97x41");
+
+        client.resize(80, 24);
+        sleep(Duration::from_millis(500)).await;
+        let out = tokio::process::Command::new("tmux")
+            .args(["-L", tmux::socket(), "display-message", "-p", "-t", &id, "#{window_width}x#{window_height}"])
+            .output().await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "80x24");
+
+        drop(client);
+        tmux::kill_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_viewer_client_never_resizes_the_window() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        let engine = test_engine();
+        tmux::create_session(&id, "/tmp", "cat", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        let app = AttachedClient::spawn(engine.clone(), id.clone(), tmux::attach_args(&id).await, 100, 30, 1).unwrap();
+        sleep(Duration::from_millis(400)).await;
+        assert_eq!(tmux::window_size(&id).await, Some((100, 30)));
+
+        let argv = crate::runtime::viewer_attach_args(tmux::attach_args(&id).await);
+        let viewer = AttachedClient::spawn(engine.clone(), id.clone(), argv, 80, 24, 2).unwrap();
+        sleep(Duration::from_millis(300)).await;
+        // Typing makes the viewer the latest client, which would win under
+        // `window-size latest` without ignore-size.
+        viewer.write(b"x".to_vec());
+        sleep(Duration::from_millis(400)).await;
+        assert_eq!(tmux::window_size(&id).await, Some((100, 30)), "the viewer resized the agent's window");
+
+        drop(viewer);
+        drop(app);
+        tmux::kill_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shift_enter_csi_u_reaches_kitty_enabled_app() {
+        if !tmux_available() { return; }
+        // extended-keys-format csi-u (how tmux disambiguates Shift+Enter for
+        // a forwarded CSI-u sequence) does not exist before tmux 3.5 — our
+        // managed config omits it there (see tmux::server_config_for_version),
+        // so there's nothing this test can exercise. Skip with a clear
+        // reason rather than failing on tmux that genuinely can't do this.
+        let version = tmux::detected_version_sync();
+        if version < (3, 5) {
+            eprintln!(
+                "skipping shift_enter_csi_u_reaches_kitty_enabled_app: tmux {version:?} \
+                 predates extended-keys-format (needs >= 3.5)"
+            );
+            return;
+        }
+        let id = unique_id();
+        let engine = test_engine();
+        let mut rx = engine.subscribe();
+
+        // Inner app enables the kitty keyboard protocol (CSI > 1 u), then
+        // echoes every byte it receives with escapes made visible. With
+        // extended-keys always + csi-u format, tmux must forward our
+        // Shift+Enter encoding to it intact.
+        let cmd = r#"bash -c 'stty -echo -icanon; printf "\033[>1u"; cat -v'"#;
+        tmux::create_session(&id, "/tmp", cmd, &[]).await.unwrap();
+        sleep(Duration::from_millis(400)).await;
+
+        let argv = tmux::attach_args(&id).await;
+        let client = AttachedClient::spawn(engine.clone(), id.clone(), argv, 100, 30, 1).unwrap();
+        sleep(Duration::from_millis(400)).await;
+
+        client.write(b"\x1b[13;2u".to_vec()); // Shift+Enter, CSI-u encoded
+        let out = collect_client_output(&mut rx, &id, 3000).await;
+        let text = String::from_utf8_lossy(&out);
+        // cat -v renders ESC as ^[ — the CSI-u sequence must survive intact.
+        assert!(text.contains("^[[13;2u"),
+                "Shift+Enter did not reach the kitty-enabled app as CSI-u: {text}");
+
+        drop(client);
+        tmux::kill_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_closed_emitted_when_session_killed() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        let engine = test_engine();
+        let mut rx = engine.subscribe();
+        tmux::create_session(&id, "/tmp", "sleep 30", &[]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        let argv = tmux::attach_args(&id).await;
+        let expected_generation = 99;
+        let _client = AttachedClient::spawn(
+            engine.clone(), id.clone(), argv, 80, 24, expected_generation,
+        ).unwrap();
+        sleep(Duration::from_millis(300)).await;
+        tmux::kill_session(&id).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(3000);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "ClientClosed never arrived");
+            if let Ok(Ok(Event::ClientClosed { session_id, generation })) =
+                tokio::time::timeout(remaining, rx.recv()).await
+            {
+                if session_id == id {
+                    assert_eq!(generation, expected_generation, "generation must round-trip on ClientClosed");
+                    break;
+                }
+            }
+        }
+    }
+}

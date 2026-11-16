@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ninox Fleet Overview — GUI at scale</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0}
+a{color:#9db4ff}a:hover{color:#c3d2ff}
+.ninox{--bg:#0b0e14;--panel:#12161f;--panel2:#171c28;--border:#242a3a;--text:#e8e9ed;--dim:#8b92a5;--dim2:#5b6478;--teal:#4fd1c5;--amber:#e8a33d;--green:#4ade80;--gray:#6b7280;--red:#f0506e;--violet:#9b8cff;
+  font-family:-apple-system,"Segoe UI",Inter,system-ui,sans-serif;color:var(--text);background:var(--bg);box-sizing:border-box}
+.ninox *{box-sizing:border-box}
+.mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.panel-title{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim2);font-weight:700}
+.nav{height:44px;flex-shrink:0;display:flex;align-items:stretch;gap:2px;padding:0 12px 0 16px;background:var(--panel);border-bottom:1px solid var(--border)}
+.nav-brand{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:800;color:var(--text);text-decoration:none;padding-right:14px;margin-right:6px;border-right:1px solid var(--border)}
+.nav-link{display:flex;align-items:center;gap:7px;padding:0 13px;font-size:12.5px;font-weight:600;color:#a3aabb;text-decoration:none;border-bottom:2px solid transparent;border-top:2px solid transparent}
+.nav-active{color:var(--text);background:#1b2236;border-bottom-color:var(--teal)}
+.nav-key{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:10px;color:#8b92a5}
+.nav-count{font-size:10px;font-weight:700;padding:1px 6px;border-radius:9px;background:#3a2a12;color:#f3c27a}
+.tree-row{font-size:12px;padding:3px 0;white-space:nowrap;display:flex;align-items:center;gap:6px;overflow:hidden}
+.tree-count{margin-left:auto;font-size:10.5px;color:var(--dim2);padding-left:6px}
+.tree-selected{background:#1b2236;border-radius:4px;margin:0 -8px;padding:3px 8px}
+.island{break-inside:avoid;margin:0 0 14px;background:var(--panel);border:1px solid var(--border);border-radius:9px;overflow:hidden}
+.island-sel{border-color:#2f6f6a;box-shadow:0 0 0 1px #2f6f6a}
+.island-head{display:flex;align-items:center;gap:7px;padding:9px 11px 7px}
+.island-name{font-size:12.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.island-meta{margin-left:auto;font-size:10px;color:var(--dim2);white-space:nowrap}
+.needs{font-size:9.5px;font-weight:800;letter-spacing:.03em;padding:2px 6px;border-radius:4px;background:#3a2a12;color:#f3c27a;white-space:nowrap}
+.bar{display:flex;height:3px;margin:0 11px 6px;border-radius:2px;overflow:hidden;background:#1d2230}
+.rail{margin:0 11px 9px 15px;border-left:1px solid #343c50}
+.wrow{display:flex;align-items:center;gap:6px;font-size:11px;padding:2.5px 0;white-space:nowrap}
+.tick{width:9px;height:1px;background:#343c50;flex-shrink:0}
+.wname{overflow:hidden;text-overflow:ellipsis;min-width:0;color:#cfd3dc}
+.chip{margin-left:auto;font-size:9.5px;font-weight:700;padding:1px 6px;border-radius:9px;white-space:nowrap;flex-shrink:0}
+.chip-open{background:#1e2740;color:#9db4ff}
+.chip-merge{background:#15291f;color:#7fd8a8}
+.chip-fail{background:#3a1f26;color:#f58aa0}
+.chip-wait{background:#3a2a12;color:#f3c27a}
+.fold{font-size:10.5px;color:var(--dim2);padding:3px 0 1px}
+.empty{font-size:10.5px;color:var(--dim2);font-style:italic;padding:2px 0}
+.island-remote{border-color:#3b3366}
+.machine{display:flex;align-items:center;gap:6px;padding:4px 11px;background:#1c1833;border-bottom:1px solid #3b3366;font-size:10px;font-weight:700;letter-spacing:.04em;color:#c9c2ff}
+.machine-state{margin-left:auto;font-weight:600;letter-spacing:0}
+.tree-machine{font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:#c9c2ff;margin:10px 0 3px;display:flex;align-items:center;gap:6px}
+.rail-btn{width:30px;height:30px;display:flex;align-items:center;justify-content:center;background:transparent;border:1px solid var(--border);border-radius:6px;color:#a3aabb;cursor:pointer;padding:0}
+.rail-btn:hover{background:#1b2236;color:var(--text)}
+.seg{display:flex;background:var(--panel2);border:1px solid var(--border);border-radius:6px;overflow:hidden;font-size:10.5px}
+.seg span{padding:5px 10px;color:var(--dim)}
+.seg .on{background:#1f3a6e;color:#cfe0ff}
+</style>
+</helmet>
+
+<div class="ninox" style="width:1440px;height:944px;display:flex;flex-direction:column">
+  <nav class="nav" aria-label="Primary">
+    <a class="nav-brand" href="#"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M7 1 13 7 7 13 1 7z" fill="#4fd1c5"/></svg>ninox</a>
+    <a class="nav-link nav-active" href="#" aria-current="page">Fleet<span class="nav-count" aria-label="3 need you">3</span><span class="nav-key">1</span></a>
+    <a class="nav-link" href="#">Board<span class="nav-key">2</span></a>
+    <a class="nav-link" href="#">Plans<span class="nav-key">3</span></a>
+    <a class="nav-link" href="#">Brain<span class="nav-key">4</span></a>
+    <a class="nav-link" href="#">Worker Types<span class="nav-key">5</span></a>
+    <a class="nav-link" href="#">Remotes<span class="nav-key">6</span></a>
+    <div style="flex:1"></div>
+  </nav>
+
+  <div style="flex:1;display:flex;min-height:0">
+
+    <!-- TREE collapsed to a rail: the islands already show every orchestrator -->
+    <sc-if value="{{treeCollapsed}}" hint-placeholder-val="{{true}}">
+    <div style="width:44px;flex-shrink:0;border-right:1px solid var(--border);background:var(--panel);display:flex;flex-direction:column;align-items:center;padding:10px 0;gap:10px">
+      <button type="button" class="rail-btn" aria-label="Show session tree" onClick="{{toggleTree}}"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="M6 2.5v11M9 6l2 2-2 2"/></svg></button>
+      <span class="nav-key">[</span>
+      <span style="writing-mode:vertical-rl;transform:rotate(180deg);font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim2);font-weight:700;margin-top:6px">Sessions · 19 trees</span>
+    </div>
+    </sc-if>
+    <sc-if value="{{treeOpen}}" hint-placeholder-val="{{false}}">
+    <div style="width:238px;flex-shrink:0;border-right:1px solid var(--border);background:var(--panel);padding:14px 16px;overflow:hidden">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px"><span class="panel-title">Sessions</span><span style="margin-left:auto;font-size:10px;color:var(--dim2)">19 orch · 69 workers</span><button type="button" class="rail-btn" aria-label="Hide session tree" onClick="{{toggleTree}}"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="M6 2.5v11M11 6l-2 2 2 2"/></svg></button></div>
+      <div class="tree-machine" style="margin-top:0"><span>This machine</span></div>
+      <sc-for list="{{tree}}" as="t" hint-placeholder-count="18">
+        <div class="{{t.cls}}"><span style="color:var(--dim2)">{{t.caret}}</span><span class="dot" style="background:{{t.color}}"></span><span style="overflow:hidden;text-overflow:ellipsis">{{t.name}}</span><span class="tree-count">{{t.count}}</span></div>
+        <sc-if value="{{t.open}}" hint-placeholder-val="{{false}}">
+          <sc-for list="{{t.kids}}" as="k" hint-placeholder-count="3">
+            <div class="tree-row" style="padding-left:20px"><span class="dot" style="background:{{k.color}}"></span><span style="overflow:hidden;text-overflow:ellipsis">{{k.name}}</span></div>
+          </sc-for>
+          <div class="tree-row" style="padding-left:20px;color:var(--dim2);font-size:11px">▸ 17 done · 2 stopped</div>
+        </sc-if>
+      </sc-for>
+      <div class="tree-machine"><span>⌁ eu1-ptyd</span><span class="dot" style="background:var(--amber)"></span><span style="text-transform:none;letter-spacing:0;color:var(--dim2)">reconnecting</span></div>
+      <div class="tree-row"><span style="color:var(--dim2)">▸</span><span class="dot" style="background:var(--teal)"></span><span>gpu-eval-sweep</span><span class="tree-count">3</span></div>
+    </div>
+    </sc-if>
+
+    <!-- CENTER: islands + prompt -->
+    <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+      <div style="display:flex;align-items:center;gap:12px;padding:10px 18px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <span style="font-size:12px;font-weight:700">Fleet</span>
+        <span style="font-size:11px;color:var(--dim)">19 orchestrator trees · 69 workers · <span style="color:#f3c27a">3 need you</span> · 21 finished folded</span>
+        <div style="flex:1"></div>
+        <span style="font-size:10.5px;color:var(--dim2)">Machine</span>
+        <div class="seg"><span class="on">All</span><span>Local</span><span>eu1</span></div>
+        <span style="font-size:10.5px;color:var(--dim2)">Sort</span>
+        <div class="seg"><span class="on">Needs you first</span><span>Most active</span><span>A–Z</span></div>
+        <div class="seg"><span>Full cards</span><span class="on">Compact</span></div>
+      </div>
+
+      <div style="flex:1;min-height:0;overflow:hidden;padding:14px 18px 0;column-count:{{columns}};column-gap:14px">
+        <sc-for list="{{islands}}" as="o" hint-placeholder-count="18">
+          <div class="{{o.cls}}">
+            <sc-if value="{{o.machine}}" hint-placeholder-val="{{false}}">
+              <div class="machine"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="2" y="2" width="12" height="5" rx="1"/><rect x="2" y="9" width="12" height="5" rx="1"/></svg>REMOTE · {{o.machine}}<span class="machine-state"><span class="dot" style="background:{{o.healthColor}};margin-right:4px"></span>{{o.health}}</span></div>
+            </sc-if>
+            <div class="island-head">
+              <span class="dot" style="background:var(--teal)"></span>
+              <span class="island-name">{{o.name}}</span>
+              <sc-if value="{{o.needs}}" hint-placeholder-val="{{false}}"><span class="needs">{{o.needs}}</span></sc-if>
+              <span class="island-meta">{{o.meta}}</span>
+            </div>
+            <div class="bar" aria-hidden="true">
+              <sc-for list="{{o.segs}}" as="g" hint-placeholder-count="3"><span style="flex:{{g.n}};background:{{g.color}}"></span></sc-for>
+            </div>
+            <div class="rail">
+              <sc-for list="{{o.workers}}" as="w" hint-placeholder-count="3">
+                <div class="wrow"><span class="tick"></span><span class="dot" style="background:{{w.color}}"></span><span class="wname">{{w.name}}</span><sc-if value="{{w.chip}}" hint-placeholder-val="{{false}}"><span class="{{w.chipCls}}">{{w.chip}}</span></sc-if></div>
+              </sc-for>
+              <sc-if value="{{o.fold}}" hint-placeholder-val="{{false}}"><div class="wrow"><span class="tick"></span><span class="fold">{{o.fold}}</span></div></sc-if>
+              <sc-if value="{{o.empty}}" hint-placeholder-val="{{false}}"><div class="wrow"><span class="tick"></span><span class="empty">no workers — orchestrator only</span></div></sc-if>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+
+      <div style="height:54px;flex-shrink:0;background:var(--panel);border-top:1px solid var(--border);display:flex;align-items:center;padding:0 16px;gap:10px">
+        <span class="mono" style="color:var(--violet);font-size:14px">❯</span>
+        <div class="mono" style="flex:1;font-size:12.5px;color:var(--dim)">ask ninox — "what's blocking dind-gpu-sharing?" or "fold everything except bellhop work"</div>
+        <span style="font-size:10px;color:var(--dim2)">always on</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"treeCollapsed":{"editor":"boolean","default":true},"$preview":{"width":1440,"height":944}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const C = { working: '#4fd1c5', blocked: '#e8a33d', idle: '#6b7280', done: '#4ade80' };
+    const W = (name, st, pr) => {
+      const m = {
+        working:   { color: C.working },
+        pr_open:   { color: C.idle,    chip: pr ? 'PR ' + pr : 'PR open', chipCls: 'chip chip-open' },
+        mergeable: { color: C.idle,    chip: 'mergeable', chipCls: 'chip chip-merge' },
+        ci_failed: { color: C.blocked, chip: 'CI failed', chipCls: 'chip chip-fail' },
+        needs_you: { color: C.blocked, chip: 'needs you', chipCls: 'chip chip-wait' },
+        paused:    { color: C.blocked, chip: 'paused', chipCls: 'chip chip-wait' },
+      }[st];
+      return { name, st, color: m.color, chip: m.chip || '', chipCls: m.chipCls || '' };
+    };
+    const orchs = [
+      { name: 'Ray rolout teething', needs: 'CI FAILED', workers: [W('rnd-44-workspace-uv-sync','working'), W('mlops-4749-nightly-publish-fix','ci_failed'), W('mlops-5348-resolve-new-version-tag-push','mergeable')] },
+      { name: 'Ninox', needs: '2 NEED YOU', sel: true, done: 17, stopped: 2, workers: [W('v1-user-request-design','needs_you'), W('v1-mlops-5339-gui-fleet-overview','paused'), W('v1-mlops-5309-auto-planning','working')] },
+      { name: 'gpu-eval-sweep', machine: 'eu1-ptyd', health: 'reconnecting', remote: true, workers: [W('eval-sweep-shard-a','working'), W('eval-sweep-shard-b','working'), W('eval-sweep-report','pr_open','#412')] },
+      { name: 'dind-gpu-sharing', workers: [W('mlops-5137-gpu-slot-multi-tenant-proof','working'), W('mlops-5182-cgroup-shareprocessns-fix','working'), W('cdi-nested-gpu-quicktest','working'), W('cdi-fix-verify-real-k8s-pod','working'), W('bottlerocket-selinux-mount-propagation-test','working'), W('al2023-nested-gpu-mount-propagation-test','working'), W('mlops-5182-runc-systemd-version-check','mergeable'), W('mlops-5306-al2023-interactivesession-validate','pr_open','#1084')] },
+      { name: 'Clean up approved PRs', workers: [W('mlops-adjective-owl-rebase','working'), W('mlops-4109-placement-preview-rebase','working'), W('mlops-3067-workload-filter-rebase','working'), W('mlops-cloudin-1120-base-domain-rebase','working'), W('mlops-3066-history-server-rebase','mergeable'), W('mlops-4156-cli-skill-docs-update','mergeable'), W('mlops-3486-readme-kargo-fix','pr_open','#48'), W('mlops-4245-typed-config-rebase','pr_open','#1007')] },
+      { name: 'interactive-sessions', workers: [W('mlops-unstick-abdo-evicted-session','working'), W('mlops-4803-skill-docs','mergeable'), W('mlops-4752-ca-keyring-pip-fix','pr_open','#78'), W('mlops-4809-stuck-session-visibility','pr_open','#901'), W('mlops-4772-numa-sysfs','pr_open','#899'), W('mlops-4783-4784-session-iam-grants','pr_open','#897')] },
+      { name: 'dockerjobs', workers: [W('mlops-4076-jobset-batch-ui-visibility','pr_open','#863'), W('mlops-4812-spot-placement-score','pr_open','#900'), W('mlops-5174-parallelize-remaining-loops','pr_open','#1067'), W('mlops-5175-pod-evidence-sweep-deletion-driven','pr_open','#1066')] },
+      { name: 'ray-jobs', workers: [W('mlops-4696-graceful-shutdown-log-flush','working'), W('mlops-5151-postmerge-verify','working'), W('mlops-4753-exclude-ray-otel','pr_open','#249')] },
+      { name: 'Interactive avatar training in radisson', workers: [W('mlops-5016-turbo-exp3-rebase-resume','mergeable'), W('mlops-4995-ia-radisson-training','pr_open','#720')] },
+      { name: 'mlops-cluster-infra', workers: [W('mlops-argocd-degraded-investigation','working'), W('mlops-4797-bellhop-overlays','pr_open','#894')] },
+      { name: 'Archipellago', done: 1, workers: [W('mlops-4771-s3-third-party-models','working')] },
+      { name: 'Fix datadog logs', workers: [W('mlops-4817-gpu-datadog-logs','working')] },
+      { name: 'user-issues', workers: [W('mlops-4709-codex-mirror-fix','working')] },
+      { name: 'Meta orchestrator', workers: [W('dithree-radisson-adoption','pr_open','#1278')] },
+      { name: 'radisson-cli skill', workers: [W('radisson-cli-skill-docs-stack','pr_open','#243')] },
+      { name: 'Archipelago', workers: [W('mlops-4619-single-island','pr_open','#3')] },
+      { name: 'Fix hello world temporal', done: 1, workers: [] },
+      { name: 'Plan the rollout and architecture of the bellhop in production', workers: [] },
+      { name: 'New scheduler for GPUs', workers: [] },
+      { name: 'Unparented sessions', unparented: true, workers: [W('nexttts-gradio-app-down','working')] },
+    ];
+    const islands = orchs.map((o) => {
+      const n = (s) => o.workers.filter((w) => w.color === s).length;
+      const segs = [
+        { n: n(C.working), color: C.working },
+        { n: n(C.blocked), color: C.blocked },
+        { n: n(C.idle), color: C.idle },
+        { n: o.done || 0, color: C.done },
+      ].filter((g) => g.n > 0);
+      const active = o.workers.length;
+      const total = active + (o.done || 0) + (o.stopped || 0);
+      const foldParts = [];
+      if (o.done) foldParts.push(o.done + ' done');
+      if (o.stopped) foldParts.push(o.stopped + ' stopped');
+      return {
+        name: o.name,
+        cls: 'island' + (o.sel ? ' island-sel' : '') + (o.machine ? ' island-remote' : ''),
+        machine: o.machine || '',
+        health: o.health || '',
+        healthColor: { connected: '#4ade80', reconnecting: '#e8a33d', unreachable: '#f0506e' }[o.health] || '#6b7280',
+        needs: o.needs || '',
+        meta: total === 0 ? '' : (total === active ? active + '' : active + ' / ' + total),
+        segs: segs.length ? segs : [{ n: 1, color: '#1d2230' }],
+        workers: o.workers,
+        fold: foldParts.length ? '▸ ' + foldParts.join(' · ') + ' (folded)' : '',
+        empty: total === 0,
+      };
+    });
+    const tree = orchs.filter((o) => !o.unparented && !o.remote).map((o) => ({
+      name: o.name,
+      open: !!o.sel,
+      caret: o.sel ? '▾' : '▸',
+      cls: o.sel ? 'tree-row tree-selected' : 'tree-row',
+      color: o.needs ? '#e8a33d' : '#4fd1c5',
+      count: (o.workers.length + (o.done || 0) + (o.stopped || 0)) || '',
+      kids: o.sel ? o.workers : [],
+    }));
+    const collapsed = (this.state && this.state.treeCollapsed !== undefined) ? this.state.treeCollapsed : (this.props.treeCollapsed ?? true);
+    return {
+      islands, tree,
+      treeCollapsed: collapsed,
+      treeOpen: !collapsed,
+      columns: collapsed ? 5 : 4,
+      toggleTree: () => this.setState({ treeCollapsed: !collapsed }),
+    };
+  }
+}
+</script>
+</body>
+</html>

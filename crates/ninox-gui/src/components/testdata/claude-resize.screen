@@ -1,0 +1,45 @@
+
+ ▐▛███▛█   Claude Code v2.1.317
+▝▜██████▀  Haiku 5.5 · Claude Pro       
+ ▝▝   ▝▝   ~/src/example-project/terminal-fixture                           
+
+
+❯ Think briefly, then run ls here, then reply with 4 bullets of about 30 words each on how terminal
+  emulators measure character width.
+
+  Listed 1 directory
+
+⏺ The directory is empty: ls returned no output.
+
+  - Cell grid: Terminals draw text on a fixed grid, so each character occupies one or more cells.
+    Emulators decide that count per code point, usually from Unicode data, and the app must agree or
+    columns drift.
+  - East Asian Width: Characters marked Wide or Fullwidth take two cells, and most CJK text and many
+    emoji fall in this group. Combining marks and zero-width characters take zero cells.
+  - Ambiguous width: Characters marked Ambiguous, such as some Greek, Cyrillic and box-drawing
+    symbols, render as one or two cells depending on locale or a user setting, so the same text can
+    misalign between terminals.
+  - Grapheme clusters and emoji: Emoji sequences with ZWJ joiners, skin tones or variation selectors
+    are inconsistent across emulators. Newer terminals measure whole grapheme clusters, while older
+    ones count each code point separately.
+
+✻ Worked for 9s · done 16:39
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 4 agents

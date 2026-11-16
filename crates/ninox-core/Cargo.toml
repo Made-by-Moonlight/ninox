@@ -1,0 +1,58 @@
+[package]
+name        = "ninox-core"
+version     = "0.37.0"
+edition     = "2021"
+description = "Engine core for the Ninox native app: session lifecycle, config, and storage."
+license     = "MIT"
+repository  = "https://github.com/Made-by-Moonlight/ninox"
+
+[features]
+# Exposes test-only `Store` methods (see `Store::upsert_comment_for_test`) to
+# sibling crates' own test builds, which otherwise only see this crate's
+# public API — same rationale and pattern as ninox-ui-shared's
+# `test-support` feature (its `cli::test_fixtures` module).
+test-support = []
+# Arms `test_isolation`'s guard in this crate's dependents' test binaries
+# and exposes `test_isolation::isolate()` to them. Every workspace crate
+# depending on ninox-core enables it through its dev-dependency — enforced
+# by `test_isolation`'s tests.
+test-isolation = ["dep:tempfile"]
+
+[dependencies]
+tempfile   = { version = "3", optional = true }
+tokio      = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+rusqlite   = { workspace = true, features = ["functions", "backup"] }
+anyhow     = { workspace = true }
+toml       = { workspace = true }
+dirs       = { workspace = true }
+fastembed  = { workspace = true }
+tracing    = { workspace = true }
+tokio-util = { workspace = true }
+libc       = { workspace = true }
+reqwest    = { workspace = true }
+walkdir    = { workspace = true }
+rayon      = { workspace = true }
+portable-pty = "0.8"
+uuid       = { version = "1", features = ["v4"] }
+async-trait = { workspace = true }
+tar        = { workspace = true }
+flate2     = { workspace = true }
+semver     = { workspace = true }
+sha2       = { workspace = true }
+time       = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+ninox-ptyd = { path = "../ninox-ptyd", version = "0.37.0" }
+
+[build-dependencies]
+# Compiles src/ort_link_compat.cpp on gnu-Linux targets only — the iostream
+# init half of the prebuilt-ONNX-Runtime toolchain compatibility shims (see
+# the ort_link_compat module in src/embeddings.rs).
+cc = "1"
+
+[dev-dependencies]
+tempfile           = "3"
+tokio-test         = "0.4"
+tracing-subscriber = { workspace = true }

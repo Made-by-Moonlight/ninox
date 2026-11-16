@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ninox Worker Types — Settings</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0}
+a{color:#9db4ff}a:hover{color:#c3d2ff}
+.ninox{--bg:#0b0e14;--panel:#12161f;--panel2:#171c28;--border:#242a3a;--text:#e8e9ed;--dim:#8b92a5;--dim2:#5b6478;--teal:#4fd1c5;--amber:#e8a33d;--green:#4ade80;--gray:#6b7280;--red:#f0506e;--violet:#9b8cff;
+  font-family:-apple-system,"Segoe UI",Inter,system-ui,sans-serif;color:var(--text);background:var(--bg);box-sizing:border-box}
+.ninox *{box-sizing:border-box}
+.mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+.badge{display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700}
+.badge-builtin{background:#15231d;color:#7fd8a8}
+.badge-custom{background:#1e2740;color:#9db4ff}
+.badge-draft{background:#241d3a;color:var(--violet);border:1px dashed var(--violet)}
+.type-row{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:7px;font-size:12.5px;cursor:default}
+.type-row-selected{background:#1b2236;border:1px solid #2c4a7a}
+.type-row:not(.type-row-selected){border:1px solid transparent}
+.panel-title{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim2);margin-bottom:10px;font-weight:700}
+.field-label{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim2);margin:16px 0 6px;font-weight:700}
+.field-box{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:9px 11px;font-size:12.5px;color:var(--text)}
+.field-box-dim{color:var(--dim)}
+.chip{display:inline-flex;align-items:center;gap:5px;background:var(--panel2);border:1px solid var(--border);border-radius:14px;padding:5px 11px 5px 9px;font-size:11px;margin:3px 6px 3px 0}
+.chip-on{border-color:#2f6b4a;background:#132018;color:#7fd8a8}
+.chip-ask{border-color:#6b5a2a;background:#241e10;color:var(--amber)}
+.chip-off{color:var(--dim2)}
+.btn{background:var(--panel2);border:1px solid var(--border);color:var(--text);font-size:12px;padding:8px 16px;border-radius:6px;font-weight:600}
+.btn-primary{background:#1f3a6e;border-color:#30548f;color:#cfe0ff}
+.nav{height:44px;flex-shrink:0;display:flex;align-items:stretch;gap:2px;padding:0 12px 0 16px;background:var(--panel);border-bottom:1px solid var(--border)}
+.nav-brand{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:800;color:var(--text);text-decoration:none;padding-right:14px;margin-right:6px;border-right:1px solid var(--border)}
+.nav-link{display:flex;align-items:center;gap:7px;padding:0 13px;font-size:12.5px;font-weight:600;color:#a3aabb;text-decoration:none;border-bottom:2px solid transparent;border-top:2px solid transparent}
+.nav-link:hover{color:var(--text);background:#161b26}
+.nav-active{color:var(--text);background:#1b2236;border-bottom-color:var(--teal)}
+.nav-count{font-size:10px;font-weight:700;padding:1px 6px;border-radius:9px;background:#241d3a;color:#c9c2ff}
+.nav-key{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:10px;color:#8b92a5}
+.nav-search{align-self:center;display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;min-width:230px;background:var(--panel2);border:1px solid var(--border);border-radius:6px;color:#a3aabb;font-size:12px;font-family:inherit;cursor:default}
+.nav-icon{align-self:center;width:36px;height:36px;display:flex;align-items:center;justify-content:center;background:transparent;border:1px solid transparent;border-radius:6px;color:#a3aabb;cursor:default}
+.nav-icon:hover{background:#161b26;color:var(--text)}
+</style>
+</helmet>
+
+<div class="ninox" style="width:1280px;height:844px;display:flex;flex-direction:column">
+  <nav class="nav" aria-label="Primary">
+  <a class="nav-brand" href="#"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M7 1 13 7 7 13 1 7z" fill="#4fd1c5"/></svg>ninox</a>
+  <a class="nav-link" href="#"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="5.5" y="1.5" width="5" height="4" rx="1"/><rect x="1" y="10.5" width="5" height="4" rx="1"/><rect x="10" y="10.5" width="5" height="4" rx="1"/><path d="M8 5.5v2.5M3.5 10.5V8h9v2.5"/></svg>Fleet<span class="nav-key">1</span></a>
+  <a class="nav-link" href="#"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" stroke-dasharray="2 1.6"><rect x="2" y="2" width="12" height="12" rx="2"/></svg>Plans<span class="nav-count" aria-label="1 pending">1</span><span class="nav-key">2</span></a>
+  <a class="nav-link" href="#"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 3h4.5A1.5 1.5 0 0 1 8 4.5V14a1.5 1.5 0 0 0-1.5-1.5H2zM14 3H9.5A1.5 1.5 0 0 0 8 4.5V14a1.5 1.5 0 0 1 1.5-1.5H14z"/></svg>Brain<span class="nav-key">3</span></a>
+  <a class="nav-link nav-active" href="#" aria-current="page"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 1.5 14.5 5 8 8.5 1.5 5zM1.5 8 8 11.5 14.5 8M1.5 11 8 14.5 14.5 11"/></svg>Worker Types<span class="nav-key">4</span></a>
+  <a class="nav-link" href="#"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2" y="2" width="12" height="5" rx="1"/><rect x="2" y="9" width="12" height="5" rx="1"/><path d="M5 4.5h.01M5 11.5h.01"/></svg>Remotes<span style="width:7px;height:7px;border-radius:50%;background:var(--amber)" aria-label="eu1 reconnecting"></span><span class="nav-key">5</span></a>
+  <div style="flex:1"></div>
+  <button class="nav-search" type="button"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3.5 3.5"/></svg>Search sessions, plans, brain…<span style="flex:1"></span><span class="nav-key">⌘K</span></button>
+  <button class="nav-icon" type="button" aria-label="Settings"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4"/></svg></button>
+  </nav>
+
+  <div style="height:58px;flex-shrink:0;border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 20px;gap:12px">
+    <div style="font-size:15px;font-weight:800">Worker Types</div>
+    <div style="font-size:11.5px;color:var(--dim)">named, reusable configs — brief template, permission profile, default harness. Not a closed set.</div>
+    <div style="flex:1"></div>
+    <div class="btn">Export</div>
+    <div class="btn">Import</div>
+    <div class="btn btn-primary">+ New type</div>
+  </div>
+
+  <div style="flex:1;display:flex;flex-direction:row;min-height:0">
+
+    <!-- LIST -->
+    <div style="width:300px;flex-shrink:0;border-right:1px solid var(--border);background:var(--panel);padding:16px;overflow:hidden">
+      <div class="panel-title">Built-in</div>
+      <div class="type-row"><span class="badge badge-builtin">Implementation</span></div>
+      <div class="type-row"><span class="badge badge-builtin">Researcher</span></div>
+      <div class="type-row"><span class="badge badge-builtin">Evaluator</span></div>
+
+      <div style="height:16px"></div>
+      <div class="panel-title">Custom</div>
+      <div class="type-row type-row-selected"><span class="badge badge-custom">Tester</span>&nbsp;<span style="color:var(--text)">Tester</span></div>
+      <div class="type-row"><span class="badge badge-custom">Custom</span>&nbsp;<span style="color:var(--text)">Security Reviewer</span></div>
+
+      <div style="height:16px"></div>
+      <div class="panel-title">Drafted, not saved</div>
+      <div class="type-row"><span class="badge badge-draft">GHOST</span>&nbsp;<span style="color:#d8d3f5;font-style:italic">Docs Writer</span></div>
+    </div>
+
+    <!-- FORM EDITOR -->
+    <div style="flex:1;padding:20px 28px;overflow:hidden">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span class="badge badge-custom">Custom type</span>
+        <div style="font-size:16px;font-weight:800">Tester</div>
+      </div>
+      <div style="font-size:11px;color:var(--dim2);margin-top:4px">drafted via the ninox prompt — "make a Tester type that only runs tests and reports, no fixing" — reviewed and saved, not auto-created</div>
+
+      <div class="field-label">Name</div>
+      <div class="field-box">Tester</div>
+
+      <div class="field-label">Brief template</div>
+      <div class="field-box field-box-dim" style="min-height:64px">Run the existing test suite for the assigned scope. Report failures with file:line and a one-line cause. Do not modify source files — report only, never fix.</div>
+
+      <div class="field-label">Default harness</div>
+      <div style="display:flex;gap:10px">
+        <div class="field-box" style="flex:1">claude-code</div>
+        <div class="field-label" style="margin:0;align-self:center">model</div>
+        <div class="field-box" style="flex:1">sonnet-5-5</div>
+      </div>
+
+      <div class="field-label">Permission profile (worker-permission-model spec)</div>
+      <div>
+        <span class="chip chip-on">✓ allow: Bash(cargo test *)</span>
+        <span class="chip chip-on">✓ allow: Read</span>
+        <span class="chip chip-ask">? ask: Bash(git push)</span>
+        <span class="chip chip-off">✕ deny: Write</span>
+        <span class="chip chip-off">✕ deny: Edit</span>
+        <span class="chip chip-off">✕ deny: nested-spawn</span>
+      </div>
+
+      <div style="display:flex;gap:10px;margin-top:22px">
+        <div class="btn btn-primary">Save changes</div>
+        <div class="btn">Duplicate</div>
+        <div class="btn" style="color:var(--red);border-color:#5a2c38">Delete</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {};
+  }
+}
+</script>
+</body>
+</html>

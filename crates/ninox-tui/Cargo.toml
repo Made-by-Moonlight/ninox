@@ -1,0 +1,50 @@
+[package]
+name        = "ninox-tui"
+version     = "0.37.0"
+edition     = "2021"
+description = "Ninox terminal app: ratatui TUI for the Ninox orchestrator engine."
+license     = "MIT"
+repository  = "https://github.com/Made-by-Moonlight/ninox"
+
+# cargo-binstall: download the prebuilt tarball attached to the GitHub release
+# instead of compiling. Asset names are produced by scripts/package-release.sh
+# (checked by tests/binstall_metadata.rs in ninox-ui-shared).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/ninox-{ version }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "ninox-{ version }-{ target }/{ bin }{ binary-ext }"
+
+[[bin]]
+name = "ninox-tui"
+path = "src/main.rs"
+
+[[bin]]
+name = "nx"
+path = "src/main.rs"
+
+[dependencies]
+ninox-core      = { path = "../ninox-core", version = "0.37.0" }
+ninox-overview  = { path = "../ninox-overview", version = "0.37.0" }
+ninox-ptyd      = { path = "../ninox-ptyd", version = "0.37.0" }
+ninox-ui-shared = { path = "../ninox-ui-shared", version = "0.37.0" }
+tokio           = { workspace = true }
+anyhow          = { workspace = true }
+tracing         = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+chrono       = "0.4"
+ratatui      = { workspace = true }
+crossterm    = { workspace = true }
+rataflow     = "0.1"
+futures-util = { workspace = true }
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+ninox-core = { path = "../ninox-core", version = "0.37.0", features = ["test-support", "test-isolation"] }
+# test-util: only `tui::live::tests::settle_waits_for_quiet_but_is_bounded`
+# needs this, for a paused/virtual clock — a real-wall-clock timing race is
+# at the mercy of OS scheduling jitter under CPU-throttled CI runners.
+tokio = { workspace = true, features = ["test-util"] }
+ninox-ui-shared = { path = "../ninox-ui-shared", version = "0.37.0", features = ["test-support"] }

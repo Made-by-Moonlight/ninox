@@ -1,0 +1,76 @@
+[package]
+name        = "ninox-gui"
+version     = "0.37.0"
+edition     = "2021"
+description = "Ninox native desktop app: GPU-accelerated Rust/Iced UI for the Ninox orchestrator engine."
+license     = "MIT"
+repository  = "https://github.com/Made-by-Moonlight/ninox"
+
+# cargo-binstall: download the prebuilt tarball attached to the GitHub release
+# instead of compiling. Asset names are produced by scripts/package-release.sh
+# (checked by tests/binstall_metadata.rs in ninox-ui-shared).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/ninox-{ version }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "ninox-{ version }-{ target }/{ bin }{ binary-ext }"
+
+[dependencies]
+ninox-core      = { path = "../ninox-core", version = "0.37.0" }
+ninox-ui-shared = { path = "../ninox-ui-shared", version = "0.37.0" }
+ninox-overview  = { path = "../ninox-overview", version = "0.37.0" }
+tokio           = { workspace = true }
+anyhow          = { workspace = true }
+tracing         = { workspace = true }
+tracing-subscriber = { workspace = true }
+iced = { version = "0.13", features = ["tokio", "canvas", "advanced", "wgpu", "markdown", "lazy"] }
+pulldown-cmark = "0.11"
+chrono = "0.4"
+notify-rust = "4"
+alacritty_terminal = "0.26"
+async-stream = "0.3.6"
+arboard = "3"
+ttf-parser = "0.25"
+futures-util = { workspace = true }
+
+[package.metadata.bundle]
+name = "Ninox"
+identifier = "com.madebymoonlight.ninox"
+icon = ["crates/ninox-gui/assets/Ninox.icns"]
+copyright = "Copyright (c) 2026 Made by Moonlight"
+category = "public.app-category.developer-tools"
+short_description = "GPU-accelerated desktop UI for the Ninox orchestrator engine."
+
+[dev-dependencies]
+tempfile = "3.27.0"
+dirs     = { workspace = true }
+toml     = { workspace = true }
+# Used only to drive `iced::Task<Message>` (returned from `App::update`) to
+# completion synchronously in tests — specifically
+# `resume_message_keeps_status_interrupted_when_tmux_create_fails`, which
+# needs to observe the store mutation the Task's async block performs (its
+# sibling `resume_message_relaunches_and_attaches` deliberately checks only
+# synchronous state and doesn't need this). Already transitive deps of
+# `iced` at the exact versions pinned here (see Cargo.lock), so this adds
+# no new dependency, just a direct edge to what's already resolved.
+iced_runtime = "0.13"
+futures = "0.3"
+# Headless, software-only (no GPU) `iced_core::Renderer` impl, used to drive
+# real `Widget::layout()` calls in layout tests — already resolved as the
+# `tiny-skia` fallback backend behind `iced`'s own default features (see
+# Cargo.lock), so this adds no new dependency, just a direct edge to it.
+iced_tiny_skia = "0.13"
+ninox-ui-shared = { path = "../ninox-ui-shared", version = "0.37.0", features = ["test-support"] }
+ninox-core      = { path = "../ninox-core", version = "0.37.0", features = ["test-support", "test-isolation"] }
+
+# The app icon from the embedded PNG (window icon everywhere; Dock icon on
+# macOS), so an unbundled `ninox-gui` shows the owl, not the generic exec.
+[dependencies.image]
+version = "0.25"
+default-features = false
+features = ["png"]
+
+# Same versions winit already pulls in.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSData", "NSGeometry"] }
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSResponder", "NSImage", "NSWorkspace", "NSAccessibility", "NSView", "NSWindow", "NSButton", "NSControl"] }
