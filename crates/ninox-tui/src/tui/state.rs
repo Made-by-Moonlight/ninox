@@ -40,6 +40,8 @@ pub struct Row {
     pub machine_health: Option<MachineHealth>,
     /// 1-based place in its location's spawn queue while `Queued`.
     pub queue_position: Option<usize>,
+    /// Every PR the session is responsible for, open first; filled by `refresh`.
+    pub prs: Vec<ninox_core::session_prs::SessionPr>,
 }
 
 impl Row {
@@ -58,7 +60,7 @@ impl Row {
             is_orchestrator: false,
             group: None,
             machine_health: None,
-            queue_position: None,
+            queue_position: None, prs: Vec::new(),
         }
     }
 }
@@ -407,6 +409,10 @@ pub struct TuiState {
     pub spawn_form: super::spawn::SpawnForm,
     /// Geometry of the last frame, for mouse hit-testing and paging.
     pub layout: Layout,
+    /// Screen rects of the PR chips drawn last frame, rebuilt every `draw`.
+    pub chip_hits: std::cell::RefCell<Vec<(ratatui::layout::Rect, super::pr_chips::ChipTarget)>>,
+    /// Click targets of chip spans built since the last `pr_chips::register`.
+    pub chip_scratch: std::cell::RefCell<Vec<super::pr_chips::ChipTarget>>,
     /// Wheel-entered scroll mode leaves itself when scrolled back to live.
     pub scroll_by_wheel: bool,
     pub restore_policy: ninox_core::config::RestorePolicy,
@@ -564,6 +570,8 @@ impl Default for TuiState {
             worker_types: Default::default(),
             spawn_form: Default::default(),
             layout: Layout::default(),
+            chip_hits: Default::default(),
+            chip_scratch: Default::default(),
             scroll_by_wheel: false,
             restore_policy: Default::default(),
             restore_offered: None,
@@ -785,10 +793,11 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         ("↵ / c", "open the selected session"),
         ("/ · o · A", "filter · cycle orchestrator scope · resume all interrupted (asks first)"),
     ]),
-    ("Settings (not a tab — press s)", &[
-        ("j k · ↵/space", "move · open or change a field"),
-        ("←/→ · e", "cycle a choice · open config.toml in $EDITOR"),
-        ("esc", "cancel editing a field, or close the modal"),
+    ("Settings (press s, or click ⚙ in the header)", &[
+        ("j k", "move between sections · between fields"),
+        ("→ · ↵ · tab", "from the section bar into its fields · tab goes back"),
+        ("↵/space · ←/→ · e", "change a field · cycle a choice · open config.toml in $EDITOR"),
+        ("esc", "cancel editing, back to the section bar, then close"),
     ]),
     ("Idle workers (not a tab — press 7)", &[
         ("j k · ↵", "move · open the worker"),
@@ -2061,10 +2070,7 @@ fn command(st: &mut TuiState, key: KeyEvent) -> Action {
             st.view = View::Brain;
             return Action::LoadBrain(st.brain.query.clone());
         }
-        KeyCode::Char('s') => {
-            st.modal = Some(Modal::Settings);
-            return Action::LoadSettings;
-        }
+        KeyCode::Char('s') => return open_settings(st),
         KeyCode::Char('w') => {
             st.view = View::WorkerTypes;
             return Action::LoadWorkerTypes;
@@ -3017,9 +3023,7 @@ fn step_setting(st: &mut TuiState, back: bool) -> Action {
 }
 
 fn move_setting(st: &mut TuiState, delta: i64) {
-    let last = st.settings.fields.len().saturating_sub(1) as i64;
-    st.settings.selected = (st.settings.selected as i64 + delta).clamp(0, last) as usize;
-    st.settings.error = None;
+    st.settings.move_field(delta);
 }
 
 fn settings_key(st: &mut TuiState, key: KeyEvent) -> Action {
@@ -3044,10 +3048,25 @@ fn settings_key(st: &mut TuiState, key: KeyEvent) -> Action {
         }
         return Action::None;
     }
+    if !st.settings.in_fields {
+        match key.code {
+            // Closing is decided by `handle_modal_key`; the page is a modal
+            // overlay, so `st.view` stays whatever was showing underneath.
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => {}
+            KeyCode::Char('j') | KeyCode::Down => st.settings.move_section(1),
+            KeyCode::Char('k') | KeyCode::Up => st.settings.move_section(-1),
+            KeyCode::Char('g') | KeyCode::Home | KeyCode::PageUp => st.settings.move_section(i64::MIN / 2),
+            KeyCode::Char('G') | KeyCode::End | KeyCode::PageDown => st.settings.move_section(i64::MAX / 2),
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => enter_setting_fields(st),
+            KeyCode::Char('e') => return Action::EditConfig,
+            KeyCode::Char('?') => st.modal = Some(Modal::Help),
+            _ => {}
+        }
+        return Action::None;
+    }
     match key.code {
-        // Settings is a modal overlay, not a view transition — closing it
-        // leaves `st.view` as whatever was showing underneath.
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => {}
+        KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab => st.settings.in_fields = false,
+        KeyCode::Char('q') | KeyCode::Char('s') => {}
         KeyCode::Char('j') | KeyCode::Down => move_setting(st, 1),
         KeyCode::Char('k') | KeyCode::Up => move_setting(st, -1),
         KeyCode::PageDown => move_setting(st, 10),
@@ -3056,12 +3075,26 @@ fn settings_key(st: &mut TuiState, key: KeyEvent) -> Action {
         KeyCode::Char('G') | KeyCode::End => move_setting(st, i64::MAX / 2),
         KeyCode::Enter | KeyCode::Char(' ') => return activate_setting(st),
         KeyCode::Char('l') | KeyCode::Right => return step_setting(st, false),
+        // A field with nothing to cycle has no use for ←: it goes back to the bar.
+        KeyCode::Char('h') | KeyCode::Left if st.settings.selected_field().is_some_and(|f| f.options.is_empty()) => st.settings.in_fields = false,
         KeyCode::Char('h') | KeyCode::Left => return step_setting(st, true),
         KeyCode::Char('e') => return Action::EditConfig,
         KeyCode::Char('?') => st.modal = Some(Modal::Help),
         _ => {}
     }
     Action::None
+}
+
+pub fn open_settings(st: &mut TuiState) -> Action {
+    st.settings.in_fields = false;
+    st.settings.editing = None;
+    st.settings.error = None;
+    st.modal = Some(Modal::Settings);
+    Action::LoadSettings
+}
+
+fn enter_setting_fields(st: &mut TuiState) {
+    st.settings.in_fields = !st.settings.section_fields().is_empty();
 }
 
 fn confirmed(pending: Pending) -> Action {
@@ -3102,12 +3135,14 @@ fn handle_modal_key(st: &mut TuiState, key: KeyEvent) -> Action {
             Action::None
         }
         Modal::Settings => {
-            // `settings_key`'s own close arm (Esc/q/s, not mid-edit) doesn't
-            // tell us whether to keep the modal open, so that's decided up
-            // front.
-            let closing = st.settings.editing.is_none() && matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s'));
+            // Esc closes only from the section bar (from the fields it goes
+            // back to the bar), and not mid-edit; `settings_key` doesn't
+            // say whether to keep the modal open, so that's decided up front.
+            let closing = st.settings.editing.is_none()
+                && (matches!(key.code, KeyCode::Char('q') | KeyCode::Char('s')) || (key.code == KeyCode::Esc && !st.settings.in_fields));
             let action = settings_key(st, key);
-            if !closing {
+            // Keep the page unless the key closed it or opened Help / a confirm over it.
+            if !closing && st.modal.is_none() {
                 st.modal = Some(Modal::Settings);
             }
             action
@@ -3406,14 +3441,31 @@ fn contains(r: Rect, x: u16, y: u16) -> bool {
 /// pane's `◀ fleet` button always belong to ninox, whatever the agent asked
 /// for; only events inside the pane's inner area can reach the agent, in
 /// pane-local coordinates.
+/// A click on a PR chip never reaches the row under it: a PR chip opens
+/// the PR, `+N` selects the session and opens it with its inspector.
+fn chip_click(st: &mut TuiState, target: super::pr_chips::ChipTarget) -> Action {
+    use super::pr_chips::ChipTarget;
+    match target {
+        ChipTarget::Open(url) => Action::OpenUrl(url),
+        ChipTarget::More(id) => {
+            let Some(row) = st.rows.iter().position(|r| r.id() == id) else { return Action::None };
+            st.select(row);
+            st.fleet.nav.select(id);
+            st.inspector = true;
+            st.open_selected()
+        }
+    }
+}
+
 pub fn handle_mouse(st: &mut TuiState, ev: MouseEvent) -> Action {
     let (x, y) = (ev.column, ev.row);
     if st.modal.is_some() {
         let left = matches!(ev.kind, MouseEventKind::Down(MouseButton::Left));
-        // Settings has no mouse support for its fields this PR — rather
-        // than leave it with no mouse affordance at all, any click closes
-        // it, the same as Help.
-        if matches!(ev.kind, MouseEventKind::Down(_)) && matches!(st.modal, Some(Modal::Help) | Some(Modal::Settings)) {
+        if matches!(st.modal, Some(Modal::Settings)) {
+            return settings_mouse(st, &ev);
+        }
+        // Help has no controls: any click closes it.
+        if matches!(ev.kind, MouseEventKind::Down(_)) && matches!(st.modal, Some(Modal::Help)) {
             st.modal = None;
             st.help_scroll = 0;
         }
@@ -3445,12 +3497,20 @@ pub fn handle_mouse(st: &mut TuiState, ev: MouseEvent) -> Action {
         return action;
     }
     let left_down = matches!(ev.kind, MouseEventKind::Down(MouseButton::Left));
+    if left_down {
+        if let Some(target) = super::pr_chips::hit(st, x, y) {
+            return chip_click(st, target);
+        }
+    }
     let double = left_down && register_click(st, x, y);
     if left_down {
         st.selection = None;
     }
     if contains(lay.header, x, y) {
         if left_down {
+            if lay.settings_button.is_some_and(|b| contains(b, x, y)) {
+                return open_settings(st);
+            }
             if let Some(t) = lay.tabs.iter().find(|t| contains(t.rect, x, y)) {
                 return st.switch_view(t.view);
             }
@@ -3842,6 +3902,68 @@ fn worker_types_key(st: &mut TuiState, key: KeyEvent) -> Action {
         KeyCode::Char('i') => return Action::ImportWorkerType,
         KeyCode::Char('?') => st.modal = Some(Modal::Help),
         _ => {}
+    }
+    Action::None
+}
+
+/// The settings page: a click on a section selects it, a click on a field
+/// selects it and a click on its value (or a second click on it) changes it,
+/// as Enter does; the wheel moves within the pane it is over.
+fn settings_mouse(st: &mut TuiState, ev: &MouseEvent) -> Action {
+    let (x, y) = (ev.column, ev.row);
+    let sl = super::layout::settings(super::layout::settings_area(st.layout.header.union(st.layout.footer)), st);
+    let wheel = match ev.kind {
+        MouseEventKind::ScrollUp => Some(-1i64),
+        MouseEventKind::ScrollDown => Some(1),
+        _ => None,
+    };
+    if let Some(d) = wheel {
+        if st.settings.editing.is_none() {
+            if contains(sl.bar, x, y) {
+                st.settings.move_section(d);
+            } else if contains(sl.list, x, y) {
+                st.settings.move_field(d);
+            }
+        }
+        return Action::None;
+    }
+    if !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return Action::None;
+    }
+    if contains(sl.close, x, y) {
+        st.modal = None;
+        return Action::None;
+    }
+    if contains(sl.open, x, y) {
+        st.settings.editing = None;
+        st.settings.error = None;
+        return Action::EditConfig;
+    }
+    if contains(sl.bar, x, y) {
+        if let Some(super::layout::SettingsBarLine::Section(s)) = sl.bar_lines.get(sl.bar_offset + (y - sl.bar.y) as usize) {
+            st.settings.select_section(*s);
+            st.settings.in_fields = false;
+        }
+        return Action::None;
+    }
+    if !contains(sl.list, x, y) {
+        return Action::None;
+    }
+    let Some(super::layout::SettingsLine::Field(i)) = sl.lines.get(sl.offset + (y - sl.list.y) as usize).copied() else {
+        return Action::None;
+    };
+    let again = i == st.settings.selected && st.settings.in_fields;
+    if st.settings.editing.is_some() {
+        if again {
+            return Action::None;
+        }
+        st.settings.editing = None;
+    }
+    st.settings.in_fields = true;
+    st.settings.selected = i;
+    st.settings.error = None;
+    if again || x >= sl.value_x {
+        return activate_setting(st);
     }
     Action::None
 }
@@ -4960,16 +5082,169 @@ mod tests {
         assert_eq!(st.modal, None);
     }
 
-    #[test]
-    fn clicking_anywhere_closes_the_settings_modal() {
-        // Settings has no mouse support for its fields this PR (Task 9
-        // ruling), but leaving it with no mouse affordance at all means a
-        // mouse user can't even dismiss it — give it the same click-anywhere
-        // closes behavior Help already has, rather than a dead end.
+    fn settings_page() -> TuiState {
+        let _iso = ninox_core::test_isolation::isolate();
         let mut st = state_with_rows(1);
+        st.settings.reload(Ok(Default::default()));
+        open_settings(&mut st);
+        st.layout = crate::tui::layout::compute(Rect::new(0, 0, 80, 24), &st);
+        st
+    }
+
+    fn settings_hit(st: &TuiState, pred: impl Fn(&crate::tui::layout::SettingsBarLine) -> bool) -> (u16, u16) {
+        let sl = crate::tui::layout::settings(crate::tui::layout::settings_area(Rect::new(0, 0, 80, 24)), st);
+        let k = sl.bar_lines.iter().position(pred).expect("bar row");
+        (sl.bar.x + 3, sl.bar.y + (k - sl.bar_offset) as u16)
+    }
+
+    #[test]
+    fn settings_arrows_move_the_section_bar_until_a_field_pane_is_entered() {
+        use ninox_ui_shared::settings_form::SettingsSection as S;
+        let mut st = settings_page();
+        assert_eq!((st.settings.section, st.settings.in_fields), (S::Appearance, false));
+        handle_key(&mut st, code(KeyCode::Down));
+        assert_eq!(st.settings.section, S::Agents);
+        assert_eq!(st.settings.selected_field().map(|f| f.id.clone()), Some(ninox_ui_shared::settings_form::FieldId::OrchHarness), "a section's first field is selected");
+        for _ in 0..20 {
+            handle_key(&mut st, code(KeyCode::Down));
+        }
+        assert_eq!(st.settings.section, S::Version, "the bar stops at its last section");
+        handle_key(&mut st, code(KeyCode::Home));
+        assert_eq!(st.settings.section, S::Appearance);
+    }
+
+    #[test]
+    fn settings_tab_and_enter_move_between_the_bar_and_the_fields_and_esc_steps_back() {
+        use ninox_ui_shared::settings_form::SettingsSection as S;
+        let mut st = settings_page();
+        handle_key(&mut st, code(KeyCode::Down));
+        handle_key(&mut st, code(KeyCode::Tab));
+        assert!(st.settings.in_fields);
+        handle_key(&mut st, code(KeyCode::Down));
+        assert_eq!(st.settings.selected_field().map(|f| f.label.as_str()), Some("Orchestrator model"));
+        handle_key(&mut st, code(KeyCode::Down));
+        assert_eq!(st.settings.section, S::Agents, "↓ in the fields never changes section");
+        handle_key(&mut st, code(KeyCode::Esc));
+        assert!(!st.settings.in_fields);
+        assert_eq!(st.modal, Some(Modal::Settings), "esc from the fields only goes back to the bar");
+        handle_key(&mut st, code(KeyCode::Right));
+        assert!(st.settings.in_fields, "→ enters the fields");
+        handle_key(&mut st, code(KeyCode::BackTab));
+        assert!(!st.settings.in_fields);
+        handle_key(&mut st, code(KeyCode::Esc));
+        assert_eq!(st.modal, None, "esc from the bar closes");
+    }
+
+    #[test]
+    fn settings_left_on_a_field_with_nothing_to_cycle_returns_to_the_bar() {
+        use ninox_ui_shared::settings_form::SettingsSection as S;
+        let mut st = settings_page();
+        st.settings.select_section(S::Engine);
+        handle_key(&mut st, code(KeyCode::Tab));
+        assert_eq!(st.settings.selected_field().map(|f| f.label.as_str()), Some("Port"));
+        handle_key(&mut st, code(KeyCode::Left));
+        assert!(!st.settings.in_fields);
+    }
+
+    #[test]
+    fn settings_esc_mid_edit_cancels_the_edit_not_the_page() {
+        use ninox_ui_shared::settings_form::SettingsSection as S;
+        let mut st = settings_page();
+        st.settings.select_section(S::Engine);
+        handle_key(&mut st, code(KeyCode::Tab));
+        handle_key(&mut st, code(KeyCode::Enter));
+        assert!(st.settings.editing.is_some());
+        handle_key(&mut st, code(KeyCode::Esc));
+        assert!(st.settings.editing.is_none());
+        assert!(st.settings.in_fields && st.modal == Some(Modal::Settings));
+    }
+
+    #[test]
+    fn settings_question_mark_and_restart_server_open_their_modals() {
+        use ninox_ui_shared::settings_form::SettingsSection as S;
+        let mut st = settings_page();
+        handle_key(&mut st, key('?'));
+        assert_eq!(st.modal, Some(Modal::Help));
         st.modal = Some(Modal::Settings);
-        assert_eq!(handle_mouse(&mut st, down(5, 5)), Action::None);
+        st.settings.select_section(S::Engine);
+        handle_key(&mut st, code(KeyCode::Tab));
+        handle_key(&mut st, code(KeyCode::Down));
+        handle_key(&mut st, code(KeyCode::Enter));
+        assert!(matches!(st.modal, Some(Modal::Confirm(Pending::RestartServer))), "{:?}", st.modal);
+    }
+
+    #[test]
+    fn opening_the_editor_by_mouse_mid_edit_drops_the_draft() {
+        use ninox_ui_shared::settings_form::SettingsSection as S;
+        let mut st = settings_page();
+        st.settings.select_section(S::Engine);
+        handle_key(&mut st, code(KeyCode::Tab));
+        handle_key(&mut st, code(KeyCode::Enter));
+        let sl = crate::tui::layout::settings(crate::tui::layout::settings_area(Rect::new(0, 0, 80, 24)), &st);
+        assert_eq!(handle_mouse(&mut st, down(sl.open.x + 1, sl.open.y)), Action::EditConfig);
+        assert!(st.settings.editing.is_none());
+    }
+
+    #[test]
+    fn closing_by_mouse_mid_edit_drops_the_edit() {
+        use ninox_ui_shared::settings_form::SettingsSection as S;
+        let mut st = settings_page();
+        st.settings.select_section(S::Engine);
+        handle_key(&mut st, code(KeyCode::Tab));
+        handle_key(&mut st, code(KeyCode::Enter));
+        let sl = crate::tui::layout::settings(crate::tui::layout::settings_area(Rect::new(0, 0, 80, 24)), &st);
+        handle_mouse(&mut st, down(sl.close.x + 1, sl.close.y));
+        open_settings(&mut st);
+        assert!(st.settings.editing.is_none());
+    }
+
+    #[test]
+    fn settings_reopens_on_the_bar() {
+        let mut st = settings_page();
+        handle_key(&mut st, code(KeyCode::Tab));
+        handle_key(&mut st, key('q'));
         assert_eq!(st.modal, None);
+        open_settings(&mut st);
+        assert!(!st.settings.in_fields);
+    }
+
+    #[test]
+    fn clicking_a_section_selects_it_and_a_field_value_changes_it() {
+        use ninox_ui_shared::settings_form::SettingsSection as S;
+        let mut st = settings_page();
+        let (x, y) = settings_hit(&st, |l| *l == crate::tui::layout::SettingsBarLine::Section(S::Runtime));
+        assert_eq!(handle_mouse(&mut st, down(x, y)), Action::None);
+        assert_eq!(st.settings.section, S::Runtime);
+        let sl = crate::tui::layout::settings(crate::tui::layout::settings_area(Rect::new(0, 0, 80, 24)), &st);
+        let row = sl.lines.iter().position(|l| matches!(l, crate::tui::layout::SettingsLine::Field(_))).unwrap() as u16;
+        let label = handle_mouse(&mut st, down(sl.list.x + 3, sl.list.y + row));
+        assert_eq!((label, st.settings.in_fields), (Action::None, true), "a click on the label only selects");
+        let action = handle_mouse(&mut st, down(sl.value_x, sl.list.y + row));
+        assert!(matches!(action, Action::SaveSetting(Change::Step { back: false, .. })), "{action:?}");
+    }
+
+    #[test]
+    fn clicking_close_or_the_header_entry_closes_and_opens_the_page() {
+        let mut st = settings_page();
+        let sl = crate::tui::layout::settings(crate::tui::layout::settings_area(Rect::new(0, 0, 80, 24)), &st);
+        handle_mouse(&mut st, down(sl.close.x + 1, sl.close.y));
+        assert_eq!(st.modal, None);
+        let b = st.layout.settings_button.expect("the header has a settings entry at 80 columns");
+        assert_eq!(handle_mouse(&mut st, down(b.x + 1, b.y)), Action::LoadSettings);
+        assert_eq!(st.modal, Some(Modal::Settings));
+    }
+
+    #[test]
+    fn settings_wheel_scrolls_the_bar_and_the_fields_separately() {
+        use ninox_ui_shared::settings_form::SettingsSection as S;
+        let mut st = settings_page();
+        let sl = crate::tui::layout::settings(crate::tui::layout::settings_area(Rect::new(0, 0, 80, 24)), &st);
+        let wheel = |x, y| MouseEvent { kind: MouseEventKind::ScrollDown, column: x, row: y, modifiers: KeyModifiers::NONE };
+        handle_mouse(&mut st, wheel(sl.bar.x + 2, sl.bar.y + 1));
+        assert_eq!(st.settings.section, S::Agents);
+        let before = st.settings.selected;
+        handle_mouse(&mut st, wheel(sl.list.x + 2, sl.list.y));
+        assert!(st.settings.selected > before);
     }
 
     #[test]
@@ -6253,7 +6528,7 @@ mod tests {
             session: ninox_ui_shared::cli::test_fixtures::session(id, None, S::Working),
             is_orchestrator: false,
             group: None,
-            machine_health: None, queue_position: None,
+            machine_health: None, queue_position: None, prs: Vec::new(),
         };
         let mut st = TuiState::default();
         st.apply_rows(vec![working("s0"), working("s1"), working("s2")]);

@@ -228,6 +228,7 @@ process.exit(0);
     });
     crate::identity::set_session_start_hook(config, &ninox_bin_quoted, &mut hooks);
     let settings = serde_json::json!({
+        crate::harness::CROSS_SESSION_KEY: crate::harness::CROSS_SESSION_ACCEPT,
         "hooks": hooks,
         "statusLine": {
             "type": "command",
@@ -539,6 +540,7 @@ mod tests {
             &std::fs::read_to_string(root.join(".claude").join("settings.local.json")).unwrap(),
         ).unwrap();
         assert!(!root.join(".claude").join("settings.json").exists(), "ninox must not seed the shared settings.json");
+        assert_eq!(settings["crossSessionInbound"], "accept");
         assert_eq!(settings["statusLine"]["type"], "command");
         assert_eq!(settings["statusLine"]["command"], "'/path/to/ninox' statusline");
         assert_eq!(settings["statusLine"]["refreshInterval"], 20);

@@ -46,6 +46,92 @@ pub enum FieldId {
     OpenFile,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsSection {
+    #[default]
+    Appearance,
+    Agents,
+    Harnesses,
+    Messaging,
+    Runtime,
+    SessionLimits,
+    Terminal,
+    Fleet,
+    Engine,
+    Version,
+}
+
+impl SettingsSection {
+    /// The section list, grouped; shared so the desktop and terminal apps
+    /// show the same sections in the same order.
+    pub const GROUPS: [(&'static str, &'static [SettingsSection]); 3] = [
+        ("General", &[Self::Appearance, Self::Agents, Self::Harnesses, Self::Messaging]),
+        ("Sessions", &[Self::Runtime, Self::SessionLimits, Self::Terminal, Self::Fleet]),
+        ("System", &[Self::Engine, Self::Version]),
+    ];
+
+    /// Every section in bar order.
+    pub fn all() -> Vec<SettingsSection> {
+        Self::GROUPS.iter().flat_map(|(_, ss)| ss.iter().copied()).collect()
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::Agents => "Agents",
+            Self::Harnesses => "Harnesses",
+            Self::Messaging => "Messaging",
+            Self::Runtime => "Session runtime",
+            Self::SessionLimits => "Session limits",
+            Self::Terminal => "Terminal",
+            Self::Fleet => "Fleet",
+            Self::Engine => "Engine",
+            Self::Version => "Version",
+        }
+    }
+
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Self::Appearance => "How the desktop app looks.",
+            Self::Agents => "What new orchestrators and workers run, and where workspaces open.",
+            Self::Harnesses => "The agent CLIs ninox can launch. Off hides one from every picker.",
+            Self::Messaging => "How orchestrators and workers reach each other, and how PRs are watched.",
+            Self::Runtime => "Which process hosts new sessions.",
+            Self::SessionLimits => "How many agent sessions may run at once on each machine.",
+            Self::Terminal => "The terminal UI (nx) and agent panes.",
+            Self::Fleet => "Restoring, reaping and keeping sessions.",
+            Self::Engine => "The background server every ninox app talks to.",
+            Self::Version => "This build, and updates.",
+        }
+    }
+}
+
+impl FieldId {
+    /// The settings section this field is shown under. `None` for the
+    /// config-file button, which is not a setting.
+    pub fn section(&self) -> Option<SettingsSection> {
+        use SettingsSection as S;
+        Some(match self {
+            Self::Theme | Self::Colors => S::Appearance,
+            Self::OrchHarness | Self::OrchModel | Self::WorkerHarness | Self::WorkerModel | Self::Editor => S::Agents,
+            Self::Harness(_) => S::Harnesses,
+            Self::SendMechanism | Self::PrWatch => S::Messaging,
+            Self::RuntimeBackend => S::Runtime,
+            Self::SessionLimit(_) | Self::SessionLimitUnlimited(_) => S::SessionLimits,
+            Self::Prefix => S::Terminal,
+            Self::RestorePolicy
+            | Self::WorkerCompletion
+            | Self::RetentionDays
+            | Self::GithubPollInterval
+            | Self::GithubDetailRefresh
+            | Self::BrainHarvest => S::Fleet,
+            Self::Port | Self::RestartServer | Self::RestartAffected => S::Engine,
+            Self::UpdateChannel => S::Version,
+            Self::OpenFile => return None,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Toggle,
@@ -595,6 +681,33 @@ mod tests {
                 seen.push(s);
             }
         }
+    }
+
+    #[test]
+    fn every_field_but_the_file_button_has_a_section_and_every_section_a_field() {
+        let fs = fields(&AppConfig::default());
+        for f in &fs {
+            assert_eq!(f.id.section().is_none(), f.id == FieldId::OpenFile, "{:?}", f.id);
+        }
+        for (_, sections) in SettingsSection::GROUPS {
+            for s in sections {
+                assert!(fs.iter().any(|f| f.id.section() == Some(*s)), "{s:?} has no field");
+            }
+        }
+    }
+
+    #[test]
+    fn section_groups_and_titles_match_the_desktop_settings_page() {
+        let shape: Vec<(&str, Vec<&str>)> =
+            SettingsSection::GROUPS.iter().map(|(g, ss)| (*g, ss.iter().map(|s| s.title()).collect())).collect();
+        assert_eq!(
+            shape,
+            [
+                ("General", vec!["Appearance", "Agents", "Harnesses", "Messaging"]),
+                ("Sessions", vec!["Session runtime", "Session limits", "Terminal", "Fleet"]),
+                ("System", vec!["Engine", "Version"]),
+            ]
+        );
     }
 
     #[test]

@@ -73,15 +73,19 @@ impl From<ninox_ui_shared::theme::ColorScheme> for ColorScheme {
 }
 
 impl ColorScheme {
-    pub fn iced_theme(&self) -> iced::Theme {
+    /// Independent of the scheme: v1 chrome is dark-only, so widgets that
+    /// inherit the base palette (markdown text, inputs, scrollables) must
+    /// agree with `tokens` even when `theme = "light"`.
+    pub fn iced_theme() -> iced::Theme {
+        use crate::components::shell::tokens;
         iced::Theme::custom(
             "Ninox".into(),
             iced::theme::Palette {
-                background: self.paper,
-                text:       self.ink,
-                primary:    self.accent,
-                success:    self.status_working,
-                danger:     self.status_ci_failed,
+                background: tokens::BG,
+                text:       tokens::TEXT,
+                primary:    tokens::BLUE,
+                success:    tokens::GREEN,
+                danger:     tokens::RED,
             },
         )
     }
@@ -159,4 +163,18 @@ pub fn dark() -> ColorScheme {
 #[allow(dead_code)]
 pub fn from_variant(v: ThemeVariant) -> ColorScheme {
     Themes::builtin().scheme(v)
+}
+
+#[cfg(test)]
+mod iced_theme_tests {
+    use super::*;
+    use crate::components::shell::tokens;
+
+    #[test]
+    fn base_palette_follows_tokens_not_the_light_scheme() {
+        let p = ColorScheme::iced_theme().palette();
+        assert_eq!(p.text, tokens::TEXT);
+        assert_eq!(p.background, tokens::BG);
+        assert_ne!(p.text, light().ink);
+    }
 }

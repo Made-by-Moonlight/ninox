@@ -78,14 +78,43 @@ fn propose_stores_a_pending_plan_that_lists_and_shows() {
 fn validation_rejects_bad_proposals() {
     let registry = AppConfig::default().worker_type_registry();
     let mut p = three_orchestrators();
-    p.sections[1].worker_type = Some("Implementor".into());
     p.sections[2].worker_type = Some("NoSuchType".into());
     p.sections.push(section("w", Some("alpha"), "Implementor", &["w"]));
     p.sections.push(ProposalSection { name: Some("Alpha".into()), ..section("dup", Some("alpha"), "Researcher", &[]) });
     p.sections.push(ProposalSection { workspace: None, ..section("nows", Some("alpha"), "Researcher", &[]) });
     let errors = validate_proposal(&p, &registry, 3, 0);
     let c = codes(&errors);
-    for want in ["top_level_not_orchestrator", "unknown_worker_type", "dependency_cycle", "duplicate_name", "missing_workspace"] {
+    for want in ["unknown_worker_type", "dependency_cycle", "duplicate_name", "missing_workspace"] {
+        assert!(c.contains(&want), "expected {want} in {c:?}");
+    }
+}
+
+#[test]
+fn a_top_level_worker_is_a_valid_standalone_section() {
+    let registry = AppConfig::default().worker_type_registry();
+    let p = Proposal { parent_id: None, title: None, sections: vec![section("fix", None, "Implementor", &[])] };
+    assert!(validate_proposal(&p, &registry, 3, 0).is_empty());
+
+    let mixed = Proposal {
+        parent_id: None,
+        title: None,
+        sections: vec![section("lead", None, "Orchestrator", &[]), section("fix", None, "Implementor", &[])],
+    };
+    assert!(validate_proposal(&mixed, &registry, 3, 0).is_empty());
+}
+
+#[test]
+fn a_standalone_section_keeps_the_other_rules() {
+    let registry = AppConfig::default().worker_type_registry();
+    let mut no_ws = section("fix", None, "Implementor", &[]);
+    no_ws.workspace = None;
+    let mut unknown = section("odd", None, "NoSuchType", &[]);
+    unknown.name = Some("odd".into());
+    let reserved = ProposalSection { name: Some("ninox-prompt".into()), ..section("res", None, "Implementor", &[]) };
+    let nested = section("child", Some("fix"), "Researcher", &[]);
+    let p = Proposal { parent_id: None, title: None, sections: vec![no_ws, unknown, reserved, nested] };
+    let c = codes(&validate_proposal(&p, &registry, 3, 0));
+    for want in ["missing_workspace", "unknown_worker_type", "invalid_name", "nested_spawn_not_allowed"] {
         assert!(c.contains(&want), "expected {want} in {c:?}");
     }
 }

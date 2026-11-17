@@ -897,7 +897,7 @@ mod tests {
 
         let resumed = relaunch_cmd(&config, &spec, &session, true);
         assert!(resumed.resumed);
-        assert_eq!(resumed.base_cmd, "claude --resume 'conv-1' --model 'm'");
+        assert_eq!(resumed.base_cmd, "claude --resume 'conv-1' --model 'm' --settings '{\"crossSessionInbound\":\"accept\"}'");
         assert_eq!(resumed.permission_mode, ninox_core::harness::PermissionMode::Standard);
 
         let fresh = relaunch_cmd(&config, &spec, &session, false);

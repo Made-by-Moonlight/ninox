@@ -749,6 +749,7 @@ fn ensure_statusline_settings(
     // that ultimately runs this command and never resolve to the binary.
     let ninox_bin_quoted = format!("'{}'", ninox_bin.replace('\'', "'\\''"));
     let mut settings = serde_json::json!({
+        ninox_core::harness::CROSS_SESSION_KEY: ninox_core::harness::CROSS_SESSION_ACCEPT,
         "statusLine": {
             "type": "command",
             "command": format!("{ninox_bin_quoted} statusline"),
@@ -1260,6 +1261,7 @@ mod tests {
             &std::fs::read_to_string(&settings_path).unwrap(),
         ).unwrap();
         assert_eq!(settings["statusLine"]["type"], "command");
+        assert_eq!(settings["crossSessionInbound"], "accept");
         let command = settings["statusLine"]["command"].as_str().unwrap();
         // The binary path is single-quoted (it may contain spaces, e.g. the
         // default macOS config dir `~/Library/Application Support/...`), so

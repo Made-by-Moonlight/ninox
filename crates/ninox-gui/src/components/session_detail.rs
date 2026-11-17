@@ -1308,11 +1308,16 @@ fn side_section<'a>(label: &'static str, body: Element<'a, Message>) -> Vec<Elem
 }
 
 fn side_panel<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
-    let mut items: Vec<Element<Message>> =
-        vec![field_label("Pull request"), Space::new(0, 6).into()];
+    let list = app.session_prs.get(&session.id).map(Vec::as_slice).filter(|l| !l.is_empty());
+    let mut items: Vec<Element<Message>> = vec![
+        text(crate::components::pr_list::heading(list.map_or(1, <[_]>::len)))
+            .size(9.5).font(SANS).color(tokens::DIM2).into(),
+        Space::new(0, 6).into(),
+    ];
 
-    match session.pr_id.and_then(|id| app.prs.get(&id)) {
-        Some(pr) => {
+    match (list, session.pr_id.and_then(|id| app.prs.get(&id))) {
+        (Some(list), _) => items.extend(crate::components::pr_list::rows(list, tokens::BLUE, 12.5, 11.5)),
+        (None, Some(pr)) => {
             items.push(
                 rich_text![span(format!("#{} {}", pr.number, pr.title))
                     .color(tokens::BLUE)
@@ -1332,7 +1337,7 @@ fn side_panel<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
                 );
             }
         }
-        None => {
+        (None, None) => {
             let mut parts = vec![span("No PR yet").color(tokens::DIM)];
             if let Some(branch) = branch_from_workspace(session) {
                 parts.push(span(" · branch ").color(tokens::DIM));

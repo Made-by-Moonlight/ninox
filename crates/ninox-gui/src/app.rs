@@ -295,6 +295,9 @@ pub struct App {
     pub active_catalogue: Option<usize>,
     pub prs:             HashMap<PrId, PR>,
     pub ci_status:       HashMap<PrId, CIStatus>,
+    /// Every PR each session is responsible for (tracked, watched, extra),
+    /// open first; refreshed on the store poll.
+    pub session_prs:     HashMap<SessionId, Vec<ninox_core::session_prs::SessionPr>>,
     /// Latest GitHub rate-limit reading the poller stored, for the budget readout.
     pub github_budget:   Option<ninox_core::github_budget::GithubBudget>,
     store_poll_tick:     u32,
@@ -515,6 +518,8 @@ pub struct App {
     /// The reply drawer (`PromptReply.dc.html`): the prompt conversation,
     /// expanded or collapsed to one line above the prompt bar.
     pub ninox_reply_drawer: crate::prompt_agent::ReplyDrawer,
+    /// Drawer answers in "Select" mode, keyed by `Turn::asked_at_ms`.
+    pub ninox_turn_select: HashMap<i64, iced::widget::text_editor::Content>,
     /// Frame counter for the drawer's "is thinking" animation; advances
     /// only while [`App::wants_thinking_tick`].
     pub thinking_tick: u64,
@@ -728,6 +733,8 @@ pub enum Message {
     NinoxPromptCleared { generation: u64, target_label: String, result: Result<(), String> },
     /// The drawer's "Collapse" button or Esc.
     NinoxDrawerCollapse,
+    NinoxTurnSelectToggle(i64),
+    NinoxTurnSelectAction(i64, iced::widget::text_editor::Action),
     /// The collapsed one-line indicator was clicked.
     NinoxDrawerReopen,
     /// Esc that a focused `text_input` captured (it unfocuses itself, and
@@ -1191,6 +1198,36 @@ fn adopts_terminal_status(known: &SessionStatus, from_store: &SessionStatus) -> 
     from_store.is_terminal() && from_store != known
 }
 
+/// Mirrors the store's sessions into `known`, touching only what differs:
+/// untouched sessions are neither cloned nor written. Returns how many
+/// sessions were inserted or changed.
+fn sync_db_sessions(known: &mut HashMap<SessionId, Session>, db_sessions: Vec<Session>) -> usize {
+    let mut changed = 0;
+    for session in db_sessions {
+        let replace = match known.get_mut(&session.id) {
+            None => true,
+            Some(k) if adopts_terminal_status(&k.status, &session.status) => true,
+            // Entering or leaving the spawn queue happens in another process
+            // (the poller's launcher) and emits no event here.
+            Some(k) if k.status != session.status
+                && (k.status == SessionStatus::Queued || session.status == SessionStatus::Queued) => true,
+            // PR link/status written by a daemon's GitHub sweep: its Engine
+            // events never reach this process.
+            Some(k) => {
+                if adopts_pr_progress(k, &session) {
+                    changed += 1;
+                }
+                false
+            }
+        };
+        if replace {
+            known.insert(session.id.clone(), session);
+            changed += 1;
+        }
+    }
+    changed
+}
+
 /// Copies what a GitHub sweep in *another process* (the daemon) wrote to a
 /// session's row into the app's copy: the PR link, and the PR-lifecycle
 /// status. Only moves among the five PR-lifecycle statuses are adopted, so
@@ -1468,6 +1505,7 @@ impl App {
             .into_iter()
             .map(|s| (s.id.clone(), s))
             .collect();
+        let session_prs = ninox_core::session_prs::for_sessions(&engine.store, sessions.values());
 
         // Comments already fetched by a previous run — grouped by PR so a
         // restart doesn't blank out the Marginalia feed until the next poll.
@@ -1560,6 +1598,7 @@ impl App {
             active_catalogue,
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
+            session_prs,
             github_budget:  None,
             store_poll_tick: 0,
             review_threads,
@@ -1651,6 +1690,7 @@ impl App {
             idle: crate::components::idle_view::IdleState::default(),
             ninox_prompt_target: crate::prompt_agent::PromptTarget::default(),
             ninox_reply_drawer: crate::prompt_agent::ReplyDrawer::default(),
+            ninox_turn_select: HashMap::new(),
             thinking_tick: 0,
             reduce_motion: crate::motion::reduce_motion(),
             ninox_prompt_generation: 0,
@@ -2375,6 +2415,9 @@ impl App {
         if let Some(turn) = state.ninox_reply_drawer.latest_mut() {
             let linked = crate::components::shell::reply_drawer::linkify(&turn.answer, &sessions, &prs);
             turn.rendered = iced::widget::markdown::parse(&crate::components::markdown_prepass::prepare(&linked)).collect();
+            if let Some(content) = state.ninox_turn_select.get_mut(&turn.asked_at_ms) {
+                *content = iced::widget::text_editor::Content::with_text(&turn.answer);
+            }
         }
     }
 
@@ -3592,6 +3635,7 @@ impl App {
                     Ok(()) => {
                         state.ninox_prompt_generation += 1;
                         state.ninox_reply_drawer.clear();
+                        state.ninox_turn_select.clear();
                     }
                     Err(message) => state.ninox_reply_drawer.clear_failed(format!("{target_label}: {message}")),
                 }
@@ -3599,6 +3643,22 @@ impl App {
             }
             Message::NinoxDrawerCollapse => {
                 state.ninox_reply_drawer.collapse();
+                Task::none()
+            }
+            Message::NinoxTurnSelectToggle(asked_at_ms) => {
+                if state.ninox_turn_select.remove(&asked_at_ms).is_none() {
+                    if let Some(turn) = state.ninox_reply_drawer.turns.iter().find(|t| t.asked_at_ms == asked_at_ms) {
+                        state
+                            .ninox_turn_select
+                            .insert(asked_at_ms, iced::widget::text_editor::Content::with_text(&turn.answer));
+                    }
+                }
+                Task::none()
+            }
+            Message::NinoxTurnSelectAction(asked_at_ms, action) => {
+                if let Some(content) = state.ninox_turn_select.get_mut(&asked_at_ms) {
+                    apply_comment_action(content, action);
+                }
                 Task::none()
             }
             Message::NinoxDrawerReopen => {
@@ -5660,30 +5720,9 @@ impl App {
                 // statuses, and only in the live → terminal direction, so
                 // this can never fight the app's own in-flight updates or
                 // resurrect a session the app just respawned.
-                for session in db_sessions {
-                    match state.sessions.get(&session.id) {
-                        None => {
-                            state.sessions.insert(session.id.clone(), session);
-                        }
-                        Some(known) if adopts_terminal_status(&known.status, &session.status) => {
-                            state.sessions.insert(session.id.clone(), session);
-                        }
-                        // Entering or leaving the spawn queue happens in
-                        // another process (the poller's launcher) and
-                        // emits no event here.
-                        Some(known) if known.status != session.status
-                            && (known.status == SessionStatus::Queued || session.status == SessionStatus::Queued) =>
-                        {
-                            state.sessions.insert(session.id.clone(), session);
-                        }
-                        // PR link/status written by a daemon's GitHub sweep:
-                        // its Engine events never reach this process.
-                        Some(_) => {
-                            if let Some(known) = state.sessions.get_mut(&session.id) {
-                                adopts_pr_progress(known, &session);
-                            }
-                        }
-                    }
+                let changed = sync_db_sessions(&mut state.sessions, db_sessions);
+                if changed > 0 {
+                    tracing::debug!(changed, "poll sessions: adopted store changes");
                 }
 
                 // Same reason for the PR rows themselves: PR/CI/review data a
@@ -5695,6 +5734,7 @@ impl App {
                 for ci in state.engine.store.list_ci_statuses().unwrap_or_default() {
                     state.ci_status.insert(ci.pr_id, ci);
                 }
+                state.session_prs = ninox_core::session_prs::for_sessions(&state.engine.store, state.sessions.values());
                 state.github_budget = state.engine.store.get_github_budget().ok().flatten();
                 state.store_poll_tick = state.store_poll_tick.wrapping_add(1);
                 if state.store_poll_tick.is_multiple_of(5) {
@@ -7904,55 +7944,93 @@ async fn prepare_attach(engine: std::sync::Arc<ninox_core::events::Engine>, id: 
     prepared
 }
 
+/// Collapses a drained burst of engine events so iced's bounded subscription
+/// channel sees one message per thing that changed, not one per emission.
+///
+/// Only *adjacent* events merge, so the relative order of everything else is
+/// untouched: consecutive `ClientOutput` chunks for one session+generation
+/// concatenate, and within a run of `SessionUpdated` events, repeats for the
+/// same session fold into the first one's slot (see [`fold_session_update`]).
+fn coalesce_events(batch: impl IntoIterator<Item = Event>) -> std::collections::VecDeque<Event> {
+    let mut out: Vec<Event> = Vec::new();
+    for event in batch {
+        match event {
+            Event::ClientOutput { session_id, generation, bytes } => {
+                if let Some(Event::ClientOutput { session_id: sid, generation: gen, bytes: acc }) = out.last_mut() {
+                    if *sid == session_id && *gen == generation {
+                        acc.extend(bytes);
+                        continue;
+                    }
+                }
+                out.push(Event::ClientOutput { session_id, generation, bytes });
+            }
+            Event::SessionUpdated(incoming, fields) => {
+                let run_start = out.iter().rposition(|e| !matches!(e, Event::SessionUpdated(..))).map_or(0, |i| i + 1);
+                let slot = out[run_start..].iter_mut().find_map(|e| match e {
+                    Event::SessionUpdated(known, known_fields) if known.id == incoming.id => Some((known, known_fields)),
+                    _ => None,
+                });
+                match slot {
+                    Some((known, known_fields)) => fold_session_update(known, known_fields, &incoming, fields),
+                    None => out.push(Event::SessionUpdated(incoming, fields)),
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out.into()
+}
+
+/// Folds a later `SessionUpdated(incoming, fields)` into an earlier one for
+/// the same session. Overlaying only `fields` keeps the earlier snapshot's
+/// values for fields the later emitter was not authoritative for, so applying
+/// the folded event equals applying both in order.
+fn fold_session_update(known: &mut Session, known_fields: &mut SessionFields, incoming: &Session, fields: SessionFields) {
+    known.merge_from(incoming, fields);
+    *known_fields = *known_fields | fields;
+}
+
+/// Next event for iced. Every call first moves whatever is buffered on the
+/// broadcast channel into `pending` and re-coalesces it, so a long backlog
+/// being handed out one message at a time never leaves fresh events sitting
+/// in the (bounded, lag-dropping) channel. It never waits for more events
+/// while `pending` is non-empty, so this adds no latency to paced output.
 async fn next_coalesced_event(
     rx: &mut broadcast::Receiver<Event>,
-    pending: &mut Option<Event>,
+    pending: &mut std::collections::VecDeque<Event>,
 ) -> Option<Event> {
-    let event = if let Some(event) = pending.take() {
-        event
-    } else {
-        loop {
+    let mut batch = Vec::new();
+    if pending.is_empty() {
+        batch.push(loop {
             match rx.recv().await {
                 Ok(event) => break event,
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(dropped = n, "GUI engine-event receiver lagged; events were dropped");
-                    continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
-        }
-    };
-
-    // Extend `bytes` in place rather than re-cloning the merged-so-far
-    // buffer on every iteration — a bursty repaint can queue dozens of
-    // chunks, and cloning each time would copy O(chunks²) bytes instead
-    // of O(total bytes).
-    let Event::ClientOutput { session_id, generation, mut bytes } = event else {
-        return Some(event);
-    };
+        });
+    }
     loop {
         match rx.try_recv() {
-            Ok(Event::ClientOutput { session_id: sid2, generation: gen2, bytes: more })
-                if sid2 == session_id && gen2 == generation =>
-            {
-                bytes.extend(more);
-            }
-            Ok(other) => {
-                *pending = Some(other);
-                break;
+            Ok(event) => batch.push(event),
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                tracing::warn!(dropped = n, "GUI engine-event receiver lagged; events were dropped");
             }
             Err(_) => break,
         }
     }
-
-    Some(Event::ClientOutput { session_id, generation, bytes })
+    if !batch.is_empty() {
+        *pending = coalesce_events(pending.drain(..).chain(batch));
+    }
+    pending.pop_front()
 }
 
 impl App {
     /// Subscription that drives `Message::EngineEvent` from the engine broadcast channel.
     pub fn subscription(state: &Self) -> Subscription<Message> {
         let mut rx: broadcast::Receiver<Event> = state.engine.subscribe();
-        let mut pending: Option<Event> = None;
+        let mut pending = std::collections::VecDeque::new();
         let engine_sub = Subscription::run_with_id(
             "engine-events",
             async_stream::stream! {
@@ -8003,8 +8081,8 @@ impl App {
     }
 
     /// Theme accessor for the iced `.theme()` builder.
-    pub fn theme(state: &Self) -> Theme {
-        state.scheme.iced_theme()
+    pub fn theme(_state: &Self) -> Theme {
+        ColorScheme::iced_theme()
     }
 }
 
@@ -8184,7 +8262,7 @@ mod tests {
         // than requiring three separate (and three separately rendered)
         // frames.
         let (tx, mut rx) = broadcast::channel(16);
-        let mut pending = None;
+        let mut pending = std::collections::VecDeque::new();
         tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"foo".to_vec() }).unwrap();
         tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"bar".to_vec() }).unwrap();
         tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"baz".to_vec() }).unwrap();
@@ -8204,7 +8282,7 @@ mod tests {
         // fresh client's — same reasoning as the `current != Some(generation)`
         // guard in the `ClientOutput` handler.
         let (tx, mut rx) = broadcast::channel(16);
-        let mut pending = None;
+        let mut pending = std::collections::VecDeque::new();
         tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"old".to_vec() }).unwrap();
         tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 2, bytes: b"new".to_vec() }).unwrap();
 
@@ -8218,7 +8296,7 @@ mod tests {
     #[tokio::test]
     async fn does_not_merge_client_output_across_different_sessions() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut pending = None;
+        let mut pending = std::collections::VecDeque::new();
         tx.send(Event::ClientOutput { session_id: "s1".into(), generation: 1, bytes: b"a".to_vec() }).unwrap();
         tx.send(Event::ClientOutput { session_id: "s2".into(), generation: 1, bytes: b"b".to_vec() }).unwrap();
 
@@ -8227,6 +8305,92 @@ mod tests {
 
         let second = next_coalesced_event(&mut rx, &mut pending).await.unwrap();
         assert!(matches!(&second, Event::ClientOutput { session_id, bytes, .. } if session_id == "s2" && bytes == b"b"));
+    }
+
+    #[test]
+    fn folds_repeated_session_updates_per_id_and_keeps_order() {
+        let mut a1 = live_session("a");
+        a1.cost_usd = 1.0;
+        let mut b1 = live_session("b");
+        b1.cost_usd = 5.0;
+        let mut a2 = live_session("a");
+        a2.cost_usd = 2.0;
+        a2.status = SessionStatus::Done;
+        let out = coalesce_events([
+            Event::SessionUpdated(a1, SessionFields::COST | SessionFields::STATUS),
+            Event::SessionUpdated(b1, SessionFields::COST),
+            Event::SessionUpdated(a2, SessionFields::COST),
+        ]);
+        assert_eq!(out.len(), 2);
+        match (&out[0], &out[1]) {
+            (Event::SessionUpdated(a, af), Event::SessionUpdated(b, _)) => {
+                assert_eq!((a.id.as_str(), b.id.as_str()), ("a", "b"));
+                assert_eq!(a.cost_usd, 2.0, "later cost wins");
+                assert_eq!(a.status, live_session("a").status, "status comes from the earlier emitter, which owned it");
+                assert!(af.contains(SessionFields::STATUS | SessionFields::COST));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_updates_do_not_fold_across_other_events() {
+        let out = coalesce_events([
+            Event::SessionUpdated(live_session("a"), SessionFields::COST),
+            Event::SessionDone("a".into()),
+            Event::SessionUpdated(live_session("a"), SessionFields::COST),
+        ]);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn drains_a_buffered_burst_into_one_event_per_session() {
+        let (tx, mut rx) = broadcast::channel(256);
+        let mut pending = std::collections::VecDeque::new();
+        for _ in 0..50 {
+            for id in ["a", "b", "c"] {
+                tx.send(Event::SessionUpdated(live_session(id), SessionFields::ACTIVITY)).unwrap();
+            }
+        }
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            match next_coalesced_event(&mut rx, &mut pending).await {
+                Some(Event::SessionUpdated(s, _)) => seen.push(s.id),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(seen, ["a", "b", "c"]);
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_arriving_during_a_backlog_leave_the_channel() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut pending = std::collections::VecDeque::new();
+        for id in ["a", "b", "c"] {
+            tx.send(Event::SessionUpdated(live_session(id), SessionFields::COST)).unwrap();
+        }
+        assert!(matches!(next_coalesced_event(&mut rx, &mut pending).await, Some(Event::SessionUpdated(s, _)) if s.id == "a"));
+        for i in 0..3 {
+            tx.send(Event::SessionDone(format!("d{i}"))).unwrap();
+        }
+        assert!(matches!(next_coalesced_event(&mut rx, &mut pending).await, Some(Event::SessionUpdated(s, _)) if s.id == "b"));
+        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)), "fresh events must be pulled off the ring");
+        assert_eq!(pending.len(), 4);
+    }
+
+    #[test]
+    fn sync_db_sessions_reports_only_real_changes() {
+        let mut known: HashMap<SessionId, Session> = HashMap::new();
+        let s = live_session("s1");
+        assert_eq!(sync_db_sessions(&mut known, vec![s.clone()]), 1, "new session");
+        assert_eq!(sync_db_sessions(&mut known, vec![s.clone()]), 0, "identical store row is a no-op");
+        let mut with_pr = s.clone();
+        with_pr.pr_number = Some(9);
+        with_pr.pr_id = Some(9);
+        with_pr.repo = "o/r".into();
+        assert_eq!(sync_db_sessions(&mut known, vec![with_pr]), 1, "daemon-written PR link adopted");
+        assert_eq!(known["s1"].pr_number, Some(9));
     }
 
     fn pr_session(pr_number: Option<u64>, pr_id: Option<i64>, repo: &str) -> Session {
@@ -8371,6 +8535,7 @@ mod tests {
             active_catalogue: Some(0),
             prs:            HashMap::new(),
             ci_status:      HashMap::new(),
+            session_prs:    HashMap::new(),
             github_budget:  None,
             store_poll_tick: 0,
             review_threads: HashMap::new(),
@@ -8451,6 +8616,7 @@ mod tests {
             idle: crate::components::idle_view::IdleState::default(),
             ninox_prompt_target: crate::prompt_agent::PromptTarget::default(),
             ninox_reply_drawer: crate::prompt_agent::ReplyDrawer::default(),
+            ninox_turn_select: HashMap::new(),
             thinking_tick: 0,
             reduce_motion: false,
             ninox_prompt_generation: 0,
@@ -11659,6 +11825,28 @@ mod tests {
             &[],
         );
         assert!(linked.contains("](https://ninox.invalid/session/w1)"), "{linked}");
+    }
+
+    #[test]
+    fn select_toggle_swaps_in_a_read_only_copy_of_the_answer_and_back() {
+        use iced::widget::text_editor::{Action, Edit};
+        let m = submitted(fleet_test_app("o1", "w1"), "who?");
+        let generation = m.ninox_prompt_generation;
+        let (m, _) = m.update(Message::NinoxPromptDelivered {
+            generation,
+            result: Ok(crate::prompt_agent::AnswerSource::Transcript(Default::default())),
+        });
+        let (m, _) = m.update(Message::NinoxPromptPolled { generation, poll: transcript_poll(&["Run `x` now."], true) });
+        let at = m.ninox_reply_drawer.turns[0].asked_at_ms;
+
+        let (m, _) = m.update(Message::NinoxTurnSelectToggle(at));
+        assert_eq!(m.ninox_turn_select[&at].text(), "Run `x` now.\n");
+        let (m, _) = m.update(Message::NinoxTurnSelectAction(at, Action::Edit(Edit::Insert('!'))));
+        assert_eq!(m.ninox_turn_select[&at].text(), "Run `x` now.\n", "edits are dropped");
+        let (m, _) = m.update(Message::NinoxPromptPolled { generation, poll: transcript_poll(&["Run `x` now.", "More."], false) });
+        assert!(m.ninox_turn_select[&at].text().contains("More."), "a growing answer refreshes the selectable copy");
+        let (m, _) = m.update(Message::NinoxTurnSelectToggle(at));
+        assert!(m.ninox_turn_select.is_empty(), "second toggle returns to the formatted view");
     }
 
     #[test]
@@ -16498,6 +16686,227 @@ mod tests {
             "\"1\" must not navigate while the spawn modal is open"
         );
     }
+
+    /// PR chips on every surface that shows a session, rendered offscreen
+    /// through iced's software renderer with in-process events (no window,
+    /// no desktop input). Set `NINOX_SHOT_DIR` to also write PNGs.
+    mod pr_chip_surfaces {
+        use super::*;
+        use iced::advanced::{clipboard, renderer::Style};
+        use iced_runtime::{user_interface::Cache, UserInterface};
+        use iced::{mouse, Event, Font, Pixels, Point, Rectangle, Size, Theme};
+        use ninox_core::pr_events::CiVerdict;
+        use ninox_core::session_prs::{PrState, SessionPr};
+        use ninox_core::types::{Orchestrator, SessionStatus};
+
+        const SIZE: Size = Size { width: 1280.0, height: 800.0 };
+        /// The Split view's terminal is a fixed 140 columns, so its side panel needs a wider window.
+        const WIDE: Size = Size { width: 1800.0, height: 900.0 };
+
+        #[allow(clippy::too_many_arguments)]
+        fn pr(repo: &str, n: u64, title: &str, state: PrState, ci: CiVerdict, passing: u32, failing: u32, pending: u32) -> SessionPr {
+            SessionPr {
+                repo: repo.into(), number: n, url: format!("https://github.com/{repo}/pull/{n}"), title: title.into(),
+                state, draft: false, ci, passing, failing, pending, changes_requested: false, approved: false, tracked: false,
+            }
+        }
+
+        fn worker(id: &str, name: &str, status: SessionStatus, prs: Vec<SessionPr>) -> (Session, Vec<SessionPr>) {
+            let mut s = pr_session(prs.first().map(|p| p.number), None, "org/bellhop");
+            s.id = id.into();
+            s.name = name.into();
+            s.status = status;
+            s.orchestrator_id = Some("ninox".into());
+            s.summary = Some("rolling out spokes across regions".into());
+            (s, prs)
+        }
+
+        fn seeded(view: View) -> App {
+            let mut app = base(test_engine());
+            let mut orch = pr_session(None, None, "org/ninox");
+            orch.id = "ninox".into();
+            orch.name = "ninox".into();
+            orch.status = SessionStatus::Working;
+            app.orchestrators = vec![Orchestrator { id: "ninox".into(), name: "ninox".into(), created_at: 0 }];
+            app.sessions.insert("ninox".into(), orch);
+            let mut changes = pr("org/manifests", 988, "Enable eus2 spokes", PrState::Open, CiVerdict::Passed, 12, 0, 0);
+            changes.changes_requested = true;
+            let mut draft = pr("org/manifests", 990, "Draft: cleanup", PrState::Open, CiVerdict::Passed, 4, 0, 0);
+            draft.draft = true;
+            let many = vec![
+                pr("org/bellhop", 1466, "Spoke sizing", PrState::Open, CiVerdict::Pending, 28, 0, 25),
+                pr("org/bellhop", 1473, "Add eus2 routes", PrState::Open, CiVerdict::Failed, 9, 3, 0),
+                changes,
+                draft,
+                pr("org/manifests", 989, "Enable euc1 spokes", PrState::Merged, CiVerdict::Passed, 12, 0, 0),
+            ];
+            let few = vec![pr("org/bellhop", 412, "Rebase the parser", PrState::Open, CiVerdict::Passed, 4, 0, 0)];
+            for (s, mut prs) in [
+                worker("w-spokes", "mlops-5202-euc1-eus2-spokes", SessionStatus::PrOpen, many),
+                worker("w-parser", "w-parser", SessionStatus::PrOpen, few),
+                worker("w-none", "w-no-pr-yet", SessionStatus::Working, vec![]),
+            ] {
+                ninox_core::session_prs::order(&mut prs);
+                app.session_prs.insert(s.id.clone(), prs);
+                app.sessions.insert(s.id.clone(), s);
+            }
+            app.view = view;
+            app.info_width = 360.0;
+            app
+        }
+
+        /// Builds the full window view and runs `f` against its UI and renderer.
+        fn with_ui<R>(app: &App, size: Size, f: impl FnOnce(&mut UserInterface<'_, Message, Theme, iced::Renderer>, &mut iced::Renderer) -> R) -> R {
+            crate::style::load_bundled_fonts();
+            let mut renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(Font::default(), Pixels(16.0)));
+            let mut ui = UserInterface::build(App::iced_view(app), size, Cache::default(), &mut renderer);
+            f(&mut ui, &mut renderer)
+        }
+
+        fn click(ui: &mut UserInterface<'_, Message, Theme, iced::Renderer>, renderer: &mut iced::Renderer, at: Point) -> Vec<Message> {
+            let mut out = Vec::new();
+            let events = [
+                Event::Mouse(mouse::Event::CursorMoved { position: at }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ];
+            ui.update(&events, mouse::Cursor::Available(at), renderer, &mut clipboard::Null, &mut out);
+            out
+        }
+
+        /// Every message a click anywhere in the window produces, by point.
+        fn sweep(app: &App, size: Size) -> Vec<(Point, Vec<Message>)> {
+            with_ui(app, size, |ui, renderer| {
+                let mut hits = Vec::new();
+                let mut y = 40.0;
+                while y < size.height {
+                    let mut x = 4.0;
+                    while x < size.width {
+                        let at = Point::new(x, y);
+                        let msgs = click(ui, renderer, at);
+                        if !msgs.is_empty() {
+                            hits.push((at, msgs));
+                        }
+                        x += 3.0;
+                    }
+                    y += 3.0;
+                }
+                hits
+            })
+        }
+
+        fn shot(app: &App, size: Size, name: &str) {
+            let Ok(dir) = std::env::var("NINOX_SHOT_DIR") else { return };
+            with_ui(app, size, |ui, renderer| {
+                ui.draw(renderer, &Theme::Dark, &Style { text_color: crate::components::shell::tokens::TEXT }, mouse::Cursor::Unavailable);
+                let (w, h) = (size.width as u32, size.height as u32);
+                let mut pixels = tiny_skia::Pixmap::new(w, h).unwrap();
+                let mut mask = tiny_skia::Mask::new(w, h).unwrap();
+                let iced::Renderer::Secondary(r) = renderer else { panic!("software renderer expected") };
+                r.draw(
+                    &mut pixels.as_mut(),
+                    &mut mask,
+                    &iced_tiny_skia::graphics::Viewport::with_physical_size(Size::new(w, h), 1.0),
+                    &[Rectangle::with_size(size)],
+                    crate::components::shell::tokens::BG,
+                    &[] as &[&str],
+                );
+                let path = std::path::Path::new(&dir).join(format!("{name}.png"));
+                // The software renderer writes BGRA (what the window compositor expects).
+                let mut rgba = pixels.data().to_vec();
+                for i in (0..rgba.len()).step_by(4) {
+                    rgba.swap(i, i + 2);
+                }
+                image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8).unwrap();
+            });
+        }
+
+        fn urls(hits: &[(Point, Vec<Message>)]) -> std::collections::BTreeSet<String> {
+            hits.iter()
+                .flat_map(|(_, m)| m)
+                .filter_map(|m| match m { Message::OpenUrl(u) => Some(u.clone()), _ => None })
+                .collect()
+        }
+
+        /// A chip click opens the PR and does nothing else: no point in the
+        /// window yields both an `OpenUrl` and a navigation/selection.
+        fn assert_chip_clicks_do_not_also_select(hits: &[(Point, Vec<Message>)]) {
+            for (at, msgs) in hits {
+                if msgs.iter().any(|m| matches!(m, Message::OpenUrl(_))) {
+                    assert_eq!(msgs.len(), 1, "a click at {at:?} on a chip also fired {msgs:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn board_card_chips_open_the_pr_and_do_not_navigate_the_card() {
+            let app = seeded(View::Board { scope: None });
+            shot(&app, SIZE, "board");
+            let hits = sweep(&app, SIZE);
+            let opened = urls(&hits);
+            assert!(opened.contains("https://github.com/org/bellhop/pull/1466"), "{opened:?}");
+            assert!(opened.contains("https://github.com/org/bellhop/pull/412"), "{opened:?}");
+            assert!(hits.iter().any(|(_, m)| m.iter().any(|m| matches!(m, Message::NavigateSession(id) if id == "w-spokes"))), "the card itself still navigates");
+            assert_chip_clicks_do_not_also_select(&hits);
+        }
+
+        #[test]
+        fn board_card_plus_n_chip_opens_the_session_side_panel_listing() {
+            let app = seeded(View::Board { scope: None });
+            let hits = sweep(&app, SIZE);
+            let nav_count = hits.iter().filter(|(_, m)| matches!(m.as_slice(), [Message::NavigateSession(id)] if id == "w-spokes")).count();
+            assert!(nav_count > 0);
+        }
+
+        #[test]
+        fn sidebar_row_chips_open_the_pr_and_do_not_select_the_row() {
+            let mut app = seeded(View::Fleet);
+            app.fleet_nav.tree_collapsed = false;
+            app.sidebar.expanded_orchestrators.insert("ninox".into());
+            shot(&app, SIZE, "fleet-islands-and-sidebar");
+            let hits = sweep(&app, SIZE);
+            let sidebar_hits: Vec<_> = hits.iter().filter(|(p, _)| p.x < crate::components::shell::tree::EXPANDED_WIDTH).cloned().collect();
+            let opened = urls(&sidebar_hits);
+            assert!(!opened.is_empty(), "no PR chip in the sidebar: {sidebar_hits:?}");
+            assert_chip_clicks_do_not_also_select(&sidebar_hits);
+            assert!(
+                sidebar_hits.iter().any(|(_, m)| matches!(m.as_slice(), [Message::NavigateSession(id)] if id == "w-spokes")),
+                "the long-named multi-PR row still shows a clickable count chip: {sidebar_hits:?}",
+            );
+            assert!(
+                sidebar_hits.iter().any(|(_, m)| m.iter().all(|m| !matches!(m, Message::OpenUrl(_))) && !m.is_empty()),
+                "the row itself still selects",
+            );
+        }
+
+        #[test]
+        fn fleet_island_rows_and_graph_cards_carry_chips() {
+            let app = seeded(View::Fleet);
+            let hits = sweep(&app, SIZE);
+            let in_main = hits;
+            assert!(urls(&in_main).contains("https://github.com/org/bellhop/pull/1473"), "island row chip missing: the lead (failing) PR comes first");
+            assert_chip_clicks_do_not_also_select(&in_main);
+
+            let mut focus = seeded(View::Fleet);
+            let islands = crate::components::fleet_islands::build_fleet_islands(&focus);
+            focus.fleet_nav.open_island(ninox_overview::islands::IslandKey::Root("ninox".into()), &islands);
+            shot(&focus, SIZE, "fleet-graph");
+            let hits = sweep(&focus, SIZE);
+            assert!(urls(&hits).contains("https://github.com/org/bellhop/pull/1466"), "graph card chip missing");
+            assert_chip_clicks_do_not_also_select(&hits);
+        }
+
+        #[test]
+        fn session_side_panel_lists_every_pr_open_first() {
+            let app = seeded(View::SessionDetail { session_id: "w-spokes".into(), panel: DetailPanel::Split });
+            shot(&app, WIDE, "session-detail");
+            let opened = urls(&sweep(&app, WIDE));
+            for n in [1466, 1473, 989] {
+                assert!(opened.iter().any(|u| u.ends_with(&format!("/pull/{n}"))), "PR {n} not clickable in the side panel: {opened:?}");
+            }
+        }
+    }
+
 }
 
 fn now_ms_i64() -> i64 {

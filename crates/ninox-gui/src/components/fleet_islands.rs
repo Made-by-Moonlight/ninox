@@ -118,7 +118,19 @@ pub(crate) fn member_status_color(status: MemberStatus) -> Color {
 /// "needs you" chip next to its green/gray dot — `classify_member` already
 /// gives terminal status precedence over a blocked activity flag, and this
 /// must agree with it rather than re-checking `activity` on its own.
+#[cfg(test)]
 pub(crate) fn member_chip(status: MemberStatus, session: &Session, queue_position: Option<usize>) -> Option<(String, Color, Color)> {
+    member_chip_with_prs(status, session, queue_position, &[])
+}
+
+/// [`member_chip`] without the plain `PR #n` text when `prs` is non-empty:
+/// those render as clickable chips (`pr_chip`) instead.
+pub(crate) fn member_chip_with_prs(
+    status: MemberStatus,
+    session: &Session,
+    queue_position: Option<usize>,
+    prs: &[ninox_core::session_prs::SessionPr],
+) -> Option<(String, Color, Color)> {
     use SessionStatus::*;
     if matches!(status, MemberStatus::Done | MemberStatus::Stopped) {
         return None;
@@ -127,6 +139,8 @@ pub(crate) fn member_chip(status: MemberStatus, session: &Session, queue_positio
         Queued => Some((ninox_ui_shared::session_queue::queued_badge(queue_position), tokens::PANEL2, tokens::DIM)),
         CiFailed => Some(("CI failed".to_string(), CHIP_FAIL_BG, CHIP_FAIL_FG)),
         Mergeable => Some(("mergeable".to_string(), CHIP_MERGE_BG, CHIP_MERGE_FG)),
+        // Listed PRs are drawn as clickable chips by the caller.
+        PrOpen if !prs.is_empty() => None,
         PrOpen => Some((
             session.pr_number.map(|n| format!("PR #{n}")).unwrap_or_else(|| "PR open".to_string()),
             CHIP_OPEN_BG, CHIP_OPEN_FG,
@@ -210,10 +224,13 @@ pub(crate) fn chip_pill<'a>(label: String, bg: Color, fg: Color) -> Element<'a, 
 // whichever of the two borrows is shorter-lived (the islands `Vec` that
 // `fleet_islands` rebuilds on every render), which the pub `fleet_islands`
 // function then can't return as `Element<'_, Message>` tied to `app` alone.
+/// An island row is ~220px wide: one short chip, so the name keeps room.
+const ISLAND_ROW_LABEL_CHARS: usize = 12;
+
 fn member_row<'a>(app: &'a App, island: &IslandKey, member: &IslandMember) -> Element<'a, Message> {
     let session = app.sessions.get(&member.id);
     let name = session.map(|s| s.name.as_str()).unwrap_or(member.id.as_str());
-    let chip = session.and_then(|s| member_chip(member.status, s, app.queue_positions.get(&member.id).copied()));
+    let chip = session.and_then(|s| member_chip_with_prs(member.status, s, app.queue_positions.get(&member.id).copied(), app.session_prs.get(&member.id).map(Vec::as_slice).unwrap_or_default()));
 
     let mut items: Vec<Element<Message>> = vec![
         tick(),
@@ -231,6 +248,9 @@ fn member_row<'a>(app: &'a App, island: &IslandKey, member: &IslandMember) -> El
     ];
     if let Some((label, bg, fg)) = chip {
         items.push(chip_pill(label, bg, fg));
+    }
+    if let Some(prs) = app.session_prs.get(&member.id).and_then(|prs| crate::components::pr_chip::chips(&member.id, prs, 1, ISLAND_ROW_LABEL_CHARS, false)) {
+        items.push(prs);
     }
 
     mouse_area(row(items).align_y(Alignment::Center).spacing(6))
@@ -781,6 +801,21 @@ mod tests {
         let session = session_with(SessionStatus::Terminated, ActivityState::Blocked);
         assert_eq!(member_chip(MemberStatus::Stopped, &session, None), None);
         assert_eq!(member_chip(MemberStatus::Done, &session, None), None);
+    }
+
+    #[test]
+    fn member_chip_drops_the_plain_pr_text_when_pr_chips_are_drawn() {
+        use ninox_core::session_prs::{PrState, SessionPr};
+        let pr = |n, state| SessionPr {
+            repo: "o/bellhop".into(), number: n, url: String::new(), title: String::new(), state,
+            draft: false, ci: ninox_core::pr_events::CiVerdict::None, passing: 0, failing: 0, pending: 0,
+            changes_requested: false, approved: false, tracked: false,
+        };
+        let session = session_with(SessionStatus::PrOpen, ActivityState::Idle);
+        let prs = [pr(1466, PrState::Open), pr(1473, PrState::Open), pr(900, PrState::Merged)];
+        assert_eq!(member_chip_with_prs(MemberStatus::WaitingOnPr, &session, None, &prs), None);
+        let (label, ..) = member_chip_with_prs(MemberStatus::WaitingOnPr, &session, None, &[]).unwrap();
+        assert_eq!(label, "PR open");
     }
 
     #[test]

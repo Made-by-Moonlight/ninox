@@ -109,7 +109,7 @@ mod tests {
             session: ninox_ui_shared::cli::test_fixtures::session(id, None, status),
             is_orchestrator: false,
             group: None,
-            machine_health: None, queue_position: None,
+            machine_health: None, queue_position: None, prs: Vec::new(),
         }
     }
 
@@ -140,7 +140,7 @@ mod tests {
             session: ninox_ui_shared::cli::test_fixtures::session(id, orch, SessionStatus::Working),
             is_orchestrator,
             group: orch.map(str::to_string),
-            machine_health: None, queue_position: None,
+            machine_health: None, queue_position: None, prs: Vec::new(),
         }
     }
 

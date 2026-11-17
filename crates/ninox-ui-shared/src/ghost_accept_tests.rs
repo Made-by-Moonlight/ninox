@@ -119,6 +119,62 @@ async fn user_accept_goes_through_the_normal_spawn_path_and_respects_the_limit()
 }
 
 #[tokio::test]
+async fn a_top_level_worker_is_queued_as_a_standalone_session_the_user_owns() {
+    let iso = isolate();
+    let store = store_in(&iso);
+    busy_worker(&store, "busy");
+    limit(1);
+    let repo = tempfile::tempdir().unwrap();
+    let ws = repo.path().to_str().unwrap();
+    let p = Proposal {
+        parent_id: None,
+        title: None,
+        sections: vec![
+            ProposalSection { name: Some("Bellhop istio charts".into()), ..section("fix", None, "Implementor", &[], ws) },
+            section("lead", None, "Orchestrator", &[], ""),
+        ],
+    };
+    let id = propose(&store, &p, PROMPT_SESSION_ID);
+    let config = AppConfig::load_or_default();
+
+    let err = accept(&store, &config, &id, None, Some("busy"), 150).await.unwrap_err().to_string();
+    assert!(err.contains("only"), "a worker can't accept a top-level plan: {err}");
+
+    let report = accept(&store, &config, &id, None, None, 200).await.unwrap();
+    assert_eq!(report.decided_by, USER);
+    assert!(matches!(outcome(&report, "fix"), NodeOutcome::Queued { session_id, .. } if session_id == "bellhop-istio-charts"));
+    assert!(matches!(outcome(&report, "lead"), NodeOutcome::Spawned { session_id } if session_id == "lead"), "the top-level Orchestrator still spawns beside it");
+    assert!(report.summary().contains("bellhop-istio-charts"), "the summary names the session: {}", report.summary());
+
+    let entry = store.queue_entry("bellhop-istio-charts").unwrap().expect("queued under the limit");
+    let payload: crate::session_queue::QueuedLaunch = serde_json::from_str(&entry.payload).unwrap();
+    match payload {
+        crate::session_queue::QueuedLaunch::Standalone(l) => {
+            assert_eq!(l.worker_type, "Implementor");
+            assert_eq!(l.workspace_input, ws);
+            assert!(l.isolate_worktree);
+            assert!(l.prompt.as_deref().is_some_and(|p| p.contains("brief for fix")));
+        }
+        other => panic!("expected a standalone launch, got {other:?}"),
+    }
+    assert!(store.get_session("bellhop-istio-charts").unwrap().is_none_or(|s| s.orchestrator_id.is_none()));
+}
+
+#[test]
+fn the_summary_names_the_sessions_it_started() {
+    let r = DecisionReport {
+        plan_id: "p".into(),
+        decided_by: USER.into(),
+        status: PlanStatus::Accepted,
+        nodes: vec![
+            NodeReport { node_id: "a".into(), outcome: NodeOutcome::Spawned { session_id: "fix-charts".into() }, warnings: vec![] },
+            NodeReport { node_id: "b".into(), outcome: NodeOutcome::Discarded, warnings: vec![] },
+        ],
+    };
+    assert_eq!(r.summary(), "1 spawned · 1 discarded (fix-charts)");
+}
+
+#[tokio::test]
 async fn dependents_wait_and_spawn_in_order() {
     let iso = isolate();
     let store = store_in(&iso);

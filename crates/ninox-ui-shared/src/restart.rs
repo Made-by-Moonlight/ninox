@@ -684,7 +684,7 @@ mod tests {
         });
         let session = refile_session("s1");
         let plan = refile_plan(&st(), &session, false, &cfg, "fresh-uuid").expect("plan");
-        assert_eq!(plan.base_cmd, "claude-nightly --model 'claude-opus-4-8'");
+        assert_eq!(plan.base_cmd, "claude-nightly --model 'claude-opus-4-8' --settings '{\"crossSessionInbound\":\"accept\"}'");
         assert_eq!(plan.workspace, "/tmp/ws");
         assert_eq!(plan.brain, Some(ninox_core::brain_set::BrainSet::single("/brains/b")));
         assert!(plan.extra_env.is_empty());

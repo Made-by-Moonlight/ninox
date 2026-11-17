@@ -16,6 +16,10 @@ pub struct WorkspaceObservation {
     pub branch: Option<String>,
     /// Uncommitted changes (tracked or untracked); `None` when unknown.
     pub dirty:  Option<bool>,
+    /// A settings file that makes Claude Code hold or refuse messages from
+    /// other sessions regardless of ninox's own `crossSessionInbound:
+    /// "accept"` (see [`cross_session_override`]), as `<value> in <path>`.
+    pub cross_session_override: Option<String>,
 }
 
 pub trait WorkspaceProbe: Send + Sync {
@@ -30,18 +34,43 @@ impl WorkspaceProbe for GitProbe {
         if !path.is_dir() {
             return WorkspaceObservation::default();
         }
+        let cross_session_override = cross_session_override(path, MANAGED_SETTINGS);
         let is_git = git(path, &["rev-parse", "--is-inside-work-tree"])
             .is_some_and(|s| s.trim() == "true");
         if !is_git {
-            return WorkspaceObservation { exists: true, ..Default::default() };
+            return WorkspaceObservation { exists: true, cross_session_override, ..Default::default() };
         }
         WorkspaceObservation {
             exists: true,
             is_git,
             branch: current_branch(path),
             dirty:  git(path, &["status", "--porcelain", "--untracked-files=all"]).map(|s| has_user_changes(&s)),
+            cross_session_override,
         }
     }
+}
+
+/// Where Claude Code reads organization-managed settings on macOS and Linux.
+const MANAGED_SETTINGS: &[&str] = &[
+    "/Library/Application Support/ClaudeCode/managed-settings.json",
+    "/etc/claude-code/managed-settings.json",
+];
+
+/// Whether a settings file ninox can't win against sets
+/// `crossSessionInbound` to `hold` or `refuse`: the workspace's project and
+/// local settings (a stricter value there beats every other source,
+/// including `--settings`) or a managed settings file in `managed`. User
+/// settings are skipped, since ninox's `--settings` outranks them.
+pub fn cross_session_override(workspace: &Path, managed: &[&str]) -> Option<String> {
+    let claude = workspace.join(".claude");
+    let files = [claude.join("settings.local.json"), claude.join("settings.json")]
+        .into_iter()
+        .chain(managed.iter().map(std::path::PathBuf::from));
+    files.into_iter().find_map(|file| {
+        let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).ok()?).ok()?;
+        let value = json.get(crate::harness::CROSS_SESSION_KEY)?.as_str()?;
+        matches!(value, "hold" | "refuse").then(|| format!("{value} in {}", file.display()))
+    })
 }
 
 /// Files ninox itself writes into every worker worktree (statusline/hook
@@ -100,12 +129,19 @@ pub enum Anomaly {
     /// Informational: restarting fresh without a recorded task brief means
     /// the worker only gets its state, not its original instructions.
     NoTaskBrief,
+    /// Informational: a settings file makes Claude Code hold or refuse
+    /// messages from other sessions, so the briefing ninox sends this
+    /// session may never reach it.
+    CrossSessionInboundOverridden { detail: String },
 }
 
 impl Anomaly {
     /// Blocking anomalies keep the session out of the restore.
     pub fn is_blocking(&self) -> bool {
-        !matches!(self, Self::OrchestratorWorkspaceRecreated { .. } | Self::NoTaskBrief | Self::BranchMismatch { .. })
+        !matches!(self, Self::OrchestratorWorkspaceRecreated { .. }
+                | Self::NoTaskBrief
+                | Self::BranchMismatch { .. }
+                | Self::CrossSessionInboundOverridden { .. })
     }
 
     pub fn describe(&self) -> String {
@@ -122,6 +158,9 @@ impl Anomaly {
             Self::OrchestratorWorkspaceRecreated { path } =>
                 format!("orchestrator workspace `{path}` is missing and will be recreated"),
             Self::NoTaskBrief => "no task brief was recorded at spawn".into(),
+            Self::CrossSessionInboundOverridden { detail } => format!(
+                "crossSessionInbound is {detail}, which overrides ninox's \"accept\": messages from other sessions to it may not be delivered"
+            ),
         }
     }
 }
@@ -162,7 +201,7 @@ mod tests {
     use super::*;
 
     fn obs(exists: bool, is_git: bool, branch: Option<&str>, dirty: Option<bool>) -> WorkspaceObservation {
-        WorkspaceObservation { exists, is_git, branch: branch.map(str::to_string), dirty }
+        WorkspaceObservation { exists, is_git, branch: branch.map(str::to_string), dirty, ..Default::default() }
     }
 
     #[test]
@@ -233,5 +272,30 @@ mod tests {
         assert_eq!(GitProbe.observe(p).dirty, Some(true));
         assert_eq!(current_branch(p).as_deref(), Some("feat-x"));
         assert!(!GitProbe.observe(&p.join("nope")).exists);
+    }
+
+    #[test]
+    fn a_strict_cross_session_value_in_project_or_managed_settings_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("w");
+        std::fs::create_dir_all(ws.join(".claude")).unwrap();
+        let managed = dir.path().join("managed.json");
+        let managed_s = managed.to_str().unwrap();
+
+        assert_eq!(cross_session_override(&ws, &[managed_s]), None);
+
+        std::fs::write(ws.join(".claude/settings.json"), r#"{"crossSessionInbound":"accept"}"#).unwrap();
+        std::fs::write(&managed, r#"{"crossSessionInbound":"hold"}"#).unwrap();
+        assert!(cross_session_override(&ws, &[managed_s]).unwrap().starts_with("hold in "));
+
+        std::fs::write(ws.join(".claude/settings.local.json"), r#"{"crossSessionInbound":"refuse"}"#).unwrap();
+        assert!(cross_session_override(&ws, &[managed_s]).unwrap().contains("refuse in "));
+    }
+
+    #[test]
+    fn the_override_anomaly_is_informational_and_names_the_file() {
+        let a = Anomaly::CrossSessionInboundOverridden { detail: "refuse in /w/.claude/settings.local.json".into() };
+        assert!(!a.is_blocking());
+        assert!(a.describe().contains("/w/.claude/settings.local.json"));
     }
 }

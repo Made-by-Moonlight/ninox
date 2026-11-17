@@ -400,7 +400,7 @@ mod tests {
             session: ninox_ui_shared::cli::test_fixtures::session(id, group, status),
             is_orchestrator,
             group: group.map(String::from),
-            machine_health: None, queue_position: None,
+            machine_health: None, queue_position: None, prs: Vec::new(),
         };
         if is_orchestrator {
             row.group = Some(id.to_string());

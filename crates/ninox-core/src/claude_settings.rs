@@ -138,10 +138,10 @@ fn read_object(path: &Path) -> anyhow::Result<Option<Map<String, Value>>> {
 }
 
 /// Merge ninox's `entries` (a settings object holding at most `statusLine`
-/// and `hooks`) into `<claude_dir>/settings.local.json`, creating it if
+/// `hooks` and `crossSessionInbound`) into `<claude_dir>/settings.local.json`, creating it if
 /// absent. Any ninox entries already there (e.g. from a previous spawn, with
 /// a different binary path) are replaced; the user's own keys and hooks are
-/// kept, and a user-defined `statusLine` wins over ninox's. A file that
+/// kept, and a user-defined `statusLine` or `crossSessionInbound` wins over ninox's. A file that
 /// can't be parsed as a JSON object is left alone and reported as an error
 /// rather than clobbered.
 pub fn install_local(claude_dir: &Path, entries: &Value) -> anyhow::Result<()> {
@@ -149,6 +149,9 @@ pub fn install_local(claude_dir: &Path, entries: &Value) -> anyhow::Result<()> {
     let mut settings = read_object(&path)?.unwrap_or_default();
     strip_ninox_entries(&mut settings);
 
+    if let Some(accept) = entries.get(crate::harness::CROSS_SESSION_KEY) {
+        settings.entry(crate::harness::CROSS_SESSION_KEY).or_insert_with(|| accept.clone());
+    }
     if let Some(status_line) = entries.get("statusLine") {
         settings.entry("statusLine").or_insert_with(|| status_line.clone());
     }
@@ -274,6 +277,28 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn install_local_adds_cross_session_accept_and_keeps_user_keys() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(LOCAL_SETTINGS);
+        std::fs::write(&path, json!({"permissions": {"allow": ["Read"]}}).to_string()).unwrap();
+        let entries = json!({"crossSessionInbound": "accept"});
+        install_local(dir.path(), &entries).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["crossSessionInbound"], "accept");
+        assert_eq!(v["permissions"]["allow"], json!(["Read"]));
+    }
+
+    #[test]
+    fn install_local_keeps_a_user_set_cross_session_value() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(LOCAL_SETTINGS);
+        std::fs::write(&path, json!({"crossSessionInbound": "hold"}).to_string()).unwrap();
+        install_local(dir.path(), &json!({"crossSessionInbound": "accept"})).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["crossSessionInbound"], "hold");
+    }
 
     #[test]
     fn set_permission_rules_replaces_the_lists_and_keeps_other_keys() {

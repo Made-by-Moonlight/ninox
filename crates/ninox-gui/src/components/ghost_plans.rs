@@ -122,7 +122,7 @@ pub fn ghost_node_card<'a>(app: &'a App, plan: &'a PlanWithNodes, node: &'a Node
         .into()
 }
 
-/// A pending plan of new top-level orchestrators as its own dashed island
+/// A pending plan of new top-level sessions as its own dashed island
 /// in the Fleet grid.
 pub fn ghost_island<'a>(app: &'a App, plan: &'a PlanWithNodes) -> Element<'a, Message> {
     let mut lines: Vec<Element<Message>> = vec![

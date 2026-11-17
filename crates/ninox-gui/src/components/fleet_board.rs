@@ -263,6 +263,10 @@ fn session_card<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> 
         );
     }
     body.push(Space::new(0, 9).into());
+    if let Some(prs) = app.session_prs.get(&session.id).and_then(|prs| crate::components::pr_chip::chips(&session.id, prs, 3, crate::components::pr_chip::CARD_LABEL_CHARS, true)) {
+        body.push(prs);
+        body.push(Space::new(0, 8).into());
+    }
 
     let retention_badge: Option<Element<Message>> = if matches!(
         session.status, SessionStatus::Done | SessionStatus::Terminated

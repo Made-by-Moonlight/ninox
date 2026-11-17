@@ -153,7 +153,7 @@ mod tests {
             is_orchestrator: false,
             group: None,
             machine_health: None,
-            queue_position: None,
+            queue_position: None, prs: Vec::new(),
         }
     }
 

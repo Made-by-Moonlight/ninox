@@ -705,15 +705,7 @@ fn reading_pane(app: &App) -> Element<'_, Message> {
                         code_size: 12.0.into(),
                         ..iced::widget::markdown::Settings::with_text_size(14.0)
                     },
-                    iced::widget::markdown::Style {
-                        inline_code_highlight: iced::widget::markdown::Highlight {
-                            background: Background::Color(tokens::PANEL2),
-                            border: Border { color: tokens::BORDER, width: 1.0, radius: 2.0.into() },
-                        },
-                        inline_code_padding: iced::Padding { top: 1.0, right: 5.0, bottom: 1.0, left: 5.0 },
-                        inline_code_color: tokens::TEXT,
-                        link_color: tokens::TEAL,
-                    },
+                    crate::components::markdown_style::inline_code_style(tokens::TEAL, 2.0),
                     tokens::DIM2,
                 )
                 .map(Message::BrainLinkClicked),

@@ -17,8 +17,9 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 
-/// A measurement older than this is re-taken on the next disk tick.
-pub const DISK_REMEASURE_MS: i64 = 5 * 60 * 1000;
+/// A measurement older than this is re-taken on the next disk tick, even if
+/// the worktree root looks untouched.
+pub const DISK_REMEASURE_MS: i64 = 30 * 60 * 1000;
 
 /// Worktrees measured per tick, so a fleet of large worktrees is spread
 /// over several ticks instead of one long walk. Arbitrary; bump if the
@@ -403,7 +404,7 @@ pub fn measure_idle_disks(store: &Store, workers: &[IdleWorker], build_dirs: &[S
         .iter()
         .filter_map(|w| Some((w, w.workspace_path.as_deref()?)))
         .filter(|(w, ws)| workspace::ninox_repo_root(ws, &w.id).is_some() && Path::new(ws).is_dir())
-        .filter(|(w, _)| cached.get(&w.id).is_none_or(|m| now.saturating_sub(m.measured_at) >= DISK_REMEASURE_MS))
+        .filter(|(w, ws)| cached.get(&w.id).is_none_or(|m| needs_remeasure(m.measured_at, now, Path::new(ws))))
         .collect();
     stale.sort_by_key(|(w, _)| cached.get(&w.id).map_or(i64::MIN, |m| m.measured_at));
     for (w, ws) in stale.into_iter().take(MAX_MEASURED_PER_TICK) {
@@ -414,6 +415,21 @@ pub fn measure_idle_disks(store: &Store, workers: &[IdleWorker], build_dirs: &[S
     }
     let keep: Vec<String> = workers.iter().map(|w| w.id.clone()).collect();
     let _ = store.prune_disk_measurements(&keep);
+}
+
+/// Stale after [`DISK_REMEASURE_MS`], or sooner when the worktree root's mtime
+/// is newer than the last measurement (entries added or removed there, e.g. a
+/// `target/` created or deleted).
+fn needs_remeasure(measured_at: i64, now: i64, workspace: &Path) -> bool {
+    if now.saturating_sub(measured_at) >= DISK_REMEASURE_MS {
+        return true;
+    }
+    let mtime_ms = std::fs::metadata(workspace)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64);
+    mtime_ms.is_some_and(|t| t > measured_at)
 }
 
 fn measure(workspace: &Path, build_dirs: &[String], now: i64) -> DiskMeasurement {
@@ -771,6 +787,15 @@ mod tests {
         store.upsert_session(&session("w0", Some("o"))).unwrap();
         store.delete_session("w0").unwrap();
         assert!(store.disk_measurements().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_fresh_measurement_is_kept_until_it_ages_out_or_the_worktree_root_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        assert!(!needs_remeasure(now + 1000, now + 2000, dir.path()), "root untouched since the measurement");
+        assert!(needs_remeasure(now - 60 * MIN, now, dir.path()), "aged out");
+        assert!(needs_remeasure(0, 1, dir.path()), "root modified after the measurement");
     }
 
     #[test]

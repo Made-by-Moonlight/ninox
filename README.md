@@ -71,6 +71,8 @@ Prerequisites. This compiles the whole workspace:
 cargo install ninox-gui ninox-tui
 ```
 
+Ninox launches every Claude Code session with `--settings '{"crossSessionInbound":"accept"}'` so inter-session messages are delivered; sessions started by an older build pick it up on their next restart or resume, and a `hold`/`refuse` in a project's `.claude/settings*.json` or in managed settings still overrides it (the fleet recovery briefing flags that).
+
 ## Build and run
 
 ```bash

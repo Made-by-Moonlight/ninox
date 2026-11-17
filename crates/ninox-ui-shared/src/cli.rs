@@ -782,7 +782,8 @@ enum PlanAction {
     /// JSON (`parent_id` + `sections`), each section optionally adding
     /// `name`, `workspace`, `model`, `brain_reads`, `brain_write`, `linear`
     /// and `await_done`; a null `parent_id` proposes new top-level
-    /// orchestrators. Prints the plan id and node ids. Never spawns: the
+    /// sessions: Orchestrators, or standalone sessions the user owns for any
+    /// other worker type. Prints the plan id and node ids. Never spawns: the
     /// user (or the parent orchestrator) must accept it.
     Propose {
         /// JSON file to read; `-` or omitted reads stdin.
@@ -3004,6 +3005,9 @@ pub(crate) async fn launch_cli_worker(
         .worker_cmd(&agent, permission_mode, &effective_prompt, &claude_session_id)
         .ok_or_else(|| anyhow::anyhow!("harness '{}' has no worker mode", agent.harness))?;
     let cmd = ninox_core::hooks::with_bin_dir_on_path(&cmd_base);
+    if let Some(warning) = registry.cross_session_warning(&agent) {
+        eprintln!("warning: {warning}");
+    }
 
     // A fresh tmux session does *not* inherit the caller's ambient
     // environment — only vars explicitly passed via `-e` (see
@@ -4242,7 +4246,7 @@ pub(crate) async fn launch_orchestrator(
     }
     ninox_core::lifecycle::pane_pid::record_pane_pid(store, &id).await;
 
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<String> = config.registry().cross_session_warning(&agent).into_iter().collect();
     if let Some(brief) = prompt {
         let message = orchestrator_initial_brief(&id, &brief, spawner.as_deref());
         note_initial_prompt(deliver_initial_prompt(store, config, &id, &message, spawner.as_deref()).await, &mut warnings);
@@ -4277,6 +4281,24 @@ pub async fn spawn_standalone_worker(
     agent: ninox_core::config::AgentConfig,
     brain: ninox_core::brain_set::BrainSet,
     prompt: String,
+) -> anyhow::Result<SpawnedSession> {
+    spawn_standalone_worker_opts(store, config, name, workspace_input, worker_type, agent, brain, prompt, false).await
+}
+
+/// [`spawn_standalone_worker`], optionally cutting the session its own
+/// worktree (as the desktop Spawn dialog does) instead of working in the
+/// given directory.
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_standalone_worker_opts(
+    store: &Store,
+    config: &AppConfig,
+    name: String,
+    workspace_input: String,
+    worker_type: Option<String>,
+    agent: ninox_core::config::AgentConfig,
+    brain: ninox_core::brain_set::BrainSet,
+    prompt: String,
+    isolate_worktree: bool,
 ) -> anyhow::Result<SpawnedSession> {
     let id = slugify(&name);
     if id.is_empty() {
@@ -4315,7 +4337,7 @@ pub async fn spawn_standalone_worker(
         task_brief,
         success_criteria: resolved_criteria,
         started_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64,
-        isolate_worktree: false,
+        isolate_worktree,
     };
     let payload = crate::session_queue::QueuedLaunch::Standalone(plan.clone());
     match crate::session_queue::admit(store, ninox_core::store::QueueKind::Spawn, &plan.skeleton(), &payload, false)? {
@@ -4362,11 +4384,13 @@ pub(crate) async fn launch_standalone_worker(
     .map_err(|e| anyhow::anyhow!(e))?;
     // The desktop Spawn dialog cuts each standalone session its own
     // worktree; a queued one from there must get the same when it starts.
+    let mut warnings = Vec::new();
     let workspace = if isolate_worktree {
         match create_worker_worktree(&workspace, &id, inbox_enabled, config).await {
             Ok(path) => path,
             Err(e) => {
                 tracing::warn!("worktree creation failed for {id}, using shared workspace: {e}");
+                warnings.push(format!("couldn't create a worktree for {id} ({e}); it is working in {workspace} directly"));
                 workspace
             }
         }
@@ -4423,7 +4447,7 @@ pub(crate) async fn launch_standalone_worker(
         return Err(e);
     }
 
-    let mut warnings = Vec::new();
+    warnings.extend(config.registry().cross_session_warning(&agent));
     if let Some(prompt) = prompt {
         note_initial_prompt(deliver_initial_prompt(store, config, &id, &prompt, None).await, &mut warnings);
     }
@@ -5885,10 +5909,15 @@ pub fn group_sessions(
 pub(crate) fn render_session_board(
     groups: &[(Option<ninox_core::types::Orchestrator>, Vec<Session>)],
     queue_positions: &std::collections::HashMap<String, usize>,
+    pr_summaries: &std::collections::HashMap<String, String>,
 ) -> String {
     if groups.iter().all(|(_, m)| m.is_empty()) {
         return "no sessions — start one with `ninox orchestrate <name>`".to_string();
     }
+    let pr_label = |s: &Session| {
+        pr_summaries.get(&s.id).cloned().or_else(|| s.pr_number.map(|n| format!("PR #{n}"))).unwrap_or_default()
+    };
+    let pr_w = groups.iter().flat_map(|(_, m)| m).map(|s| pr_label(s).chars().count()).max().unwrap_or(0).max(8);
     let mut out = String::new();
     for (orch, members) in groups {
         match orch {
@@ -5896,13 +5925,13 @@ pub(crate) fn render_session_board(
             None    => out.push_str("(no orchestrator)\n"),
         }
         for s in members {
-            let pr = s.pr_number.map(|n| format!("PR #{n}")).unwrap_or_default();
+            let pr = pr_label(s);
             let status = match queue_positions.get(&s.id) {
                 Some(n) if s.status == SessionStatus::Queued => format!("queued #{n}"),
                 _ => status_slug(&s.status).to_string(),
             };
             out.push_str(&format!(
-                "  {:<24} {:<10} {:<20} {:<8} ${:.2}\n",
+                "  {:<24} {:<10} {:<20} {:<pr_w$} ${:.2}\n",
                 s.id, status, s.repo, pr, s.cost_usd,
             ));
         }
@@ -5978,7 +6007,12 @@ pub(crate) fn run_list_sessions(store: &ninox_core::store::Store, json: bool) ->
         }))?);
     }
     let headline = crate::session_queue::limits_headline(&limits);
-    Ok(format!("{headline}\n{}", render_session_board(&group_sessions(sessions, orchestrators), &positions)))
+    let pr_summaries: std::collections::HashMap<String, String> =
+        ninox_core::session_prs::for_sessions(store, sessions.iter())
+            .into_iter()
+            .filter_map(|(id, prs)| ninox_core::session_prs::summary(&prs).map(|s| (id, s)))
+            .collect();
+    Ok(format!("{headline}\n{}", render_session_board(&group_sessions(sessions, orchestrators), &positions, &pr_summaries)))
 }
 
 /// Core of `ninox capabilities`, split out from arg parsing so it can be
@@ -10034,7 +10068,7 @@ mod list_sessions_tests {
                 test_fixtures::session("w1", Some("boss"), SessionStatus::PrOpen),
             ],
             vec![orch],
-        ), &std::collections::HashMap::new());
+        ), &std::collections::HashMap::new(), &std::collections::HashMap::new());
         assert!(out.contains("boss"), "{out}");
         assert!(out.contains("w1"), "{out}");
         assert!(out.contains("PR #42"), "{out}");
@@ -10043,8 +10077,19 @@ mod list_sessions_tests {
     }
 
     #[test]
+    fn board_shows_the_pr_summary_for_a_session_with_several_prs() {
+        let out = render_session_board(
+            &group_sessions(vec![test_fixtures::session("w1", None, SessionStatus::PrOpen)], vec![]),
+            &std::collections::HashMap::new(),
+            &[("w1".to_string(), "PR bellhop#1466 +3 · 1 failing".to_string())].into(),
+        );
+        assert!(out.contains("PR bellhop#1466 +3 · 1 failing $1.50"), "{out}");
+        assert!(!out.contains("PR #42"), "{out}");
+    }
+
+    #[test]
     fn empty_store_prints_hint() {
-        let out = render_session_board(&group_sessions(vec![], vec![]), &std::collections::HashMap::new());
+        let out = render_session_board(&group_sessions(vec![], vec![]), &std::collections::HashMap::new(), &std::collections::HashMap::new());
         assert!(out.contains("no sessions"), "{out}");
         assert!(out.contains("ninox orchestrate"), "{out}");
     }

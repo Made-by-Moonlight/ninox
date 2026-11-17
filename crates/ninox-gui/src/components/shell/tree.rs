@@ -12,6 +12,7 @@ use iced::{
 use ninox_core::types::{MachineHealth, OrchestratorId, SessionStatus};
 
 use super::tokens;
+use crate::components::pr_chip;
 use crate::{
     app::{App, Message, View},
     components::lifecycle_status,
@@ -127,6 +128,20 @@ fn row_label_plan(row_px: f32, name: &str, right: Option<&str>, retention: Optio
         }
     }
     plan
+}
+
+const SIDEBAR_LABEL_CHARS: usize = 14;
+
+/// How many PR chips a sidebar row can carry (2, then 1, then 0) without
+/// truncating the name. 0 means the row folds to a count chip.
+fn pr_chip_budget(row_px: f32, name: &str, prs: &[ninox_core::session_prs::SessionPr]) -> usize {
+    use pr_chip::width_estimate;
+    let name_px = name.chars().count() as f32 * NAME_CHAR_PX;
+    [2usize, 1]
+        .into_iter()
+        .filter(|_| !prs.is_empty())
+        .find(|&max| name_px + width_estimate(prs, max, SIDEBAR_LABEL_CHARS) + 6.0 <= row_px)
+        .unwrap_or(0)
 }
 
 /// Truncates to `max_chars` including the ellipsis, so the result never
@@ -572,7 +587,16 @@ fn tree_row<'a>(
         + if chevron_toggle.is_some() { 26.0 } else { 0.0 }
         + if unread > 0 { 24.0 } else { 0.0 };
     let right_opt = Some(right).filter(|r| !r.is_empty());
-    let plan = row_label_plan(EXPANDED_WIDTH - fixed_px, name, right_opt, retention_full.as_deref());
+    let session_prs = app.session_prs.get(id).map(Vec::as_slice).unwrap_or_default();
+    let chip_max = pr_chip_budget(EXPANDED_WIDTH - fixed_px, name, session_prs);
+    // A session with PRs always shows a chip: when two or one don't fit beside
+    // the name, it folds to a count chip and the name truncates instead.
+    let chips_px = match (session_prs.is_empty(), chip_max) {
+        (true, _) => 0.0,
+        (false, 0) => pr_chip::count_width_estimate(session_prs) + 6.0,
+        (false, max) => pr_chip::width_estimate(session_prs, max, SIDEBAR_LABEL_CHARS) + 6.0,
+    };
+    let plan = row_label_plan(EXPANDED_WIDTH - fixed_px - chips_px, name, right_opt, retention_full.as_deref());
     let shown_name = name_for_budget(name, plan.name_max_chars);
     let name_truncated = shown_name != name;
 
@@ -622,6 +646,15 @@ fn tree_row<'a>(
                 })
                 .into(),
         );
+    }
+    let chip = if chip_max > 0 {
+        pr_chip::chips(id, session_prs, chip_max, SIDEBAR_LABEL_CHARS, false)
+    } else {
+        pr_chip::count_chip(id, session_prs)
+    };
+    if let Some(chip) = chip {
+        nav_row_items.push(Space::new(6, 0).into());
+        nav_row_items.push(chip);
     }
     if plan.show_right {
         nav_row_items.push(Space::new(6, 0).into());
@@ -704,6 +737,22 @@ fn tree_row<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pr_chips_yield_to_the_name_in_a_narrow_row() {
+        use ninox_core::{pr_events::CiVerdict, session_prs::{PrState, SessionPr}};
+        let pr = |n| SessionPr {
+            repo: "o/bellhop".into(), number: n, url: String::new(), title: String::new(), state: PrState::Open,
+            draft: false, ci: CiVerdict::None, passing: 0, failing: 0, pending: 0,
+            changes_requested: false, approved: false, tracked: false,
+        };
+        let prs = [pr(1), pr(2), pr(3)];
+        assert_eq!(super::pr_chip_budget(1000.0, "worker", &prs), 2);
+        assert_eq!(super::pr_chip_budget(1000.0, "worker", &[]), 0);
+        assert_eq!(super::pr_chip_budget(90.0, "a-name-that-fills-the-row", &prs), 0);
+        let one_fits = 6.0 * 5.8 + super::pr_chip::width_estimate(&prs, 1, super::SIDEBAR_LABEL_CHARS) + 6.0;
+        assert_eq!(super::pr_chip_budget(one_fits, "worker", &prs), 1);
+    }
+
     use super::*;
 
     #[test]
