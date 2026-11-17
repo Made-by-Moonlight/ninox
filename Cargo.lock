@@ -4332,6 +4332,7 @@ dependencies = [
  "objc2-foundation 0.2.2",
  "pulldown-cmark",
  "tempfile",
+ "tiny-skia",
  "tokio",
  "toml",
  "tracing",

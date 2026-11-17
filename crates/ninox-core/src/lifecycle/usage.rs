@@ -27,8 +27,11 @@
 //! to reconcile an invoice.
 
 use std::{
-    io::{BufRead, BufReader},
+    collections::{HashMap, HashSet},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
+    time::SystemTime,
 };
 
 /// A snapshot of a workspace's accumulated `claude` usage, computed by
@@ -136,41 +139,118 @@ fn parse_turn(line: &str) -> Option<TurnUsage> {
     })
 }
 
-/// Sum usage across every `*.jsonl` transcript in `dir` (non-recursive).
-/// Returns `None` if the directory doesn't exist or no assistant-usage
-/// lines were found in it.
-fn ingest_dir(dir: &Path) -> Option<UsageSnapshot> {
-    let entries = std::fs::read_dir(dir).ok()?;
+/// Accumulated usage of one transcript file, valid up to `offset`.
+#[derive(Default, Clone)]
+struct FileState {
+    size:           u64,
+    mtime:          Option<SystemTime>,
+    /// End of the last fully consumed line; the next read starts here.
+    offset:         u64,
+    cost:           f64,
+    found:          bool,
+    latest_ts:      String,
+    latest_context: u64,
+    latest_model:   Option<String>,
+}
 
-    let mut total_cost = 0.0f64;
-    let mut latest_ts   = String::new();
-    let mut latest_context: u64 = 0;
-    let mut latest_model: Option<String> = None;
-    let mut found = false;
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Ok(file) = std::fs::File::open(&path) else { continue };
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
-            let Some(turn) = parse_turn(&line) else { continue };
-            found = true;
-            total_cost += turn_cost_usd(&turn.model, turn.input, turn.output, turn.cache_creation, turn.cache_read);
-            if turn.timestamp >= latest_ts {
-                latest_ts      = turn.timestamp;
-                latest_context = turn.input + turn.cache_creation + turn.cache_read;
-                latest_model   = Some(turn.model);
-            }
+impl FileState {
+    fn apply(&mut self, turn: TurnUsage) {
+        self.found = true;
+        self.cost += turn_cost_usd(&turn.model, turn.input, turn.output, turn.cache_creation, turn.cache_read);
+        if turn.timestamp >= self.latest_ts {
+            self.latest_ts      = turn.timestamp;
+            self.latest_context = turn.input + turn.cache_creation + turn.cache_read;
+            self.latest_model   = Some(turn.model);
         }
     }
 
-    found.then_some(UsageSnapshot {
-        cost_usd:       total_cost,
-        context_tokens: latest_context,
-        model:          latest_model,
-    })
+    /// Consume lines appended since `offset`. A trailing line without a
+    /// newline is only consumed once it parses as a complete turn. Returns
+    /// `false` on an I/O error so the caller retries on the next poll.
+    fn read_appended(&mut self, path: &Path, size: u64) -> bool {
+        let Ok(mut file) = std::fs::File::open(path) else { return false };
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return false;
+        }
+        let mut reader = BufReader::new(file.take(size.saturating_sub(self.offset)));
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            let Ok(n) = reader.read_until(b'\n', &mut buf) else { return false };
+            if n == 0 {
+                return true;
+            }
+            let complete = buf.last() == Some(&b'\n');
+            let turn = std::str::from_utf8(&buf).ok().and_then(parse_turn);
+            if !complete && turn.is_none() {
+                return true;
+            }
+            self.offset += n as u64;
+            if let Some(turn) = turn {
+                self.apply(turn);
+            }
+        }
+    }
+}
+
+/// Per-file incremental state for transcript ingestion, so each poll parses
+/// only the bytes appended since the previous one.
+#[derive(Default)]
+struct UsageCache {
+    files: HashMap<PathBuf, FileState>,
+}
+
+impl UsageCache {
+    /// Sum usage across every `*.jsonl` transcript in `dir` (non-recursive).
+    /// Returns `None` if the directory doesn't exist or no assistant-usage
+    /// lines were found in it.
+    fn ingest_dir(&mut self, dir: &Path) -> Option<UsageSnapshot> {
+        let entries = std::fs::read_dir(dir).ok()?;
+
+        let mut seen = HashSet::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let (size, mtime) = (meta.len(), meta.modified().ok());
+            let state = self.files.entry(path.clone()).or_default();
+            if size < state.offset {
+                *state = FileState::default();
+            }
+            let stale = state.size != size || state.mtime != mtime || state.mtime.is_none();
+            if stale && state.read_appended(&path, size) {
+                state.size  = size;
+                state.mtime = mtime;
+            }
+            seen.insert(path);
+        }
+        self.files.retain(|p, _| p.parent() != Some(dir) || seen.contains(p));
+
+        let mut total_cost = 0.0f64;
+        let mut latest: Option<&FileState> = None;
+        for st in self.files.iter().filter(|(p, _)| p.parent() == Some(dir)).map(|(_, st)| st) {
+            if !st.found {
+                continue;
+            }
+            total_cost += st.cost;
+            if latest.is_none_or(|l| st.latest_ts >= l.latest_ts) {
+                latest = Some(st);
+            }
+        }
+        latest.map(|l| UsageSnapshot {
+            cost_usd:       total_cost,
+            context_tokens: l.latest_context,
+            model:          l.latest_model.clone(),
+        })
+    }
+}
+
+static USAGE_CACHE: LazyLock<Mutex<UsageCache>> = LazyLock::new(Mutex::default);
+
+fn ingest_dir(dir: &Path) -> Option<UsageSnapshot> {
+    USAGE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).ingest_dir(dir)
 }
 
 /// Compute the current usage snapshot for a session's workspace directory,
@@ -317,5 +397,105 @@ mod tests {
         let snap = snap.expect("usage found via projects-dir override");
         assert!(snap.cost_usd > 0.0);
         assert_eq!(snap.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    fn turn(ts: &str, out: u64) -> String {
+        format!(r#"{{"type":"assistant","timestamp":"{ts}","message":{{"model":"claude-haiku-4-5","usage":{{"input_tokens":1,"output_tokens":{out},"cache_creation_input_tokens":0,"cache_read_input_tokens":{out}}}}}}}"#)
+    }
+
+    fn append(path: &Path, text: &str) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn full_reparse(dir: &Path) -> Option<UsageSnapshot> {
+        UsageCache::default().ingest_dir(dir)
+    }
+
+    fn assert_same(a: &Option<UsageSnapshot>, b: &Option<UsageSnapshot>) {
+        let (a, b) = (a.as_ref().unwrap(), b.as_ref().unwrap());
+        assert!((a.cost_usd - b.cost_usd).abs() < 1e-12, "{} vs {}", a.cost_usd, b.cost_usd);
+        assert_eq!(a.context_tokens, b.context_tokens);
+        assert_eq!(a.model, b.model);
+    }
+
+    #[test]
+    fn incremental_appends_match_full_reparse() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        write_jsonl(dir.path(), "s.jsonl", &[&turn("2026-07-05T13:00:00Z", 10)]);
+        write_jsonl(dir.path(), "other.jsonl", &[&turn("2026-07-05T12:00:00Z", 7)]);
+
+        let mut cache = UsageCache::default();
+        cache.ingest_dir(dir.path());
+        for i in 1..5u64 {
+            append(&path, &format!("{}\n", turn(&format!("2026-07-05T13:0{i}:00Z"), 10 + i)));
+            let inc = cache.ingest_dir(dir.path());
+            assert_same(&inc, &full_reparse(dir.path()));
+        }
+        assert_eq!(cache.files[&path].offset, std::fs::metadata(&path).unwrap().len());
+    }
+
+    #[test]
+    fn unchanged_file_is_not_reread() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        write_jsonl(dir.path(), "s.jsonl", &[&turn("2026-07-05T13:00:00Z", 10)]);
+
+        let mut cache = UsageCache::default();
+        let first = cache.ingest_dir(dir.path());
+        // Poison the cached total: an unchanged (size, mtime) must serve it.
+        cache.files.get_mut(&path).unwrap().cost = 123.0;
+        let second = cache.ingest_dir(dir.path());
+        assert_eq!(second.unwrap().cost_usd, 123.0);
+        assert!(first.unwrap().cost_usd < 1.0);
+    }
+
+    #[test]
+    fn partial_trailing_line_is_deferred_until_complete() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let second = turn("2026-07-05T13:01:00Z", 20);
+        write_jsonl(dir.path(), "s.jsonl", &[&turn("2026-07-05T13:00:00Z", 10)]);
+        let (head, tail) = second.split_at(second.len() / 2);
+        append(&path, head);
+
+        let mut cache = UsageCache::default();
+        let partial = cache.ingest_dir(dir.path());
+        assert_eq!(partial.as_ref().unwrap().context_tokens, 1 + 10);
+
+        append(&path, tail);
+        append(&path, "\n");
+        assert_same(&cache.ingest_dir(dir.path()), &full_reparse(dir.path()));
+        assert_eq!(cache.ingest_dir(dir.path()).unwrap().context_tokens, 1 + 20);
+    }
+
+    #[test]
+    fn truncation_resets_to_a_full_reread() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        write_jsonl(dir.path(), "s.jsonl", &[
+            &turn("2026-07-05T13:00:00Z", 500),
+            &turn("2026-07-05T13:01:00Z", 600),
+        ]);
+        let mut cache = UsageCache::default();
+        cache.ingest_dir(dir.path());
+
+        write_jsonl(dir.path(), "s.jsonl", &[&turn("2026-07-05T14:00:00Z", 5)]);
+        let after = cache.ingest_dir(dir.path());
+        assert_same(&after, &full_reparse(dir.path()));
+        assert_eq!(after.unwrap().context_tokens, 1 + 5);
+        assert_eq!(cache.files[&path].offset, std::fs::metadata(&path).unwrap().len());
+    }
+
+    #[test]
+    fn deleted_transcript_stops_counting() {
+        let dir = tempdir().unwrap();
+        write_jsonl(dir.path(), "a.jsonl", &[&turn("2026-07-05T13:00:00Z", 10)]);
+        write_jsonl(dir.path(), "b.jsonl", &[&turn("2026-07-05T14:00:00Z", 20)]);
+        let mut cache = UsageCache::default();
+        cache.ingest_dir(dir.path());
+        std::fs::remove_file(dir.path().join("b.jsonl")).unwrap();
+        assert_same(&cache.ingest_dir(dir.path()), &full_reparse(dir.path()));
     }
 }

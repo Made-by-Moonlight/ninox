@@ -66,10 +66,21 @@ impl DecisionReport {
             }
         }
         if parts.is_empty() {
-            "nothing changed".to_string()
-        } else {
-            parts.join(" · ")
+            return "nothing changed".to_string();
         }
+        let sessions: Vec<&str> = self
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.outcome {
+                NodeOutcome::Spawned { session_id } | NodeOutcome::Queued { session_id, .. } => Some(session_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut out = parts.join(" · ");
+        if !sessions.is_empty() {
+            out.push_str(&format!(" ({})", sessions.join(", ")));
+        }
+        out
     }
 }
 
@@ -301,7 +312,7 @@ async fn spawn_node(
     }
 
     let Some(orchestrator_id) = parent_session else {
-        bail!("a '{}' node needs a parent orchestrator", node.worker_type);
+        return spawn_standalone_node(store, config, node, &brief).await;
     };
     let registry = config.worker_type_registry();
     let spec = crate::cli::resolve_requested_worker_type(&registry, &node.worker_type)
@@ -347,6 +358,33 @@ async fn spawn_node(
         brain: Some(brain),
     };
     crate::cli::admit_and_launch_worker(store, config, launch, false).await
+}
+
+/// A top-level, non-Orchestrator node: an interactive session owned by the
+/// human (no `orchestrator_id`), the same kind the desktop Spawn dialog makes.
+/// Asks for its own worktree; if that can't be made the spawn warns and uses the directory itself.
+async fn spawn_standalone_node(
+    store: &Store,
+    config: &AppConfig,
+    node: &NodeRow,
+    brief: &str,
+) -> anyhow::Result<SpawnedSession> {
+    let registry = config.worker_type_registry();
+    let spec = crate::cli::resolve_requested_worker_type(&registry, &node.worker_type)
+        .map_err(|_| anyhow::anyhow!("worker type '{}' can't be spawned as a standalone session", node.worker_type))?;
+    let agent = crate::spawn_form::resolve_spawn_agent(
+        config, crate::spawn_form::SpawnKind::Standalone, &spec.name, None, node.model.as_deref(),
+    )
+    .agent;
+    let workspace = node.workspace.clone().context("a standalone node needs a workspace")?;
+    let brain = match &node.brain {
+        Some(b) => b.clone(),
+        None => ninox_core::brain_set::resolve_child(store, None, config, &[], None)?,
+    };
+    crate::cli::spawn_standalone_worker_opts(
+        store, config, node.name.clone(), workspace, Some(spec.name.clone()), agent, brain, spec.compose_prompt(brief)?, true,
+    )
+    .await
 }
 
 fn now_ms() -> i64 {

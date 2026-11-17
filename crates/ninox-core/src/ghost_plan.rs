@@ -111,7 +111,8 @@ impl NodeState {
 
 /// `ninox plan propose` input: the `ninox plan generate` JSON shape
 /// (`parent_id` + flat `sections`) plus the optional per-section fields
-/// below. A null/absent `parent_id` proposes new top-level orchestrators.
+/// below. A null/absent `parent_id` proposes new top-level sessions: Orchestrators, or
+/// standalone (human-owned, parentless) sessions for any other type.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Proposal {
@@ -323,12 +324,6 @@ pub fn validate_proposal(
         }
         let Some(ty) = section.worker_type.as_deref() else { continue };
         let is_top = ghost.parent_id == root_id;
-        if root.is_none() && is_top && ty != ORCHESTRATOR {
-            errors.push(perr(
-                "top_level_not_orchestrator",
-                format!("section '{}' is a top-level '{ty}', but a plan with no parent_id can only start Orchestrators", section.id),
-            ));
-        }
         if ty != ORCHESTRATOR && section.workspace.as_deref().is_none_or(|w| w.trim().is_empty()) {
             errors.push(perr("missing_workspace", format!("section '{}' is a '{ty}' and needs a workspace", section.id)));
         }
@@ -525,7 +520,7 @@ pub fn authorize_decision(store: &Store, plan: &PlanRow, caller_session_id: Opti
         bail!("only the user, or an orchestrator for plans under itself, can accept or discard plans — '{caller}' is neither");
     }
     let Some(target) = plan.target_parent.as_deref() else {
-        bail!("plan {} starts new top-level orchestrators — only the user can accept or discard it", plan.id);
+        bail!("plan {} starts new top-level sessions — only the user can accept or discard it", plan.id);
     };
     if is_self_or_descendant(store, target, caller)? {
         Ok(Decider::Orchestrator(caller.to_string()))

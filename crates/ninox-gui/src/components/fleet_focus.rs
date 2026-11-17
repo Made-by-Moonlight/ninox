@@ -28,7 +28,7 @@ use ninox_overview::islands::{Island, IslandKey};
 use ninox_overview::node::{NodeId, NodeKind, OverviewNode, RealNode};
 use ninox_overview::status::MemberStatus;
 
-use super::fleet_islands::{chip_pill, fold_expanded, member_chip, member_status_color, seg_control};
+use super::fleet_islands::{chip_pill, fold_expanded, member_chip_with_prs, member_status_color, seg_control};
 use super::shell::tokens;
 use crate::app::{App, Message};
 
@@ -169,7 +169,7 @@ pub(crate) fn key_hint<'a>(label: &'static str) -> Element<'a, Message> {
 /// note while working, otherwise the same chip `fleet_islands::member_chip`
 /// gives the grid cards (must agree with it — see that function's own doc
 /// comment), `None` for a plain idle/finished member (no extra line).
-fn meta_line<'a>(session: &Session, status: MemberStatus, queue_position: Option<usize>) -> Option<Element<'a, Message>> {
+fn meta_line<'a>(session: &Session, status: MemberStatus, queue_position: Option<usize>, prs: &[ninox_core::session_prs::SessionPr]) -> Option<Element<'a, Message>> {
     if status == MemberStatus::Working {
         if let Some(note) = session.activity_note.as_deref().filter(|n| !n.trim().is_empty()) {
             // Advanced: Inter has no "⚒", and Basic shaping doesn't fall back.
@@ -177,7 +177,7 @@ fn meta_line<'a>(session: &Session, status: MemberStatus, queue_position: Option
         }
         return None;
     }
-    member_chip(status, session, queue_position).map(|(label, bg, fg)| chip_pill(label, bg, fg))
+    member_chip_with_prs(status, session, queue_position, prs).map(|(label, bg, fg)| chip_pill(label, bg, fg))
 }
 
 fn real_card<'a>(app: &'a App, id: &str, status: MemberStatus, is_orchestrator: bool, selected: bool) -> Element<'a, Message> {
@@ -216,8 +216,11 @@ fn real_card<'a>(app: &'a App, id: &str, status: MemberStatus, is_orchestrator: 
         }
     }
     if let Some(session) = session {
-        if let Some(meta) = meta_line(session, status, app.queue_positions.get(id).copied()) {
+        if let Some(meta) = meta_line(session, status, app.queue_positions.get(id).copied(), app.session_prs.get(id).map(Vec::as_slice).unwrap_or_default()) {
             lines.push(meta);
+        }
+        if let Some(prs) = app.session_prs.get(id).and_then(|prs| crate::components::pr_chip::chips(id, prs, 3, crate::components::pr_chip::CARD_LABEL_CHARS, true)) {
+            lines.push(prs);
         }
     }
 

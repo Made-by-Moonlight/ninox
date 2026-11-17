@@ -312,6 +312,35 @@ impl HarnessRegistry {
         Some(build_cmd(&spec, agent, wargs, mode, Some(prompt), claude_session_id))
     }
 
+    /// Why this agent's launch may not end up accepting cross-session
+    /// messages despite ninox's own `--settings`, for the spawn result to
+    /// surface: the harness args carry a `--settings <file>` ninox can't
+    /// merge into, or an inline value other than `accept`. `None` when
+    /// fine or not claude-code.
+    pub fn cross_session_warning(&self, agent: &AgentConfig) -> Option<String> {
+        if agent.harness != CLAUDE_CODE_HARNESS {
+            return None;
+        }
+        let spec = self.spec(&agent.harness);
+        let lists = [Some(&spec.interactive_args), spec.worker_args.as_ref(), Some(&spec.resume_args)];
+        let found = lists.into_iter().flatten().find_map(|args| {
+            let (_, value, _) = find_settings_flag(args)?;
+            match inline_settings(value) {
+                None => Some(format!(
+                    "the claude-code harness args pass `--settings {value}`; ninox can't add {CROSS_SESSION_KEY} to a file, \
+                     so make sure it sets \"{CROSS_SESSION_KEY}\": \"{CROSS_SESSION_ACCEPT}\" or inter-session messages may be held"
+                )),
+                Some(map) => match map.get(CROSS_SESSION_KEY).and_then(|v| v.as_str()) {
+                    Some(v) if v != CROSS_SESSION_ACCEPT => Some(format!(
+                        "the claude-code harness args set {CROSS_SESSION_KEY} to \"{v}\"; inter-session messages to this session will not be delivered"
+                    )),
+                    _ => None,
+                },
+            }
+        });
+        found
+    }
+
     /// Refuses a worker type with `permissions.enabled` on a harness that has
     /// no permission prompts: the profile would be silently ignored and the
     /// session would run unrestricted.
@@ -392,8 +421,81 @@ fn build_cmd(
     if mode == PermissionMode::Standard {
         shape = without_run(&shape, &[CLAUDE_SKIP_PERMISSIONS_FLAG.to_string()]);
     }
-    out.extend(expand_args(&shape, model, prompt, claude_session_id));
+    let mut expanded = expand_args(&shape, model, prompt, claude_session_id);
+    if agent.harness == CLAUDE_CODE_HARNESS {
+        expanded = with_cross_session_accept(expanded);
+    }
+    out.extend(expanded);
     join_cmd(binary, out)
+}
+
+/// The built-in Claude Code harness; the only one that understands
+/// `--settings`.
+pub const CLAUDE_CODE_HARNESS: &str = "claude-code";
+/// Claude Code setting that lets a session receive messages from other
+/// sessions. Its default holds them for a session that bypasses permission
+/// prompts, which every ninox worker does.
+pub const CROSS_SESSION_KEY: &str = "crossSessionInbound";
+pub const CROSS_SESSION_ACCEPT: &str = "accept";
+
+/// The text a shell would pass for a single-quoted token, including the
+/// `'\''` idiom for an embedded quote.
+fn unquote_single(s: &str) -> String {
+    let inner = s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).unwrap_or(s);
+    inner.replace("'\\''", "'")
+}
+
+/// Index of a `--settings <v>` / `--settings=<v>` flag in `args`, with its
+/// value and whether it is the `=` form.
+fn find_settings_flag(args: &[String]) -> Option<(usize, &str, bool)> {
+    args.iter().enumerate().find_map(|(i, a)| {
+        if a == "--settings" {
+            Some((i, args.get(i + 1).map_or("", String::as_str), false))
+        } else {
+            a.strip_prefix("--settings=").map(|v| (i, v, true))
+        }
+    })
+}
+
+/// A `--settings` value that is inline JSON (rather than a file path).
+fn inline_settings(value: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    match serde_json::from_str(&unquote_single(value.trim())) {
+        Ok(serde_json::Value::Object(map)) => Some(map),
+        _ => None,
+    }
+}
+
+/// Make `args` carry `crossSessionInbound: "accept"`. Claude Code takes one
+/// `--settings`, so when the args already hold one with inline JSON the key
+/// is merged into it (a value already there wins); a `--settings <file>` is
+/// left alone, since ninox doesn't own that file (see
+/// [`HarnessRegistry::cross_session_warning`]).
+fn with_cross_session_accept(mut args: Vec<String>) -> Vec<String> {
+    let json = |map: &serde_json::Map<String, serde_json::Value>| shell_quote(&serde_json::Value::Object(map.clone()).to_string());
+    match find_settings_flag(&args) {
+        None => {
+            let map = serde_json::Map::from_iter([(CROSS_SESSION_KEY.to_string(), CROSS_SESSION_ACCEPT.into())]);
+            // Before a `--` prompt separator when there is one, else last.
+            let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+            args.splice(at..at, ["--settings".to_string(), json(&map)]);
+        }
+        Some((i, value, eq)) => {
+            let Some(mut map) = inline_settings(value) else { return args };
+            if !eq && i + 1 >= args.len() {
+                return args;
+            }
+            if map.contains_key(CROSS_SESSION_KEY) {
+                return args;
+            }
+            map.insert(CROSS_SESSION_KEY.to_string(), CROSS_SESSION_ACCEPT.into());
+            if eq {
+                args[i] = format!("--settings={}", json(&map));
+            } else {
+                args[i + 1] = json(&map);
+            }
+        }
+    }
+    args
 }
 
 /// `args` with every contiguous occurrence of `run` removed: a multi-arg
@@ -483,25 +585,25 @@ mod tests {
     #[test]
     fn interactive_cmd_claude_with_model() {
         assert_eq!(reg().interactive_cmd(&agent("claude-code", Some("claude-opus-4-5")), PermissionMode::Standard, "sess-1"),
-                   "claude --session-id 'sess-1' --model 'claude-opus-4-5'");
+                   "claude --session-id 'sess-1' --model 'claude-opus-4-5' --settings '{\"crossSessionInbound\":\"accept\"}'");
     }
 
     #[test]
     fn interactive_cmd_claude_without_model_is_bare() {
         assert_eq!(reg().interactive_cmd(&agent("claude-code", None), PermissionMode::Standard, "sess-1"),
-                   "claude --session-id 'sess-1'");
+                   "claude --session-id 'sess-1' --settings '{\"crossSessionInbound\":\"accept\"}'");
     }
 
     #[test]
     fn worker_cmd_claude_code() {
         assert_eq!(reg().worker_cmd(&agent("claude-code", None), PermissionMode::Bypass, "Fix the bug", "sess-1").unwrap(),
-                   "claude --dangerously-skip-permissions --session-id 'sess-1' -- 'Fix the bug'");
+                   "claude --dangerously-skip-permissions --session-id 'sess-1' --settings '{\"crossSessionInbound\":\"accept\"}' -- 'Fix the bug'");
     }
 
     #[test]
     fn worker_cmd_claude_code_with_model() {
         assert_eq!(reg().worker_cmd(&agent("claude-code", Some("claude-opus-4-5")), PermissionMode::Bypass, "Fix the bug", "sess-1").unwrap(),
-                   "claude --dangerously-skip-permissions --session-id 'sess-1' --model 'claude-opus-4-5' -- 'Fix the bug'");
+                   "claude --dangerously-skip-permissions --session-id 'sess-1' --model 'claude-opus-4-5' --settings '{\"crossSessionInbound\":\"accept\"}' -- 'Fix the bug'");
     }
 
     #[test]
@@ -745,7 +847,7 @@ mod tests {
     fn resume_cmd_claude_code_with_model() {
         assert_eq!(
             reg().resume_cmd(&agent("claude-code", Some("claude-opus-4-5")), PermissionMode::Standard, "sess-1").unwrap(),
-            "claude --resume 'sess-1' --model 'claude-opus-4-5'"
+            "claude --resume 'sess-1' --model 'claude-opus-4-5' --settings '{\"crossSessionInbound\":\"accept\"}'"
         );
     }
 
@@ -753,7 +855,7 @@ mod tests {
     fn resume_cmd_claude_code_without_model() {
         assert_eq!(
             reg().resume_cmd(&agent("claude-code", None), PermissionMode::Standard, "sess-1").unwrap(),
-            "claude --resume 'sess-1'"
+            "claude --resume 'sess-1' --settings '{\"crossSessionInbound\":\"accept\"}'"
         );
     }
 
@@ -782,9 +884,9 @@ mod tests {
     #[test]
     fn resume_carries_the_skip_flag_only_in_bypass_mode() {
         let a = agent("claude-code", Some("m"));
-        assert_eq!(reg().resume_cmd(&a, PermissionMode::Standard, "s").unwrap(), "claude --resume 's' --model 'm'");
+        assert_eq!(reg().resume_cmd(&a, PermissionMode::Standard, "s").unwrap(), "claude --resume 's' --model 'm' --settings '{\"crossSessionInbound\":\"accept\"}'");
         assert_eq!(reg().resume_cmd(&a, PermissionMode::Bypass, "s").unwrap(),
-                   "claude --dangerously-skip-permissions --resume 's' --model 'm'");
+                   "claude --dangerously-skip-permissions --resume 's' --model 'm' --settings '{\"crossSessionInbound\":\"accept\"}'");
     }
 
     #[test]
@@ -809,8 +911,8 @@ mod tests {
         builtin.skip_permissions_args = None;
         let r = HarnessRegistry::from_config(&BTreeMap::from([("claude-code".to_string(), builtin)]));
         let a = agent("claude-code", None);
-        assert_eq!(r.resume_cmd(&a, PermissionMode::Standard, "s").unwrap(), "claude --resume 's'");
-        assert_eq!(r.resume_cmd(&a, PermissionMode::Bypass, "s").unwrap(), "claude --dangerously-skip-permissions --resume 's'");
+        assert_eq!(r.resume_cmd(&a, PermissionMode::Standard, "s").unwrap(), "claude --resume 's' --settings '{\"crossSessionInbound\":\"accept\"}'");
+        assert_eq!(r.resume_cmd(&a, PermissionMode::Bypass, "s").unwrap(), "claude --dangerously-skip-permissions --resume 's' --settings '{\"crossSessionInbound\":\"accept\"}'");
         assert!(!r.worker_cmd(&a, PermissionMode::Standard, "p", "s").unwrap().contains(CLAUDE_SKIP_PERMISSIONS_FLAG));
     }
 
@@ -868,5 +970,95 @@ mod tests {
         assert!(fb.enabled);
         assert_eq!(fb.known_models, vec!["fb-large", "fb-mini"]);
         assert_eq!(fb.models_cmd.as_deref(), Some(&["freebuff".to_string(), "models".to_string()][..]));
+    }
+
+    const ACCEPT: &str = "{\"crossSessionInbound\":\"accept\"}";
+
+    fn registry_with_args(args: &[&str]) -> HarnessRegistry {
+        let mut spec = reg().spec("claude-code");
+        spec.interactive_args = args.iter().map(|s| s.to_string()).collect();
+        spec.worker_args = Some(spec.interactive_args.clone());
+        spec.resume_args = spec.interactive_args.clone();
+        HarnessRegistry::from_config(&BTreeMap::from([("claude-code".to_string(), spec)]))
+    }
+
+    #[test]
+    fn every_claude_launch_kind_carries_cross_session_accept() {
+        let a = agent("claude-code", None);
+        for mode in [PermissionMode::Standard, PermissionMode::Bypass] {
+            for cmd in [
+                reg().interactive_cmd(&a, mode, "s"),
+                reg().worker_cmd(&a, mode, "p", "s").unwrap(),
+                reg().resume_cmd(&a, mode, "s").unwrap(),
+            ] {
+                assert_eq!(cmd.matches("--settings").count(), 1, "{cmd}");
+                assert!(cmd.contains(&format!("--settings '{ACCEPT}'")), "{cmd}");
+            }
+        }
+    }
+
+    #[test]
+    fn other_harnesses_get_no_settings_flag() {
+        for h in ["codex", "pi", "aider"] {
+            let cmd = reg().interactive_cmd(&agent(h, None), PermissionMode::Bypass, "s");
+            assert!(!cmd.contains("--settings"), "{h}: {cmd}");
+        }
+    }
+
+    #[test]
+    fn a_user_inline_settings_flag_gets_the_key_merged_not_a_second_flag() {
+        let a = agent("claude-code", None);
+        for args in [
+            vec!["--settings", "'{\"model\":\"x\"}'", "--session-id", "{session_id}"],
+            vec!["--settings={\"model\":\"x\"}", "--session-id", "{session_id}"],
+        ] {
+            let cmd = registry_with_args(&args).interactive_cmd(&a, PermissionMode::Standard, "s");
+            assert_eq!(cmd.matches("--settings").count(), 1, "{cmd}");
+            assert!(cmd.contains("crossSessionInbound") && cmd.contains("\"model\""), "{cmd}");
+            assert!(cmd.contains("--session-id 's'"), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_user_value_for_the_key_wins() {
+        let a = agent("claude-code", None);
+        let r = registry_with_args(&["--settings", "'{\"crossSessionInbound\":\"refuse\"}'"]);
+        let cmd = r.interactive_cmd(&a, PermissionMode::Standard, "s");
+        assert!(cmd.contains("refuse") && !cmd.contains("accept"), "{cmd}");
+        assert!(r.cross_session_warning(&a).unwrap().contains("refuse"));
+    }
+
+    #[test]
+    fn a_settings_file_arg_is_left_alone_and_warned_about() {
+        let a = agent("claude-code", None);
+        let r = registry_with_args(&["--settings", "/etc/my.json"]);
+        let cmd = r.interactive_cmd(&a, PermissionMode::Standard, "s");
+        assert_eq!(cmd, "claude --settings /etc/my.json");
+        assert!(r.cross_session_warning(&a).unwrap().contains("/etc/my.json"));
+    }
+
+    #[test]
+    fn no_warning_for_defaults_or_other_harnesses() {
+        assert!(reg().cross_session_warning(&agent("claude-code", None)).is_none());
+        assert!(reg().cross_session_warning(&agent("codex", None)).is_none());
+        let r = registry_with_args(&["--settings", "'{\"model\":\"x\"}'"]);
+        assert!(r.cross_session_warning(&agent("claude-code", None)).is_none());
+    }
+
+    #[test]
+    fn an_inline_settings_value_with_an_escaped_quote_is_still_merged() {
+        let a = agent("claude-code", None);
+        let r = registry_with_args(&["--settings", r#"'{"x":"it'\''s"}'"#]);
+        let cmd = r.interactive_cmd(&a, PermissionMode::Standard, "s");
+        assert_eq!(cmd.matches("--settings").count(), 1, "{cmd}");
+        assert!(cmd.contains("crossSessionInbound"), "{cmd}");
+        assert!(r.cross_session_warning(&a).is_none());
+    }
+
+    #[test]
+    fn a_trailing_settings_flag_without_a_value_is_not_duplicated() {
+        let cmd = registry_with_args(&["--session-id", "{session_id}", "--settings"])
+            .interactive_cmd(&agent("claude-code", None), PermissionMode::Standard, "s");
+        assert_eq!(cmd.matches("--settings").count(), 1, "{cmd}");
     }
 }

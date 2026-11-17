@@ -98,13 +98,34 @@ fn status_str(status: &ninox_core::types::SessionStatus) -> &'static str {
     }
 }
 
+/// One `PR` row per PR the session is responsible for (open first), or
+/// the single tracked PR before the store poll has listed them.
+fn pr_fields<'a>(app: &'a App, session: &'a Session) -> Vec<Element<'a, Message>> {
+    let list = app.session_prs.get(&session.id).map(Vec::as_slice).filter(|l| !l.is_empty());
+    if let Some(list) = list {
+        return list
+            .iter()
+            .enumerate()
+            .map(|(i, pr)| link_field(if i == 0 { "PR" } else { "" }, pr_value(pr), pr.url.clone()))
+            .collect();
+    }
+    vec![match (session.pr_number, crate::app::pr_url_for_session(&app.prs, session)) {
+        (Some(n), Some(url)) => link_field("PR", format!("#{n}"), url),
+        (n, _) => field("PR", n.map(|n| format!("#{n}")).unwrap_or("—".into())),
+    }]
+}
+
+fn pr_value(pr: &ninox_core::session_prs::SessionPr) -> String {
+    format!("{} · {}", pr.label(), pr.state_line())
+}
+
 pub fn inspector_panel<'a>(app: &'a App, session: &'a Session) -> Element<'a, Message> {
     let orchestrator_name = session.orchestrator_id.as_deref()
         .and_then(|oid| app.orchestrators.iter().find(|o| o.id == oid))
         .map(|o| o.name.as_str())
         .unwrap_or("—");
 
-    let fields: Vec<Element<Message>> = vec![
+    let mut fields: Vec<Element<Message>> = vec![
         field("Session ID",     session.id.clone()),
         field("Name",           session.name.clone()),
         field("Repository",     session.repo.clone()),
@@ -118,14 +139,13 @@ pub fn inspector_panel<'a>(app: &'a App, session: &'a Session) -> Element<'a, Me
             session.context_total_tokens,
             session.context_window_size,
         )),
-        match (session.pr_number, crate::app::pr_url_for_session(&app.prs, session)) {
-            (Some(n), Some(url)) => link_field("PR", format!("#{n}"), url),
-            (n, _) => field("PR", n.map(|n| format!("#{n}")).unwrap_or("—".into())),
-        },
+    ];
+    fields.extend(pr_fields(app, session));
+    fields.extend([
         field("PID",            session.pid.map(|p| p.to_string()).unwrap_or("—".into())),
         field("Workspace",      session.workspace_path.clone().unwrap_or("—".into())),
         field("Started (unix)", session.started_at.to_string()),
-    ];
+    ]);
 
     let content: Vec<Element<Message>> = fields
         .into_iter()
@@ -157,6 +177,17 @@ pub fn inspector_panel<'a>(app: &'a App, session: &'a Session) -> Element<'a, Me
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr_value_names_the_pr_and_its_state() {
+        let pr = ninox_core::session_prs::SessionPr {
+            repo: "o/bellhop".into(), number: 1473, url: "u".into(), title: String::new(),
+            state: ninox_core::session_prs::PrState::Merged, draft: false,
+            ci: ninox_core::pr_events::CiVerdict::None, passing: 0, failing: 0, pending: 0,
+            changes_requested: false, approved: false, tracked: false,
+        };
+        assert_eq!(pr_value(&pr), "bellhop#1473 · merged");
+    }
 
     #[test]
     fn format_burn_matches_design_spec_example() {

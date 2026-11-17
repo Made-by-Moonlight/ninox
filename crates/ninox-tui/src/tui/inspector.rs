@@ -99,6 +99,55 @@ fn heading(p: &Palette, text: String) -> Line<'static> {
     Line::from(Span::styled(text, Style::default().fg(p.faint).add_modifier(Modifier::BOLD)))
 }
 
+/// `PULL REQUEST`, with the count once there is more than one.
+pub(super) fn pr_heading(count: usize) -> String {
+    if count > 1 { format!("PULL REQUEST · {count}") } else { "PULL REQUEST".to_string() }
+}
+
+/// One entry per PR, open first (the order `session_prs` returns): a state
+/// glyph and `repo#n title`, then an indented state and checks line.
+pub(super) fn pr_entries(prs: &[ninox_core::session_prs::SessionPr]) -> Vec<(String, String)> {
+    use ninox_core::session_prs::PrState;
+    prs.iter()
+        .map(|pr| {
+            let glyph = match (pr.state, pr.draft) {
+                (PrState::Merged, _) => "✓",
+                (PrState::Closed, _) | (PrState::Open, true) => "○",
+                (PrState::Open, false) => "●",
+            };
+            let title = if pr.title.is_empty() { pr.label() } else { format!("{} {}", pr.label(), pr.title) };
+            let mut detail = pr.state_line();
+            if pr.is_open() {
+                if let Some(checks) = pr.checks_line() {
+                    detail = format!("{detail} · {checks}");
+                }
+            }
+            (format!("{glyph} {title}"), detail)
+        })
+        .collect()
+}
+
+fn pr_tone(p: &Palette, pr: &ninox_core::session_prs::SessionPr) -> ratatui::style::Color {
+    use ninox_core::session_prs::PrState;
+    match pr.state {
+        PrState::Merged => p.done,
+        PrState::Closed => p.faint,
+        PrState::Open if pr.failing > 0 || pr.changes_requested => p.ci_failed,
+        PrState::Open if pr.pending > 0 => p.review,
+        PrState::Open if pr.draft => p.faint,
+        PrState::Open => p.working,
+    }
+}
+
+fn push_pr_list(out: &mut Vec<Line<'static>>, p: &Palette, prs: &[ninox_core::session_prs::SessionPr], width: usize) {
+    for (pr, (title, detail)) in prs.iter().zip(pr_entries(prs)) {
+        wrapped(out, &title, width, Style::default().fg(p.ink));
+        for l in wrap(&detail, width.saturating_sub(2)) {
+            out.push(Line::from(Span::styled(format!("  {l}"), Style::default().fg(pr_tone(p, pr)))));
+        }
+    }
+}
+
 /// Word wrap that keeps blank lines and splits a word longer than `width`
 /// (a path, a URL) across lines rather than clipping it.
 fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -212,7 +261,11 @@ pub fn info_lines(st: &TuiState, r: &Row, width: usize) -> Vec<Line<'static>> {
     // `sync_detail_pr` runs once per refresh tick, so a selection change can
     // land before it catches up — only show PR state that is this row's.
     let detail = st.fleet.detail_pr.as_ref().filter(|d| s.pr_id == Some(d.pr_id));
-    if s.pr_number.is_some() || detail.is_some() {
+    if !r.prs.is_empty() {
+        out.push(Line::from(""));
+        out.push(heading(p, pr_heading(r.prs.len())));
+        push_pr_list(&mut out, p, &r.prs, width);
+    } else if s.pr_number.is_some() || detail.is_some() {
         out.push(Line::from(""));
         out.push(heading(p, "PULL REQUEST".into()));
         match detail.and_then(|d| d.pr.as_ref()) {

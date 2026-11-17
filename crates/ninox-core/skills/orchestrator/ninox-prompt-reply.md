@@ -43,12 +43,16 @@ A request that resolves to spawning one clear worker or orchestrator: just
 do it (`{{NINOX_BIN}} spawn` / `{{NINOX_BIN}} spawn-orchestrator`), then
 reply with a short confirmation through `prompt-answer` the same way.
 
-A request that implies multiple sections or dependencies (an epic) is not
-yet wired to the plan-review ghost-node flow — the ghost-node review UI
-exists, but real "approve & spawn" is still a stub pending the
-auto-planning backend. Reply explaining that you can't plan it from the
-prompt yet, and use `{{NINOX_BIN}} request-work` to flag the section/epic
-so it gets properly planned instead of executed as a single step.
+A request for a standalone session ("I need a session to do X in repo Y", no
+orchestrator involved) is a one-section ghost plan: `parent_id` null, a
+non-Orchestrator `worker_type`, a `workspace`. Propose it with
+`{{NINOX_BIN}} plan propose` for the user to accept — it starts a session the
+user owns. Don't offer to parent it under another orchestrator or to start a
+throwaway one.
+
+A request that implies multiple sections or dependencies (an epic): propose
+it as a ghost plan (`{{NINOX_BIN}} plan propose`, see the `plan` skill) and
+tell the user its `plan_id` so they can accept or discard it.
 
 ## What this is not
 

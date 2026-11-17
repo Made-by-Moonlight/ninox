@@ -1,3 +1,5 @@
+pub mod pr_chip;
+pub mod pr_list;
 pub mod brain_edit_view;
 pub mod orchestrator_plans;
 pub mod brain_editor;
@@ -34,6 +36,7 @@ pub mod reap_modal;
 pub mod delete_modal;
 pub mod restore_modal;
 pub mod scrollback;
+pub mod markdown_style;
 pub mod selectable_markdown;
 pub mod session_detail;
 pub mod settings_panel;

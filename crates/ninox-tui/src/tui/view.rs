@@ -236,6 +236,8 @@ fn key_hint(p: &Palette, k: &str, what: &str) -> Vec<Span<'static>> {
 /// Draws the frame; returns the terminal cursor position for the focused pane.
 pub fn draw(f: &mut Frame, st: &TuiState, lay: &Layout) {
     let p = &st.palette;
+    st.chip_hits.borrow_mut().clear();
+    st.chip_scratch.borrow_mut().clear();
     f.render_widget(Block::default().style(Style::default().bg(p.paper).fg(p.ink)), f.area());
     draw_header(f, lay, st);
     let mut cursor = None;
@@ -289,6 +291,12 @@ fn draw_header(f: &mut Frame, lay: &Layout, st: &TuiState) {
             Span::raw(" "),
         ]);
         f.render_widget(Paragraph::new(tab).style(Style::default().bg(bg)), t.rect);
+    }
+    if let Some(r) = lay.settings_button {
+        let on = matches!(st.modal, Some(Modal::Settings));
+        let (glyph, bg) = if on { (Style::default().fg(p.accent), p.highlight) } else { (Style::default().fg(p.ink_2), p.paper) };
+        let line = Line::from(vec![Span::raw(" "), Span::styled("⚙ ", glyph), Span::styled("s", Style::default().fg(p.faint)), Span::raw(" ")]);
+        f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), r);
     }
 
     let dot = |up: bool| Style::default().fg(if up { p.working } else { p.ci_failed });
@@ -347,7 +355,14 @@ fn draw_header(f: &mut Frame, lay: &Layout, st: &TuiState) {
             c
         })
         .find(|c| spans_width(c) < text.width as usize)
-        .unwrap_or(health);
+        // Too narrow even for the labels: one dot, red if either is down.
+        .unwrap_or_else(|| {
+            if spans_width(&health) <= text.width as usize {
+                health
+            } else {
+                vec![Span::styled("●", dot(st.ptyd == PtydState::Up && st.daemon_up))]
+            }
+        });
     f.render_widget(Paragraph::new(Line::from(right).alignment(Alignment::Right)), text);
 }
 
@@ -1502,7 +1517,9 @@ fn draw_fleet_tree(f: &mut Frame, st: &TuiState, area: Rect) {
     };
     let rows = fleet::tree_rows(&st.rows, &needs, &fold);
     let selected = st.selected_id();
+    st.chip_scratch.borrow_mut().clear();
     let lines: Vec<Line> = rows.iter().map(|row| tree_line(st, row, selected.as_deref())).collect();
+    super::pr_chips::register(st, &lines, Rect { width: area.width.saturating_sub(1), ..area }, false);
     let border_color = if st.fleet.main_focus == fleet::FleetFocus::Tree { p.working } else { p.rule };
     let block = Block::default().borders(Borders::RIGHT).border_style(Style::default().fg(border_color));
     f.render_widget(Paragraph::new(lines).block(block), area);
@@ -1538,7 +1555,7 @@ fn tree_line(st: &TuiState, row: &fleet::TreeRow, selected: Option<&str>) -> Lin
             let caret = if is_orch { if is_open { "▾ " } else { "▸ " } } else { "" };
             let status = classify_member(&r.session, false);
             let dot_color = fleet::member_status_color(status, p);
-            let tag = fleet::member_tag(status, r, p);
+            let tag = fleet::member_tag(status, r, p).filter(|_| !super::pr_chips::replaces_pr_tag(r));
             let mut spans = vec![
                 Span::styled(indent, Style::default().add_modifier(sel_mod)),
                 Span::styled(caret, Style::default().fg(p.faint).add_modifier(sel_mod)),
@@ -1548,6 +1565,9 @@ fn tree_line(st: &TuiState, row: &fleet::TreeRow, selected: Option<&str>) -> Lin
             if let Some((text, color)) = tag {
                 spans.push(Span::styled(text, Style::default().fg(color).add_modifier(sel_mod)));
             }
+            let used: usize = spans.iter().map(|s| s.content.width()).sum();
+            let tree_w = st.layout.fleet.as_ref().map_or(30, |f| f.tree.width as usize).saturating_sub(1);
+            spans.extend(super::pr_chips::spans(st, r, 1, sel_mod, tree_w.saturating_sub(used)));
             if is_orch {
                 let count = st.rows.iter().filter(|w| w.group.as_deref() == Some(r.id()) && !w.is_orchestrator).count();
                 if count > 0 {
@@ -1624,9 +1644,12 @@ fn member_row_line(st: &TuiState, m: &ninox_overview::islands::IslandMember, is_
     let rail = if is_last { "└ " } else { "├ " };
     let row = st.rows.iter().find(|r| r.id() == m.id);
     let name = row.map(|r| r.session.name.as_str()).unwrap_or(m.id.as_str());
-    let tag = row.and_then(|r| fleet::member_tag(m.status, r, p));
+    let tag = row.and_then(|r| fleet::member_tag(m.status, r, p).filter(|_| !super::pr_chips::replaces_pr_tag(r)));
+    const MEMBER_CHIP_BUDGET: usize = 22;
+    let chips = row.map(|r| super::pr_chips::fitting(r.id(), &r.prs, 1, MEMBER_CHIP_BUDGET)).unwrap_or_default();
+    let chips_w: usize = chips.iter().map(|c| c.0.chars().count() + 1).sum();
     let dot_color = fleet::member_status_color(m.status, p);
-    let budget = 34usize.saturating_sub(tag.as_ref().map(|(t, _)| t.chars().count()).unwrap_or(0));
+    let budget = 34usize.saturating_sub(tag.as_ref().map(|(t, _)| t.chars().count()).unwrap_or(0) + chips_w);
     let mut spans = vec![
         Span::styled(rail, Style::default().fg(p.faint)),
         Span::styled("● ", Style::default().fg(dot_color)),
@@ -1634,6 +1657,9 @@ fn member_row_line(st: &TuiState, m: &ninox_overview::islands::IslandMember, is_
     ];
     if let Some((text, color)) = tag {
         spans.push(Span::styled(text, Style::default().fg(color)));
+    }
+    if let Some(r) = row {
+        spans.extend(super::pr_chips::spans(st, r, 1, Modifier::empty(), MEMBER_CHIP_BUDGET));
     }
     Line::from(spans)
 }
@@ -1665,7 +1691,9 @@ fn draw_island_box(f: &mut Frame, st: &TuiState, area: Rect, island: &Island) {
     if let Some(machine) = &island.machine {
         lines.push(remote_band_line(st, machine));
     }
+    st.chip_scratch.borrow_mut().clear();
     lines.extend(island_rows(st, island));
+    super::pr_chips::register(st, &lines, inner, true);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
@@ -1996,9 +2024,10 @@ fn draw_fleet_detail(f: &mut Frame, st: &TuiState, area: Rect) {
         if let Some(b) = branch {
             artifacts.push(format!("branch {b}"));
         }
-        match row.session.pr_number {
-            Some(n) => artifacts.push(format!("PR #{n}")),
-            None => artifacts.push("no PR yet".to_string()),
+        match (ninox_core::session_prs::summary(&row.prs), row.session.pr_number) {
+            (Some(summary), _) => artifacts.push(summary),
+            (None, Some(n)) => artifacts.push(format!("PR #{n}")),
+            (None, None) => artifacts.push("no PR yet".to_string()),
         }
         lines.push(Line::from(artifacts.join(" · ")));
 
@@ -2027,14 +2056,22 @@ fn draw_fleet_detail(f: &mut Frame, st: &TuiState, area: Rect) {
         let detail = st.fleet.detail_pr.as_ref().filter(|d| row.session.pr_id == Some(d.pr_id));
         if let Some(detail) = detail {
             lines.push(Line::from(""));
-            if let Some(pr) = &detail.pr {
+            if !row.prs.is_empty() {
+                lines.push(Line::from(Span::styled(super::inspector::pr_heading(row.prs.len()), Style::default().fg(p.faint))));
+                for (title, detail) in super::inspector::pr_entries(&row.prs) {
+                    lines.push(Line::from(Span::styled(title, Style::default().fg(p.ink_2))));
+                    lines.push(Line::from(Span::styled(format!("  {detail}"), Style::default().fg(p.faint))));
+                }
+            } else if let Some(pr) = &detail.pr {
                 lines.push(Line::from(Span::styled(format!("#{} {}", pr.number, pr.title), Style::default().fg(p.ink_2))));
             } else if let Some(n) = row.session.pr_number {
                 lines.push(Line::from(Span::styled(format!("PR #{n}"), Style::default().fg(p.ink_2))));
             }
-            if let Some(ci) = &detail.ci {
-                let color = if ci.failing > 0 { p.ci_failed } else if ci.pending > 0 { p.review } else { p.working };
-                lines.push(Line::from(Span::styled(format!("{}/{} checks passing", ci.passing, ci.total), Style::default().fg(color))));
+            if row.prs.is_empty() {
+                if let Some(ci) = &detail.ci {
+                    let color = if ci.failing > 0 { p.ci_failed } else if ci.pending > 0 { p.review } else { p.working };
+                    lines.push(Line::from(Span::styled(format!("{}/{} checks passing", ci.passing, ci.total), Style::default().fg(color))));
+                }
             }
             if !detail.comments.is_empty() {
                 lines.push(Line::from(Span::styled(format!("Comments · {}", detail.comments.len()), Style::default().fg(p.faint))));
@@ -2183,15 +2220,26 @@ fn draw_board(f: &mut Frame, st: &TuiState, lay: &Layout) {
                     _ => full,
                 }
             });
-            let tail_w = queued.as_ref().map_or(if row.session.pr_number.is_some() { 9 } else { 2 }, |q| q.chars().count() + 2);
+            let chip_budget = (inner.width as usize).saturating_sub(2 + row.session.name.chars().count().min(10));
+            let pr_chips = if queued.is_none() { super::pr_chips::fitting(row.id(), &row.prs, 1, chip_budget) } else { Vec::new() };
+            let chips_w: usize = pr_chips.iter().map(|c| c.0.chars().count() + 1).sum();
+            let tail_w = queued.as_ref().map_or(
+                if chips_w > 0 { chips_w + 2 } else if row.session.pr_number.is_some() { 9 } else { 2 },
+                |q| q.chars().count() + 2,
+            );
             let name_w = (inner.width as usize).saturating_sub(tail_w);
             spans.push(Span::styled(truncate(&row.session.name, name_w), Style::default().fg(p.ink)));
             if let Some(q) = queued {
                 spans.push(Span::styled(q, Style::default().fg(p.faint)));
+            } else if !pr_chips.is_empty() {
+                st.chip_scratch.borrow_mut().clear();
+                spans.extend(super::pr_chips::spans(st, row, 1, Modifier::empty(), chip_budget));
             } else if let Some(pr) = row.session.pr_number {
                 spans.push(Span::styled(format!(" #{pr}"), Style::default().fg(p.ink_2)));
             }
-            f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)), line_area);
+            let line = Line::from(spans);
+            super::pr_chips::register(st, std::slice::from_ref(&line), line_area, false);
+            f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), line_area);
         }
         if rows.is_empty() && inner.height > 0 {
             f.render_widget(Paragraph::new(Span::styled(" empty", Style::default().fg(p.faint))), Rect { height: 1, ..inner });
@@ -2881,6 +2929,33 @@ fn highlight_terms(text: &str, query: &str, p: &super::palette::Palette, plain_f
     out
 }
 
+fn draw_settings_bar(f: &mut Frame, sl: &super::layout::SettingsLayout, st: &TuiState) {
+    use super::layout::SettingsBarLine;
+    let p = &st.palette;
+    let v = &st.settings;
+    for (k, line) in sl.bar_lines.iter().skip(sl.bar_offset).take(sl.bar.height as usize).enumerate() {
+        let r = Rect { y: sl.bar.y + k as u16, height: 1, ..sl.bar };
+        let text = match *line {
+            SettingsBarLine::Gap => continue,
+            SettingsBarLine::Heading(h) => Line::from(Span::styled(h.to_uppercase(), Style::default().fg(p.faint).add_modifier(Modifier::BOLD))),
+            SettingsBarLine::Section(s) => {
+                let sel = s == v.section;
+                let focused = sel && !v.in_fields;
+                if focused {
+                    fill(f, r, p.highlight);
+                }
+                let mark = if sel { Span::styled(if focused { "▌ " } else { "▏ " }, Style::default().fg(p.accent)) } else { Span::raw("  ") };
+                let style = if sel { Style::default().fg(p.ink).add_modifier(Modifier::BOLD) } else { Style::default().fg(p.ink_2) };
+                Line::from(vec![mark, Span::styled(truncate(s.title(), r.width.saturating_sub(2) as usize), style)])
+            }
+        };
+        f.render_widget(Paragraph::new(text), r);
+    }
+    let rule = Rect { x: sl.bar.right() + 1, width: 1, ..sl.bar };
+    let col: Vec<Line> = (0..rule.height).map(|_| Line::from(Span::styled("│", Style::default().fg(p.rule)))).collect();
+    f.render_widget(Paragraph::new(col), rule);
+}
+
 fn draw_settings(f: &mut Frame, lay: &Layout, st: &TuiState) {
     use super::layout::SettingsLine;
     use super::settings::Kind;
@@ -2906,7 +2981,25 @@ fn draw_settings(f: &mut Frame, lay: &Layout, st: &TuiState) {
             f.render_widget(Paragraph::new(Span::styled(format!("✗ {e} — changes are not saved until it does"), Style::default().fg(p.ci_failed))), r);
         }
     }
-    let label_w = super::layout::SETTINGS_LABEL_W as usize;
+    draw_settings_bar(f, sl, st);
+    let section = v.section;
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(section.title(), Style::default().fg(p.ink).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled(truncate(section.blurb(), sl.title.width as usize), Style::default().fg(p.ink_2))),
+        ]),
+        sl.title,
+    );
+    f.render_widget(Paragraph::new(Span::styled(super::layout::SETTINGS_CLOSE_LABEL, Style::default().fg(p.ink).bg(p.paper_2).add_modifier(Modifier::BOLD))), sl.close);
+    let hint = if v.editing.is_some() {
+        "↵ save · esc cancel"
+    } else if v.in_fields {
+        "↑↓ field · ↵ change · ←/→ cycle · tab sections · e config · esc back"
+    } else {
+        "↑↓ section · →/↵/tab fields · e config · esc close"
+    };
+    f.render_widget(Paragraph::new(Span::styled(truncate(hint, sl.hint.width as usize), faint)), sl.hint);
+    let label_w = sl.label_w as usize;
     let w = sl.list.width as usize;
     for (k, line) in sl.lines.iter().skip(sl.offset).take(sl.list.height as usize).enumerate() {
         let r = Rect { y: sl.list.y + k as u16, height: 1, ..sl.list };
@@ -2915,11 +3008,13 @@ fn draw_settings(f: &mut Frame, lay: &Layout, st: &TuiState) {
             SettingsLine::Heading(h) => Line::from(Span::styled(h.to_uppercase(), faint.add_modifier(Modifier::BOLD))),
             SettingsLine::Error => {
                 let e = v.error.clone().unwrap_or_default();
-                Line::from(Span::styled(truncate(&format!("{}✗ {e}", " ".repeat(label_w + 2)), w), Style::default().fg(p.ci_failed)))
+                // Under the value when the message fits there, else from the label's edge.
+                let indent = if label_w + 2 + 2 + e.chars().count() <= w { label_w + 2 } else { 2 };
+                Line::from(Span::styled(truncate(&format!("{}✗ {e}", " ".repeat(indent)), w), Style::default().fg(p.ci_failed)))
             }
             SettingsLine::Field(i) => {
                 let Some(fd) = v.fields.get(i) else { continue };
-                let sel = i == v.selected;
+                let sel = i == v.selected && v.in_fields;
                 if sel {
                     fill(f, r, p.highlight);
                 }
@@ -3644,12 +3739,9 @@ fn draw_modal(f: &mut Frame, area: Rect, st: &TuiState, lay: &Layout, modal: &Mo
             f.render_widget(Paragraph::new(Span::styled("type to filter · tab state · ↑↓ move · ↵ open · esc close", faint)), hint);
         }
         Modal::Settings => {
-            let r = centered(area, (area.width * 4 / 5).clamp(60, 120), (area.height * 4 / 5).clamp(14, 40));
-            f.render_widget(Clear, r);
-            let block = modal_block(p, "settings");
-            let inner = block.inner(r);
-            f.render_widget(block, r);
-            let sl = super::layout::settings(inner, st);
+            f.render_widget(Clear, area);
+            f.render_widget(modal_block(p, "settings"), area);
+            let sl = super::layout::settings(super::layout::settings_area(area), st);
             let modal_lay = Layout { settings: Some(sl), ..Default::default() };
             draw_settings(f, &modal_lay, st);
         }
@@ -3772,8 +3864,8 @@ mod tests {
         let w2 = ninox_ui_shared::cli::test_fixtures::session("w2", None, S::Mergeable);
         let st = TuiState {
             rows: vec![
-                Row { session: w1, is_orchestrator: false, group: None, machine_health: None , queue_position: None},
-                Row { session: w2, is_orchestrator: false, group: None, machine_health: None , queue_position: None},
+                Row { session: w1, is_orchestrator: false, group: None, machine_health: None , queue_position: None, prs: Vec::new()},
+                Row { session: w2, is_orchestrator: false, group: None, machine_health: None , queue_position: None, prs: Vec::new()},
             ],
             view: View::Board,
             ..Default::default()
@@ -3786,6 +3878,67 @@ mod tests {
         assert!(out.contains("w2"), "{out}");
     }
 
+    fn chip_fixture(view: View) -> TuiState {
+        use ninox_core::session_prs::{PrState, SessionPr};
+        let pr = |n, state| SessionPr {
+            repo: "o/bellhop".into(), number: n, url: format!("https://github.com/o/bellhop/pull/{n}"), title: String::new(),
+            state, draft: false, ci: ninox_core::pr_events::CiVerdict::Passed, passing: 1, failing: 0, pending: 0,
+            changes_requested: false, approved: false, tracked: false,
+        };
+        let mut w1 = ninox_ui_shared::cli::test_fixtures::session("w1", None, ninox_core::types::SessionStatus::PrOpen);
+        w1.pr_number = Some(1466);
+        let mut row = Row::test_row("w1");
+        row.session = w1;
+        row.prs = vec![pr(1466, PrState::Open), pr(1473, PrState::Open), pr(900, PrState::Merged)];
+        let mut st = TuiState { rows: vec![row], view, ..Default::default() };
+        st.fleet.sync(&st.rows.clone(), &std::collections::HashMap::new());
+        st
+    }
+
+    /// Writes the rendered frame to `$NINOX_SHOT_DIR/<name>.txt` when set.
+    fn dump(name: &str, frame: &str) {
+        if let Ok(dir) = std::env::var("NINOX_SHOT_DIR") {
+            std::fs::write(std::path::Path::new(&dir).join(format!("{name}.txt")), frame).unwrap();
+        }
+    }
+
+    fn click_at(st: &mut TuiState, x: u16, y: u16) -> crate::tui::state::Action {
+        use crate::tui::state::handle_mouse;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let ev = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE };
+        handle_mouse(st, ev)
+    }
+
+    #[test]
+    fn board_card_shows_pr_chips_and_clicking_one_opens_the_pr_without_selecting_the_card() {
+        let mut st = chip_fixture(View::Board);
+        let out = render(&st, 160, 20);
+        dump("tui-board", &out);
+        assert!(out.contains("[bellhop#1466]"), "a Board column is narrow, so the lead chip stays and +N yields:\n{out}");
+        st.layout = layout::compute(ratatui::layout::Rect::new(0, 0, 160, 20), &st);
+        let (rect, target) = st.chip_hits.borrow().iter().find(|(_, t)| matches!(t, crate::tui::pr_chips::ChipTarget::Open(_))).cloned().expect("an open chip");
+        assert_eq!(target, crate::tui::pr_chips::ChipTarget::Open("https://github.com/o/bellhop/pull/1466".into()));
+        let before = (st.kanban.col, st.kanban.row, st.selected);
+        let action = click_at(&mut st, rect.x + 1, rect.y);
+        assert!(matches!(&action, crate::tui::state::Action::OpenUrl(u) if u == "https://github.com/o/bellhop/pull/1466"), "{action:?}");
+        assert_eq!((st.kanban.col, st.kanban.row, st.selected), before, "the card underneath was not selected");
+    }
+
+    #[test]
+    fn fleet_tree_chips_are_clickable_and_plus_n_opens_the_session() {
+        let mut st = chip_fixture(View::Fleet);
+        dump("tui-fleet", &render(&st, 160, 24));
+        st.layout = layout::compute(ratatui::layout::Rect::new(0, 0, 160, 40), &st);
+        let hits: Vec<_> = st.chip_hits.borrow().clone();
+        assert!(hits.iter().any(|(_, t)| matches!(t, crate::tui::pr_chips::ChipTarget::Open(_))), "{hits:?}");
+        let (rect, _) = hits.iter().find(|(_, t)| matches!(t, crate::tui::pr_chips::ChipTarget::Open(_))).unwrap().clone();
+        assert!(matches!(click_at(&mut st, rect.x, rect.y), crate::tui::state::Action::OpenUrl(_)));
+        let (more, _) = hits.iter().find(|(_, t)| matches!(t, crate::tui::pr_chips::ChipTarget::More(_))).unwrap().clone();
+        let action = click_at(&mut st, more.x, more.y);
+        assert!(!matches!(action, crate::tui::state::Action::OpenUrl(_)), "{action:?}");
+        assert!(st.inspector, "+N opens the session with its inspector");
+    }
+
     #[test]
     fn board_scrolls_the_selected_column_so_the_cursor_stays_visible() {
         use ninox_core::types::SessionStatus as S;
@@ -3794,7 +3947,7 @@ mod tests {
                 session: ninox_ui_shared::cli::test_fixtures::session(&format!("w{i}"), None, S::Working),
                 is_orchestrator: false,
                 group: None,
-                machine_health: None, queue_position: None,
+                machine_health: None, queue_position: None, prs: Vec::new(),
             })
             .collect();
         let mut st = TuiState { rows, view: View::Board, ..Default::default() };
@@ -3951,15 +4104,75 @@ mod tests {
         assert!(out.contains("No plans pending"), "{out}");
     }
 
-    #[test]
-    fn settings_modal_renders_the_field_list() {
-        let _iso = ninox_core::test_isolation::isolate();
+    fn settings_state(section: ninox_ui_shared::settings_form::SettingsSection) -> TuiState {
         let mut st = st_with(&["alpha"]);
         st.settings.reload(Ok(Default::default()));
+        st.settings.select_section(section);
         st.modal = Some(Modal::Settings);
-        let out = render(&st, 140, 50);
-        assert!(out.contains("SESSION RUNTIME") && out.contains("Runtime for new sessions"), "{out}");
-        assert!(out.contains("‹ tmux ›"), "the selected choice shows its arrows: {out}");
+        st
+    }
+
+    #[test]
+    fn settings_page_shows_the_section_bar_and_the_selected_sections_fields() {
+        use ninox_ui_shared::settings_form::SettingsSection;
+        let _iso = ninox_core::test_isolation::isolate();
+        let out = render(&settings_state(SettingsSection::Runtime), 140, 50);
+        for t in ["GENERAL", "SESSIONS", "SYSTEM", "Appearance", "Agents", "Harnesses", "Messaging", "Session runtime", "Session limits", "Terminal", "Fleet", "Engine", "Version"] {
+            assert!(out.contains(t), "{t} missing from the bar:\n{out}");
+        }
+        assert!(out.contains("Runtime for new sessions") && out.contains("tmux"), "{out}");
+        assert!(!out.contains("Colours"), "another section's fields are not listed:\n{out}");
+        let mut st = settings_state(SettingsSection::Runtime);
+        st.settings.in_fields = true;
+        assert!(render(&st, 140, 50).contains("‹ tmux ›"), "the selected choice shows its arrows");
+    }
+
+    #[test]
+    fn settings_page_at_80x24_fits_the_bar_fields_and_hint() {
+        use ninox_ui_shared::settings_form::SettingsSection;
+        let _iso = ninox_core::test_isolation::isolate();
+        let out = render(&settings_state(SettingsSection::Agents), 80, 24);
+        println!("{out}");
+        for t in ["Appearance", "Version", "Orchestrator harness", "Worker model", "↑↓ section", "✕ close", "$EDITOR"] {
+            assert!(out.contains(t), "{t} missing at 80x24:\n{out}");
+        }
+    }
+
+    #[test]
+    fn settings_page_at_a_wide_size_puts_the_help_beside_the_fields() {
+        use ninox_ui_shared::settings_form::SettingsSection;
+        let _iso = ninox_core::test_isolation::isolate();
+        let mut st = settings_state(SettingsSection::Messaging);
+        st.settings.in_fields = true;
+        let out = render(&st, 200, 40);
+        println!("{out}");
+        assert!(out.contains("Send mechanism") && out.contains("Consolidated PR watching"), "{out}");
+    }
+
+    #[test]
+    fn settings_page_shows_a_refused_change_under_its_field_and_the_load_error() {
+        use ninox_ui_shared::settings_form::SettingsSection;
+        let _iso = ninox_core::test_isolation::isolate();
+        let mut st = settings_state(SettingsSection::Engine);
+        st.settings.in_fields = true;
+        st.settings.error = Some("port must be 1-65535".into());
+        assert!(render(&st, 80, 24).contains("✗ port must be 1-65535"));
+        st.settings.reload(Err("expected `=`".into()));
+        assert!(render(&st, 80, 24).contains("✗ expected `=`"));
+    }
+
+    #[test]
+    fn header_shows_the_settings_entry_at_80_columns() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let st = st_with(&["alpha"]);
+        let out = render(&st, 80, 24);
+        let first = out.lines().next().unwrap_or_default();
+        println!("{first}");
+        assert!(first.contains("⚙ s"), "{first}");
+        assert!(!first.contains("pt"), "no clipped status label: {first}");
+        for tab in ["Fleet", "Board", "Plans", "Brain", "Types", "Remotes"] {
+            assert!(first.contains(tab), "{tab} missing: {first}");
+        }
     }
 
     #[test]
@@ -4074,7 +4287,7 @@ mod tests {
         for gone in ["PRs tab", "Graph tab", "overview grid", "settings · graph", "1-7"] {
             assert!(!out.contains(gone), "stale reference to the old shell: {gone}\n{out}");
         }
-        for present in ["Board tab", "Settings (not a tab", "1-6", "hide/show the tree"] {
+        for present in ["Board tab", "Settings (press s", "1-6", "hide/show the tree"] {
             assert!(out.contains(present), "{present} missing:\n{out}");
         }
     }
@@ -4409,7 +4622,7 @@ mod tests {
                 session: ninox_core::types::Session { name: "orch2".into(), ..ninox_ui_shared::cli::test_fixtures::session("orch2", Some("orch2"), S::PrOpen) },
                 is_orchestrator: true,
                 group: Some("orch2".into()),
-                machine_health: None, queue_position: None,
+                machine_health: None, queue_position: None, prs: Vec::new(),
             };
             let mut st = TuiState { rows: vec![row], palette, ..Default::default() };
             st.fleet.sync(&st.rows.clone(), &std::collections::HashMap::new());
@@ -4529,7 +4742,7 @@ mod tests {
             session: ninox_core::types::Session { name: format!("{id} with a rather long name"), ..session(id, orch, status) },
             is_orchestrator: orch == Some(id),
             group: orch.map(str::to_string),
-            machine_health: None, queue_position: None,
+            machine_health: None, queue_position: None, prs: Vec::new(),
         };
         let mut rows = vec![
             row("orch", Some("orch"), S::Working),
@@ -4639,10 +4852,13 @@ mod tests {
         for tab in ["1 Fleet", "2 Board", "3 Plans", "4 Brain", "5 Types", "6 Remotes"] {
             assert!(header.contains(tab), "all tabs fit at 80 columns: {header}");
         }
-        // At a width with real margin, the status strip still degrades
-        // gracefully (down to just the health dots) rather than vanishing.
+        // The `⚙ s` entry takes five columns after the tabs, so the labelled
+        // status strip needs 100 columns; narrower it degrades to one health
+        // dot rather than vanishing or clipping a label.
+        let header = render(&st, 100, 24).lines().next().unwrap().to_string();
+        assert!(header.contains("ptyd"), "the status strip must still show something at 100 columns: {header}");
         let header = render(&st, 90, 24).lines().next().unwrap().to_string();
-        assert!(header.contains("ptyd"), "the status strip must still show something at 90 columns: {header}");
+        assert!(header.contains('●') && header.contains("⚙ s"), "{header}");
     }
 
     #[test]
@@ -4725,6 +4941,35 @@ mod tests {
             assert!(out.contains(want), "{want} missing:\n{out}");
         }
         assert!(out.contains("Please split this function") && out.contains("sixty characters"), "the comment is plain text and never cut:\n{out}");
+    }
+
+    #[test]
+    fn inspector_info_lists_every_pr_of_a_session_open_first() {
+        use ninox_core::pr_events::CiVerdict;
+        use ninox_core::session_prs::{PrState, SessionPr};
+        let _iso = ninox_core::test_isolation::isolate();
+        let mut st = inspected(crate::tui::inspector::Tab::Info);
+        let pr = |repo: &str, n, title: &str, state, passing, pending| SessionPr {
+            repo: repo.into(), number: n, url: String::new(), title: title.into(), state,
+            draft: false, ci: CiVerdict::Pending, passing, failing: 0, pending,
+            changes_requested: false, approved: false, tracked: false,
+        };
+        st.rows[0].session.pr_number = Some(1466);
+        st.rows[0].prs = vec![
+            pr("o/bellhop", 1466, "Spoke sizing", PrState::Open, 28, 25),
+            pr("o/manifests", 988, "Enable eus2", PrState::Open, 3, 0),
+            pr("o/manifests", 989, "Enable euc1", PrState::Merged, 3, 0),
+        ];
+
+        let out = render(&st, 200, 80);
+        dump("tui-inspector", &out);
+
+        for want in ["PULL REQUEST · 3", "● bellhop#1466 Spoke sizing", "open · 28/53 checks passing",
+                     "● manifests#988 Enable eus2", "✓ manifests#989 Enable euc1", "  merged"] {
+            assert!(out.contains(want), "{want} missing:\n{out}");
+        }
+        let (a, b) = (out.find("bellhop#1466").unwrap(), out.find("manifests#989").unwrap());
+        assert!(a < b, "open PRs come before merged ones:\n{out}");
     }
 
     #[test]
@@ -5552,7 +5797,7 @@ mod tests {
             is_orchestrator: false,
             group: None,
             machine_health: None,
-            queue_position: None,
+            queue_position: None, prs: Vec::new(),
         };
         let st = TuiState {
             view: View::UserRequests,

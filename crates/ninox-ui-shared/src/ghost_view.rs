@@ -24,7 +24,7 @@ pub fn load(store: &Store, now_ms: i64) -> Vec<PlanWithNodes> {
 /// Arbitrary; long enough to see what happened after a break.
 const RECENT_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// Pending plans that start new top-level orchestrators: each is drawn as
+/// Pending plans that start new top-level sessions: each is drawn as
 /// its own dashed ghost island in Fleet.
 pub fn ghost_islands(plans: &[PlanWithNodes]) -> Vec<&PlanWithNodes> {
     plans.iter().filter(|p| p.plan.status == PlanStatus::Pending && p.plan.target_parent.is_none()).collect()

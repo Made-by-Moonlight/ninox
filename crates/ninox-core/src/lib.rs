@@ -38,6 +38,7 @@ pub mod remote;
 pub mod runtime;
 pub mod server_control;
 pub mod session_limits;
+pub mod session_prs;
 pub mod session_socket;
 pub mod store;
 pub mod test_isolation;

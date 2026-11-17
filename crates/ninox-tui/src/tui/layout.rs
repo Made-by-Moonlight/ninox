@@ -1,6 +1,7 @@
 //! Frame geometry, computed once per frame from state so drawing, mouse
 //! hit-testing and pane resizing all agree.
 
+use ninox_ui_shared::settings_form::SettingsSection;
 use ratatui::layout::Rect;
 
 use ninox_overview::islands::IslandKey;
@@ -33,6 +34,8 @@ pub const TABS: [(View, &str); 6] = [
     (View::WorkerTypes, "Types"),
     (View::Remotes, "Remotes"),
 ];
+/// The header's ` ⚙ s ` entry: a gap, the glyph, the key, a gap.
+pub const SETTINGS_BUTTON_W: u16 = 5;
 /// Width of the header's `⬡ ninox` mark, its padding and the gap after it.
 const BADGE_W: u16 = 10;
 /// Room kept for the header's right-aligned `ptyd ● engine ●`, when all
@@ -236,25 +239,67 @@ pub enum SettingsLine {
     Error,
 }
 
+/// One row of the settings page's section bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsBarLine {
+    Heading(&'static str),
+    Gap,
+    Section(SettingsSection),
+}
+
+/// The bar's rows: each group's heading over its sections, a gap between groups.
+pub fn settings_bar_lines() -> Vec<SettingsBarLine> {
+    let mut out = Vec::new();
+    for (i, (group, sections)) in SettingsSection::GROUPS.iter().enumerate() {
+        if i > 0 {
+            out.push(SettingsBarLine::Gap);
+        }
+        out.push(SettingsBarLine::Heading(group));
+        out.extend(sections.iter().map(|s| SettingsBarLine::Section(*s)));
+    }
+    out
+}
+
+pub const SETTINGS_CLOSE_LABEL: &str = " ✕ close ";
+const SETTINGS_BAR_W: u16 = 18;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SettingsLayout {
-    /// The file path line; `open` is its "open in $EDITOR" button.
+    /// The version and file path line; `open` is its "open in $EDITOR" button.
     pub path: Rect,
     pub open: Rect,
+    /// The left section bar; `bar_lines[bar_offset..]` are drawn.
+    pub bar: Rect,
+    pub bar_lines: Vec<SettingsBarLine>,
+    pub bar_offset: usize,
+    /// The selected section's title (and, under it, its blurb), with a
+    /// `close` button at the right of the title row.
+    pub title: Rect,
+    pub close: Rect,
     pub list: Rect,
     pub lines: Vec<SettingsLine>,
     /// `lines[offset..]` are drawn.
     pub offset: usize,
     /// Where the value column starts; a click from here on changes it.
     pub value_x: u16,
+    pub label_w: u16,
     /// The selected field's description.
     pub help: Rect,
+    pub hint: Rect,
+}
+
+/// Where the settings page's content goes inside a `screen`-sized terminal:
+/// the full-screen modal's border and padding removed.
+pub fn settings_area(screen: Rect) -> Rect {
+    Rect { x: screen.x + 2, y: screen.y + 1, width: screen.width.saturating_sub(4), height: screen.height.saturating_sub(2) }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Layout {
     pub header: Rect,
     pub tabs: Vec<Tab>,
+    /// The header's `⚙ s` entry, right after the tabs, when it fits.
+    pub settings_button: Option<Rect>,
     /// Where the header's own text (agent counts) starts, after the tabs.
     pub header_text_x: u16,
     pub body: Rect,
@@ -386,6 +431,10 @@ fn tabs(lay: &mut Layout) {
         }
         lay.tabs.push(Tab { view, key, label, rect: Rect { x, y: h.y, width: w, height: 1 } });
         x += w + 1;
+    }
+    if h.height > 0 && x + SETTINGS_BUTTON_W <= h.right() {
+        lay.settings_button = Some(Rect { x, y: h.y, width: SETTINGS_BUTTON_W, height: 1 });
+        x += SETTINGS_BUTTON_W + 1;
     }
     lay.header_text_x = x.min(h.right());
 }
@@ -594,20 +643,24 @@ fn kanban(body: Rect) -> KanbanLayout {
     KanbanLayout { header, columns }
 }
 
-/// The settings lines: fields grouped under their section headings, with
-/// the last refusal under the selected field.
+/// The section's field lines. Fields that the shared form files under
+/// different headings (default models, say) keep them as sub-headings; the
+/// last refusal sits under the selected field.
 pub fn settings_lines(st: &TuiState) -> Vec<SettingsLine> {
     let v = &st.settings;
+    let visible = v.section_fields();
+    let headed = visible.windows(2).any(|w| v.fields[w[0]].section != v.fields[w[1]].section);
     let mut out = Vec::new();
     let mut section = None;
-    for (i, f) in v.fields.iter().enumerate() {
-        if section != Some(f.section) {
+    for i in visible {
+        let f = &v.fields[i];
+        if headed && section != Some(f.section) {
             if section.is_some() {
                 out.push(SettingsLine::Gap);
             }
             out.push(SettingsLine::Heading(f.section));
-            section = Some(f.section);
         }
+        section = Some(f.section);
         out.push(SettingsLine::Field(i));
         if i == v.selected && v.error.is_some() {
             out.push(SettingsLine::Error);
@@ -616,16 +669,31 @@ pub fn settings_lines(st: &TuiState) -> Vec<SettingsLine> {
     out
 }
 
-/// Path line with its button, a gap (or the parse error), then the list;
-/// the selected field's description sits right of the list when there is
-/// room, else under it.
+/// The page: a path line (and the load error under it), the section bar on
+/// the left, and on the right the section's title, blurb and fields, with
+/// the selected field's description beside them when there is room, else
+/// under; a key-hint row closes the page.
 pub(super) fn settings(body: Rect, st: &TuiState) -> SettingsLayout {
-    let pad = Rect { x: body.x + 1, width: body.width.saturating_sub(2), ..body };
-    let path = Rect { height: pad.height.min(1), ..pad };
+    let path = Rect { height: body.height.min(1), ..body };
     let bw = (OPEN_CONFIG_LABEL.len() as u16).min(path.width);
     let open = Rect { x: path.right() - bw, width: bw, ..path };
-    let top = pad.height.min(2);
-    let rest = Rect { y: pad.y + top, height: pad.height - top, ..pad };
+    let top = body.height.min(2);
+    let hint_h = u16::from(body.height > top + 3);
+    let content = Rect { y: body.y + top, height: body.height - top - hint_h, ..body };
+    let hint = Rect { y: content.bottom(), height: hint_h, ..body };
+
+    let bar_w = SETTINGS_BAR_W.min(content.width / 3);
+    let bar = Rect { width: bar_w, ..content };
+    let bar_lines = settings_bar_lines();
+    let sel_bar = bar_lines.iter().position(|l| *l == SettingsBarLine::Section(st.settings.section)).unwrap_or(0);
+    let bar_offset = scroll_offset(sel_bar, 0, bar_lines.len(), bar.height.max(1) as usize);
+
+    let right = Rect { x: content.x + bar_w + 3, width: content.width.saturating_sub(bar_w + 3), ..content };
+    let title = Rect { height: right.height.min(2), ..right };
+    let cw = (SETTINGS_CLOSE_LABEL.chars().count() as u16).min(right.width);
+    let close = Rect { x: right.right() - cw, width: cw, height: right.height.min(1), ..right };
+    let rest = Rect { y: right.y + right.height.min(3), height: right.height.saturating_sub(3), ..right };
+
     let list_w = rest.width.min(SETTINGS_LIST_MAX);
     let (list, help) = if rest.width >= list_w + 3 + SETTINGS_HELP_MIN {
         let help = Rect { x: rest.x + list_w + 3, width: rest.width - list_w - 3, ..rest };
@@ -641,8 +709,9 @@ pub(super) fn settings(body: Rect, st: &TuiState) -> SettingsLayout {
     let h = list.height.max(1) as usize;
     // One more line under the selection, so its error stays in view.
     let offset = scroll_offset(sel, 2, lines.len(), h);
-    let value_x = (list.x + 2 + SETTINGS_LABEL_W).min(list.right());
-    SettingsLayout { path, open, list, lines, offset, value_x, help }
+    let label_w = SETTINGS_LABEL_W.min(list.width.saturating_sub(2 + 20)).max(12);
+    let value_x = (list.x + 2 + label_w).min(list.right());
+    SettingsLayout { path, open, bar, bar_lines, bar_offset, title, close, list, lines, offset, value_x, label_w, help, hint }
 }
 
 /// Scroll offset for `selected` so it — plus `lookahead` rows after it, so

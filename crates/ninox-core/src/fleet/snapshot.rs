@@ -217,6 +217,10 @@ fn compute_anomalies(m: &FleetMember, all: &[FleetMember]) -> Vec<Anomaly> {
     let mut out = validate_workspace(
         m.session.workspace_path.as_deref(), is_orch, m.record.branch.as_deref(), &m.workspace,
     );
+    let reads_claude_settings = m.session.agent_type == crate::harness::CLAUDE_CODE_HARNESS;
+    if let Some(detail) = m.workspace.cross_session_override.as_ref().filter(|_| reads_claude_settings) {
+        out.push(Anomaly::CrossSessionInboundOverridden { detail: detail.clone() });
+    }
     if m.role == Role::Worker {
         let orch_id = m.session.orchestrator_id.as_deref().unwrap_or_default();
         let orch_alive = all.iter().find(|o| o.id() == orch_id)
@@ -259,7 +263,7 @@ pub(crate) mod test_support {
         FleetMember {
             session, role, record: FleetRecord::default(), pr: None, ci: None,
             pending_inbox: 0, can_resume: true,
-            workspace: WorkspaceObservation { exists: true, is_git: true, branch: None, dirty: Some(false) },
+            workspace: WorkspaceObservation { exists: true, is_git: true, branch: None, dirty: Some(false), ..Default::default() },
             anomalies: Vec::new(),
         }
     }
@@ -336,6 +340,27 @@ mod tests {
         assert!(snap.members.iter().all(|m| m.anomalies.is_empty()));
         assert_eq!(snap.members[0].id(), "o", "sorted by start time");
         assert_eq!(snap.workers_of("o").count(), 1);
+    }
+
+    #[test]
+    fn an_overridden_cross_session_setting_is_an_informational_anomaly() {
+        let o = member(session("o", None, SessionStatus::Working, 0), Role::Orchestrator);
+        let mut w = interrupted(member(session("w", Some("o"), SessionStatus::Working, 1), Role::Worker), 10, SessionStatus::Working);
+        w.workspace.cross_session_override = Some("refuse in /w/.claude/settings.local.json".into());
+        let snap = FleetSnapshot::assemble(vec![o, w], vec![], vec![], 0);
+        let w = snap.member("w").unwrap();
+        assert_eq!(w.anomalies, vec![Anomaly::CrossSessionInboundOverridden { detail: "refuse in /w/.claude/settings.local.json".into() }]);
+        assert_eq!(w.blocking_anomalies().count(), 0);
+    }
+
+    #[test]
+    fn a_non_claude_session_gets_no_cross_session_anomaly() {
+        let o = member(session("o", None, SessionStatus::Working, 0), Role::Orchestrator);
+        let mut w = interrupted(member(session("w", Some("o"), SessionStatus::Working, 1), Role::Worker), 10, SessionStatus::Working);
+        w.session.agent_type = "codex".into();
+        w.workspace.cross_session_override = Some("refuse in /w/.claude/settings.local.json".into());
+        let snap = FleetSnapshot::assemble(vec![o, w], vec![], vec![], 0);
+        assert!(snap.member("w").unwrap().anomalies.is_empty());
     }
 
     #[test]

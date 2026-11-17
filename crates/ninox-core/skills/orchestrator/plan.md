@@ -47,10 +47,13 @@ as dashed ghost nodes, and nothing spawns until it is accepted.
 non-Orchestrator node), `model`, `brain_reads` / `brain_write` (catalogue
 names, narrowed from your own brain set), `linear` and `await_done` (wait for
 every dependency to finish, not just start). Use your own id as `parent_id`
-for sessions under you; null means new top-level orchestrators.
+for sessions under you; null means new top-level sessions: Orchestrators, or,
+for any other worker type, a standalone session owned by the user (no
+orchestrator; it reports to no one, so its PR and completion events don't reach
+you). A non-Orchestrator top-level section needs a `workspace`.
 
 Who can accept or discard: the user, or you for a plan attached under you
-or one of your sub-orchestrators. A plan of new top-level orchestrators is
+or one of your sub-orchestrators. A plan of new top-level sessions is
 the user's to accept. Accepting spawns ready nodes through the normal spawn
 path (session limits may queue them); a node whose parent or dependencies
 haven't started yet waits and spawns automatically once they have. Re-running

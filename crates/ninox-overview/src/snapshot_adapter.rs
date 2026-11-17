@@ -79,7 +79,7 @@ mod tests {
         FleetMember {
             session, role, record: FleetRecord::default(), pr: None, ci: None,
             pending_inbox: 0, can_resume: true,
-            workspace: WorkspaceObservation { exists: true, is_git: true, branch: None, dirty: Some(false) },
+            workspace: WorkspaceObservation { exists: true, is_git: true, branch: None, dirty: Some(false), ..Default::default() },
             anomalies: Vec::new(),
         }
     }

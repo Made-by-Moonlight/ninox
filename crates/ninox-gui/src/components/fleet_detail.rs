@@ -445,37 +445,50 @@ fn marginalia_comment<'a>(comment: &'a Comment) -> Element<'a, Message> {
     .into()
 }
 
-/// PR state (open/mergeable/CI failed/merged), checks summary, a compact
-/// diff, and Marginalia comments — shown only when `session` has a PR.
+/// Every PR the session is responsible for (open first), then — for the
+/// tracked PR — a compact diff and Marginalia comments.
 fn pr_section<'a>(app: &'a App, session: &'a Session) -> Vec<Element<'a, Message>> {
-    let Some(pr) = session.pr_id.and_then(|id| app.prs.get(&id)) else {
+    let tracked = session.pr_id.and_then(|id| app.prs.get(&id));
+    let list = app.session_prs.get(&session.id).map(Vec::as_slice).filter(|l| !l.is_empty());
+    if tracked.is_none() && list.is_none() {
         return Vec::new();
-    };
-
-    let mut items = vec![
-        Space::new(0, 10).into(),
-        text("PULL REQUEST").size(9.5).font(crate::style::SANS).color(tokens::DIM2).into(),
-        Space::new(0, 4).into(),
-        rich_text![
-            span(format!("#{} {}", pr.number, pr.title))
-                .color(tokens::VIOLET_BADGE_FG)
-                .underline(true)
-                .link(Message::OpenUrl(pr.url.clone()))
-        ]
-        .size(12)
-        .into(),
-    ];
-
-    if let Some(ci) = app.ci_status.get(&pr.id) {
-        items.push(Space::new(0, 6).into());
-        items.push(
-            text(format!("{}/{} checks passing", ci.passing, ci.total))
-                .size(10.5)
-                .font(crate::style::SANS)
-                .color(ci_summary_color(ci))
-                .into(),
-        );
     }
+
+    let mut items: Vec<Element<Message>> = vec![
+        Space::new(0, 10).into(),
+        text(super::pr_list::heading(list.map_or(1, <[_]>::len)))
+            .size(9.5).font(crate::style::SANS).color(tokens::DIM2).into(),
+        Space::new(0, 4).into(),
+    ];
+    match (list, tracked) {
+        (Some(list), _) => items.extend(super::pr_list::rows(list, tokens::VIOLET_BADGE_FG, 12.0, 10.5)),
+        (None, Some(pr)) => {
+            items.push(
+                rich_text![
+                    span(format!("#{} {}", pr.number, pr.title))
+                        .color(tokens::VIOLET_BADGE_FG)
+                        .underline(true)
+                        .link(Message::OpenUrl(pr.url.clone()))
+                ]
+                .size(12)
+                .into(),
+            );
+            if let Some(ci) = app.ci_status.get(&pr.id) {
+                items.push(Space::new(0, 6).into());
+                items.push(
+                    text(format!("{}/{} checks passing", ci.passing, ci.total))
+                        .size(10.5)
+                        .font(crate::style::SANS)
+                        .color(ci_summary_color(ci))
+                        .into(),
+                );
+            }
+        }
+        (None, None) => {}
+    }
+    let Some(pr) = tracked else {
+        return items;
+    };
 
     items.push(Space::new(0, 8).into());
     items.push(diff_section(app, &session.id));

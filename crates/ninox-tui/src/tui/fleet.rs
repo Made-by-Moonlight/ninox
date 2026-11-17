@@ -314,7 +314,10 @@ pub fn member_tag(status: MemberStatus, row: &Row, p: &Palette) -> Option<(Strin
         SessionStatus::CiFailed => Some((" ✗CI".into(), p.ci_failed)),
         SessionStatus::Mergeable => Some((" ✓merge".into(), p.mergeable)),
         SessionStatus::PrOpen => {
-            Some((row.session.pr_number.map(|n| format!(" PR #{n}")).unwrap_or_else(|| " PR".into()), PR_TAG_COLOR))
+            let label = ninox_core::session_prs::summary(&row.prs)
+                .or_else(|| row.session.pr_number.map(|n| format!("PR #{n}")))
+                .unwrap_or_else(|| "PR".into());
+            Some((format!(" {label}"), PR_TAG_COLOR))
         }
         SessionStatus::ReviewPending => Some((" review".into(), PR_TAG_COLOR)),
         SessionStatus::Interrupted => Some((" paused".into(), p.review)),
@@ -756,6 +759,22 @@ impl FleetState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn member_tag_names_the_lead_pr_and_the_rest() {
+        use ninox_core::session_prs::{PrState, SessionPr};
+        let pr = |n, state| SessionPr {
+            repo: "o/bellhop".into(), number: n, url: String::new(), title: String::new(), state,
+            draft: false, ci: ninox_core::pr_events::CiVerdict::None, passing: 0, failing: 0, pending: 0,
+            changes_requested: false, approved: false, tracked: false,
+        };
+        let mut r = row("w1", Some("acme"), false, SessionStatus::PrOpen);
+        let p = Palette::terminal();
+        assert_eq!(member_tag(MemberStatus::WaitingOnPr, &r, &p).unwrap().0, " PR #42");
+        r.prs = vec![pr(1466, PrState::Open), pr(1473, PrState::Open), pr(900, PrState::Merged)];
+        assert_eq!(member_tag(MemberStatus::WaitingOnPr, &r, &p).unwrap().0, " PR bellhop#1466 +2");
+    }
+
     use ninox_core::types::SessionStatus;
     use ninox_overview::islands::{IslandKey, IslandMember};
 
@@ -769,7 +788,7 @@ mod tests {
             // `Row.group`, not `session.orchestrator_id`, to find an
             // orchestrator's row at all.
             group: if is_orchestrator { Some(id.to_string()) } else { group.map(String::from) },
-            machine_health: None, queue_position: None,
+            machine_health: None, queue_position: None, prs: Vec::new(),
         }
     }
 
@@ -984,7 +1003,7 @@ mod tests {
 
         let mut w1 = ninox_ui_shared::cli::test_fixtures::session("w1", Some("acme"), SessionStatus::PrOpen);
         w1.pr_id = Some(42);
-        let rows = vec![Row { session: w1, is_orchestrator: false, group: Some("acme".into()), machine_health: None , queue_position: None}];
+        let rows = vec![Row { session: w1, is_orchestrator: false, group: Some("acme".into()), machine_health: None , queue_position: None, prs: Vec::new()}];
 
         let mut fleet = FleetState::default();
         fleet.nav.select("w1");
@@ -1012,7 +1031,7 @@ mod tests {
 
         let mut w1 = ninox_ui_shared::cli::test_fixtures::session("w1", Some("acme"), SessionStatus::PrOpen);
         w1.pr_id = Some(42);
-        let rows = vec![Row { session: w1, is_orchestrator: false, group: Some("acme".into()), machine_health: None , queue_position: None}];
+        let rows = vec![Row { session: w1, is_orchestrator: false, group: Some("acme".into()), machine_health: None , queue_position: None, prs: Vec::new()}];
 
         let mut fleet = FleetState::default();
         fleet.nav.select("w1");

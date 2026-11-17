@@ -18,60 +18,7 @@ use crate::{
     style::{self, MONO, SANS, SANS_BOLD},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SettingsSection {
-    #[default]
-    Appearance,
-    Agents,
-    Harnesses,
-    Messaging,
-    Runtime,
-    SessionLimits,
-    Terminal,
-    Fleet,
-    Engine,
-    Version,
-}
-
-impl SettingsSection {
-    /// The left list, grouped. New sections (session limits, restarting the
-    /// server) slot into these groups.
-    pub const GROUPS: [(&'static str, &'static [SettingsSection]); 3] = [
-        ("General", &[Self::Appearance, Self::Agents, Self::Harnesses, Self::Messaging]),
-        ("Sessions", &[Self::Runtime, Self::SessionLimits, Self::Terminal, Self::Fleet]),
-        ("System", &[Self::Engine, Self::Version]),
-    ];
-
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::Appearance => "Appearance",
-            Self::Agents => "Agents",
-            Self::Harnesses => "Harnesses",
-            Self::Messaging => "Messaging",
-            Self::Runtime => "Session runtime",
-            Self::SessionLimits => "Session limits",
-            Self::Terminal => "Terminal",
-            Self::Fleet => "Fleet",
-            Self::Engine => "Engine",
-            Self::Version => "Version",
-        }
-    }
-
-    fn blurb(self) -> &'static str {
-        match self {
-            Self::Appearance => "How the desktop app looks.",
-            Self::Agents => "What new orchestrators and workers run, and where workspaces open.",
-            Self::Harnesses => "The agent CLIs ninox can launch. Off hides one from every picker.",
-            Self::Messaging => "How orchestrators and workers reach each other, and how PRs are watched.",
-            Self::Runtime => "Which process hosts new sessions.",
-            Self::SessionLimits => "How many agent sessions may run at once on each machine.",
-            Self::Terminal => "The terminal UI (nx) and agent panes.",
-            Self::Fleet => "Restoring, reaping and keeping sessions.",
-            Self::Engine => "The background server every ninox app talks to.",
-            Self::Version => "This build, and updates.",
-        }
-    }
-}
+pub use ninox_ui_shared::settings_form::SettingsSection;
 
 /// Settings-view UI state.
 #[derive(Debug, Clone, Default)]

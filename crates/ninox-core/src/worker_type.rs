@@ -482,10 +482,14 @@ then report the answer back once it arrives.\n\
 \n\
 New work: to propose new sessions, store a ghost plan with `ninox plan \
 propose` (JSON on stdin; run `ninox plan propose --help` for the shape: \
-`parent_id` (an orchestrator id, or null for new top-level orchestrators) and \
+`parent_id` (an orchestrator id, or null for new top-level sessions) and \
 `sections`, each with an `id`, `worker_type` (one of the worker types listed \
 below, picked by its description), `name`, `brief`, optional `dependencies`, and a \
-`workspace` for every non-Orchestrator node). Only when it exits 0 and its JSON \
+`workspace` for every non-Orchestrator node). A request for a standalone, \
+one-off session (no orchestrator) is a one-section plan with `parent_id` null, a \
+non-Orchestrator `worker_type` and a `workspace`: accepting it starts a session \
+the user owns. Never offer to attach it under an unrelated orchestrator or to \
+start a throwaway Orchestrator for it. Only when it exits 0 and its JSON \
 has `ok` true was a plan stored: then quote the exact `plan_id` it returned \
 and tell the user it is waiting for them to accept or discard it in Fleet or \
 the Plans tab, or with `ninox plan accept <plan_id>`. If it fails validation, \
@@ -958,6 +962,14 @@ mod tests {
         for rule in ["Bash(ninox list:*)", "Bash(ninox send:*)", "Bash(ninox brain:*)", "Bash(gh pr view:*)"] {
             assert!(spec.permissions.allow.iter().any(|a| a == rule), "missing allow rule: {rule}");
         }
+    }
+
+    #[test]
+    fn prompt_agent_brief_routes_a_standalone_request_through_a_top_level_plan() {
+        let brief = reg().get(PROMPT_WORKER_TYPE).unwrap().brief_template.clone().unwrap();
+        assert!(brief.contains("a one-section plan with `parent_id` null, a non-Orchestrator `worker_type` and a `workspace`"));
+        assert!(brief.contains("Never offer to attach it under an unrelated orchestrator or to start a throwaway Orchestrator"));
+        assert!(!brief.contains("null for new top-level orchestrators"));
     }
 
     #[test]

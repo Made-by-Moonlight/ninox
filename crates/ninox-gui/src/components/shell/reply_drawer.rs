@@ -297,7 +297,31 @@ fn user_bubble<'a>(question: &'a str, max_width: f32) -> Element<'a, Message> {
         },
         ..Default::default()
     });
-    row![Space::with_width(Length::Fill), bubble].into()
+    let copy = column![bubble, turn_actions(vec![("Copy", Message::CopyToClipboard(question.to_string()), false)])]
+        .spacing(3)
+        .align_x(Alignment::End);
+    row![Space::with_width(Length::Fill), copy].into()
+}
+
+/// Small dim text buttons under a message; a `(label, message)` per action.
+fn turn_actions<'a>(actions: Vec<(&'static str, Message, bool)>) -> Element<'a, Message> {
+    let buttons = actions.into_iter().map(|(label, msg, active)| {
+        button(text(label).size(11).font(crate::style::SANS))
+            .on_press(msg)
+            .padding(Padding { top: 1.0, right: 6.0, bottom: 1.0, left: 6.0 })
+            .style(move |_t, status| button::Style {
+                text_color: if active {
+                    tokens::TEAL
+                } else if matches!(status, button::Status::Hovered) {
+                    tokens::TEXT
+                } else {
+                    tokens::DIM2
+                },
+                ..Default::default()
+            })
+            .into()
+    });
+    row(buttons).spacing(2).into()
 }
 
 fn target_role(app: &App, id: &str) -> &'static str {
@@ -391,7 +415,15 @@ fn agent_message<'a>(
     now_ms: i64,
 ) -> Element<'a, Message> {
     let mut parts: Vec<Element<Message>> = Vec::new();
-    if !turn.rendered.is_empty() {
+    let asked_at = turn.asked_at_ms;
+    let selecting = app.ninox_turn_select.get(&asked_at);
+    if let Some(content) = selecting {
+        parts.push(
+            crate::components::selectable_markdown::selectable_markdown(content, move |action| {
+                Message::NinoxTurnSelectAction(asked_at, action)
+            }),
+        );
+    } else if !turn.rendered.is_empty() {
         parts.push(
             iced::widget::markdown::view(
                 &turn.rendered,
@@ -399,24 +431,7 @@ fn agent_message<'a>(
                     code_size: 12.0.into(),
                     ..iced::widget::markdown::Settings::with_text_size(13.0)
                 },
-                iced::widget::markdown::Style {
-                    inline_code_highlight: iced::widget::markdown::Highlight {
-                        background: Background::Color(tokens::PANEL2),
-                        border: Border {
-                            color: tokens::BORDER,
-                            width: 1.0,
-                            radius: 3.0.into(),
-                        },
-                    },
-                    inline_code_padding: Padding {
-                        top: 1.0,
-                        right: 5.0,
-                        bottom: 1.0,
-                        left: 5.0,
-                    },
-                    inline_code_color: tokens::TEXT,
-                    link_color: tokens::BLUE,
-                },
+                crate::components::markdown_style::inline_code_style(tokens::BLUE, 3.0),
             )
             .map(|url| link_message(&url)),
         );
@@ -426,6 +441,15 @@ fn agent_message<'a>(
             .map(|(segment, color)| span(segment).color(color))
             .collect();
         parts.push(rich_text(spans).size(13).font(crate::style::SANS).into());
+    }
+    if !turn.answer.is_empty() {
+        let mut actions = vec![("Copy", Message::CopyToClipboard(turn.answer.clone()), false)];
+        if selecting.is_some() {
+            actions.push(("✓ Selecting — back to formatted view", Message::NinoxTurnSelectToggle(asked_at), true));
+        } else {
+            actions.push(("Select", Message::NinoxTurnSelectToggle(asked_at), false));
+        }
+        parts.push(turn_actions(actions));
     }
     if let Some(error) = &turn.error {
         parts.push(

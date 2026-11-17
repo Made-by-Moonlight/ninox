@@ -806,21 +806,24 @@ impl Poller {
             tokio::select! {
                 _ = token.cancelled()      => break,
                 _ = pid_interval.tick()    => {
+                    let config = AppConfig::load_or_default();
                     self.retry_unreconciled_live().await;
                     self.poll_pids().await;
-                    self.poll_remote_sessions().await;
-                    self.poll_context_updates().await;
-                    self.poll_activity_updates().await;
+                    if config.remote_machines.enabled {
+                        self.poll_remote_sessions().await;
+                    }
+                    // One snapshot, taken after the steps above that write
+                    // session rows, for the read-only diff steps below.
+                    let snapshot = self.engine.store.list_sessions().unwrap_or_default();
+                    self.poll_context_updates(&snapshot).await;
+                    self.poll_activity_updates(&snapshot).await;
                     self.poll_message_counts().await;
-                    let retention = AppConfig::load()
-                        .unwrap_or_default()
-                        .session_retention;
-                    self.sweep_retired_sessions(&retention).await;
-                    self.reap_self_completed_sessions().await;
+                    self.sweep_retired_sessions(&config.session_retention).await;
+                    self.reap_self_completed_sessions(&snapshot).await;
                     self.drain_session_queue().await;
                     self.retry_unreachable_messages().await;
                     self.emit_held_messages_if_changed();
-                    self.check_message_stalls(&AppConfig::load_or_default().message_stalls).await;
+                    self.check_message_stalls(&config.message_stalls).await;
                     self.advance_ghost_plans().await;
                 }
                 _ = usage_interval.tick()  => self.poll_usage().await,
@@ -831,6 +834,8 @@ impl Poller {
                 _ = workspace_disk_interval.tick() => self.poll_workspace_disk(&AppConfig::load_or_default()).await,
                 _ = update_interval.tick() => self.poll_update_check().await,
                 _ = harness_auth_interval.tick() => self.poll_harness_auth().await,
+                // Not gated on `remote_machines.enabled`: the poll prunes stale
+                // health bookkeeping before its own disabled early-return.
                 _ = remote_health_interval.tick() => self.poll_remote_machine_health().await,
                 _ = github_interval.tick() => {
                     if now_millis() < next_github_ms {
@@ -1746,12 +1751,16 @@ impl Poller {
     /// spam the store/UI every tick for idle sessions.
     async fn poll_usage(&self) {
         let Ok(sessions) = self.engine.store.list_sessions() else { return };
-        for mut session in sessions {
+        for session in sessions {
             if matches!(session.status, SessionStatus::Done | SessionStatus::Terminated | SessionStatus::Interrupted) {
                 continue;
             }
             let Some(workspace) = session.workspace_path.clone() else { continue };
-            let Some(snapshot) = usage::ingest_usage_for_workspace(&workspace) else { continue };
+            let Ok(Some(snapshot)) =
+                tokio::task::spawn_blocking(move || usage::ingest_usage_for_workspace(&workspace)).await
+            else {
+                continue;
+            };
 
             let cost_changed = (session.cost_usd - snapshot.cost_usd).abs() > 1e-9;
             let context_changed = session.context_tokens != Some(snapshot.context_tokens);
@@ -1759,14 +1768,17 @@ impl Poller {
                 continue;
             }
 
-            session.cost_usd = snapshot.cost_usd;
-            session.context_tokens = Some(snapshot.context_tokens);
-            if session.model.is_none() {
-                session.model = snapshot.model;
-            }
-            let _ = self.engine.store.upsert_session(&session);
+            let Some(row) = self.update_live_session_row(&session, |row| {
+                row.cost_usd = snapshot.cost_usd;
+                row.context_tokens = Some(snapshot.context_tokens);
+                if row.model.is_none() {
+                    row.model = snapshot.model.clone();
+                }
+            }) else {
+                continue;
+            };
             self.engine.emit(Event::SessionUpdated(
-                session, SessionFields::COST | SessionFields::CONTEXT | SessionFields::MODEL,
+                row, SessionFields::COST | SessionFields::CONTEXT | SessionFields::MODEL,
             ));
         }
     }
@@ -1781,12 +1793,11 @@ impl Poller {
     /// diff against except a cache of the last-seen values. Detects
     /// external changes and re-broadcasts them as `SessionUpdated` so the
     /// GUI picks them up.
-    async fn poll_context_updates(&self) {
-        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+    async fn poll_context_updates(&self, sessions: &[Session]) {
         let mut changed = Vec::new();
         {
             let mut cache = self.context_cache.lock().unwrap();
-            for session in sessions {
+            for session in sessions.iter().cloned() {
                 let key = (session.cost_usd, session.context_used_pct, session.context_total_tokens);
                 // `None` means this session has never been cached — seed it
                 // silently rather than treating "no prior state" as a change
@@ -1810,12 +1821,11 @@ impl Poller {
     /// activity fields directly into the store from a separate short-lived
     /// process — the same external-writer shape as `poll_context_updates`
     /// above, so the same diff-cache re-broadcast, flagged ACTIVITY.
-    async fn poll_activity_updates(&self) {
-        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+    async fn poll_activity_updates(&self, sessions: &[Session]) {
         let mut changed = Vec::new();
         {
             let mut cache = self.activity_cache.lock().unwrap();
-            for session in sessions {
+            for session in sessions.iter().cloned() {
                 let key = (session.activity, session.activity_note.clone(), session.activity_since);
                 // Seed silently on first sight — see `poll_context_updates`.
                 if let Some(prev) = cache.insert(session.id.clone(), key.clone()) {
@@ -3497,7 +3507,16 @@ impl Poller {
             store, &config.workspaces, &config.orphan_sweep, config.session_retention.retention_millis(), now_millis(),
         ).await;
         if !steps.is_empty() {
-            tracing::warn!("disk pressure: {steps:?}");
+            let freed = steps.iter().any(|s| match s {
+                crate::workspace::PressureStep::FreedFinishedBuilds { bytes, .. } => *bytes > 0,
+                crate::workspace::PressureStep::SweptOrphans { removed } => *removed > 0,
+                crate::workspace::PressureStep::Notified => true,
+            });
+            if freed {
+                tracing::warn!("disk pressure: {steps:?}");
+            } else {
+                tracing::debug!("disk pressure pass freed nothing: {steps:?}");
+            }
         }
         if let Some(n) = notification {
             self.engine.emit(Event::Notification(n));
@@ -3694,8 +3713,7 @@ impl Poller {
     /// (`self_completed_at.is_some()`) — `complete` itself never kills its
     /// own pane (it's a child of it), so this sweep is the one place that
     /// actually does. See [`Session::self_completed_at`]'s doc comment.
-    async fn reap_self_completed_sessions(&self) {
-        let Ok(sessions) = self.engine.store.list_sessions() else { return };
+    async fn reap_self_completed_sessions(&self, sessions: &[Session]) {
         for session in sessions {
             if session.self_completed_at.is_some() {
                 self.reap_one_self_completed_session(&session.id).await;
@@ -4722,7 +4740,7 @@ mod tests {
         // First tick establishes the baseline — nothing to diff against yet,
         // so it must not emit for sessions that already exist with no prior
         // cached state.
-        poller.poll_context_updates().await;
+        poller.poll_context_updates(&poller.engine.store.list_sessions().unwrap()).await;
         let baseline_events = drain_events(&mut rx);
         assert!(baseline_events.is_empty(), "no prior cached state means no change to report");
 
@@ -4731,7 +4749,7 @@ mod tests {
         s1.cost_usd = 3.5;
         store.upsert_session(&s1).unwrap();
 
-        poller.poll_context_updates().await;
+        poller.poll_context_updates(&poller.engine.store.list_sessions().unwrap()).await;
         let events = drain_events(&mut rx);
         assert_eq!(events.len(), 1, "only the changed session should emit");
         assert!(matches!(
@@ -4740,7 +4758,7 @@ mod tests {
         ));
 
         // A third tick with no further changes emits nothing.
-        poller.poll_context_updates().await;
+        poller.poll_context_updates(&poller.engine.store.list_sessions().unwrap()).await;
         assert!(drain_events(&mut rx).is_empty());
     }
 
@@ -4761,7 +4779,7 @@ mod tests {
         let mut rx = engine.subscribe();
         let poller = Poller::new(engine);
 
-        poller.poll_activity_updates().await;
+        poller.poll_activity_updates(&poller.engine.store.list_sessions().unwrap()).await;
         assert!(drain_events(&mut rx).is_empty(), "baseline seeding must not emit");
 
         // Simulate the external hook process writing for s1 only.
@@ -4769,7 +4787,7 @@ mod tests {
             state: ActivityState::Blocked, note: Some("stuck".into()),
         }, 1_000).unwrap();
 
-        poller.poll_activity_updates().await;
+        poller.poll_activity_updates(&poller.engine.store.list_sessions().unwrap()).await;
         let events = drain_events(&mut rx);
         assert_eq!(events.len(), 1, "only the changed session should emit");
         match &events[0] {
@@ -4781,7 +4799,7 @@ mod tests {
             other => panic!("expected SessionUpdated, got {other:?}"),
         }
 
-        poller.poll_activity_updates().await;
+        poller.poll_activity_updates(&poller.engine.store.list_sessions().unwrap()).await;
         assert!(drain_events(&mut rx).is_empty(), "steady state must not re-emit");
     }
 
@@ -10208,7 +10226,7 @@ enabled = true
 
         let engine = Engine::new(store.clone());
         let poller = Poller::new(engine);
-        poller.reap_self_completed_sessions().await;
+        poller.reap_self_completed_sessions(&poller.engine.store.list_sessions().unwrap()).await;
 
         assert!(!worktree_path.exists(), "the sweep must physically reap a self-completed session");
         let after = store.get_session(session_id).unwrap().unwrap();

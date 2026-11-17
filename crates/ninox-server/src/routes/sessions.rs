@@ -184,6 +184,9 @@ async fn create_acp_session(
     Path(id): Path<String>,
     Json(req): Json<CreateAcpSessionRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if ninox_core::messaging::is_reserved_session_id(&id) || ninox_core::slugify(&id) != id {
+        return Err((StatusCode::BAD_REQUEST, format!("'{id}' is not a valid session id")));
+    }
     e.acp
         .create_session(&id, &req.workspace, &req.harness, &[])
         .await
@@ -414,6 +417,23 @@ done
 
         let second = sessions_router(engine.clone()).oneshot(json_post("/s1/acp", body)).await.unwrap();
         assert_eq!(second.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn creating_an_acp_session_under_a_reserved_or_non_slug_id_is_rejected() {
+        let store = Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
+        let pid_log = tempdir().unwrap().keep().join("pids");
+        let acp = Arc::new(AcpBackend::with_agent_command(fake_agent_command(&pid_log)));
+        let engine = Engine::new_with_acp(store, acp);
+        let workspace = tempdir().unwrap().keep();
+        let body = serde_json::json!({ "workspace": workspace.to_str().unwrap(), "harness": "opencode" });
+
+        for id in [ninox_core::messaging::SYSTEM_SENDER, ninox_core::messaging::HUMAN_SENDER, ninox_core::worker_type::PROMPT_SESSION_ID, "Bad_Id"] {
+            let uri = format!("/{}/acp", id.replace(':', "%3A"));
+            let response = sessions_router(engine.clone()).oneshot(json_post(&uri, body.clone())).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{id}");
+        }
+        assert!(!pid_log.exists(), "no agent may have been spawned for a rejected id");
     }
 
     /// Regression test for `CreateAcpSessionRequest::harness` actually being

@@ -41,6 +41,9 @@ pub type DiskProbe = Arc<dyn Fn(&Path) -> Option<DiskUsage> + Send + Sync>;
 /// Arbitrary; long enough that a disk nothing can relieve doesn't re-run
 /// the orphan sweep every tick.
 pub const RELIEF_COOLDOWN_MS: i64 = 15 * 60 * 1000;
+/// Each pass that frees nothing doubles the relief cooldown, up to
+/// `RELIEF_COOLDOWN_MS << 3` (2h). Arbitrary.
+const MAX_RELIEF_BACKOFF_SHIFT: u32 = 3;
 /// Arbitrary; how often a still-full disk re-raises its notification.
 pub const NOTIFY_COOLDOWN_MS: i64 = 6 * 60 * 60 * 1000;
 
@@ -58,6 +61,7 @@ pub struct DiskJanitor {
     probe: DiskProbe,
     freed: Mutex<HashSet<String>>,
     last_relief_at: Mutex<Option<i64>>,
+    fruitless_passes: Mutex<u32>,
     last_notified_at: Mutex<Option<i64>>,
 }
 
@@ -73,6 +77,7 @@ impl DiskJanitor {
             probe,
             freed: Mutex::new(HashSet::new()),
             last_relief_at: Mutex::new(None),
+            fruitless_passes: Mutex::new(0),
             last_notified_at: Mutex::new(None),
         }
     }
@@ -120,11 +125,16 @@ impl DiskJanitor {
         let threshold = ws.disk_low_percent;
         let low = |repos: &[PathBuf]| self.lowest(repos).filter(|u| u.free_percent() < threshold);
         if repos.is_empty() || low(&repos).is_none() {
+            *self.fruitless_passes.lock().unwrap_or_else(|e| e.into_inner()) = 0;
             return (steps, None);
         }
+        let cooldown = {
+            let n = *self.fruitless_passes.lock().unwrap_or_else(|e| e.into_inner());
+            RELIEF_COOLDOWN_MS << n.min(MAX_RELIEF_BACKOFF_SHIFT)
+        };
         {
             let mut last = self.last_relief_at.lock().unwrap_or_else(|e| e.into_inner());
-            if last.is_some_and(|t| now.saturating_sub(t) < RELIEF_COOLDOWN_MS) {
+            if last.is_some_and(|t| now.saturating_sub(t) < cooldown) {
                 return (steps, None);
             }
             *last = Some(now);
@@ -146,6 +156,7 @@ impl DiskJanitor {
             steps.push(PressureStep::FreedFinishedBuilds { sessions: count, bytes });
         }
         if low(&repos).is_none() {
+            self.record_pass(&steps);
             return (steps, None);
         }
 
@@ -161,11 +172,15 @@ impl DiskJanitor {
             }
             steps.push(PressureStep::SweptOrphans { removed });
         }
-        let Some(usage) = low(&repos) else { return (steps, None) };
+        let Some(usage) = low(&repos) else {
+            self.record_pass(&steps);
+            return (steps, None);
+        };
 
         {
             let mut last = self.last_notified_at.lock().unwrap_or_else(|e| e.into_inner());
             if last.is_some_and(|t| now.saturating_sub(t) < NOTIFY_COOLDOWN_MS) {
+                self.record_pass(&steps);
                 return (steps, None);
             }
             *last = Some(now);
@@ -181,7 +196,18 @@ impl DiskJanitor {
             session_id: None,
             created_at: now,
         };
+        self.record_pass(&steps);
         (steps, Some(notification))
+    }
+
+    fn record_pass(&self, steps: &[PressureStep]) {
+        let freed = steps.iter().any(|s| match s {
+            PressureStep::FreedFinishedBuilds { bytes, .. } => *bytes > 0,
+            PressureStep::SweptOrphans { removed } => *removed > 0,
+            PressureStep::Notified => false,
+        });
+        let mut n = self.fruitless_passes.lock().unwrap_or_else(|e| e.into_inner());
+        *n = if freed { 0 } else { n.saturating_add(1) };
     }
 
     fn lowest(&self, repos: &[PathBuf]) -> Option<DiskUsage> {

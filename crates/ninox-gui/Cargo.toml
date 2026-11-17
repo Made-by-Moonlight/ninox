@@ -59,6 +59,9 @@ futures = "0.3"
 # `tiny-skia` fallback backend behind `iced`'s own default features (see
 # Cargo.lock), so this adds no new dependency, just a direct edge to it.
 iced_tiny_skia = "0.13"
+# Pixmap/Mask types for the offscreen PR-chip surface renders; same version
+# `iced_tiny_skia` already resolves.
+tiny-skia = "0.11"
 ninox-ui-shared = { path = "../ninox-ui-shared", version = "0.37.0", features = ["test-support"] }
 ninox-core      = { path = "../ninox-core", version = "0.37.0", features = ["test-support", "test-isolation"] }
 

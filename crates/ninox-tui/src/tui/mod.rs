@@ -16,6 +16,7 @@ mod live;
 mod markdown;
 mod palette;
 mod pane;
+pub mod pr_chips;
 mod remotes;
 #[cfg(debug_assertions)]
 mod reply_fixture;
@@ -1802,7 +1803,7 @@ async fn resume(engine: Arc<Engine>, session: ninox_core::types::Session, is_orc
 /// is usually the input-source shortcut.
 fn prefix_notice(prefix: u8) -> Option<String> {
     (cfg!(target_os = "macos") && prefix == 0x00).then(|| {
-        "Ctrl+Space may never reach nx on macOS (input sources) — Ctrl+] always returns to the fleet; change the prefix in Settings (5)".into()
+        "Ctrl+Space may never reach nx on macOS (input sources) — Ctrl+] always returns to the fleet; change the prefix in Settings (s)".into()
     })
 }
 
@@ -1988,7 +1989,12 @@ fn refresh(st: &mut TuiState, store: &Store) {
         st.set_workspace_rows(crate::tui::workspaces_panel::collect(store, crate::tui::workspaces_panel::retention_millis()));
     }
     st.brain_lines = sessions.iter().map(|s| (s.id.clone(), ninox_core::brain_set::session_brains_line(s, &config))).collect();
-    st.apply_rows(build_rows(ninox_ui_shared::cli::group_sessions(sessions, orchs), &machine_health, &positions));
+    let mut new_rows = build_rows(ninox_ui_shared::cli::group_sessions(sessions, orchs), &machine_health, &positions);
+    let mut session_prs = ninox_core::session_prs::for_sessions(store, new_rows.iter().map(|r| &r.session));
+    for r in &mut new_rows {
+        r.prs = session_prs.remove(r.id()).unwrap_or_default();
+    }
+    st.apply_rows(new_rows);
     st.fleet.sync(&st.rows, &machine_health);
     st.fleet.sync_detail_pr(&st.rows, store);
     st.pr_watches = store.list_pr_watches().unwrap_or_default();
@@ -2041,6 +2047,7 @@ fn build_rows(
                 is_orchestrator: orch.as_ref().is_some_and(|o| o.id == s.id),
                 group: orch.as_ref().map(|o| o.id.clone()),
                 queue_position: queue_positions.get(&s.id).copied(),
+                prs: Vec::new(),
                 session: s,
                 machine_health,
             });
@@ -2262,7 +2269,7 @@ mod tests {
         let mut st = TuiState {
             rows: vec![Row {
                 session: session("w1", None, SessionStatus::Working),
-                is_orchestrator: false, group: None, machine_health: None, queue_position: None,
+                is_orchestrator: false, group: None, machine_health: None, queue_position: None, prs: Vec::new(),
             }],
             ..Default::default()
         };
