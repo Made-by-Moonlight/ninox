@@ -4,7 +4,7 @@ Ninox is a native desktop agent orchestrator — built in Rust with [Iced](https
 
 ## Prerequisites
 
-Only needed to build from source (prebuilt binaries via `cargo binstall` need none of it):
+Source builds need:
 
 - Rust toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - macOS or Linux (Windows not yet supported). Ubuntu 22.04 and newer are
@@ -22,24 +22,34 @@ Only needed to build from source (prebuilt binaries via `cargo binstall` need no
 
 ### Homebrew
 
-The Homebrew formulae build the current `main` branch from source. They require
-Homebrew's Rust toolchain to meet the version in `rust-toolchain.toml`, and the
-first installation can take a while. Both formulae support macOS and Linux:
+The Homebrew tap provides release binaries for Linux x86_64 and Apple silicon
+macOS. The GUI and TUI can be installed independently:
 
 ```bash
-brew install --HEAD made-by-moonlight/tap/ninox-gui  # desktop app
-brew install --HEAD made-by-moonlight/tap/ninox-tui  # terminal app and nx
+brew tap made-by-moonlight/tap
+brew trust --formula made-by-moonlight/tap/ninox-gui
+brew trust --formula made-by-moonlight/tap/ninox-tui
+brew install made-by-moonlight/tap/ninox-gui  # desktop app
+brew install made-by-moonlight/tap/ninox-tui  # terminal app and nx
 ```
 
-Install either or both. Run `brew upgrade --fetch-HEAD ninox-gui ninox-tui`
-to update HEAD builds, omitting any formula you did not install. The formulae
+Trust and install either or both. Run `brew update` to refresh formulae, then
+`brew upgrade ninox-gui ninox-tui` to upgrade installed packages, omitting any
+formula you did not install. Quit and reopen the UI to
+run the new build. Run `ninox-gui reset-bin` or `ninox-tui reset-bin` to select
+which new binary owns the `ninox` command, then run `ninox server restart` to
+start the new server. The restart is designed to preserve running sessions:
+their panes are hosted by tmux or the separate PTY host. A running PTY host
+is not itself replaced by the server restart. The formulae
 are maintained in the [Homebrew tap](https://github.com/Made-by-Moonlight/homebrew-tap).
+Use `--HEAD` at installation and `--fetch-HEAD` on upgrade to build the current
+`main` branch from source instead; that requires a Rust toolchain.
 The GUI formula installs the `ninox-gui` executable, not an Applications bundle.
 On first run Ninox creates its `ninox` shim in its own bin directory; make sure
 that directory is on your PATH as described by Ninox. Use Homebrew to upgrade
 these installations rather than `ninox update`.
 
-### Prebuilt binaries
+### Release binaries
 
 Prebuilt binaries need no Rust toolchain and no compile. With
 [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
@@ -48,13 +58,11 @@ Prebuilt binaries need no Rust toolchain and no compile. With
 cargo binstall ninox-gui ninox-tui
 ```
 
-On Linux install just the terminal app (`cargo binstall ninox-tui`): there is no
-prebuilt `ninox-gui` for Linux, so naming it compiles it.
-
-This downloads the release tarball for your platform from this repo's GitHub
-Releases (`ninox-gui`: Apple silicon macOS; `ninox-tui`: Apple silicon macOS
-and Linux x86_64/aarch64). On a platform with no published tarball (for
-example Intel Macs), `cargo binstall` offers to build from source instead.
+Both binaries are packaged for Linux x86_64 and Apple silicon macOS in
+[GitHub Releases](https://github.com/Made-by-Moonlight/ninox/releases). On
+other platforms `cargo binstall` may offer to build from source. The crates
+must be published to crates.io before the `cargo binstall` command is usable;
+the archives can also be downloaded and unpacked directly.
 
 Installing either crate also provides a `ninox` command, pointing at
 whichever one you ran first (switch it later with `ninox reset-bin`);
@@ -64,11 +72,11 @@ only need the desktop app or the terminal app.
 
 ### Build from source
 
-Needs the Rust toolchain and, on Debian/Ubuntu, the build dependencies from
-Prerequisites. This compiles the whole workspace:
+From a source checkout, with the Rust toolchain and Linux dependencies above:
 
 ```bash
-cargo install ninox-gui ninox-tui
+cargo install --locked --path crates/ninox-gui
+cargo install --locked --path crates/ninox-tui
 ```
 
 Ninox launches every Claude Code session with `--settings '{"crossSessionInbound":"accept"}'` so inter-session messages are delivered; sessions started by an older build pick it up on their next restart or resume, and a `hold`/`refuse` in a project's `.claude/settings*.json` or in managed settings still overrides it (the fleet recovery briefing flags that).
@@ -118,7 +126,15 @@ The daemon automatically starts in the background on first use and logs to `~/.l
 
 ## macOS app bundle
 
-Every [tagged release](https://github.com/Made-by-Moonlight/ninox/releases) has a prebuilt `Ninox.app.zip` attached as a release asset — download it, unzip, and drag `Ninox.app` into `/Applications`. No local Rust toolchain needed.
+Published releases include an Apple silicon `Ninox.app.zip` — download it from
+[GitHub Releases](https://github.com/Made-by-Moonlight/ninox/releases), unzip
+it, and drag `Ninox.app` into `/Applications`. The app includes the Ninox icon.
+The Homebrew tap also supplies a `ninox-app` cask after the release is published:
+
+```bash
+brew trust --cask made-by-moonlight/tap/ninox-app
+brew install --cask made-by-moonlight/tap/ninox-app
+```
 
 The bundle is ad-hoc code-signed in CI (no paid Apple Developer ID or notarization), which is enough to stop Gatekeeper from calling it "damaged" after a browser download. It's not enough to clear the separate "unidentified developer" warning macOS shows the first time you open an app from outside the App Store — that only goes away with real notarization. The first time you launch `Ninox.app`, expect that prompt; get past it with either:
 

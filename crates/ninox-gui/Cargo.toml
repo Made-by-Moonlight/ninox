@@ -1,6 +1,6 @@
 [package]
 name        = "ninox-gui"
-version     = "0.37.0"
+version     = "1.0.0"
 edition     = "2021"
 description = "Ninox native desktop app: GPU-accelerated Rust/Iced UI for the Ninox orchestrator engine."
 license     = "MIT"
@@ -15,9 +15,9 @@ pkg-fmt = "tgz"
 bin-dir = "ninox-{ version }-{ target }/{ bin }{ binary-ext }"
 
 [dependencies]
-ninox-core      = { path = "../ninox-core", version = "0.37.0" }
-ninox-ui-shared = { path = "../ninox-ui-shared", version = "0.37.0" }
-ninox-overview  = { path = "../ninox-overview", version = "0.37.0" }
+ninox-core      = { path = "../ninox-core", version = "1.0.0" }
+ninox-ui-shared = { path = "../ninox-ui-shared", version = "1.0.0" }
+ninox-overview  = { path = "../ninox-overview", version = "1.0.0" }
 tokio           = { workspace = true }
 anyhow          = { workspace = true }
 tracing         = { workspace = true }
@@ -62,8 +62,8 @@ iced_tiny_skia = "0.13"
 # Pixmap/Mask types for the offscreen PR-chip surface renders; same version
 # `iced_tiny_skia` already resolves.
 tiny-skia = "0.11"
-ninox-ui-shared = { path = "../ninox-ui-shared", version = "0.37.0", features = ["test-support"] }
-ninox-core      = { path = "../ninox-core", version = "0.37.0", features = ["test-support", "test-isolation"] }
+ninox-ui-shared = { path = "../ninox-ui-shared", version = "1.0.0", features = ["test-support"] }
+ninox-core      = { path = "../ninox-core", version = "1.0.0", features = ["test-support", "test-isolation"] }
 
 # The app icon from the embedded PNG (window icon everywhere; Dock icon on
 # macOS), so an unbundled `ninox-gui` shows the owl, not the generic exec.

@@ -86,7 +86,8 @@ jobs:
             crate="${entry##*:}"
             version=$(echo "$metadata" | jq -er --arg n "$crate" '.packages[] | select(.name==$n) | .version')
             echo "${key}_version=${version}" >> "$GITHUB_OUTPUT"
-            if curl -sf -A "ninox-ci-publish-workflow" "https://crates.io/api/v1/crates/${crate}/${version}" > /dev/null; then
+            status=$(curl -sS -o /dev/null -w '%{http_code}' -A "ninox-ci-publish-workflow" "https://crates.io/api/v1/crates/${crate}/${version}")
+            if [ "$status" = 200 ]; then
               echo "${crate} ${version} is already published — skipping."
               echo "${key}_publish=false" >> "$GITHUB_OUTPUT"
             elif [ "$status" = 404 ]; then
