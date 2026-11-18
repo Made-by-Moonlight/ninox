@@ -1,8 +1,8 @@
 name: Build macOS app bundle
 description: >
-  Build Ninox.app with cargo-bundle, verify its structure, ad-hoc code-sign
+  Build Ninox.app, verify its structure, ad-hoc code-sign
   it, verify the signature, and (optionally) zip it with ditto. Shared by
-  ci.yml, release.yml, and publish-codeartifact.yml so the build/sign
+  ci.yml and release.yml so the build/sign
   sequence can't drift between them.
 
 inputs:
@@ -22,13 +22,26 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Install cargo-bundle
-      shell: bash
-      run: command -v cargo-bundle || cargo install cargo-bundle
-
     - name: Build Ninox.app
       shell: bash
-      run: cargo bundle --release -p ninox-gui --format osx
+      run: |
+        set -euo pipefail
+        cargo build --release --locked -p ninox-gui
+        app=target/release/bundle/osx/Ninox.app
+        mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+        cp target/release/ninox-gui "$app/Contents/MacOS/ninox-gui"
+        cp crates/ninox-gui/assets/Ninox.icns "$app/Contents/Resources/Ninox.icns"
+        version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "ninox-gui") | .version')
+        plist="$app/Contents/Info.plist"
+        /usr/libexec/PlistBuddy -c 'Add :CFBundleName string Ninox' "$plist"
+        /usr/libexec/PlistBuddy -c 'Add :CFBundleDisplayName string Ninox' "$plist"
+        /usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string com.madebymoonlight.ninox' "$plist"
+        /usr/libexec/PlistBuddy -c 'Add :CFBundleExecutable string ninox-gui' "$plist"
+        /usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string Ninox.icns' "$plist"
+        /usr/libexec/PlistBuddy -c 'Add :CFBundlePackageType string APPL' "$plist"
+        /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $version" "$plist"
+        /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $version" "$plist"
+        /usr/libexec/PlistBuddy -c 'Add :NSHighResolutionCapable bool true' "$plist"
 
     - name: Verify bundle
       shell: bash

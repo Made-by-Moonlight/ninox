@@ -1,7 +1,5 @@
 name: Release
 
-# Tag a commit already merged to main as vX.Y.Z. Failed builds leave a draft;
-# rerun this workflow with the same tag to finish publishing.
 on:
   push:
     tags: ['v*']
@@ -19,38 +17,74 @@ concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
 jobs:
-  macos:
-    runs-on: macos-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  prepare:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
-
       - name: Verify release tag and main ancestry
-        shell: bash
         run: |
           set -euo pipefail
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           git fetch origin main
           git merge-base --is-ancestor HEAD origin/main
-          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "ninox-gui") | .version')
-          test "$RELEASE_TAG" = "v$version"
-
-      - name: Ensure release exists
+          cargo metadata --locked --no-deps --format-version 1 | jq -e --arg version "${RELEASE_TAG#v}" '[.packages[].version] | all(. == $version)' >/dev/null
+      - name: Ensure draft release exists
         run: |
           gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
             gh release create "$RELEASE_TAG" --draft --title "$RELEASE_TAG" --generate-notes --verify-tag
 
+  linux:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cmake pkg-config libxkbcommon-dev libwayland-dev
+      - name: Build and package Linux x86_64
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p ninox-gui -p ninox-tui --bin ninox-gui --bin ninox-tui
+          scripts/package-release.sh "${RELEASE_TAG#v}" x86_64-unknown-linux-gnu target/release dist ninox-gui ninox-tui
+          gh release upload "$RELEASE_TAG" --clobber "dist/ninox-${RELEASE_TAG#v}-x86_64-unknown-linux-gnu.tar.gz"
+
+  macos:
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - name: Build and sign app bundle
         id: bundle
         uses: ./.github/actions/build-macos-bundle
-
-      - name: Publish bundle
+      - name: Build and package macOS Apple silicon binaries
         run: |
-          gh release upload "$RELEASE_TAG" --clobber "${{ steps.bundle.outputs.zip-path }}"
-          gh release edit "$RELEASE_TAG" --draft=false
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          cargo build --release --locked -p ninox-tui --bin ninox-tui
+          for bin in ninox-gui ninox-tui; do
+            codesign --force --sign - "target/release/$bin"
+            codesign --verify --strict "target/release/$bin"
+          done
+          scripts/package-release.sh "${RELEASE_TAG#v}" aarch64-apple-darwin target/release dist ninox-gui ninox-tui
+          gh release upload "$RELEASE_TAG" --clobber "${{ steps.bundle.outputs.zip-path }}" "dist/ninox-${RELEASE_TAG#v}-aarch64-apple-darwin.tar.gz"
+
+  publish:
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish after all assets are uploaded
+        run: gh release edit "$RELEASE_TAG" --draft=false
