@@ -152,6 +152,13 @@ brew trust --cask made-by-moonlight/tap/ninox-app
 brew install --cask made-by-moonlight/tap/ninox-app
 ```
 
+Upgrade the app with `brew upgrade --cask ninox-app`, then quit and reopen it.
+For a cask-only installation, point the shared command at the new app with
+`/Applications/Ninox.app/Contents/MacOS/ninox-gui reset-bin` and use Settings →
+Restart server. If the server runs inside the app, quit and reopen the app to
+restart it. Existing PTY and tmux sessions are designed to survive a server
+restart.
+
 The bundle is ad-hoc code-signed in CI (no paid Apple Developer ID or notarization), which is enough to stop Gatekeeper from calling it "damaged" after a browser download. It's not enough to clear the separate "unidentified developer" warning macOS shows the first time you open an app from outside the App Store — that only goes away with real notarization. The first time you launch `Ninox.app`, expect that prompt; get past it with either:
 
 - Right-click (or Control-click) `Ninox.app` → **Open** → **Open** in the confirmation dialog, or
