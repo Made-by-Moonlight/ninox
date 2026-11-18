@@ -124,6 +124,22 @@ ninox orchestrate <name> [--prompt <brief>] [--no-attach]
 
 The daemon automatically starts in the background on first use and logs to `~/.local/share/ninox/daemon.log` (Linux) or `~/Library/Application Support/ninox/daemon.log` (macOS). Quitting the TUI doesn't shut down the daemon — sessions continue running in the background.
 
+### PTY host
+
+Ninox starts its PTY host on demand. To inspect it and stop it when you no
+longer need its sessions:
+
+```bash
+ninox ptyd status
+ninox pane list
+ninox ptyd stop
+```
+
+`ptyd stop` stops the host and **terminates every pane it owns**, including
+running agents. Finish or save work in those panes first. The host starts
+again when needed; tmux-hosted sessions are separate. Restarting the Ninox
+server does not stop the PTY host.
+
 ## macOS app bundle
 
 Published releases include an Apple silicon `Ninox.app.zip` — download it from
