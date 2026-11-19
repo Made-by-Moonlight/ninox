@@ -33,6 +33,9 @@ runs:
         cp crates/ninox-gui/assets/Ninox.icns "$app/Contents/Resources/Ninox.icns"
         version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "ninox-gui") | .version')
         plist="$app/Contents/Info.plist"
+        # The CI cache can contain an older bundle. Start a fresh dictionary
+        # so repeated builds do not fail on keys from the cached plist.
+        printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' '<plist version="1.0"><dict/></plist>' > "$plist"
         /usr/libexec/PlistBuddy -c 'Add :CFBundleName string Ninox' "$plist"
         /usr/libexec/PlistBuddy -c 'Add :CFBundleDisplayName string Ninox' "$plist"
         /usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string com.madebymoonlight.ninox' "$plist"
