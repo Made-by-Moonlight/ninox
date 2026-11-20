@@ -19,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Test release versioning
+        run: python3 -m unittest discover -s scripts/tests -v
       # The runner image ships ~25 GB of toolchains this job never uses.
       # A restored cargo cache plus a large feature-unification rebuild
       # (any PR that reshapes Cargo.lock) doubles much of target/ and can
