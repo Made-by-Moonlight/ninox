@@ -9189,7 +9189,9 @@ mod tests {
             title: format!("t-{id}"),
             body: String::new(),
             session_id: None,
-            created_at: 1,
+            // Store assigns the current time, so retention pruning cannot
+            // discard this fixture before the notification is polled.
+            created_at: 0,
         }
     }
 

@@ -1,6 +1,6 @@
 //! Data-driven agent-harness registry — harness definitions are DATA, not
 //! code (spec: field-notes-design.md §V "Backend (registry, not enum)").
-//! Four known harnesses ship as compiled-in default specs; `[harnesses.*]`
+//! Known harnesses ship as compiled-in default specs; `[harnesses.*]`
 //! config entries override (whole-spec replace) or extend the registry, so
 //! adding a future harness requires zero Rust changes.
 
@@ -139,7 +139,7 @@ pub struct HarnessSpec {
     #[serde(default)]
     pub no_permission_prompts: bool,
     /// Repo-relative skills directory this harness reads, in addition to
-    /// `.claude/skills` (pi scans `.agents/skills`, not `.claude/skills`).
+    /// the standard seeded `.claude/skills` and `.agents/skills` directories.
     /// Seeded from the same capability registry and git-excluded the same way.
     #[serde(default)]
     pub extra_skills_dir: Option<String>,
@@ -210,17 +210,20 @@ fn builtin_specs() -> BTreeMap<String, HarnessSpec> {
         models_cmd:       Some(vec!["opencode".into(), "models".into()]),
         ..HarnessSpec::default()
     });
+    // `ori code` is Ori's native agent; bare `ori` also wraps other agents.
+    // Keep approvals manual for both launch paths: Ori otherwise defaults to
+    // self-drive. `--interactive` keeps a prompted worker open for follow-up.
+    m.insert("ori".to_string(), HarnessSpec {
+        interactive_args: vec!["code".into(), "--approvals".into(), "manual".into(), "--model".into(), "{model}".into()],
+        worker_args: Some(vec!["code".into(), "--approvals".into(), "manual".into(), "--model".into(), "{model}".into(), "--interactive".into(), "-p".into(), "{prompt}".into()]),
+        install_hint: Some("install Ori from https://openrouter.ai/ori".into()),
+        ..HarnessSpec::default()
+    });
     m.insert("aider".to_string(), HarnessSpec {
         interactive_args: vec!["--model".into(), "{model}".into()],
         worker_args:      Some(vec!["--model".into(), "{model}".into(), "--message".into(), "{prompt}".into()]),
         // aider's `--list-models` needs a search-term argument, so no
         // reliable bare models_cmd ships by default; supply one in config.
-        ..HarnessSpec::default()
-    });
-    m.insert("freebuff".to_string(), HarnessSpec {
-        // Researched 2026-07-05: worker/one-shot mode UNVERIFIED — no
-        // worker_args until someone supplies them in config.
-        interactive_args: vec!["--model".into(), "{model}".into()],
         ..HarnessSpec::default()
     });
     // Researched against pi 1.5.0 (`@earendil-works/pi-coding-agent`, needs
@@ -670,6 +673,16 @@ mod tests {
     }
 
     #[test]
+    fn ori_launches_its_native_agent_with_manual_approvals() {
+        let r = reg();
+        assert!(!r.spec("ori").enabled);
+        assert_eq!(r.interactive_cmd(&agent("ori", None), PermissionMode::Standard, "s"),
+                   "ori code --approvals manual");
+        assert_eq!(r.worker_cmd(&agent("ori", Some("provider/model")), PermissionMode::Bypass, "fix it", "s").unwrap(),
+                   "ori code --approvals manual --model 'provider/model' --interactive -p 'fix it'");
+    }
+
+    #[test]
     fn worker_cmd_aider_uses_message_flag() {
         assert_eq!(reg().worker_cmd(&agent("aider", None), PermissionMode::Bypass, "fix it", "sess-1").unwrap(),
                    "aider --message 'fix it'");
@@ -830,16 +843,6 @@ mod tests {
     }
 
     #[test]
-    fn freebuff_ships_disabled_without_worker_args() {
-        let r = reg();
-        let fb = r.spec("freebuff");
-        assert!(!fb.enabled);
-        assert!(fb.worker_args.is_none());
-        assert_eq!(r.interactive_cmd(&agent("freebuff", Some("fb-large")), PermissionMode::Standard, "sess-1"),
-                   "freebuff --model 'fb-large'");
-    }
-
-    #[test]
     fn only_claude_code_enabled_by_default() {
         assert_eq!(reg().enabled_names(), vec!["claude-code".to_string()]);
     }
@@ -847,7 +850,7 @@ mod tests {
     #[test]
     fn names_lists_claude_code_first_then_alphabetical() {
         assert_eq!(reg().names(),
-                   vec!["claude-code", "aider", "codex", "freebuff", "opencode", "pi"]
+                   vec!["claude-code", "aider", "codex", "opencode", "ori", "pi"]
                        .into_iter().map(String::from).collect::<Vec<_>>());
     }
 
@@ -868,14 +871,14 @@ mod tests {
     #[test]
     fn config_entry_extends_registry_with_new_harness() {
         let mut over = BTreeMap::new();
-        over.insert("freebuff2".to_string(), HarnessSpec {
+        over.insert("custom".to_string(), HarnessSpec {
             enabled: true,
             worker_args: Some(vec!["--model".into(), "{model}".into(), "-p".into(), "{prompt}".into()]),
             ..HarnessSpec::default()
         });
         let r = HarnessRegistry::from_config(&over);
         // binary defaults to the harness name
-        assert_eq!(r.worker_cmd(&agent("freebuff2", None), PermissionMode::Bypass, "go", "sess-1").unwrap(), "freebuff2 -p 'go'");
+        assert_eq!(r.worker_cmd(&agent("custom", None), PermissionMode::Bypass, "go", "sess-1").unwrap(), "custom -p 'go'");
     }
 
     #[test]
@@ -1022,22 +1025,22 @@ mod tests {
     #[test]
     fn harness_spec_round_trips_through_toml() {
         let toml_src = r#"
-            [harnesses.freebuff]
+            [harnesses.custom]
             enabled = true
-            binary  = "freebuff"
+            binary  = "custom"
             model   = "fb-large"
             interactive_args = ["--model", "{model}"]
             worker_args      = ["--model", "{model}", "-p", "{prompt}"]
             known_models     = ["fb-large", "fb-mini"]
-            models_cmd       = ["freebuff", "models"]
+            models_cmd       = ["custom", "models"]
         "#;
         #[derive(serde::Deserialize)]
         struct Wrap { harnesses: BTreeMap<String, HarnessSpec> }
         let w: Wrap = toml::from_str(toml_src).unwrap();
-        let fb = &w.harnesses["freebuff"];
+        let fb = &w.harnesses["custom"];
         assert!(fb.enabled);
         assert_eq!(fb.known_models, vec!["fb-large", "fb-mini"]);
-        assert_eq!(fb.models_cmd.as_deref(), Some(&["freebuff".to_string(), "models".to_string()][..]));
+        assert_eq!(fb.models_cmd.as_deref(), Some(&["custom".to_string(), "models".to_string()][..]));
     }
 
     const ACCEPT: &str = "{\"crossSessionInbound\":\"accept\"}";

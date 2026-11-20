@@ -4702,10 +4702,9 @@ pub fn orchestrator_initial_brief(id: &str, brief: &str, spawner: Option<&str>, 
 }
 
 /// A Standalone spawn's success criteria (the worker type's defaults) and
-/// the first message to send it, if any: the Definition-of-done block goes
-/// out whenever there's a prompt or criteria the session would otherwise
-/// never be told about. No orchestrator footer — a human-initiated standalone
-/// session reports to no one. `None` for an unknown or non-standalone type.
+/// the first message to send it, including capability discovery and any
+/// Definition-of-done block. A human-initiated standalone session reports
+/// to no orchestrator. `None` for an unknown or non-standalone type.
 pub fn standalone_initial_prompt(
     config: &AppConfig,
     id: &str,
@@ -4723,9 +4722,15 @@ fn standalone_prompt_for(
     prompt: String,
 ) -> (Vec<ninox_core::worker_type::SuccessCriterion>, Option<String>) {
     let criteria = resolve_success_criteria(&spec.success, &[], false);
-    let message = (!prompt.trim().is_empty() || !criteria.is_empty())
-        .then(|| compose_effective_prompt(prompt, id, "", config.pr_watch.enabled, &criteria, false));
-    (criteria, message)
+    let mut message = compose_effective_prompt(prompt, id, "", config.pr_watch.enabled, &criteria, false);
+    message.push_str("\n\nNinox capabilities are available in this session. Run `ninox capabilities --worker` for the current list. Read the relevant instructions before using a capability:");
+    for cap in ninox_core::capabilities::for_audience(ninox_core::capabilities::Audience::Worker) {
+        if !(cap.enabled)(config) { continue; }
+        let Some(md) = cap.worker_md else { continue };
+        let Some(description) = ninox_core::capabilities::description(md) else { continue };
+        message.push_str(&format!("\n- .agents/skills/{}/SKILL.md: {}", cap.name, description));
+    }
+    (criteria, Some(message))
 }
 
 /// Delivers a freshly spawned session's first message once its harness has
@@ -9960,8 +9965,15 @@ mod orchestrator_cli_tests {
         // caller's explicit agent argument must be what lands on the
         // session — the dialog's Agent/Model fields, not the type.
         let agent = ninox_core::config::AgentConfig { harness: "codex".to_string(), model: Some("o3".to_string()) };
+        let mut config = scratch_config();
+        config.harnesses.insert("codex".into(), ninox_core::harness::HarnessSpec {
+            enabled: true,
+            binary: Some("sh".into()),
+            interactive_args: vec!["-c".into(), "'printf \"❯ \\n\"; exec cat'".into()],
+            ..Default::default()
+        });
         let result = spawn_standalone_worker(
-            &store, &scratch_config(), "standalone-explicit-agent".into(), existing_workspace(),
+            &store, &config, "standalone-explicit-agent".into(), existing_workspace(),
             Some("Researcher".into()), agent, ninox_core::brain_set::BrainSet::single("/brain"), String::new(),
         ).await;
         if result.is_ok() {
@@ -10149,13 +10161,15 @@ mod orchestrator_cli_tests {
     fn standalone_initial_prompt_appends_the_definition_of_done() {
         let _iso = ninox_core::test_isolation::isolate();
         let config = ninox_core::config::AppConfig::default();
-        let (criteria, message) = crate::cli::standalone_initial_prompt(&config, "solo", "Implementor", "do x".into()).unwrap();
+        let (_, message) = crate::cli::standalone_initial_prompt(&config, "solo", "Implementor", "do x".into()).unwrap();
         let message = message.expect("a prompt is always sent");
         assert!(message.starts_with("do x") && message.contains("Definition of done"), "{message}");
         assert!(!message.contains("ninox send"), "a standalone session reports to no one: {message}");
 
         let (_, empty) = crate::cli::standalone_initial_prompt(&config, "solo", "Implementor", "  ".into()).unwrap();
-        assert_eq!(empty.is_some(), !criteria.is_empty(), "with no prompt, only criteria are worth sending");
+        let empty = empty.expect("capabilities must be advertised even without a task");
+        assert!(empty.contains("ninox capabilities --worker"));
+        assert!(empty.contains(".agents/skills/brain/SKILL.md"));
         assert!(crate::cli::standalone_initial_prompt(&config, "solo", "Orchestrator", "x".into()).is_none());
         assert!(crate::cli::standalone_initial_prompt(&config, "solo", "no-such-type", "x".into()).is_none());
     }

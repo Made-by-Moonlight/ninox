@@ -1359,7 +1359,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub limits: LimitsConfig,
     /// Agent-harness registry overrides/extensions (`[harnesses.<name>]`).
-    /// Builtin specs for claude-code/codex/opencode/aider/freebuff/pi apply
+    /// Builtin specs for claude-code/codex/opencode/ori/aider/pi apply
     /// when a name is absent here. See `crate::harness`. Kept last so TOML
     /// serialization emits this table-of-tables after every scalar field.
     #[serde(default)]

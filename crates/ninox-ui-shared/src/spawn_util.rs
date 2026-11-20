@@ -1097,14 +1097,17 @@ async fn seed_worker_skill(workspace: &str, skills_rel: &str, name: &str, conten
 /// never fatal to the spawn — mirroring how `setup_orchestrator_root`'s own
 /// failures are handled in `main.rs`.
 ///
-/// `harness` selects extra skills directories beyond `.claude/skills` (pi
-/// reads `.agents/skills`); every directory is written from the same
-/// registry loop, so they cannot drift.
+/// Every harness gets the same registry skills in `.agents/skills`, as well
+/// as `.claude/skills`. A harness can also specify an additional directory.
 pub async fn seed_worker_skills(workspace: &str, config: &ninox_core::config::AppConfig, harness: &str) {
     use ninox_core::capabilities::{for_audience, Audience};
 
-    let mut dirs = vec![".claude/skills".to_string()];
-    dirs.extend(config.registry().spec(harness).extra_skills_dir);
+    let mut dirs = vec![".claude/skills".to_string(), ".agents/skills".to_string()];
+    if let Some(dir) = config.registry().spec(harness).extra_skills_dir {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
     for cap in for_audience(Audience::Worker) {
         if !(cap.enabled)(config) {
             continue;
@@ -2213,11 +2216,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_workers_get_no_agents_skills_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path().to_str().unwrap().to_string();
-        seed_worker_skills(&ws, &cfg(true), "claude-code").await;
-        assert!(!dir.path().join(".agents").exists());
+    async fn every_builtin_harness_gets_the_registry_skills() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let config = cfg(true);
+        for harness in config.registry().names() {
+            let dir = tempfile::tempdir().unwrap();
+            let ws = dir.path().to_str().unwrap();
+            seed_worker_skills(ws, &config, &harness).await;
+            for cap in ninox_core::capabilities::for_audience(ninox_core::capabilities::Audience::Worker) {
+                if !(cap.enabled)(&config) { continue; }
+                if let Some(md) = cap.worker_md {
+                    let path = dir.path().join(".agents/skills").join(cap.name).join("SKILL.md");
+                    assert_eq!(std::fs::read_to_string(path).unwrap(), md, "{harness}: {}", cap.name);
+                }
+            }
+        }
     }
 
     #[tokio::test]

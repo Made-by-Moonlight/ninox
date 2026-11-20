@@ -368,11 +368,10 @@ mod tests {
         let path = dir.path().join("config.toml");
         {
             let _iso = crate::test_isolation::isolate_with_config(&path);
-            // freebuff ships enabled:false in the builtin registry AND has no
-            // worker_args — enable it first so the failure is specifically
-            // the worker-mode check, not the enabled-harness check.
-            set("harnesses.freebuff.enabled", "true").unwrap();
-            let err = set("worker.harness", "freebuff").unwrap_err();
+            // Register an interactive-only harness so the failure exercises
+            // the worker-mode check rather than the enabled-harness check.
+            set("harnesses.interactive-only.enabled", "true").unwrap();
+            let err = set("worker.harness", "interactive-only").unwrap_err();
             assert!(err.to_string().contains("no verified worker mode"), "{err}");
         }
     }

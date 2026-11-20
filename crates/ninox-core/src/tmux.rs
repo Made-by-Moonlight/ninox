@@ -323,6 +323,17 @@ pub async fn create_session(
     cmd:       &str,
     env:       &[(&str, &str)],
 ) -> Result<()> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    create_session_with_shell(id, workspace, cmd, env, &shell).await
+}
+
+async fn create_session_with_shell(
+    id: &str,
+    workspace: &str,
+    cmd: &str,
+    env: &[(&str, &str)],
+    shell: &str,
+) -> Result<()> {
     // tmux does NOT fail on a nonexistent `-c` dir (verified on 3.6a: exit 0,
     // pane silently starts in $HOME). For harnesses with cwd-scoped state —
     // claude-code keys conversations to the directory it starts in — that
@@ -348,16 +359,23 @@ pub async fn create_session(
     // Wrap the command in a login shell so the full user PATH is available.
     // tmux sessions do not inherit shell rc files, so tools installed via
     // nvm / cargo / homebrew etc. would not be found otherwise.
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    let shell_cmd = format!("{shell} -l -c {}", shell_quote(cmd));
-
     // Fix the terminal dimensions to match the canvas.  The canvas is roughly
     // (window_width - 220px sidebar) / 7.8px_per_col ≈ 135 cols on a 1280-wide
     // window.  Use 140 as a safe default; too-wide values push Claude Code's
     // centered content off-screen.
     let mut base = vec!["new-session", "-d", "-s", id, "-x", "140", "-y", "50", "-c", workspace];
     base.extend_from_slice(&extra);
-    base.push(&shell_cmd);
+    // Multiple shell-command arguments make tmux exec the shell directly.
+    // A single string is first parsed by tmux's default shell, which may be
+    // fish and cannot parse the POSIX quoting used in worker prompts.
+    if std::path::Path::new(shell).file_name().is_some_and(|name| name == "fish") {
+        // Harness commands use POSIX quoting. Let fish load the user's
+        // login environment, then pass the command to a POSIX shell as an
+        // argument rather than asking fish to parse it.
+        base.extend_from_slice(&[shell, "-l", "-c", "exec /bin/sh -c \"$argv[1]\"", cmd]);
+    } else {
+        base.extend_from_slice(&[shell, "-l", "-c", cmd]);
+    }
 
     // A duplicate name means a LIVE tmux session already exists under this
     // id. Killing it to make room (the old behavior) silently destroys a
@@ -1221,6 +1239,18 @@ mod tests {
             sleep(Duration::from_millis(100)).await;
         }
         panic!("pane {id} never showed {needle:?}");
+    }
+
+    #[tokio::test]
+    async fn fish_login_shell_runs_posix_quoted_worker_command() {
+        if !tmux_available() || std::process::Command::new("fish").arg("--version").output().is_err() {
+            return;
+        }
+        let id = unique_id();
+        create_session_with_shell(&id, "/tmp", "printf '%s\\n' \"can't stop\"; exec cat", &[], "fish")
+            .await.unwrap();
+        wait_for_pane_contains(&id, "can't stop").await;
+        kill_session(&id).await.unwrap();
     }
 
     /// A message that stays visible at a `❯` prompt after Enter (the
