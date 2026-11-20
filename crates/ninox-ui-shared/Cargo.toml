@@ -1,15 +1,15 @@
 [package]
 name        = "ninox-ui-shared"
-version     = "1.0.0"
+version     = "1.0.1"
 edition     = "2021"
 description = "Framework-agnostic session/lifecycle logic shared by ninox-gui and ninox-tui."
 license     = "MIT"
 repository  = "https://github.com/Made-by-Moonlight/ninox"
 
 [dependencies]
-ninox-core   = { path = "../ninox-core", version = "1.0.0" }
-ninox-server = { path = "../ninox-server", version = "1.0.0" }
-ninox-ptyd   = { path = "../ninox-ptyd", version = "1.0.0" }
+ninox-core   = { path = "../ninox-core", version = "1.0.1" }
+ninox-server = { path = "../ninox-server", version = "1.0.1" }
+ninox-ptyd   = { path = "../ninox-ptyd", version = "1.0.1" }
 tokio        = { workspace = true }
 sha2         = { workspace = true }
 anyhow       = { workspace = true }
@@ -36,7 +36,7 @@ futures-util = { workspace = true }
 test-support = []
 
 [dev-dependencies]
-ninox-core  = { path = "../ninox-core", version = "1.0.0", features = ["test-isolation"] }
+ninox-core  = { path = "../ninox-core", version = "1.0.1", features = ["test-isolation"] }
 tempfile    = "3.27.0"
 async-trait = { workspace = true }
 rusqlite    = { workspace = true }
