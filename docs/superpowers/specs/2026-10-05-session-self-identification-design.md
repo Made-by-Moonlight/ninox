@@ -8,7 +8,7 @@ writing; later phases should re-check them before building.
 
 ## Context
 
-[Moxy](https://github.com/Synthesia-Technologies/moxy), ninox's spiritual
+Moxy, ninox's spiritual
 successor, lets a session determine its own identity on demand instead of
 relying on identity injected once at spawn time. Its daemon owns one
 canonical, bounded role descriptor per session (profile, role, ownership,

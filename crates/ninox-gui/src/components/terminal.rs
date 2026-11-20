@@ -393,6 +393,11 @@ pub struct SelectionState {
     /// carry none, and Option/Cmd+click moves the cursor (see
     /// `cursor_move_bytes`).
     modifiers: iced::keyboard::Modifiers,
+    /// Fractional wheel/trackpad scroll (in lines) not yet emitted. Pixel
+    /// deltas from a slow trackpad swipe are well under one cell high;
+    /// truncating each event to whole lines would drop them all, so the
+    /// remainder is carried across events instead.
+    scroll_remainder: f32,
 }
 
 /// iTerm2's "Option-click moves cursor": a terminal has no cursor-move
@@ -730,19 +735,28 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                 return (iced::widget::canvas::event::Status::Captured, Some(msg));
             }
 
-            Event::Mouse(MouseEvent::WheelScrolled { delta }) => {
+            // Only when the pointer is over the terminal: a wheel event over
+            // a sibling widget (split inspector, lists) must stay theirs.
+            Event::Mouse(MouseEvent::WheelScrolled { delta }) if cursor.position_in(bounds).is_some() => {
                 use iced::mouse::ScrollDelta;
-                // Positive y = scroll up (into history). Convert to integer line delta.
-                let lines = match delta {
-                    ScrollDelta::Lines { y, .. }  => (*y * 3.0) as i32,
-                    ScrollDelta::Pixels { y, .. } => (*y / cell_h) as i32,
+                // Positive y = scroll up (into history). Accumulate in
+                // fractional lines and emit only the whole part, keeping the
+                // remainder so slow trackpad swipes still scroll smoothly.
+                let line_delta = match delta {
+                    ScrollDelta::Lines { y, .. }  => *y * 3.0,
+                    ScrollDelta::Pixels { y, .. } => *y / cell_h,
                 };
+                state.scroll_remainder += line_delta;
+                let lines = state.scroll_remainder.trunc() as i32;
+                state.scroll_remainder -= lines as f32;
                 if lines != 0 {
                     return (
                         iced::widget::canvas::event::Status::Captured,
                         Some(Message::ScrollTerminal { session_id: self.session_id.clone(), delta: lines, local: false }),
                     );
                 }
+                // Swallow sub-line deltas so they don't leak to parent widgets.
+                return (iced::widget::canvas::event::Status::Captured, None);
             }
 
             _ => {}
@@ -1859,5 +1873,58 @@ mod tests {
             Some(Message::ScrollTerminal { local: false, .. }) => {}
             other => panic!("expected a PTY-aware ScrollTerminal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn slow_pixel_scroll_accumulates_instead_of_being_dropped() {
+        use iced::widget::canvas::Program;
+
+        let s = TerminalState::new(80, 24, None);
+        let widget = test_widget(&s);
+        let (cell_w, cell_h) = cell_size(FONT_SIZE);
+        let bounds = Rectangle::new(iced::Point::new(0.0, 0.0), Size::new(80.0 * cell_w, 24.0 * cell_h));
+        let mut state = SelectionState::default();
+        let inside = iced::Point::new(cell_w, cell_h);
+
+        // Each event is a quarter of a cell: only every fourth should emit.
+        let mut total = 0;
+        for _ in 0..12 {
+            let (_, msg) = widget.update(
+                &mut state,
+                iced::widget::canvas::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                    delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: cell_h / 4.0 },
+                }),
+                bounds,
+                iced::mouse::Cursor::Available(inside),
+            );
+            if let Some(Message::ScrollTerminal { delta, .. }) = msg {
+                total += delta;
+            }
+        }
+        assert_eq!(total, 3, "12 quarters of a cell must add up to 3 lines");
+    }
+
+    #[test]
+    fn wheel_outside_bounds_is_ignored_and_not_accumulated() {
+        use iced::widget::canvas::Program;
+
+        let s = TerminalState::new(80, 24, None);
+        let widget = test_widget(&s);
+        let (cell_w, cell_h) = cell_size(FONT_SIZE);
+        let bounds = Rectangle::new(iced::Point::new(0.0, 100.0), Size::new(80.0 * cell_w, 24.0 * cell_h));
+        let mut state = SelectionState::default();
+        let outside = iced::Point::new(cell_w, bounds.y - 20.0);
+
+        let (status, msg) = widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: cell_h / 4.0 },
+            }),
+            bounds,
+            iced::mouse::Cursor::Available(outside),
+        );
+        assert_eq!(status, iced::widget::canvas::event::Status::Ignored);
+        assert!(msg.is_none());
+        assert_eq!(state.scroll_remainder, 0.0);
     }
 }

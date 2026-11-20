@@ -82,8 +82,8 @@ fn action_button<'a>(label: &'a str, message: Option<Message>) -> Element<'a, Me
 /// (`poller::poll_update_check`) already recorded this version as notified
 /// before the install was attempted, so without this button a failed
 /// install wouldn't get another automatic reminder for the same version.
-fn notification_action<'a>(app: &'a App, kind: &NotificationKind) -> Option<Element<'a, Message>> {
-    match kind {
+fn notification_action<'a>(app: &'a App, n: &ninox_core::types::Notification) -> Option<Element<'a, Message>> {
+    match &n.kind {
         NotificationKind::UpdateAvailable => Some(if app.update_in_progress {
             action_button("Updating…", None)
         } else {
@@ -102,6 +102,9 @@ fn notification_action<'a>(app: &'a App, kind: &NotificationKind) -> Option<Elem
         )),
         NotificationKind::DiskPressure => Some(action_button(
             "Review workspaces", Some(Message::WorkspacesModalOpen),
+        )),
+        NotificationKind::ResetPlanReady => Some(action_button(
+            "Review plan…", n.session_id.clone().map(Message::ResetFromPlanOpenReady),
         )),
         _ => None,
     }
@@ -139,7 +142,7 @@ fn notification_row<'a>(app: &'a App, n: &'a ninox_core::types::Notification) ->
         Space::new(0, 2),
         text(&n.body).size(12).font(crate::style::SANS).color(tokens::DIM),
     ];
-    if let Some(action) = notification_action(app, &n.kind) {
+    if let Some(action) = notification_action(app, n) {
         content = content.push(Space::new(0, 6)).push(action);
     }
 

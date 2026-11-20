@@ -334,6 +334,7 @@ pub(crate) mod tests {
             enabled,
             cadence: "every_10_min".to_string(),
             access: "read_write".to_string(),
+            write_rules_override: None,
         }
     }
 

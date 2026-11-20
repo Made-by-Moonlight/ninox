@@ -408,6 +408,7 @@ mod tests {
             enabled: true,
             cadence: "manual".to_string(),
             access: "read_write".to_string(),
+            write_rules_override: None,
         }
     }
 }

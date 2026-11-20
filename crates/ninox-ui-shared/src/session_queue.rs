@@ -58,6 +58,10 @@ pub struct OrchestratorLaunch {
     /// The spawner's `NINOX_ORCHESTRATOR_ID`, which the brief is attributed to.
     pub spawner:                Option<String>,
     pub started_at:             i64,
+    /// A user-chosen folder to run in (already validated), instead of a
+    /// directory under ninox's orchestrator root.
+    #[serde(default)]
+    pub workspace:              Option<String>,
 }
 
 /// `cli::spawn_standalone_worker` after validation.
@@ -103,7 +107,7 @@ pub fn base_session(id: &str, name: &str, agent: &AgentConfig, started_at: i64) 
         id: id.to_string(), orchestrator_id: None, name: name.to_string(), repo: String::new(),
         status: SessionStatus::Working, agent_type: agent.harness.clone(), cost_usd: 0.0,
         started_at, pr_number: None, pr_id: None, workspace_path: None, pid: None,
-        model: agent.model.clone(), context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+        model: agent.model.clone(), observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
         context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: None, summary: None, terminal_at: None, gate_status: None,
         merged_at: None, activity: Default::default(), activity_note: None, activity_since: None,

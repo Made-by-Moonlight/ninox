@@ -192,7 +192,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None,
             workspace_path: Some(workspace.into()), pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -233,7 +233,8 @@ mod tests {
         assert_eq!(s.context_used_pct, Some(62.0));
         assert_eq!(s.context_total_tokens, Some(124_000));
         assert_eq!(s.context_window_size, Some(200_000));
-        assert_eq!(s.model.as_deref(), Some("Opus 4.8"));
+        assert_eq!(s.model, None, "the statusline's model is observed, never recorded as the session's choice");
+        assert_eq!(s.observed_model.as_deref(), Some("Opus 4.8"));
     }
 
     #[test]

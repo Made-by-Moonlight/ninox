@@ -238,7 +238,7 @@ async fn restart_one_inner(store: &Arc<Store>, config: &AppConfig, id: &str) -> 
     let is_orchestrator = store.is_orchestrator(id).unwrap_or(false);
 
     let can_resume = session.claude_session_id.is_some()
-        && config.registry().can_resume(&relaunch_agent(&session))
+        && config.registry().can_resume(&relaunch_agent(&session, is_orchestrator, config))
         && store.list_sessions().is_ok_and(|all| config.registry().session_can_resume(&session, &all));
 
     let planned = if can_resume {
@@ -474,14 +474,36 @@ pub fn session_permission_mode(store: &Store, session: &Session, is_orchestrator
 pub fn can_resume(session: &Session, config: &AppConfig) -> bool {
     session.workspace_path.is_some()
         && session.claude_session_id.is_some()
-        && config.registry().can_resume(&relaunch_agent(session))
+        && config.registry().can_resume(&relaunch_agent(session, false, config))
 }
 
 /// A relaunch (re-file / resume / restart / restore) keeps the harness
 /// and model the session was started with — a `[orchestrator]`/`[worker]`
 /// model change applies to new spawns only.
-fn relaunch_agent(session: &Session) -> AgentConfig {
-    ninox_core::model_resolution::relaunch_agent(&session.agent_type, session.model.as_deref())
+fn relaunch_agent(session: &Session, is_orchestrator: bool, config: &AppConfig) -> AgentConfig {
+    use ninox_core::model_resolution::{relaunch_agent, Role};
+    let types = config.worker_type_registry();
+    let (role, worker_type) = if is_orchestrator {
+        (Role::Orchestrator, types.get("Orchestrator"))
+    } else {
+        (Role::Worker, session.worker_type.as_deref().and_then(|t| types.get(t)))
+    };
+    relaunch_agent(&session.agent_type, session.model.as_deref(), role, worker_type, config)
+}
+
+/// An orchestrator in a custom workspace has no AGENTS.md. Under claude-code
+/// its role arrives through the session-setup hook on every launch; a harness
+/// with no hooks gets the role text on the command line, resumes included.
+fn with_custom_role(store: &Store, session: &Session, is_orchestrator: bool, config: &AppConfig, agent: &AgentConfig, cmd: String) -> String {
+    let hooked = session
+        .workspace_path
+        .as_deref()
+        .is_some_and(|ws| ninox_core::session_setup::delivered_by_hook(config, &agent.harness, std::path::Path::new(ws)));
+    if !is_orchestrator || hooked || !matches!(store.custom_workspace(&session.id), Ok(Some(_))) {
+        return cmd;
+    }
+    let role = ninox_core::custom_workspace::role_prompt(config);
+    config.registry().with_system_prompt(agent, &cmd, &role).unwrap_or(cmd)
 }
 
 /// `None` when the session has no recorded workspace (nothing to respawn
@@ -496,9 +518,10 @@ pub fn refile_plan(
     claude_session_id: &str,
 ) -> Option<RefilePlan> {
     let workspace = session.workspace_path.clone()?;
-    let agent = relaunch_agent(session);
+    let agent = relaunch_agent(session, is_orchestrator, config);
     let permission_mode = session_permission_mode(store, session, is_orchestrator, config);
-    let base_cmd = config.registry().interactive_cmd(&agent, permission_mode, claude_session_id);
+    let base_cmd = with_custom_role(store, session, is_orchestrator, config, &agent,
+        config.registry().interactive_cmd(&agent, permission_mode, claude_session_id));
     let brain = Some(ninox_core::brain_set::BrainSet::from_session(session, config));
     let extra_env = if is_orchestrator {
         vec![
@@ -527,6 +550,38 @@ pub fn refile_request(store: &Store, session: Session, is_orchestrator: bool, co
     })
 }
 
+/// A fresh-conversation relaunch that starts on the prompt in `prompt_file`
+/// as its first input when the harness can take one as a launch argument.
+/// The returned flag is `false` when it cannot, and the caller must feed the
+/// prompt through the pane instead.
+pub fn refile_request_with_prompt(
+    store: &Store,
+    session: Session,
+    is_orchestrator: bool,
+    config: &AppConfig,
+    started_at: i64,
+    prompt_file: &str,
+) -> Option<(RelaunchRequest, bool)> {
+    let mut req = refile_request(store, session, is_orchestrator, config, started_at)?;
+    // Hook-capable harness: the prompt's content reaches the session through
+    // the session-setup hook, so the launch only needs a minimal first input
+    // to make it start a turn.
+    let cmd = if ninox_core::session_setup::delivered_by_hook(config, &req.plan.agent.harness, std::path::Path::new(&req.plan.workspace)) {
+        config.registry().interactive_cmd_with_prompt(
+            &req.plan.agent, req.plan.permission_mode, ninox_core::session_setup::RESET_KICKOFF_PROMPT, &req.claude_session_id,
+        )
+    } else {
+        config.registry().interactive_cmd_with_prompt_file(
+            &req.plan.agent, req.plan.permission_mode, prompt_file, &req.claude_session_id,
+        )
+    };
+    let as_arg = cmd.is_some();
+    if let Some(cmd) = cmd {
+        req.plan.base_cmd = with_custom_role(store, &req.session, is_orchestrator, config, &req.plan.agent, cmd);
+    }
+    Some((req, as_arg))
+}
+
 /// Like `refile_plan`, but rebuilds via `resume_cmd` (continuing the
 /// existing `claude_session_id`) instead of `interactive_cmd` (starting
 /// fresh). `None` when there's no workspace to resume into OR no stored
@@ -542,12 +597,13 @@ pub fn resume_plan(
 ) -> Option<RefilePlan> {
     let workspace = session.workspace_path.clone()?;
     let claude_session_id = session.claude_session_id.as_deref()?;
-    let agent = relaunch_agent(session);
+    let agent = relaunch_agent(session, is_orchestrator, config);
     if !config.registry().session_can_resume(session, &store.list_sessions().ok()?) {
         return None;
     }
     let permission_mode = session_permission_mode(store, session, is_orchestrator, config);
-    let base_cmd = config.registry().resume_cmd(&agent, permission_mode, claude_session_id)?;
+    let base_cmd = with_custom_role(store, session, is_orchestrator, config, &agent,
+        config.registry().resume_cmd(&agent, permission_mode, claude_session_id)?);
     let brain = Some(ninox_core::brain_set::BrainSet::from_session(session, config));
     let extra_env = if is_orchestrator {
         vec![
@@ -575,7 +631,7 @@ mod tests {
             status: SessionStatus::Terminated, agent_type: "claude-code".into(),
             cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None,
             workspace_path: Some("/tmp/ws".into()), pid: None,
-            model: Some("claude-opus-4-8".into()), context_tokens: None,
+            model: Some("claude-opus-4-8".into()), observed_model: None, context_tokens: None,
             brain_reads: Vec::new(), brain_write: Some("/brains/b".into()),
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
@@ -616,6 +672,130 @@ mod tests {
                 assert_eq!(plan.base_cmd.contains(SKIP), want_skip, "{mode:?}: {}", plan.base_cmd);
             }
         }
+    }
+
+    /// A workspace whose settings.local.json runs the session-setup hook, as
+    /// a successful seeding leaves it.
+    fn hooked_workspace() -> String {
+        let ws = tempfile::tempdir().unwrap().keep();
+        std::fs::create_dir_all(ws.join(".claude")).unwrap();
+        std::fs::write(
+            ws.join(".claude/settings.local.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"'/b/ninox' session-setup"}]}]}}"#,
+        )
+        .unwrap();
+        ws.to_string_lossy().into_owned()
+    }
+
+    /// A config with a hook-less harness that can still append a system
+    /// prompt, and a custom-workspace orchestrator session running it.
+    fn hookless_custom_workspace() -> (ninox_core::config::AppConfig, Store, Session) {
+        let mut cfg = ninox_core::config::AppConfig::default();
+        cfg.harnesses.insert("nohook".into(), ninox_core::harness::HarnessSpec {
+            enabled: true,
+            binary: Some("nohook".into()),
+            interactive_args: vec!["--sid".into(), "{session_id}".into()],
+            worker_args: Some(vec!["--sid".into(), "{session_id}".into(), "--".into(), "{prompt}".into()]),
+            resume_args: vec!["--resume".into(), "{session_id}".into()],
+            append_system_prompt_flag: Some("--append-system-prompt".into()),
+            ..Default::default()
+        });
+        let store = st();
+        let mut session = refile_session("o1");
+        session.orchestrator_id = None;
+        session.agent_type = "nohook".into();
+        session.model = None;
+        session.claude_session_id = Some("c1".into());
+        store.upsert_session(&session).unwrap();
+        store.set_custom_workspace("o1", "/tmp/ws").unwrap();
+        (cfg, store, session)
+    }
+
+    /// Under claude-code a custom workspace's role arrives through the
+    /// session-setup hook, so no way back in carries it on the command line.
+    #[test]
+    fn claude_code_custom_workspace_orchestrators_relaunch_without_the_role_flag() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let cfg = ninox_core::config::AppConfig::default();
+        let store = st();
+        let ws = hooked_workspace();
+        let mut session = refile_session("o1");
+        session.orchestrator_id = None;
+        session.workspace_path = Some(ws.clone());
+        session.claude_session_id = Some("c1".into());
+        store.upsert_session(&session).unwrap();
+        store.set_custom_workspace("o1", &ws).unwrap();
+        for plan in [resume_plan(&store, &session, true, &cfg).unwrap(), refile_plan(&store, &session, true, &cfg, "u").unwrap()] {
+            assert!(!plan.base_cmd.contains("--append-system-prompt"), "{}", plan.base_cmd);
+            assert_eq!(plan.workspace, ws);
+        }
+    }
+
+    /// The hook could not be installed (git-tracked or unparsable
+    /// settings.local.json): the role stays on the command line rather than
+    /// being lost.
+    #[test]
+    fn a_claude_code_custom_workspace_without_the_hook_keeps_the_role_flag() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let cfg = ninox_core::config::AppConfig::default();
+        let store = st();
+        let mut session = refile_session("o1");
+        session.orchestrator_id = None;
+        session.claude_session_id = Some("c1".into());
+        store.upsert_session(&session).unwrap();
+        store.set_custom_workspace("o1", "/tmp/ws").unwrap();
+        for plan in [resume_plan(&store, &session, true, &cfg).unwrap(), refile_plan(&store, &session, true, &cfg, "u").unwrap()] {
+            assert!(plan.base_cmd.contains("--append-system-prompt '# Ninox Orchestrator"), "{}", plan.base_cmd);
+        }
+        let (req, _) = refile_request_with_prompt(&store, session, true, &cfg, 0, "/tmp/plan.md").unwrap();
+        assert!(req.plan.base_cmd.contains("--append-system-prompt") && req.plan.base_cmd.ends_with("\"$(cat '/tmp/plan.md')\""), "{}", req.plan.base_cmd);
+    }
+
+    /// Harness fallback: a harness with no hooks keeps the role text on the
+    /// command line of every way back in, and only for a custom workspace.
+    #[test]
+    fn hookless_custom_workspace_orchestrators_relaunch_with_the_role_prompt() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let (cfg, store, session) = hookless_custom_workspace();
+        for plan in [resume_plan(&store, &session, true, &cfg).unwrap(), refile_plan(&store, &session, true, &cfg, "u").unwrap()] {
+            assert!(plan.base_cmd.contains("--append-system-prompt '# Ninox Orchestrator"), "{}", plan.base_cmd);
+            assert_eq!(plan.workspace, "/tmp/ws");
+        }
+        assert!(!resume_plan(&store, &session, false, &cfg).unwrap().base_cmd.contains("--append-system-prompt"));
+    }
+
+    /// A hook-less harness's reset launch puts the plan on the command line
+    /// after `--`; the role text must stay a flag before it.
+    #[test]
+    fn a_hookless_custom_workspace_reset_launch_keeps_the_role_flag_before_the_prompt() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let (cfg, store, session) = hookless_custom_workspace();
+        let (req, as_arg) = refile_request_with_prompt(&store, session, true, &cfg, 0, "/tmp/plan.md").unwrap();
+        assert!(as_arg);
+        let cmd = req.plan.base_cmd;
+        let (flag, sep) = (cmd.find("--append-system-prompt").unwrap(), cmd.find(" -- ").unwrap());
+        assert!(flag < sep, "{cmd}");
+        assert!(cmd.ends_with("\"$(cat '/tmp/plan.md')\""), "{cmd}");
+    }
+
+    /// Under claude-code the reset launch carries only the kick-off prompt;
+    /// the plan travels through the hook.
+    #[test]
+    fn a_claude_code_reset_launch_carries_only_the_kickoff_prompt() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let cfg = ninox_core::config::AppConfig::default();
+        let store = st();
+        let ws = hooked_workspace();
+        let mut session = refile_session("o1");
+        session.orchestrator_id = None;
+        session.workspace_path = Some(ws.clone());
+        store.upsert_session(&session).unwrap();
+        store.set_custom_workspace("o1", &ws).unwrap();
+        let (req, as_arg) = refile_request_with_prompt(&store, session, true, &cfg, 0, "/tmp/plan.md").unwrap();
+        assert!(as_arg);
+        let cmd = req.plan.base_cmd;
+        assert!(cmd.ends_with(" -- 'Continue from your plan.'"), "{cmd}");
+        assert!(!cmd.contains("--append-system-prompt") && !cmd.contains("/tmp/plan.md"), "{cmd}");
     }
 
     #[test]
@@ -661,6 +841,7 @@ mod tests {
 
     #[test]
     fn refile_and_resume_keep_the_brain_set() {
+        let _iso = ninox_core::test_isolation::isolate();
         let cfg = ninox_core::config::AppConfig::default();
         let mut session = refile_session("s1");
         session.brain_reads = vec!["/brains/a".into(), "/brains/b".into()];
@@ -674,6 +855,7 @@ mod tests {
 
     #[test]
     fn refile_plan_resolves_agent_through_current_registry() {
+        let _iso = ninox_core::test_isolation::isolate();
         let mut cfg = ninox_core::config::AppConfig::default();
         // simulate a spec change since the session was filed
         cfg.harnesses.insert("claude-code".to_string(), ninox_core::harness::HarnessSpec {
@@ -694,6 +876,7 @@ mod tests {
 
     #[test]
     fn refile_plan_keeps_the_session_model_whatever_the_config_says() {
+        let _iso = ninox_core::test_isolation::isolate();
         // A `[orchestrator]`/`[worker]` model change applies to new spawns
         // only; a relaunched session keeps the model it started with.
         let mut cfg = ninox_core::config::AppConfig::default();
@@ -712,14 +895,18 @@ mod tests {
     }
 
     #[test]
-    fn refile_plan_row_without_a_model_stays_on_the_harness_default() {
+    fn refile_plan_row_without_a_model_resolves_like_a_new_spawn_of_its_role() {
+        let _iso = ninox_core::test_isolation::isolate();
         let mut cfg = ninox_core::config::AppConfig::default();
-        cfg.worker.model = Some("worker-model".into());
         let mut session = refile_session("s1");
         session.model = None;
         let plan = refile_plan(&st(), &session, false, &cfg, "u").expect("plan");
-        assert_eq!(plan.agent.model, None);
-        assert!(!plan.base_cmd.contains("--model"));
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-sonnet-5-5"));
+        let plan = refile_plan(&st(), &session, true, &cfg, "u").expect("plan");
+        assert_eq!(plan.agent.model.as_deref(), Some("claude-opus-5-5"));
+        cfg.worker.model = Some("worker-model".into());
+        let plan = refile_plan(&st(), &session, false, &cfg, "u").expect("plan");
+        assert!(plan.base_cmd.contains("--model 'worker-model'"), "{}", plan.base_cmd);
     }
 
     #[test]
@@ -742,6 +929,7 @@ mod tests {
 
     #[test]
     fn refile_plan_uses_the_freshly_generated_id_not_the_stale_one() {
+        let _iso = ninox_core::test_isolation::isolate();
         let cfg = ninox_core::config::AppConfig::default();
         let mut session = refile_session("s1");
         session.claude_session_id = Some("stale-id-from-before".into());
@@ -768,6 +956,7 @@ mod tests {
 
     #[test]
     fn resume_plan_builds_a_resume_command_from_the_stored_id() {
+        let _iso = ninox_core::test_isolation::isolate();
         let cfg = ninox_core::config::AppConfig::default();
         let mut session = refile_session("s1");
         session.claude_session_id = Some("stored-uuid".into());
@@ -779,6 +968,7 @@ mod tests {
 
     #[test]
     fn resume_plan_keeps_the_session_model_whatever_the_config_says() {
+        let _iso = ninox_core::test_isolation::isolate();
         let mut cfg = ninox_core::config::AppConfig::default();
         cfg.orchestrator.model = Some("claude-fable-5-1".into());
         cfg.worker.model       = Some("claude-fable-5-1".into());
@@ -911,7 +1101,7 @@ mod tests {
             id: id.into(), orchestrator_id: orch.map(str::to_string), name: id.into(),
             repo: String::new(), status, agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 1, pr_number: None, pr_id: None, workspace_path: Some(ws.into()),
-            pid: None, model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            pid: None, model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some(format!("uuid-{id}")), summary: Some(format!("task {id}")),
             terminal_at: None, gate_status: None, merged_at: None,

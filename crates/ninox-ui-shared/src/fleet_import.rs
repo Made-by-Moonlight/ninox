@@ -315,7 +315,7 @@ mod tests {
             id: id.into(), orchestrator_id: orch.map(str::to_string), name: id.into(),
             repo: String::new(), status, agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 1, pr_number: None, pr_id: None, workspace_path: Some(ws.into()),
-            pid: Some(1), model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            pid: Some(1), model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some(format!("uuid-{id}")), summary: Some(format!("task {id}")),
             terminal_at: None, gate_status: None, merged_at: None,

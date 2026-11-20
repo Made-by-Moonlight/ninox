@@ -178,7 +178,7 @@ pub(crate) fn spawn_spec(
     }
     Ok(SpawnSpec {
         pane: id.to_string(),
-        argv: vec![shell.to_string(), "-l".into(), "-c".into(), cmd.to_string()],
+        argv: crate::tmux::shell_command_args(shell, cmd).into_iter().map(str::to_string).collect(),
         cwd: workspace.to_string(),
         env: pairs,
         env_remove: ENV_REMOVE.iter().map(|s| s.to_string()).collect(),

@@ -36,6 +36,8 @@ pub enum FieldId {
     RestorePolicy,
     WorkerCompletion,
     RetentionDays,
+    OrchestratorResetPct,
+    OrchestratorResetMode,
     GithubPollInterval,
     GithubDetailRefresh,
     BrainHarvest,
@@ -122,6 +124,8 @@ impl FieldId {
             Self::RestorePolicy
             | Self::WorkerCompletion
             | Self::RetentionDays
+            | Self::OrchestratorResetPct
+            | Self::OrchestratorResetMode
             | Self::GithubPollInterval
             | Self::GithubDetailRefresh
             | Self::BrainHarvest => S::Fleet,
@@ -187,6 +191,16 @@ fn pick<T: Serialize + Copy>(all: &[T], s: &str) -> Option<T> {
 const THEMES: [ThemeVariant; 3] = [ThemeVariant::Light, ThemeVariant::Dark, ThemeVariant::Ninox];
 const COLORS: [TuiColors; 2] = [TuiColors::Terminal, TuiColors::FieldNotes];
 const CHANNELS: [UpdateChannel; 2] = [UpdateChannel::Stable, UpdateChannel::Alpha];
+const RESET_MODES: [ninox_core::config::ResetMode; 3] =
+    [ninox_core::config::ResetMode::Off, ninox_core::config::ResetMode::Prompt, ninox_core::config::ResetMode::Auto];
+
+fn reset_mode_label(m: ninox_core::config::ResetMode) -> &'static str {
+    match m {
+        ninox_core::config::ResetMode::Off => "Off",
+        ninox_core::config::ResetMode::Prompt => "Prompt",
+        ninox_core::config::ResetMode::Auto => "Auto",
+    }
+}
 const POLICIES: [RestorePolicy; 3] = [RestorePolicy::Manual, RestorePolicy::Prompt, RestorePolicy::Auto];
 /// Prefix suggestions ←/→ step through; any valid `C-<key>` can be typed.
 const PREFIXES: [&str; 5] = ["Ctrl+\\", "Ctrl+Space", "Ctrl+g", "Ctrl+^", "Ctrl+_"];
@@ -202,7 +216,8 @@ fn worker_harnesses(cfg: &AppConfig) -> Vec<String> {
 }
 
 fn model_suggestions(cfg: &AppConfig, harness: &str) -> Vec<String> {
-    let mut v = cfg.registry().spec(harness).known_models;
+    let mut v: Vec<String> = cfg.registry().spec(harness).known_models.into_iter()
+        .filter(|m| ninox_core::model_resolution::is_selectable_model(m)).collect();
     v.insert(0, String::new());
     v
 }
@@ -413,6 +428,32 @@ pub fn fields(cfg: &AppConfig) -> Vec<Field> {
             "How long a done or ended session stays on the board before it is purged.",
         ),
         f(
+            FieldId::OrchestratorResetMode,
+            "Fleet",
+            "Reset an orchestrator at high context",
+            reset_mode_label(cfg.orchestrator_reset.mode).to_string(),
+            Kind::Choice,
+            RESET_MODES.iter().map(|m| reset_mode_label(*m).to_string()).collect(),
+            reset_mode_help(cfg.orchestrator_reset.mode),
+        ),
+        {
+            let mut pct = f(
+                FieldId::OrchestratorResetPct,
+                "Fleet",
+                "Reset threshold",
+                cfg.orchestrator_reset.auto_at_context_pct.to_string(),
+                Kind::Text,
+                Vec::new(),
+                "How full an orchestrator's context window gets, from 10% to 95%, before it is asked to update its \
+                 plan. Takes effect at the next check.",
+            );
+            pct.locked = !cfg.orchestrator_reset.enabled();
+            if pct.locked {
+                pct.help.push_str(" Choose Prompt or Auto to use this.");
+            }
+            pct
+        },
+        f(
             FieldId::GithubPollInterval,
             "Fleet",
             "GitHub poll interval (seconds)",
@@ -505,10 +546,28 @@ pub fn fields(cfg: &AppConfig) -> Vec<Field> {
     out
 }
 
+fn reset_mode_help(mode: ninox_core::config::ResetMode) -> &'static str {
+    use ninox_core::config::ResetMode;
+    match mode {
+        ResetMode::Off => "Orchestrators are never reset automatically. You can still use Reset from plan by hand.",
+        ResetMode::Prompt => {
+            "When an orchestrator passes the threshold, it is asked to update its plan. You get a notification to \
+             review the plan and reset."
+        }
+        ResetMode::Auto => {
+            "When an orchestrator passes the threshold, it is asked to update its plan and is reset once it has. \
+             If the plan is never updated, nothing is reset."
+        }
+    }
+}
+
 /// Make one change. `Ok` carries a short confirmation for the footer.
 pub fn apply(cfg: &mut AppConfig, change: &Change) -> Result<String, String> {
     let field = fields(cfg).into_iter().find(|f| &f.id == change.id()).ok_or("no such setting")?;
     if field.locked {
+        if field.id == FieldId::OrchestratorResetPct {
+            return Err("set the reset setting to Prompt or Auto first".into());
+        }
         return Err(format!("{} can't be turned off", field.label));
     }
     let text = match change {
@@ -591,6 +650,22 @@ fn set(cfg: &mut AppConfig, field: &Field, s: &str) -> Result<(), String> {
             cfg.session_retention.done_retention_days =
                 s.parse().map_err(|_| format!("{s:?} is not a whole number of days"))?;
         }
+        FieldId::OrchestratorResetPct => {
+            let range = ninox_core::config::AUTO_RESET_PCT_RANGE;
+            let pct: u8 = s
+                .parse()
+                .ok()
+                .filter(|n| range.contains(n))
+                .ok_or_else(|| format!("{s:?} is not a whole number from {} to {}", range.start(), range.end()))?;
+            cfg.orchestrator_reset.auto_at_context_pct = pct;
+        }
+        FieldId::OrchestratorResetMode => {
+            cfg.orchestrator_reset.mode = RESET_MODES
+                .iter()
+                .copied()
+                .find(|m| reset_mode_label(*m).eq_ignore_ascii_case(s))
+                .ok_or_else(bad)?;
+        }
         FieldId::GithubPollInterval | FieldId::GithubDetailRefresh => {
             let min = ninox_core::config::GITHUB_MIN_POLL_INTERVAL_SECS;
             let secs: u64 = s.parse().map_err(|_| format!("{s:?} is not a whole number of seconds"))?;
@@ -659,6 +734,8 @@ mod tests {
             FieldId::UpdateChannel,
             FieldId::RestorePolicy,
             FieldId::RetentionDays,
+            FieldId::OrchestratorResetPct,
+            FieldId::OrchestratorResetMode,
             FieldId::GithubPollInterval,
             FieldId::GithubDetailRefresh,
             FieldId::Port,
@@ -785,6 +862,66 @@ mod tests {
         assert!(set_text(&mut cfg, FieldId::RetentionDays, "-1").is_err());
         set_text(&mut cfg, FieldId::RetentionDays, "7").unwrap();
         assert_eq!(cfg.session_retention.done_retention_days, 7);
+    }
+
+    #[test]
+    fn reset_help_follows_the_selected_mode_and_the_threshold_follows_the_mode() {
+        let mut cfg = AppConfig::default();
+        let ids: Vec<_> = fields(&cfg).into_iter().map(|f| f.id).collect();
+        let at = |id| ids.iter().position(|i| *i == id).unwrap();
+        assert_eq!(at(FieldId::OrchestratorResetPct), at(FieldId::OrchestratorResetMode) + 1);
+        let help = |cfg: &AppConfig| field(&fields(cfg), &FieldId::OrchestratorResetMode).help.clone();
+        let off = help(&cfg);
+        assert!(off.starts_with("Orchestrators are never reset"));
+        let pct = field(&fields(&cfg), &FieldId::OrchestratorResetPct).clone();
+        assert_eq!(pct.label, "Reset threshold");
+        assert!(pct.help.ends_with("Choose Prompt or Auto to use this."));
+        set_text(&mut cfg, FieldId::OrchestratorResetMode, "Prompt").unwrap();
+        let prompt = help(&cfg);
+        set_text(&mut cfg, FieldId::OrchestratorResetMode, "Auto").unwrap();
+        let auto = help(&cfg);
+        assert!(prompt != off && auto != prompt && auto.contains("is reset once it has"));
+        assert!(!field(&fields(&cfg), &FieldId::OrchestratorResetPct).help.contains("Choose Prompt"));
+    }
+
+    #[test]
+    fn the_orchestrator_reset_mode_and_threshold_round_trip_through_the_form() {
+        use ninox_core::config::ResetMode;
+        let mut cfg = AppConfig::default();
+        let fs = fields(&cfg);
+        assert_eq!(field(&fs, &FieldId::OrchestratorResetMode).value, "Off", "off by default");
+        assert_eq!(field(&fs, &FieldId::OrchestratorResetMode).options, ["Off", "Prompt", "Auto"]);
+        assert_eq!(field(&fs, &FieldId::OrchestratorResetPct).value, "40");
+        assert!(field(&fs, &FieldId::OrchestratorResetPct).locked, "the threshold is inactive while Off");
+        let err = set_text(&mut cfg, FieldId::OrchestratorResetPct, "55").unwrap_err();
+        assert!(err.contains("Prompt or Auto"), "{err}");
+        assert_eq!(cfg.orchestrator_reset.auto_at_context_pct, 40);
+
+        set_text(&mut cfg, FieldId::OrchestratorResetMode, "Prompt").unwrap();
+        assert_eq!(cfg.orchestrator_reset.mode, ResetMode::Prompt);
+        assert!(!field(&fields(&cfg), &FieldId::OrchestratorResetPct).locked);
+        set_text(&mut cfg, FieldId::OrchestratorResetMode, "auto").unwrap();
+        assert_eq!(cfg.orchestrator_reset.mode, ResetMode::Auto, "case does not matter");
+        assert!(set_text(&mut cfg, FieldId::OrchestratorResetMode, "yolo").is_err());
+
+        for ok in ["10", "55", "95"] {
+            set_text(&mut cfg, FieldId::OrchestratorResetPct, ok).unwrap();
+            assert_eq!(cfg.orchestrator_reset.auto_at_context_pct.to_string(), ok);
+        }
+        for bad in ["9", "96", "0", "101", "-1", "lots", ""] {
+            let err = set_text(&mut cfg, FieldId::OrchestratorResetPct, bad).unwrap_err();
+            assert!(err.contains("10 to 95"), "{bad:?}: {err}");
+            assert_eq!(cfg.orchestrator_reset.auto_at_context_pct, 95, "{bad:?} left the value alone");
+        }
+
+        // The stored value reads back through the form, and through the file.
+        let again = fields(&cfg);
+        assert_eq!(field(&again, &FieldId::OrchestratorResetPct).value, "95");
+        let back: AppConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!((back.orchestrator_reset.auto_at_context_pct, back.orchestrator_reset.mode), (95, ResetMode::Auto));
+
+        step(&mut cfg, FieldId::OrchestratorResetMode, false).unwrap();
+        assert_eq!(cfg.orchestrator_reset.mode, ResetMode::Off, "steps wrap around");
     }
 
     #[test]

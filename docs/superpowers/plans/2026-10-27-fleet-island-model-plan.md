@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, `ninox-core` (`Session`, `SessionStatus`, `ActivityState`, `MachineHealth`, `SessionKindData`, `fleet::snapshot::{FleetSnapshot, FleetMember, Role}`, `store::WorkRequestRow`), `serde` (workspace dep, already in `ninox-overview`'s `Cargo.toml` — no new dependencies needed).
 
-**Spec:** `docs/superpowers/specs/2026-10-21-fleet-overview-ui-vision-design.md` (general vision — superseded on specifics by the two briefs below), `/Users/ethan.brodie/proj/ninox/.claude/design-ref/fleet-overview-v1/BRIEF-common.md` and `BRIEF-MLOPS-5351.md` (authoritative, final 27 Oct decisions — where these differ from the vision spec, the briefs win), plus the design artboards `FleetAtScale.dc.html`, `TUIAtScale.dc.html`, `FleetFocused.dc.html`, `Legend.dc.html` and `canvas.json`'s `scaleflow` note in the same folder.
+**Spec:** `docs/superpowers/specs/2026-10-21-fleet-overview-ui-vision-design.md` (general vision — superseded on specifics by the two briefs below), `.claude/design-ref/fleet-overview-v1/BRIEF-common.md` and `BRIEF-MLOPS-5351.md` (authoritative, final 27 Oct decisions — where these differ from the vision spec, the briefs win), plus the design artboards `FleetAtScale.dc.html`, `TUIAtScale.dc.html`, `FleetFocused.dc.html`, `Legend.dc.html` and `canvas.json`'s `scaleflow` note in the same folder.
 
 ## Global Constraints
 

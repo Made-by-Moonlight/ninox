@@ -31,6 +31,8 @@ pub mod plan_block_highlighter;
 pub mod plan_panel;
 pub mod idle_view;
 pub mod remotes;
+pub mod context_meter;
+pub mod reset_from_plan_modal;
 pub mod restart_all_modal;
 pub mod reap_modal;
 pub mod delete_modal;

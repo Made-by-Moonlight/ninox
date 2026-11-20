@@ -96,32 +96,7 @@ pub async fn setup_orchestrator_root(
     // AGENTS.md is canonical; CLAUDE.md symlinks to it.
     let agents_md_path = root.join("AGENTS.md");
     if !agents_md_path.exists() {
-        let mut skills = String::new();
-        for cap in &seeded {
-            let Some(md) = cap.orchestrator_md else { continue };
-            skills.push_str(&format!(
-                "- `{}` — {}\n",
-                skill_path(cap.name).display(),
-                capabilities::description(md).unwrap_or(""),
-            ));
-        }
-        // The preamble points at whichever entry owns the spawn-worker
-        // capability rather than a hand-typed directory name, so a rename in
-        // the registry can't silently leave a dangling path here.
-        let spawn_skill = seeded
-            .iter()
-            .find(|c| c.name == "spawn-worker")
-            .expect("registry must declare an orchestrator spawn-worker capability");
-        let body = format!(
-            "# Ninox Orchestrator\n\n\
-             Before doing anything else, read and follow: `{spawn_skill}`\n\n\
-             ## Available Skills\n\n\
-             {skills}\n\
-             Run `{ninox_bin} capabilities --orchestrator` to list what ninox can currently do.\n",
-            spawn_skill = skill_path(spawn_skill.name).display(),
-            skills      = skills,
-            ninox_bin   = ninox_bin,
-        );
+        let body = role_text(&seeded, &skill_path, ninox_bin);
         fs::write(&agents_md_path, body).await?;
     }
     let claude_md_path = root.join("CLAUDE.md");
@@ -135,8 +110,57 @@ pub async fn setup_orchestrator_root(
         }
     }
 
-    // subagent-blocker hook — always overwritten.
-    let blocker = r#"#!/usr/bin/env node
+    write_guard_scripts(&claude_dir, config).await?;
+
+    let settings = orchestrator_settings(config, ninox_bin, &|script| format!("node .claude/{script}"));
+    // A user's unparsable settings file is left alone (never clobbered) and
+    // must not fail the rest of the root setup.
+    if let Err(e) = crate::claude_settings::strip_legacy(&claude_dir) {
+        tracing::warn!("orchestrator root: {e:#}");
+    }
+    if let Err(e) = crate::claude_settings::install_local(&claude_dir, &settings) {
+        tracing::warn!("orchestrator root: {e:#}");
+    }
+
+    Ok(())
+}
+
+/// The orchestrator role text: AGENTS.md's body in the orchestrator root, and
+/// the appended system prompt in a custom workspace, so the two can't drift.
+/// `skill_path` renders where a capability's `SKILL.md` lives for the reader.
+pub fn role_text(
+    seeded: &[&crate::capabilities::Capability],
+    skill_path: &dyn Fn(&str) -> std::path::PathBuf,
+    ninox_bin: &str,
+) -> String {
+    use crate::capabilities;
+    let mut skills = String::new();
+    for cap in seeded {
+        let Some(md) = cap.orchestrator_md else { continue };
+        skills.push_str(&format!(
+            "- `{}` — {}\n",
+            skill_path(cap.name).display(),
+            capabilities::description(md).unwrap_or(""),
+        ));
+    }
+    // The preamble points at whichever entry owns the spawn-worker
+    // capability rather than a hand-typed directory name, so a rename in
+    // the registry can't silently leave a dangling path here.
+    let spawn_skill = seeded
+        .iter()
+        .find(|c| c.name == "spawn-worker")
+        .expect("registry must declare an orchestrator spawn-worker capability");
+    format!(
+        "# Ninox Orchestrator\n\n\
+         Before doing anything else, read and follow: `{spawn_skill}`\n\n\
+         ## Available Skills\n\n\
+         {skills}\n\
+         Run `{ninox_bin} capabilities --orchestrator` to list what ninox can currently do.\n",
+        spawn_skill = skill_path(spawn_skill.name).display(),
+    )
+}
+
+const SUBAGENT_BLOCKER: &str = r#"#!/usr/bin/env node
 const { readFileSync } = require("node:fs");
 const callerType = process.env.NINOX_CALLER_TYPE || "";
 if (callerType !== "orchestrator") process.exit(0);
@@ -157,33 +181,52 @@ process.stdout.write(JSON.stringify({
 }) + "\n");
 process.exit(0);
 "#;
-    fs::write(claude_dir.join(crate::claude_settings::SUBAGENT_BLOCKER_SCRIPT), blocker).await?;
 
-    // Hook-bearing capabilities (today: `pr-watch-enforcement`) also write
-    // their guard script, gated the same way as their skill markdown —
-    // always overwritten, same as the subagent-blocker above, so an
-    // upgraded ninox re-seeds the current script.
+/// Writes the orchestrator guard scripts (the subagent blocker and every
+/// hook-bearing capability's script) into `claude_dir`, always overwriting so
+/// an upgraded ninox re-seeds the current script. Capability scripts are gated
+/// the same way as their skill markdown.
+pub async fn write_guard_scripts(claude_dir: &std::path::Path, config: &AppConfig) -> anyhow::Result<()> {
+    use crate::capabilities::{self, Audience};
+    tokio::fs::create_dir_all(claude_dir).await?;
+    tokio::fs::write(claude_dir.join(crate::claude_settings::SUBAGENT_BLOCKER_SCRIPT), SUBAGENT_BLOCKER).await?;
+    for hook in capabilities::hooks_for(Audience::Orchestrator, config) {
+        tokio::fs::write(claude_dir.join(hook.script_name), hook.script).await?;
+    }
+    Ok(())
+}
+
+/// The statusLine/hooks/crossSessionInbound ninox merges into an
+/// orchestrator's `settings.local.json`. `script_cmd` turns a guard script
+/// name into the command that runs it: the root's own `.claude/` is cwd-relative,
+/// a custom workspace points back at the root by absolute path.
+pub fn orchestrator_settings(
+    config: &AppConfig,
+    ninox_bin: &str,
+    script_cmd: &dyn Fn(&str) -> String,
+) -> serde_json::Value {
+    use crate::capabilities::{self, Audience};
+
     let mut capability_pre_tool_use = Vec::new();
     for hook in capabilities::hooks_for(Audience::Orchestrator, config) {
-        fs::write(claude_dir.join(hook.script_name), hook.script).await?;
         capability_pre_tool_use.push(serde_json::json!({
             "matcher": hook.matcher,
-            "hooks": [{"type": "command", "command": format!("node .claude/{}", hook.script_name), "timeout": 5}]
+            "hooks": [{"type": "command", "command": script_cmd(hook.script_name), "timeout": 5}]
         }));
     }
 
     // Machine-specific (absolute binary path), so it goes in the per-user
     // `settings.local.json`, merged with whatever the user keeps there and
     // refreshed on every call (so a root seeded by an older build picks up
-    // newly added hooks). Older builds wrote it to `settings.json`; prune
-    // ninox's own entries from there, leaving the user's.
+    // newly added hooks). Older builds wrote it to `settings.json`; the root
+    // prunes ninox's own entries from there, leaving the user's.
     let ninox_bin_quoted = format!("'{}'", ninox_bin.replace('\'', "'\\''"));
     let hook = |cmd: &str| crate::worker_status::hook_entry(&ninox_bin_quoted, cmd);
 
     let mut pre_tool_use = vec![
         serde_json::json!({
             "matcher": "Task|Agent",
-            "hooks": [{"type": "command", "command": format!("node .claude/{}", crate::claude_settings::SUBAGENT_BLOCKER_SCRIPT), "timeout": 2000}]
+            "hooks": [{"type": "command", "command": script_cmd(crate::claude_settings::SUBAGENT_BLOCKER_SCRIPT), "timeout": 2000}]
         }),
         // Mirrors the worker-worktree `hook-needs-input` entry
         // (`spawn_util::ensure_statusline_settings`): reports an
@@ -226,8 +269,11 @@ process.exit(0);
         "Stop":             [{ "hooks": [hook("worker-status hook-stop")] }],
         "UserPromptSubmit": [{ "hooks": prompt_hooks }]
     });
-    crate::identity::set_session_start_hook(config, &ninox_bin_quoted, &mut hooks);
-    let settings = serde_json::json!({
+    // Role, skills pointer, identity and any pending reset snapshot, on every
+    // SessionStart source. Replaces the identity-only SessionStart entry: the
+    // hook prints the identity reminder itself when `[role_rehydration]` is on.
+    hooks["SessionStart"] = serde_json::json!([{ "hooks": [hook("session-setup")] }]);
+    serde_json::json!({
         crate::harness::CROSS_SESSION_KEY: crate::harness::CROSS_SESSION_ACCEPT,
         "hooks": hooks,
         "statusLine": {
@@ -235,17 +281,32 @@ process.exit(0);
             "command": format!("{ninox_bin_quoted} statusline"),
             "refreshInterval": 20
         }
-    });
-    // A user's unparsable settings file is left alone (never clobbered) and
-    // must not fail the rest of the root setup.
-    if let Err(e) = crate::claude_settings::strip_legacy(&claude_dir) {
-        tracing::warn!("orchestrator root: {e:#}");
-    }
-    if let Err(e) = crate::claude_settings::install_local(&claude_dir, &settings) {
-        tracing::warn!("orchestrator root: {e:#}");
-    }
+    })
+}
 
-    Ok(())
+/// The reporting half of [`orchestrator_settings`]: statusLine, activity and
+/// needs-input hooks, identity hooks, and nothing that runs a guard script.
+pub fn orchestrator_reporting_settings(config: &AppConfig, ninox_bin: &str) -> serde_json::Value {
+    const GUARD: &str = "ninox-guard-script:";
+    let mut settings = orchestrator_settings(config, ninox_bin, &|script| format!("{GUARD}{script}"));
+    if let Some(pre) = settings.pointer_mut("/hooks/PreToolUse").and_then(|p| p.as_array_mut()) {
+        pre.retain(|entry| !entry.to_string().contains(GUARD));
+    }
+    settings
+}
+
+/// Claude Code loads `.claude/settings.local.json` from the directory it
+/// starts in and no parent, and an orchestrator starts in its own
+/// subdirectory of the root, so the root's statusLine and hooks never reach
+/// it. Merge the reporting ones into `workspace`'s own file, keeping the
+/// user's entries and touching nothing else: not `settings.json`, not
+/// `CLAUDE.md`, and not the script-backed guards, which stay the root's
+/// business. Not for a custom workspace: `custom_workspace::install` seeds
+/// those, guards included, and re-seeding would strip them.
+pub fn seed_orchestrator_workspace(workspace: &std::path::Path, config: &AppConfig, ninox_bin: &str) -> anyhow::Result<()> {
+    let claude_dir = workspace.join(".claude");
+    std::fs::create_dir_all(&claude_dir)?;
+    crate::claude_settings::install_local(&claude_dir, &orchestrator_reporting_settings(config, ninox_bin))
 }
 
 #[cfg(test)]
@@ -629,7 +690,8 @@ mod tests {
         assert!(prompt_cmds.iter().any(|c| c.ends_with("identity-hook prompt")), "{prompt_cmds:?}");
         assert!(prompt_cmds.iter().any(|c| c.ends_with("worker-status hook-prompt")), "{prompt_cmds:?}");
         let session_start_cmds = hook_commands(&settings, "SessionStart");
-        assert!(session_start_cmds.iter().any(|c| c.ends_with("identity-hook session-start")), "{session_start_cmds:?}");
+        assert_eq!(session_start_cmds.len(), 1, "{session_start_cmds:?}");
+        assert!(session_start_cmds[0].ends_with("session-setup"), "identity rides in the session-setup hook: {session_start_cmds:?}");
     }
 
     #[tokio::test]
@@ -643,7 +705,9 @@ mod tests {
 
         let prompt_cmds = hook_commands(&settings, "UserPromptSubmit");
         assert!(!prompt_cmds.iter().any(|c| c.contains("identity-hook")), "{prompt_cmds:?}");
-        assert!(settings["hooks"]["SessionStart"].is_null(), "SessionStart must not be installed when disabled");
+        let session_start_cmds = hook_commands(&settings, "SessionStart");
+        assert_eq!(session_start_cmds.len(), 1, "{session_start_cmds:?}");
+        assert!(session_start_cmds[0].ends_with("session-setup"), "the role hook is not gated: {session_start_cmds:?}");
     }
 
     #[tokio::test]

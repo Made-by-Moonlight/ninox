@@ -184,12 +184,13 @@ fn labelled<'a>(label: &str, control: Element<'a, Message>, help_text: Option<St
 
 fn input_style(status: text_input::Status) -> text_input::Style {
     let focused = matches!(status, text_input::Status::Focused);
+    let disabled = matches!(status, text_input::Status::Disabled);
     text_input::Style {
         background: Background::Color(tokens::PANEL2),
-        border: Border { color: if focused { tokens::TEAL } else { tokens::BORDER }, width: 1.0, radius: 6.0.into() },
+        border: Border { color: if focused { tokens::TEAL } else if disabled { Color { a: 0.5, ..tokens::BORDER } } else { tokens::BORDER }, width: 1.0, radius: 6.0.into() },
         icon: tokens::DIM,
         placeholder: tokens::DIM,
-        value: tokens::TEXT,
+        value: if disabled { tokens::DIM2 } else { tokens::TEXT },
         selection: tokens::TEAL,
     }
 }
@@ -246,6 +247,33 @@ fn small_button<'a>(label: &str, color: Color, on_press: Option<Message>) -> Ele
         .into()
 }
 
+/// `seg_control` for a locked field: same shape, dimmed, and no press handlers.
+fn seg_control_locked<'a>(options: Vec<(String, bool, Message)>) -> Element<'a, Message> {
+    container(
+        row(options
+            .into_iter()
+            .map(|(label, active, _)| {
+                button(text(label).size(10.5).font(SANS).color(tokens::DIM2))
+                    .padding([5, 10])
+                    .style(move |_t, _status| button::Style {
+                        background: Some(Background::Color(if active { tokens::BORDER } else { tokens::PANEL2 })),
+                        text_color: tokens::DIM2,
+                        border: Border::default(),
+                        ..Default::default()
+                    })
+                    .into()
+            })
+            .collect::<Vec<Element<Message>>>())
+        .wrap(),
+    )
+    .style(|_| container::Style { border: Border { color: Color { a: 0.5, ..tokens::BORDER }, width: 1.0, radius: 6.0.into() }, ..Default::default() })
+    .into()
+}
+
+fn seg_for<'a>(locked: bool, options: Vec<(String, bool, Message)>) -> Element<'a, Message> {
+    if locked { seg_control_locked(options) } else { seg_control(options) }
+}
+
 /// A shared Choice field as a segmented control (few options).
 fn choice_field(app: &App, id: FieldId) -> Element<'_, Message> {
     let Some(f) = shared_field(app, &id) else { return Space::new(0, 0).into() };
@@ -254,7 +282,7 @@ fn choice_field(app: &App, id: FieldId) -> Element<'_, Message> {
         .iter()
         .map(|o| (o.clone(), *o == f.value, Message::SettingsSet { id: id.clone(), text: o.clone() }))
         .collect();
-    labelled(&f.label, seg_control(options), Some(f.help.clone()), error_line(app, &id))
+    labelled(&f.label, seg_for(f.locked, options), Some(f.help.clone()), error_line(app, &id).filter(|_| !f.locked))
 }
 
 /// A shared on/off field.
@@ -265,23 +293,25 @@ fn toggle_field(app: &App, id: FieldId) -> Element<'_, Message> {
         ("On".to_string(), on, Message::SettingsSet { id: id.clone(), text: "on".into() }),
         ("Off".to_string(), !on, Message::SettingsSet { id: id.clone(), text: "off".into() }),
     ];
-    labelled(&f.label, seg_control(options), Some(f.help.clone()), error_line(app, &id))
+    labelled(&f.label, seg_for(f.locked, options), Some(f.help.clone()), error_line(app, &id).filter(|_| !f.locked))
 }
 
 /// A shared free-text field: typed into a draft, committed with Enter or
 /// Save. Suggestions, if the field has any, apply in one click.
 fn text_field(app: &App, id: FieldId) -> Element<'_, Message> {
     let Some(f) = shared_field(app, &id) else { return Space::new(0, 0).into() };
-    let draft = app.settings.draft(&id).map(str::to_string);
-    let dirty = draft.as_deref().is_some_and(|d| d != f.value);
+    let draft = app.settings.draft(&id).filter(|_| !f.locked).map(str::to_string);
+    let dirty = !f.locked && draft.as_deref().is_some_and(|d| d != f.value);
     let value = draft.unwrap_or_else(|| f.value.clone());
     let on_input = {
         let id = id.clone();
         move |t| Message::SettingsDraft { id: id.clone(), text: t }
     };
-    let input = text_input("", &value)
-        .on_input(on_input)
-        .on_submit(Message::SettingsCommit(id.clone()))
+    let mut input = text_input("", &value);
+    if !f.locked {
+        input = input.on_input(on_input).on_submit(Message::SettingsCommit(id.clone()));
+    }
+    let input = input
         .font(MONO)
         .size(12.5)
         .padding([7, 10])
@@ -296,14 +326,15 @@ fn text_field(app: &App, id: FieldId) -> Element<'_, Message> {
     let mut col = column![control.wrap()].spacing(8);
     let suggestions: Vec<String> = f.options.iter().filter(|o| !o.is_empty()).cloned().collect();
     if !suggestions.is_empty() {
-        col = col.push(seg_control(
+        col = col.push(seg_for(
+            f.locked,
             suggestions
                 .into_iter()
                 .map(|o| (o.clone(), o == f.value, Message::SettingsSet { id: id.clone(), text: o }))
                 .collect(),
         ));
     }
-    labelled(&f.label, col.into(), Some(f.help.clone()), error_line(app, &id))
+    labelled(&f.label, col.into(), Some(f.help.clone()), error_line(app, &id).filter(|_| !f.locked))
 }
 
 // ── Sections ──────────────────────────────────────────────────────────────
@@ -625,6 +656,8 @@ fn fleet(app: &App) -> Element<'_, Message> {
         choice_field(app, FieldId::RestorePolicy),
         choice_field(app, FieldId::WorkerCompletion),
         text_field(app, FieldId::RetentionDays),
+        choice_field(app, FieldId::OrchestratorResetMode),
+        text_field(app, FieldId::OrchestratorResetPct),
         text_field(app, FieldId::GithubPollInterval),
         text_field(app, FieldId::GithubDetailRefresh),
         github_budget_line(app),
@@ -714,8 +747,8 @@ fn version(app: &App) -> Element<'_, Message> {
     let (line, color, action): (String, Color, Option<Element<Message>>) = match &app.version_check {
         VersionCheckState::NotChecked | VersionCheckState::Checking => ("Checking for updates…".into(), tokens::DIM, None),
         VersionCheckState::UpToDate => ("Up to date.".into(), tokens::GREEN, None),
-        VersionCheckState::Failed => {
-            ("The update check failed.".into(), tokens::AMBER, Some(small_button("Retry", tokens::TEXT, Some(Message::NavigateSettings))))
+        VersionCheckState::Failed(why) => {
+            (why.clone(), tokens::AMBER, Some(small_button("Retry", tokens::TEXT, Some(Message::NavigateSettings))))
         }
         VersionCheckState::Installed => {
             ("Update installed.".into(), tokens::GREEN, Some(small_button("Restart now", tokens::TEAL, Some(Message::RestartApp))))

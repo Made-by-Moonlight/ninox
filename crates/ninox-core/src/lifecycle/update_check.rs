@@ -165,18 +165,31 @@ pub trait UpdateSource: Send + Sync {
 /// prereleases count. `Ok(None)` when the package has no published versions.
 pub struct GenericPackageUpdateSource {
     pub channel: crate::config::UpdateChannel,
+    /// A missing `aws` CLI is an error rather than "not a Synthesia
+    /// install": set once the user opted in (non-stable channel or a saved
+    /// AWS profile).
+    pub surface_missing_aws: bool,
+}
+
+impl GenericPackageUpdateSource {
+    pub fn from_config(cfg: &crate::config::AppConfig) -> Self {
+        Self {
+            channel: cfg.update.channel,
+            surface_missing_aws: cfg.update.channel != crate::config::UpdateChannel::Stable || cfg.update.aws_profile.is_some(),
+        }
+    }
 }
 
 #[async_trait]
 impl UpdateSource for GenericPackageUpdateSource {
     async fn latest_version(&self, package: &str) -> Result<Option<semver::Version>> {
         use super::binary_update as bu;
-        let (package, channel) = (package.to_string(), self.channel);
+        let (package, channel, surface) = (package.to_string(), self.channel, self.surface_missing_aws);
         let lookup = tokio::task::spawn_blocking(move || {
             let coords = bu::CodeArtifactCoords::from_env();
             // No `aws` CLI means this machine isn't set up for CodeArtifact
             // (any non-Synthesia install): nothing to check, not a failure.
-            let missing_aws = |e: &anyhow::Error| e.to_string().contains(bu::AWS_MISSING_MARKER);
+            let missing_aws = |e: &anyhow::Error| !surface && e.to_string().contains(bu::AWS_MISSING_MARKER);
             let owner = match bu::resolve_owner(&coords) {
                 Ok(owner) => owner,
                 Err(e) if missing_aws(&e) => return Ok(None),
@@ -288,6 +301,11 @@ impl UpdateInstaller for CargoInstallInstaller {
 /// channel's CodeArtifact package — the counterpart of
 /// [`GenericPackageUpdateSource`], so "Update now" installs exactly the
 /// version the check announced. `package` is ignored.
+/// What the GUI's update button runs: the same `ninox update` plan as the
+/// CLI (every binary, the shim, Ninox.app), minus the terminal prompt — the
+/// GUI offers the server restart itself through its banner.
+pub const IN_APP_UPDATE_ARGS: [&str; 2] = ["update", "--no-restart"];
+
 pub struct SelfUpdateInstaller;
 
 #[async_trait]
@@ -295,7 +313,7 @@ impl UpdateInstaller for SelfUpdateInstaller {
     async fn install(&self, _package: &str) -> Result<()> {
         let exe = crate::hooks::canonical_exe().context("resolving the running ninox binary")?;
         let output = tokio::process::Command::new(&exe)
-            .arg("update")
+            .args(IN_APP_UPDATE_ARGS)
             .output()
             .await
             .context("spawning `ninox update`")?;
@@ -316,6 +334,11 @@ mod tests {
 
     fn write_cargo_config(dir: &Path, contents: &str) {
         std::fs::write(dir.join("config.toml"), contents).unwrap();
+    }
+
+    #[test]
+    fn in_app_update_runs_the_shared_plan_without_a_prompt() {
+        assert_eq!(IN_APP_UPDATE_ARGS, ["update", "--no-restart"]);
     }
 
     #[test]

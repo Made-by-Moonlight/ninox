@@ -287,6 +287,21 @@ pub enum Modal {
     Settings,
     /// Brain › Sources' add (`a`) / edit (`e`) form.
     SourceForm(super::sources::SourceForm),
+    /// An orchestrator's "reset from plan" flow (`P`). The flow itself lives
+    /// on the loop; this is what the dialog shows.
+    ResetFromPlan(ResetModal),
+}
+
+/// What the reset-from-plan dialog shows; the polling flow lives on the loop.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResetModal {
+    pub id:      String,
+    pub name:    String,
+    pub phase:   ninox_ui_shared::reset_from_plan::UiPhase,
+    /// `(path, content)` of the registered plan, once readable.
+    pub preview: Option<(String, String)>,
+    pub error:   Option<String>,
+    pub scroll:  u16,
 }
 
 /// `D`'s confirm: what deleting `root` removes, read off the loop (it runs
@@ -327,6 +342,9 @@ pub use super::brain::BrainView;
 use super::fleet::{FleetFocus, FleetState, GridDirection, PromptTarget};
 
 pub struct TuiState {
+    /// `[orchestrator_reset]`, re-read each tick: the context meter marks its
+    /// threshold and tints toward it while the mode is not Off.
+    pub reset_cfg: ninox_core::config::OrchestratorResetConfig,
     pub rows: Vec<Row>,
     /// Header counter, e.g. "6/6 workers running locally · 3 orchestrators · 2 queued".
     pub limits_headline: String,
@@ -524,6 +542,7 @@ pub const ESCAPE_BYTE: u8 = 0x1d;
 impl Default for TuiState {
     fn default() -> Self {
         Self {
+            reset_cfg: Default::default(),
             rows: Vec::new(),
             limits_headline: String::new(),
             selected: 0,
@@ -621,6 +640,15 @@ pub enum Action {
     Reap(String),
     /// Relaunch an ended session under its own id, `--resume`d.
     Resume(String),
+    /// Start an orchestrator's reset-from-plan flow: ask it for its plan.
+    ResetFromPlanStart(String),
+    /// Open the dialog on the plan the automatic trigger asked for (its
+    /// notification's Enter).
+    ResetFromPlanOpenReady(String),
+    /// Reset now (the dialog's confirm).
+    ResetFromPlanConfirm,
+    /// Close the dialog and drop the flow; nothing is reset.
+    ResetFromPlanCancel,
     OpenUrl(String),
     /// Idle screen: prompt one orchestrator (`Some`) or each with idle workers.
     PromptIdle(Option<String>),
@@ -2015,6 +2043,13 @@ fn command(st: &mut TuiState, key: KeyEvent) -> Action {
             None => {}
         },
         KeyCode::Char('r') => return st.resume_selected(),
+        KeyCode::Char('P') => match st.selected_row() {
+            Some(row) if row.is_orchestrator && !row.session.status.is_terminal() => {
+                return Action::ResetFromPlanStart(row.id().to_string());
+            }
+            Some(_) => st.notify(Level::Info, "reset from plan applies to a live orchestrator"),
+            None => {}
+        },
         KeyCode::Char('O') => return st.open_selected_pr(),
         KeyCode::Char('N') => st.modal = Some(Modal::Notifications(0)),
         KeyCode::Char('t') if !key.modifiers.contains(KeyModifiers::CONTROL) => match st.selected_row() {
@@ -3198,6 +3233,11 @@ fn handle_modal_key(st: &mut TuiState, key: KeyEvent) -> Action {
                     return Action::None;
                 }
                 KeyCode::Enter => {
+                    if let Some(n) = st.notification_at(cur).filter(|n| n.kind == ninox_core::types::NotificationKind::ResetPlanReady) {
+                        if let Some(id) = n.session_id.clone() {
+                            return Action::ResetFromPlanOpenReady(id);
+                        }
+                    }
                     if let Some(id) = st.notification_at(cur).and_then(|n| n.session_id.clone()) {
                         match st.rows.iter().position(|r| r.id() == id) {
                             Some(idx) => {
@@ -3227,6 +3267,22 @@ fn handle_modal_key(st: &mut TuiState, key: KeyEvent) -> Action {
                 _ => {}
             }
             st.modal = Some(Modal::Message(m));
+            Action::None
+        }
+        Modal::ResetFromPlan(mut m) => {
+            match key.code {
+                KeyCode::Esc if m.phase != ninox_ui_shared::reset_from_plan::UiPhase::Resetting => {
+                    return Action::ResetFromPlanCancel;
+                }
+                KeyCode::Enter | KeyCode::Char('y') if m.phase.can_reset() && m.preview.is_some() => {
+                    st.modal = Some(Modal::ResetFromPlan(m));
+                    return Action::ResetFromPlanConfirm;
+                }
+                KeyCode::Up | KeyCode::Char('k') => m.scroll = m.scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => m.scroll = m.scroll.saturating_add(1),
+                _ => {}
+            }
+            st.modal = Some(Modal::ResetFromPlan(m));
             Action::None
         }
         Modal::Restore(summary) => match key.code {
@@ -3949,8 +4005,10 @@ fn settings_mouse(st: &mut TuiState, ev: &MouseEvent) -> Action {
     if !contains(sl.list, x, y) {
         return Action::None;
     }
-    let Some(super::layout::SettingsLine::Field(i)) = sl.lines.get(sl.offset + (y - sl.list.y) as usize).copied() else {
-        return Action::None;
+    let (i, continuation) = match sl.lines.get(sl.offset + (y - sl.list.y) as usize).copied() {
+        Some(super::layout::SettingsLine::Field(i)) => (i, false),
+        Some(super::layout::SettingsLine::Cont(i, _)) => (i, true),
+        _ => return Action::None,
     };
     let again = i == st.settings.selected && st.settings.in_fields;
     if st.settings.editing.is_some() {
@@ -3962,7 +4020,7 @@ fn settings_mouse(st: &mut TuiState, ev: &MouseEvent) -> Action {
     st.settings.in_fields = true;
     st.settings.selected = i;
     st.settings.error = None;
-    if again || x >= sl.value_x {
+    if !continuation && (again || x >= sl.value_x) {
         return activate_setting(st);
     }
     Action::None
@@ -5248,6 +5306,37 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_wrapped_labels_continuation_only_selects_its_field() {
+        use ninox_ui_shared::settings_form::SettingsSection as S;
+        let mut st = settings_page();
+        st.settings.select_section(S::Fleet);
+        let sl = crate::tui::layout::settings(crate::tui::layout::settings_area(Rect::new(0, 0, 80, 24)), &st);
+        let row = sl.lines.iter().position(|l| matches!(l, crate::tui::layout::SettingsLine::Cont(..))).expect("a wrapped label at 80 columns") as u16;
+        let crate::tui::layout::SettingsLine::Cont(i, _) = sl.lines[row as usize] else { unreachable!() };
+        assert_eq!(handle_mouse(&mut st, down(sl.value_x, sl.list.y + row)), Action::None);
+        assert_eq!((st.settings.selected, st.settings.in_fields), (i, true));
+        assert_eq!(handle_mouse(&mut st, down(sl.value_x, sl.list.y + row)), Action::None, "a second click doesn't activate either");
+    }
+
+    #[test]
+    fn a_wrapped_selected_fields_error_stays_in_view() {
+        use ninox_ui_shared::settings_form::SettingsSection as S;
+        let mut st = settings_page();
+        st.settings.select_section(S::Fleet);
+        let area = crate::tui::layout::settings_area(Rect::new(0, 0, 80, 13));
+        let wrapped = crate::tui::layout::settings(area, &st).lines.iter().find_map(|l| match l {
+            crate::tui::layout::SettingsLine::Cont(i, _) => Some(*i),
+            _ => None,
+        }).expect("a wrapped label at 80 columns");
+        st.settings.in_fields = true;
+        st.settings.selected = wrapped;
+        st.settings.error = Some("refused".into());
+        let sl = crate::tui::layout::settings(area, &st);
+        let err = sl.lines.iter().position(|l| *l == crate::tui::layout::SettingsLine::Error).unwrap();
+        assert!((sl.offset..sl.offset + sl.list.height as usize).contains(&err), "offset {} err {err} h {}", sl.offset, sl.list.height);
+    }
+
+    #[test]
     fn closing_settings_returns_to_the_view_it_was_opened_from() {
         let mut st = state_with_rows(1);
         st.view = View::Brain;
@@ -5457,6 +5546,73 @@ mod tests {
         st.reports.insert("s0".into(), ReportSlot { data: Some(data), loading: false });
         st.layout = crate::tui::layout::compute(Rect::new(0, 0, 120, 40), &st);
         st
+    }
+
+    fn reset_modal(phase: ninox_ui_shared::reset_from_plan::UiPhase) -> TuiState {
+        let mut st = state_with_rows(1);
+        st.modal = Some(Modal::ResetFromPlan(ResetModal {
+            id: "s0".into(), name: "s0".into(), phase, preview: None, error: None, scroll: 0,
+        }));
+        st
+    }
+
+    #[test]
+    fn enter_on_a_reset_plan_ready_notification_opens_the_reset_dialog() {
+        use ninox_core::types::{Notification, NotificationKind};
+        let mut st = state_with_rows(1);
+        let note = |kind, session: Option<&str>| Notification {
+            id: format!("{kind:?}"), kind, title: "t".into(), body: "b".into(), session_id: session.map(Into::into), created_at: 0,
+        };
+        st.notifications.push_back(note(NotificationKind::ResetPlanReady, Some("s0")));
+        st.modal = Some(Modal::Notifications(0));
+        assert_eq!(handle_key(&mut st, code(KeyCode::Enter)), Action::ResetFromPlanOpenReady("s0".into()));
+
+        let mut other = state_with_rows(1);
+        other.notifications.push_back(note(NotificationKind::ResetPlanTimedOut, Some("s0")));
+        other.modal = Some(Modal::Notifications(0));
+        assert_ne!(handle_key(&mut other, code(KeyCode::Enter)), Action::ResetFromPlanOpenReady("s0".into()), "only the ready notification");
+    }
+
+    #[test]
+    fn the_settings_form_offers_the_reset_threshold_and_mode_in_the_tui() {
+        let mut st = state_with_rows(1);
+        st.settings.reload(Ok(ninox_core::config::AppConfig::default()));
+        let ids: Vec<_> = st.settings.fields.iter().map(|f| f.id.clone()).collect();
+        assert!(ids.contains(&ninox_ui_shared::settings_form::FieldId::OrchestratorResetPct));
+        assert!(ids.contains(&ninox_ui_shared::settings_form::FieldId::OrchestratorResetMode));
+    }
+
+    #[test]
+    fn p_starts_reset_from_plan_only_on_a_live_orchestrator() {
+        let mut st = state_with_rows(1);
+        st.rows[0].is_orchestrator = false;
+        assert_eq!(handle_key(&mut st, key('P')), Action::None, "a worker row");
+        st.rows[0].is_orchestrator = true;
+        st.rows[0].session.status = ninox_core::types::SessionStatus::Terminated;
+        assert_eq!(handle_key(&mut st, key('P')), Action::None, "an ended orchestrator");
+        st.rows[0].session.status = ninox_core::types::SessionStatus::Working;
+        assert_eq!(handle_key(&mut st, key('P')), Action::ResetFromPlanStart("s0".into()));
+    }
+
+    #[test]
+    fn the_reset_dialog_confirms_only_when_a_reset_is_allowed_and_esc_always_cancels() {
+        use ninox_ui_shared::reset_from_plan::UiPhase::*;
+        for (phase, confirms) in [(Sending, false), (Waiting, true), (Ready, true), (TimedOut, true), (SendFailed, true), (ResetFailed, false)] {
+            let mut st = reset_modal(phase);
+            if let Some(Modal::ResetFromPlan(m)) = st.modal.as_mut() {
+                m.preview = Some(("/p/PLAN.md".into(), "# Plan".into()));
+            }
+            let got = handle_key(&mut st, code(KeyCode::Enter));
+            assert_eq!(got == Action::ResetFromPlanConfirm, confirms, "{phase:?}");
+            let mut st = reset_modal(phase);
+            assert_eq!(handle_key(&mut st, code(KeyCode::Esc)), Action::ResetFromPlanCancel, "{phase:?}");
+        }
+        let mut st = reset_modal(Waiting);
+        assert_eq!(handle_key(&mut st, code(KeyCode::Enter)), Action::None, "no readable plan, nothing to reset from");
+        let mut st = reset_modal(Resetting);
+        assert_eq!(handle_key(&mut st, code(KeyCode::Enter)), Action::None);
+        assert_eq!(handle_key(&mut st, code(KeyCode::Esc)), Action::None, "no cancelling a reset that is running");
+        assert!(matches!(st.modal, Some(Modal::ResetFromPlan(_))));
     }
 
     #[test]
@@ -6199,8 +6355,8 @@ mod tests {
         st.modal = Some(Modal::Spawn);
         st.spawn_form.focus = st.spawn_form.fields.iter().position(|f| f.id == spawn::FieldId::Name).unwrap();
         handle_key(&mut st, code(KeyCode::Tab));
-        // Orchestrator kind hides Workspace/WorkerType — Tab from Name lands on Harness.
-        assert_eq!(st.spawn_form.fields[st.spawn_form.focus].id, spawn::FieldId::Harness);
+        // Orchestrator kind hides Workspace/WorkerType — Tab from Name lands on its optional Workspace folder.
+        assert_eq!(st.spawn_form.fields[st.spawn_form.focus].id, spawn::FieldId::WorkspaceFolder);
         handle_key(&mut st, code(KeyCode::BackTab));
         assert_eq!(st.spawn_form.fields[st.spawn_form.focus].id, spawn::FieldId::Name);
     }
@@ -6927,6 +7083,7 @@ mod tests {
                 enabled: true,
                 cadence: "manual".to_string(),
                 access: "read_write".to_string(),
+                write_rules_override: None,
             },
             ninox_core::config::CatalogueRef {
                 name: "team".to_string(),
@@ -6938,6 +7095,7 @@ mod tests {
                 enabled: true,
                 cadence: "manual".to_string(),
                 access: "read_write".to_string(),
+                write_rules_override: None,
             },
         ]);
         assert_eq!(st.brain.active_catalogue, None);

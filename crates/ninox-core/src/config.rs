@@ -118,6 +118,11 @@ pub struct BrainConfig {
     pub endpoint: Option<String>,
     pub region: Option<String>,
     pub cache_ttl_secs: Option<u64>,
+    /// This machine's extra write rules for the default brain. Appended to
+    /// the brain's own `_rules.md` and winning where they conflict; never
+    /// synced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_rules_override: Option<String>,
     /// Additional named knowledge bases selectable when spawning an
     /// orchestrator. The implicit "default" catalogue (this config's
     /// `resolved_brain_path()`) is always offered first by
@@ -156,6 +161,10 @@ pub struct CatalogueRef {
     /// push regardless of this value, for the same reason as `cadence`.
     #[serde(default = "default_access")]
     pub access: String,
+    /// This machine's extra write rules for the catalogue; same semantics
+    /// as `BrainConfig::write_rules_override`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_rules_override: Option<String>,
 }
 
 fn default_catalogue_enabled() -> bool {
@@ -339,6 +348,91 @@ impl Default for PrWatchConfig {
     }
 }
 
+/// What the automatic reset-from-plan trigger does. Off is the default and
+/// the value for anything unrecognised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResetMode {
+    /// No automatic plan request, no reset.
+    #[default]
+    Off,
+    /// Ask for the plan at the threshold, then notify; the user opens the
+    /// plan and clicks to reset.
+    Prompt,
+    /// Ask for the plan at the threshold, then reset without a click. A plan
+    /// that is never updated is never reset from.
+    Auto,
+}
+
+impl<'de> Deserialize<'de> for ResetMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = ResetMode;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("\"off\", \"prompt\" or \"auto\"")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<ResetMode, E> {
+                Ok(match v.trim().to_ascii_lowercase().as_str() {
+                    "prompt" => ResetMode::Prompt,
+                    "auto" => ResetMode::Auto,
+                    _ => ResetMode::Off,
+                })
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<ResetMode, E> {
+                Ok(ResetMode::Off)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<ResetMode, E> {
+                Ok(ResetMode::Off)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<ResetMode, E> {
+                Ok(ResetMode::Off)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<ResetMode, E> {
+                Ok(ResetMode::Off)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+pub const DEFAULT_AUTO_RESET_AT_CONTEXT_PCT: u8 = 40;
+/// The range `auto_at_context_pct` is accepted in.
+pub const AUTO_RESET_PCT_RANGE: std::ops::RangeInclusive<u8> = 10..=95;
+
+/// `[orchestrator_reset]`: reset an orchestrator onto a fresh conversation,
+/// continuing from its plan doc, once its context window is
+/// `auto_at_context_pct` percent full. Off by default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrchestratorResetConfig {
+    /// The threshold only; `mode` switches the feature on and off.
+    #[serde(default = "default_auto_reset_pct")]
+    pub auto_at_context_pct: u8,
+    #[serde(default)]
+    pub mode: ResetMode,
+}
+
+fn default_auto_reset_pct() -> u8 {
+    DEFAULT_AUTO_RESET_AT_CONTEXT_PCT
+}
+
+impl Default for OrchestratorResetConfig {
+    fn default() -> Self {
+        Self { auto_at_context_pct: default_auto_reset_pct(), mode: ResetMode::default() }
+    }
+}
+
+impl OrchestratorResetConfig {
+    pub fn enabled(&self) -> bool {
+        self.mode != ResetMode::Off
+    }
+
+    /// The threshold, held to [`AUTO_RESET_PCT_RANGE`] whatever the file says.
+    pub fn threshold(&self) -> u8 {
+        self.auto_at_context_pct.clamp(*AUTO_RESET_PCT_RANGE.start(), *AUTO_RESET_PCT_RANGE.end())
+    }
+}
+
 /// Which prebuilt release stream `ninox update` and the daemon's update
 /// check follow. The alpha channel is a separate CodeArtifact package, so a
 /// stable user never receives an alpha unless they opt in.
@@ -382,6 +476,11 @@ impl std::str::FromStr for UpdateChannel {
 pub struct UpdateConfig {
     #[serde(default)]
     pub channel: UpdateChannel,
+    /// AWS profile used for the CodeArtifact update lookups when the
+    /// process has no `AWS_PROFILE` of its own (a launchd-started server
+    /// never inherits the shell the installer ran in).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_profile: Option<String>,
 }
 
 pub const GITHUB_MIN_POLL_INTERVAL_SECS: u64 = 15;
@@ -1189,6 +1288,10 @@ pub struct AppConfig {
     /// `PrWatchConfig`.
     #[serde(default)]
     pub pr_watch: PrWatchConfig,
+    /// Automatic reset-from-plan at a context threshold — see
+    /// `OrchestratorResetConfig`.
+    #[serde(default)]
+    pub orchestrator_reset: OrchestratorResetConfig,
     /// Release channel for `ninox update` and the daemon's update check.
     #[serde(default)]
     pub update: UpdateConfig,
@@ -1256,7 +1359,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub limits: LimitsConfig,
     /// Agent-harness registry overrides/extensions (`[harnesses.<name>]`).
-    /// Builtin specs for claude-code/codex/opencode/aider/freebuff/pi apply
+    /// Builtin specs for claude-code/codex/opencode/ori/aider/pi apply
     /// when a name is absent here. See `crate::harness`. Kept last so TOML
     /// serialization emits this table-of-tables after every scalar field.
     #[serde(default)]
@@ -1302,6 +1405,7 @@ impl Default for AppConfig {
             messaging:        None,
             inbox_messaging:  InboxMessagingConfig::default(),
             pr_watch:         PrWatchConfig::default(),
+            orchestrator_reset: OrchestratorResetConfig::default(),
             update:           UpdateConfig::default(),
             github:           GithubConfig::default(),
             pr_events:        PrEventsConfig::default(),
@@ -1604,6 +1708,7 @@ impl AppConfig {
             enabled: true,
             cadence: default_cadence(),
             access: default_access(),
+            write_rules_override: self.brain.write_rules_override.clone(),
         }];
         options.extend(
             self.brain
@@ -1654,12 +1759,7 @@ impl AppConfig {
     /// on next launch — their old orchestrator directory is left in place
     /// untouched, not migrated or deleted.
     pub fn resolved_orchestrator_root(&self) -> PathBuf {
-        self.orchestrator_root.clone().unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("ninox")
-                .join("orchestrators")
-        })
+        self.orchestrator_root.clone().unwrap_or_else(crate::test_isolation::default_orchestrator_root)
     }
 
     /// The store a command uses without `--db`: the one a scoped instance
@@ -2165,7 +2265,7 @@ mod tests {
         let profile = MachineProfile {
             id: "11111111-1111-1111-1111-111111111111".into(),
             label: "build-box".into(),
-            ssh_target: "ethan@10.0.0.5".into(),
+            ssh_target: "dev@10.0.0.5".into(),
             remote_session: "default".into(),
             enabled: true,
         };
@@ -2288,8 +2388,9 @@ mod tests {
 
     #[test]
     fn resolved_orchestrator_root_default() {
+        let _iso = crate::test_isolation::isolate();
         let cfg = AppConfig::default();
-        assert!(cfg.resolved_orchestrator_root().ends_with("ninox/orchestrators"));
+        assert!(cfg.resolved_orchestrator_root().ends_with("orchestrators"));
     }
 
     #[test]
@@ -2577,6 +2678,25 @@ mod tests {
     }
 
     #[test]
+    fn saving_the_update_settings_merges_into_an_existing_config() {
+        let _iso = crate::test_isolation::isolate();
+        let path = AppConfig::config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "port = 9123\n").unwrap();
+        AppConfig::update(|c| {
+            c.update.channel = UpdateChannel::Alpha;
+            c.update.aws_profile = Some("prd-build-readonly".into());
+        })
+        .unwrap();
+        let cfg = AppConfig::load().unwrap();
+        assert_eq!(cfg.port, 9123, "existing keys survive");
+        assert_eq!(cfg.update.channel, UpdateChannel::Alpha);
+        assert_eq!(cfg.update.aws_profile.as_deref(), Some("prd-build-readonly"));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[update]") && raw.contains("channel = \"alpha\"") && raw.contains("aws_profile = \"prd-build-readonly\""), "{raw}");
+    }
+
+    #[test]
     fn update_channel_defaults_to_stable() {
         assert_eq!(AppConfig::default().update.channel, UpdateChannel::Stable);
         let cfg: AppConfig = toml::from_str("port = 8080\n").unwrap();
@@ -2601,6 +2721,40 @@ mod tests {
         assert_eq!("alpha".parse::<UpdateChannel>(), Ok(UpdateChannel::Alpha));
         assert_eq!("stable".parse::<UpdateChannel>(), Ok(UpdateChannel::Stable));
         assert!("nightly".parse::<UpdateChannel>().is_err());
+    }
+
+    #[test]
+    fn orchestrator_reset_is_off_by_default_with_a_40_percent_threshold() {
+        let d = AppConfig::default().orchestrator_reset;
+        assert_eq!((d.mode, d.auto_at_context_pct, d.enabled()), (ResetMode::Off, 40, false));
+        for src in ["port = 8080\n", "port = 8080\n\n[orchestrator_reset]\n", "port = 8080\n\n[orchestrator_reset]\nauto_at_context_pct = 40\n"] {
+            let cfg: AppConfig = toml::from_str(src).unwrap();
+            assert!(!cfg.orchestrator_reset.enabled(), "{src:?}: the threshold alone does not switch it on");
+        }
+    }
+
+    #[test]
+    fn orchestrator_reset_mode_reads_off_prompt_auto_and_anything_else_is_off() {
+        let mode = |v: &str| -> ResetMode {
+            toml::from_str::<AppConfig>(&format!("port = 8080\n\n[orchestrator_reset]\nmode = {v}\n")).unwrap().orchestrator_reset.mode
+        };
+        assert_eq!(mode("\"off\""), ResetMode::Off);
+        assert_eq!(mode("\"prompt\""), ResetMode::Prompt);
+        assert_eq!(mode("\"auto\""), ResetMode::Auto);
+        assert_eq!(mode("\"Prompt\""), ResetMode::Prompt);
+        for unknown in ["\"confirm\"", "\"yes\"", "\"\"", "true", "7"] {
+            assert_eq!(mode(unknown), ResetMode::Off, "{unknown}");
+        }
+        let cfg: AppConfig = toml::from_str("port = 8080\n\n[orchestrator_reset]\nauto_at_context_pct = 55\nmode = \"auto\"\n").unwrap();
+        assert!(cfg.orchestrator_reset.enabled());
+        let back: AppConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.orchestrator_reset, cfg.orchestrator_reset, "serializes in a position TOML accepts");
+    }
+
+    #[test]
+    fn the_threshold_is_held_to_10_through_95() {
+        let at = |n: u8| OrchestratorResetConfig { auto_at_context_pct: n, mode: ResetMode::Prompt }.threshold();
+        assert_eq!((at(0), at(9), at(10), at(40), at(95), at(96), at(255)), (10, 10, 10, 40, 95, 95, 95));
     }
 
     #[test]
@@ -2710,8 +2864,8 @@ mod tests {
         let _iso = crate::test_isolation::isolate();
         let mut cfg = AppConfig::default();
         cfg.brain.catalogues = vec![
-            CatalogueRef { name: "docs".to_string(), path: PathBuf::from("/tmp/docs-brain"), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
-            CatalogueRef { name: "default".to_string(), path: PathBuf::from("/tmp/should-be-skipped"), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
+            CatalogueRef { name: "docs".to_string(), path: PathBuf::from("/tmp/docs-brain"), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
+            CatalogueRef { name: "default".to_string(), path: PathBuf::from("/tmp/should-be-skipped"), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
         ];
         let options = cfg.catalogue_options();
         assert_eq!(options.len(), 2);
@@ -2724,8 +2878,8 @@ mod tests {
     fn catalogue_names_matches_catalogue_options_without_resolving_paths() {
         let mut cfg = AppConfig::default();
         cfg.brain.catalogues = vec![
-            CatalogueRef { name: "docs".to_string(), path: PathBuf::from("/tmp/docs-brain"), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
-            CatalogueRef { name: "default".to_string(), path: PathBuf::from("/tmp/should-be-skipped"), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
+            CatalogueRef { name: "docs".to_string(), path: PathBuf::from("/tmp/docs-brain"), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
+            CatalogueRef { name: "default".to_string(), path: PathBuf::from("/tmp/should-be-skipped"), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
         ];
         let names = cfg.catalogue_names();
         let _iso = crate::test_isolation::isolate();
@@ -2746,6 +2900,7 @@ mod tests {
             enabled: true,
             cadence: default_cadence(),
             access: default_access(),
+            write_rules_override: None,
         }];
         let sync = cfg.remote_config_for(std::path::Path::new("/tmp/team-brain")).unwrap();
         assert_eq!(sync.remote, "s3://team-brains/main");
@@ -2779,6 +2934,7 @@ mod tests {
             enabled: true,
             cadence: default_cadence(),
             access: default_access(),
+            write_rules_override: None,
         }];
         assert!(cfg.remote_config_for(std::path::Path::new("/tmp/local-brain")).is_none());
     }

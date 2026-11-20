@@ -279,15 +279,15 @@ pub fn render_reminder(resolution: &Resolution) -> String {
     crate::util::truncate_chars(&text, MAX_IDENTITY_REMINDER_CHARS)
 }
 
-/// Whether the identity-hook's `UserPromptSubmit` sibling entry and
-/// `SessionStart` event should be installed — the `whoami` capability's own
+/// Whether the identity-hook's `UserPromptSubmit` sibling entry and the
+/// identity reminder in the session-setup hook's output should be installed — the `whoami` capability's own
 /// registry gate (`[role_rehydration].enabled`), looked up once here so the
-/// two install sites ([`push_prompt_hook`]/[`set_session_start_hook`], used
+/// two install sites ([`push_prompt_hook`], used
 /// by `ninox_app::spawn_util::ensure_statusline_settings` and
 /// `orchestrator_root::setup_orchestrator_root`) share one source of truth
 /// instead of each re-reading the config field — or worse, each being handed
 /// a hand-threaded bool — directly.
-fn hooks_enabled(config: &AppConfig) -> bool {
+pub fn hooks_enabled(config: &AppConfig) -> bool {
     capabilities::REGISTRY
         .iter()
         .find(|c| c.name == "whoami")
@@ -298,22 +298,10 @@ fn hooks_enabled(config: &AppConfig) -> bool {
 /// `prompt_hooks` when [`hooks_enabled`] — a no-op otherwise. Shared by the
 /// worker-worktree and orchestrator-root install sites so the entry can't
 /// drift between them. Call before building the `hooks` JSON object that
-/// embeds `prompt_hooks`; pair with [`set_session_start_hook`] afterward.
+/// embeds `prompt_hooks`.
 pub fn push_prompt_hook(config: &AppConfig, ninox_bin_quoted: &str, prompt_hooks: &mut Vec<serde_json::Value>) {
     if hooks_enabled(config) {
         prompt_hooks.push(crate::worker_status::hook_entry(ninox_bin_quoted, "identity-hook prompt"));
-    }
-}
-
-/// Set `hooks["SessionStart"]` to the identity-hook's `SessionStart` event
-/// when [`hooks_enabled`] — a no-op otherwise, leaving `SessionStart` unset
-/// (both install sites' tests assert on that as the "disabled" state). The
-/// sibling of [`push_prompt_hook`]; call after `hooks` is built.
-pub fn set_session_start_hook(config: &AppConfig, ninox_bin_quoted: &str, hooks: &mut serde_json::Value) {
-    if hooks_enabled(config) {
-        hooks["SessionStart"] = serde_json::json!([{
-            "hooks": [crate::worker_status::hook_entry(ninox_bin_quoted, "identity-hook session-start")]
-        }]);
     }
 }
 
@@ -337,7 +325,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None,
             workspace_path: Some(format!("/work/{id}")), pid: None,
-            model: Some("claude-sonnet-5-5".into()), context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: Some("claude-sonnet-5-5".into()), observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,

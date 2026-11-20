@@ -389,7 +389,7 @@ mod tests {
         m.generation = 7;
         m.entries.insert(
             "repos/a.md".into(),
-            ManifestEntry { sha256: "abc".into(), size: 3, updated_by: "ethan".into(), updated_at: "2026-07-22T10:00:00Z".into() },
+            ManifestEntry { sha256: "abc".into(), size: 3, updated_by: "alice".into(), updated_at: "2026-07-22T10:00:00Z".into() },
         );
         let loaded = Manifest::from_bytes(&m.to_bytes().unwrap()).unwrap();
         assert_eq!(loaded.generation, 7);
@@ -443,8 +443,8 @@ mod tests {
     fn conflict_copy_rel_keeps_section_and_extension() {
         // 2026-07-22T10:45:01Z == 1784112301... use a fixed epoch: 1753181101 = 2025-07-22T10:45:01Z is
         // irrelevant — just assert shape, not the exact date digits.
-        let rel = conflict_copy_rel("repos/ninox.md", "ethan", 1_753_181_101);
-        assert!(rel.starts_with("repos/ninox.conflict-ethan-"), "{rel}");
+        let rel = conflict_copy_rel("repos/ninox.md", "alice", 1_753_181_101);
+        assert!(rel.starts_with("repos/ninox.conflict-alice-"), "{rel}");
         assert!(rel.ends_with(".md"), "{rel}");
         assert_eq!(rel.matches(".md").count(), 1);
     }
@@ -2327,13 +2327,13 @@ Append to `brain_sync/mod.rs` tests:
         sync.pull_if_stale().await.unwrap();
 
         fs::write(dir.path().join("a.md"), "# A locally edited").unwrap();
-        fs::write(dir.path().join("b.conflict-ethan-20260722-100000.md"), "# leftover").unwrap();
+        fs::write(dir.path().join("b.conflict-alice-20260722-100000.md"), "# leftover").unwrap();
 
         let status = remote_status(dir.path()).unwrap().unwrap();
         assert_eq!(status.remote, "s3://bucket/prefix");
         assert_eq!(status.generation, 1);
         assert!(status.pending_pushes.contains(&"a.md".to_string()));
-        assert_eq!(status.conflict_files, vec!["b.conflict-ethan-20260722-100000.md"]);
+        assert_eq!(status.conflict_files, vec!["b.conflict-alice-20260722-100000.md"]);
     }
 ```
 

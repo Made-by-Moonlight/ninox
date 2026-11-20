@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 pub const IMPORTED_TABLES: &[&str] = &[
     "sessions", "fleet_sessions", "orchestrators", "prs", "ci_status", "review_comments",
     "pr_watches", "orchestrator_plans", "session_deps", "session_messages", "message_events",
-    "held_messages", "work_requests", "user_requests",
+    "held_messages", "work_requests", "user_requests", "custom_workspaces",
 ];
 
 /// Tables deliberately left behind, and why. Every table a fresh store has
@@ -43,6 +43,9 @@ pub const NOT_IMPORTED_TABLES: &[(&str, &str)] = &[
     ("notifications",            "transient alerts of the old install, not worth carrying over"),
     ("workspace_disk_cache",     "measurements of the source's worktrees, re-measured by the next disk tick"),
     ("idle_prompts",             "the source's orchestrator prompt log; its cooldown names the source's sessions"),
+    ("orchestrator_resets",      "auto reset-from-plan bookkeeping for the source's conversations; re-arms on its own"),
+    ("reset_flow_markers",       "in-flight reset flows of the source; none survive a move"),
+    ("session_conversations",    "conversations retired by reset-from-plan; no older store has any, and the ids belong to the source's machine"),
 ];
 
 /// The worker type an untyped (pre-worker-types) session gets.
@@ -494,6 +497,9 @@ fn import_in_tx(
         ("held_messages",      &["seq"], vec![("to_id", M), ("attributed_from", MC)], ins("to_id")),
         ("work_requests",      &[],      vec![("from_session", MC), ("orchestrator_id", MC)], format!("({} OR {})", ins("from_session"), ins("orchestrator_id"))),
         ("user_requests",      &[],      vec![("requester_session_id", M)], ins("requester_session_id")),
+        // Every folder on record comes over, whether or not its session did:
+        // the unmapped ones keep their path with no session (the sweep guard).
+        ("custom_workspaces",  &[],      vec![("session_id", M)], "1 = 1".into()),
     ];
     for (table, omit, maps, filter) in tables {
         let c = copy_rows(tx, table, omit, &maps, &filter, true)?;

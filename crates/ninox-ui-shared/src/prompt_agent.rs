@@ -578,7 +578,9 @@ struct RelaunchCmd {
 fn relaunch_cmd(config: &AppConfig, spec: &WorkerTypeSpec, session: &Session, prefer_resume: bool) -> RelaunchCmd {
     let permission_mode = permission_mode(Interactive, Some(spec));
     let registry = config.registry();
-    let row_agent = AgentConfig { harness: session.agent_type.clone(), model: session.model.clone() };
+    let row_agent = ninox_core::model_resolution::relaunch_agent(
+        &session.agent_type, session.model.as_deref(), ninox_core::model_resolution::Role::Worker, Some(spec), config,
+    );
     match session.claude_session_id.clone().filter(|_| prefer_resume && registry.can_resume(&row_agent)) {
         Some(claude_session_id) => RelaunchCmd {
             base_cmd: registry.resume_cmd(&row_agent, permission_mode, &claude_session_id).expect("checked by can_resume"),
@@ -1128,7 +1130,7 @@ mod tests {
             id: id.to_string(), orchestrator_id: None, name: id.to_string(), repo: String::new(),
             status: SessionStatus::Working, agent_type: "claude-code".to_string(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: Some(std::process::id()),
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,

@@ -431,7 +431,7 @@ pub fn plan(st: &TuiState, r: &Row, width: u16) -> Plan {
         sub.push(sep(p));
         sub.push(Span::styled(format!("${:.2}", s.cost_usd), faint));
     }
-    let harness = match &s.model {
+    let harness = match s.model_label() {
         Some(m) => format!("{} · {m}", s.agent_type),
         None => s.agent_type.clone(),
     };

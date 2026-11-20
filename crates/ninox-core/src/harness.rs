@@ -1,6 +1,6 @@
 //! Data-driven agent-harness registry — harness definitions are DATA, not
 //! code (spec: field-notes-design.md §V "Backend (registry, not enum)").
-//! Four known harnesses ship as compiled-in default specs; `[harnesses.*]`
+//! Known harnesses ship as compiled-in default specs; `[harnesses.*]`
 //! config entries override (whole-spec replace) or extend the registry, so
 //! adding a future harness requires zero Rust changes.
 
@@ -139,10 +139,15 @@ pub struct HarnessSpec {
     #[serde(default)]
     pub no_permission_prompts: bool,
     /// Repo-relative skills directory this harness reads, in addition to
-    /// `.claude/skills` (pi scans `.agents/skills`, not `.claude/skills`).
+    /// the standard seeded `.claude/skills` and `.agents/skills` directories.
     /// Seeded from the same capability registry and git-excluded the same way.
     #[serde(default)]
     pub extra_skills_dir: Option<String>,
+    /// Flag taking text to append to the harness's system prompt. How an
+    /// orchestrator in a custom workspace gets the role text AGENTS.md would
+    /// otherwise carry. `None`: the text goes at the top of the first message.
+    #[serde(default)]
+    pub append_system_prompt_flag: Option<String>,
     /// Shown when the binary isn't on PATH (e.g. the npm package to install).
     #[serde(default)]
     pub install_hint: Option<String>,
@@ -186,10 +191,11 @@ fn builtin_specs() -> BTreeMap<String, HarnessSpec> {
             "--model".into(), "{model}".into(),
         ],
         skip_permissions_args: Some(vec![CLAUDE_SKIP_PERMISSIONS_FLAG.into()]),
+        append_system_prompt_flag: Some("--append-system-prompt".into()),
         known_models:     vec![
             "claude-opus-5-5".into(),
             "claude-sonnet-5-5".into(),
-            "claude-haiku-4-5-20251001".into(),
+            "claude-haiku-5-5".into(),
         ],
         ..HarnessSpec::default()
     });
@@ -204,17 +210,20 @@ fn builtin_specs() -> BTreeMap<String, HarnessSpec> {
         models_cmd:       Some(vec!["opencode".into(), "models".into()]),
         ..HarnessSpec::default()
     });
+    // `ori code` is Ori's native agent; bare `ori` also wraps other agents.
+    // Keep approvals manual for both launch paths: Ori otherwise defaults to
+    // self-drive. `--interactive` keeps a prompted worker open for follow-up.
+    m.insert("ori".to_string(), HarnessSpec {
+        interactive_args: vec!["code".into(), "--approvals".into(), "manual".into(), "--model".into(), "{model}".into()],
+        worker_args: Some(vec!["code".into(), "--approvals".into(), "manual".into(), "--model".into(), "{model}".into(), "--interactive".into(), "-p".into(), "{prompt}".into()]),
+        install_hint: Some("install Ori from https://openrouter.ai/ori".into()),
+        ..HarnessSpec::default()
+    });
     m.insert("aider".to_string(), HarnessSpec {
         interactive_args: vec!["--model".into(), "{model}".into()],
         worker_args:      Some(vec!["--model".into(), "{model}".into(), "--message".into(), "{prompt}".into()]),
         // aider's `--list-models` needs a search-term argument, so no
         // reliable bare models_cmd ships by default; supply one in config.
-        ..HarnessSpec::default()
-    });
-    m.insert("freebuff".to_string(), HarnessSpec {
-        // Researched 2026-07-05: worker/one-shot mode UNVERIFIED — no
-        // worker_args until someone supplies them in config.
-        interactive_args: vec!["--model".into(), "{model}".into()],
         ..HarnessSpec::default()
     });
     // Researched against pi 1.5.0 (`@earendil-works/pi-coding-agent`, needs
@@ -248,6 +257,13 @@ fn builtin_specs() -> BTreeMap<String, HarnessSpec> {
 }
 
 impl HarnessRegistry {
+    /// Whether `harness` runs ninox's seeded `SessionStart` hook, so session
+    /// setup can arrive that way instead of through a launch prompt, an
+    /// appended system prompt or a seeded file. Only claude-code does.
+    pub fn supports_session_hooks(&self, harness: &str) -> bool {
+        harness == CLAUDE_CODE_HARNESS
+    }
+
     /// Builtins overlaid by config `[harnesses.*]` entries (a config entry
     /// replaces the builtin spec wholesale). claude-code is the locked-on
     /// default and cannot be disabled.
@@ -261,6 +277,8 @@ impl HarnessRegistry {
                 spec.no_permission_prompts |= builtin.no_permission_prompts;
                 spec.resume_cwd_scoped |= builtin.resume_cwd_scoped;
                 spec.extra_skills_dir = spec.extra_skills_dir.or_else(|| builtin.extra_skills_dir.clone());
+                spec.append_system_prompt_flag =
+                    spec.append_system_prompt_flag.or_else(|| builtin.append_system_prompt_flag.clone());
             }
             specs.insert(name.clone(), spec);
         }
@@ -302,6 +320,47 @@ impl HarnessRegistry {
     pub fn interactive_cmd(&self, agent: &AgentConfig, mode: PermissionMode, claude_session_id: &str) -> String {
         let spec = self.spec(&agent.harness);
         build_cmd(&spec, agent, &spec.interactive_args, mode, None, claude_session_id)
+    }
+
+    /// [`Self::interactive_cmd_with_prompt`] with the prompt read from `file`
+    /// by the launching shell, so its size never reaches a command-line
+    /// limit (tmux caps a command at about 16 KiB).
+    pub fn interactive_cmd_with_prompt_file(&self, agent: &AgentConfig, mode: PermissionMode, file: &str, claude_session_id: &str) -> Option<String> {
+        const SENTINEL: &str = "NINOXPROMPTFILEPLACEHOLDER";
+        let cmd = self.interactive_cmd_with_prompt(agent, mode, SENTINEL, claude_session_id)?;
+        let read = format!("\"$(cat {})\"", shell_quote(file));
+        Some(cmd.replace(&format!("'{SENTINEL}'"), &read))
+    }
+
+    /// A fresh interactive launch that starts on `prompt` as its first
+    /// input, or `None` when the harness has no such shape. Supported when
+    /// the spec's `worker_args` end in a positional `-- {prompt}` (Claude
+    /// Code's interactive-with-prompt form); harnesses whose prompt flag is
+    /// non-interactive (`-p`, `--message`) must be fed through the pane.
+    pub fn interactive_cmd_with_prompt(&self, agent: &AgentConfig, mode: PermissionMode, prompt: &str, claude_session_id: &str) -> Option<String> {
+        let spec = self.spec(&agent.harness);
+        let w = spec.worker_args.as_ref()?;
+        let [.., dashes, placeholder] = w.as_slice() else { return None };
+        if dashes != "--" || placeholder != "{prompt}" {
+            return None;
+        }
+        let mut args = spec.interactive_args.clone();
+        args.extend(["--".to_string(), "{prompt}".to_string()]);
+        Some(build_cmd(&spec, agent, &args, mode, Some(prompt), claude_session_id))
+    }
+
+    /// `cmd` (from [`Self::interactive_cmd`] / [`Self::resume_cmd`]) with
+    /// `prompt` appended to the harness's system prompt, or `None` when this
+    /// harness has no such flag. Must be applied to resumes too: the flag is
+    /// per-process, not part of the stored conversation. Goes before a `--`
+    /// prompt separator when the command has one.
+    pub fn with_system_prompt(&self, agent: &AgentConfig, cmd: &str, prompt: &str) -> Option<String> {
+        let flag = self.spec(&agent.harness).append_system_prompt_flag?;
+        let extra = format!("{flag} {}", shell_quote(prompt));
+        Some(match cmd.find(" -- ") {
+            Some(at) => format!("{} {extra}{}", &cmd[..at], &cmd[at..]),
+            None => format!("{cmd} {extra}"),
+        })
     }
 
     /// Worker launch command, or `None` when the spec has no `worker_args`
@@ -546,10 +605,11 @@ fn expand_args(args: &[String], model: Option<&str>, prompt: Option<&str>, claud
         }
         let had_placeholder = a.contains("{model}") || a.contains("{prompt}") || a.contains("{session_id}");
         let mut s = a.replace("{model}", model.unwrap_or(""));
+        s = s.replace("{session_id}", claude_session_id);
+        // Last, so placeholder-looking text inside the prompt is left alone.
         if let Some(p) = prompt {
             s = s.replace("{prompt}", p);
         }
-        s = s.replace("{session_id}", claude_session_id);
         out.push(if had_placeholder { shell_quote(&s) } else { s });
         i += 1;
     }
@@ -610,6 +670,16 @@ mod tests {
     fn worker_cmd_codex() {
         assert_eq!(reg().worker_cmd(&agent("codex", Some("gpt-4o")), PermissionMode::Bypass, "do the thing", "sess-1").unwrap(),
                    "codex --model 'gpt-4o' -p 'do the thing'");
+    }
+
+    #[test]
+    fn ori_launches_its_native_agent_with_manual_approvals() {
+        let r = reg();
+        assert!(!r.spec("ori").enabled);
+        assert_eq!(r.interactive_cmd(&agent("ori", None), PermissionMode::Standard, "s"),
+                   "ori code --approvals manual");
+        assert_eq!(r.worker_cmd(&agent("ori", Some("provider/model")), PermissionMode::Bypass, "fix it", "s").unwrap(),
+                   "ori code --approvals manual --model 'provider/model' --interactive -p 'fix it'");
     }
 
     #[test]
@@ -680,7 +750,7 @@ mod tests {
             agent_type: harness.into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None,
             workspace_path: cwd.map(Into::into), pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some("x".into()),
             summary: None,
@@ -773,16 +843,6 @@ mod tests {
     }
 
     #[test]
-    fn freebuff_ships_disabled_without_worker_args() {
-        let r = reg();
-        let fb = r.spec("freebuff");
-        assert!(!fb.enabled);
-        assert!(fb.worker_args.is_none());
-        assert_eq!(r.interactive_cmd(&agent("freebuff", Some("fb-large")), PermissionMode::Standard, "sess-1"),
-                   "freebuff --model 'fb-large'");
-    }
-
-    #[test]
     fn only_claude_code_enabled_by_default() {
         assert_eq!(reg().enabled_names(), vec!["claude-code".to_string()]);
     }
@@ -790,7 +850,7 @@ mod tests {
     #[test]
     fn names_lists_claude_code_first_then_alphabetical() {
         assert_eq!(reg().names(),
-                   vec!["claude-code", "aider", "codex", "freebuff", "opencode", "pi"]
+                   vec!["claude-code", "aider", "codex", "opencode", "ori", "pi"]
                        .into_iter().map(String::from).collect::<Vec<_>>());
     }
 
@@ -811,14 +871,14 @@ mod tests {
     #[test]
     fn config_entry_extends_registry_with_new_harness() {
         let mut over = BTreeMap::new();
-        over.insert("freebuff2".to_string(), HarnessSpec {
+        over.insert("custom".to_string(), HarnessSpec {
             enabled: true,
             worker_args: Some(vec!["--model".into(), "{model}".into(), "-p".into(), "{prompt}".into()]),
             ..HarnessSpec::default()
         });
         let r = HarnessRegistry::from_config(&over);
         // binary defaults to the harness name
-        assert_eq!(r.worker_cmd(&agent("freebuff2", None), PermissionMode::Bypass, "go", "sess-1").unwrap(), "freebuff2 -p 'go'");
+        assert_eq!(r.worker_cmd(&agent("custom", None), PermissionMode::Bypass, "go", "sess-1").unwrap(), "custom -p 'go'");
     }
 
     #[test]
@@ -944,6 +1004,17 @@ mod tests {
     }
 
     #[test]
+    fn interactive_launch_prompt_is_claude_only_and_has_no_resume() {
+        let reg = HarnessRegistry::from_config(&BTreeMap::new());
+        let claude = AgentConfig { harness: "claude-code".into(), model: Some("m".into()) };
+        let cmd = reg.interactive_cmd_with_prompt(&claude, PermissionMode::Standard, "it's {session_id}", "sid").unwrap();
+        assert!(cmd.starts_with("claude --session-id 'sid'") && !cmd.contains("--resume"), "{cmd}");
+        assert!(cmd.ends_with("-- 'it'\\''s {session_id}'"), "{cmd}");
+        let codex = AgentConfig { harness: "codex".into(), model: None };
+        assert!(reg.interactive_cmd_with_prompt(&codex, PermissionMode::Standard, "p", "sid").is_none());
+    }
+
+    #[test]
     fn new_claude_session_id_returns_distinct_uuids() {
         let a = new_claude_session_id();
         let b = new_claude_session_id();
@@ -954,22 +1025,22 @@ mod tests {
     #[test]
     fn harness_spec_round_trips_through_toml() {
         let toml_src = r#"
-            [harnesses.freebuff]
+            [harnesses.custom]
             enabled = true
-            binary  = "freebuff"
+            binary  = "custom"
             model   = "fb-large"
             interactive_args = ["--model", "{model}"]
             worker_args      = ["--model", "{model}", "-p", "{prompt}"]
             known_models     = ["fb-large", "fb-mini"]
-            models_cmd       = ["freebuff", "models"]
+            models_cmd       = ["custom", "models"]
         "#;
         #[derive(serde::Deserialize)]
         struct Wrap { harnesses: BTreeMap<String, HarnessSpec> }
         let w: Wrap = toml::from_str(toml_src).unwrap();
-        let fb = &w.harnesses["freebuff"];
+        let fb = &w.harnesses["custom"];
         assert!(fb.enabled);
         assert_eq!(fb.known_models, vec!["fb-large", "fb-mini"]);
-        assert_eq!(fb.models_cmd.as_deref(), Some(&["freebuff".to_string(), "models".to_string()][..]));
+        assert_eq!(fb.models_cmd.as_deref(), Some(&["custom".to_string(), "models".to_string()][..]));
     }
 
     const ACCEPT: &str = "{\"crossSessionInbound\":\"accept\"}";

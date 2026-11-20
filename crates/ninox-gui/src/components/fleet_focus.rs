@@ -51,7 +51,7 @@ const BADGE_FINISHED_FG: Color = Color { r: 0x7f as f32 / 255.0, g: 0xd8 as f32 
 const CARD_SELECTED_BORDER: Color = Color { r: 0xc9 as f32 / 255.0, g: 0x8a as f32 / 255.0, b: 0x2e as f32 / 255.0, a: 1.0 };
 
 /// Clips `s` to at most `max_chars`, whole, with an ellipsis — same rule as
-/// `fleet_islands::truncate_chars` and `shell::tree::truncate_chars`
+/// `shell::tree::truncate_chars`
 /// (duplicated rather than shared: a trivial leaf utility, not
 /// classification logic that must agree across call sites).
 fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -194,16 +194,25 @@ fn real_card<'a>(app: &'a App, id: &str, status: MemberStatus, is_orchestrator: 
         row![badge(type_label, BADGE_TYPE_BG, BADGE_TYPE_FG), badge(harness, BADGE_HARNESS_BG, BADGE_HARNESS_FG)]
             .spacing(6)
             .into(),
-        container(
-            text(truncate_chars(name, 34))
-                .size(12.5)
-                .font(crate::style::SANS)
-                .color(tokens::TEXT)
-                .wrapping(iced::widget::text::Wrapping::None),
-        )
-        .width(Length::Fixed(CARD_WIDTH - 22.0))
-        .clip(true)
-        .into(),
+        {
+            let shown = crate::components::pr_chip::fit_name(name, 12.5, CARD_WIDTH - 22.0);
+            let truncated = shown != name;
+            let cell = container(
+                text(shown)
+                    .size(12.5)
+                    .font(crate::style::SANS)
+                    .color(tokens::TEXT)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            )
+            .width(Length::Fixed(CARD_WIDTH - 22.0))
+            .height(Length::Fixed(18.0))
+            .clip(true);
+            if truncated {
+                crate::components::shell::tree::hover_tip(cell.into(), name.to_string())
+            } else {
+                cell.into()
+            }
+        },
     ];
     if let Some(brief) = session.and_then(|s| s.summary.as_deref()).filter(|b| !b.trim().is_empty()) {
         let brief = ninox_overview::display::display_brief(brief);

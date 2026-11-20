@@ -173,6 +173,11 @@ pub struct Session {
     /// back-compat with sessions recorded before this field existed.
     #[serde(default)]
     pub model:          Option<String>,
+    /// The model the harness reported running (statusline / transcript) when
+    /// `model` was never recorded at spawn. Display-only: a relaunch must not
+    /// treat it as a user choice, or a harness's own default would stick.
+    #[serde(default)]
+    pub observed_model: Option<String>,
     /// Named `WorkerTypeSpec` (see `ninox_core::worker_type`) this session
     /// was spawned under via `ninox spawn --type <name>`, if any —
     /// orthogonal to `agent_type` (the harness name). `None` for workers
@@ -314,6 +319,18 @@ pub struct Session {
     pub cleanup_at: Option<i64>,
 }
 
+impl Session {
+    /// The model to show: the recorded one, else what the harness reported
+    /// running, tagged `(observed)`. `None` when neither is known.
+    pub fn model_label(&self) -> Option<String> {
+        match (self.model.as_deref().filter(|m| !m.is_empty()), self.observed_model.as_deref().filter(|m| !m.is_empty())) {
+            (Some(m), _)    => Some(m.to_string()),
+            (None, Some(o)) => Some(format!("{o} (observed)")),
+            (None, None)    => None,
+        }
+    }
+}
+
 /// Which fields of a `Session` a particular `Event::SessionUpdated` carries
 /// fresh, authoritative values for. Every producer of that event is read
 /// from a DB snapshot taken at the start of its own tick — a snapshot that
@@ -452,6 +469,7 @@ impl Session {
         }
         if fields.contains(SessionFields::MODEL) {
             self.model = incoming.model.clone();
+            self.observed_model = incoming.observed_model.clone();
         }
         if fields.contains(SessionFields::ACTIVITY) {
             self.activity = incoming.activity;
@@ -748,6 +766,16 @@ pub enum NotificationKind {
     /// A session launched from a UI (spawn, resume, re-file) failed to
     /// start; the body carries the cause.
     LaunchFailed,
+    /// An orchestrator's context crossed `[orchestrator_reset]`'s threshold
+    /// and it updated its plan; opening this shows the plan and asks for the
+    /// reset (`session_id` is the orchestrator).
+    ResetPlanReady,
+    /// An automatic reset-from-plan flow gave up waiting for the plan
+    /// update, or failed; nothing was reset.
+    ResetPlanTimedOut,
+    /// A freshly reset orchestrator started at or near the threshold: its
+    /// plan is too large to reset below the threshold, so it needs trimming.
+    ResetPlanTooLarge,
 }
 
 /// Health of a `MachineProfile`'s SSH connection, as last observed by
@@ -813,6 +841,9 @@ mod tests {
             (NotificationKind::FleetRestorePending, "\"fleet_restore_pending\""),
             (NotificationKind::InitialPromptFailed, "\"initial_prompt_failed\""),
             (NotificationKind::LaunchFailed,        "\"launch_failed\""),
+            (NotificationKind::ResetPlanReady,      "\"reset_plan_ready\""),
+            (NotificationKind::ResetPlanTimedOut,   "\"reset_plan_timed_out\""),
+            (NotificationKind::ResetPlanTooLarge,   "\"reset_plan_too_large\""),
         ] {
             assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
             let parsed: NotificationKind = serde_json::from_str(wire).unwrap();
@@ -869,7 +900,7 @@ mod tests {
             repo: "r1".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 1.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: Some("/ws".into()),
-            pid: Some(111), model: Some("m1".into()), context_tokens: Some(10),
+            pid: Some(111), model: Some("m1".into()), observed_model: None, context_tokens: Some(10),
             brain_reads: Vec::new(), brain_write: None, context_used_pct: Some(1.0),
             context_total_tokens: Some(10), context_window_size: Some(200_000),
             claude_session_id: None, summary: None, terminal_at: None,
@@ -899,6 +930,15 @@ mod tests {
 
         existing.merge_from(&incoming, SessionFields::GATE);
         assert_eq!(existing.gate_status, incoming.gate_status, "flagged GATE must be copied");
+    }
+
+    #[test]
+    fn merge_from_model_flag_carries_the_observed_model() {
+        let mut existing = base_session();
+        let mut incoming = base_session();
+        incoming.observed_model = Some("claude-fable-5-1".into());
+        existing.merge_from(&incoming, SessionFields::MODEL);
+        assert_eq!(existing.observed_model.as_deref(), Some("claude-fable-5-1"));
     }
 
     #[test]

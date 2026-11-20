@@ -142,8 +142,14 @@ pub enum VersionCheckState {
     /// so re-checking the registry would just report `UpdateAvailable`
     /// again for the exact version that was just installed.
     Installed,
-    Failed,
+    /// Why the check or install failed, with the fix command when known.
+    Failed(String),
 }
+
+/// Shown after the in-app update replaced every ninox binary: this app and
+/// the background server still run the old build until restarted.
+pub const UPDATE_INSTALLED_BODY: &str =
+    "All ninox binaries are updated. Restart ninox, then use Restart server in the banner (or Settings) to run the new build in the server too; sessions are kept.";
 
 /// One orchestrator's registered goals/plan doc, as last read from disk.
 /// Keyed by `orchestrator_id` on `App::plan_docs` — see
@@ -407,6 +413,11 @@ pub struct App {
     /// it renders inline alongside the card grid, matching
     /// `BrainSources.dc.html`'s layout.
     pub sources_edit: Option<ninox_ui_shared::brain_sources::SourceEditForm>,
+    /// Multi-line editors for the Sources form's brain rules and local
+    /// override (`text_editor::Content` isn't `Clone`, so they sit beside
+    /// the form, whose strings they mirror).
+    pub sources_brain_rules_editor: iced::widget::text_editor::Content,
+    pub sources_rules_override_editor: iced::widget::text_editor::Content,
     /// Per-catalogue live status for the Sources view, keyed by path —
     /// computed on demand (opening the view, after Save/Remove/Sync now),
     /// never kept fresh automatically (no background scheduler).
@@ -420,6 +431,9 @@ pub struct App {
     /// there's no form data to carry; the live count it displays is read
     /// straight from `sessions` at render time.
     pub restart_all_confirm: bool,
+    /// The orchestrator reset-from-plan dialog, while a flow is running.
+    /// In memory only: closing the app drops it and nothing can fire later.
+    pub reset_flow: Option<crate::components::reset_from_plan_modal::ResetUi>,
     /// The "Restore fleet" modal, while open.
     pub restore_modal: Option<crate::components::restore_modal::RestoreModal>,
     /// The Fleet toolbar's "Clean up finished" confirm, while open.
@@ -799,6 +813,14 @@ pub enum Message {
     SpawnFormName(String),
     SpawnFormKind(crate::components::spawn_modal::SpawnKind),
     SpawnFormWorkspace(String),
+    /// Opens the native folder chooser for the Workspace field.
+    SpawnFormBrowse,
+    SpawnFormBrowsed(Option<String>),
+    /// Non-fatal problems from a spawn that went through the shared launch path.
+    SpawnWarnings { session_id: SessionId, warnings: Vec<String> },
+    /// An orchestrator started through the shared launch path (a custom
+    /// workspace): attach to it, and show what it warned about.
+    CustomOrchestratorSpawned { session_id: SessionId, argv: Vec<String>, warnings: Vec<String> },
     SpawnFormHarness(String),
     SpawnFormModel(String),
     SpawnFormCustomModel(String),
@@ -1007,6 +1029,8 @@ pub enum Message {
     SourcesFormCachePath(String),
     SourcesFormCadence(String),
     SourcesFormAccess(String),
+    SourcesFormBrainRules(iced::widget::text_editor::Action),
+    SourcesFormRulesOverride(iced::widget::text_editor::Action),
     SourcesFormCancel,
     SourcesFormSave,
     SourcesToggleEnabled(String),
@@ -1105,6 +1129,19 @@ pub enum Message {
     /// "Restart all agents" pressed on the Fleet card — opens the
     /// confirmation modal rather than firing immediately.
     RequestRestartAll,
+    /// "Reset from plan" pressed on an orchestrator's session page.
+    ResetFromPlanAsk(String),
+    /// The plan request was (or could not be) delivered.
+    ResetFromPlanRequestSent(u64, Result<(), String>),
+    /// Re-check whether the plan was updated and the orchestrator is idle.
+    ResetFromPlanTick,
+    /// "Reset now" / "Reset with the plan as it is".
+    ResetFromPlanConfirm,
+    ResetFromPlanCancel,
+    /// The automatic trigger's notification: open the dialog on the plan it
+    /// asked for.
+    ResetFromPlanOpenReady(String),
+    ResetFromPlanDone(u64, Result<Vec<String>, String>),
     /// Re-read `/api/server/info` (periodically, and after a restart).
     ServerInfoTick,
     ServerInfoLoaded(Option<ninox_core::server_control::ServerInfo>),
@@ -1641,9 +1678,12 @@ impl App {
             help_open:      false,
             catalogue_modal: None,
             sources_edit: None,
+            sources_brain_rules_editor: iced::widget::text_editor::Content::new(),
+            sources_rules_override_editor: iced::widget::text_editor::Content::new(),
             source_status: HashMap::new(),
             source_sync_log: VecDeque::new(),
             restart_all_confirm: false,
+            reset_flow: None,
             restore_modal: None,
             reap_modal: None,
             delete_modal: None,
@@ -1759,7 +1799,7 @@ impl App {
 
     fn navigate_history(state: &mut Self, backwards: bool) -> Task<Message> {
         if state.spawn_modal.is_some() || state.catalogue_modal.is_some() || state.restart_all_confirm
-            || state.workspaces_modal.is_some() || state.delete_modal.is_some()
+            || state.reset_flow.is_some() || state.workspaces_modal.is_some() || state.delete_modal.is_some()
         {
             return Task::none();
         }
@@ -1903,6 +1943,17 @@ impl App {
             Ok(cfg) => state.config = cfg,
             Err(e) => tracing::warn!("failed to reload config after a worker type change: {e}"),
         }
+    }
+
+    /// Refills the two rules editors from the Sources form just opened.
+    fn load_rules_editors(state: &mut App) {
+        let (brains, over) = state
+            .sources_edit
+            .as_ref()
+            .map(|f| (f.brain_rules.clone(), f.rules_override.clone()))
+            .unwrap_or_default();
+        state.sources_brain_rules_editor = iced::widget::text_editor::Content::with_text(&brains);
+        state.sources_rules_override_editor = iced::widget::text_editor::Content::with_text(&over);
     }
 
     fn persist_config<R>(state: &mut App, what: &str, f: impl Fn(&mut AppConfig) -> R) -> R {
@@ -2365,7 +2416,7 @@ impl App {
     /// its inputs must not reach past.
     fn modal_open(state: &App) -> bool {
         state.spawn_modal.is_some() || state.catalogue_modal.is_some()
-            || state.restart_all_confirm || state.workspaces_modal.is_some()
+            || state.restart_all_confirm || state.reset_flow.is_some() || state.workspaces_modal.is_some()
             || (matches!(state.view, View::Remotes) && (state.remotes.add.is_some() || state.remotes.remove_confirm.is_some()))
             || state.fleet_message_draft.is_some()
     }
@@ -2429,13 +2480,14 @@ impl App {
         state.version_check = VersionCheckState::Checking;
         Task::future(async move {
             use ninox_core::lifecycle::{binary_update, update_check::{GenericPackageUpdateSource, check_for_update}};
-            let channel = ninox_core::config::AppConfig::load_or_default().update.channel;
+            let config = ninox_core::config::AppConfig::load_or_default();
+            let channel = config.update.channel;
             let supported = binary_update::platform_supported(std::env::consts::OS, std::env::consts::ARCH);
             let result = match binary_update::generic_package(std::env::consts::OS, channel).filter(|_| supported) {
-                Some(package) => check_for_update(&GenericPackageUpdateSource { channel }, package, NINOX_VERSION)
+                Some(package) => check_for_update(&GenericPackageUpdateSource::from_config(&config), package, NINOX_VERSION)
                     .await
                     .map(|latest| latest.map(|v| v.to_string()))
-                    .map_err(|e| e.to_string()),
+                    .map_err(|e| binary_update::explain_check_error(&e, binary_update::known_aws_profile().as_deref())),
                 None => Ok(None),
             };
             Message::VersionCheckResult(result)
@@ -4033,6 +4085,47 @@ impl App {
                 Task::none()
             }
 
+            Message::SpawnFormBrowse => Task::future(async {
+                Message::SpawnFormBrowsed(
+                    tokio::task::spawn_blocking(ninox_ui_shared::spawn_util::choose_folder).await.ok().flatten(),
+                )
+            }),
+
+            Message::SpawnFormBrowsed(path) => {
+                if let (Some(f), Some(path)) = (&mut state.spawn_modal, path) {
+                    f.workspace = path;
+                    f.error = None;
+                }
+                Task::none()
+            }
+
+            Message::CustomOrchestratorSpawned { session_id, argv, warnings } => {
+                // The shared path already delivered the brief.
+                let attach = App::apply(state, Message::SpawnLaunched {
+                    session_id: session_id.clone(), argv: Ok(argv), first_message: None, spawner: None,
+                });
+                if warnings.is_empty() {
+                    return attach;
+                }
+                Task::batch([attach, App::apply(state, Message::SpawnWarnings { session_id, warnings })])
+            }
+
+            Message::SpawnWarnings { session_id, warnings } => {
+                let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+                for w in &warnings {
+                    tracing::warn!("{session_id}: {w}");
+                }
+                Self::push_notification(state, Notification {
+                    id:         format!("spawn-warnings-{session_id}-{ts}"),
+                    kind:       NotificationKind::LaunchFailed,
+                    title:      format!("{session_id}: spawn notice"),
+                    body:       warnings.join("\n"),
+                    session_id: Some(session_id),
+                    created_at: ts,
+                });
+                Task::none()
+            }
+
             Message::SpawnFormHarness(h) => {
                 // Re-clicking the already-selected chip must not wipe the
                 // model choice (iced buttons fire on every press).
@@ -4262,6 +4355,7 @@ impl App {
                         enabled: true,
                         cadence: "manual".to_string(),
                         access: "read_write".to_string(),
+                        write_rules_override: None,
                     })
                 });
                 state.catalogues = state.config.catalogue_options();
@@ -4476,9 +4570,9 @@ impl App {
                             workspace_path:  Some(workspace.clone()),
                             pid:             None,
                             model:           agent.model.clone(),
-                            context_tokens:  None,
-                            brain_reads:     brain.reads.iter().map(|r| r.to_string_lossy().into_owned()).collect(),
-                            brain_write:     Some(brain.write_str()),
+                            observed_model: None, context_tokens:  None,
+                            brain_reads:     brain.stored_reads(),
+                            brain_write:     brain.stored_write(),
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
                             summary:         None,
@@ -4573,6 +4667,60 @@ impl App {
 
                     // ── Orchestrator path: existing flow, stamped with the
                     // selected agent preset + brain catalogue.
+                    SpawnKind::Orchestrator if !form.workspace.trim().is_empty() => {
+                        // A folder the user chose: the shared launch path owns
+                        // everything ninox writes there.
+                        let dir = match ninox_core::custom_workspace::resolve(&form.workspace, &state.orchestrator_root) {
+                            Ok(dir) => dir,
+                            Err(e) => {
+                                if let Some(f) = &mut state.spawn_modal {
+                                    f.error = Some(format!("{e:#}"));
+                                }
+                                return Task::none();
+                            }
+                        };
+                        // Same guards as the default branch, so the modal stays open.
+                        let slug = slugify(&name);
+                        if ninox_core::messaging::is_reserved_session_id(&slug) {
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!("'{slug}' is reserved for ninox itself — pick another name"));
+                            }
+                            return Task::none();
+                        }
+                        if state.sessions.contains_key(&slug) || state.orchestrators.iter().any(|o| o.id == slug) {
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!("a session named {slug} already exists — pick another name"));
+                            }
+                            return Task::none();
+                        }
+                        if let Some(other) = state.sessions.values().find(|s| s.workspace_path.as_deref() == dir.to_str()) {
+                            if let Some(f) = &mut state.spawn_modal {
+                                f.error = Some(format!("{} is already the workspace of session {} — pick another folder", dir.display(), other.id));
+                            }
+                            return Task::none();
+                        }
+                        state.spawn_modal = None;
+                        let (store, config) = (state.engine.store.clone(), state.config.clone());
+                        let brief = (!prompt.trim().is_empty()).then(|| prompt.clone());
+                        let failed_id = slugify(&name);
+                        Task::future(async move {
+                            let spawned = ninox_ui_shared::cli::spawn_orchestrator_common(
+                                &store, &config, &name, brief, None, Some(agent), Some(brain), Some(&dir),
+                            ).await;
+                            match spawned {
+                                Ok(s) if s.queued.is_some() => Message::SpawnWarnings {
+                                    session_id: s.id,
+                                    warnings: s.queued.into_iter().chain(s.warnings).collect(),
+                                },
+                                Ok(s) => Message::CustomOrchestratorSpawned {
+                                    argv: ninox_core::runtime::attach_args(&s.id).await,
+                                    session_id: s.id,
+                                    warnings: s.warnings,
+                                },
+                                Err(e) => Message::SessionLaunchFailed { session_id: failed_id, action: "spawn", cause: format!("{e:#}") },
+                            }
+                        })
+                    }
                     SpawnKind::Orchestrator => {
                         let ts = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -4615,6 +4763,7 @@ impl App {
                             brain: Some(brain.clone()),
                             spawner: std::env::var("NINOX_ORCHESTRATOR_ID").ok().filter(|s| !s.is_empty()),
                             started_at: ts as i64,
+                            workspace: None,
                         };
                         match Self::admit_spawn(state, queued_launch.skeleton(), ninox_ui_shared::session_queue::QueuedLaunch::Orchestrator(queued_launch)) {
                             Err(e) => {
@@ -4659,9 +4808,9 @@ impl App {
                             workspace_path:  Some(ws.clone()),
                             pid:             None,
                             model:           agent.model.clone(),
-                            context_tokens:  None,
-                            brain_reads:     brain.reads.iter().map(|r| r.to_string_lossy().into_owned()).collect(),
-                            brain_write:     Some(brain.write_str()),
+                            observed_model: None, context_tokens:  None,
+                            brain_reads:     brain.stored_reads(),
+                            brain_write:     brain.stored_write(),
                             context_used_pct: None, context_total_tokens: None, context_window_size: None,
                             claude_session_id: Some(claude_session_id.clone()),
                             summary:         None,
@@ -4693,12 +4842,17 @@ impl App {
                         let spawner           = std::env::var("NINOX_ORCHESTRATOR_ID").ok().filter(|s| !s.is_empty());
                         let config            = state.config.clone();
                         let first_message     = (!prompt.trim().is_empty())
-                            .then(|| ninox_ui_shared::cli::orchestrator_initial_brief(&sid, &prompt, spawner.as_deref()));
+                            .then(|| ninox_ui_shared::cli::orchestrator_initial_brief(
+                                &sid, &prompt, spawner.as_deref(), config.registry().supports_session_hooks(&orch_agent.harness),
+                            ));
 
                         Task::future(async move {
                             if let Err(e) = tokio::fs::create_dir_all(&ws).await {
                                 tracing::error!("mkdir orchestrator workspace {ws}: {e}");
                             }
+                            // The role/identity hook and statusLine live in the
+                            // orchestrator's own settings.local.json.
+                            ninox_ui_shared::spawn_util::seed_orchestrator_workspace_settings(std::path::Path::new(&ws), &config);
                             if let Err(e) = ninox_ui_shared::spawn_util::seed_permissions_for_type_name(
                                 std::path::Path::new(&ws), &orch_agent.harness, Some("Orchestrator"), &config,
                             ) {
@@ -5051,6 +5205,17 @@ impl App {
                 if state.restart_all_confirm {
                     if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)) {
                         state.restart_all_confirm = false;
+                    }
+                    return Task::none();
+                }
+
+                if let Some(ui) = &state.reset_flow {
+                    if matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape))
+                        && ui.phase != crate::components::reset_from_plan_modal::UiPhase::Resetting
+                    {
+                        if let Some(ui) = state.reset_flow.take() {
+                            ui.cancel();
+                        }
                     }
                     return Task::none();
                 }
@@ -6312,12 +6477,14 @@ impl App {
 
             Message::SourcesOpenAdd => {
                 state.sources_edit = Some(ninox_ui_shared::brain_sources::SourceEditForm::default());
+                Self::load_rules_editors(state);
                 Task::none()
             }
 
             Message::SourcesOpenEdit(name) => {
                 if let Some(c) = state.catalogues.iter().find(|c| c.name == name) {
                     state.sources_edit = Some(ninox_ui_shared::brain_sources::form_from_catalogue(c));
+                    Self::load_rules_editors(state);
                 }
                 Task::none()
             }
@@ -6384,6 +6551,26 @@ impl App {
                 Task::none()
             }
 
+            Message::SourcesFormBrainRules(action) => {
+                let edit = action.is_edit();
+                state.sources_brain_rules_editor.perform(action);
+                if let (true, Some(f)) = (edit, &mut state.sources_edit) {
+                    f.brain_rules = state.sources_brain_rules_editor.text().trim_end().to_string();
+                    f.error = None;
+                }
+                Task::none()
+            }
+
+            Message::SourcesFormRulesOverride(action) => {
+                let edit = action.is_edit();
+                state.sources_rules_override_editor.perform(action);
+                if let (true, Some(f)) = (edit, &mut state.sources_edit) {
+                    f.rules_override = state.sources_rules_override_editor.text().trim_end().to_string();
+                    f.error = None;
+                }
+                Task::none()
+            }
+
             Message::SourcesFormCancel => {
                 state.sources_edit = None;
                 Task::none()
@@ -6401,6 +6588,13 @@ impl App {
                         return Task::none();
                     }
                 };
+
+                if let Err(e) = ninox_ui_shared::brain_sources::save_brain_rules(&form, &catalogue) {
+                    if let Some(f) = &mut state.sources_edit {
+                        f.error = Some(e);
+                    }
+                    return Task::none();
+                }
 
                 let editing = form.editing.clone();
                 Self::persist_config(state, "save source", |c| {
@@ -6972,14 +7166,14 @@ impl App {
                             id:         format!("update-installed-{ts}"),
                             kind:       NotificationKind::UpdateInstalled,
                             title:      "Update installed".to_string(),
-                            body:       "Restart ninox to use the new version.".to_string(),
+                            body:       UPDATE_INSTALLED_BODY.to_string(),
                             session_id: None,
                             created_at: ts,
                         });
                     }
                     Err(e) => {
                         tracing::error!("update install failed: {e}");
-                        state.version_check = VersionCheckState::Failed;
+                        state.version_check = VersionCheckState::Failed(e.clone());
                         Self::push_notification(state, Notification {
                             id:         format!("update-failed-{ts}"),
                             kind:       NotificationKind::UpdateFailed,
@@ -7011,7 +7205,7 @@ impl App {
                     Ok(None)         => VersionCheckState::UpToDate,
                     Err(e) => {
                         tracing::warn!("settings version check failed: {e}");
-                        VersionCheckState::Failed
+                        VersionCheckState::Failed(e)
                     }
                 };
                 Task::none()
@@ -7315,6 +7509,124 @@ impl App {
                 state.server.restarting_sessions = false;
                 state.server.result = Some(result);
                 Task::done(Message::ServerInfoTick)
+            }
+
+            Message::ResetFromPlanAsk(id) => {
+                use crate::components::reset_from_plan_modal::ResetUi;
+                if state.reset_flow.is_some() {
+                    return Task::none();
+                }
+                let store = state.engine.store.clone();
+                let (flow, request) = match ninox_ui_shared::reset_from_plan::ResetFlow::prepare(store.clone(), &id) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("reset from plan {id}: {e:#}");
+                        return Task::none();
+                    }
+                };
+                let name = state.sessions.get(&id).map(|s| s.name.clone()).unwrap_or_else(|| id.clone());
+                let ui = ResetUi::new(id.clone(), name, flow);
+                let generation = ui.generation;
+                state.reset_flow = Some(ui);
+                let config = state.config.clone();
+                Task::future(async move {
+                    let r = ninox_ui_shared::reset_from_plan::send_request(&store, &config, &id, &request).await;
+                    Message::ResetFromPlanRequestSent(generation, r.map_err(|e| format!("{e:#}")))
+                })
+            }
+            Message::ResetFromPlanRequestSent(generation, result) => {
+                use crate::components::reset_from_plan_modal::UiPhase;
+                if let Some(ui) = state.reset_flow.as_mut().filter(|u| u.generation == generation && u.phase == UiPhase::Sending) {
+                    match result {
+                        Ok(()) => ui.phase = UiPhase::Waiting,
+                        Err(e) => {
+                            tracing::warn!("reset from plan {}: {e}", ui.id);
+                            ui.error = Some(e);
+                            ui.phase = UiPhase::SendFailed;
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::ResetFromPlanTick => {
+                if let Some(ui) = state.reset_flow.as_mut() {
+                    if ui.phase.pollable() {
+                        if let Some(flow) = ui.flow.as_mut() {
+                            let phase = flow.poll();
+                            let preview = flow.preview();
+                            ui.phase = ui.phase.after_poll(phase);
+                            ui.set_preview(preview);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::ResetFromPlanCancel => {
+                if state.reset_flow.as_ref().is_some_and(|u| u.phase != crate::components::reset_from_plan_modal::UiPhase::Resetting) {
+                    if let Some(ui) = state.reset_flow.take() {
+                        ui.cancel();
+                    }
+                }
+                Task::none()
+            }
+            Message::ResetFromPlanOpenReady(id) => {
+                use crate::components::reset_from_plan_modal::{ResetUi, UiPhase};
+                if state.reset_flow.is_some() {
+                    return Task::none();
+                }
+                let Some(row) = ninox_ui_shared::reset_from_plan::auto_flow_row(&state.engine.store, &id) else { return Task::none() };
+                let flow = ninox_ui_shared::reset_from_plan::ResetFlow::from_auto_row(state.engine.store.clone(), &row);
+                let name = state.sessions.get(&id).map(|s| s.name.clone()).unwrap_or_else(|| id.clone());
+                let mut ui = ResetUi::new(id, name, flow);
+                ui.auto_started = true;
+                // The plan request is already out; this is a wait that the next tick resolves.
+                ui.phase = UiPhase::Waiting;
+                state.reset_flow = Some(ui);
+                Task::done(Message::ResetFromPlanTick)
+            }
+            Message::ResetFromPlanConfirm => {
+                use crate::components::reset_from_plan_modal::UiPhase;
+                let Some(ui) = state.reset_flow.as_mut().filter(|u| u.can_reset()) else { return Task::none() };
+                let Some(flow) = ui.flow.take() else { return Task::none() };
+                ui.phase = UiPhase::Resetting;
+                ui.error = None;
+                let generation = ui.generation;
+                let engine = state.engine.clone();
+                let config = state.config.clone();
+                Task::future(async move {
+                    let r = flow.confirm_with(engine, &config, true).await.map(|r| r.attach).map_err(|e| format!("{e:#}"));
+                    Message::ResetFromPlanDone(generation, r)
+                })
+            }
+            Message::ResetFromPlanDone(generation, result) => {
+                if state.reset_flow.as_ref().is_some_and(|u| u.generation != generation) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(argv) => {
+                        let id = state.reset_flow.take().map(|u| u.id);
+                        return match id {
+                            Some(session_id) => {
+                                // Only now: a refused or failed confirm leaves
+                                // the old pane, and its terminal, alone.
+                                state.clients.remove(&session_id);
+                                state.terminals.remove(&session_id);
+                                state.attach.remove(&session_id);
+                                state.diffs.remove(&session_id);
+                                Task::done(Message::ClientAttach { session_id, argv })
+                            }
+                            None => Task::none(),
+                        };
+                    }
+                    Err(e) => {
+                        tracing::error!("reset from plan failed: {e}");
+                        if let Some(ui) = state.reset_flow.as_mut() {
+                            ui.error = Some(e);
+                            ui.phase = crate::components::reset_from_plan_modal::UiPhase::ResetFailed;
+                        }
+                    }
+                }
+                Task::none()
             }
 
             Message::RequestRestartAll => {
@@ -7821,6 +8133,8 @@ impl App {
             iced::widget::stack![base, catalogue_modal(state, form)].into()
         } else if state.restart_all_confirm {
             iced::widget::stack![base, restart_all_modal(state)].into()
+        } else if let Some(ui) = &state.reset_flow {
+            iced::widget::stack![base, crate::components::reset_from_plan_modal::reset_from_plan_modal(ui)].into()
         } else if let Some(modal) = &state.restore_modal {
             iced::widget::stack![base, crate::components::restore_modal::restore_modal(modal)].into()
         } else if let Some(modal) = &state.reap_modal {
@@ -8068,6 +8382,9 @@ impl App {
 
         let reap_sub = iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::AttachReap);
         let mut subs = vec![engine_sub, keyboard_sub, poll_sub, server_info_sub, reap_sub];
+        if state.reset_flow.is_some() {
+            subs.push(iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::ResetFromPlanTick));
+        }
         if Self::wants_thinking_tick(state) {
             subs.push(iced::time::every(crate::motion::TICK).map(|_| Message::ThinkingTick));
         }
@@ -8399,7 +8716,7 @@ mod tests {
             repo: repo.into(), status: ninox_core::types::SessionStatus::PrOpen,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number, pr_id, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -8531,6 +8848,7 @@ mod tests {
                 enabled: true,
                 cadence: "manual".to_string(),
                 access: "read_write".to_string(),
+                write_rules_override: None,
             }],
             active_catalogue: Some(0),
             prs:            HashMap::new(),
@@ -8574,9 +8892,12 @@ mod tests {
             help_open:      false,
             catalogue_modal: None,
             sources_edit: None,
+            sources_brain_rules_editor: iced::widget::text_editor::Content::new(),
+            sources_rules_override_editor: iced::widget::text_editor::Content::new(),
             source_status: HashMap::new(),
             source_sync_log: VecDeque::new(),
             restart_all_confirm: false,
+            reset_flow: None,
             restore_modal: None,
             reap_modal: None,
             delete_modal: None,
@@ -8794,7 +9115,7 @@ mod tests {
             status: SessionStatus::Terminated, agent_type: "claude-code".into(),
             cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None,
             workspace_path: Some("/tmp/ws".into()), pid: None,
-            model: Some("claude-opus-4-8".into()), context_tokens: None,
+            model: Some("claude-opus-4-8".into()), observed_model: None, context_tokens: None,
             brain_reads: Vec::new(), brain_write: Some("/brains/b".into()),
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
@@ -8812,6 +9133,7 @@ mod tests {
 
     #[test]
     fn refile_message_drops_client_state_and_keeps_session() {
+        let _iso = ninox_core::test_isolation::isolate();
         let e = test_engine();
         let mut m = base(e);
         let s = refile_session("s1");
@@ -8826,6 +9148,7 @@ mod tests {
 
     #[test]
     fn refile_message_drops_the_cached_diff_from_the_prior_incarnation() {
+        let _iso = ninox_core::test_isolation::isolate();
         let e = test_engine();
         let mut m = base(e);
         let s = refile_session("s1");
@@ -8909,6 +9232,33 @@ mod tests {
         let (m, _) = m.update(Message::PollSessions);
         assert!(m.notifications.iter().all(|n| n.kind != NotificationKind::UpdateAvailable));
         assert!(m.notifications.iter().any(|n| n.kind == NotificationKind::UpdateInstalled));
+    }
+
+    #[test]
+    fn an_applied_update_tells_the_user_to_restart_the_server_too() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let (m, _) = base(test_engine()).update(Message::UpdateApplied(Ok(())));
+        let note = m.notifications.iter().find(|n| n.kind == NotificationKind::UpdateInstalled).expect("installed notice");
+        assert!(note.body.contains("Restart server") , "{}", note.body);
+        assert!(note.body.contains("All ninox binaries"), "{}", note.body);
+        assert_eq!(m.version_check, VersionCheckState::Installed);
+    }
+
+    #[test]
+    fn a_failed_install_keeps_the_reason_in_settings() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let why = "update check can't run: the AWS SSO session expired — run `aws sso login --profile p`".to_string();
+        let (m, _) = base(test_engine()).update(Message::UpdateApplied(Err(why.clone())));
+        assert_eq!(m.version_check, VersionCheckState::Failed(why.clone()));
+        assert!(m.notifications.iter().any(|n| n.kind == NotificationKind::UpdateFailed && n.body == why));
+    }
+
+    #[test]
+    fn a_failed_version_check_shows_why_with_the_fix() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let why = "update check can't run: no AWS profile is set — run `aws sso login --profile <profile>`".to_string();
+        let (m, _) = base(test_engine()).update(Message::VersionCheckResult(Err(why.clone())));
+        assert_eq!(m.version_check, VersionCheckState::Failed(why));
     }
 
     #[test]
@@ -9124,6 +9474,20 @@ mod tests {
         assert!(!shown.contains("hunter2"), "{shown}");
         let (m, _) = m.update(Message::SourcesFormLocation(shown.replace("acme/repo", "acme/docs")));
         assert_eq!(m.sources_edit.as_ref().unwrap().location, "https://bob:hunter2@github.com/acme/docs/wiki");
+    }
+
+    #[test]
+    fn sources_rules_editors_keep_newlines_and_mirror_into_the_form() {
+        use iced::widget::text_editor::{Action, Edit};
+        let mut m = base(test_engine());
+        m.sources_edit = Some(ninox_ui_shared::brain_sources::SourceEditForm::default());
+        for a in [Action::Edit(Edit::Insert('a')), Action::Edit(Edit::Enter), Action::Edit(Edit::Insert('b'))] {
+            m = m.update(Message::SourcesFormBrainRules(a)).0;
+        }
+        m = m.update(Message::SourcesFormRulesOverride(Action::Edit(Edit::Insert('z')))).0;
+        let f = m.sources_edit.as_ref().unwrap();
+        assert_eq!(f.brain_rules, "a\nb");
+        assert_eq!(f.rules_override, "z");
     }
 
     #[test]
@@ -9378,7 +9742,7 @@ mod tests {
             pr_id:           None,
             workspace_path:  None,
             pid:             None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -9409,7 +9773,7 @@ mod tests {
             repo: "r1".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
@@ -9515,7 +9879,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
@@ -9629,7 +9993,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -9687,7 +10051,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -9834,7 +10198,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.42,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -9908,7 +10272,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -9969,7 +10333,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -10003,7 +10367,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: Some(0), gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
@@ -10043,7 +10407,7 @@ mod tests {
             agent_type: "c".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
@@ -11022,6 +11386,7 @@ mod tests {
 
     #[test]
     fn the_more_menu_closes_on_an_outside_click_or_a_pick() {
+        let _iso = ninox_core::test_isolation::isolate();
         let m = on_session_page(DetailPanel::Split);
         let (m, _) = m.update(Message::SessionMoreToggle);
         assert!(m.session_more_open);
@@ -12379,6 +12744,7 @@ mod tests {
             enabled: true,
             cadence: "manual".to_string(),
             access: "read_write".to_string(),
+            write_rules_override: None,
         }
     }
 
@@ -13035,8 +13401,8 @@ mod tests {
         let e = test_engine();
         let mut app = base_with_brain(e, brain_a);
         app.catalogues = vec![
-            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
-            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
         ];
         let (app, _) = app.update(Message::NavigateBrain);
         let (app, _) = app.update(Message::BrainSelectEntry("symbols/a.md".into()));
@@ -13095,8 +13461,8 @@ mod tests {
         let e = test_engine();
         let mut app = base_with_brain(e, Arc::new(BrainIndex::open(&dir_a).unwrap()));
         app.catalogues = vec![
-            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
-            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
         ];
 
         let (app, task) = app.update(Message::BrainSwitchCatalogue(Some(1)));
@@ -13127,8 +13493,8 @@ mod tests {
         let e = test_engine();
         let mut app = base_with_brain(e, Arc::new(BrainIndex::open(&dir_a).unwrap()));
         app.catalogues = vec![
-            ninox_core::config::CatalogueRef { name: "alpha".into(), path: dir_a, remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
-            ninox_core::config::CatalogueRef { name: "beta".into(), path: dir_b, remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
+            ninox_core::config::CatalogueRef { name: "alpha".into(), path: dir_a, remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
+            ninox_core::config::CatalogueRef { name: "beta".into(), path: dir_b, remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
         ];
 
         let (app, _) = app.update(Message::BrainSwitchCatalogue(None));
@@ -13156,8 +13522,8 @@ mod tests {
         let e = test_engine();
         let mut app = base_with_brain(e, Arc::new(BrainIndex::open(&dir_a).unwrap()));
         app.catalogues = vec![
-            ninox_core::config::CatalogueRef { name: "alpha".into(), path: dir_a, remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
-            ninox_core::config::CatalogueRef { name: "beta".into(), path: dir_b, remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: false, cadence: "manual".to_string(), access: "read_write".to_string() },
+            ninox_core::config::CatalogueRef { name: "alpha".into(), path: dir_a, remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
+            ninox_core::config::CatalogueRef { name: "beta".into(), path: dir_b, remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: false, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
         ];
 
         let (app, _) = app.update(Message::BrainSwitchCatalogue(None));
@@ -13176,8 +13542,8 @@ mod tests {
         let e = test_engine();
         let mut app = base_with_brain(e, Arc::new(BrainIndex::open(&dir_a).unwrap()));
         app.catalogues = vec![
-            ninox_core::config::CatalogueRef { name: "alpha".into(), path: dir_a, remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
-            ninox_core::config::CatalogueRef { name: "beta".into(), path: dir_b, remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
+            ninox_core::config::CatalogueRef { name: "alpha".into(), path: dir_a, remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
+            ninox_core::config::CatalogueRef { name: "beta".into(), path: dir_b, remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
         ];
 
         let (app, task) = app.update(Message::BrainSwitchCatalogue(None));
@@ -13213,8 +13579,8 @@ mod tests {
         let e = test_engine();
         let mut app = base_with_brain(e, Arc::new(BrainIndex::open(&dir_a).unwrap()));
         app.catalogues = vec![
-            ninox_core::config::CatalogueRef { name: "alpha".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
-            ninox_core::config::CatalogueRef { name: "beta".into(), path: dir_b, remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
+            ninox_core::config::CatalogueRef { name: "alpha".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
+            ninox_core::config::CatalogueRef { name: "beta".into(), path: dir_b, remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
         ];
         let (app, _) = app.update(Message::BrainSwitchCatalogue(None));
         assert_eq!(app.brain_view.entries.len(), 2, "both catalogues are in scope");
@@ -13259,8 +13625,8 @@ mod tests {
         let e = test_engine();
         let mut app = base_with_brain(e, Arc::new(BrainIndex::open(&dir_a).unwrap()));
         app.catalogues = vec![
-            ninox_core::config::CatalogueRef { name: "alpha".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
-            ninox_core::config::CatalogueRef { name: "beta".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
+            ninox_core::config::CatalogueRef { name: "alpha".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
+            ninox_core::config::CatalogueRef { name: "beta".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
         ];
         let (app, _) = app.update(Message::BrainSwitchCatalogue(None));
         assert_eq!(app.brain_view.entries.len(), 2);
@@ -13563,8 +13929,8 @@ mod tests {
         let e = test_engine();
         let mut app = base_with_brain(e, brain_a);
         app.catalogues = vec![
-            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
-            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string() },
+            ninox_core::config::CatalogueRef { name: "default".into(), path: dir_a.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
+            ninox_core::config::CatalogueRef { name: "second".into(), path: dir_b.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None, enabled: true, cadence: "manual".to_string(), access: "read_write".to_string(), write_rules_override: None },
         ];
         let (app, _) = app.update(Message::NavigateBrain);
         assert_eq!(
@@ -13680,7 +14046,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 1.23,
             started_at: 0, pr_number: Some(42), pr_id: None,
             workspace_path: Some("/tmp/w".into()), pid: Some(1234),
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -13710,7 +14076,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 1.23,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
@@ -13760,7 +14126,7 @@ mod tests {
                 agent_type: "claude-code".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -13821,7 +14187,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -13961,7 +14327,7 @@ mod tests {
                 agent_type: "claude-code".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -14053,7 +14419,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -14116,7 +14482,7 @@ mod tests {
                 agent_type: "c".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -14491,7 +14857,7 @@ mod tests {
                 agent_type: "c".into(), cost_usd: 0.0,
                 started_at: 0, pr_number: None, pr_id: None,
                 workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -15762,6 +16128,119 @@ mod tests {
         Session { status: SessionStatus::Working, ..refile_session(id) }
     }
 
+    fn with_orchestrator(m: &App, id: &str) {
+        let s = Session { status: SessionStatus::Working, claude_session_id: Some("c1".into()), ..refile_session(id) };
+        m.engine.store.upsert_orchestrator(&ninox_core::types::Orchestrator { id: id.into(), name: id.into(), created_at: 0 }).unwrap();
+        m.engine.store.upsert_session(&s).unwrap();
+    }
+
+    #[test]
+    fn reset_from_plan_opens_a_dialog_that_cancel_and_esc_close_without_resetting() {
+        use crate::components::reset_from_plan_modal::UiPhase;
+        let _iso = ninox_core::test_isolation::isolate();
+        let m = base(test_engine());
+        with_orchestrator(&m, "orch");
+        let (m, _) = m.update(Message::ResetFromPlanAsk("orch".into()));
+        assert_eq!(m.reset_flow.as_ref().unwrap().phase, UiPhase::Sending);
+
+        let generation = m.reset_flow.as_ref().unwrap().generation;
+        let (m, _) = m.update(Message::ResetFromPlanRequestSent(generation, Ok(())));
+        assert_eq!(m.reset_flow.as_ref().unwrap().phase, UiPhase::Waiting);
+        let (m, _) = m.update(Message::ResetFromPlanCancel);
+        assert!(m.reset_flow.is_none());
+        assert!(m.engine.store.retired_conversations("orch").unwrap().is_empty(), "cancel resets nothing");
+
+        let (m, _) = m.update(Message::ResetFromPlanAsk("orch".into()));
+        let (m, _) = m.update(Message::RawKey {
+            key:       iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+            modifiers: iced::keyboard::Modifiers::default(),
+            text:      None,
+        });
+        assert!(m.reset_flow.is_none());
+    }
+
+    #[test]
+    fn the_automatic_triggers_notification_opens_the_dialog_and_cancelling_it_suppresses_the_trigger() {
+        use ninox_core::store::{ResetRow, ResetState};
+        use crate::components::reset_from_plan_modal::UiPhase;
+        let _iso = ninox_core::test_isolation::isolate();
+        let m = base(test_engine());
+        with_orchestrator(&m, "orch");
+
+        let (m, _) = m.update(Message::ResetFromPlanOpenReady("orch".into()));
+        assert!(m.reset_flow.is_none(), "no automatic flow, nothing to open");
+
+        let mut row = ResetRow::fresh("orch", "c1", false);
+        row.state = ResetState::Requested;
+        m.engine.store.put_reset_row(&row).unwrap();
+        let (m, _) = m.update(Message::ResetFromPlanOpenReady("orch".into()));
+        let ui = m.reset_flow.as_ref().expect("dialog opened");
+        assert!(ui.auto_started && ui.phase == UiPhase::Waiting);
+
+        let (m, _) = m.update(Message::ResetFromPlanCancel);
+        assert!(m.reset_flow.is_none());
+        assert_eq!(m.engine.store.reset_row("orch").unwrap().unwrap().state, ResetState::Suppressed);
+        assert!(m.engine.store.retired_conversations("orch").unwrap().is_empty(), "cancel resets nothing");
+    }
+
+    #[test]
+    fn a_stale_ready_notice_opens_nothing() {
+        use ninox_core::store::{ResetRow, ResetState};
+        let _iso = ninox_core::test_isolation::isolate();
+        let m = base(test_engine());
+        with_orchestrator(&m, "orch");
+        let mut row = ResetRow::fresh("orch", "c1", false);
+        row.state = ResetState::Suppressed;
+        m.engine.store.put_reset_row(&row).unwrap();
+        let (m, _) = m.update(Message::ResetFromPlanOpenReady("orch".into()));
+        assert!(m.reset_flow.is_none(), "cancelled flow");
+
+        row.state = ResetState::Requested;
+        row.conversation_id = "an-older-conversation".into();
+        m.engine.store.put_reset_row(&row).unwrap();
+        let (m, _) = m.update(Message::ResetFromPlanOpenReady("orch".into()));
+        assert!(m.reset_flow.is_none(), "the orchestrator has since been reset onto another conversation");
+    }
+
+    #[test]
+    fn cancelling_a_manual_flow_does_not_touch_the_automatic_triggers_state() {
+        use ninox_core::store::{ResetRow, ResetState};
+        let _iso = ninox_core::test_isolation::isolate();
+        let m = base(test_engine());
+        with_orchestrator(&m, "orch");
+        let mut row = ResetRow::fresh("orch", "c1", false);
+        row.state = ResetState::Requested;
+        m.engine.store.put_reset_row(&row).unwrap();
+        let (m, _) = m.update(Message::ResetFromPlanAsk("orch".into()));
+        let (m, _) = m.update(Message::ResetFromPlanCancel);
+        assert_eq!(m.engine.store.reset_row("orch").unwrap().unwrap().state, ResetState::Requested);
+        assert!(m.engine.store.reset_marker("orch").unwrap().is_none(), "the manual flow's marker is cleared");
+    }
+
+    #[test]
+    fn reset_from_plan_refuses_a_worker_and_cannot_be_confirmed_while_sending() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let m = base(test_engine());
+        with_orchestrator(&m, "orch");
+        m.engine.store.upsert_session(&refile_session("w1")).unwrap();
+        let (m, _) = m.update(Message::ResetFromPlanAsk("w1".into()));
+        assert!(m.reset_flow.is_none(), "only orchestrators");
+
+        let (m, _) = m.update(Message::ResetFromPlanAsk("orch".into()));
+        let (m, _) = m.update(Message::ResetFromPlanConfirm);
+        let ui = m.reset_flow.as_ref().unwrap();
+        assert_eq!(ui.phase, crate::components::reset_from_plan_modal::UiPhase::Sending);
+        assert!(ui.flow.is_some(), "no flow was consumed");
+    }
+
+    #[test]
+    fn the_session_page_offers_reset_from_plan_for_orchestrators() {
+        assert!(matches!(
+            crate::components::session_detail::action_message(crate::components::session_detail::SessionAction::ResetFromPlan, "o1", None),
+            Some(Message::ResetFromPlanAsk(id)) if id == "o1"
+        ));
+    }
+
     #[test]
     fn request_restart_all_noops_without_live_agents() {
         let m = base(test_engine());
@@ -16097,8 +16576,11 @@ mod tests {
         assert!(f.custom_model.is_none());
     }
 
+    /// The Workspace field is shared by both kinds and visible for each, so
+    /// text left in it applies to an orchestrator as its folder: one that does
+    /// not exist keeps the modal open with the reason, and creates nothing.
     #[test]
-    fn orchestrator_confirm_unaffected_by_workspace_field() {
+    fn orchestrator_confirm_with_a_missing_workspace_folder_keeps_the_modal_open() {
         let _iso = ninox_core::test_isolation::isolate();
         use crate::components::spawn_modal::SpawnKind;
 
@@ -16107,10 +16589,6 @@ mod tests {
         m = next;
         let (next, _) = m.update(Message::SpawnFormName("theme-tokens".into()));
         m = next;
-        // Type a workspace while on Standalone, then flip back to
-        // Orchestrator — the stale workspace text must not block or alter
-        // the orchestrator spawn (its workspace always derives from the
-        // orchestrator root).
         let (next, _) = m.update(Message::SpawnFormKind(SpawnKind::Standalone));
         m = next;
         let (next, _) = m.update(Message::SpawnFormWorkspace("/does/not/matter".into()));
@@ -16120,14 +16598,9 @@ mod tests {
         let (next, _) = m.update(Message::SpawnFormConfirm);
         m = next;
 
-        assert!(m.spawn_modal.is_none());
-        assert_eq!(m.orchestrators.len(), 1);
-        let sess = m.sessions.get("theme-tokens").expect("orchestrator session created");
-        assert_eq!(
-            sess.workspace_path.as_deref(),
-            Some(std::path::Path::new("/tmp/theme-tokens").to_str().unwrap()),
-            "workspace comes from the orchestrator root, not the form field",
-        );
+        let err = m.spawn_modal.as_ref().and_then(|f| f.error.clone()).expect("modal stays open with an error");
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(m.orchestrators.is_empty() && !m.sessions.contains_key("theme-tokens"));
     }
 
     /// G4 (MLOPS-5416's Type field): the chosen worker type is recorded on
@@ -16645,7 +17118,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -16821,6 +17294,207 @@ mod tests {
             });
         }
 
+        /// Offscreen screenshot of the Brain Sources edit view with multi-line
+        /// brain rules and a local override (set `NINOX_SHOT_DIR` to write it).
+        #[test]
+        fn shot_sources_rules_edit() {
+            let _iso = ninox_core::test_isolation::isolate();
+            let dir = tempfile::tempdir().unwrap();
+            ninox_core::brain_rules::write_brain_rules(
+                dir.path(),
+                "MLOps knowledge: how our systems behave, decisions and why, runbooks.\n\nNo personal notes, no secrets, no raw logs.\nPrefer one entry per decision.",
+            )
+            .unwrap();
+            let mut app = seeded(View::Brain);
+            app.brain_view.mode = BrainMode::Sources;
+            app.config.brain.catalogues = vec![ninox_core::config::CatalogueRef {
+                name: "mlops".into(),
+                path: dir.path().to_path_buf(),
+                remote: Some("https://github.com/acme/brain/wiki".into()),
+                endpoint: None, region: None, cache_ttl_secs: None, enabled: true,
+                cadence: "manual".into(), access: "read_write".into(),
+                write_rules_override: Some("no transcripts\nonly things I verified myself".into()),
+            }];
+            app.catalogues = app.config.catalogue_options();
+            let (app, _) = app.update(Message::SourcesOpenEdit("mlops".into()));
+            shot(&app, Size::new(1280.0, 1000.0), "sources-rules-edit");
+        }
+
+        /// Like `shot`, but lays out at logical `size` and rasterises at `scale`,
+        /// the way the real window does with `App::zoom`.
+        fn shot_scaled(app: &App, size: Size, scale: f32, name: &str) {
+            let Ok(dir) = std::env::var("NINOX_SHOT_DIR") else { return };
+            with_ui(app, size, |ui, renderer| {
+                ui.draw(renderer, &Theme::Dark, &Style { text_color: crate::components::shell::tokens::TEXT }, mouse::Cursor::Unavailable);
+                let phys = Size::new((size.width * scale) as u32, (size.height * scale) as u32);
+                let (w, h) = (phys.width, phys.height);
+                let mut pixels = tiny_skia::Pixmap::new(w, h).unwrap();
+                let mut mask = tiny_skia::Mask::new(w, h).unwrap();
+                let iced::Renderer::Secondary(r) = renderer else { panic!("software renderer expected") };
+                r.draw(
+                    &mut pixels.as_mut(),
+                    &mut mask,
+                    &iced_tiny_skia::graphics::Viewport::with_physical_size(Size::new(w, h), scale as f64),
+                    &[Rectangle::with_size(Size::new(w as f32, h as f32))],
+                    crate::components::shell::tokens::BG,
+                    &[] as &[&str],
+                );
+                let path = std::path::Path::new(&dir).join(format!("{name}.png"));
+                let mut rgba = pixels.data().to_vec();
+                for i in (0..rgba.len()).step_by(4) {
+                    rgba.swap(i, i + 2);
+                }
+                image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8).unwrap();
+            });
+        }
+
+        /// Island members with the long names and chips from the user's screenshot.
+        fn island_app(compact: bool) -> App {
+            let mut app = seeded(View::Fleet);
+            app.fleet_compact = compact;
+            app.fleet_nav.tree_collapsed = true;
+            let one = |repo: &str, n: u64| vec![pr(repo, n, "t", PrState::Open, CiVerdict::Passed, 4, 0, 0)];
+            let two = |repo: &str, n: u64| {
+                let mut v = one(repo, n);
+                v.push(pr(repo, n + 1, "t", PrState::Open, CiVerdict::Pending, 1, 0, 2));
+                v
+            };
+            for (id, name, prs) in [
+                ("w-free", "mlops-5578-free-nodes-by-size", two("org/bellhop", 1171)),
+                ("w-spore", "mlops-5218-spore-adopt", one("org/eks-helm-charts", 436)),
+                ("w-ray", "mlops-5870-ray-migrated-source-sweeper", one("org/bellhop", 1462)),
+                ("w-grpc", "mlops-5259-modal-grpc-client", one("org/bellhop", 1450)),
+                ("w-jobset", "mlops-4076-jobset-batch-ui-visibility", one("org/bellhop", 863)),
+            ] {
+                let (s, _) = worker(id, name, SessionStatus::PrOpen, prs.clone());
+                app.session_prs.insert(id.into(), prs);
+                app.sessions.insert(id.into(), s);
+            }
+            // A second island with a short title and a member that needs the user.
+            let mut orch = pr_session(None, None, "org/radison");
+            orch.id = "radison".into();
+            orch.name = "radison UX".into();
+            orch.status = SessionStatus::Working;
+            app.orchestrators.push(Orchestrator { id: "radison".into(), name: "radison UX".into(), created_at: 0 });
+            app.sessions.insert("radison".into(), orch);
+            for (id, name, blocked) in [("r-blocked", "mlops-5001-radison-onboarding-flow", true), ("r-ok", "r-ok", false)] {
+                let (mut s, _) = worker(id, name, SessionStatus::Working, vec![]);
+                s.orchestrator_id = Some("radison".into());
+                if blocked {
+                    s.activity = ninox_core::types::ActivityState::Blocked;
+                }
+                app.sessions.insert(id.into(), s);
+            }
+            app
+        }
+
+        /// Every layout leaf of `el` at `width`.
+        fn leaf_sizes(el: Element<'_, Message>, width: f32) -> Vec<Size> {
+            use iced::advanced::{layout::Limits, widget::Tree};
+            fn walk(n: &iced::advanced::layout::Node, out: &mut Vec<Size>) {
+                if n.children().is_empty() {
+                    out.push(n.size());
+                }
+                n.children().iter().for_each(|c| walk(c, out));
+            }
+            crate::style::load_bundled_fonts();
+            let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(Font::default(), Pixels(16.0)));
+            let mut tree = Tree::new(el.as_widget());
+            let node = el.as_widget().layout(&mut tree, &renderer, &Limits::new(Size::ZERO, Size::new(width, f32::INFINITY)));
+            let mut out = Vec::new();
+            walk(&node, &mut out);
+            out
+        }
+
+        /// One (layout, window width) case of the long-named-island check. Each
+        /// case sweeps a click over the whole window, which is slow enough that
+        /// running them in one test made it the longest test in the suite; they
+        /// are separate `#[test]`s below so libtest can run them in parallel.
+        fn long_named_island_members_case(compact: bool, collapsed: bool, width: f32) {
+            use crate::components::fleet_islands::{build_fleet_islands, island_card_px, member_row, member_row_parts};
+            let mut app = island_app(compact);
+            app.fleet_nav.tree_collapsed = collapsed;
+            app.window_width = width;
+            let islands = build_fleet_islands(&app);
+            let card = island_card_px(&app);
+            let mut checked = 0;
+            for island in &islands {
+                for m in island.members.iter().filter(|m| Some(&m.id) != island.root.as_ref()) {
+                    let (shown, _) = member_row_parts(&app, m);
+                    let row = member_row(&app, &island.key, m);
+                    // The name cell is the row's widest child (the Fill one).
+                    let cell_px = {
+                        use iced::advanced::{layout::Limits, widget::Tree};
+                        crate::style::load_bundled_fonts();
+                        let r = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(Font::default(), Pixels(16.0)));
+                        let mut tree = Tree::new(row.as_widget());
+                        let node = row.as_widget().layout(&mut tree, &r, &Limits::new(Size::ZERO, Size::new(card - 34.0, f32::INFINITY)));
+                        node.children().iter().map(|c| c.size().width).fold(0.0, f32::max)
+                    };
+                    let text_px = leaf_sizes(
+                        iced::widget::text(shown.clone()).size(11).font(crate::style::SANS).wrapping(iced::widget::text::Wrapping::None).into(),
+                        f32::MAX / 4.0,
+                    )[0].width;
+                    assert!(text_px <= cell_px, "{} shows {shown:?} ({text_px}px) in a {cell_px}px cell at {width}", m.id);
+                    checked += 1;
+                }
+            }
+            assert!(checked >= 8);
+            let hits = sweep(&app, Size::new(width, 900.0));
+            for (id, n) in [("w-free", 1171), ("w-spore", 436), ("w-ray", 1462), ("w-grpc", 1450), ("w-jobset", 863)] {
+                let opens = urls(&hits).iter().any(|u| u.ends_with(&format!("/pull/{n}")));
+                let nav = hits.iter().any(|(_, m)| m.iter().any(|m| matches!(m, Message::NavigateSession(s) if s == id)));
+                assert!(opens || nav, "{id} has no clickable chip at {width} (compact={compact}, collapsed={collapsed})");
+            }
+        }
+
+        macro_rules! long_named_island_cases {
+            ($($name:ident: ($compact:expr, $collapsed:expr, $width:expr)),* $(,)?) => {
+                $(
+                    #[test]
+                    fn $name() {
+                        long_named_island_members_case($compact, $collapsed, $width);
+                    }
+                )*
+            };
+        }
+
+        long_named_island_cases! {
+            long_named_island_members_compact_collapsed_1200: (true, true, 1200.0),
+            long_named_island_members_compact_collapsed_1720: (true, true, 1720.0),
+            long_named_island_members_compact_collapsed_2800: (true, true, 2800.0),
+            long_named_island_members_full_collapsed_1200: (false, true, 1200.0),
+            long_named_island_members_full_collapsed_1720: (false, true, 1720.0),
+            long_named_island_members_full_collapsed_2800: (false, true, 2800.0),
+            long_named_island_members_compact_expanded_1200: (true, false, 1200.0),
+            long_named_island_members_compact_expanded_1720: (true, false, 1720.0),
+            long_named_island_members_compact_expanded_2800: (true, false, 2800.0),
+            long_named_island_members_full_expanded_1200: (false, false, 1200.0),
+            long_named_island_members_full_expanded_1720: (false, false, 1720.0),
+            long_named_island_members_full_expanded_2800: (false, false, 2800.0),
+        }
+
+        #[test]
+        fn island_shots() {
+            for compact in [true, false] {
+                let mut app = island_app(compact);
+                let mode = if compact { "compact" } else { "full" };
+                for (cols, w) in [(3, 2800.0), (5, 1720.0), (7, 1200.0)] {
+                    app.window_width = w;
+                    shot(&app, Size::new(w, 900.0), &format!("islands-{mode}-{cols}col"));
+                }
+                {
+                    let islands = crate::components::fleet_islands::build_fleet_islands(&app);
+                    let mut focus = island_app(compact);
+                    focus.window_width = 1720.0;
+                    focus.fleet_nav.open_island(ninox_overview::islands::IslandKey::Root("ninox".into()), &islands);
+                    shot(&focus, Size::new(1720.0, 900.0), &format!("graph-{mode}"));
+                }
+                app.window_width = 1720.0;
+                shot_scaled(&app, Size::new(1720.0, 900.0), 1.5, &format!("islands-{mode}-5col-x1.5"));
+            }
+        }
+
         fn urls(hits: &[(Point, Vec<Message>)]) -> std::collections::BTreeSet<String> {
             hits.iter()
                 .flat_map(|(_, m)| m)
@@ -16881,10 +17555,14 @@ mod tests {
 
         #[test]
         fn fleet_island_rows_and_graph_cards_carry_chips() {
+        let _iso = ninox_core::test_isolation::isolate();
             let app = seeded(View::Fleet);
             let hits = sweep(&app, SIZE);
             let in_main = hits;
-            assert!(urls(&in_main).contains("https://github.com/org/bellhop/pull/1473"), "island row chip missing: the lead (failing) PR comes first");
+            // A narrow row folds the five PRs to a `5 PRs` chip that opens the session.
+            let lead = urls(&in_main).contains("https://github.com/org/bellhop/pull/1473");
+            let count = in_main.iter().any(|(_, m)| m.iter().any(|m| matches!(m, Message::NavigateSession(id) if id == "w-spokes")));
+            assert!(lead || count, "island row chip missing: the lead (failing) PR chip or the count chip");
             assert_chip_clicks_do_not_also_select(&in_main);
 
             let mut focus = seeded(View::Fleet);
@@ -16898,11 +17576,150 @@ mod tests {
 
         #[test]
         fn session_side_panel_lists_every_pr_open_first() {
+        let _iso = ninox_core::test_isolation::isolate();
             let app = seeded(View::SessionDetail { session_id: "w-spokes".into(), panel: DetailPanel::Split });
             shot(&app, WIDE, "session-detail");
             let opened = urls(&sweep(&app, WIDE));
             for n in [1466, 1473, 989] {
                 assert!(opened.iter().any(|u| u.ends_with(&format!("/pull/{n}"))), "PR {n} not clickable in the side panel: {opened:?}");
+            }
+        }
+
+        fn clicked(app: &App, size: Size, want: impl Fn(&Message) -> bool) -> bool {
+            sweep(app, size).iter().any(|(_, msgs)| msgs.iter().any(&want))
+        }
+
+        fn reset_app(phase: ninox_ui_shared::reset_from_plan::UiPhase, plan: bool) -> App {
+            use crate::components::reset_from_plan_modal::ResetUi;
+            use ninox_ui_shared::reset_from_plan::{PlanPreview, PlanSnapshot, ResetFlow};
+            let mut app = seeded(View::SessionDetail { session_id: "ninox".into(), panel: DetailPanel::Split });
+            let flow = ResetFlow::with_baseline(app.engine.store.clone(), "ninox", PlanSnapshot { path: None, hash: None });
+            let mut ui = ResetUi::new("ninox".into(), "ninox".into(), flow);
+            ui.phase = phase;
+            if plan {
+                ui.set_preview(Some(PlanPreview {
+                    path: "/work/ninox/PLAN.md".into(),
+                    content: "# Plan\n\n## Goals\n\n- Ship reset-from-plan\n- Keep workers attached\n\n## Live workers\n\n1. v1-orchestrator-reset-from-plan: PR open\n\n## Next steps\n\n- [ ] Review the dialog\n- [x] Write the plan\n".into(),
+                }));
+            }
+            app.reset_flow = Some(ui);
+            app
+        }
+
+        fn meter_app(view: View, pct: Option<f64>, mode: ninox_core::config::ResetMode) -> App {
+            let mut app = seeded(view);
+            app.window_width = 1280.0;
+            app.config.orchestrator_reset = ninox_core::config::OrchestratorResetConfig { auto_at_context_pct: 40, mode };
+            let orch = app.sessions.get_mut("ninox").unwrap();
+            orch.context_used_pct = pct;
+            orch.context_total_tokens = pct.map(|p| (p * 10_000.0) as u64);
+            orch.context_window_size = pct.map(|_| 1_000_000);
+            app
+        }
+
+        #[test]
+        fn only_an_orchestrator_rooted_island_gets_a_context_meter() {
+            let mut app = meter_app(View::Fleet, Some(44.0), ninox_core::config::ResetMode::Prompt);
+            let (mut solo, _) = worker("solo-w", "solo-worker", SessionStatus::Working, vec![]);
+            solo.orchestrator_id = None;
+            solo.context_used_pct = Some(60.0);
+            app.sessions.insert("solo-w".into(), solo);
+            let islands = crate::components::fleet_islands::build_fleet_islands(&app);
+            assert!(islands.len() >= 2, "the orchestrator's island and the unparented one");
+            let mut with_meter = 0;
+            for island in &islands {
+                let is_orch = island.root.as_ref().is_some_and(|r| app.orchestrators.iter().any(|o| &o.id == r));
+                let has = crate::components::fleet_islands::island_meter(&app, island).is_some();
+                assert_eq!(has, is_orch, "island {} (root {:?})", island.name, island.root);
+                with_meter += usize::from(has);
+            }
+            assert_eq!(with_meter, 1);
+        }
+
+        /// The context meter on the orchestrator's session header and Fleet island head:
+        /// below, near and over the threshold, with the reset off, and unknown.
+        #[test]
+        fn the_context_meter_renders_on_the_header_and_the_island_below_near_and_over_the_threshold() {
+            use ninox_core::config::ResetMode::{Off, Prompt};
+            for (name, pct, mode) in [
+                ("below", Some(18.0), Prompt),
+                ("near", Some(34.0), Prompt),
+                ("over", Some(52.0), Prompt),
+                ("off", Some(34.0), Off),
+                ("unknown", None, Prompt),
+            ] {
+                let detail = meter_app(View::SessionDetail { session_id: "ninox".into(), panel: DetailPanel::Split }, pct, mode);
+                shot(&detail, WIDE, &format!("context-meter-header-{name}"));
+                let fleet = meter_app(View::Fleet, pct, mode);
+                shot(&fleet, SIZE, &format!("context-meter-island-{name}"));
+            }
+            // A worker's header has no meter and still lays out.
+            let worker = meter_app(View::SessionDetail { session_id: "w-spokes".into(), panel: DetailPanel::Split }, Some(52.0), Prompt);
+            shot(&worker, WIDE, "context-meter-worker-none");
+        }
+
+        #[test]
+        fn reset_from_plan_button_is_on_an_orchestrators_session_page_only() {
+        let _iso = ninox_core::test_isolation::isolate();
+            use crate::components::session_detail::DetailPanel as P;
+            let orch = seeded(View::SessionDetail { session_id: "ninox".into(), panel: P::Split });
+            shot(&orch, WIDE, "reset-from-plan-button");
+            assert!(clicked(&orch, WIDE, |m| matches!(m, Message::ResetFromPlanAsk(id) if id == "ninox")));
+            let worker = seeded(View::SessionDetail { session_id: "w-spokes".into(), panel: P::Split });
+            assert!(!clicked(&worker, WIDE, |m| matches!(m, Message::ResetFromPlanAsk(_))), "workers have no reset");
+        }
+
+        // The dialog's phases each sweep a click over the whole (wide) window, so
+        // they are separate tests rather than one — libtest runs them in parallel.
+        #[test]
+        fn reset_from_plan_dialog_with_no_plan_offers_no_reset() {
+            let _iso = ninox_core::test_isolation::isolate();
+            use ninox_ui_shared::reset_from_plan::UiPhase;
+            let no_plan = reset_app(UiPhase::Waiting, false);
+            assert!(!clicked(&no_plan, WIDE, |m| matches!(m, Message::ResetFromPlanConfirm)), "nothing to reset from");
+        }
+
+        #[test]
+        fn reset_from_plan_dialog_renders_waiting_and_offers_cancel_and_skip() {
+            let _iso = ninox_core::test_isolation::isolate();
+            use ninox_ui_shared::reset_from_plan::UiPhase;
+            let waiting = reset_app(UiPhase::Waiting, true);
+            shot(&waiting, WIDE, "reset-from-plan-waiting");
+            assert!(clicked(&waiting, WIDE, |m| matches!(m, Message::ResetFromPlanCancel)));
+            assert!(clicked(&waiting, WIDE, |m| matches!(m, Message::ResetFromPlanConfirm)), "skip while waiting");
+        }
+
+        #[test]
+        fn reset_from_plan_dialog_renders_ready_and_offers_cancel_and_confirm() {
+            let _iso = ninox_core::test_isolation::isolate();
+            use ninox_ui_shared::reset_from_plan::UiPhase;
+            let ready = reset_app(UiPhase::Ready, true);
+            shot(&ready, WIDE, "reset-from-plan-confirm");
+            assert!(clicked(&ready, WIDE, |m| matches!(m, Message::ResetFromPlanCancel)));
+            assert!(clicked(&ready, WIDE, |m| matches!(m, Message::ResetFromPlanConfirm)));
+        }
+
+        #[test]
+        fn reset_from_plan_dialog_offers_no_buttons_while_resetting() {
+            let _iso = ninox_core::test_isolation::isolate();
+            use ninox_ui_shared::reset_from_plan::UiPhase;
+            let resetting = reset_app(UiPhase::Resetting, false);
+            assert!(!clicked(&resetting, WIDE, |m| matches!(m, Message::ResetFromPlanCancel | Message::ResetFromPlanConfirm)));
+        }
+
+        #[test]
+        fn settings_fleet_dims_the_reset_threshold_while_the_mode_is_off() {
+            use crate::components::settings_panel::SettingsSection;
+            use ninox_core::config::ResetMode;
+            use ninox_ui_shared::settings_form::{fields, FieldId};
+            let _iso = ninox_core::test_isolation::isolate();
+            for (mode, name, locked) in [(ResetMode::Off, "settings-fleet-reset-off", true), (ResetMode::Prompt, "settings-fleet-reset-prompt", false)] {
+                let mut app = seeded(View::Settings);
+                app.config.orchestrator_reset.mode = mode;
+                app.settings.section = SettingsSection::Fleet;
+                let f = fields(&app.config).into_iter().find(|f| f.id == FieldId::OrchestratorResetPct).unwrap();
+                assert_eq!(f.locked, locked);
+                shot(&app, SIZE, name);
             }
         }
     }

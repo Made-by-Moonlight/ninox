@@ -152,6 +152,7 @@ impl Capability {
 /// can't bridge into an unrelated chained command.
 const PR_WATCH_ENFORCEMENT_HOOK_SCRIPT: &str = r#"#!/usr/bin/env node
 const { readFileSync } = require("node:fs");
+if (!process.env.NINOX_SESSION) process.exit(0);
 let raw = "";
 try { raw = readFileSync(0, "utf-8"); } catch { process.exit(0); }
 let payload;
@@ -738,6 +739,7 @@ mod tests {
             std::fs::write(script.path(), PR_WATCH_ENFORCEMENT_HOOK_SCRIPT).unwrap();
             let mut child = std::process::Command::new("node")
                 .arg(script.path())
+                .env("NINOX_SESSION", "w1")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .spawn()
@@ -761,6 +763,24 @@ mod tests {
             "gh --repo owner/repo run watch 123",
         ] {
             assert!(run(cmd), "must deny: {cmd}");
+        }
+
+        // Outside a ninox session (a user's own claude in a custom workspace)
+        // it never denies.
+        {
+            use std::io::Write;
+            let script = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(script.path(), PR_WATCH_ENFORCEMENT_HOOK_SCRIPT).unwrap();
+            let mut child = std::process::Command::new("node")
+                .arg(script.path())
+                .env_remove("NINOX_SESSION")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "gh run watch 1"}});
+            child.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
+            assert!(child.wait_with_output().unwrap().stdout.is_empty());
         }
 
         for cmd in [

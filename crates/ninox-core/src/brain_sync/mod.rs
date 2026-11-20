@@ -792,12 +792,12 @@ mod tests {
         sync.pull_if_stale().await.unwrap();
 
         fs::write(dir.path().join("a.md"), "# A locally edited").unwrap();
-        fs::write(dir.path().join("b.conflict-ethan-20260722-100000.md"), "# leftover").unwrap();
+        fs::write(dir.path().join("b.conflict-alice-20260722-100000.md"), "# leftover").unwrap();
 
         let status = remote_status(dir.path()).unwrap().unwrap();
         assert_eq!(status.remote, "s3://bucket/prefix");
         assert_eq!(status.generation, 1);
         assert!(status.pending_pushes.contains(&"a.md".to_string()));
-        assert_eq!(status.conflict_files, vec!["b.conflict-ethan-20260722-100000.md"]);
+        assert_eq!(status.conflict_files, vec!["b.conflict-alice-20260722-100000.md"]);
     }
 }

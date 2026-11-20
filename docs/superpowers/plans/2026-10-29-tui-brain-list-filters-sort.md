@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, ratatui/crossterm (TUI), iced (GUI, unaffected behaviorally), existing `ninox-core` brain module.
 
-**Spec:** `/Users/ethan.brodie/proj/ninox/.claude/design-ref/fleet-overview-v1/BRIEF-MLOPS-5350-tui-parity.md` (Worker B, item 1 "Brain list depth") and `BRIEF-common.md` §7. No `docs/superpowers/specs` design doc covers Brain (`2026-10-21-fleet-overview-ui-vision-design.md` line 123: "Brain — unchanged" at the fleet-shell level); the ticket brief is authoritative for Brain's own content, translating `Brain.dc.html`'s GUI behavior into the TUI's box-drawing language per the brief.
+**Spec:** `.claude/design-ref/fleet-overview-v1/BRIEF-MLOPS-5350-tui-parity.md` (Worker B, item 1 "Brain list depth") and `BRIEF-common.md` §7. No `docs/superpowers/specs` design doc covers Brain (`2026-10-21-fleet-overview-ui-vision-design.md` line 123: "Brain — unchanged" at the fleet-shell level); the ticket brief is authoritative for Brain's own content, translating `Brain.dc.html`'s GUI behavior into the TUI's box-drawing language per the brief.
 
 ## Global Constraints
 

@@ -26,6 +26,16 @@ pub struct BrainSet {
     /// Ordered, deduplicated; always contains `write`.
     pub reads: Vec<PathBuf>,
     pub write: PathBuf,
+    /// `true` when this set was chosen to restrict the session (a limit);
+    /// `false` for the default of every enabled brain, which is re-evaluated
+    /// against the live config each time. A set that deserializes without
+    /// the field counts as limited, so nothing widens silently.
+    #[serde(default = "limited_by_default")]
+    pub limited: bool,
+}
+
+fn limited_by_default() -> bool {
+    true
 }
 
 /// One member of a resolved set, with its config-derived identity.
@@ -92,7 +102,7 @@ impl BrainSet {
                 deduped.push(r);
             }
         }
-        Self { reads: deduped, write }
+        Self { reads: deduped, write, limited: true }
     }
 
     /// The set a session gets when nothing was chosen: every source with
@@ -101,7 +111,59 @@ impl BrainSet {
     /// still redirects writes as it always has).
     pub fn default_for(config: &AppConfig) -> Self {
         let reads = human_pool(config).into_iter().filter(|c| c.enabled).map(|c| c.path).collect();
-        Self::new(reads, config.resolved_brain_path())
+        Self { limited: false, ..Self::new(reads, config.resolved_brain_path()) }
+    }
+
+    /// The unlimited set for a live session: every enabled brain, writing to
+    /// the default brain at its configured location. Unlike [`default_for`]
+    /// it never reads `NINOX_BRAIN`, so a session can't redirect where it
+    /// writes by editing its environment.
+    pub fn session_default(config: &AppConfig) -> Self {
+        let reads = pool(config).into_iter().filter(|c| c.enabled).map(|c| c.path).collect();
+        Self { limited: false, ..Self::new(reads, config.configured_brain_path()) }
+    }
+
+    /// What goes on a session row: nothing for the default (every enabled
+    /// brain, resolved live), the explicit lists for a limit.
+    pub fn stored_reads(&self) -> Vec<String> {
+        if !self.limited {
+            return Vec::new();
+        }
+        self.reads.iter().map(|p| p.to_string_lossy().into_owned()).collect()
+    }
+
+    pub fn stored_write(&self) -> Option<String> {
+        self.limited.then(|| self.write_str())
+    }
+
+    /// An explicit choice that amounts to the default (every enabled brain,
+    /// writing to the default brain) is the default, not a limit.
+    fn unlimited_if_default(self, default: Self) -> Self {
+        let same_reads = self.reads.len() == default.reads.len() && self.reads.iter().all(|r| default.reads.iter().any(|d| same_path(d, r)));
+        if same_reads && same_path(&self.write, &default.write) {
+            default
+        } else {
+            self
+        }
+    }
+
+    /// For a process with no session: shrinks the default set to the paths in
+    /// `NINOX_BRAIN_READS`, when set (the env-scrubbed harvest subprocess
+    /// gets the harvested session's set this way). Only ever narrows — an
+    /// env value can't add a brain the default set doesn't already have.
+    fn narrowed_by_env(self, config: &AppConfig) -> Self {
+        let Ok(raw) = std::env::var(READS_ENV) else { return self };
+        let wanted = parse_reads_env(&raw);
+        if wanted.is_empty() {
+            return self;
+        }
+        let reads: Vec<PathBuf> = self.reads.iter().filter(|r| wanted.iter().any(|w| same_path(w, r))).cloned().collect();
+        if reads.is_empty() {
+            return self;
+        }
+        let write = config.resolved_brain_path();
+        let write = if reads.iter().any(|r| same_path(r, &write)) { write } else { reads[0].clone() };
+        Self::new(reads, write)
     }
 
     /// A single-catalogue set — what every session had before brain sets.
@@ -116,14 +178,24 @@ impl BrainSet {
     /// i.e. migrated from `catalogue_path`) reads only that catalogue.
     pub fn from_session(session: &Session, config: &AppConfig) -> Self {
         match session.brain_write.as_deref().filter(|w| !w.is_empty()) {
-            None => Self::default_for(config),
+            None => Self::session_default(config),
+            Some(w) if Self::is_old_default_row(session, w, config) => Self::session_default(config),
             Some(w) => Self::new(session.brain_reads.iter().map(PathBuf::from).collect(), PathBuf::from(w)),
         }
     }
 
+    /// Before limits existed every session stored `reads=[default]
+    /// write=default`, because that was the default, not a choice. Such a
+    /// row counts as unlimited, decided at read time so the stored row (and
+    /// a downgrade) is untouched. Any other stored set is a real choice.
+    fn is_old_default_row(session: &Session, write: &str, config: &AppConfig) -> bool {
+        let is_default = |p: &Path| same_path(p, &config.configured_brain_path()) || same_path(p, &config.resolved_brain_path());
+        is_default(Path::new(write)) && !session.brain_reads.is_empty() && session.brain_reads.iter().all(|r| is_default(Path::new(r)))
+    }
+
     pub fn apply_to(&self, session: &mut Session) {
-        session.brain_reads = self.reads.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        session.brain_write = Some(self.write.to_string_lossy().into_owned());
+        session.brain_reads = self.stored_reads();
+        session.brain_write = self.stored_write();
     }
 
     pub fn write_str(&self) -> String {
@@ -218,7 +290,10 @@ impl BrainSet {
     /// must already be one of this set's reads — a child never gets more
     /// than its parent — and the write must be a writable requested read.
     pub fn narrow(&self, config: &AppConfig, reads: &[String], write: Option<&str>) -> Result<Self> {
-        choose(&self.members(config), self, reads, write, "the parent's brain set")
+        let set = choose(&self.members(config), self, reads, write, "the parent's brain set")?;
+        // A child of an unlimited parent that asks for everything is unlimited
+        // too; a child of a limited parent never widens past that limit.
+        Ok(if self.limited { set } else { set.unlimited_if_default(Self::session_default(config)) })
     }
 
     /// A top-level set chosen by a human (no parent): any configured
@@ -232,25 +307,19 @@ impl BrainSet {
                 pool.push(m);
             }
         }
-        choose(&pool, &default, reads, write, "the configured brain catalogues")
+        Ok(choose(&pool, &default, reads, write, "the configured brain catalogues")?.unlimited_if_default(Self::default_for(config)))
     }
 }
 
-/// `"Brains: reads A, B, C · writes A"` for a session row. A row with no
-/// recorded set shows the default set by name, without resolving paths.
+/// `"Brains: all"` for a session with no limit, else
+/// `"Brains: limited to A, B · writes A"`. Read-only brains are never write
+/// targets whatever the limit.
 pub fn session_brains_line(session: &Session, config: &AppConfig) -> String {
-    let summary = match session.brain_write.as_deref().filter(|w| !w.is_empty()) {
-        Some(_) => BrainSet::from_session(session, config).summary(config),
-        None => {
-            let reads: Vec<String> = config
-                .catalogue_names()
-                .into_iter()
-                .filter(|n| n == "default" || config.brain.catalogues.iter().any(|c| &c.name == n && c.enabled))
-                .collect();
-            format!("reads {} · writes default", reads.join(", "))
-        }
-    };
-    format!("Brains: {summary}")
+    let set = BrainSet::from_session(session, config);
+    if !set.limited {
+        return "Brains: all".to_string();
+    }
+    format!("Brains: limited to {} · writes {}", set.names(config).join(", "), set.write_member(config).name())
 }
 
 fn synthetic(path: &Path) -> CatalogueRef {
@@ -269,6 +338,7 @@ fn synthetic(path: &Path) -> CatalogueRef {
         enabled: true,
         cadence: "manual".into(),
         access: "read_write".into(),
+        write_rules_override: None,
     }
 }
 
@@ -347,7 +417,7 @@ pub fn resolve_for_caller(
 ) -> Result<(BrainSet, Option<String>)> {
     match verified_caller_row(store, pane_session_id)? {
         Some(s) => Ok((BrainSet::from_session(&s, config), Some(s.id))),
-        None => Ok((BrainSet::default_for(config), None)),
+        None => Ok((BrainSet::default_for(config).narrowed_by_env(config), None)),
     }
 }
 
@@ -412,6 +482,7 @@ mod tests {
             enabled,
             cadence: "manual".into(),
             access: access.into(),
+            write_rules_override: None,
         }
     }
 
@@ -468,7 +539,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         config.brain.path = Some(dir.path().join("brain"));
         let set = BrainSet::default_for(&config);
-        assert_eq!(set, BrainSet::single(dir.path().join("brain")));
+        let single = BrainSet::single(dir.path().join("brain"));
+        assert_eq!((set.reads.clone(), set.write.clone()), (single.reads, single.write));
+        assert!(!set.limited, "the default is unlimited");
     }
 
     #[test]
@@ -616,9 +689,9 @@ mod tests {
         let _iso = isolate();
         let f = fixture();
         let mut s = session();
-        assert_eq!(session_brains_line(&s, &f.config), "Brains: reads default, a, b · writes default");
+        assert_eq!(session_brains_line(&s, &f.config), "Brains: all");
         BrainSet::select(&f.config, &strs(&["a", "b", "c"]), Some("a")).unwrap().apply_to(&mut s);
-        assert_eq!(session_brains_line(&s, &f.config), "Brains: reads a, b, c · writes a");
+        assert_eq!(session_brains_line(&s, &f.config), "Brains: limited to a, b, c · writes a");
     }
 
     #[test]
@@ -632,7 +705,7 @@ mod tests {
     fn a_set_whose_write_is_outside_its_reads_does_not_panic() {
         let _iso = isolate();
         let f = fixture();
-        let odd = BrainSet { reads: vec![f.a.clone()], write: f.b.clone() };
+        let odd = BrainSet { reads: vec![f.a.clone()], write: f.b.clone(), limited: true };
         assert_eq!(odd.write_member(&f.config).name(), "b");
         assert!(odd.authorize_write(&f.config, None).is_err(), "b is read-only");
     }
@@ -646,5 +719,149 @@ mod tests {
         assert!(parse_reads_env("/a:/b").is_empty());
         assert!(parse_reads_env("").is_empty());
         assert_eq!(parse_reads_env(r#"["/a", 3, "", null]"#), vec![PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn automated_writers_target_only_the_write_member() {
+        let _iso = isolate();
+        let f = fixture();
+        let set = BrainSet::select(&f.config, &strs(&["a", "c"]), Some("a")).unwrap();
+        let m = set.authorize_write(&f.config, None).unwrap();
+        assert_eq!(m.catalogue.path, f.a, "harvest/discover-repos use authorize_write(None): never a fan-out");
+    }
+
+    #[test]
+    fn env_scope_only_narrows_a_sessionless_process() {
+        let _iso = isolate();
+        let f = fixture();
+        let everything = BrainSet::default_for(&f.config);
+        let narrowed = crate::config::with_env_override(
+            READS_ENV,
+            serde_json::to_string(&[&f.a, &f.c]).unwrap(),
+            || BrainSet::default_for(&f.config).narrowed_by_env(&f.config),
+        );
+        assert_eq!(narrowed.reads, vec![f.a.clone()], "c is search-disabled so it is not in the default set; env can't add it");
+        assert_ne!(narrowed.reads, everything.reads);
+        let by_name: Vec<String> = narrowed.members(&f.config).iter().map(|m| m.name().to_string()).collect();
+        assert_eq!(by_name, vec!["a"]);
+        assert!(narrowed.authorize_write(&f.config, Some("b")).is_err(), "b is outside the scope (and read-only)");
+    }
+
+    #[test]
+    fn an_unlimited_session_can_write_to_a_catalogue_added_after_it_started() {
+        let _iso = isolate();
+        let mut f = fixture();
+        let s = session();
+        assert!(BrainSet::from_session(&s, &f.config).authorize_write(&f.config, Some("late")).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        f.config.brain.catalogues.push(cat("late", dir.path(), true, "read_write"));
+        let set = BrainSet::from_session(&s, &f.config);
+        assert_eq!(set.authorize_write(&f.config, Some("late")).unwrap().name(), "late", "no re-spawn needed");
+    }
+
+    #[test]
+    fn a_limited_session_is_refused_outside_its_limit_and_never_widens() {
+        let _iso = isolate();
+        let mut f = fixture();
+        let mut s = session();
+        BrainSet::select(&f.config, &strs(&["a"]), Some("a")).unwrap().apply_to(&mut s);
+        let dir = tempfile::tempdir().unwrap();
+        f.config.brain.catalogues.push(cat("late", dir.path(), true, "read_write"));
+        let set = BrainSet::from_session(&s, &f.config);
+        assert!(set.limited);
+        let err = set.authorize_write(&f.config, Some("late")).unwrap_err();
+        assert!(err.to_string().contains("not in this session's brain set"), "{err}");
+        assert!(set.authorize_write(&f.config, Some("default")).is_err(), "default is outside the limit too");
+        assert_eq!(set.authorize_write(&f.config, None).unwrap().name(), "a");
+    }
+
+    #[test]
+    fn workers_inherit_their_orchestrators_limit_unless_narrower() {
+        let _iso = isolate();
+        let f = fixture();
+        let limited = BrainSet::select(&f.config, &strs(&["a", "default"]), Some("a")).unwrap();
+        let inherited = limited.narrow(&f.config, &[], None).unwrap();
+        assert!(inherited.limited && inherited.reads == limited.reads && inherited.write == limited.write);
+        let narrower = limited.narrow(&f.config, &strs(&["a"]), Some("a")).unwrap();
+        assert_eq!(narrower.reads, vec![f.a.clone()]);
+        assert!(limited.narrow(&f.config, &strs(&["c"]), None).is_err(), "a child never exceeds its parent's limit");
+        let unlimited_parent = BrainSet::default_for(&f.config);
+        assert!(!unlimited_parent.narrow(&f.config, &[], None).unwrap().limited, "an unlimited parent gives unlimited workers");
+    }
+
+    #[test]
+    fn read_only_catalogues_are_never_write_targets_whatever_the_limit() {
+        let _iso = isolate();
+        let f = fixture();
+        for set in [BrainSet::default_for(&f.config), BrainSet::select(&f.config, &strs(&["a", "b"]), Some("a")).unwrap()] {
+            let err = set.authorize_write(&f.config, Some("b")).unwrap_err();
+            assert!(err.to_string().contains("read-only"), "{err}");
+        }
+        assert!(BrainSet::select(&f.config, &strs(&["a", "b"]), Some("b")).is_err(), "read-only can't be the write brain");
+    }
+
+    #[test]
+    fn a_stored_explicit_set_keeps_acting_as_a_limit_and_asking_for_everything_is_unlimited() {
+        let _iso = isolate();
+        let mut f = fixture();
+        let mut s = session();
+        s.brain_reads = vec![f.a.to_string_lossy().into_owned()];
+        s.brain_write = Some(f.a.to_string_lossy().into_owned());
+        let dir = tempfile::tempdir().unwrap();
+        f.config.brain.catalogues.push(cat("later", dir.path(), true, "read_write"));
+        let set = BrainSet::from_session(&s, &f.config);
+        assert!(set.limited && set.authorize_write(&f.config, Some("later")).is_err(), "a running session isn't silently widened");
+
+        let all = BrainSet::select(&f.config, &strs(&["default", "a", "b", "later"]), Some("default")).unwrap();
+        assert!(!all.limited, "choosing every enabled brain is the default, not a limit");
+        let mut row = session();
+        all.apply_to(&mut row);
+        assert!(row.brain_reads.is_empty() && row.brain_write.is_none());
+    }
+
+    #[test]
+    fn a_row_that_stores_only_the_old_default_is_unlimited_and_its_workers_reach_new_brains() {
+        let _iso = isolate();
+        let mut f = fixture();
+        let mut s = session();
+        s.brain_reads = vec![f.default.to_string_lossy().into_owned()];
+        s.brain_write = Some(f.default.to_string_lossy().into_owned());
+        let row_before = (s.brain_reads.clone(), s.brain_write.clone());
+        let dir = tempfile::tempdir().unwrap();
+        f.config.brain.catalogues.push(cat("later", dir.path(), true, "read_write"));
+
+        let set = BrainSet::from_session(&s, &f.config);
+        assert!(!set.limited, "the old default is not a choice");
+        assert_eq!(session_brains_line(&s, &f.config), "Brains: all");
+        let worker = set.narrow(&f.config, &[], None).unwrap();
+        assert_eq!(worker.authorize_write(&f.config, Some("later")).unwrap().name(), "later");
+        assert_eq!((s.brain_reads, s.brain_write), row_before, "nothing is migrated in the store");
+    }
+
+    #[test]
+    fn a_row_that_stores_more_than_the_old_default_stays_limited() {
+        let _iso = isolate();
+        let f = fixture();
+        let mut s = session();
+        s.brain_reads = vec![f.default.to_string_lossy().into_owned(), f.a.to_string_lossy().into_owned()];
+        s.brain_write = Some(f.default.to_string_lossy().into_owned());
+        assert!(BrainSet::from_session(&s, &f.config).limited);
+        s.brain_reads = vec![f.a.to_string_lossy().into_owned()];
+        s.brain_write = Some(f.a.to_string_lossy().into_owned());
+        assert!(BrainSet::from_session(&s, &f.config).limited, "a different single brain is a real choice");
+        s.brain_reads = vec![];
+        s.brain_write = Some(f.default.to_string_lossy().into_owned());
+        assert!(BrainSet::from_session(&s, &f.config).limited, "no reads with a write brain is a real choice, not the old default");
+    }
+
+    #[test]
+    fn an_unlimited_session_ignores_ninox_brain_so_env_cannot_redirect_its_writes() {
+        let _iso = isolate();
+        let f = fixture();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let set = crate::config::with_env_override("NINOX_BRAIN", elsewhere.path(), || BrainSet::from_session(&session(), &f.config));
+        assert_eq!(set.write, f.default, "write stays the configured default brain");
+        assert!(set.reads.iter().all(|r| r != elsewhere.path()));
+        assert!(set.authorize_write(&f.config, Some(&elsewhere.path().to_string_lossy())).is_err());
     }
 }

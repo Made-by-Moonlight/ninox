@@ -49,7 +49,7 @@ updates and other installation methods.
 
 ## Prerequisites
 
-Source builds need:
+Only needed to build from source (prebuilt binaries via `cargo binstall` need none of it):
 
 - Rust toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - macOS or Linux (Windows not yet supported). Ubuntu 22.04 and newer are
@@ -248,6 +248,45 @@ App config is stored at `~/.config/ninox/config.toml`:
 port = 8080
 font_size = 13.0
 ```
+
+### Resetting a long-running orchestrator
+
+An orchestrator's context fills as it works. "Reset from plan" (the session page's button, `P` in `nx`, or
+`ninox reset-from-plan <orchestrator-id>`) asks it to update its registered plan doc, then starts a fresh
+conversation for the same session with that plan as its first prompt. Workers stay attached.
+
+The engine can start this for you when an orchestrator's context window reaches a threshold. It is off by default:
+
+```toml
+[orchestrator_reset]
+mode = "off"               # "off" (default), "prompt" or "auto"; anything else counts as "off"
+auto_at_context_pct = 40   # the threshold, 10-95; used only when mode is not "off"
+```
+
+At the threshold, once the orchestrator is idle, ninox sends it the plan request. With `mode = "prompt"` a
+notification then opens the updated plan for you to review, and nothing resets until you click. With
+`mode = "auto"` it resets by itself once the plan is updated; a plan that is never updated is never reset from.
+It fires at most once per conversation, so each reset re-arms it. If a fresh conversation already starts near the
+threshold (a big plan), the next reset waits for it to grow another 10 points and you get a notice to trim the
+plan. A change to the file applies on the next check without a restart.
+
+## Brain access
+
+A session reads every enabled brain and can write to every enabled
+read-write one by default; limit it to a subset with the spawn form's brains
+field or `--brain` / `--brain-write` (workers inherit the limit). Read-only
+brains are never write targets. See [docs/BRAIN.md](docs/BRAIN.md).
+
+## Brain write rules
+
+Your local brain gets every entry an agent or the harvest writes. Other brains
+you can write to carry write rules saying what belongs in them (stored in the
+brain as `_rules.md` and synced to everyone who uses it; `write_rules_override`
+in `config.toml` adds your own, never synced), and get a copy only of entries
+their rules fit. `ninox brain add <path>` prints the other writable brains'
+rules after writing; copy the entry with `ninox brain copy <path> --to <brain>`
+when it fits (`ninox brain rules` looks them up). A brain with no rules is never a copy target unless you ask. See
+[docs/BRAIN.md](docs/BRAIN.md).
 
 ## Development
 

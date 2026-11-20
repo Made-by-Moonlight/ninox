@@ -36,15 +36,17 @@ fn socket_for(test_binary: bool, override_name: Option<String>) -> String {
 /// `target/<profile>/deps/` (e.g. `target/debug/deps/ninox_core-<hash>`),
 /// while the real `cargo build`/`cargo run` binary lives directly at
 /// `target/<profile>/<name>` with no `deps` path component. Checking for
-/// that segment is a reliable, zero-config way to tell "am I a test binary"
-/// apart from "am I the real app" — no env var, no per-test setup required,
-/// so it can't race under parallel test execution the way a shared env var
-/// would (see `lifecycle::usage::ENV_TEST_GUARD` for a case where that
-/// exact hazard already had to be worked around once in this codebase).
+/// that segment, or Cargo's build/<package>/<hash>/out layout, identifies
+/// a test binary without a process-wide environment variable that could race
+/// under parallel test execution.
 pub(crate) fn is_test_binary() -> bool {
-    std::env::current_exe()
+    cfg!(test) || std::env::current_exe()
         .ok()
-        .is_some_and(|p| p.components().any(|c| c.as_os_str() == "deps"))
+        .is_some_and(|p| {
+            p.components().any(|c| c.as_os_str() == "deps")
+                || (p.parent().is_some_and(|dir| dir.file_name().is_some_and(|name| name == "out"))
+                    && p.components().any(|c| c.as_os_str() == "build"))
+        })
 }
 
 /// Parse a `tmux -V` version string (e.g. "tmux 3.4" or "tmux 3.5a") into
@@ -317,6 +319,16 @@ fn shell_quote(s: &str) -> String {
 
 /// Create a detached tmux session.  Kills a stale session with the same name
 /// if one exists, then hides the status bar so the terminal widget is clean.
+/// Start fish interactively so its version managers initialize, while passing
+/// the POSIX-quoted harness command to a POSIX shell without reinterpretation.
+pub(crate) fn shell_command_args<'a>(shell: &'a str, cmd: &'a str) -> Vec<&'a str> {
+    if std::path::Path::new(shell).file_name().is_some_and(|name| name == "fish") {
+        vec![shell, "-il", "-c", "exec /bin/sh -c \"$argv[1]\"", cmd]
+    } else {
+        vec![shell, "-l", "-c", cmd]
+    }
+}
+
 pub async fn create_session(
     id:        &str,
     workspace: &str,
@@ -368,14 +380,7 @@ async fn create_session_with_shell(
     // Multiple shell-command arguments make tmux exec the shell directly.
     // A single string is first parsed by tmux's default shell, which may be
     // fish and cannot parse the POSIX quoting used in worker prompts.
-    if std::path::Path::new(shell).file_name().is_some_and(|name| name == "fish") {
-        // Harness commands use POSIX quoting. Let fish load the user's
-        // login environment, then pass the command to a POSIX shell as an
-        // argument rather than asking fish to parse it.
-        base.extend_from_slice(&[shell, "-l", "-c", "exec /bin/sh -c \"$argv[1]\"", cmd]);
-    } else {
-        base.extend_from_slice(&[shell, "-l", "-c", cmd]);
-    }
+    base.extend(shell_command_args(shell, cmd));
 
     // A duplicate name means a LIVE tmux session already exists under this
     // id. Killing it to make room (the old behavior) silently destroys a
@@ -634,11 +639,18 @@ pub async fn wake_idle_session(session_id: &str) -> Result<()> {
 /// box yet — those are simply swallowed by the welcome/auth screens. A
 /// timeout is not an error: the caller is expected to try the send anyway
 /// and report the failure, which beats silently declining to deliver.
+///
+/// Returns `false` immediately if the session no longer exists — a harness
+/// that exits at startup (binary missing, crash) takes its tmux session with
+/// it, and no prompt will ever be drawn, so polling out the full `timeout`
+/// only delays the caller's failure report.
 pub async fn wait_for_input_prompt(session_id: &str, timeout: std::time::Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if prompt_line_content(&capture_visible_plain(session_id).await).is_some() {
-            return true;
+        match run_session_scoped(&["capture-pane", "-p", "-t", &exact_pane(session_id)]).await {
+            Ok(pane) if prompt_line_content(&pane).is_some() => return true,
+            Err(e) if is_missing_session(&e) => return false,
+            _ => {}
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
@@ -878,6 +890,22 @@ mod tests {
 
         assert!(!ready, "must time out rather than block forever");
         kill_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_input_prompt_returns_at_once_when_the_session_is_gone() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        // A harness that exits at startup takes its session with it; no
+        // prompt can ever appear, so the wait must not poll out its timeout.
+        create_session(&id, "/tmp", "exit 127", &[]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let started = std::time::Instant::now();
+        let ready = wait_for_input_prompt(&id, Duration::from_secs(30)).await;
+
+        assert!(!ready);
+        assert!(started.elapsed() < Duration::from_secs(5), "must bail early, took {:?}", started.elapsed());
     }
 
     #[tokio::test]
@@ -1223,10 +1251,17 @@ mod tests {
         if !tmux_available() || std::process::Command::new("fish").arg("--version").output().is_err() {
             return;
         }
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".config/fish");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.fish"), "if status is-interactive; set -gx NINOX_FISH_TEST ready; end\n").unwrap();
         let id = unique_id();
-        create_session_with_shell(&id, "/tmp", "printf '%s\\n' \"can't stop\"; exec cat", &[], "fish")
+        create_session_with_shell(&id, "/tmp", "printf '%s %s\\n' \"can't stop\" \"$NINOX_FISH_TEST\"; exec cat", &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("XDG_CONFIG_HOME", home.path().join(".config").to_str().unwrap()),
+        ], "fish")
             .await.unwrap();
-        wait_for_pane_contains(&id, "can't stop").await;
+        wait_for_pane_contains(&id, "can't stop ready").await;
         kill_session(&id).await.unwrap();
     }
 

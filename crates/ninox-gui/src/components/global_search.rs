@@ -335,7 +335,7 @@ mod tests {
             id: id.into(), orchestrator_id: None, name: name.into(),
             repo: "o/r".into(), status: SessionStatus::Working, agent_type: "claude-code".into(),
             cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None,
-            workspace_path: None, pid: None, model: None, context_tokens: None,
+            workspace_path: None, pid: None, model: None, observed_model: None, context_tokens: None,
             brain_reads: Vec::new(), brain_write: None, context_used_pct: None, context_total_tokens: None,
             context_window_size: None, claude_session_id: None,
             summary: summary.map(String::from), terminal_at: None, gate_status: None, merged_at: None,

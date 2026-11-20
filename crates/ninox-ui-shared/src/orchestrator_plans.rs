@@ -95,7 +95,7 @@ mod tests {
             repo: "r1".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 1.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: Some("/ws".into()),
-            pid: Some(111), model: Some("m1".into()), context_tokens: Some(10),
+            pid: Some(111), model: Some("m1".into()), observed_model: None, context_tokens: Some(10),
             brain_reads: Vec::new(), brain_write: None, context_used_pct: Some(1.0),
             context_total_tokens: Some(10), context_window_size: Some(200_000),
             claude_session_id: None, summary: None, terminal_at: None,

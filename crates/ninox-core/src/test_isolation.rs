@@ -181,6 +181,21 @@ pub fn data_root() -> PathBuf {
     real
 }
 
+/// `~/ninox/orchestrators` — where orchestrator roots default. Under
+/// [`isolate`] it is `<tempdir>/orchestrators`; in a test process without
+/// one it panics, since seeding the real root rewrites every live
+/// orchestrator's hooks and statusLine.
+pub fn default_orchestrator_root() -> PathBuf {
+    if let Some(o) = current() {
+        return o.root.join("orchestrators");
+    }
+    let real = dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("ninox").join("orchestrators");
+    if enforced() {
+        deny("the default orchestrator root", &real);
+    }
+    real
+}
+
 /// Wraps `f` so it runs under the calling thread's [`isolate`] override
 /// wherever it ends up running — for work handed to `spawn_blocking` or a
 /// fresh thread, which would otherwise see no override. A plain call when
@@ -364,10 +379,27 @@ mod tests {
             .resolved_brain_path()
             .starts_with(&root));
         assert!(data_root().starts_with(&root));
+        assert!(AppConfig::default().resolved_orchestrator_root().starts_with(&root));
 
         AppConfig::update(|c| c.port = 4242).unwrap();
         assert_eq!(AppConfig::load().unwrap().port, 4242);
         assert!(iso.config_path().exists());
+    }
+
+    /// The leak this guards: a test that seeds or spawns into the default
+    /// orchestrator root rewrote the real `~/ninox/orchestrators/.claude`
+    /// (hooks and statusLine of every live orchestrator) with a test binary.
+    #[test]
+    #[should_panic(expected = "default orchestrator root")]
+    fn the_default_orchestrator_root_is_denied_without_isolation() {
+        let _ = AppConfig::default().resolved_orchestrator_root();
+    }
+
+    #[test]
+    fn a_configured_orchestrator_root_needs_no_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AppConfig { orchestrator_root: Some(dir.path().to_path_buf()), ..Default::default() };
+        assert_eq!(cfg.resolved_orchestrator_root(), dir.path());
     }
 
     #[test]

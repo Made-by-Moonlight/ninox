@@ -171,7 +171,7 @@ local event pipeline (requiring some reachability from the public endpoint
 runs on laptops) or becomes the shared store of record that per-machine
 ninox instances poll/subscribe against.
 - *This is the option that, if pursued, must go through CITADEL*
-  (https://app.notion.com/p/synthesia/CITADEL-Platform-Guide-190c16d22bf1803abfe7d4cdb28b29b9),
+  (the internal hosting platform),
   not an ad-hoc tunnel. A durable internet-facing listener receiving
   unsolicited inbound traffic from GitHub is exactly the "shared service
   needing its own infrastructure" category CITADEL exists for — ownership,
@@ -258,7 +258,7 @@ the org's existing split:
 
 - **If any part of this is CITADEL-hosted** (Options A/B/C above all
   involve *something* CITADEL-hosted): the secret lives in CITADEL's own
-  secrets management (dev.citadel.synthesia.io) and is injected into the
+  secrets management and is injected into the
   hosted service's runtime environment — not read from a ninox config
   file at all for the hosted component.
 - **If a per-machine `ninox-server` instance also needs the secret**

@@ -10,7 +10,7 @@ fn session(id: &str, orch: Option<&str>, status: SessionStatus) -> Session {
         id: id.into(), orchestrator_id: orch.map(str::to_string), name: format!("name-{id}"),
         repo: "repo".into(), status, agent_type: "claude-code".into(), cost_usd: 1.5,
         started_at: 100, pr_number: None, pr_id: None, workspace_path: Some(format!("/ws/{id}")),
-        pid: Some(4242), model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+        pid: Some(4242), model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
         context_used_pct: None, context_total_tokens: None, context_window_size: None,
         claude_session_id: Some(format!("uuid-{id}")), summary: Some(format!("task {id}")),
         terminal_at: None, gate_status: None, merged_at: None,

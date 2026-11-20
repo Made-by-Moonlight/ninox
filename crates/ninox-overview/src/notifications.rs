@@ -31,6 +31,7 @@ pub fn kind_label(kind: &NotificationKind) -> &'static str {
         NotificationKind::FleetRestorePending => "Restore",
         NotificationKind::InitialPromptFailed | NotificationKind::LaunchFailed => "Spawn",
         NotificationKind::DiskPressure => "Disk",
+        NotificationKind::ResetPlanReady | NotificationKind::ResetPlanTimedOut | NotificationKind::ResetPlanTooLarge => "Reset",
     }
 }
 
@@ -49,9 +50,12 @@ pub fn kind_tone(kind: &NotificationKind) -> Tone {
         | NotificationKind::ExtraPr
         | NotificationKind::DiskPressure
         | NotificationKind::PrNeedsAttention
+        | NotificationKind::ResetPlanTimedOut
+        | NotificationKind::ResetPlanTooLarge
         | NotificationKind::FleetRestorePending => Tone::Attention,
         NotificationKind::WorkRequested
         | NotificationKind::UpdateAvailable
+        | NotificationKind::ResetPlanReady
         | NotificationKind::PrReadyToMerge => Tone::Open,
         NotificationKind::WorkerDone
         | NotificationKind::UpdateInstalled

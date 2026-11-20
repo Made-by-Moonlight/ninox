@@ -288,22 +288,42 @@ pub fn spawn_modal<'a>(state: &'a App, form: &'a SpawnForm) -> Element<'a, Messa
     ]
     .spacing(0);
 
-    // ── Workspace (standalone only) ──────────────────────────────────────
-    let workspace_field: Option<Element<Message>> = (form.kind == SpawnKind::Standalone).then(|| {
-        column![
-            field_label("Workspace"),
-            Space::new(0, 6),
-            text_input("~/proj/my-repo", &form.workspace)
-                .on_input(Message::SpawnFormWorkspace)
-                .on_submit_maybe(can_submit.then_some(Message::SpawnFormConfirm))
-                .font(MONO)
-                .size(13)
-                .padding(Padding { top: 9.0, right: 11.0, bottom: 9.0, left: 11.0 })
-                .style(|_t, status| field_style(status)),
-        ]
-        .spacing(0)
-        .into()
-    });
+    // ── Workspace: required for standalone; an optional folder for an
+    // orchestrator (blank keeps ninox's own) ────────────────────────────────
+    let standalone = form.kind == SpawnKind::Standalone;
+    let workspace_field: Element<Message> = {
+        let input = text_input(
+            if standalone { "~/proj/my-repo" } else { "~/proj/my-repo (optional)" },
+            &form.workspace,
+        )
+        .on_input(Message::SpawnFormWorkspace)
+        .on_submit_maybe(can_submit.then_some(Message::SpawnFormConfirm))
+        .font(MONO)
+        .size(13)
+        .padding(Padding { top: 9.0, right: 11.0, bottom: 9.0, left: 11.0 })
+        .style(|_t, status| field_style(status));
+        let mut line = row![input].spacing(8).align_y(Alignment::Center);
+        if cfg!(target_os = "macos") {
+            line = line.push(
+                button(text("Browse…").size(12).font(SANS).color(tokens::TEXT))
+                    .on_press(Message::SpawnFormBrowse)
+                    .padding(Padding { top: 8.0, right: 12.0, bottom: 8.0, left: 12.0 }),
+            );
+        }
+        let mut col = column![field_label(if standalone { "Workspace" } else { "Workspace folder" }), Space::new(0, 6), line];
+        if !standalone {
+            col = col
+                .push(Space::new(0, 4))
+                .push(
+                    text("An existing folder to run in, such as a git worktree. Blank uses ninox's own. \
+                          ninox only adds .claude/settings.local.json entries and .claude/skills/ninox-*.")
+                        .size(11)
+                        .font(SANS)
+                        .color(tokens::DIM2),
+                );
+        }
+        col.spacing(0).into()
+    };
 
     // ── Agent + Model ─────────────────────────────────────────────────────
     let registry = state.config.registry();
@@ -503,16 +523,15 @@ pub fn spawn_modal<'a>(state: &'a App, form: &'a SpawnForm) -> Element<'a, Messa
         text(msg.clone()).size(11.5).font(SANS).color(tokens::RED).into()
     });
 
-    // Final layout: Kind → Name → Workspace (standalone only) → Agent·Model
+    // Final layout: Kind → Name → Workspace → Agent·Model
     // → Brain catalogue → Type (standalone only) → Initial prompt → error
     // (if any) → footer.
     let mut body = column![kind_field, Space::new(0, 18), name_field]
         .padding(Padding { top: 18.0, right: 20.0, bottom: 18.0, left: 20.0 })
         .spacing(0);
-    if let Some(ws) = workspace_field {
-        body = body.push(Space::new(0, 18)).push(ws);
-    }
     body = body
+        .push(Space::new(0, 18))
+        .push(workspace_field)
         .push(Space::new(0, 18))
         .push(agent_field)
         .push(Space::new(0, 18))

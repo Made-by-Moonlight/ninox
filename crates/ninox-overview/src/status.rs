@@ -45,7 +45,7 @@ mod tests {
             id: "s".into(), orchestrator_id: None, name: "s-name".into(),
             repo: "o/r".into(), status, agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
-            workspace_path: Some("/ws/s".into()), pid: None, model: None,
+            workspace_path: Some("/ws/s".into()), pid: None, model: None, observed_model: None,
             context_tokens: None, brain_reads: Vec::new(), brain_write: None, context_used_pct: None,
             context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None,

@@ -4,7 +4,7 @@
 
 **Goal:** implement items 4 and 6 of `BRIEF-MLOPS-5418-workspace-cleanup.md` on top of the already-merged core (#271, `crates/ninox-core/src/workspace/`): a `ninox workspaces list/prune/show` CLI, a GUI nav-bar chip + compact list/prune modal, and a TUI Remotes-tab panel (`W` key). Items 1-3, 5, 7 are done; this PR does not touch cleanup/orphan safety semantics except one additive, backward-compatible parameter described in Task 1.
 
-**Spec:** `/Users/ethan.brodie/proj/ninox/.claude/design-ref/fleet-overview-v1/BRIEF-MLOPS-5418-workspace-cleanup.md` + `BRIEF-common.md` §7 (process).
+**Spec:** `.claude/design-ref/fleet-overview-v1/BRIEF-MLOPS-5418-workspace-cleanup.md` + `BRIEF-common.md` §7 (process).
 
 ## Global constraints
 

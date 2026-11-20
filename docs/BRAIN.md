@@ -83,6 +83,76 @@ are immutable (`entries/<path>@<hash>`); `manifest.json` alone decides
 what's current, and concurrent pushes are serialized by compare-and-swap
 on it. Full design: `docs/superpowers/specs/2026-07-22-remote-brain-design.md`.
 
+## Which brains a session can use
+
+By default a session (orchestrator, worker, standalone, and the harvest acting
+for it) reads every enabled brain and can write to every enabled `read_write`
+brain, including ones added after it started. A session can be **limited** to
+a subset: the spawn form's brains field, `--brain <name>` / `--brain-write
+<name>` on spawn and orchestrate, or the session's stored set. Workers inherit
+their orchestrator's limit unless spawned with a narrower one; no limit means
+all. A session that already had an explicit stored set keeps it as its limit,
+so nothing widens silently, except that a stored set of just the default brain (what every session stored before limits existed) counts as unlimited, decided at read time with no store migration. `ninox brain limit <session> --clear` lifts a session's limit and `--set a,b [--write a]` changes it, without re-spawning; only the user or the session's own orchestrator may, and never past the orchestrator's own limit. `read_only` brains are never write targets,
+whatever the limit. The session header reads "Brains: all" or "Brains: limited
+to A, B · writes A".
+
+## Write rules
+
+A session can write to several brains, so each brain says how and when to use
+it:
+
+- Your **local brain** (the session's write brain, normally `default`) gets
+  **every entry** an agent or the harvest writes, with no rules filter.
+- **Other brains you can write to** each carry **write rules**, a
+  natural-language prompt such as "MLOps knowledge: how our systems behave,
+  decisions and why, runbooks. No personal notes, no secrets." An entry is
+  copied to such a brain only when the agent judges its rules fit. No fit
+  means the entry stays in your local brain alone. A brain with **no rules** is never a copy target by default (a freshly connected brain would otherwise receive every entry); `brain add`, `brain rules` and the harvest all show it as "no rules set, so entries aren't copied here unless the user asks".
+
+Rules live with the brain, so you manage a brain once:
+
+- **Brain rules** are the reserved root file `_rules.md`. It syncs like any
+  entry on S3 and GitHub-wiki remotes (on the wiki it is stored as
+  `entries/_rules.md@<hash>`, never at the wiki root, so GitHub's special
+  `_Sidebar`/`_Footer` pages are not involved), so everyone with write access
+  edits it and everyone gets the same rules on sync. It is excluded from the
+  index: never in search results or entry lists. `ninox brain add _rules.md`
+  is refused.
+- **Local override** is yours alone, saved in `config.toml` and never synced.
+  It is appended to the brain rules and wins where they conflict:
+
+      [brain]
+      write_rules_override = "no transcripts, no raw logs"   # default brain
+
+      [[brain.catalogues]]
+      name = "mlops"
+      path = "~/.config/ninox/brains/mlops"
+      write_rules_override = "only things I verified myself"
+
+The rules reach the agent at write time, in the output of the command itself:
+`ninox brain add <path>` writes to your local brain and then prints every other
+brain the session can write to with its combined rules, telling the agent to
+copy the entry there (`ninox brain copy <path> --to a,b`, which copies the entry already written; no content to re-send) if it fits. Nothing rule-related is
+added to launch prompts or skills; `ninox brain rules` is an explicit lookup.
+Targets are all checked before anything is written, copies are independent,
+and a failure on one (e.g. disk) does not block the others. Remotes catch up on
+the next `ninox brain sync`. Read-only brains are never targets. The harvest follows the same model and
+stamps its entries `source: harvest` plus `harvest_session`, so others can tell them apart; `discover-repos` is mechanical (no model to
+judge rules), so it writes only to your local brain.
+
+```
+ninox brain rules [--catalogue X] [--json]        combined rules per brain
+ninox brain rules set --catalogue X [--file F]    replace the brain's rules (stdin by default)
+ninox brain rules set-override --catalogue X      replace your local override (blank clears)
+ninox brain add <path> [--catalogue a,b]          your local brain, prints other brains' rules; plus the named brains
+ninox brain copy <path> --to a[,b]                copy the written entry to other brains (checks as for add)
+```
+
+`set` and `set-override` are for when you explicitly ask to change rules. The
+GUI Brain Sources editor shows both parts in multi-line editors, labelled
+"everyone who uses this brain" and "only on this machine"; the TUI Sources view shows
+them read-only.
+
 ## CLI
 
 ```

@@ -35,6 +35,7 @@ const NINOX_SUBCOMMANDS: &[&str] = &[
     "inbox drain-prompt",
     "identity-hook prompt",
     "identity-hook session-start",
+    "session-setup",
 ];
 
 /// The orchestrator root's native-subagent guard script under `.claude/`.
@@ -53,7 +54,12 @@ pub fn is_ninox_command(cmd: &str) -> bool {
 /// commands.
 fn ninox_command_key(cmd: &str) -> Option<&str> {
     let cmd = cmd.trim();
-    if let Some(script) = cmd.strip_prefix("node .claude/") {
+    if let Some(script) = cmd.strip_prefix("node ") {
+        // `.claude/<script>` in ninox's own root, or `'<root>/.claude/<script>'`
+        // from a custom workspace that points back at the root.
+        let script = script.trim();
+        let script = script.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).unwrap_or(script);
+        let script = script.strip_prefix(".claude/").or_else(|| script.rsplit_once("/.claude/").map(|(_, s)| s))?;
         let known = script == SUBAGENT_BLOCKER_SCRIPT
             || crate::capabilities::REGISTRY
                 .iter()
@@ -68,7 +74,7 @@ fn ninox_command_key(cmd: &str) -> Option<&str> {
     })
 }
 
-/// `bin` names a ninox executable: its file name starts with `ninox` (the
+/// `bin` names a ninox executable: its file name is `nx` or starts with `ninox` (the
 /// release binary, a `target/<profile>/ninox` build, or a cargo test
 /// harness binary such as `ninox_app-<hash>`).
 fn is_ninox_bin(bin: &str) -> bool {
@@ -77,7 +83,7 @@ fn is_ninox_bin(bin: &str) -> bool {
     Path::new(bin)
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with("ninox"))
+        .is_some_and(|n| n.starts_with("ninox") || n == "nx")
 }
 
 fn command_of(v: &Value) -> Option<&str> {
@@ -146,7 +152,8 @@ fn read_object(path: &Path) -> anyhow::Result<Option<Map<String, Value>>> {
 /// rather than clobbered.
 pub fn install_local(claude_dir: &Path, entries: &Value) -> anyhow::Result<()> {
     let path = claude_dir.join(LOCAL_SETTINGS);
-    let mut settings = read_object(&path)?.unwrap_or_default();
+    let original = read_object(&path)?;
+    let mut settings = original.clone().unwrap_or_default();
     strip_ninox_entries(&mut settings);
 
     if let Some(accept) = entries.get(crate::harness::CROSS_SESSION_KEY) {
@@ -170,9 +177,15 @@ pub fn install_local(claude_dir: &Path, entries: &Value) -> anyhow::Result<()> {
         }
     }
 
+    // Unchanged: leave the file (and the user's formatting) alone, so a
+    // restart never races a write Claude Code made meanwhile.
+    if original.as_ref() == Some(&settings) {
+        return Ok(());
+    }
     std::fs::create_dir_all(claude_dir).with_context(|| format!("create {}", claude_dir.display()))?;
-    std::fs::write(&path, serde_json::to_string_pretty(&settings)?)
-        .with_context(|| format!("write {}", path.display()))
+    let tmp = claude_dir.join(format!(".{LOCAL_SETTINGS}.ninox-tmp"));
+    std::fs::write(&tmp, serde_json::to_string_pretty(&settings)?).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("write {}", path.display()))
 }
 
 /// Remove the entries older ninox builds seeded into
@@ -194,6 +207,30 @@ pub fn strip_legacy(claude_dir: &Path) -> anyhow::Result<bool> {
         std::fs::write(&path, serde_json::to_string_pretty(&settings)?)
             .with_context(|| format!("write {}", path.display()))?;
     }
+    Ok(true)
+}
+
+/// Whether `<claude_dir>/settings.json` or `settings.local.json` defines a
+/// `statusLine` that isn't ninox's. Claude Code lets the local file override
+/// the shared one, so ninox seeding its own would silently replace the user's.
+pub fn user_status_line(claude_dir: &Path) -> bool {
+    [LEGACY_SETTINGS, LOCAL_SETTINGS].iter().any(|name| {
+        let Ok(Some(settings)) = read_object(&claude_dir.join(name)) else { return false };
+        settings.get("statusLine").is_some_and(|sl| !command_of(sl).is_some_and(is_ninox_command))
+    })
+}
+
+/// Remove ninox's entries from `<claude_dir>/settings.local.json`, keeping
+/// every other key. Rewrites the file only when something was removed (an
+/// emptied file stays, as `{}`: it may be the user's). Returns whether it
+/// changed. An unparsable file is left alone and reported.
+pub fn strip_local(claude_dir: &Path) -> anyhow::Result<bool> {
+    let path = claude_dir.join(LOCAL_SETTINGS);
+    let Some(mut settings) = read_object(&path)? else { return Ok(false) };
+    if !strip_ninox_entries(&mut settings) {
+        return Ok(false);
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&settings)?).with_context(|| format!("write {}", path.display()))?;
     Ok(true)
 }
 
@@ -320,6 +357,36 @@ mod tests {
             "allow": ["Read"], "deny": ["Bash(rm:*)"], "ask": ["Bash(git push:*)"], "defaultMode": "default",
         }));
         assert_eq!(v["statusLine"]["command"], "x");
+    }
+
+    #[test]
+    fn recognises_absolute_path_guard_scripts_and_the_nx_binary() {
+        assert!(is_ninox_command("node '/Users/x/Library/Application Support/o/.claude/subagent-blocker.cjs'"));
+        assert!(is_ninox_command("node /root/.claude/subagent-blocker.cjs"));
+        assert!(is_ninox_command("'/usr/local/bin/nx' worker-status hook-stop"));
+        assert!(!is_ninox_command("node '/repo/.claude/hooks/sync.cjs'"));
+        assert!(!is_ninox_command("node /repo/.claude/other.cjs"));
+    }
+
+    #[test]
+    fn strip_local_removes_only_ninox_and_keeps_an_emptied_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(LOCAL_SETTINGS);
+        std::fs::write(&path, json!({"statusLine": {"type": "command", "command": "'/b/ninox' statusline"}}).to_string()).unwrap();
+        assert!(strip_local(dir.path()).unwrap());
+        assert_eq!(serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap(), json!({}));
+        assert!(!strip_local(dir.path()).unwrap());
+        assert!(!strip_local(&dir.path().join("none")).unwrap());
+    }
+
+    #[test]
+    fn user_status_line_looks_in_both_files_and_ignores_ninoxs_own() {
+        let dir = tempdir().unwrap();
+        assert!(!user_status_line(dir.path()));
+        std::fs::write(dir.path().join(LOCAL_SETTINGS), json!({"statusLine": {"command": "'/b/ninox' statusline"}}).to_string()).unwrap();
+        assert!(!user_status_line(dir.path()));
+        std::fs::write(dir.path().join(LEGACY_SETTINGS), json!({"statusLine": {"command": "mine"}}).to_string()).unwrap();
+        assert!(user_status_line(dir.path()));
     }
 
     #[test]

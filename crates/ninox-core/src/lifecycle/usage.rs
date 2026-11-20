@@ -278,8 +278,8 @@ mod tests {
     #[test]
     fn slug_replaces_non_alphanumeric_with_dash() {
         assert_eq!(
-            claude_project_slug("/Users/ethan.brodie/Library/Application Support/ninox/orchestrator/2"),
-            "-Users-ethan-brodie-Library-Application-Support-ninox-orchestrator-2",
+            claude_project_slug("/Users/dev/Library/Application Support/ninox/orchestrator/2"),
+            "-Users-dev-Library-Application-Support-ninox-orchestrator-2",
         );
     }
 
