@@ -1,3 +1,4 @@
 target/
+__pycache__/
 # Machine-local agent config: absolute paths, per-developer permissions.
 .claude/settings.json

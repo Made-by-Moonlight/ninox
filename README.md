@@ -298,6 +298,15 @@ cargo run -p ninox-tui              # Run the terminal UI
 cargo run -p ninox-gui -- --headless  # Run headless (engine + HTTP only)
 ```
 
+Merges to `main` automatically advance the workspace patch version, push a
+version commit and tag, and start the GitHub release and crates.io publishing
+workflows. Merges that arrive together may be included in one release. The
+Homebrew tap updates its stable packages on its daily schedule after the
+release is published. The automation requires the write-enabled
+`RELEASE_DEPLOY_KEY` and verifies that the current workspace version matches
+the latest stable tag before bumping. Failed release or publish jobs can be
+retried with their existing tag using the corresponding workflow's manual run.
+
 ## Crates
 
 | Crate | Purpose |
