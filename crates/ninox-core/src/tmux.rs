@@ -36,15 +36,17 @@ fn socket_for(test_binary: bool, override_name: Option<String>) -> String {
 /// `target/<profile>/deps/` (e.g. `target/debug/deps/ninox_core-<hash>`),
 /// while the real `cargo build`/`cargo run` binary lives directly at
 /// `target/<profile>/<name>` with no `deps` path component. Checking for
-/// that segment is a reliable, zero-config way to tell "am I a test binary"
-/// apart from "am I the real app" — no env var, no per-test setup required,
-/// so it can't race under parallel test execution the way a shared env var
-/// would (see `lifecycle::usage::ENV_TEST_GUARD` for a case where that
-/// exact hazard already had to be worked around once in this codebase).
+/// that segment, or Cargo's build/<package>/<hash>/out layout, identifies
+/// a test binary without a process-wide environment variable that could race
+/// under parallel test execution.
 pub(crate) fn is_test_binary() -> bool {
     cfg!(test) || std::env::current_exe()
         .ok()
-        .is_some_and(|p| p.components().any(|c| c.as_os_str() == "deps"))
+        .is_some_and(|p| {
+            p.components().any(|c| c.as_os_str() == "deps")
+                || (p.parent().is_some_and(|dir| dir.file_name().is_some_and(|name| name == "out"))
+                    && p.components().any(|c| c.as_os_str() == "build"))
+        })
 }
 
 /// Parse a `tmux -V` version string (e.g. "tmux 3.4" or "tmux 3.5a") into
