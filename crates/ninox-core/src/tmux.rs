@@ -317,6 +317,16 @@ fn shell_quote(s: &str) -> String {
 
 /// Create a detached tmux session.  Kills a stale session with the same name
 /// if one exists, then hides the status bar so the terminal widget is clean.
+/// Start fish interactively so its version managers initialize, while passing
+/// the POSIX-quoted harness command to a POSIX shell without reinterpretation.
+pub(crate) fn shell_command_args<'a>(shell: &'a str, cmd: &'a str) -> Vec<&'a str> {
+    if std::path::Path::new(shell).file_name().is_some_and(|name| name == "fish") {
+        vec![shell, "-il", "-c", "exec /bin/sh -c \"$argv[1]\"", cmd]
+    } else {
+        vec![shell, "-l", "-c", cmd]
+    }
+}
+
 pub async fn create_session(
     id:        &str,
     workspace: &str,
@@ -368,17 +378,7 @@ async fn create_session_with_shell(
     // Multiple shell-command arguments make tmux exec the shell directly.
     // A single string is first parsed by tmux's default shell, which may be
     // fish and cannot parse the POSIX quoting used in worker prompts.
-    if std::path::Path::new(shell).file_name().is_some_and(|name| name == "fish") {
-        // Harness commands use POSIX quoting. Let fish load the user's
-        // login environment, then pass the command to a POSIX shell as an
-        // argument rather than asking fish to parse it.
-        // Fish users commonly initialize version managers only in interactive
-        // shells. Load that environment before starting the agent so its
-        // subprocesses (including hooks) can find tools such as Node.
-        base.extend_from_slice(&[shell, "-il", "-c", "exec /bin/sh -c \"$argv[1]\"", cmd]);
-    } else {
-        base.extend_from_slice(&[shell, "-l", "-c", cmd]);
-    }
+    base.extend(shell_command_args(shell, cmd));
 
     // A duplicate name means a LIVE tmux session already exists under this
     // id. Killing it to make room (the old behavior) silently destroys a
@@ -1254,7 +1254,10 @@ mod tests {
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(config.join("config.fish"), "if status is-interactive; set -gx NINOX_FISH_TEST ready; end\n").unwrap();
         let id = unique_id();
-        create_session_with_shell(&id, "/tmp", "printf '%s %s\\n' \"can't stop\" \"$NINOX_FISH_TEST\"; exec cat", &[("HOME", home.path().to_str().unwrap())], "fish")
+        create_session_with_shell(&id, "/tmp", "printf '%s %s\\n' \"can't stop\" \"$NINOX_FISH_TEST\"; exec cat", &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("XDG_CONFIG_HOME", home.path().join(".config").to_str().unwrap()),
+        ], "fish")
             .await.unwrap();
         wait_for_pane_contains(&id, "can't stop ready").await;
         kill_session(&id).await.unwrap();
