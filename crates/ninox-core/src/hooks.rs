@@ -327,7 +327,21 @@ fn write_shim(shim: &Path, exe: &Path, version: &str) -> Result<()> {
     if let Some(dir) = shim.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    write_executable(shim.to_path_buf(), &shim_script(exe, version))
+    write_executable(shim.to_path_buf(), &shim_script(&stable_shim_target(exe), version))
+}
+
+// Homebrew replaces the versioned Cellar path during an upgrade. Its opt
+// link follows the active keg, so keep that path in the shim when it points
+// at the binary being registered. Other installations keep their exact path.
+fn stable_shim_target(exe: &Path) -> PathBuf {
+    let Some(bin) = exe.parent().filter(|p| p.file_name().is_some_and(|n| n == "bin")) else { return exe.to_path_buf() };
+    let Some(formula) = bin.parent().and_then(Path::parent) else { return exe.to_path_buf() };
+    let Some(cellar) = formula.parent().filter(|p| p.file_name().is_some_and(|n| n == "Cellar")) else { return exe.to_path_buf() };
+    let Some(prefix) = cellar.parent() else { return exe.to_path_buf() };
+    let Some(name) = formula.file_name() else { return exe.to_path_buf() };
+    let Some(binary) = exe.file_name() else { return exe.to_path_buf() };
+    let candidate = prefix.join("opt").join(name).join("bin").join(binary);
+    if candidate.canonicalize().ok().as_deref() == Some(exe) { candidate } else { exe.to_path_buf() }
 }
 
 /// A one-line hint when the (valid) self-shim is behind the running
@@ -349,6 +363,11 @@ fn self_shim_drift_hint_at(shim: &Path, current_exe: &Path, version: &str) -> Op
         .is_none_or(|v| v < current);
     // `current_exe` is canonical; a hand-edited shim may not be.
     let elsewhere = std::fs::canonicalize(&info.target).unwrap_or(info.target.clone()) != current_exe;
+    // The version marker records when the shim was written, but an opt link
+    // tracks newer Homebrew kegs without rewriting that marker.
+    if !elsewhere && stable_shim_target(current_exe) == info.target && info.target != current_exe {
+        return None;
+    }
     if !older && !elsewhere {
         return None;
     }
@@ -707,6 +726,34 @@ mod tests {
         let exe = dir.join("it's a build").join("ninox");
         write_shim(&shim, &exe, "1.2.3").unwrap();
         assert_eq!(read_shim(&shim), Some(ShimInfo { target: exe, version: Some("1.2.3".into()) }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn homebrew_shim_tracks_the_active_keg() {
+        let dir = tempfile::tempdir().unwrap();
+        let keg = dir.path().join("Cellar/ninox-gui/1.0");
+        std::fs::create_dir_all(keg.join("bin")).unwrap();
+        let exe = keg.join("bin/ninox-gui");
+        std::fs::write(&exe, "binary").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(dir.path().join("opt")).unwrap();
+        let opt = dir.path().join("opt/ninox-gui");
+        std::os::unix::fs::symlink(&keg, &opt).unwrap();
+        assert_eq!(super::stable_shim_target(&exe), opt.join("bin/ninox-gui"));
+        let shim = dir.path().join("ninox");
+        super::write_shim(&shim, &exe, "1.0.0").unwrap();
+        assert!(super::self_shim_drift_hint_at(&shim, &exe, "1.1.0").is_none());
+        let other = dir.path().join("Cellar/ninox-gui/2.0/bin/ninox-gui");
+        assert_eq!(super::stable_shim_target(&other), other);
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, "new binary").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_file(&opt).unwrap();
+        std::os::unix::fs::symlink(other.parent().unwrap().parent().unwrap(), &opt).unwrap();
+        assert_eq!(std::fs::canonicalize(super::read_shim(&shim).unwrap().target).unwrap(), other);
+        assert!(super::self_shim_drift_hint_at(&shim, &other, "2.0.0").is_none());
     }
 
     #[test]
