@@ -228,7 +228,7 @@ mod tests {
         m.generation = 7;
         m.entries.insert(
             "repos/a.md".into(),
-            ManifestEntry { sha256: "abc".into(), size: 3, updated_by: "ethan".into(), updated_at: "2026-07-22T10:00:00Z".into() },
+            ManifestEntry { sha256: "abc".into(), size: 3, updated_by: "alice".into(), updated_at: "2026-07-22T10:00:00Z".into() },
         );
         let loaded = Manifest::from_bytes(&m.to_bytes().unwrap()).unwrap();
         assert_eq!(loaded.generation, 7);
@@ -261,7 +261,7 @@ mod tests {
         let mut m = Manifest::empty();
         m.entries.insert(
             "repos/a.md".into(),
-            ManifestEntry { sha256: "abc".into(), size: 3, updated_by: "ethan".into(), updated_at: "2026-07-22T10:00:00Z".into() },
+            ManifestEntry { sha256: "abc".into(), size: 3, updated_by: "alice".into(), updated_at: "2026-07-22T10:00:00Z".into() },
         );
         let loaded = Manifest::from_bytes(&m.to_bytes().unwrap()).unwrap();
         assert!(loaded.entries.contains_key("repos/a.md"));
@@ -307,8 +307,8 @@ mod tests {
     fn conflict_copy_rel_keeps_section_and_extension() {
         // 2026-07-22T10:45:01Z == 1784112301... use a fixed epoch: 1753181101 = 2025-07-22T10:45:01Z is
         // irrelevant — just assert shape, not the exact date digits.
-        let rel = conflict_copy_rel("repos/ninox.md", "ethan", 1_753_181_101);
-        assert!(rel.starts_with("repos/ninox.conflict-ethan-"), "{rel}");
+        let rel = conflict_copy_rel("repos/ninox.md", "alice", 1_753_181_101);
+        assert!(rel.starts_with("repos/ninox.conflict-alice-"), "{rel}");
         assert!(rel.ends_with(".md"), "{rel}");
         assert_eq!(rel.matches(".md").count(), 1);
     }

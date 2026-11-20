@@ -190,9 +190,20 @@ pub struct SourceEditForm {
     pub cadence: String,
     pub access: String,
     pub enabled: bool,
+    /// Shared write rules, stored in the brain (`_rules.md`) and synced.
+    pub brain_rules: String,
+    /// `brain_rules` as loaded, so Save only touches the brain when edited.
+    pub brain_rules_loaded: String,
+    /// This machine's override, stored in config and never synced.
+    pub rules_override: String,
     /// Human-readable refusal reason from the last Save attempt, if any.
     pub error: Option<String>,
 }
+
+pub const BRAIN_RULES_LABEL: &str = "Brain rules — shared with everyone who uses this brain";
+pub const BRAIN_RULES_HINT: &str = "Saved into the brain; reaches everyone who uses this brain on the next sync.";
+pub const OVERRIDE_LABEL: &str = "Your override — only on this machine";
+pub const OVERRIDE_HINT: &str = "Saved to your config; never synced. Wins where it conflicts with the brain rules.";
 
 impl Default for SourceEditForm {
     fn default() -> Self {
@@ -207,6 +218,9 @@ impl Default for SourceEditForm {
             cadence: "manual".to_string(),
             access: "read_write".to_string(),
             enabled: true,
+            brain_rules: String::new(),
+            brain_rules_loaded: String::new(),
+            rules_override: String::new(),
             error: None,
         }
     }
@@ -231,8 +245,25 @@ pub fn form_from_catalogue(c: &CatalogueRef) -> SourceEditForm {
         cadence: c.cadence.clone(),
         access: c.access.clone(),
         enabled: c.enabled,
+        brain_rules: brain_rules_text(&c.path),
+        brain_rules_loaded: brain_rules_text(&c.path),
+        rules_override: c.write_rules_override.clone().unwrap_or_default(),
         error: None,
     }
+}
+
+/// The brain's shared write rules, empty when none are set.
+pub fn brain_rules_text(brain_path: &std::path::Path) -> String {
+    ninox_core::brain_rules::read_brain_rules(brain_path).unwrap_or_default()
+}
+
+/// Writes the form's brain rules into the brain if they were edited.
+pub fn save_brain_rules(form: &SourceEditForm, catalogue: &CatalogueRef) -> Result<(), String> {
+    if form.brain_rules.trim() == form.brain_rules_loaded.trim() {
+        return Ok(());
+    }
+    ninox_core::brain_rules::write_brain_rules(&catalogue.path, &form.brain_rules)
+        .map_err(|e| format!("couldn't save the brain rules: {e}"))
 }
 
 /// Validates and builds a `CatalogueRef` from the form's string fields —
@@ -298,6 +329,7 @@ pub fn build_catalogue_ref(form: &SourceEditForm) -> Result<CatalogueRef, String
         enabled: form.enabled,
         cadence: form.cadence.clone(),
         access: form.access.clone(),
+        write_rules_override: Some(form.rules_override.trim().to_string()).filter(|s| !s.is_empty()),
     })
 }
 
@@ -334,6 +366,10 @@ pub fn prepare_save(form: &SourceEditForm, existing: &[CatalogueRef]) -> Result<
 /// Replaces the source being edited (by its original name) or adds a new
 /// one. Run it inside `AppConfig::update`.
 pub fn apply_save(cfg: &mut AppConfig, editing: Option<&str>, catalogue: &CatalogueRef) {
+    if editing == Some("default") || catalogue.name == "default" {
+        cfg.brain.write_rules_override = catalogue.write_rules_override.clone();
+        return;
+    }
     if let Some(old_name) = editing {
         cfg.brain.catalogues.retain(|existing| existing.name != old_name);
     }
@@ -657,6 +693,7 @@ mod tests {
             enabled: true,
             cadence: "every_10_min".to_string(),
             access: "read_write".to_string(),
+            write_rules_override: None,
         }
     }
 
@@ -942,5 +979,41 @@ mod tests {
             ["Type", "s3://bucket/prefix", "Region", "Endpoint", "Local cache", "Sync", "Access", "Search"]
         );
         assert!(source_fields(&catalogue("team", Some("https://github.com/a/b/wiki"))).iter().all(|f| !f.secret));
+    }
+
+    #[test]
+    fn form_round_trips_rules_and_saves_brain_rules_only_when_edited() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let dir = tempfile::tempdir().unwrap();
+        ninox_core::brain_rules::write_brain_rules(dir.path(), "brain says").unwrap();
+        let mut c = form_from_catalogue(&CatalogueRef {
+            name: "t".into(), path: dir.path().to_path_buf(), remote: None, endpoint: None, region: None,
+            cache_ttl_secs: None, enabled: true, cadence: "manual".into(), access: "read_write".into(),
+            write_rules_override: Some("mine".into()),
+        });
+        assert_eq!((c.brain_rules.as_str(), c.rules_override.as_str()), ("brain says", "mine"));
+        let built = build_catalogue_ref(&c).unwrap();
+        assert_eq!(built.write_rules_override.as_deref(), Some("mine"));
+        std::fs::write(dir.path().join("_rules.md"), "changed elsewhere\n").unwrap();
+        save_brain_rules(&c, &built).unwrap();
+        assert_eq!(brain_rules_text(dir.path()), "changed elsewhere", "an unedited field never overwrites the brain");
+        c.brain_rules = "new rules".into();
+        save_brain_rules(&c, &built).unwrap();
+        assert_eq!(brain_rules_text(dir.path()), "new rules");
+        c.rules_override = "  ".into();
+        assert_eq!(build_catalogue_ref(&c).unwrap().write_rules_override, None);
+    }
+
+    #[test]
+    fn saving_the_default_source_stores_only_its_override() {
+        let mut cfg = AppConfig::default();
+        let c = CatalogueRef {
+            name: "default".into(), path: PathBuf::from("/x"), remote: None, endpoint: None, region: None,
+            cache_ttl_secs: None, enabled: true, cadence: "manual".into(), access: "read_write".into(),
+            write_rules_override: Some("no logs".into()),
+        };
+        apply_save(&mut cfg, Some("default"), &c);
+        assert_eq!(cfg.brain.write_rules_override.as_deref(), Some("no logs"));
+        assert!(cfg.brain.catalogues.is_empty());
     }
 }

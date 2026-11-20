@@ -348,7 +348,7 @@ does not resolve them, since doing so is implementation, not spec:
    work for comparatively little benefit given ptyd is already the
    direction this project is standardizing on.
 7. **Binary distribution across architectures.** Ninox currently ships
-   prebuilt Apple-silicon binaries plus a CodeArtifact cargo registry
+   prebuilt Apple-silicon binaries plus a private cargo registry
    (recent `ninox update` work). The install-with-approval flow (§5.3)
    needs a real answer for a remote Linux/x86 host — is there a prebuilt
    artifact to fetch, or does install fall back to `cargo install` on the
@@ -356,9 +356,9 @@ does not resolve them, since doing so is implementation, not spec:
 
    **Resolved:** prefer a prebuilt binary matching the remote host's
    OS/architecture when one exists; fall back to `cargo install` from the
-   internal CodeArtifact registry only when no prebuilt exists (requiring
+   internal cargo registry only when no prebuilt exists (requiring
    a Rust toolchain on the remote host in that fallback case only). Flag:
-   this depends on CodeArtifact publishing actually being live on the
+   this depends on registry publishing actually being live on the
    internal repo, which has historically not been fully configured —
    implementation should verify this before relying on the fallback path,
    and treat an unavailable fallback as a clear, reported error rather

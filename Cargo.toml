@@ -55,3 +55,20 @@ aws-sdk-s3  = { version = "1", default-features = false, features = ["behavior-v
 ratatui     = "0.30"
 crossterm   = { version = "0.29", features = ["event-stream"] }
 futures-util = "0.3"
+
+# The GUI tests drive iced's widget tree hundreds of thousands of times (e.g.
+# click sweeps over the whole window). That generic code is monomorphised into
+# `ninox-gui`, so it runs at the crate's own opt-level — unoptimised it makes a
+# single render test take minutes.
+[profile.dev.package.ninox-gui]
+opt-level = 1
+[profile.dev.package.iced_core]
+opt-level = 1
+[profile.dev.package.iced_widget]
+opt-level = 1
+
+# Tests and CI never need full debuginfo, and it is the bulk of `target/`: line
+# tables keep backtraces readable (file:line) while shrinking the build cache CI
+# restores on every run and speeding up compiling/linking the test binaries.
+[profile.dev]
+debug = "line-tables-only"

@@ -147,7 +147,7 @@ mod tests {
             id: "s1".into(), orchestrator_id: None, name: "w".into(),
             repo: "r".into(), status, agent_type: "c".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None, workspace_path: None,
-            pid: None, model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            pid: None, model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             merged_at: None, gate_status: gate,

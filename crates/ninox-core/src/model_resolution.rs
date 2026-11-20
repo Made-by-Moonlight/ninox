@@ -53,6 +53,12 @@ pub const HARNESS_ROLE_DEFAULTS: &[HarnessRoleDefault] = &[
     HarnessRoleDefault { harness: "claude-code", role: Role::Worker,       model: "claude-sonnet-5-5", label: "Sonnet 5.5" },
 ];
 
+/// Whether a model id may appear in a picker list. Fable is usable only when
+/// typed explicitly (config, type, `--model`, the custom field), never offered.
+pub fn is_selectable_model(id: &str) -> bool {
+    !id.to_ascii_lowercase().contains("fable")
+}
+
 pub fn harness_role_default(harness: &str, role: Role) -> Option<&'static HarnessRoleDefault> {
     HARNESS_ROLE_DEFAULTS.iter().find(|d| d.harness == harness && d.role == role)
 }
@@ -213,9 +219,49 @@ pub fn type_model_summary(spec: &WorkerTypeSpec, config: &AppConfig) -> String {
     }
 }
 
-/// A restore/resume/restart keeps the model the session started with.
-pub fn relaunch_agent(session_harness: &str, session_model: Option<&str>) -> AgentConfig {
-    AgentConfig { harness: session_harness.to_string(), model: session_model.map(str::to_string) }
+/// A restore/resume/restart keeps the model the session was spawned with. A
+/// session spawned without one (`session_model` is `None`; a model the
+/// harness merely reported running is never passed here) gets the model a new
+/// spawn of the same role would resolve to, so the harness's own default
+/// can't win.
+pub fn relaunch_agent(
+    session_harness: &str,
+    session_model: Option<&str>,
+    role: Role,
+    worker_type: Option<&WorkerTypeSpec>,
+    config: &AppConfig,
+) -> AgentConfig {
+    // Rows written before `observed_model` existed may hold a statusline
+    // display name ("Opus 4.8"), which is never a launchable model id.
+    if let Some(m) = session_model.map(str::trim).filter(|m| !m.is_empty() && !m.contains(char::is_whitespace)) {
+        return AgentConfig { harness: session_harness.to_string(), model: Some(m.to_string()) };
+    }
+    let req = SpawnModelRequest { role: Some(role), worker_type, ..Default::default() }.with_harness(Some(session_harness));
+    effective_agent(&req, config).agent
+}
+
+/// Context window sizes by model id, in tokens, for sessions whose statusline
+/// has not reported one. The one place these live. A `[1m]` suffix marks the
+/// 1M-token variant of any Claude model.
+const CONTEXT_WINDOWS: &[(&str, u64)] = &[
+    ("claude-fable-5", 1_000_000),
+    ("claude-opus-5", 200_000),
+    ("claude-sonnet-5", 200_000),
+    ("claude-haiku-5", 200_000),
+    ("claude-opus-4", 200_000),
+    ("claude-sonnet-4", 200_000),
+    ("claude-haiku-4", 200_000),
+    ("claude-3", 200_000),
+];
+
+/// The context window of `model` in tokens, `None` for a model not in the
+/// table (callers then cannot compute a percentage).
+pub fn model_context_window(model: &str) -> Option<u64> {
+    let model = model.trim().to_ascii_lowercase();
+    if model.contains("[1m]") || model.ends_with("-1m") {
+        return model.starts_with("claude-").then_some(1_000_000);
+    }
+    CONTEXT_WINDOWS.iter().find(|(prefix, _)| model.starts_with(prefix)).map(|(_, w)| *w)
 }
 
 fn nonempty(m: &Option<String>) -> Option<String> {
@@ -225,6 +271,17 @@ fn nonempty(m: &Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_windows_cover_known_models_and_the_1m_variants() {
+        assert_eq!(model_context_window("claude-opus-5-5"), Some(200_000));
+        assert_eq!(model_context_window("claude-sonnet-5-5[1m]"), Some(1_000_000));
+        assert_eq!(model_context_window("claude-opus-5-5[1M]"), Some(1_000_000));
+        assert_eq!(model_context_window("claude-fable-5-2"), Some(1_000_000));
+        assert_eq!(model_context_window("gpt-4o"), None);
+        assert_eq!(model_context_window("gpt-4o[1m]"), None);
+        assert_eq!(model_context_window(""), None);
+    }
 
     fn cfg(orch: (&str, Option<&str>), worker: (&str, Option<&str>)) -> AppConfig {
         AppConfig {
@@ -421,7 +478,37 @@ mod tests {
 
     #[test]
     fn relaunch_keeps_the_session_model() {
-        let a = relaunch_agent("claude-code", Some("claude-opus-4-8"));
-        assert_eq!(a.model.as_deref(), Some("claude-opus-4-8"));
+        let c = cfg(("claude-code", Some("o")), ("claude-code", Some("w")));
+        for role in [Role::Orchestrator, Role::Worker] {
+            let a = relaunch_agent("claude-code", Some("claude-opus-4-8"), role, None, &c);
+            assert_eq!(a.model.as_deref(), Some("claude-opus-4-8"));
+        }
+    }
+
+    #[test]
+    fn an_explicitly_typed_fable_model_still_launches_and_relaunches() {
+        let c = cfg(("claude-code", Some("claude-fable-5-2")), ("claude-code", None));
+        let o = effective_agent(&SpawnModelRequest::orchestrator(None), &c);
+        assert_eq!((o.agent.model.as_deref(), o.source), (Some("claude-fable-5-2"), ModelSource::Setting));
+        let w = effective_agent(&SpawnModelRequest::worker(None).with_model(Some("claude-fable-5-1")), &c);
+        assert_eq!((w.agent.model.as_deref(), w.source), (Some("claude-fable-5-1"), ModelSource::Explicit));
+        let r = relaunch_agent("claude-code", Some("claude-fable-5-1"), Role::Worker, None, &c);
+        assert_eq!(r.model.as_deref(), Some("claude-fable-5-1"));
+        assert!(is_selectable_model("claude-opus-5-5") && !is_selectable_model("claude-fable-5-2"));
+    }
+
+    #[test]
+    fn relaunch_without_a_recorded_model_resolves_by_role() {
+        let c = cfg(("claude-code", None), ("claude-code", None));
+        let model = |role, harness: &str| relaunch_agent(harness, None, role, None, &c).model;
+        assert_eq!(model(Role::Orchestrator, "claude-code").as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(model(Role::Worker, "claude-code").as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(model(Role::Worker, "codex"), None, "no built-in default for codex: the harness picks");
+        let c = cfg(("claude-code", Some("o")), ("claude-code", Some("w")));
+        assert_eq!(relaunch_agent("claude-code", None, Role::Orchestrator, None, &c).model.as_deref(), Some("o"));
+        assert_eq!(relaunch_agent("claude-code", Some("  "), Role::Worker, None, &c).model.as_deref(), Some("w"));
+        assert_eq!(relaunch_agent("claude-code", Some("Opus 4.8"), Role::Worker, None, &c).model.as_deref(), Some("w"), "a display name is not a model id");
+        let t = ty("claude-code", Some("t"));
+        assert_eq!(relaunch_agent("claude-code", None, Role::Worker, Some(&t), &c).model.as_deref(), Some("t"));
     }
 }

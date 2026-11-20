@@ -222,7 +222,11 @@ pub fn info_lines(st: &TuiState, r: &Row, width: usize) -> Vec<Line<'static>> {
         kv(&mut out, p, "gate", format!("ci {:?} · review {:?} · merge {:?}", g.ci, g.review, g.mergeable).to_lowercase(), width);
     }
     kv(&mut out, p, "cost", format!("${:.2}", s.cost_usd), width);
-    if let Some(pct) = s.context_used_pct {
+    if r.is_orchestrator {
+        // Always shown for an orchestrator, `—` until it reports.
+        let meter = ninox_ui_shared::context_meter::ContextMeter::for_session(s, &st.reset_cfg);
+        kv(&mut out, p, "context", meter.sheet_line(), width);
+    } else if let Some(pct) = s.context_used_pct {
         kv(&mut out, p, "context", format!("{pct:.0}%"), width);
     }
     kv(&mut out, p, "harness", format!("{}{}", s.agent_type, s.model.as_ref().map(|m| format!(" · {m}")).unwrap_or_default()), width);
@@ -445,6 +449,26 @@ mod tests {
         let text: String = info_lines(&st, &st.rows[0], 60).iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n").collect();
         assert!(!text.contains("— ago") && !text.contains("for —"), "{text}");
         assert!(text.contains("STARTED   —"), "{text}");
+    }
+
+    fn sheet(st: &TuiState, i: usize) -> String {
+        info_lines(st, &st.rows[i], 80).iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n").collect()
+    }
+
+    #[test]
+    fn an_orchestrators_sheet_shows_context_with_the_threshold_and_a_dash_when_unknown() {
+        use ninox_core::config::{OrchestratorResetConfig, ResetMode};
+        let mut st = TuiState { rows: vec![Row::test_row("o"), Row::test_row("w")], ..Default::default() };
+        st.rows[0].is_orchestrator = true;
+        st.reset_cfg = OrchestratorResetConfig { auto_at_context_pct: 40, mode: ResetMode::Auto };
+        assert!(sheet(&st, 0).contains("CONTEXT   —"), "{}", sheet(&st, 0));
+        st.rows[0].session.context_used_pct = Some(44.0);
+        st.rows[0].session.context_total_tokens = Some(440_000);
+        st.rows[0].session.context_window_size = Some(1_000_000);
+        assert!(sheet(&st, 0).contains("44% (440k / 1000k) · reset at 40%"), "{}", sheet(&st, 0));
+        st.reset_cfg.mode = ResetMode::Off;
+        assert!(!sheet(&st, 0).contains("reset at"), "no threshold while off");
+        assert!(!sheet(&st, 1).contains("CONTEXT"), "a worker with no reading shows no line");
     }
 
     #[test]

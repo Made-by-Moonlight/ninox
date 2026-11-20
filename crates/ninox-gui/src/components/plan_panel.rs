@@ -78,7 +78,7 @@ fn link_chips<'a>(links: &'a [(String, String)], editor_is_terminal: bool) -> El
 /// Font size + base font for a block kind. Headings step down from a large
 /// sans H1 to a body-sized H6; paragraphs/list items/code share the body
 /// row but differ in font (sans vs. mono).
-fn style_for(kind: BlockKind) -> (f32, iced::Font) {
+pub(super) fn style_for(kind: BlockKind) -> (f32, iced::Font) {
     match kind {
         BlockKind::Heading(1) => (22.0, crate::style::SANS_SEMIBOLD),
         BlockKind::Heading(2) => (19.0, crate::style::SANS_SEMIBOLD),

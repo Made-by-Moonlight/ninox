@@ -214,6 +214,7 @@ mod tests {
             enabled: true,
             cadence: "manual".to_string(),
             access: "read_write".to_string(),
+            write_rules_override: None,
         }];
         ensure_sync_toml(&cfg, &brain_path).unwrap();
         let loaded = SyncToml::load(&brain_path).unwrap().unwrap();
@@ -237,6 +238,7 @@ mod tests {
             enabled: true,
             cadence: "manual".to_string(),
             access: "read_write".to_string(),
+            write_rules_override: None,
         }];
         ensure_sync_toml(&cfg, dir.path()).unwrap();
         assert_eq!(SyncToml::load(dir.path()).unwrap().unwrap(), existing, "the directory's .sync.toml wins");

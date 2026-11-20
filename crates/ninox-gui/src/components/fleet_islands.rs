@@ -27,6 +27,7 @@ use ninox_overview::islands::{
 };
 use ninox_overview::status::MemberStatus;
 
+use super::pr_chip::{self, ChipPlan};
 use super::shell::tokens;
 use crate::app::{App, FleetMachineFilter, Message};
 
@@ -153,18 +154,6 @@ pub(crate) fn member_chip_with_prs(
     }
 }
 
-/// Clips `s` to at most `max_chars`, whole, with an ellipsis — avoids
-/// mid-word wraps on a hyphenated session name (same rule `fleet_board`
-/// applies to Board cards).
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let clipped: String = s.chars().take(max_chars).collect();
-        format!("{clipped}…")
-    }
-}
-
 fn island_meta(summary: &IslandSummary) -> String {
     let total = summary.total();
     let active = summary.active();
@@ -224,33 +213,98 @@ pub(crate) fn chip_pill<'a>(label: String, bg: Color, fg: Color) -> Element<'a, 
 // whichever of the two borrows is shorter-lived (the islands `Vec` that
 // `fleet_islands` rebuilds on every render), which the pub `fleet_islands`
 // function then can't return as `Element<'_, Message>` tied to `app` alone.
-/// An island row is ~220px wide: one short chip, so the name keeps room.
-const ISLAND_ROW_LABEL_CHARS: usize = 12;
+/// Label cap for a member's PR chips; the budget folds to fewer or a count chip first.
+const ISLAND_ROW_LABEL_CHARS: usize = 14;
+const ISLAND_ROW_SHORT_LABEL_CHARS: usize = 8;
+const MEMBER_NAME_SIZE: f32 = 11.0;
+const HEAD_NAME_SIZE: f32 = 12.5;
+/// The island head's context meter bar.
+const METER_BAR_PX: f32 = 34.0;
+/// Card insets: 18px board padding each side, 14px between columns.
+const BOARD_PAD_PX: f32 = 36.0;
+const COLUMN_GAP_PX: f32 = 14.0;
+/// Head: 11px card padding each side plus the status dot and its gap.
+const HEAD_FIXED_PX: f32 = 22.0 + 8.0 + 7.0 + CARD_BORDER_PX;
+/// Member row inside the rail: 15 left + 1 line + 7 gap + 11 right padding,
+/// plus the tick, status dot and their spacing.
+const ROW_FIXED_PX: f32 = 34.0 + 9.0 + 7.0 + 12.0 + CARD_BORDER_PX;
+/// The card's border, both sides, at its 2px selected width.
+const CARD_BORDER_PX: f32 = 4.0;
 
-fn member_row<'a>(app: &'a App, island: &IslandKey, member: &IslandMember) -> Element<'a, Message> {
+fn board_columns(app: &App) -> usize {
+    if app.fleet_nav.tree_collapsed { 5 } else { 4 }
+}
+
+/// Logical width of one island card, from the window width (which already
+/// accounts for the zoom) less the sidebar and the board's insets.
+pub(crate) fn island_card_px(app: &App) -> f32 {
+    let sidebar = if app.fleet_nav.tree_collapsed { super::shell::tree::RAIL_WIDTH } else { super::shell::tree::EXPANDED_WIDTH };
+    let cols = board_columns(app) as f32;
+    // A selected ghost opens a detail panel (and its divider) beside the board;
+    // a selected card only raises the bottom action row.
+    let detail = if app.ghost.selected.is_some() {
+        super::fleet_detail::PANEL_WIDTH + 1.0
+    } else {
+        0.0
+    };
+    ((app.window_width - sidebar - detail - BOARD_PAD_PX - COLUMN_GAP_PX * (cols - 1.0)) / cols).max(120.0)
+}
+
+/// A single-line name cell: the pinned height is what keeps it to one line
+/// (the text otherwise re-wraps inside whatever width it is given).
+fn name_cell<'a>(full: &str, shown: String, size: f32, line_px: f32) -> Element<'a, Message> {
+    let truncated = shown != full;
+    let cell = container(
+        text(shown)
+            .size(size)
+            .font(crate::style::SANS)
+            .color(tokens::TEXT)
+            .wrapping(iced::widget::text::Wrapping::None),
+    )
+    .width(Length::Fill)
+    .height(Length::Fixed(line_px))
+    .align_y(iced::alignment::Vertical::Center)
+    .clip(true);
+    if truncated {
+        super::shell::tree::hover_tip(cell.into(), full.to_string())
+    } else {
+        cell.into()
+    }
+}
+
+/// The name as shown and the PR chip plan for a member row, from the row's
+/// width budget.
+pub(crate) fn member_row_parts(app: &App, member: &IslandMember) -> (String, Option<ChipPlan>) {
     let session = app.sessions.get(&member.id);
     let name = session.map(|s| s.name.as_str()).unwrap_or(member.id.as_str());
-    let chip = session.and_then(|s| member_chip_with_prs(member.status, s, app.queue_positions.get(&member.id).copied(), app.session_prs.get(&member.id).map(Vec::as_slice).unwrap_or_default()));
+    let prs = app.session_prs.get(&member.id).map(Vec::as_slice).unwrap_or_default();
+    let chip = session.and_then(|s| member_chip_with_prs(member.status, s, app.queue_positions.get(&member.id).copied(), prs));
+    let status_px = chip.as_ref().map_or(0.0, |(label, ..)| 6.0 + pr_chip::text_px(label, 9.5) + 12.0);
+    let avail = island_card_px(app) - ROW_FIXED_PX - status_px;
+    let chip_plan = (!prs.is_empty()).then(|| {
+        pr_chip::plan(prs, pr_chip::text_px(name, MEMBER_NAME_SIZE), avail, 2, ISLAND_ROW_LABEL_CHARS, Some(ISLAND_ROW_SHORT_LABEL_CHARS))
+    });
+    let name_px = avail - chip_plan.map_or(0.0, |p| p.width(prs));
+    (pr_chip::fit_name(name, MEMBER_NAME_SIZE, name_px), chip_plan)
+}
+
+pub(crate) fn member_row<'a>(app: &'a App, island: &IslandKey, member: &IslandMember) -> Element<'a, Message> {
+    let session = app.sessions.get(&member.id);
+    let name = session.map(|s| s.name.as_str()).unwrap_or(member.id.as_str());
+    let prs = app.session_prs.get(&member.id).map(Vec::as_slice).unwrap_or_default();
+    let chip = session.and_then(|s| member_chip_with_prs(member.status, s, app.queue_positions.get(&member.id).copied(), prs));
+    let (shown, chip_plan) = member_row_parts(app, member);
 
     let mut items: Vec<Element<Message>> = vec![
         tick(),
         dot(member_status_color(member.status), 7.0),
-        container(
-            text(truncate_chars(name, 34))
-                .size(11)
-                .font(crate::style::SANS)
-                .color(tokens::TEXT)
-                .wrapping(iced::widget::text::Wrapping::None),
-        )
-        .width(Length::Fill)
-        .clip(true)
-        .into(),
+        name_cell(name, shown, MEMBER_NAME_SIZE, 16.0),
     ];
     if let Some((label, bg, fg)) = chip {
         items.push(chip_pill(label, bg, fg));
     }
-    if let Some(prs) = app.session_prs.get(&member.id).and_then(|prs| crate::components::pr_chip::chips(&member.id, prs, 1, ISLAND_ROW_LABEL_CHARS, false)) {
-        items.push(prs);
+    if let Some(chips) = chip_plan.and_then(|p| pr_chip::render(&member.id, prs, p, false)) {
+        items.push(chips);
     }
 
     mouse_area(row(items).align_y(Alignment::Center).spacing(6))
@@ -337,29 +391,50 @@ fn status_bar<'a>(summary: &IslandSummary) -> Element<'a, Message> {
         .into()
 }
 
-fn island_head<'a>(island: &Island) -> Element<'a, Message> {
+/// The context meter for an island's head: only when its root is an
+/// orchestrator (an island rooted at a standalone or worker session has no
+/// context to reset).
+pub(crate) fn island_meter(app: &App, island: &Island) -> Option<ninox_ui_shared::context_meter::ContextMeter> {
+    let root = island.root.as_ref()?;
+    if !app.orchestrators.iter().any(|o| &o.id == root) {
+        return None;
+    }
+    let session = app.sessions.get(root)?;
+    Some(ninox_ui_shared::context_meter::ContextMeter::for_session(session, &app.config.orchestrator_reset))
+}
+
+pub(crate) fn island_head<'a>(app: &App, island: &Island) -> Element<'a, Message> {
+    use crate::components::pr_chip::{fit_name, text_px};
+    let badge = island.needs_attention().then(|| format!("{} NEED YOU", island.summary.needs_you));
+    let meta = Some(island_meta(&island.summary)).filter(|m| !m.is_empty());
+
+    // The title keeps its room first; the meta is dropped before the title
+    // is cut, and the badge is the last thing to give way.
+    let badge_px = badge.as_ref().map_or(0.0, |b| 7.0 + text_px(b, 9.5) + 12.0);
+    let meta_px = meta.as_ref().map_or(0.0, |m| 7.0 + text_px(m, 10.0) * 1.2);
+    let avail = island_card_px(app) - HEAD_FIXED_PX;
+    let name_px = text_px(&island.name, HEAD_NAME_SIZE);
+    // The orchestrator's context meter; it goes after the meta, which is
+    // dropped first when the head is short of room.
+    let meter = island_meter(app, island);
+    let meter_w = crate::components::context_meter::meter_px(METER_BAR_PX, 9.5) + 7.0;
+    let show_meter = meter.is_some() && name_px + badge_px + meter_w <= avail;
+    let meter_reserved = if show_meter { meter_w } else { 0.0 };
+    let show_meta = meta.is_some() && name_px + badge_px + meter_reserved + meta_px <= avail;
+    let reserved = badge_px + meter_reserved + if show_meta { meta_px } else { 0.0 };
+
     let mut items: Vec<Element<Message>> = vec![
         dot(tokens::TEAL, 8.0),
-        container(
-            text(truncate_chars(&island.name, 40))
-                .size(12.5)
-                .font(crate::style::SANS)
-                .color(tokens::TEXT)
-                .wrapping(iced::widget::text::Wrapping::None),
-        )
-        .width(Length::Fill)
-        .clip(true)
-        .into(),
+        name_cell(&island.name, fit_name(&island.name, HEAD_NAME_SIZE, avail - reserved), HEAD_NAME_SIZE, 18.0),
     ];
-    if island.needs_attention() {
-        items.push(chip_pill(
-            format!("{} NEED YOU", island.summary.needs_you),
-            tokens::AMBER_BADGE_BG, tokens::AMBER_BADGE_FG,
-        ));
+    if let Some(badge) = badge {
+        items.push(chip_pill(badge, tokens::AMBER_BADGE_BG, tokens::AMBER_BADGE_FG));
     }
-    let meta = island_meta(&island.summary);
-    if !meta.is_empty() {
-        items.push(text(meta).size(10).font(crate::style::MONO).color(tokens::DIM2).into());
+    if let Some(meta) = meta.filter(|_| show_meta) {
+        items.push(text(meta).size(10).font(crate::style::MONO).color(tokens::DIM2).wrapping(iced::widget::text::Wrapping::None).into());
+    }
+    if let Some(meter) = meter.filter(|_| show_meter) {
+        items.push(crate::components::context_meter::context_meter(meter, METER_BAR_PX, 9.5));
     }
     row(items).align_y(Alignment::Center).spacing(7)
         .padding(Padding { top: 9.0, right: 11.0, bottom: 7.0, left: 11.0 })
@@ -420,7 +495,7 @@ fn island_card<'a>(app: &'a App, island: &Island, selected: bool) -> Element<'a,
     if let Some(machine) = &island.machine {
         sections.push(remote_band(app, machine));
     }
-    sections.push(island_head(island));
+    sections.push(island_head(app, island));
     sections.push(status_bar(&island.summary));
     sections.push(member_rail(app, island));
 
@@ -643,7 +718,7 @@ pub fn fleet_islands<'a>(app: &'a App, islands: &[Island]) -> Element<'a, Messag
             .center_y(Length::Fill)
             .into()
     } else {
-        let columns = if app.fleet_nav.tree_collapsed { 5 } else { 4 };
+        let columns = board_columns(app);
         let cols = pack_columns(&visible, columns.min(visible.len().max(1)).max(1));
         let mut cells: Vec<Vec<Element<Message>>> = cols.into_iter().map(|col_islands| {
             col_islands.into_iter().map(|island| {
@@ -770,20 +845,12 @@ mod tests {
         assert_eq!(island_meta(&IslandSummary::default()), "");
     }
 
-    #[test]
-    fn truncate_chars_clips_long_names_whole() {
-        let name = "bottlerocket-selinux-mount-propagation-test";
-        let clipped = truncate_chars(name, 10);
-        assert_eq!(clipped.chars().count(), 11);
-        assert!(clipped.ends_with('…'));
-    }
-
     fn session_with(status: SessionStatus, activity: ActivityState) -> Session {
         Session {
             id: "s".into(), orchestrator_id: Some("o".into()), name: "s-name".into(),
             repo: "o/r".into(), status, agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None, context_used_pct: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None, context_used_pct: None,
             context_total_tokens: None, context_window_size: None, claude_session_id: None,
             summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity, activity_note: None, activity_since: None, machine_id: None, worker_type: None,

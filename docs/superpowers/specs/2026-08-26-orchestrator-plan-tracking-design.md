@@ -82,7 +82,7 @@ Two problems block a good version of this:
   free. Its `Highlighter` trait (used for code-editor syntax highlighting
   in iced's own examples) lets us color/weight spans per line without
   owning selection logic ourselves. Trade-off, called out explicitly for
-  Ethan to sign off on: this gets bold/italic/heading/code/link *styling*
+  the maintainer to sign off on: this gets bold/italic/heading/code/link *styling*
   and full text selection, but not `markdown::view`'s block layout (no
   distinct heading font sizes, no indented block quotes/lists, no inline
   images, no clickable links). If pixel-parity rendering *and* selection is

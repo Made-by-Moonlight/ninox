@@ -160,6 +160,7 @@ pub enum SessionAction {
     OpenInEditor,
     PopOut,
     Restart,
+    ResetFromPlan,
     Kill,
     Delete,
 }
@@ -186,6 +187,7 @@ pub fn action_message(
         SessionAction::OpenInEditor => Message::OpenInEditor(workspace?.to_string()),
         SessionAction::PopOut => Message::PopOutSession(session_id.to_string()),
         SessionAction::Restart => Message::SessionConfirmAsk(Confirmable::Restart),
+        SessionAction::ResetFromPlan => Message::ResetFromPlanAsk(session_id.to_string()),
         SessionAction::Kill => Message::SessionConfirmAsk(Confirmable::Kill),
         SessionAction::Delete => Message::DeleteAsk(session_id.to_string()),
     })
@@ -326,7 +328,7 @@ pub fn type_badge_label(session: &Session, is_orchestrator: bool) -> String {
 
 /// `harness · model`, or just the harness when the model is unknown.
 pub fn harness_label(session: &Session) -> String {
-    match session.model.as_deref().filter(|m| !m.is_empty()) {
+    match session.model_label() {
         Some(m) => format!("{} · {m}", session.agent_type),
         None => session.agent_type.clone(),
     }
@@ -671,11 +673,12 @@ fn actions<'a>(app: &'a App, session: &'a Session, is_orchestrator: bool) -> Ele
         )
     });
     let send_tone = if acp { Tone::Primary } else { Tone::Plain };
-    let mut items: Vec<Element<Message>> = vec![text(format!("${:.2}", session.cost_usd))
-        .size(12)
-        .font(MONO)
-        .color(tokens::DIM)
-        .into()];
+    let mut items: Vec<Element<Message>> = Vec::new();
+    if is_orchestrator {
+        let meter = ninox_ui_shared::context_meter::ContextMeter::for_session(session, &app.config.orchestrator_reset);
+        items.push(crate::components::context_meter::context_meter(meter, 84.0, 12.0));
+    }
+    items.push(text(format!("${:.2}", session.cost_usd)).size(12).font(MONO).color(tokens::DIM).into());
     items.extend(connect);
     items.extend([
         btn(
@@ -738,6 +741,14 @@ fn actions<'a>(app: &'a App, session: &'a Session, is_orchestrator: bool) -> Ele
                     .flatten(),
                 Tone::Warn,
             ));
+            if is_orchestrator {
+                let live = !session.status.is_terminal();
+                items.push(btn(
+                    btn_text("Reset from plan", Tone::Warn, live),
+                    live.then(|| action_message(SessionAction::ResetFromPlan, sid, None)).flatten(),
+                    Tone::Warn,
+                ));
+            }
             if !is_orchestrator {
                 items.push(btn(
                     btn_text("Kill", Tone::Danger, true),
@@ -1636,7 +1647,7 @@ mod tests {
             workspace_path: workspace_path.map(String::from),
             pid: None,
             model: None,
-            context_tokens: None,
+            observed_model: None, context_tokens: None,
             brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None,
             context_total_tokens: None,

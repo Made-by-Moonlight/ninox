@@ -278,7 +278,7 @@ async fn an_accepted_worker_node_launches() {
     let row = row.expect("session row");
     assert_eq!(row.orchestrator_id.as_deref(), Some("lead"));
     assert_eq!(row.worker_type.as_deref(), Some("FakeWorker"));
-    assert!(row.brain_write.is_some());
+    assert!(row.brain_write.is_none(), "no limit recorded: the worker gets every enabled brain");
 }
 
 #[test]

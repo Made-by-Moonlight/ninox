@@ -1594,19 +1594,60 @@ fn tree_line(st: &TuiState, row: &fleet::TreeRow, selected: Option<&str>) -> Lin
 /// Called both to measure the box's height and to render it — islands are
 /// small and this redraws at most once a second, so recomputing rather than
 /// caching is simplest.
-fn island_rows(st: &TuiState, island: &Island) -> Vec<Line<'static>> {
+/// The context meter's colour: plain until it nears the reset threshold,
+/// then the accent, then the failure colour at and past it.
+pub(super) fn meter_style(p: &Palette, tint: ninox_ui_shared::context_meter::MeterTint) -> Style {
+    use ninox_ui_shared::context_meter::MeterTint;
+    match tint {
+        MeterTint::Normal => Style::default().fg(p.faint),
+        MeterTint::Near => Style::default().fg(p.accent),
+        MeterTint::Over => Style::default().fg(p.ci_failed).add_modifier(Modifier::BOLD),
+    }
+}
+
+/// The island's title line, fitted to `width` columns so it never wraps into
+/// the member rows below it: the name gives way first (down to a floor), then
+/// the context meter is dropped.
+fn island_title(st: &TuiState, island: &Island, width: usize) -> Line<'static> {
+    const NAME_FLOOR: usize = 10;
+    let p = &st.palette;
+    let attn = if island.needs_attention() { format!("  !{}", island.summary.needs_you) } else { String::new() };
+    let total = island.summary.total();
+    let count = if total > 0 { format!("  {total}") } else { String::new() };
+    let mut meter = island
+        .root
+        .as_ref()
+        .and_then(|id| st.rows.iter().find(|r| r.id() == id.as_str()))
+        .filter(|r| r.is_orchestrator)
+        .map(|r| ninox_ui_shared::context_meter::ContextMeter::for_session(&r.session, &st.reset_cfg))
+        .map(|m| (format!("  {}", m.compact()), meter_style(p, m.tint)));
+    let fixed = 2 + attn.width() + count.width();
+    let floor = NAME_FLOOR.min(island.name.width());
+    if meter.as_ref().is_some_and(|(t, _)| width < fixed + t.width() + floor) {
+        meter = None;
+    }
+    let name_room = width.saturating_sub(fixed + meter.as_ref().map_or(0, |(t, _)| t.width()));
+    let mut title = vec![
+        Span::styled("● ", Style::default().fg(p.working)),
+        Span::styled(truncate(&island.name, name_room.min(26)), Style::default().fg(p.ink).add_modifier(Modifier::BOLD)),
+    ];
+    if !attn.is_empty() {
+        title.push(Span::styled(attn, Style::default().fg(p.accent)));
+    }
+    if !count.is_empty() {
+        title.push(Span::styled(count, Style::default().fg(p.faint)));
+    }
+    if let Some((text, style)) = meter {
+        title.push(Span::styled(text, style));
+    }
+    Line::from(title)
+}
+
+fn island_rows(st: &TuiState, island: &Island, width: usize) -> Vec<Line<'static>> {
     let p = &st.palette;
     let mut lines = Vec::new();
-    let mut title = vec![Span::styled("● ", Style::default().fg(p.working))];
-    title.push(Span::styled(truncate(&island.name, 26), Style::default().fg(p.ink).add_modifier(Modifier::BOLD)));
-    if island.needs_attention() {
-        title.push(Span::styled(format!("  !{}", island.summary.needs_you), Style::default().fg(p.accent)));
-    }
-    let total = island.summary.total();
-    if total > 0 {
-        title.push(Span::styled(format!("  {total}"), Style::default().fg(p.faint)));
-    }
-    lines.push(Line::from(title));
+    let title = island_title(st, island, width);
+    lines.push(title);
 
     let others: Vec<&ninox_overview::islands::IslandMember> =
         island.members.iter().filter(|m| Some(&m.id) != island.root.as_ref()).collect();
@@ -1692,7 +1733,7 @@ fn draw_island_box(f: &mut Frame, st: &TuiState, area: Rect, island: &Island) {
         lines.push(remote_band_line(st, machine));
     }
     st.chip_scratch.borrow_mut().clear();
-    lines.extend(island_rows(st, island));
+    lines.extend(island_rows(st, island, inner.width as usize));
     super::pr_chips::register(st, &lines, inner, true);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
@@ -2017,7 +2058,7 @@ fn draw_fleet_detail(f: &mut Frame, st: &TuiState, area: Rect) {
             "{} · {} · {}",
             row.session.worker_type.as_deref().unwrap_or("Worker"),
             row.session.agent_type,
-            row.session.model.as_deref().unwrap_or("—"),
+            row.session.model_label().as_deref().unwrap_or("—"),
         )));
         let branch = row.session.workspace_path.as_deref().and_then(|w| w.rsplit('/').next()).filter(|b| !b.is_empty());
         let mut artifacts = Vec::new();
@@ -2104,6 +2145,10 @@ fn draw_fleet_detail(f: &mut Frame, st: &TuiState, area: Rect) {
     if row.session.workspace_path.is_some() {
         spans.push(Span::raw("  "));
         spans.extend(key_hint(p, "F", "re-file"));
+    }
+    if row.is_orchestrator && !row.session.status.is_terminal() {
+        spans.push(Span::raw("  "));
+        spans.extend(key_hint(p, "P", "reset from plan"));
     }
     lines.push(Line::from(spans));
 
@@ -2634,6 +2679,33 @@ fn draw_brain_sources(f: &mut Frame, area: Rect, st: &TuiState) {
     }
 }
 
+/// Word-wraps `text` to `width` columns, keeping its line breaks, and stops
+/// at `max_lines` with a trailing "…".
+fn wrap_rules(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for para in text.trim().lines() {
+        let mut cur = String::new();
+        for word in para.split_whitespace() {
+            let word: String = if word.chars().count() > width { word.chars().take(width).collect() } else { word.to_string() };
+            if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > width {
+                out.push(std::mem::take(&mut cur));
+            }
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(&word);
+        }
+        out.push(cur);
+    }
+    if out.len() > max_lines {
+        out.truncate(max_lines);
+        if let Some(last) = out.last_mut() {
+            *last = format!("{}…", truncate(last, width.saturating_sub(1)));
+        }
+    }
+    out
+}
+
 fn draw_source_detail(f: &mut Frame, area: Rect, st: &TuiState, c: &ninox_core::config::CatalogueRef) {
     use ninox_ui_shared::brain_sources::{self as shared, SourceType};
     let p = &st.palette;
@@ -2672,6 +2744,21 @@ fn draw_source_detail(f: &mut Frame, area: Rect, st: &TuiState, c: &ninox_core::
     if let Some(err) = status.and_then(|s| s.last_error.as_deref()) {
         lines.push(field("Last error", shared::redact_credentials(err), p.ci_failed));
     }
+    lines.push(Line::from(""));
+    let brain_text = shared::brain_rules_text(&c.path);
+    let rules_block = |lines: &mut Vec<Line>, title: &str, note: &str, text: &str| {
+        lines.push(Line::from(Span::styled(truncate(title, w), Style::default().fg(p.faint))));
+        lines.push(Line::from(Span::styled(truncate(note, w), Style::default().fg(p.faint))));
+        if text.trim().is_empty() {
+            lines.push(Line::from(Span::styled("none", Style::default().fg(p.ink_2))));
+        }
+        for l in wrap_rules(text, w.max(8), 8) {
+            lines.push(Line::from(Span::styled(l, Style::default().fg(p.ink_2))));
+        }
+    };
+    rules_block(&mut lines, "Brain rules", "shared with everyone who uses this brain, synced", &brain_text);
+    lines.push(Line::from(""));
+    rules_block(&mut lines, "My override", "only on this machine, never synced", c.write_rules_override.as_deref().unwrap_or(""));
     lines.push(Line::from(""));
     let actions = if super::sources::is_builtin(c) { "s sync · set in config.toml [brain]" } else { "e edit · s sync · t on/off · d remove" };
     lines.push(Line::from(Span::styled(truncate(actions, w), Style::default().fg(p.faint))));
@@ -2956,8 +3043,19 @@ fn draw_settings_bar(f: &mut Frame, sl: &super::layout::SettingsLayout, st: &Tui
     f.render_widget(Paragraph::new(col), rule);
 }
 
+/// A locked field reads dimmed; `ink_2` while selected, since `faint` is the
+/// selection background's colour.
+fn settings_label_style(p: &Palette, sel: bool, locked: bool, faint: Style) -> Style {
+    match (sel, locked) {
+        (true, true) => Style::default().fg(p.ink_2),
+        (true, false) => Style::default().fg(p.ink).add_modifier(Modifier::BOLD),
+        (false, true) => faint,
+        (false, false) => Style::default().fg(p.ink_2),
+    }
+}
+
 fn draw_settings(f: &mut Frame, lay: &Layout, st: &TuiState) {
-    use super::layout::SettingsLine;
+    use super::layout::{wrap_label, SettingsLine};
     use super::settings::Kind;
     let p = &st.palette;
     let Some(sl) = &lay.settings else { return };
@@ -3012,15 +3110,25 @@ fn draw_settings(f: &mut Frame, lay: &Layout, st: &TuiState) {
                 let indent = if label_w + 2 + 2 + e.chars().count() <= w { label_w + 2 } else { 2 };
                 Line::from(Span::styled(truncate(&format!("{}✗ {e}", " ".repeat(indent)), w), Style::default().fg(p.ci_failed)))
             }
+            SettingsLine::Cont(i, n) => {
+                let Some(fd) = v.fields.get(i) else { continue };
+                let sel = i == v.selected && v.in_fields;
+                if sel {
+                    fill(f, r, p.highlight);
+                }
+                let part = wrap_label(&fd.label, label_w).get(n).cloned().unwrap_or_default();
+                Line::from(vec![Span::raw("  "), Span::styled(part, settings_label_style(p, sel, fd.locked, faint))])
+            }
             SettingsLine::Field(i) => {
                 let Some(fd) = v.fields.get(i) else { continue };
                 let sel = i == v.selected && v.in_fields;
                 if sel {
                     fill(f, r, p.highlight);
                 }
-                let label_style = if sel { Style::default().fg(p.ink).add_modifier(Modifier::BOLD) } else { Style::default().fg(p.ink_2) };
+                let label_style = settings_label_style(p, sel, fd.locked, faint);
                 let bar = if sel { Span::styled("▌ ", Style::default().fg(p.accent)) } else { Span::raw("  ") };
-                let mut spans = vec![bar, Span::styled(format!("{:<label_w$}", truncate(&fd.label, label_w)), label_style)];
+                let first = wrap_label(&fd.label, label_w).swap_remove(0);
+                let mut spans = vec![bar, Span::styled(format!("{first:<label_w$}"), label_style)];
                 let vw = w.saturating_sub(label_w + 2);
                 // `ink_2` rather than `faint` while selected — this row's
                 // background is `p.highlight` then, and `faint` is
@@ -3034,7 +3142,7 @@ fn draw_settings(f: &mut Frame, lay: &Layout, st: &TuiState) {
                     }
                     (Kind::Toggle, None) => {
                         let on = fd.value == "on";
-                        let (g, c) = if on { ("● on", p.working) } else { ("○ off", dim.fg.unwrap_or(p.faint)) };
+                        let (g, c) = if on && !fd.locked { ("● on", p.working) } else if on { ("● on", dim.fg.unwrap_or(p.faint)) } else { ("○ off", dim.fg.unwrap_or(p.faint)) };
                         spans.push(Span::styled(g, Style::default().fg(c).add_modifier(if on { Modifier::BOLD } else { Modifier::empty() })));
                         if fd.locked {
                             spans.push(Span::styled("  always", dim));
@@ -3044,14 +3152,14 @@ fn draw_settings(f: &mut Frame, lay: &Layout, st: &TuiState) {
                         let shown = truncate(&fd.value, vw.saturating_sub(4));
                         if sel {
                             spans.push(Span::styled("‹ ", dim));
-                            spans.push(Span::styled(shown, Style::default().fg(p.accent).add_modifier(Modifier::BOLD)));
+                            spans.push(Span::styled(shown, if fd.locked { dim } else { Style::default().fg(p.accent).add_modifier(Modifier::BOLD) }));
                             spans.push(Span::styled(" ›", dim));
                         } else {
-                            spans.push(Span::styled(shown, Style::default().fg(p.ink)));
+                            spans.push(Span::styled(shown, if fd.locked { dim } else { Style::default().fg(p.ink) }));
                         }
                     }
                     (Kind::Text, None) if fd.value.is_empty() => spans.push(Span::styled(truncate(&fd.placeholder, vw), dim)),
-                    (Kind::Text, None) => spans.push(Span::styled(truncate(&fd.value, vw), Style::default().fg(p.ink))),
+                    (Kind::Text, None) => spans.push(Span::styled(truncate(&fd.value, vw), if fd.locked { dim } else { Style::default().fg(p.ink) })),
                     (Kind::Action, None) => {
                         let verb = if fd.id == super::settings::FieldId::RestartServer && st.server_restarting {
                             "restarting…"
@@ -3519,6 +3627,56 @@ fn draw_modal(f: &mut Frame, area: Rect, st: &TuiState, lay: &Layout, modal: &Mo
             ];
             f.render_widget(Clear, r);
             f.render_widget(Paragraph::new(lines).block(modal_block(p, &format!("message {}", m.name))), r);
+        }
+        Modal::ResetFromPlan(m) => {
+            use ninox_ui_shared::reset_from_plan::UiPhase;
+            let (status, hint, go) = match m.phase {
+                UiPhase::Sending => ("Asking the orchestrator to update its plan…", "", None),
+                UiPhase::Waiting => (
+                    "Waiting for plan update…",
+                    "nothing resets until you confirm",
+                    Some("↵ reset with the plan as it is"),
+                ),
+                UiPhase::TimedOut => ("Timed out waiting for the plan update.", "", Some("↵ reset with the plan as it is")),
+                UiPhase::SendFailed => ("Could not ask the orchestrator to update its plan.", "", Some("↵ reset with the plan as it is")),
+                UiPhase::Ready => ("The plan was updated. Review it, then reset.", "workers stay attached", Some("↵ reset now")),
+                UiPhase::Resetting => ("Resetting…", "", None),
+                UiPhase::ResetFailed => ("The reset failed.", "", None),
+            };
+            let dim = Style::default().fg(p.ink_2);
+            let show_plan = matches!(m.phase, UiPhase::Ready | UiPhase::TimedOut | UiPhase::SendFailed);
+            let w = (area.width * 2 / 3).clamp(50, 100);
+            let plan_rows = if show_plan { 12u16.min(area.height.saturating_sub(10)) } else { 0 };
+            let mut lines = vec![Line::from(Span::styled(status, Style::default().fg(p.ink).add_modifier(Modifier::BOLD)))];
+            if !hint.is_empty() {
+                lines.push(Line::from(Span::styled(hint, dim)));
+            }
+            if let Some(e) = &m.error {
+                lines.push(Line::from(Span::styled(truncate(e, w.saturating_sub(4) as usize), Style::default().fg(p.ink))));
+            }
+            if m.phase.pollable() && m.preview.is_none() && m.phase != UiPhase::Ready {
+                lines.push(Line::from(Span::styled("no readable plan doc is registered yet; nothing to reset from", dim)));
+            }
+            if show_plan {
+                match &m.preview {
+                    Some((path, content)) => {
+                        lines.push(Line::from(Span::styled(truncate(path, w.saturating_sub(4) as usize), dim)));
+                        for l in content.lines().skip(m.scroll as usize).take(plan_rows as usize) {
+                            lines.push(Line::from(Span::styled(truncate(l, w.saturating_sub(4) as usize), Style::default().fg(p.ink))));
+                        }
+                    }
+                    None => lines.push(Line::from(Span::styled("no readable plan doc is registered", dim))),
+                }
+            }
+            let keys = match go.filter(|_| m.preview.is_some()) {
+                Some(go) => format!("{go} · j/k scroll · esc cancel"),
+                None if m.phase == UiPhase::Resetting => "resetting…".to_string(),
+                None => "esc cancel".to_string(),
+            };
+            lines.push(Line::from(Span::styled(keys, faint)));
+            let r = centered(area, w, lines.len() as u16 + 2);
+            f.render_widget(Clear, r);
+            f.render_widget(Paragraph::new(lines).block(modal_block(p, &format!("reset {} from plan", m.name))), r);
         }
         Modal::Restore(s) => {
             let text = format!("Restore fleet ({} workers, {} orchestrators)?  y / n", s.workers, s.orchestrators);
@@ -4139,6 +4297,51 @@ mod tests {
     }
 
     #[test]
+    fn settings_labels_are_never_cut_at_120_columns_and_wrap_without_an_ellipsis_at_80() {
+        use ninox_ui_shared::settings_form::SettingsSection;
+        let _iso = ninox_core::test_isolation::isolate();
+        for (w, wraps_ok) in [(120u16, false), (80, true)] {
+            for section in SettingsSection::all() {
+                let st = settings_state(section);
+                let sl = layout::settings(layout::settings_area(ratatui::layout::Rect::new(0, 0, w, 50)), &st);
+                for &i in &st.settings.section_fields() {
+                    let label = &st.settings.fields[i].label;
+                    let parts = layout::wrap_label(label, sl.label_w as usize);
+                    assert!(parts.iter().all(|p| p.chars().count() <= sl.label_w as usize), "{label}");
+                    assert!(wraps_ok || parts.len() == 1, "{label} wraps at {w} columns: {parts:?}");
+                    assert_eq!(parts.join(" "), *label, "{label} is cut at {w} columns");
+                }
+            }
+        }
+        let out = render(&settings_state(SettingsSection::Fleet), 120, 50);
+        assert!(out.contains("Reset an orchestrator at high context"), "{out}");
+        assert!(out.contains("Reset threshold"), "{out}");
+    }
+
+    #[test]
+    fn a_locked_setting_is_drawn_dimmed() {
+        use ninox_ui_shared::settings_form::{FieldId, SettingsSection};
+        let _iso = ninox_core::test_isolation::isolate();
+        let st = settings_state(SettingsSection::Fleet);
+        let locked = st.settings.fields.iter().find(|f| f.id == FieldId::OrchestratorResetPct).expect("threshold field");
+        assert!(locked.locked, "the default mode is Off");
+        let buf = render_buffer(&st, 120, 50);
+        let find = |needle: &str| {
+            (0..50u16).find_map(|y| {
+                let row: String = (0..120u16).map(|x| buf[(x, y)].symbol()).collect();
+                row.find(needle).map(|_| (row.chars().take_while(|_| true).count(), y)).and_then(|_| {
+                    let x = (0..120u16).find(|&x| (0..needle.chars().count() as u16).all(|k| x + k < 120 && buf[(x + k, y)].symbol() == needle.chars().nth(k as usize).unwrap().to_string()))?;
+                    Some(buf[(x, y)].fg)
+                })
+            })
+        };
+        let dim = find("Reset threshold").expect("threshold label drawn");
+        let live = find("Reset an orchestrator").expect("mode label drawn");
+        assert_eq!(dim, st.palette.faint);
+        assert_ne!(dim, live);
+    }
+
+    #[test]
     fn settings_page_at_a_wide_size_puts_the_help_beside_the_fields() {
         use ninox_ui_shared::settings_form::SettingsSection;
         let _iso = ninox_core::test_isolation::isolate();
@@ -4385,10 +4588,10 @@ mod tests {
         let mut st = st_with(&["a"]);
         st.modal = Some(Modal::Spawn);
         let out = render(&st, 200, 55);
-        for want in ["spawn a session", "Kind", "Orchestrator", "Name", "Agent", "claude-code", "Model", "Brains this tree reads", "[x] default", "Writes to", "Initial prompt", "Model: claude-opus-5-5 (claude-code default)", "est. $2", "tab/shift-tab field"] {
+        for want in ["spawn a session", "Kind", "Orchestrator", "Name", "Workspace folder", "Agent", "claude-code", "Model", "Brains this tree reads", "[x] default", "Writes to", "Initial prompt", "Model: claude-opus-5-5 (claude-code default)", "est. $2", "tab/shift-tab field"] {
             assert!(out.contains(want), "missing {want:?} in:\n{out}");
         }
-        assert!(!out.contains("Workspace") && !out.contains("Worker type"), "Workspace/Worker type must stay hidden for the Orchestrator kind:\n{out}");
+        assert!(!out.contains("Workspace  ") && !out.contains("Worker type"), "Standalone's Workspace/Worker type must stay hidden for the Orchestrator kind:\n{out}");
 
         st.spawn_form.error = Some("name is required".to_string());
         let out = render(&st, 200, 55);
@@ -4400,6 +4603,7 @@ mod tests {
         let cat = |name: &str, enabled: bool, access: &str| ninox_core::config::CatalogueRef {
             name: name.into(), path: format!("/scratch/{name}").into(), remote: None, endpoint: None,
             region: None, cache_ttl_secs: None, enabled, cadence: "manual".into(), access: access.into(),
+            write_rules_override: None,
         };
         cfg.brain.catalogues = vec![cat("alpha", true, "read_write"), cat("beta", true, "read_only"), cat("old", false, "read_write")];
         crate::tui::spawn::build(&cfg)
@@ -4506,6 +4710,34 @@ mod tests {
     }
 
     #[test]
+    fn the_reset_dialog_names_each_phase_and_previews_the_plan_when_ready() {
+        use ninox_ui_shared::reset_from_plan::UiPhase::*;
+        let modal = |phase, preview: Option<(String, String)>| {
+            let mut st = st_with(&["a"]);
+            st.modal = Some(Modal::ResetFromPlan(crate::tui::state::ResetModal {
+                id: "a".into(), name: "atlas".into(), phase, preview, error: None, scroll: 0,
+            }));
+            render(&st, 100, 30)
+        };
+        let plan = Some(("/p/PLAN.md".to_string(), "# Plan\n- ship it".to_string()));
+        let waiting = modal(Waiting, plan.clone());
+        assert!(waiting.contains("Waiting for plan update…") && waiting.contains("reset with the plan as it is") && waiting.contains("esc cancel"), "{waiting}");
+        let ready = modal(Ready, plan.clone());
+        if let Ok(dir) = std::env::var("NINOX_SHOT_DIR") {
+            for (name, screen) in [("waiting", &waiting), ("ready", &ready)] {
+                std::fs::write(std::path::Path::new(&dir).join(format!("tui-reset-from-plan-{name}.txt")), screen).unwrap();
+            }
+        }
+        assert!(ready.contains("reset atlas from plan") && ready.contains("- ship it") && ready.contains("↵ reset now"), "{ready}");
+        let timed_out = modal(TimedOut, plan);
+        assert!(timed_out.contains("Timed out") && timed_out.contains("reset with the plan as it is"), "{timed_out}");
+        let no_plan = modal(Waiting, None);
+        assert!(no_plan.contains("nothing to reset from") && !no_plan.contains("↵ reset"), "{no_plan}");
+        let resetting = modal(Resetting, None);
+        assert!(resetting.contains("Resetting…") && !resetting.contains("esc cancel"), "{resetting}");
+    }
+
+    #[test]
     fn a_worktree_name_wider_than_the_modal_shows_every_character() {
         use ninox_core::events::{DeletePlan, DeleteTarget, WorktreeState};
         let name: String = (0..12).map(|i| format!("seg{i}-abcd")).collect::<Vec<_>>().join("") + "-END";
@@ -4540,6 +4772,10 @@ mod tests {
                 ("Message", Modal::Message(crate::tui::state::MessageComposer { id: "a".into(), name: "a".into(), draft: "hi".into() })),
                 ("Restore", Modal::Restore(RestoreSummary { workers: 3, orchestrators: 1, interrupted_at: None, flagged_at: None })),
                 ("Settings", Modal::Settings),
+                ("ResetFromPlan", Modal::ResetFromPlan(crate::tui::state::ResetModal {
+                    id: "a".into(), name: "a".into(), phase: ninox_ui_shared::reset_from_plan::UiPhase::Ready,
+                    preview: Some(("/p/PLAN.md".into(), "# Plan\n- ship it".into())), error: None, scroll: 0,
+                })),
                 ("Delete", Modal::Delete(DeleteConfirm { root: "o".into(), plan: Some(Ok(delete_plan())), force: false, expanded: true })),
             ];
             for (name, modal) in modals {
@@ -4869,6 +5105,80 @@ mod tests {
         let out = render(&st, 220, 40);
         assert!(out.contains("orch"), "the island's own orchestrator name must appear:\n{out}");
         assert!(out.contains("with a"), "a worker name must appear in the island's member rows:\n{out}");
+    }
+
+    #[test]
+    fn the_orchestrators_island_header_shows_its_context_with_the_threshold_when_the_mode_is_not_off() {
+        use ninox_core::config::{OrchestratorResetConfig, ResetMode};
+        let island_line = |pct: Option<f64>, cfg: OrchestratorResetConfig| {
+            let mut st = fleet();
+            st.view = View::Fleet;
+            st.rows[0].session.context_used_pct = pct;
+            st.reset_cfg = cfg;
+            st.fleet.sync(&st.rows.clone(), &std::collections::HashMap::new());
+            render(&st, 220, 40).lines().find(|l| l.contains("● orch")).unwrap_or_else(|| panic!("no island header")).to_string()
+        };
+        let prompt = OrchestratorResetConfig { auto_at_context_pct: 40, mode: ResetMode::Prompt };
+        if let Ok(dir) = std::env::var("NINOX_SHOT_DIR") {
+            let mut out = String::new();
+            for (label, pct, cfg) in [
+                ("below the threshold", Some(18.0), prompt.clone()),
+                ("near the threshold", Some(34.0), prompt.clone()),
+                ("over the threshold", Some(52.0), prompt.clone()),
+                ("reset off", Some(34.0), OrchestratorResetConfig::default()),
+                ("unknown", None, prompt.clone()),
+            ] {
+                out.push_str(&format!("{label:<22}{}\n", island_line(pct, cfg).trim_end()));
+            }
+            std::fs::write(std::path::Path::new(&dir).join("tui-context-meter-island.txt"), out).unwrap();
+        }
+        assert!(island_line(Some(44.0), prompt.clone()).contains("ctx 44% ▏40"));
+        assert!(island_line(Some(20.0), OrchestratorResetConfig::default()).contains("ctx 20%"));
+        let off = island_line(Some(20.0), OrchestratorResetConfig::default());
+        assert!(!off.contains('▏'), "no threshold while off: {off}");
+        assert!(island_line(None, prompt).contains("ctx — ▏40"), "unknown reads as a dash");
+    }
+
+    #[test]
+    fn an_island_rooted_at_a_worker_shows_no_context_meter() {
+        let mut st = fleet();
+        st.view = View::Fleet;
+        st.reset_cfg = ninox_core::config::OrchestratorResetConfig { auto_at_context_pct: 40, mode: ninox_core::config::ResetMode::Prompt };
+        for r in &mut st.rows {
+            r.session.context_used_pct = Some(44.0);
+        }
+        st.fleet.sync(&st.rows.clone(), &std::collections::HashMap::new());
+        let out = render(&st, 220, 40);
+        let headers: Vec<&str> = out.lines().filter(|l| l.contains("● ")).collect();
+        assert!(headers.iter().any(|l| l.contains("● orch") && l.contains("ctx 44%")), "the orchestrator's island has it");
+        let unparented = headers.iter().find_map(|l| l.split("● Unparented").nth(1)).expect("the unparented island's header");
+        assert!(!unparented.contains("ctx"), "the unparented island has none (cards sit side by side on this line): {unparented}");
+    }
+
+    #[test]
+    fn the_island_title_never_wraps_the_meter_gives_way_before_the_name() {
+        let mut st = fleet();
+        st.reset_cfg = ninox_core::config::OrchestratorResetConfig { auto_at_context_pct: 40, mode: ninox_core::config::ResetMode::Prompt };
+        st.rows[0].session.context_used_pct = Some(44.0);
+        st.fleet.sync(&st.rows.clone(), &std::collections::HashMap::new());
+        let island = st.fleet.islands.iter().find(|i| i.name.contains("orch")).expect("the orchestrator's island").clone();
+        let text = |w: usize| -> String { island_title(&st, &island, w).spans.iter().map(|s| s.content.as_ref()).collect() };
+        assert!(text(60).contains("ctx 44% ▏40"), "room for everything");
+        for w in [14usize, 20, 28, 34, 40, 60] {
+            assert!(text(w).width() <= w, "width {w}: {:?} is {} wide", text(w), text(w).width());
+        }
+        let tight = text(24);
+        assert!(!tight.contains("ctx"), "no room: the meter is dropped, not wrapped: {tight:?}");
+        assert!(tight.contains("orch"), "the name keeps its room: {tight:?}");
+    }
+
+    #[test]
+    fn the_meter_tints_toward_the_threshold() {
+        use ninox_ui_shared::context_meter::MeterTint;
+        let p = Palette::default();
+        assert_eq!(meter_style(&p, MeterTint::Normal).fg, Some(p.faint));
+        assert_eq!(meter_style(&p, MeterTint::Near).fg, Some(p.accent));
+        assert_eq!(meter_style(&p, MeterTint::Over).fg, Some(p.ci_failed));
     }
 
     #[test]
@@ -5659,6 +5969,7 @@ mod tests {
                 enabled: true,
                 cadence: "manual".to_string(),
                 access: "read_write".to_string(),
+                write_rules_override: None,
             },
             ninox_core::config::CatalogueRef {
                 name: "team".to_string(),
@@ -5670,6 +5981,7 @@ mod tests {
                 enabled: true,
                 cadence: "manual".to_string(),
                 access: "read_write".to_string(),
+                write_rules_override: None,
             },
         ]);
         let out = render(&st, 100, 20);
@@ -6016,12 +6328,37 @@ mod tests {
         st.brain.sources.cursor = 1;
         st.brain.sources.detail = true;
         let out = render(&st, 120, 40);
-        for want in ["Wiki URL", "Local cache", "Pending", "2 local change(s) to push", "ambient git credentials", "e edit · s sync"] {
+        for want in ["Wiki URL", "Local cache", "Pending", "2 local change(s) to push", "ambient git credentials", "e edit · s sync", "Brain rules", "everyone who uses this brain", "My override", "only on this machine"] {
             assert!(out.contains(want), "missing {want:?}:\n{out}");
         }
         st.brain.sources.start_sync(&["team-mlops".into()]);
         let out = render(&st, 80, 24);
         assert!(out.contains("syncing…"), "SYNC keeps its column beside the detail pane at 80 cols:\n{out}");
+    }
+
+    #[test]
+    fn sources_detail_pane_wraps_multiline_rules() {
+        let mut st = sources_state();
+        st.brain.sources.cursor = 1;
+        st.brain.sources.detail = true;
+        let rules_dir = tempfile::tempdir().unwrap();
+        ninox_core::brain_rules::write_brain_rules(
+            rules_dir.path(),
+            "MLOps knowledge: how our systems behave, decisions and why, runbooks.\n\nNo personal notes, no secrets.",
+        )
+        .unwrap();
+        st.brain.sources.catalogues[1].path = rules_dir.path().to_path_buf();
+        st.brain.sources.catalogues[1].write_rules_override = Some("no transcripts\nno raw logs".into());
+        let out = render(&st, 120, 40);
+        for want in ["how our systems behave", "No personal notes", "no transcripts", "no raw logs"] {
+            assert!(out.contains(want), "rules wrap over several lines, newlines kept; missing {want:?}:\n{out}");
+        }
+        for (w, h) in [(120, 45), (80, 50)] {
+            let out = render(&st, w, h);
+            for want in ["Brain rules", "My override", "No personal notes", "no transcripts", "no raw logs"] {
+                assert!(out.contains(want), "{w}x{h}: rules wrap over several lines, newlines kept; missing {want:?}:\n{out}");
+            }
+        }
     }
 
     #[test]

@@ -306,7 +306,7 @@ async fn spawn_node(
         }
         let agent = Some(crate::cli::resolve_orchestrator_agent(config, node.model.as_deref()));
         return crate::cli::spawn_orchestrator_common_opts(
-            store, config, &node.name, Some(brief), parent_session, agent, node.brain.clone(), false,
+            store, config, &node.name, Some(brief), parent_session, agent, node.brain.clone(), false, None,
         )
         .await;
     }

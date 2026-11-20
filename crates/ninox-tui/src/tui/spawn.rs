@@ -15,6 +15,8 @@ pub enum FieldId {
     Kind,
     Name,
     Workspace,
+    /// Orchestrator kind only, optional: an existing folder to run in.
+    WorkspaceFolder,
     WorkerType,
     Harness,
     Model,
@@ -115,6 +117,7 @@ pub fn build(config: &AppConfig) -> SpawnForm {
         field(FieldId::Kind, "Kind", "Orchestrator".to_string(), Kind::Choice,
               vec!["Orchestrator".to_string(), "Standalone".to_string()]),
         field(FieldId::Name, "Name", String::new(), Kind::Text, Vec::new()),
+        field(FieldId::WorkspaceFolder, "Workspace folder", String::new(), Kind::Text, Vec::new()),
         field(FieldId::Workspace, "Workspace", String::new(), Kind::Text, Vec::new()),
         field(FieldId::WorkerType, "Worker type", default_type, Kind::Choice, type_names),
         field(FieldId::Harness, "Agent", String::new(), Kind::Choice, harness_names),
@@ -181,10 +184,12 @@ pub fn kind(form: &SpawnForm) -> SpawnKind {
 
 /// An Orchestrator has no workspace of its own and no worker type (it's
 /// always a hidden `Orchestrator`-type spawn under the hood) — so those two
-/// fields exist only to collect input for a Standalone spawn.
+/// fields exist only to collect input for a Standalone spawn. An orchestrator
+/// instead gets an optional "Workspace folder": blank keeps ninox's own.
 pub fn visible(form: &SpawnForm, id: &FieldId) -> bool {
     match id {
         FieldId::Workspace | FieldId::WorkerType => kind(form) == SpawnKind::Standalone,
+        FieldId::WorkspaceFolder => kind(form) == SpawnKind::Orchestrator,
         FieldId::CustomModel => get(form, &FieldId::Model).value == CUSTOM_SENTINEL,
         _ => true,
     }
@@ -331,9 +336,10 @@ pub struct SpawnSubmission {
 /// Validates the form and builds a `SpawnSubmission`, or returns the
 /// human-readable refusal reason to show in `form.error` (the modal stays
 /// open either way — the caller decides that). `workspace`/`worker_type`
-/// are only read (and only required) for a Standalone spawn — an
-/// Orchestrator submission carries `None` for both regardless of what was
-/// typed before a kind switch.
+/// are only read (and only required) for a Standalone spawn. An
+/// Orchestrator submission carries `None` for the type regardless of what
+/// was typed before a kind switch, and its optional "Workspace folder" as
+/// `workspace`.
 pub fn try_submit(form: &SpawnForm) -> Result<SpawnSubmission, String> {
     let name = get(form, &FieldId::Name).value.trim().to_string();
     if name.is_empty() {
@@ -347,7 +353,8 @@ pub fn try_submit(form: &SpawnForm) -> Result<SpawnSubmission, String> {
         }
         (Some(workspace), Some(get(form, &FieldId::WorkerType).value.clone()))
     } else {
-        (None, None)
+        let folder = get(form, &FieldId::WorkspaceFolder).value.trim().to_string();
+        (Some(folder).filter(|f| !f.is_empty()), None)
     };
     let agent = resolved(form).agent;
     let (harness, model) = (agent.harness, agent.model);
@@ -388,7 +395,7 @@ mod tests {
         assert_eq!(
             f.fields.iter().map(|x| x.id.clone()).collect::<Vec<_>>(),
             vec![
-                FieldId::Kind, FieldId::Name, FieldId::Workspace, FieldId::WorkerType,
+                FieldId::Kind, FieldId::Name, FieldId::WorkspaceFolder, FieldId::Workspace, FieldId::WorkerType,
                 FieldId::Harness, FieldId::Model, FieldId::CustomModel, FieldId::Brains, FieldId::BrainWrite,
                 FieldId::Prompt,
             ]
@@ -413,7 +420,7 @@ mod tests {
         let mut f = build(&AppConfig::default());
         f.focus = f.fields.iter().position(|x| x.id == FieldId::Name).unwrap();
         let n = next_focus(&f, false);
-        assert_eq!(f.fields[n].id, FieldId::Harness); // skips Workspace + WorkerType, both hidden
+        assert_eq!(f.fields[n].id, FieldId::WorkspaceFolder); // skips Workspace + WorkerType, both hidden
     }
 
     #[test]
@@ -631,6 +638,18 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_workspace_folder_is_optional_and_carried() {
+        let mut f = build(&AppConfig::default());
+        set_value(&mut f, FieldId::Name, "demo");
+        assert!(visible(&f, &FieldId::WorkspaceFolder));
+        assert_eq!(try_submit(&f).unwrap().workspace, None);
+        set_value(&mut f, FieldId::WorkspaceFolder, "  ~/proj/brain  ");
+        assert_eq!(try_submit(&f).unwrap().workspace.as_deref(), Some("~/proj/brain"));
+        set_value(&mut f, FieldId::Kind, "Standalone");
+        assert!(!visible(&f, &FieldId::WorkspaceFolder));
+    }
+
+    #[test]
     fn try_submit_standalone_carries_workspace_and_type() {
         let mut f = build(&AppConfig::default());
         set_value(&mut f, FieldId::Name, "demo");
@@ -659,6 +678,7 @@ mod tests {
         let cat = |name: &str, enabled: bool, access: &str| ninox_core::config::CatalogueRef {
             name: name.into(), path: format!("/scratch/{name}").into(), remote: None, endpoint: None,
             region: None, cache_ttl_secs: None, enabled, cadence: "manual".into(), access: access.into(),
+            write_rules_override: None,
         };
         cfg.brain.catalogues = vec![cat("team", true, "read_write"), cat("wiki", true, "read_only"), cat("old", false, "read_write")];
         cfg

@@ -3,6 +3,7 @@
 //! discovery → known_models → configured value, then `custom…` last).
 
 use ninox_core::harness::HarnessSpec;
+use ninox_core::model_resolution::is_selectable_model;
 
 /// The picker's escape hatch — selecting it reveals a mono free-text input.
 pub const CUSTOM_SENTINEL: &str = "custom…";
@@ -12,10 +13,11 @@ pub fn model_options(
     discovered: Option<&[String]>,
     configured: Option<&str>,
 ) -> Vec<String> {
-    let mut opts: Vec<String> = match discovered {
+    let pool = match discovered {
         Some(d) if !d.is_empty() => d.to_vec(),
         _                        => spec.known_models.clone(),
     };
+    let mut opts: Vec<String> = pool.into_iter().filter(|m| is_selectable_model(m)).collect();
     if let Some(c) = configured {
         if !c.is_empty() && !opts.iter().any(|o| o == c) {
             opts.push(c.to_string());
@@ -81,6 +83,24 @@ mod tests {
         // ...but not duplicated when already listed
         assert_eq!(model_options(&spec(&["k-1"]), None, Some("k-1")),
                    vec!["k-1", CUSTOM_SENTINEL]);
+    }
+
+    #[test]
+    fn fable_is_never_offered_but_a_configured_one_still_shows() {
+        let d = vec!["claude-fable-5-2".to_string(), "claude-opus-5-5".to_string()];
+        assert_eq!(model_options(&spec(&["claude-fable-5-2", "k-1"]), Some(&d), None), vec!["claude-opus-5-5", CUSTOM_SENTINEL]);
+        assert_eq!(model_options(&spec(&["claude-fable-5-2", "k-1"]), None, None), vec!["k-1", CUSTOM_SENTINEL]);
+        assert_eq!(model_options(&spec(&["k-1"]), None, Some("claude-fable-5-1")), vec!["k-1", "claude-fable-5-1", CUSTOM_SENTINEL]);
+    }
+
+    #[test]
+    fn builtin_picker_lists_contain_no_fable() {
+        let reg = ninox_core::config::AppConfig::default().registry();
+        for name in reg.names() {
+            let spec = reg.spec(&name);
+            assert!(model_options(&spec, None, None).iter().all(|m| is_selectable_model(m)), "{name}");
+            assert!(spec.known_models.iter().all(|m| is_selectable_model(m)), "{name}");
+        }
     }
 
     #[test]

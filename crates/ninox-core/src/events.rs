@@ -342,6 +342,7 @@ impl Engine {
         // Also kill the orchestrator's own tmux session (same id as orchestrator).
         let _ = crate::runtime::kill_session(orchestrator_id).await;
         let _ = self.acp.kill_session(orchestrator_id).await;
+        self.release_custom_workspace(orchestrator_id);
         self.store.delete_orchestrator(orchestrator_id)?;
         for id in removed {
             self.emit(Event::SessionDone(id));
@@ -379,6 +380,7 @@ impl Engine {
         }
         let _ = crate::runtime::kill_session(orchestrator_id).await;
         let _ = self.acp.kill_session(orchestrator_id).await;
+        self.release_custom_workspace(orchestrator_id);
         self.store.delete_orchestrator(orchestrator_id)?;
         self.emit_kept(&kept);
         self.emit(Event::OrchestratorRemoved(orchestrator_id.to_string()));
@@ -935,6 +937,20 @@ impl Engine {
         (facts, effective_branch)
     }
 
+    /// Takes ninox's entries back out of a custom workspace before its
+    /// orchestrator goes. The folder and everything else in it stay; the
+    /// custom-workspace record also stays, so the orphan sweep keeps leaving
+    /// the folder alone.
+    pub(crate) fn release_custom_workspace(&self, orchestrator_id: &str) {
+        let Ok(Some(dir)) = self.store.custom_workspace(orchestrator_id) else { return };
+        if let Err(e) = crate::custom_workspace::uninstall(std::path::Path::new(&dir)) {
+            tracing::warn!("releasing custom workspace {dir}: {e:#}");
+        }
+        if let Err(e) = self.store.detach_custom_workspace(orchestrator_id) {
+            tracing::warn!("releasing custom workspace {dir}: {e:#}");
+        }
+    }
+
     /// Shared `workspace::cleanup` plumbing for `cleanup_session_in`,
     /// `reap_workers`, `remove_session`, and orchestrator removal: resolves
     /// the session's recorded branch and repo root, gathers real git facts
@@ -951,6 +967,22 @@ impl Engine {
         use crate::workspace;
 
         let RunCleanupArgs { session, policy, merged, interrupted, live_session_row, remove_hook_artifacts } = args;
+        // A custom workspace is the user's folder, and may well be a git
+        // worktree named like the session: it is never a ninox worktree to
+        // remove, whatever its path looks like.
+        if matches!(self.store.custom_workspace(&session.id), Ok(Some(_))) {
+            let existed = remove_hook_artifacts && sessions_dir.join(format!("{}.json", session.id)).exists();
+            if remove_hook_artifacts {
+                crate::hooks::remove_session_artifacts(sessions_dir, &session.id);
+            }
+            return Ok(crate::workspace::CleanupOutcome {
+                worktree_removed: false,
+                worktree_removal_failed: false,
+                branch_deleted: None,
+                artifacts_removed: existed,
+                skipped: None,
+            });
+        }
         let workspace_path = session.workspace_path.clone().unwrap_or_default();
         let (mut facts, effective_branch) = self.cleanup_facts(session, merged);
         facts.interrupted = interrupted;
@@ -1058,7 +1090,7 @@ mod tests {
             repo: "r".into(), status: crate::types::SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -1098,7 +1130,7 @@ mod tests {
             repo: "r".into(), status: crate::types::SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
@@ -1109,6 +1141,52 @@ mod tests {
             self_completed_at: None,
             cleanup_result: None, cleanup_at: None,
         }
+    }
+
+    /// An orchestrator in the user's own git worktree, named like it, has
+    /// every shape of a ninox worker worktree. Removing the orchestrator takes
+    /// ninox's entries out and leaves the folder, its branch and its files.
+    #[tokio::test]
+    async fn removing_a_custom_workspace_orchestrator_never_deletes_the_users_worktree() {
+        let _iso = crate::test_isolation::isolate();
+        let repo = tempdir().unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git").args(["-c", "user.email=t@t.com", "-c", "user.name=t"]).args(args)
+                .current_dir(dir).status().unwrap().success();
+            assert!(ok, "git {args:?}");
+        };
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        git(repo.path(), &["commit", "--allow-empty", "-q", "-m", "init"]);
+        let wt = repo.path().join(".claude/worktrees/brain");
+        git(repo.path(), &["worktree", "add", "-q", "-b", "brain", wt.to_str().unwrap()]);
+        std::fs::write(wt.join("notes.md"), "uncommitted\n").unwrap();
+        std::fs::create_dir_all(wt.join(".claude")).unwrap();
+        std::fs::write(wt.join(".claude/settings.local.json"), r#"{"permissions":{"allow":["Read"]}}"#).unwrap();
+
+        let root = tempdir().unwrap();
+        let cfg = crate::config::AppConfig::default();
+        let report = crate::custom_workspace::install(&wt, root.path(), &cfg, "claude-code", "/b/ninox", "/c.toml").await;
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        let store = Arc::new(Store::open(tempdir().unwrap().keep().join("t.db")).unwrap());
+        store.upsert_orchestrator(&crate::types::Orchestrator { id: "brain".into(), name: "brain".into(), created_at: 0 }).unwrap();
+        let mut row = bare_session("brain", None);
+        row.workspace_path = Some(wt.to_string_lossy().into_owned());
+        row.status = crate::types::SessionStatus::Done;
+        store.upsert_session(&row).unwrap();
+        store.set_custom_workspace("brain", wt.to_str().unwrap()).unwrap();
+
+        let engine = Engine::new(store.clone());
+        engine.remove_orchestrator("brain").await.unwrap();
+
+        assert!(wt.join("notes.md").exists() && wt.join(".git").exists(), "the user's worktree survives");
+        let out = std::process::Command::new("git").args(["branch", "--list", "brain"]).current_dir(repo.path()).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("brain"), "and so does its branch");
+        let local = std::fs::read_to_string(wt.join(".claude/settings.local.json")).unwrap();
+        assert!(local.contains("Read") && !local.contains("worker-status"), "{local}");
+        assert!(!wt.join(".claude/skills/ninox-spawn-worker").exists());
+        assert_eq!(store.custom_workspace_paths().unwrap().len(), 1, "the folder stays on record");
+        assert_eq!(store.custom_workspace("brain").unwrap(), None, "but is no longer linked to the id");
     }
 
     /// `remove_orchestrator`'s worker list comes from `Store::
@@ -1181,7 +1259,7 @@ done
             repo: "r".into(), status: crate::types::SessionStatus::Working,
             agent_type: "opencode".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -1224,7 +1302,7 @@ done
             repo: "r".into(), status: crate::types::SessionStatus::Done,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: Some(1), pr_id: Some(1), workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -1258,7 +1336,7 @@ done
             repo: String::new(), status: crate::types::SessionStatus::AwaitingReview,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
@@ -1311,7 +1389,7 @@ done
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: Some(1), pr_id: Some(1),
             workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -1357,7 +1435,7 @@ done
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: Some(1), pr_id: Some(1),
             workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -1411,7 +1489,7 @@ done
             pr_number: Some(1), pr_id: Some(1),
             workspace_path: Some(worktree_path.to_string_lossy().to_string()),
             pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -1842,7 +1920,7 @@ done
             id: id.into(), orchestrator_id: Some(orchestrator.into()), name: id.into(),
             repo: "r".into(), status, agent_type: "claude-code".into(),
             cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None,
-            workspace_path: None, pid: None, model: None, context_tokens: None,
+            workspace_path: None, pid: None, model: None, observed_model: None, context_tokens: None,
             brain_reads: Vec::new(), brain_write: None, context_used_pct: None, context_total_tokens: None,
             context_window_size: None, claude_session_id: None, summary: None,
             terminal_at: None, gate_status: None, merged_at: None,

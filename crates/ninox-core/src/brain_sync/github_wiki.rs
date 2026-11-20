@@ -790,4 +790,36 @@ mod tests {
             other => panic!("expected Found, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn rules_file_round_trips_between_two_brains_through_the_wiki() {
+        use crate::brain_sync::{BrainSync, SyncToml};
+        use std::sync::Arc;
+
+        let scratch = tempdir().unwrap();
+        let bare = scratch.path().join("wiki.git");
+        init_bare_wiki_fixture(&bare).await;
+        let cfg = || SyncToml { remote: "wiki://x/y".into(), endpoint: None, region: None, cache_ttl_secs: 0 };
+        let store = |name: &str| {
+            let url = clone_url_for(&bare);
+            let dir = scratch.path().join(name);
+            async move { Arc::new(GithubWikiRemoteStore::for_clone_url(url, dir).await.unwrap()) }
+        };
+
+        let alice = scratch.path().join("alice-brain");
+        std::fs::create_dir_all(&alice).unwrap();
+        crate::brain_rules::write_brain_rules(&alice, "MLOps knowledge only").unwrap();
+        std::fs::create_dir_all(alice.join("repos")).unwrap();
+        std::fs::write(alice.join("repos/a.md"), "# A").unwrap();
+        BrainSync::new(alice.clone(), cfg(), store("clone-alice").await).sync().await.unwrap();
+
+        let bob = scratch.path().join("bob-brain");
+        std::fs::create_dir_all(&bob).unwrap();
+        BrainSync::new(bob.clone(), cfg(), store("clone-bob").await).sync().await.unwrap();
+
+        assert_eq!(crate::brain_rules::read_brain_rules(&bob).as_deref(), Some("MLOps knowledge only"));
+        assert!(bob.join("repos/a.md").exists());
+        let idx = crate::BrainIndex::open(&bob).unwrap();
+        assert_eq!(idx.rebuild(None).unwrap().indexed, 1, "synced _rules.md stays out of the index");
+    }
 }

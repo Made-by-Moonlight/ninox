@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, ratatui (`ninox-tui`), existing `ninox-ui-shared`/`ninox-core` session+spawn plumbing.
 
-**Spec:** `/Users/ethan.brodie/proj/ninox/.claude/design-ref/fleet-overview-v1/BRIEF-MLOPS-5350-tui-parity.md` (item 1), `BRIEF-common.md` §7, `Spawn.dc.html`.
+**Spec:** `.claude/design-ref/fleet-overview-v1/BRIEF-MLOPS-5350-tui-parity.md` (item 1), `BRIEF-common.md` §7, `Spawn.dc.html`.
 
 ## Global Constraints
 

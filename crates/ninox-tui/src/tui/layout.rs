@@ -235,6 +235,8 @@ pub enum SettingsLine {
     Gap,
     /// `settings.fields[i]`.
     Field(usize),
+    /// The `n`th wrapped continuation (n >= 1) of `settings.fields[i]`'s label.
+    Cont(usize, usize),
     /// The refusal of the last change, under its field.
     Error,
 }
@@ -646,7 +648,7 @@ fn kanban(body: Rect) -> KanbanLayout {
 /// The section's field lines. Fields that the shared form files under
 /// different headings (default models, say) keep them as sub-headings; the
 /// last refusal sits under the selected field.
-pub fn settings_lines(st: &TuiState) -> Vec<SettingsLine> {
+pub fn settings_lines(st: &TuiState, label_w: usize) -> Vec<SettingsLine> {
     let v = &st.settings;
     let visible = v.section_fields();
     let headed = visible.windows(2).any(|w| v.fields[w[0]].section != v.fields[w[1]].section);
@@ -662,9 +664,33 @@ pub fn settings_lines(st: &TuiState) -> Vec<SettingsLine> {
         }
         section = Some(f.section);
         out.push(SettingsLine::Field(i));
+        for n in 1..wrap_label(&f.label, label_w).len() {
+            out.push(SettingsLine::Cont(i, n));
+        }
         if i == v.selected && v.error.is_some() {
             out.push(SettingsLine::Error);
         }
+    }
+    out
+}
+
+/// `label` broken at spaces into lines of at most `w` chars; a single word
+/// wider than `w` is cut with an ellipsis.
+pub fn wrap_label(label: &str, w: usize) -> Vec<String> {
+    let w = w.max(2);
+    let mut out: Vec<String> = Vec::new();
+    for word in label.split_whitespace() {
+        let word: String = if word.chars().count() > w { word.chars().take(w - 1).chain(Some('…')).collect() } else { word.to_string() };
+        match out.last_mut() {
+            Some(cur) if cur.chars().count() + 1 + word.chars().count() <= w => {
+                cur.push(' ');
+                cur.push_str(&word);
+            }
+            _ => out.push(word),
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
     }
     out
 }
@@ -704,12 +730,16 @@ pub(super) fn settings(body: Rect, st: &TuiState) -> SettingsLayout {
         let list = Rect { width: list_w, height: rest.height.saturating_sub(hh + gap), ..rest };
         (list, Rect { y: list.bottom() + gap, height: hh, ..rest })
     };
-    let lines = settings_lines(st);
-    let sel = lines.iter().position(|l| *l == SettingsLine::Field(st.settings.selected)).unwrap_or(0);
+    let needed = st.settings.section_fields().iter().map(|&i| st.settings.fields[i].label.chars().count()).max().unwrap_or(0) as u16;
+    let label_w = (needed + 2).min(list.width.saturating_sub(2 + 20)).max(12);
+    let lines = settings_lines(st, label_w as usize);
+    let sel = lines
+        .iter()
+        .rposition(|l| matches!(l, SettingsLine::Field(i) | SettingsLine::Cont(i, _) if *i == st.settings.selected))
+        .unwrap_or(0);
     let h = list.height.max(1) as usize;
     // One more line under the selection, so its error stays in view.
     let offset = scroll_offset(sel, 2, lines.len(), h);
-    let label_w = SETTINGS_LABEL_W.min(list.width.saturating_sub(2 + 20)).max(12);
     let value_x = (list.x + 2 + label_w).min(list.right());
     SettingsLayout { path, open, bar, bar_lines, bar_offset, title, close, list, lines, offset, value_x, label_w, help, hint }
 }

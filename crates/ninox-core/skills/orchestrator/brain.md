@@ -11,25 +11,27 @@ relate, why a decision was made. Without a place to put that, every new
 session starts cold. Write it down so the next orchestrator doesn't have to
 rediscover it.
 
-## Your brains: read many, write one
+## Your brains
 
-Your session has a **brain set**: one or more brains it *reads*, and exactly
-one it *writes* to. It was chosen when you were spawned and is shown in your
-session header ("Brains: reads A, B · writes A"); the commands below already
-act on it with no extra configuration.
+By default your session reads every enabled brain and can write to every
+enabled read-write one; your local brain gets every entry. A session can be
+**limited** to a subset when it is spawned, shown in its header as
+"Brains: all" or "Brains: limited to A, B · writes A". The commands below
+already act on whichever applies, with no extra configuration.
 
 - `brain query`, `show`, `related` and `backlinks` search **every** brain
   you read. With more than one, results are tagged `source:id` (e.g.
   `team-wiki:repos/api.md`) — pass that id straight to `show`/`related`.
   Add `--catalogue <name>` to search just one.
-- `brain add` writes to your write brain. `--catalogue <name>` targets
-  another writable brain you read; read-only brains and brains outside your
-  set are refused.
+- `brain add` writes to your write brain and prints back any other brain you could also copy the entry to; read what it prints.
+- `brain rules` looks up the write rules of the brains you can write to.
 - `brain index` / `brain sync` act on your write brain; `--all` covers your
   whole set (read-only brains are pulled, never pushed).
-- Workers and sub-orchestrators you spawn inherit your set. Narrow it for a
-  child with `--brain <name>` (repeatable) and `--brain-write <name>` — only
-  ever to brains you read yourself.
+- Workers and sub-orchestrators you spawn inherit your limit (or have none).
+  Narrow it for a child with `--brain <name>` (repeatable) and
+  `--brain-write <name>` — only ever to brains you read yourself. Change a
+  running worker's limit with `ninox brain limit <session> --set a,b` or
+  `--clear`.
 
 **Check the other brains before concluding something isn't known.** If a
 query of one brain comes up empty, the answer may well be in another one
@@ -101,6 +103,14 @@ queryable:
 ```bash
 {{NINOX_BIN}} brain index
 ```
+
+### Rules
+
+Write with `{{NINOX_BIN}} brain add <path>` and read what it prints back. Copy an entry
+to another brain only when that brain's rules fit it, never just because it has
+no rules. Run
+`{{NINOX_BIN}} brain rules set` / `set-override` only when the user explicitly asks to
+change a brain's rules; `brain add` refuses `_rules.md`.
 
 ## 3. Read for context
 

@@ -323,17 +323,6 @@ pub async fn create_session(
     cmd:       &str,
     env:       &[(&str, &str)],
 ) -> Result<()> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    create_session_with_shell(id, workspace, cmd, env, &shell).await
-}
-
-async fn create_session_with_shell(
-    id: &str,
-    workspace: &str,
-    cmd: &str,
-    env: &[(&str, &str)],
-    shell: &str,
-) -> Result<()> {
     // tmux does NOT fail on a nonexistent `-c` dir (verified on 3.6a: exit 0,
     // pane silently starts in $HOME). For harnesses with cwd-scoped state —
     // claude-code keys conversations to the directory it starts in — that
@@ -359,23 +348,16 @@ async fn create_session_with_shell(
     // Wrap the command in a login shell so the full user PATH is available.
     // tmux sessions do not inherit shell rc files, so tools installed via
     // nvm / cargo / homebrew etc. would not be found otherwise.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let shell_cmd = format!("{shell} -l -c {}", shell_quote(cmd));
+
     // Fix the terminal dimensions to match the canvas.  The canvas is roughly
     // (window_width - 220px sidebar) / 7.8px_per_col ≈ 135 cols on a 1280-wide
     // window.  Use 140 as a safe default; too-wide values push Claude Code's
     // centered content off-screen.
     let mut base = vec!["new-session", "-d", "-s", id, "-x", "140", "-y", "50", "-c", workspace];
     base.extend_from_slice(&extra);
-    // Multiple shell-command arguments make tmux exec the shell directly.
-    // A single string is first parsed by tmux's default shell, which may be
-    // fish and cannot parse the POSIX quoting used in worker prompts.
-    if std::path::Path::new(shell).file_name().is_some_and(|name| name == "fish") {
-        // Harness commands use POSIX quoting. Let fish load the user's
-        // login environment, then pass the command to a POSIX shell as an
-        // argument rather than asking fish to parse it.
-        base.extend_from_slice(&[shell, "-l", "-c", "exec /bin/sh -c \"$argv[1]\"", cmd]);
-    } else {
-        base.extend_from_slice(&[shell, "-l", "-c", cmd]);
-    }
+    base.push(&shell_cmd);
 
     // A duplicate name means a LIVE tmux session already exists under this
     // id. Killing it to make room (the old behavior) silently destroys a
@@ -634,11 +616,18 @@ pub async fn wake_idle_session(session_id: &str) -> Result<()> {
 /// box yet — those are simply swallowed by the welcome/auth screens. A
 /// timeout is not an error: the caller is expected to try the send anyway
 /// and report the failure, which beats silently declining to deliver.
+///
+/// Returns `false` immediately if the session no longer exists — a harness
+/// that exits at startup (binary missing, crash) takes its tmux session with
+/// it, and no prompt will ever be drawn, so polling out the full `timeout`
+/// only delays the caller's failure report.
 pub async fn wait_for_input_prompt(session_id: &str, timeout: std::time::Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if prompt_line_content(&capture_visible_plain(session_id).await).is_some() {
-            return true;
+        match run_session_scoped(&["capture-pane", "-p", "-t", &exact_pane(session_id)]).await {
+            Ok(pane) if prompt_line_content(&pane).is_some() => return true,
+            Err(e) if is_missing_session(&e) => return false,
+            _ => {}
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
@@ -878,6 +867,22 @@ mod tests {
 
         assert!(!ready, "must time out rather than block forever");
         kill_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_input_prompt_returns_at_once_when_the_session_is_gone() {
+        if !tmux_available() { return; }
+        let id = unique_id();
+        // A harness that exits at startup takes its session with it; no
+        // prompt can ever appear, so the wait must not poll out its timeout.
+        create_session(&id, "/tmp", "exit 127", &[]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let started = std::time::Instant::now();
+        let ready = wait_for_input_prompt(&id, Duration::from_secs(30)).await;
+
+        assert!(!ready);
+        assert!(started.elapsed() < Duration::from_secs(5), "must bail early, took {:?}", started.elapsed());
     }
 
     #[tokio::test]
@@ -1216,18 +1221,6 @@ mod tests {
             sleep(Duration::from_millis(100)).await;
         }
         panic!("pane {id} never showed {needle:?}");
-    }
-
-    #[tokio::test]
-    async fn fish_login_shell_runs_posix_quoted_worker_command() {
-        if !tmux_available() || std::process::Command::new("fish").arg("--version").output().is_err() {
-            return;
-        }
-        let id = unique_id();
-        create_session_with_shell(&id, "/tmp", "printf '%s\\n' \"can't stop\"; exec cat", &[], "fish")
-            .await.unwrap();
-        wait_for_pane_contains(&id, "can't stop").await;
-        kill_session(&id).await.unwrap();
     }
 
     /// A message that stays visible at a `❯` prompt after Enter (the

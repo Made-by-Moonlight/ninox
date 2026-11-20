@@ -143,6 +143,11 @@ pub struct HarnessSpec {
     /// Seeded from the same capability registry and git-excluded the same way.
     #[serde(default)]
     pub extra_skills_dir: Option<String>,
+    /// Flag taking text to append to the harness's system prompt. How an
+    /// orchestrator in a custom workspace gets the role text AGENTS.md would
+    /// otherwise carry. `None`: the text goes at the top of the first message.
+    #[serde(default)]
+    pub append_system_prompt_flag: Option<String>,
     /// Shown when the binary isn't on PATH (e.g. the npm package to install).
     #[serde(default)]
     pub install_hint: Option<String>,
@@ -186,10 +191,11 @@ fn builtin_specs() -> BTreeMap<String, HarnessSpec> {
             "--model".into(), "{model}".into(),
         ],
         skip_permissions_args: Some(vec![CLAUDE_SKIP_PERMISSIONS_FLAG.into()]),
+        append_system_prompt_flag: Some("--append-system-prompt".into()),
         known_models:     vec![
             "claude-opus-5-5".into(),
             "claude-sonnet-5-5".into(),
-            "claude-haiku-4-5-20251001".into(),
+            "claude-haiku-5-5".into(),
         ],
         ..HarnessSpec::default()
     });
@@ -248,6 +254,13 @@ fn builtin_specs() -> BTreeMap<String, HarnessSpec> {
 }
 
 impl HarnessRegistry {
+    /// Whether `harness` runs ninox's seeded `SessionStart` hook, so session
+    /// setup can arrive that way instead of through a launch prompt, an
+    /// appended system prompt or a seeded file. Only claude-code does.
+    pub fn supports_session_hooks(&self, harness: &str) -> bool {
+        harness == CLAUDE_CODE_HARNESS
+    }
+
     /// Builtins overlaid by config `[harnesses.*]` entries (a config entry
     /// replaces the builtin spec wholesale). claude-code is the locked-on
     /// default and cannot be disabled.
@@ -261,6 +274,8 @@ impl HarnessRegistry {
                 spec.no_permission_prompts |= builtin.no_permission_prompts;
                 spec.resume_cwd_scoped |= builtin.resume_cwd_scoped;
                 spec.extra_skills_dir = spec.extra_skills_dir.or_else(|| builtin.extra_skills_dir.clone());
+                spec.append_system_prompt_flag =
+                    spec.append_system_prompt_flag.or_else(|| builtin.append_system_prompt_flag.clone());
             }
             specs.insert(name.clone(), spec);
         }
@@ -302,6 +317,47 @@ impl HarnessRegistry {
     pub fn interactive_cmd(&self, agent: &AgentConfig, mode: PermissionMode, claude_session_id: &str) -> String {
         let spec = self.spec(&agent.harness);
         build_cmd(&spec, agent, &spec.interactive_args, mode, None, claude_session_id)
+    }
+
+    /// [`Self::interactive_cmd_with_prompt`] with the prompt read from `file`
+    /// by the launching shell, so its size never reaches a command-line
+    /// limit (tmux caps a command at about 16 KiB).
+    pub fn interactive_cmd_with_prompt_file(&self, agent: &AgentConfig, mode: PermissionMode, file: &str, claude_session_id: &str) -> Option<String> {
+        const SENTINEL: &str = "NINOXPROMPTFILEPLACEHOLDER";
+        let cmd = self.interactive_cmd_with_prompt(agent, mode, SENTINEL, claude_session_id)?;
+        let read = format!("\"$(cat {})\"", shell_quote(file));
+        Some(cmd.replace(&format!("'{SENTINEL}'"), &read))
+    }
+
+    /// A fresh interactive launch that starts on `prompt` as its first
+    /// input, or `None` when the harness has no such shape. Supported when
+    /// the spec's `worker_args` end in a positional `-- {prompt}` (Claude
+    /// Code's interactive-with-prompt form); harnesses whose prompt flag is
+    /// non-interactive (`-p`, `--message`) must be fed through the pane.
+    pub fn interactive_cmd_with_prompt(&self, agent: &AgentConfig, mode: PermissionMode, prompt: &str, claude_session_id: &str) -> Option<String> {
+        let spec = self.spec(&agent.harness);
+        let w = spec.worker_args.as_ref()?;
+        let [.., dashes, placeholder] = w.as_slice() else { return None };
+        if dashes != "--" || placeholder != "{prompt}" {
+            return None;
+        }
+        let mut args = spec.interactive_args.clone();
+        args.extend(["--".to_string(), "{prompt}".to_string()]);
+        Some(build_cmd(&spec, agent, &args, mode, Some(prompt), claude_session_id))
+    }
+
+    /// `cmd` (from [`Self::interactive_cmd`] / [`Self::resume_cmd`]) with
+    /// `prompt` appended to the harness's system prompt, or `None` when this
+    /// harness has no such flag. Must be applied to resumes too: the flag is
+    /// per-process, not part of the stored conversation. Goes before a `--`
+    /// prompt separator when the command has one.
+    pub fn with_system_prompt(&self, agent: &AgentConfig, cmd: &str, prompt: &str) -> Option<String> {
+        let flag = self.spec(&agent.harness).append_system_prompt_flag?;
+        let extra = format!("{flag} {}", shell_quote(prompt));
+        Some(match cmd.find(" -- ") {
+            Some(at) => format!("{} {extra}{}", &cmd[..at], &cmd[at..]),
+            None => format!("{cmd} {extra}"),
+        })
     }
 
     /// Worker launch command, or `None` when the spec has no `worker_args`
@@ -546,10 +602,11 @@ fn expand_args(args: &[String], model: Option<&str>, prompt: Option<&str>, claud
         }
         let had_placeholder = a.contains("{model}") || a.contains("{prompt}") || a.contains("{session_id}");
         let mut s = a.replace("{model}", model.unwrap_or(""));
+        s = s.replace("{session_id}", claude_session_id);
+        // Last, so placeholder-looking text inside the prompt is left alone.
         if let Some(p) = prompt {
             s = s.replace("{prompt}", p);
         }
-        s = s.replace("{session_id}", claude_session_id);
         out.push(if had_placeholder { shell_quote(&s) } else { s });
         i += 1;
     }
@@ -680,7 +737,7 @@ mod tests {
             agent_type: harness.into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None,
             workspace_path: cwd.map(Into::into), pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some("x".into()),
             summary: None,
@@ -941,6 +998,17 @@ mod tests {
         assert_eq!(r.interactive_cmd(&a, PermissionMode::Standard, "s"), "cc --permission-mode acceptEdits");
         assert_eq!(r.resume_cmd(&a, PermissionMode::Standard, "s").unwrap(), "cc --resume 's'");
         assert_eq!(r.resume_cmd(&a, PermissionMode::Bypass, "s").unwrap(), "cc --permission-mode bypassPermissions --resume 's'");
+    }
+
+    #[test]
+    fn interactive_launch_prompt_is_claude_only_and_has_no_resume() {
+        let reg = HarnessRegistry::from_config(&BTreeMap::new());
+        let claude = AgentConfig { harness: "claude-code".into(), model: Some("m".into()) };
+        let cmd = reg.interactive_cmd_with_prompt(&claude, PermissionMode::Standard, "it's {session_id}", "sid").unwrap();
+        assert!(cmd.starts_with("claude --session-id 'sid'") && !cmd.contains("--resume"), "{cmd}");
+        assert!(cmd.ends_with("-- 'it'\\''s {session_id}'"), "{cmd}");
+        let codex = AgentConfig { harness: "codex".into(), model: None };
+        assert!(reg.interactive_cmd_with_prompt(&codex, PermissionMode::Standard, "p", "sid").is_none());
     }
 
     #[test]

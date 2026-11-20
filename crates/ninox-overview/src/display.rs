@@ -99,8 +99,8 @@ fn strip_ticket_label(raw: &str) -> &str {
 
 /// Status words Linear's own ticket metadata uses (lower-cased) — a
 /// parenthetical containing one of these, or an "assigned to" clause, is
-/// ticket-status bookkeeping ("already In Progress, assigned to Ethan
-/// Brodie"), not real content, regardless of what labeled it.
+/// ticket-status bookkeeping ("already In Progress, assigned to Alice
+/// Smith"), not real content, regardless of what labeled it.
 const TICKET_STATUS_WORDS: &[&str] =
     &["in progress", "in review", "todo", "done", "backlog", "blocked", "cancelled", "duplicate", "triage"];
 
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn skips_a_boilerplate_linear_ticket_sentence_for_the_real_one_after_it() {
-        let raw = "Linear ticket: MLOPS-5184 (https://linear.app/synthesia/issue/MLOPS-5184/some-slug). Fix the dangling pointer in the poller. Also clean up the tests.";
+        let raw = "Linear ticket: MLOPS-5184 (https://linear.app/example/issue/MLOPS-5184/some-slug). Fix the dangling pointer in the poller. Also clean up the tests.";
         let result = display_brief(raw);
         assert!(!result.contains("MLOPS-5184"), "ticket id must be stripped: {result}");
         assert!(!result.contains("linear.app"), "url must be stripped: {result}");
@@ -335,13 +335,13 @@ mod tests {
         // existing id/url/path stripping touched it — the label and its
         // status/assignee parenthetical must be stripped outright, leaving
         // nothing for the empty-brief fallback to surface.
-        let raw = "Linear ticket: (already In Progress, assigned to Ethan Brodie).";
+        let raw = "Linear ticket: (already In Progress, assigned to Alice Smith).";
         assert_eq!(display_brief(raw), "");
     }
 
     #[test]
     fn a_ticket_label_and_status_parenthetical_fall_through_to_the_real_sentence_after_them() {
-        let raw = "Ticket: (Done, assigned to Ethan Brodie). Fix the dangling pointer in the poller.";
+        let raw = "Ticket: (Done, assigned to Alice Smith). Fix the dangling pointer in the poller.";
         assert_eq!(display_brief(raw), "Fix the dangling pointer in the poller.");
     }
 
@@ -358,7 +358,7 @@ mod tests {
         // The surviving label words ("Repo:", "worktree", "at") clear
         // MIN_CONTENT_WORDS on their own once the path token itself is
         // stripped — must be recognized and skipped as a unit regardless.
-        let raw = "Repo: worktree at /Users/ethan.brodie/proj/ninox/.claude/worktrees/v1-mlops-5350-tui-islands. Fix the dangling pointer in the poller.";
+        let raw = "Repo: worktree at /Users/dev/proj/ninox/.claude/worktrees/v1-mlops-5350-tui-islands. Fix the dangling pointer in the poller.";
         let result = display_brief(raw);
         assert!(!result.to_lowercase().contains("repo:"), "boilerplate label sentence must be skipped: {result}");
         assert!(!result.to_lowercase().contains("worktree"), "{result}");
@@ -367,13 +367,13 @@ mod tests {
 
     #[test]
     fn returns_empty_when_the_entire_input_is_just_repo_worktree_boilerplate() {
-        let raw = "Repo: worktree at /Users/ethan.brodie/proj/ninox/.claude/worktrees/v1-mlops-5350-tui-islands.";
+        let raw = "Repo: worktree at /Users/dev/proj/ninox/.claude/worktrees/v1-mlops-5350-tui-islands.";
         assert_eq!(display_brief(raw), "");
     }
 
     #[test]
     fn a_bare_worktree_label_with_no_repo_prefix_is_also_skipped() {
-        let raw = "Worktree: /Users/ethan.brodie/proj/ninox/.claude/worktrees/v1-mlops-5350-tui-islands. Also clean up the tests.";
+        let raw = "Worktree: /Users/dev/proj/ninox/.claude/worktrees/v1-mlops-5350-tui-islands. Also clean up the tests.";
         assert_eq!(display_brief(raw), "Also clean up the tests.");
     }
 
@@ -384,7 +384,7 @@ mod tests {
         // (callers already treat an empty brief as "nothing to show")
         // rather than surface the stripped remnant ("Linear ticket:.") as
         // if it were real content.
-        let raw = "Linear ticket: MLOPS-5184 (https://linear.app/synthesia/issue/MLOPS-5184/some-slug).";
+        let raw = "Linear ticket: MLOPS-5184 (https://linear.app/example/issue/MLOPS-5184/some-slug).";
         assert_eq!(display_brief(raw), "");
     }
 
@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn is_repo_slug_matches_an_owner_slash_repo_token_with_a_hyphen_or_digit() {
-        assert!(is_repo_slug("Synthesia-Technologies/rnd-training-jobs-dashboard"));
+        assert!(is_repo_slug("Example-Org/training-dashboard"));
         assert!(is_repo_slug("octocat/repo2"));
         assert!(!is_repo_slug("and/or"), "a common word pair must not match");
         assert!(!is_repo_slug("his/her"));
@@ -448,15 +448,15 @@ mod tests {
 
     #[test]
     fn strips_a_repo_slug_from_the_middle_of_a_sentence() {
-        let raw = "Rebase Synthesia-Technologies/rnd-training-jobs-dashboard and merge the history-server fix.";
+        let raw = "Rebase Example-Org/training-dashboard and merge the history-server fix.";
         let result = display_brief(raw);
-        assert!(!result.contains("Synthesia-Technologies"));
+        assert!(!result.contains("Example-Org"));
         assert_eq!(result, "Rebase and merge the history-server fix.");
     }
 
     #[test]
     fn strips_a_pr_number_and_its_parenthetical_as_one_unit() {
-        let raw = "Rebase Synthesia-Technologies/rnd-training-jobs-dashboard PR #121 (fix: redundant pr title) and merge the history-server fix.";
+        let raw = "Rebase Example-Org/training-dashboard PR #121 (fix: redundant pr title) and merge the history-server fix.";
         let result = display_brief(raw);
         assert!(!result.contains("PR #121"));
         assert!(!result.contains("redundant pr title"));

@@ -16,10 +16,16 @@ pub mod import;
 #[path = "store_queue.rs"]
 mod queue;
 
+#[path = "store_resets.rs"]
+mod resets;
+pub use resets::{ResetRow, ResetState};
+
 #[path = "store_ghost.rs"]
 mod ghost;
 #[path = "store_pr_events.rs"]
 mod pr_events;
+#[path = "store_custom_workspace.rs"]
+mod custom_workspace;
 #[path = "store_idle.rs"]
 mod idle;
 pub use idle::{DiskMeasurement, IdlePromptRecord};
@@ -123,6 +129,32 @@ impl Store {
                 session_id TEXT PRIMARY KEY,
                 sent_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS session_conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                claude_session_id TEXT NOT NULL,
+                retired_at INTEGER NOT NULL,
+                reason TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS session_conversations_by_session
+                ON session_conversations(session_id, id);
+            CREATE TABLE IF NOT EXISTS orchestrator_resets (
+                orchestrator_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                started_at INTEGER NOT NULL DEFAULT 0,
+                baseline_path TEXT,
+                baseline_hash TEXT,
+                cooldown_until INTEGER NOT NULL DEFAULT 0,
+                after_reset INTEGER NOT NULL DEFAULT 0,
+                post_reset_baseline_pct REAL,
+                loop_notified INTEGER NOT NULL DEFAULT 0,
+                ready_notified INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS reset_flow_markers (
+                orchestrator_id TEXT PRIMARY KEY,
+                started_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS machine_health (
                 machine_id TEXT PRIMARY KEY,
                 status TEXT NOT NULL
@@ -132,6 +164,7 @@ impl Store {
         // both fresh and pre-existing databases end up with the same schema.
         for (col, ddl) in [
             ("model",                "ALTER TABLE sessions ADD COLUMN model TEXT"),
+            ("observed_model",       "ALTER TABLE sessions ADD COLUMN observed_model TEXT"),
             ("context_tokens",       "ALTER TABLE sessions ADD COLUMN context_tokens INTEGER"),
             ("catalogue_path",       "ALTER TABLE sessions ADD COLUMN catalogue_path TEXT"),
             ("context_used_pct",     "ALTER TABLE sessions ADD COLUMN context_used_pct REAL"),
@@ -169,9 +202,11 @@ impl Store {
         ghost::migrate(&conn)?;
         messages::migrate(&conn)?;
         Self::migrate_legacy_system_sender(&conn)?;
+        Self::migrate_demote_recorded_fable(&conn)?;
         pr_events::migrate(&conn)?;
         notifications::migrate(&conn)?;
         idle::migrate(&conn)?;
+        custom_workspace::migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -189,6 +224,29 @@ impl Store {
         tx.execute("UPDATE message_events SET from_id = ?1 WHERE from_id = ?2", params![SYSTEM_SENDER, LEGACY_SYSTEM_SENDER])?;
         tx.execute("UPDATE held_messages SET attributed_from = ?1 WHERE attributed_from = ?2", params![SYSTEM_SENDER, LEGACY_SYSTEM_SENDER])?;
         tx.execute_batch("PRAGMA user_version = 1")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `user_version` 2: a Claude Code `model` naming Fable moves to
+    /// `observed_model`, so relaunches fall back to the role default. Fable is
+    /// only used when chosen explicitly, so a deliberately typed one is reset
+    /// too. Exactly once: a Fable model set afterwards must keep.
+    fn migrate_demote_recorded_fable(conn: &Connection) -> Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version >= 2 {
+            return Ok(());
+        }
+        let tx = conn.unchecked_transaction()?;
+        let demoted: Vec<(String, String)> = tx
+            .prepare("SELECT id, model FROM sessions WHERE agent_type = 'claude-code' AND lower(model) LIKE '%fable%'")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, model) in &demoted {
+            tx.execute("UPDATE sessions SET observed_model = COALESCE(observed_model, model), model = NULL WHERE id = ?1", params![id])?;
+            tracing::info!(session = %id, model = %model, "demoted recorded Fable model to observed_model");
+        }
+        tx.execute_batch("PRAGMA user_version = 2")?;
         tx.commit()?;
         Ok(())
     }
@@ -273,8 +331,8 @@ impl Store {
              claude_session_id,summary,terminal_at,gate_status,merged_at,
              activity,activity_note,activity_since,machine_id,worker_type,
              success_criteria,completion_outcome,self_completed_at,cleanup_result,cleanup_at,
-             brain_reads,brain_write)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?15)
+             brain_reads,brain_write,observed_model)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?15,?35)
              ON CONFLICT(id) DO UPDATE SET
              repo=excluded.repo,
              status=excluded.status,cost_usd=excluded.cost_usd,
@@ -302,7 +360,8 @@ impl Store {
              cleanup_result=excluded.cleanup_result,
              cleanup_at=excluded.cleanup_at,
              brain_reads=excluded.brain_reads,
-             brain_write=excluded.brain_write",
+             brain_write=excluded.brain_write,
+             observed_model=COALESCE(excluded.observed_model,sessions.observed_model)",
             params![
                 s.id, s.orchestrator_id, s.name, s.repo, status, s.agent_type,
                 s.cost_usd, s.started_at, s.pr_number, s.pr_id,
@@ -312,7 +371,7 @@ impl Store {
                 gate_status, s.merged_at, activity, s.activity_note, s.activity_since,
                 s.machine_id, s.worker_type,
                 success_criteria, completion_outcome, s.self_completed_at,
-                s.cleanup_result, s.cleanup_at, brain_reads
+                s.cleanup_result, s.cleanup_at, brain_reads, s.observed_model
             ],
         )?;
         Ok(())
@@ -327,7 +386,7 @@ impl Store {
              claude_session_id,summary,terminal_at,gate_status,merged_at,
              activity,activity_note,activity_since,machine_id,worker_type,
              success_criteria,completion_outcome,self_completed_at,cleanup_result,cleanup_at,
-             brain_reads,brain_write
+             brain_reads,brain_write,observed_model
              FROM sessions ORDER BY started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -367,6 +426,7 @@ impl Store {
                 r.get::<_, Option<i64>>(32)?,
                 r.get::<_, Option<String>>(33)?,
                 r.get::<_, Option<String>>(34)?,
+                r.get::<_, Option<String>>(35)?,
             ))
         })?;
         rows.map(|r| {
@@ -377,7 +437,7 @@ impl Store {
                  summary, terminal_at, gate_status_str, merged_at,
                  activity_str, activity_note, activity_since, machine_id, worker_type,
                  success_criteria_str, completion_outcome_str, self_completed_at,
-                 cleanup_result, cleanup_at, brain_reads_str, brain_write) = r?;
+                 cleanup_result, cleanup_at, brain_reads_str, brain_write, observed_model) = r?;
             let status = serde_json::from_str(&format!("\"{status_str}\""))
                 .unwrap_or(SessionStatus::Working);
             let gate_status = gate_status_str
@@ -385,7 +445,7 @@ impl Store {
             Ok(Session {
                 id, orchestrator_id, name, repo, status, agent_type,
                 cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
-                model, context_tokens: context_tokens.map(|v| v.max(0) as u64),
+                model, observed_model, context_tokens: context_tokens.map(|v| v.max(0) as u64),
                 brain_reads: Self::parse_brain_reads(brain_reads_str),
                 brain_write: brain_write.or(catalogue_path),
                 context_used_pct,
@@ -420,7 +480,7 @@ impl Store {
              claude_session_id,summary,terminal_at,gate_status,merged_at,
              activity,activity_note,activity_since,machine_id,worker_type,
              success_criteria,completion_outcome,self_completed_at,cleanup_result,cleanup_at,
-             brain_reads,brain_write
+             brain_reads,brain_write,observed_model
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], |r| {
@@ -460,6 +520,7 @@ impl Store {
                 r.get::<_, Option<i64>>(32)?,
                 r.get::<_, Option<String>>(33)?,
                 r.get::<_, Option<String>>(34)?,
+                r.get::<_, Option<String>>(35)?,
             ))
         })?;
         match rows.next() {
@@ -472,7 +533,7 @@ impl Store {
                      summary, terminal_at, gate_status_str, merged_at,
                      activity_str, activity_note, activity_since, machine_id, worker_type,
                      success_criteria_str, completion_outcome_str, self_completed_at,
-                     cleanup_result, cleanup_at, brain_reads_str, brain_write) = r?;
+                     cleanup_result, cleanup_at, brain_reads_str, brain_write, observed_model) = r?;
                 let status = serde_json::from_str(&format!("\"{status_str}\""))
                     .unwrap_or(SessionStatus::Working);
                 let gate_status = gate_status_str
@@ -480,7 +541,7 @@ impl Store {
                 Ok(Some(Session {
                     id, orchestrator_id, name, repo, status, agent_type,
                     cost_usd, started_at, pr_number, pr_id, workspace_path, pid,
-                    model, context_tokens: context_tokens.map(|v| v.max(0) as u64),
+                    model, observed_model, context_tokens: context_tokens.map(|v| v.max(0) as u64),
                     brain_reads: Self::parse_brain_reads(brain_reads_str),
                     brain_write: brain_write.or(catalogue_path),
                     context_used_pct,
@@ -657,8 +718,8 @@ impl Store {
 
 
     /// Column-scoped write of the fields the external `ninox statusline`
-    /// process owns (cost + context readout, and `model` only when not
-    /// already set). Deliberately NOT a `upsert_session` full-row write: the
+    /// process owns (cost + context readout, and `observed_model` only when no
+    /// model was recorded at spawn). Deliberately NOT a `upsert_session` full-row write: the
     /// statusline hook fires continuously and from a *separate process*, so
     /// a read-modify-write there would revert any field the in-app poller
     /// stamped between the read and the write — most visibly `merged_at` on
@@ -683,7 +744,7 @@ impl Store {
                 context_used_pct     = COALESCE(?3, context_used_pct),
                 context_total_tokens = COALESCE(?4, context_total_tokens),
                 context_window_size  = COALESCE(?5, context_window_size),
-                model                = COALESCE(model, ?6)
+                observed_model       = CASE WHEN model IS NULL THEN COALESCE(observed_model, ?6) ELSE observed_model END
              WHERE id = ?1",
             params![
                 session_id,
@@ -708,7 +769,7 @@ impl Store {
             .into_iter()
             .filter(|s| {
                 s.agent_type == agent_type
-                    && s.model.as_deref() == model
+                    && s.model.as_deref().or(s.observed_model.as_deref()) == model
                     && s.cost_usd > 0.0
             })
             .map(|s| s.cost_usd)
@@ -1033,6 +1094,28 @@ impl Store {
         Ok(())
     }
 
+    /// Remember a conversation a relaunch is about to replace, so it can be
+    /// found and `--resume`d later.
+    pub fn record_retired_conversation(&self, session_id: &str, claude_session_id: &str, retired_at: i64, reason: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO session_conversations(session_id,claude_session_id,retired_at,reason) VALUES(?1,?2,?3,?4)",
+            params![session_id, claude_session_id, retired_at, reason],
+        )?;
+        Ok(())
+    }
+
+    /// `(claude_session_id, retired_at, reason)` of every conversation retired
+    /// from `session_id`, oldest first.
+    pub fn retired_conversations(&self, session_id: &str) -> Result<Vec<(String, i64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT claude_session_id,retired_at,reason FROM session_conversations WHERE session_id=?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     pub fn get_orchestrator_plan(&self, orchestrator_id: &str) -> Result<Option<OrchestratorPlan>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -1227,6 +1310,9 @@ impl Store {
         conn.execute("DELETE FROM session_messages WHERE session_id = ?1", [id])?;
         conn.execute("DELETE FROM merge_finish_nudges WHERE session_id = ?1", [id])?;
         conn.execute("DELETE FROM workspace_disk_cache WHERE session_id = ?1", [id])?;
+        conn.execute("DELETE FROM session_conversations WHERE session_id = ?1", [id])?;
+        conn.execute("DELETE FROM orchestrator_resets WHERE orchestrator_id = ?1", [id])?;
+        conn.execute("DELETE FROM reset_flow_markers WHERE orchestrator_id = ?1", [id])?;
         Self::purge_fleet_rows(&conn, id)?;
         Ok(())
     }
@@ -1297,6 +1383,9 @@ impl Store {
         conn.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         conn.execute("DELETE FROM orchestrator_runtimes WHERE orchestrator_id=?1", [id])?;
         conn.execute("DELETE FROM orchestrator_plans WHERE orchestrator_id=?1", [id])?;
+        conn.execute("DELETE FROM session_conversations WHERE session_id=?1", [id])?;
+        conn.execute("DELETE FROM orchestrator_resets WHERE orchestrator_id = ?1", [id])?;
+        conn.execute("DELETE FROM reset_flow_markers WHERE orchestrator_id = ?1", [id])?;
         conn.execute("DELETE FROM orchestrators WHERE id = ?1", [id])?;
         Ok(())
     }
@@ -1518,6 +1607,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recorded_fable_is_demoted_once_and_a_later_choice_survives() {
+        use crate::config::AppConfig;
+        use crate::model_resolution::{relaunch_agent, Role};
+        let _iso = crate::test_isolation::isolate();
+        let path = tempdir().unwrap().keep().join("t.db");
+        let row = |id: &str, agent: &str, model: &str, observed: Option<&str>| {
+            let mut s = brain_session(id, &[], None);
+            s.agent_type = agent.into();
+            s.model = Some(model.into());
+            s.observed_model = observed.map(Into::into);
+            s
+        };
+        {
+            let store = Store::open(&path).unwrap();
+            for s in [
+                row("fable", "claude-code", "claude-fable-5-1", None),
+                row("shout", "claude-code", "Claude-FABLE-5", Some("claude-opus-5-5")),
+                row("opus", "claude-code", "claude-opus-5-5", None),
+                row("codex", "codex", "claude-fable-5-1", None),
+            ] {
+                store.upsert_session(&s).unwrap();
+            }
+            store.conn.lock().unwrap().execute_batch("PRAGMA user_version = 0").unwrap();
+        }
+
+        let version = |store: &Store| store.conn.lock().unwrap().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap();
+        let models = |store: &Store, id: &str| {
+            let s = store.get_session(id).unwrap().unwrap();
+            (s.model, s.observed_model)
+        };
+        let snapshot = |store: &Store| ["fable", "shout", "opus", "codex"].map(|id| models(store, id));
+        let s = |v: &str| Some(v.to_string());
+
+        let store = Store::open(&path).unwrap();
+        let after = snapshot(&store);
+        assert_eq!(version(&store), 2);
+        assert_eq!(after[0], (None, s("claude-fable-5-1")));
+        assert_eq!(after[1], (None, s("claude-opus-5-5")), "an existing observed_model wins");
+        assert_eq!(after[2], (s("claude-opus-5-5"), None));
+        assert_eq!(after[3], (s("claude-fable-5-1"), None), "other harnesses are left alone");
+
+        let config = AppConfig::default();
+        let demoted = store.get_session("fable").unwrap().unwrap();
+        let plan = |role| relaunch_agent(&demoted.agent_type, demoted.model.as_deref(), role, None, &config);
+        assert_eq!(plan(Role::Orchestrator).model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(plan(Role::Worker).model.as_deref(), Some("claude-sonnet-5-5"));
+
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!((snapshot(&store), version(&store)), (after, 2), "a second run changes nothing");
+
+        store.upsert_session(&row("fable", "claude-code", "claude-fable-5-2", None)).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(models(&store, "fable").0, s("claude-fable-5-2"), "a Fable model set after the migration survives a reopen");
+    }
+
     fn test_store() -> Store {
         let dir = tempdir().unwrap();
         let path = dir.path().join("t.db");
@@ -1534,7 +1681,7 @@ mod tests {
             repo: "slievr/Athene".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -1561,7 +1708,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -1590,7 +1737,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 1.5, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -1630,7 +1777,7 @@ mod tests {
             repo: "OwnerA/repoA".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -1658,7 +1805,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -1679,6 +1826,26 @@ mod tests {
     }
 
     #[test]
+    fn statusline_model_is_observed_not_recorded() {
+        let store = test_store();
+        let mut s = brain_session("a", &[], None);
+        s.model = None;
+        store.upsert_session(&s).unwrap();
+        store.update_statusline_metrics("a", None, None, None, None, Some("claude-fable-5-1")).unwrap();
+        let got = store.get_session("a").unwrap().unwrap();
+        assert_eq!((got.model.as_deref(), got.observed_model.as_deref()), (None, Some("claude-fable-5-1")));
+        store.upsert_session(&Session { observed_model: None, ..got }).unwrap();
+        assert_eq!(store.get_session("a").unwrap().unwrap().observed_model.as_deref(), Some("claude-fable-5-1"), "stale full-row write must not erase it");
+
+        s.id = "b".into();
+        s.model = Some("claude-opus-5-5".into());
+        store.upsert_session(&s).unwrap();
+        store.update_statusline_metrics("b", None, None, None, None, Some("claude-fable-5-1")).unwrap();
+        let got = store.get_session("b").unwrap().unwrap();
+        assert_eq!((got.model.as_deref(), got.observed_model), (Some("claude-opus-5-5"), None));
+    }
+
+    #[test]
     fn model_and_context_tokens_round_trip() {
         let store = test_store();
         let s = Session {
@@ -1686,7 +1853,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 1.5, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: Some("claude-fable-5".into()), context_tokens: Some(214_000), brain_reads: Vec::new(), brain_write: None,
+            model: Some("claude-fable-5".into()), observed_model: None, context_tokens: Some(214_000), brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -1771,7 +1938,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: Some("Fix flaky CI on the auth suite".into()),
@@ -1809,7 +1976,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some("b7e0b3a0-0000-4000-8000-000000000001".into()),
             summary: None,
@@ -1847,7 +2014,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Done,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -1888,7 +2055,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 100,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -1970,7 +2137,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 2.6, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: Some(62.0),
             context_total_tokens: Some(124_000),
             context_window_size: Some(200_000),
@@ -2002,7 +2169,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -2037,7 +2204,7 @@ mod tests {
                 repo: "r".into(), status: SessionStatus::Working,
                 agent_type: agent_type.into(), cost_usd: cost, started_at: 0,
                 pr_number: None, pr_id: None, workspace_path: None, pid: None,
-                model: model.map(String::from), context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+                model: model.map(String::from), observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
                 context_used_pct: None, context_total_tokens: None, context_window_size: None,
                 claude_session_id: None, summary: None,
                 terminal_at: None, gate_status: None, merged_at: None,
@@ -2063,7 +2230,7 @@ mod tests {
             repo: "r".into(), status: crate::types::SessionStatus::PrOpen,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: Some(1), pr_id: Some(1), workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
@@ -2101,7 +2268,7 @@ mod tests {
             repo: "r".into(), status: crate::types::SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
@@ -2131,7 +2298,7 @@ mod tests {
             repo: "r".into(), status: crate::types::SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
@@ -2164,7 +2331,7 @@ mod tests {
             repo: "r".into(), status: crate::types::SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
@@ -2192,7 +2359,7 @@ mod tests {
             repo: "r".into(), status: crate::types::SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
@@ -2217,7 +2384,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
@@ -2329,7 +2496,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::PrOpen,
             agent_type: "c".into(), cost_usd: 3.5, started_at: 0,
             pr_number: Some(9), pr_id: Some(9), workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
@@ -2369,7 +2536,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
@@ -2410,7 +2577,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
@@ -2501,6 +2668,19 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_session_or_orchestrator_drops_its_retired_conversations() {
+        let store = Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap();
+        for id in ["orch", "other", "w"] {
+            store.record_retired_conversation(id, "c", 1, "reset-from-plan").unwrap();
+        }
+        store.delete_orchestrator("orch").unwrap();
+        store.delete_session("w").unwrap();
+        assert!(store.retired_conversations("orch").unwrap().is_empty());
+        assert!(store.retired_conversations("w").unwrap().is_empty());
+        assert_eq!(store.retired_conversations("other").unwrap().len(), 1);
+    }
+
+    #[test]
     fn orchestrator_plan_round_trips_and_upsert_preserves_registered_at() {
         let store = test_store();
         assert!(store.get_orchestrator_plan("orch").unwrap().is_none());
@@ -2587,7 +2767,7 @@ mod tests {
             repo: "r".into(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -2676,7 +2856,7 @@ mod tests {
             repo: String::new(), status: crate::types::SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
@@ -2719,7 +2899,7 @@ mod tests {
             repo: String::new(), status: SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: Some(4242),
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
@@ -2895,7 +3075,7 @@ mod tests {
             repo: String::new(), status: crate::types::SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,

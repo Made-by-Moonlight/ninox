@@ -193,7 +193,7 @@ fn worker_fields<'a>(app: &'a App, session: &'a Session) -> Vec<Element<'a, Mess
             "{} · {} · {}",
             session.worker_type.as_deref().unwrap_or("Worker"),
             session.agent_type,
-            session.model.as_deref().unwrap_or("—"),
+            session.model_label().as_deref().unwrap_or("—"),
         ),
     ));
 
@@ -788,7 +788,7 @@ mod tests {
             status: ninox_core::types::SessionStatus::Working, agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 0, pr_number: None, pr_id: None,
             workspace_path: Some(".claude/worktrees/v1-mlops-5339-gui-detail".into()),
-            pid: None, model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None, context_used_pct: None,
+            pid: None, model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None, context_used_pct: None,
             context_total_tokens: None, context_window_size: None, claude_session_id: None, summary: None,
             terminal_at: None, gate_status: None, merged_at: None, activity: ninox_core::types::ActivityState::Idle,
             activity_note: None, activity_since: None, machine_id: None, worker_type: None,
@@ -804,7 +804,7 @@ mod tests {
             id: "s".into(), orchestrator_id: Some("o".into()), name: "s-name".into(), repo: "o/r".into(),
             status: ninox_core::types::SessionStatus::PrOpen, agent_type: "claude-code".into(), cost_usd: 0.0,
             started_at: 0, pr_number: Some(42), pr_id: None, workspace_path: None,
-            pid: None, model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None, context_used_pct: None,
+            pid: None, model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None, context_used_pct: None,
             context_total_tokens: None, context_window_size: None, claude_session_id: None, summary: None,
             terminal_at: None, gate_status: None, merged_at: None, activity: ninox_core::types::ActivityState::Idle,
             activity_note: None, activity_since: None, machine_id: None, worker_type: None,

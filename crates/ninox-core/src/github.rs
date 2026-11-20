@@ -559,8 +559,8 @@ mod tests {
     /// `github.com`.
     #[test]
     fn parse_repo_owner_from_ssh_scp_syntax_with_custom_host_alias() {
-        let (owner, repo) = split_repo("git@github.com-synthesia:Synthesia-Technologies/ninox.git").unwrap();
-        assert_eq!(owner, "Synthesia-Technologies");
+        let (owner, repo) = split_repo("git@github.com-work:Example-Org/ninox.git").unwrap();
+        assert_eq!(owner, "Example-Org");
         assert_eq!(repo, "ninox");
     }
 
@@ -581,8 +581,8 @@ mod tests {
     #[test]
     fn parse_pr_url_extracts_slug_and_number() {
         assert_eq!(
-            parse_pr_url("https://github.com/Synthesia-Technologies/ninox/pull/42"),
-            Some(("Synthesia-Technologies/ninox".to_string(), 42))
+            parse_pr_url("https://github.com/Example-Org/ninox/pull/42"),
+            Some(("Example-Org/ninox".to_string(), 42))
         );
     }
 
@@ -671,14 +671,14 @@ mod tests {
         init_repo(dir.path());
         let workspace = dir.path().to_string_lossy().to_string();
         std::process::Command::new("git")
-            .args(["-C", &workspace, "remote", "add", "internal", "git@github.com-synthesia:Synthesia-Technologies/ninox.git"])
+            .args(["-C", &workspace, "remote", "add", "internal", "git@github.com-work:Example-Org/ninox.git"])
             .status().unwrap();
         std::process::Command::new("git")
             .args(["-C", &workspace, "remote", "add", "origin", "https://github.com/Made-by-Moonlight/ninox.git"])
             .status().unwrap();
 
         let repos = candidate_repos(&workspace);
-        assert_eq!(repos, vec!["Made-by-Moonlight/ninox".to_string(), "Synthesia-Technologies/ninox".to_string()]);
+        assert_eq!(repos, vec!["Made-by-Moonlight/ninox".to_string(), "Example-Org/ninox".to_string()]);
     }
 
     #[test]

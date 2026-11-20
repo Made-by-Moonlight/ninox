@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, ratatui/crossterm, tokio (`spawn_blocking` for the sqlite-backed fetch), existing `ninox_core::BrainIndex::{backlinks,related,outlinks}`.
 
-**Spec:** `/Users/ethan.brodie/proj/ninox/.claude/design-ref/fleet-overview-v1/BRIEF-MLOPS-5350-tui-parity.md` (Worker B, item 1 "Brain list depth": *"Backlinks, related and outlinks panes in the entry view, with Enter to jump"*). The GUI (`crates/ninox-gui/src/components/brain_list.rs::reading_pane`) only currently *renders* two of the three ("Cited by" / "Links to"; `related` is fetched and tested but not yet shown anywhere in the GUI) — the brief's own text, not the GUI's current pixels, is authoritative here, so the TUI shows all three.
+**Spec:** `.claude/design-ref/fleet-overview-v1/BRIEF-MLOPS-5350-tui-parity.md` (Worker B, item 1 "Brain list depth": *"Backlinks, related and outlinks panes in the entry view, with Enter to jump"*). The GUI (`crates/ninox-gui/src/components/brain_list.rs::reading_pane`) only currently *renders* two of the three ("Cited by" / "Links to"; `related` is fetched and tested but not yet shown anywhere in the GUI) — the brief's own text, not the GUI's current pixels, is authoritative here, so the TUI shows all three.
 
 ## Global Constraints
 

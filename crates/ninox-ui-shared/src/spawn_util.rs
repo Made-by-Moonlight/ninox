@@ -187,11 +187,9 @@ pub async fn launch_interactive_session(
         workspace_path:  Some(p.workspace),
         pid,
         model:           p.agent.model.clone(),
-        context_tokens:  prior.and_then(|s| s.context_tokens),
-        brain_reads:     p.brain.as_ref().map(|b| {
-            b.reads.iter().map(|r| r.to_string_lossy().into_owned()).collect()
-        }).unwrap_or_default(),
-        brain_write:     p.brain.as_ref().map(|b| b.write_str()),
+        observed_model: None, context_tokens:  prior.and_then(|s| s.context_tokens),
+        brain_reads:     p.brain.as_ref().map(|b| b.stored_reads()).unwrap_or_default(),
+        brain_write:     p.brain.as_ref().and_then(|b| b.stored_write()),
         context_used_pct:     prior.and_then(|s| s.context_used_pct),
         context_total_tokens: prior.and_then(|s| s.context_total_tokens),
         context_window_size:  prior.and_then(|s| s.context_window_size),
@@ -216,7 +214,9 @@ pub async fn launch_interactive_session(
         // Carried: a respawn/resume is still the same worker-type
         // incarnation, not a fresh untyped spawn.
         worker_type:     prior.and_then(|s| s.worker_type.clone()),
-        success_criteria: Vec::new(),
+        // Carried: the Definition of done the session-setup hook serves a
+        // resumed or restarted worker comes from this list.
+        success_criteria: prior.map(|s| s.success_criteria.clone()).unwrap_or_default(),
         completion_outcome: None,
         self_completed_at: None,
         // Not carried: this incarnation hasn't been cleaned up.
@@ -241,6 +241,25 @@ pub async fn launch_interactive_session(
 
     // Hidden tmux client attach argv — mirrors NavigateSession's attach flow.
     Ok(runtime::attach_args(&sid).await)
+}
+
+/// Claude Code reads `.claude/settings.local.json` from the directory it
+/// starts in, never from a parent. An orchestrator runs in its own
+/// subdirectory of the orchestrator root, so the statusLine and hooks that
+/// `setup_orchestrator_root` merges into the root's file never reach it, and
+/// without them it never reports its context window or activity. Merge them
+/// into the orchestrator's own `.claude/settings.local.json` (through
+/// `claude_settings`, which keeps the user's entries and writes only that file).
+pub fn seed_orchestrator_workspace_settings(workspace: &std::path::Path, config: &ninox_core::config::AppConfig) {
+    if !workspace.is_dir() {
+        return;
+    }
+    // The shared shim, like every other seeded command (see
+    // `ensure_statusline_settings`).
+    let ninox_bin = ninox_core::hooks::self_shim_path().display().to_string();
+    if let Err(e) = ninox_core::orchestrator_root::seed_orchestrator_workspace(workspace, config, &ninox_bin) {
+        tracing::warn!("orchestrator workspace {}: {e:#}", workspace.display());
+    }
 }
 
 /// Everything needed to relaunch an existing session row under its own id.
@@ -271,6 +290,7 @@ pub async fn relaunch_in_place(
     let _ = ninox_core::runtime::kill_session(&id).await;
     if req.is_orchestrator {
         maybe_clear_dead_orchestrator_identity(&engine.store, &id).await;
+        reseed_custom_workspace(&engine.store, &id, config, &req.session.agent_type).await?;
     }
     // The worktree may have been torn down since the session ran (merge
     // cleanup, manual prune). Recreate it at the same path — claude-code
@@ -284,10 +304,19 @@ pub async fn relaunch_in_place(
     // Every resume, re-file, restart, fleet restore and queued relaunch
     // passes through here: re-seed so a recreated worktree, or a type whose
     // rules changed since the last launch, starts with the current profile.
-    if let Err(e) = seed_permissions_for_type_name(
-        std::path::Path::new(&req.plan.workspace), &req.session.agent_type, req.session.worker_type.as_deref(), config,
-    ) {
-        return Err(format!("{id}: {e:#}"));
+    // Not in a custom workspace: the rules would replace the user's own.
+    let custom = matches!(engine.store.custom_workspace(&id), Ok(Some(_)));
+    if !custom {
+        if let Err(e) = seed_permissions_for_type_name(
+            std::path::Path::new(&req.plan.workspace), &req.session.agent_type, req.session.worker_type.as_deref(), config,
+        ) {
+            return Err(format!("{id}: {e:#}"));
+        }
+    }
+    // A custom workspace was seeded by `reseed_custom_workspace` above, guards
+    // included; seeding it again here would strip them.
+    if req.is_orchestrator && !custom {
+        seed_orchestrator_workspace_settings(std::path::Path::new(&req.plan.workspace), config);
     }
     let store = engine.store.clone();
     let launched = launch_interactive_session(
@@ -325,6 +354,58 @@ pub async fn relaunch_in_place(
         });
     }
     launched
+}
+
+/// The native folder chooser, where the platform has one ready (macOS
+/// `osascript`); `None` on cancel or anywhere else, where the path is typed.
+pub fn choose_folder() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let out = std::process::Command::new("osascript")
+        .args(["-e", "POSIX path of (choose folder with prompt \"Workspace folder\")"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Some(path.trim_end_matches('/').to_string()).filter(|p| !p.is_empty())
+}
+
+/// Re-seeds the user's folder of a custom-workspace orchestrator (a no-op for
+/// any other session) so a relaunch picks up the current ninox hooks and
+/// skills. A folder that has gone is an error, never recreated: it is not
+/// ninox's to make.
+pub async fn reseed_custom_workspace(
+    store: &Store,
+    id: &str,
+    config: &ninox_core::config::AppConfig,
+    harness: &str,
+) -> Result<(), String> {
+    let Some(dir) = store.custom_workspace(id).ok().flatten() else { return Ok(()) };
+    if !std::path::Path::new(&dir).is_dir() {
+        return Err(format!("{id}: its workspace folder {dir} no longer exists"));
+    }
+    let ninox_bin = ninox_core::hooks::self_shim_path().display().to_string();
+    let config_path = ninox_core::config::AppConfig::config_path().to_string_lossy().to_string();
+    let report = ninox_core::custom_workspace::install(
+        std::path::Path::new(&dir), &config.resolved_orchestrator_root(), config, harness, &ninox_bin, &config_path,
+    ).await;
+    for w in report.warnings {
+        tracing::warn!("custom workspace {id}: {w}");
+    }
+    Ok(())
+}
+
+/// [`reseed_custom_workspace`] for every orchestrator still on record, at
+/// server start. A missing folder is skipped; its relaunch will say so.
+pub async fn reseed_all_custom_workspaces(store: &Store, config: &ninox_core::config::AppConfig) {
+    for (id, _) in store.live_custom_workspaces().unwrap_or_default() {
+        let Some(session) = store.get_session(&id).ok().flatten().filter(|s| !s.status.is_terminal()) else { continue };
+        let harness = session.agent_type;
+        if let Err(e) = reseed_custom_workspace(store, &id, config, &harness).await {
+            tracing::warn!("{e}");
+        }
+    }
 }
 
 /// Bounded wait, mirroring `tmux.rs::wait_for_input_prompt`'s poll-against-a-
@@ -727,12 +808,13 @@ fn write_ownership_marker(target: &std::path::Path, repo: &str, branch: &str) {
 ///
 /// When the `whoami` capability's own registry gate is satisfied by
 /// `config` (`[role_rehydration].enabled`), also appends a sibling
-/// `identity-hook prompt` entry to `UserPromptSubmit` and installs a new
-/// `SessionStart` event carrying `identity-hook session-start` — see
-/// `ninox_core::identity::push_prompt_hook`/`set_session_start_hook`, shared
-/// with `orchestrator_root::setup_orchestrator_root`'s identical wiring so
-/// the two install sites can't drift apart.
-fn ensure_statusline_settings(
+/// `identity-hook prompt` entry to `UserPromptSubmit` — see
+/// `ninox_core::identity::push_prompt_hook`, shared with
+/// `orchestrator_root::setup_orchestrator_root`'s identical wiring so the two
+/// install sites can't drift apart. Always installs a `SessionStart` event
+/// carrying `session-setup`, which prints the worker's footer and Definition
+/// of done (and the identity reminder when enabled).
+pub(crate) fn ensure_statusline_settings(
     worktree_path: &std::path::Path, inbox_enabled: bool, config: &ninox_core::config::AppConfig,
 ) {
     use ninox_core::claude_settings::{self, LEGACY_SETTINGS, LOCAL_SETTINGS};
@@ -778,7 +860,8 @@ fn ensure_statusline_settings(
             "hooks": [hook("worker-status hook-permission")]
         }]
     });
-    ninox_core::identity::set_session_start_hook(config, &ninox_bin_quoted, &mut hooks);
+    // Footer, Definition of done and identity, on every SessionStart source.
+    hooks["SessionStart"] = serde_json::json!([{ "hooks": [hook("session-setup")] }]);
     settings["hooks"] = hooks;
 
     if std::fs::create_dir_all(&claude_dir).is_err() {
@@ -1160,7 +1243,7 @@ mod tests {
             id: "orch-1".into(), orchestrator_id: None, name: "orch-1".into(), repo: String::new(),
             status: SessionStatus::Working, agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: Some(std::process::id()),
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None, machine_id: None,
@@ -1396,7 +1479,8 @@ mod tests {
         assert!(prompt_cmds.iter().any(|c| c.ends_with("identity-hook prompt")), "{prompt_cmds:?}");
         assert!(prompt_cmds.iter().any(|c| c.ends_with("worker-status hook-prompt")), "{prompt_cmds:?}");
         let session_start_cmds = hook_commands(&settings, "SessionStart");
-        assert!(session_start_cmds.iter().any(|c| c.ends_with("identity-hook session-start")), "{session_start_cmds:?}");
+        assert_eq!(session_start_cmds.len(), 1, "{session_start_cmds:?}");
+        assert!(session_start_cmds[0].ends_with("session-setup"), "identity rides in the session-setup hook: {session_start_cmds:?}");
     }
 
     #[tokio::test]
@@ -1412,7 +1496,9 @@ mod tests {
 
         let prompt_cmds = hook_commands(&settings, "UserPromptSubmit");
         assert!(!prompt_cmds.iter().any(|c| c.contains("identity-hook")), "{prompt_cmds:?}");
-        assert!(settings["hooks"]["SessionStart"].is_null(), "SessionStart must not be installed when disabled");
+        let session_start_cmds = hook_commands(&settings, "SessionStart");
+        assert_eq!(session_start_cmds.len(), 1, "{session_start_cmds:?}");
+        assert!(session_start_cmds[0].ends_with("session-setup"), "the worker hook is not gated: {session_start_cmds:?}");
     }
 
     /// A branch that carries a checked-in `.claude/settings.json` keeps it
@@ -1941,7 +2027,7 @@ mod tests {
             id: "respawn-preserve-test".into(), orchestrator_id: None, name: "n".into(),
             repo: "Owner/repo".into(), status: SessionStatus::Interrupted, agent_type: "claude-code".into(),
             cost_usd: 4.2, started_at: 0, pr_number: Some(7), pr_id: Some(7),
-            workspace_path: Some(ws.clone()), pid: None, model: None, context_tokens: Some(999),
+            workspace_path: Some(ws.clone()), pid: None, model: None, observed_model: None, context_tokens: Some(999),
             brain_reads: Vec::new(), brain_write: None,
             context_used_pct: Some(41.0), context_total_tokens: Some(82_000), context_window_size: Some(200_000),
             claude_session_id: Some("old-uuid".into()),
@@ -2021,7 +2107,7 @@ mod tests {
             id: "spawn-fail-test".into(), orchestrator_id: None, name: "n".into(),
             repo: String::new(), status: SessionStatus::Working, agent_type: "claude-code".into(),
             cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None,
-            workspace_path: None, pid: None, model: None, context_tokens: None,
+            workspace_path: None, pid: None, model: None, observed_model: None, context_tokens: None,
             brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: Some("fixed-uuid".into()),

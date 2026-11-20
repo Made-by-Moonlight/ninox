@@ -333,6 +333,7 @@ mod tests {
             agent_type: "claude".to_string(),
             cost_usd: 0.0,
             started_at,
+            observed_model: None,
             pr_number: None,
             pr_id: None,
             workspace_path: None,

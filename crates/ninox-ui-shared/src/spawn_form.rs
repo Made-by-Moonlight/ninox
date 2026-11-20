@@ -32,10 +32,10 @@ pub fn static_prior(harness: &str, model: Option<&str>) -> Option<(f64, f64)> {
         return None;
     }
     match model {
-        Some("claude-fable-5-1") | Some("claude-fable-5") => Some((4.0, 8.0)),
+        Some("claude-fable-5-2") | Some("claude-fable-5-1") | Some("claude-fable-5") => Some((4.0, 8.0)),
         Some("claude-opus-5-5")                           => Some((2.0, 4.0)),
         Some("claude-sonnet-5-5")                         => Some((1.0, 2.0)),
-        Some("claude-haiku-4-5-20251001")                 => Some((0.4, 1.2)),
+        Some("claude-haiku-5-5") | Some("claude-haiku-4-5-20251001") => Some((0.4, 1.2)),
         _                                                 => None,
     }
 }
@@ -314,6 +314,7 @@ mod brain_choice_tests {
         let cat = |name: &str, enabled: bool, access: &str| ninox_core::config::CatalogueRef {
             name: name.into(), path: format!("/scratch/{name}").into(), remote: None, endpoint: None,
             region: None, cache_ttl_secs: None, enabled, cadence: "manual".into(), access: access.into(),
+            write_rules_override: None,
         };
         cfg.brain.catalogues = vec![cat("wiki", true, "read_only"), cat("old", false, "read_write")];
         let c = brain_choices(&cfg);

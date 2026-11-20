@@ -365,6 +365,9 @@ impl Ops for LiveOps {
     }
 
     fn spawn(&self, target: &Target) -> Result<(), String> {
+        if target.port == ninox_core::AppConfig::load_or_default().port && start_managed_service() {
+            return Ok(());
+        }
         ninox_core::daemon::spawn_headless(target.port, &target.ninox_bin, &target.db_path)
     }
 
@@ -383,6 +386,36 @@ impl Ops for LiveOps {
             let _ = store.clear_harness_auth_subprocesses();
         }
     }
+}
+
+/// Starts the daemon through launchd/systemd when this user installed the
+/// service (`ninox service install`) and it is loaded, so the supervisor
+/// stays the only thing that spawns it. Looked up under the real `$HOME`,
+/// so a scratch HOME never reaches the user's service.
+fn start_managed_service() -> bool {
+    use ninox_core::fleet::service::{managed_command, start_commands, unit_path, ServicePlatform};
+    let Some(platform) = ServicePlatform::current() else { return false };
+    let Some(home) = dirs::home_dir() else { return false };
+    if !unit_path(platform, &home).is_file() {
+        return false;
+    }
+    let uid = {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(&home) {
+            Ok(m) => m.uid(),
+            Err(_) => return false,
+        }
+    };
+    let run = |argv: &[String]| {
+        let Some((bin, args)) = argv.split_first() else { return false };
+        std::process::Command::new(bin)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    run(&managed_command(platform, uid)) && start_commands(platform, uid).iter().all(|c| run(c))
 }
 
 /// Something the user should fix and then restart the server for. Never
@@ -416,6 +449,9 @@ pub fn classify(issue: &server_control::ServiceIssue) -> Option<Alert> {
             hint:     format!("log in again (`{}`), then Restart server", auth.login),
             sessions: issue.sessions.clone(),
         });
+    }
+    if let Some(fix) = issue.message.strip_prefix("update check can't run: ").filter(|_| issue.source == "update_check") {
+        return Some(Alert::new("Update check can't run", fix));
     }
     classify_issue(&issue.message)
 }
@@ -678,6 +714,19 @@ mod tests {
                 source: (*s).into(), message: (*m).into(), sessions: Vec::new(),
             }).collect(),
         }
+    }
+
+    #[test]
+    fn update_check_issue_shows_the_fix_command_not_a_generic_aws_alert() {
+        let issue = ninox_core::server_control::ServiceIssue {
+            source: "update_check".into(),
+            message: "update check can't run: the AWS SSO session expired — run `aws sso login --profile p`".into(),
+            sessions: Vec::new(),
+        };
+        let alert = classify(&issue).expect("surfaced");
+        assert_eq!(alert.line(), "Update check can't run: the AWS SSO session expired — run `aws sso login --profile p`");
+        let other = ninox_core::server_control::ServiceIssue { message: "update check failed: network".into(), ..issue };
+        assert!(classify(&other).is_none(), "transient failures stay in the log");
     }
 
     #[test]

@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn default_label_uses_the_host_portion_of_user_at_host() {
-        assert_eq!(default_label("ethan@10.0.0.5"), "10.0.0.5");
+        assert_eq!(default_label("alice@10.0.0.5"), "10.0.0.5");
         assert_eq!(default_label("build-box"), "build-box");
     }
 

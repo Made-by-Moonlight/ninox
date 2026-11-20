@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, rusqlite, tokio, existing `git` CLI shell-outs (no new dependencies).
 
-**Spec:** `/Users/ethan.brodie/proj/ninox/.claude/design-ref/fleet-overview-v1/BRIEF-MLOPS-5418-workspace-cleanup.md` (read `BRIEF-common.md` §7 first — process/PR rules only, no design content for this ticket).
+**Spec:** `.claude/design-ref/fleet-overview-v1/BRIEF-MLOPS-5418-workspace-cleanup.md` (read `BRIEF-common.md` §7 first — process/PR rules only, no design content for this ticket).
 
 ## Global Constraints
 

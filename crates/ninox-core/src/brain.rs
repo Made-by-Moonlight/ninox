@@ -966,6 +966,10 @@ impl BrainIndex {
             .filter_map(|e| e.ok())
             .map(|e| e.into_path())
             .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("md"))
+            .filter(|p| {
+                let rel = p.strip_prefix(&self.brain_path).unwrap_or(p).to_string_lossy();
+                !crate::brain_rules::is_reserved_rel(&rel)
+            })
             .collect();
 
         // Read + parse across a thread pool. Pure function, no shared state.
@@ -1907,6 +1911,7 @@ mod merged_tests {
             enabled,
             cadence: "manual".to_string(),
             access: "read_write".to_string(),
+            write_rules_override: None,
         }
     }
 
@@ -2131,6 +2136,7 @@ mod brain_scope_tests {
             enabled: true,
             cadence: "manual".to_string(),
             access: "read_write".to_string(),
+            write_rules_override: None,
         }
     }
 

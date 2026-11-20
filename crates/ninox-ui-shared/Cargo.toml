@@ -11,6 +11,7 @@ ninox-core   = { path = "../ninox-core", version = "1.0.0" }
 ninox-server = { path = "../ninox-server", version = "1.0.0" }
 ninox-ptyd   = { path = "../ninox-ptyd", version = "1.0.0" }
 tokio        = { workspace = true }
+sha2         = { workspace = true }
 anyhow       = { workspace = true }
 tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }

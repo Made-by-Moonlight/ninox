@@ -404,6 +404,10 @@ pub fn enclosing_app_bundle(exe: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+pub fn inside_bundle(path: &Path, bundle: &Path) -> bool {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf()).starts_with(bundle.canonicalize().unwrap_or_else(|_| bundle.to_path_buf()))
+}
+
 /// Ninox.app only ever bundles the desktop (ninox-gui) binary.
 pub fn app_bundle_binary(bundle: &Path) -> PathBuf {
     bundle.join("Contents/MacOS/ninox-gui")
@@ -433,22 +437,54 @@ pub fn cargo_config_text() -> Option<String> {
     ["config.toml", "config"].iter().find_map(|f| std::fs::read_to_string(home.join(f)).ok())
 }
 
+/// The profile to hand `aws`: `None` when the process already has
+/// `AWS_PROFILE` (the environment wins), else the one the installer saved
+/// in `[update] aws_profile` — a launchd-started server never sees the
+/// shell the installer ran in.
+pub fn effective_aws_profile() -> Option<String> {
+    if std::env::var("AWS_PROFILE").is_ok_and(|p| !p.is_empty()) {
+        return None;
+    }
+    crate::config::AppConfig::load_or_default().update.aws_profile.filter(|p| !p.is_empty())
+}
+
+/// The profile name an `aws sso login` hint should name: the environment's,
+/// else the saved one.
+pub fn known_aws_profile() -> Option<String> {
+    std::env::var("AWS_PROFILE").ok().filter(|p| !p.is_empty()).or_else(effective_aws_profile)
+}
+
 /// Runs `aws <args>`, surfacing a clear hint when the failure looks like an
 /// expired/missing AWS session rather than dumping raw CLI stderr. Shared by
 /// `ninox update` and the `machine add` cross-arch install path (`remote.rs`)
 /// so both resolve CodeArtifact the same way instead of each shelling out to
 /// `aws` with their own error handling.
 pub fn run_aws(args: &[String]) -> Result<String> {
-    let output = Command::new("aws").args(args).env("AWS_PAGER", "").output().map_err(|e| match e.kind() {
+    run_aws_with_profile(args, effective_aws_profile().as_deref())
+}
+
+pub fn run_aws_with_profile(args: &[String], profile: Option<&str>) -> Result<String> {
+    let mut cmd = Command::new("aws");
+    cmd.args(args).env("AWS_PAGER", "");
+    if let Some(profile) = profile {
+        cmd.env("AWS_PROFILE", profile);
+    }
+    let output = cmd.output().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => anyhow::anyhow!("{AWS_MISSING_MARKER} (`brew install awscli`)"),
         _ => anyhow::Error::new(e).context("running aws"),
     })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let sub = args.iter().take(2).cloned().collect::<Vec<_>>().join(" ");
+        if is_access_denied(&stderr) {
+            bail!("aws {sub} failed — {ACCESS_DENIED_MARKER}\n{}", stderr.trim());
+        }
+        if is_missing_profile(&stderr) {
+            bail!("aws {sub} failed — {NO_PROFILE_MARKER}\n{}", stderr.trim());
+        }
         let auth = ["sso", "token", "expired", "credentials", "ExpiredToken", "UnrecognizedClient"]
             .iter()
             .any(|needle| stderr.contains(needle));
-        let sub = args.iter().take(2).cloned().collect::<Vec<_>>().join(" ");
         if auth {
             bail!(
                 "aws {sub} failed — {SESSION_ERROR_MARKER}; run `aws sso login` (set AWS_PROFILE / --profile \
@@ -461,12 +497,26 @@ pub fn run_aws(args: &[String]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+fn is_access_denied(stderr: &str) -> bool {
+    ["AccessDenied", "not authorized", "is not authorized to perform"].iter().any(|n| stderr.contains(n))
+}
+
+/// `Unable to locate credentials` and `profile ... could not be found` mean
+/// no usable profile is configured at all, as opposed to an expired one.
+fn is_missing_profile(stderr: &str) -> bool {
+    ["Unable to locate credentials", "could not be found", "ProfileNotFound", "NoCredentialsError"]
+        .iter()
+        .any(|n| stderr.contains(n))
+}
+
 /// Substring of the `run_aws` error that means the caller's AWS/SSO session
 /// is missing or expired, as opposed to a genuine failure.
 /// Prefix of the `run_aws` error for a missing `aws` binary.
 pub const AWS_MISSING_MARKER: &str = "the `aws` CLI is required";
 
 const SESSION_ERROR_MARKER: &str = "no valid AWS session";
+const ACCESS_DENIED_MARKER: &str = "AWS access denied";
+const NO_PROFILE_MARKER: &str = "no usable AWS profile";
 
 /// Whether `e` (from [`run_aws`]) means "run `aws sso login`" rather than a
 /// real error — the daemon reports that as a prompt, not a failure.
@@ -488,12 +538,248 @@ pub fn resolve_owner(coords: &CodeArtifactCoords) -> Result<String> {
     Ok(account.trim().to_string())
 }
 
+/// Why an update check could not run, with the command that fixes it.
+/// Shown once in the GUI/TUI server alerts, Settings' Updates row and
+/// `ninox update --check`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckProblem {
+    AwsMissing,
+    NoProfile,
+    SessionExpired,
+    AccessDenied,
+    Other,
+}
+
+pub fn classify_check_error(e: &anyhow::Error) -> CheckProblem {
+    let text = format!("{e:#}");
+    if text.contains(AWS_MISSING_MARKER) {
+        CheckProblem::AwsMissing
+    } else if text.contains(NO_PROFILE_MARKER) {
+        CheckProblem::NoProfile
+    } else if text.contains(ACCESS_DENIED_MARKER) {
+        CheckProblem::AccessDenied
+    } else if text.contains(SESSION_ERROR_MARKER) {
+        CheckProblem::SessionExpired
+    } else {
+        CheckProblem::Other
+    }
+}
+
+/// One user-facing sentence naming the cause and the exact fix. `profile`
+/// is the profile the check ran under, if any is known.
+pub fn explain_check_error(e: &anyhow::Error, profile: Option<&str>) -> String {
+    let login = match profile {
+        Some(p) => format!("aws sso login --profile {p}"),
+        None => "aws sso login --profile <profile>".to_string(),
+    };
+    let save = "ninox update --check --aws-profile <profile>";
+    match classify_check_error(e) {
+        CheckProblem::AwsMissing => "update check can't run: the `aws` CLI isn't on PATH — run `brew install awscli`".to_string(),
+        CheckProblem::NoProfile => match profile {
+            Some(p) => format!("update check can't run: AWS profile `{p}` has no usable credentials — run `{login}`"),
+            None => format!(
+                "update check can't run: no AWS profile is set — run `{login}`, then save it with `{save}` \
+                 (or export AWS_PROFILE before starting the server)"
+            ),
+        },
+        CheckProblem::SessionExpired => format!(
+            "update check can't run: the AWS SSO session expired — run `{login}`{}",
+            if profile.is_none() { format!(", then save the profile with `{save}`") } else { String::new() }
+        ),
+        CheckProblem::AccessDenied => format!(
+            "update check can't run: access denied reading CodeArtifact{} — use the profile for the account that \
+             owns the {} domain (`{login}`, then `{save}`)",
+            profile.map(|p| format!(" as profile `{p}`")).unwrap_or_default(),
+            CodeArtifactCoords::from_env().domain,
+        ),
+        CheckProblem::Other => format!("update check failed: {e}"),
+    }
+}
+
+/// Which prebuilt a plain-file ninox binary is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flavor {
+    Gui,
+    Tui,
+}
+
+impl Flavor {
+    /// The entry name in the release tarball.
+    pub fn entry(self) -> &'static str {
+        match self {
+            Self::Gui => "ninox-gui",
+            Self::Tui => "ninox-tui",
+        }
+    }
+}
+
+/// Every installed binary one update replaces, planned before anything is
+/// written so a plain-file `ninox`/`nx` copy can be matched against the
+/// OLD siblings (after the update it matches neither new binary).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BinaryPlan {
+    pub replace: Vec<(PathBuf, Flavor)>,
+    /// Plain files that match no known binary: left alone, with the fix.
+    pub warnings: Vec<String>,
+}
+
+fn plain_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Plans the replacement of the ninox binaries in `dir` (the install dir)
+/// plus `extra` plain-file paths elsewhere (the self-shim's target, which
+/// is what the server runs). `running` is the executing binary and its
+/// known flavor — its own identity is never guessed. Symlinks (`ninox` →
+/// `ninox-gui`, `nx` → `ninox-tui`) are left alone: they follow whatever
+/// they point at. On Linux only `ninox-tui` ships, so every plain file is
+/// the TUI.
+pub fn plan_binaries(dir: &Path, running: Option<(&Path, Flavor)>, extra: &[PathBuf], os: &str) -> BinaryPlan {
+    let mut plan = BinaryPlan::default();
+    let gui = dir.join("ninox-gui");
+    let tui = dir.join("ninox-tui");
+    let old_gui = plain_file(&gui).then(|| sha256_file(&gui).ok()).flatten();
+    let old_tui = plain_file(&tui).then(|| sha256_file(&tui).ok()).flatten();
+    let add = |plan: &mut BinaryPlan, path: PathBuf, flavor: Flavor| {
+        if !plan.replace.iter().any(|(p, _)| same_file(p, &path)) {
+            plan.replace.push((path, flavor));
+        }
+    };
+    if os != "linux" && plain_file(&gui) {
+        add(&mut plan, gui.clone(), Flavor::Gui);
+    }
+    if plain_file(&tui) {
+        add(&mut plan, tui.clone(), Flavor::Tui);
+    }
+    if let Some((exe, flavor)) = running {
+        add(&mut plan, exe.to_path_buf(), if os == "linux" { Flavor::Tui } else { flavor });
+    }
+    let candidates = [dir.join("ninox"), dir.join("nx")].into_iter().chain(extra.iter().cloned());
+    for path in candidates {
+        if !plain_file(&path) || plan.replace.iter().any(|(p, _)| same_file(p, &path)) {
+            continue;
+        }
+        if os == "linux" {
+            add(&mut plan, path, Flavor::Tui);
+            continue;
+        }
+        let hash = sha256_file(&path).ok();
+        let flavor = match (&hash, &old_gui, &old_tui) {
+            (Some(h), Some(g), _) if h == g => Some(Flavor::Gui),
+            (Some(h), _, Some(t)) if h == t => Some(Flavor::Tui),
+            _ => None,
+        };
+        match flavor {
+            Some(f) => add(&mut plan, path, f),
+            None => {
+                let usual = if path.file_name().is_some_and(|n| n == "nx") { "ninox-tui" } else { "ninox-gui" };
+                plan.warnings.push(format!(
+                    "left {} alone: it is a plain file that matches neither ninox-gui nor ninox-tui, so it stays on the old \
+                     version. Fix: `ln -sf {usual} {0}` in {1} (or `ninox-{2}` instead), or delete it and re-run the installer",
+                    path.display(),
+                    path.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+                    if usual == "ninox-gui" { "tui" } else { "gui" },
+                ));
+            }
+        }
+    }
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn coords() -> CodeArtifactCoords {
         CodeArtifactCoords::from_env_with(|_| None)
+    }
+
+    fn write(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn plan_covers_gui_tui_and_a_plain_ninox_copy_but_not_symlinks() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+        write(&dir.join("ninox-gui"), "gui");
+        write(&dir.join("ninox-tui"), "tui");
+        write(&dir.join("ninox"), "tui");
+        std::os::unix::fs::symlink("ninox-tui", dir.join("nx")).unwrap();
+        let plan = plan_binaries(dir, Some((&dir.join("ninox-gui"), Flavor::Gui)), &[], "macos");
+        let got: Vec<_> = plan.replace.iter().map(|(p, f)| (p.file_name().unwrap().to_str().unwrap().to_string(), *f)).collect();
+        assert_eq!(got, [("ninox-gui".into(), Flavor::Gui), ("ninox-tui".into(), Flavor::Tui), ("ninox".into(), Flavor::Tui)]);
+        assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn plan_matches_a_ninox_copy_to_the_old_gui_sibling_too() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+        write(&dir.join("ninox-gui"), "gui");
+        write(&dir.join("ninox-tui"), "tui");
+        write(&dir.join("ninox"), "gui");
+        let plan = plan_binaries(dir, Some((&dir.join("ninox-tui"), Flavor::Tui)), &[], "macos");
+        assert!(plan.replace.contains(&(dir.join("ninox"), Flavor::Gui)));
+    }
+
+    #[test]
+    fn plan_never_guesses_an_unmatched_copy() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+        write(&dir.join("ninox-gui"), "gui");
+        write(&dir.join("ninox-tui"), "tui");
+        write(&dir.join("ninox"), "a hand-built binary");
+        let plan = plan_binaries(dir, Some((&dir.join("ninox-gui"), Flavor::Gui)), &[], "macos");
+        assert!(plan.replace.iter().all(|(p, _)| p != &dir.join("ninox")));
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(plan.warnings[0].contains("matches neither"), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn plan_includes_the_server_binary_elsewhere_when_it_matches_an_old_sibling() {
+        let d = tempfile::tempdir().unwrap();
+        let (dir, other) = (d.path().join("local"), d.path().join("cargo"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        write(&dir.join("ninox-gui"), "gui");
+        write(&dir.join("ninox-tui"), "tui");
+        write(&other.join("ninox"), "tui");
+        let plan = plan_binaries(&dir, Some((&dir.join("ninox-gui"), Flavor::Gui)), &[other.join("ninox")], "macos");
+        assert!(plan.replace.contains(&(other.join("ninox"), Flavor::Tui)));
+    }
+
+    #[test]
+    fn plan_always_includes_a_lone_running_binary_and_on_linux_maps_everything_to_the_tui() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+        write(&dir.join("ninox"), "x");
+        let plan = plan_binaries(dir, Some((&dir.join("ninox"), Flavor::Gui)), &[], "macos");
+        assert_eq!(plan.replace, [(dir.join("ninox"), Flavor::Gui)]);
+        let linux = plan_binaries(dir, Some((&dir.join("ninox"), Flavor::Gui)), &[], "linux");
+        assert_eq!(linux.replace, [(dir.join("ninox"), Flavor::Tui)]);
+    }
+
+    #[test]
+    fn check_errors_name_the_cause_and_the_exact_fix() {
+        let missing = anyhow::anyhow!("{AWS_MISSING_MARKER} (`brew install awscli`)");
+        assert!(explain_check_error(&missing, None).contains("brew install awscli"));
+        let expired = anyhow::anyhow!("aws x y failed — {SESSION_ERROR_MARKER}; run `aws sso login`");
+        assert_eq!(classify_check_error(&expired), CheckProblem::SessionExpired);
+        assert!(explain_check_error(&expired, Some("prd-build-readonly")).contains("`aws sso login --profile prd-build-readonly`"));
+        let none = anyhow::anyhow!("aws x y failed — {NO_PROFILE_MARKER}");
+        let text = explain_check_error(&none, None);
+        assert!(text.contains("no AWS profile is set") && text.contains("--aws-profile <profile>"), "{text}");
+        let denied = anyhow::anyhow!("aws x y failed — {ACCESS_DENIED_MARKER}");
+        assert!(explain_check_error(&denied, Some("p")).contains("access denied") );
+        assert_eq!(classify_check_error(&anyhow::anyhow!("connection reset")), CheckProblem::Other);
     }
 
     #[test]

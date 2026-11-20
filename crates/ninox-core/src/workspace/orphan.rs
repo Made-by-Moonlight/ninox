@@ -116,8 +116,15 @@ pub fn classify_worktree(args: ClassifyWorktreeArgs<'_>) -> OrphanStatus {
 /// `/.claude/worktrees/<name>` across all known session rows.
 pub fn discover_repo_roots(store: &Store) -> anyhow::Result<Vec<PathBuf>> {
     let sessions = store.list_sessions()?;
+    let orchestrators: std::collections::HashSet<String> =
+        store.list_orchestrators()?.into_iter().map(|o| o.id).collect();
     let mut roots = std::collections::BTreeSet::new();
     for session in &sessions {
+        // An orchestrator's folder is never a worktree ninox cut, and a
+        // custom one is the user's own.
+        if orchestrators.contains(&session.id) {
+            continue;
+        }
         if let Some(workspace_path) = &session.workspace_path {
             if let Some(repo_root) = ninox_repo_root(workspace_path, &session.id) {
                 roots.insert(PathBuf::from(repo_root));
@@ -154,6 +161,11 @@ pub async fn classify_repo_orphans(
     let fleet_records = store.fleet_records().unwrap_or_default();
     let now = crate::lifecycle::poller::now_millis();
     let base_ref = resolve_default_base_ref(repo_root);
+    // Folders users chose for orchestrators, kept after the orchestrator is
+    // gone: never ours to sweep, however much they look like a worktree
+    // ninox made.
+    let custom: std::collections::HashSet<PathBuf> = store.custom_workspace_paths().unwrap_or_default()
+        .into_iter().map(PathBuf::from).collect();
 
     let mut results = Vec::new();
     for entry in entries.flatten() {
@@ -163,6 +175,14 @@ pub async fn classify_repo_orphans(
         }
         let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else { continue };
         let path_str = path.to_string_lossy().to_string();
+        if custom.contains(&path) || path.canonicalize().is_ok_and(|p| custom.contains(&p)) {
+            results.push((path, OrphanStatus::NotOurs, WorkspaceFacts {
+                dirty: false, has_branch: false, has_upstream: false, unpushed_commit_count: 0,
+                commits_beyond_base: 0, merged: false, commits_since_merge: 0, interrupted: false,
+                live_session_row: false,
+            }));
+            continue;
+        }
 
         let session_row = sessions.iter().find(|s| s.workspace_path.as_deref() == Some(path_str.as_str()));
         let marker = read_marker(&path);
@@ -365,7 +385,7 @@ mod tests {
             id: id.into(), orchestrator_id: Some("orch".into()), name: "w".into(),
             repo: "r".into(), status, agent_type: "c".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: Some(workspace_path.into()), pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None,
             terminal_at, gate_status: None, merged_at: None,
@@ -464,6 +484,36 @@ mod tests {
     }
 
     // ---- classify_repo_orphans (read-only) ----
+
+    /// A user's worktree that ninox only ever hosted an orchestrator in has
+    /// every sign of a ninox worktree (name == branch, a settings.local.json)
+    /// once the session row is gone; the custom-workspace record is what
+    /// keeps the sweep off it, and also while the orchestrator still exists.
+    #[tokio::test]
+    async fn a_custom_orchestrator_workspace_is_never_swept_even_once_its_row_is_gone() {
+        let _iso = crate::test_isolation::isolate();
+        let repo = init_repo();
+        let wt = add_worktree_branch(repo.path(), "brain");
+        let store = Store::open(tempdir().unwrap().keep().join("t.db")).unwrap();
+
+        let control = classify_repo_orphans(&store, repo.path(), RETENTION_MS).await.unwrap();
+        assert!(matches!(control[0].1, OrphanStatus::Orphan(Ownership::LegacyMatch)), "control: {:?}", control[0].1);
+
+        store.upsert_orchestrator(&crate::types::Orchestrator { id: "brain".into(), name: "brain".into(), created_at: 0 }).unwrap();
+        let mut row = test_session("brain", SessionStatus::Terminated, wt.to_str().unwrap(), Some(0));
+        row.orchestrator_id = None;
+        store.upsert_session(&row).unwrap();
+        store.set_custom_workspace("brain", wt.to_str().unwrap()).unwrap();
+        assert!(discover_repo_roots(&store).unwrap().is_empty(), "an orchestrator's folder is not a worker worktree");
+        assert_eq!(classify_repo_orphans(&store, repo.path(), RETENTION_MS).await.unwrap()[0].1, OrphanStatus::NotOurs);
+
+        store.delete_orchestrator("brain").unwrap();
+        let report = sweep_repo_orphans(&store, repo.path(), RETENTION_MS).await.unwrap();
+        assert_eq!(report.actions[0].status, OrphanStatus::NotOurs);
+        assert!(report.actions[0].outcome.is_none());
+        assert!(wt.join(".git").exists(), "the user's worktree is untouched");
+        assert!(branch_exists(repo.path(), "brain"));
+    }
 
     #[tokio::test]
     async fn classify_never_deletes_a_safe_orphan() {

@@ -65,7 +65,7 @@ extending the substitution and its no-`{{`-left-behind tests.
 - Hot-path CLI subcommands invoked by agents or hooks short-circuit in
   `ninox-ui-shared/src/cli.rs`'s `dispatch()` before the tmux-config/
   wrapper/self-shim setup (see `Statusline`, `Inbox`, `IdentityHook`,
-  `Whoami`, `Open`/`Close`/`List` (reads sessions), `Connect`,
+  `Whoami`, `SessionSetup`, `Open`/`Close`/`List` (reads sessions), `Connect`,
   `Capabilities`, `PromptAnswer`).
 - Tests hold `ninox_core::test_isolation::isolate()` before touching
   config, brain, sessions or the store; resolving a real per-user path

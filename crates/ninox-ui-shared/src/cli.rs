@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use crate::spawn_util::{
     create_worker_worktree, interactive_env_vars, repo_from_workspace, resolve_standalone_workspace, seed_worker_skills,
 };
-use crate::{connect, fleet, machine, restart, runtime_cli, server_restart, service, update_cli};
+use crate::{connect, fleet, machine, reset_from_plan, restart, runtime_cli, server_restart, service, update_cli};
 use ninox_core::{
     capabilities::Audience,
     config::{AppConfig, SendMechanism},
@@ -151,6 +151,12 @@ enum Command {
         /// Model for this orchestrator, overriding `[orchestrator].model`.
         #[arg(long)]
         model: Option<String>,
+        /// Run in this existing folder (e.g. a git worktree) instead of a
+        /// directory under ninox's orchestrator root. ninox adds only
+        /// `.claude/settings.local.json` entries and `.claude/skills/ninox-*`
+        /// there, never CLAUDE.md, AGENTS.md or `.claude/settings.json`.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
     },
     /// Spawn a sub-orchestrator nested under an already-verified orchestrator
     /// (or, for a worker whose worker-type profile explicitly grants it,
@@ -343,6 +349,11 @@ enum Command {
         #[command(subcommand)]
         action: IdentityHookAction,
     },
+    /// `SessionStart` hook: prints the session's role and setup as
+    /// `additionalContext` (see `ninox_core::session_setup`). Invoked by
+    /// Claude Code's own hooks, not intended for direct use.
+    #[command(hide = true)]
+    SessionSetup,
     /// List the agent-facing capabilities Ninox currently offers, with each
     /// one's live enabled/disabled state (see `ninox_core::capabilities`).
     Capabilities {
@@ -428,6 +439,17 @@ enum Command {
         /// Print the workspace directory and a connect hint instead of attaching
         #[arg(long)]
         no_attach: bool,
+        /// Model for this orchestrator, overriding `[orchestrator].model`.
+        #[arg(long)]
+        model: Option<String>,
+        /// Run in this existing folder (e.g. a git worktree you already work
+        /// in) instead of a directory under ninox's orchestrator root. ninox
+        /// adds only `.claude/settings.local.json` entries and
+        /// `.claude/skills/ninox-*` there, never CLAUDE.md, AGENTS.md or
+        /// `.claude/settings.json`. Restart, resume and fleet restore keep
+        /// using it.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
     },
     /// Open the terminal UI — what bare `nx` does from a terminal.
     Tui,
@@ -446,6 +468,9 @@ enum Command {
         #[command(flatten)]
         args: restart::RestartArgs,
     },
+    /// Reset an orchestrator onto a fresh conversation that continues from
+    /// its plan doc: asks it to update the plan, waits, confirms, relaunches.
+    ResetFromPlan(reset_from_plan::ResetFromPlanArgs),
     /// Start the headless engine at login (launchd / systemd user unit).
     Service {
         #[command(subcommand)]
@@ -465,8 +490,10 @@ enum Command {
     },
     /// Open the desktop app, even when run from a terminal.
     Gui,
-    /// Update this binary (and, with --app, Ninox.app) to the latest
-    /// prebuilt Apple silicon release from CodeArtifact, via the `aws` CLI.
+    /// Update every installed ninox binary (ninox-gui, ninox-tui, plain-file
+    /// ninox/nx copies, the server's binary) and Ninox.app to the latest
+    /// prebuilt release from CodeArtifact, via the `aws` CLI, then offer to
+    /// restart the server.
     Update {
         /// Only report whether a newer version is published
         #[arg(long)]
@@ -477,13 +504,26 @@ enum Command {
         /// Install this exact version (downgrades allowed)
         #[arg(long, value_name = "X.Y.Z")]
         version: Option<String>,
-        /// Also replace an installed /Applications (or ~/Applications) Ninox.app
+        /// Fail if no Ninox.app is installed (an installed one is always updated)
         #[arg(long)]
         app: bool,
         /// Release channel to follow (`stable` or `alpha`); persisted to
         /// `[update] channel` in config.toml. Defaults to the configured one.
         #[arg(long, value_name = "CHANNEL")]
         channel: Option<ninox_core::config::UpdateChannel>,
+        /// AWS profile for the CodeArtifact lookups; persisted to
+        /// `[update] aws_profile` so the background server uses it too.
+        #[arg(long, value_name = "PROFILE")]
+        aws_profile: Option<String>,
+        /// Restart the server on the new build without asking
+        #[arg(long)]
+        yes: bool,
+        /// Don't offer to restart the server afterwards
+        #[arg(long, conflicts_with = "yes")]
+        no_restart: bool,
+        /// Only persist --channel / --aws-profile to config.toml (used by the installer)
+        #[arg(long, hide = true)]
+        save_only: bool,
     },
     /// Point the shared `ninox` shim (what agents' PATH and seeded hooks
     /// run) at this binary. Launching ninox never replaces a working shim,
@@ -1074,6 +1114,23 @@ enum IdentityHookAction {
 }
 
 #[derive(Subcommand)]
+enum RulesAction {
+    /// Replace the brain's rules (stored in the brain as
+    /// `_rules.md` and synced to everyone who uses it). Reads stdin unless `--file`.
+    /// Run only when the user explicitly asks to change the rules.
+    Set {
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Replace this machine's local override for the catalogue (saved to
+    /// config, never synced). Reads stdin unless `--file`; blank clears it.
+    SetOverride {
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum BrainAction {
     /// Rebuild the write catalogue's knowledge index (`--all`: every brain
     /// this session reads)
@@ -1140,10 +1197,51 @@ enum BrainAction {
         /// Markdown content, including frontmatter. Reads stdin if omitted.
         #[arg(long)]
         content: Option<String>,
-        /// Write to this catalogue instead of the session's write catalogue;
-        /// it must be one this session reads, and writable
-        #[arg(long)]
+        /// Also write the entry to these other brains, beside your local
+        /// brain, which always gets it (repeat the flag or comma-separate:
+        /// `--catalogue mlops,notes`). Each must be a brain this session
+        /// reads and can write to. Pick the ones whose rules fit
+        /// (`ninox brain rules`); none fitting means no flag.
+        #[arg(long, visible_alias = "to", value_delimiter = ',')]
+        catalogue: Vec<String>,
+    },
+    /// Lift or change the brain limit of an existing session without
+    /// re-spawning it. Only the user or the session's own orchestrator may.
+    Limit {
+        /// The session to change
+        session: String,
+        /// Remove the limit: the session gets every enabled brain
+        #[arg(long, conflicts_with = "set", required_unless_present = "set")]
+        clear: bool,
+        /// Limit it to these brains (repeat the flag or comma-separate)
+        #[arg(long, value_delimiter = ',')]
+        set: Vec<String>,
+        /// With --set: the brain it writes to (defaults to its first brain)
+        #[arg(long, requires = "set")]
+        write: Option<String>,
+    },
+    /// Copy this entry to another brain: `ninox brain copy <path> --to <brain>`.
+    /// Copies the entry already written to your local brain (same checks as
+    /// `add`; each target succeeds or fails on its own).
+    Copy {
+        /// Relative path of the entry, as given to `brain add`
+        path: String,
+        /// Brains to copy to (repeat the flag or comma-separate)
+        #[arg(long, required = true, value_delimiter = ',')]
+        to: Vec<String>,
+    },
+    /// Show, or (only when the user asks) change, the write rules of the
+    /// brains this session can write to: what belongs in each. Read these
+    /// before `add` to choose targets.
+    Rules {
+        /// Limit to this catalogue (required by `set` / `set-override`)
+        #[arg(long, global = true)]
         catalogue: Option<String>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<RulesAction>,
     },
     /// Package the brain's Markdown source into a portable .tar.gz archive
     /// (excludes the derived .index.db)
@@ -1293,6 +1391,7 @@ once {install_bin} is installed, `ninox reset-bin` can repoint the shim there if
 /// alias once past the hot-path checks — `true` for `ninox-tui` only,
 /// since bare `nx` has always meant "open the terminal UI".
 pub async fn dispatch(install_nx_alias: bool) -> anyhow::Result<ControlFlow<UiRequest, ()>> {
+    update_cli::set_flavor(install_nx_alias);
     let args = Args::parse();
     if args.show_version {
         print!("{}", update_cli::version_text());
@@ -1336,6 +1435,13 @@ pub async fn dispatch(install_nx_alias: bool) -> anyhow::Result<ControlFlow<UiRe
     // Inbox above.
     if let Some(Command::IdentityHook { action }) = command {
         run_identity_hook(action, args.db.clone().unwrap_or_else(default_db_path)).await;
+        return Ok(ControlFlow::Continue(()));
+    }
+
+    // Fires on every SessionStart of every orchestrator, same "stay fast"
+    // reasoning as IdentityHook above.
+    if let Some(Command::SessionSetup) = command {
+        run_session_setup(args.db.clone().unwrap_or_else(default_db_path)).await;
         return Ok(ControlFlow::Continue(()));
     }
 
@@ -1630,8 +1736,13 @@ pub async fn dispatch(install_nx_alias: bool) -> anyhow::Result<ControlFlow<UiRe
     if let Some(Command::Machine { action }) = command {
         return machine::run(action).map(ControlFlow::Continue);
     }
-    if let Some(Command::Update { check, force, version, app, channel }) = command {
-        return update_cli::run(update_cli::UpdateArgs { check, force, version, app, channel }).map(ControlFlow::Continue);
+    if let Some(Command::Update { check, force, version, app, channel, aws_profile, yes, no_restart, save_only }) = command {
+        let db_path = args.db.unwrap_or_else(default_db_path);
+        return update_cli::run(update_cli::UpdateArgs {
+            check, force, version, app, channel, aws_profile, yes, no_restart, save_only, port: args.port, db_path,
+        })
+        .await
+        .map(ControlFlow::Continue);
     }
     if let Some(Command::ResetBin) = command {
         let exe = ninox_core::hooks::canonical_exe()?;
@@ -1759,10 +1870,10 @@ pub async fn dispatch(install_nx_alias: bool) -> anyhow::Result<ControlFlow<UiRe
             let brain = brains.resolve(&store, caller_session_id.as_deref(), &config)?;
             run_spawn_opts(store, config, prompt, workspace, name, orchestrator_id, caller, worker_type, caller_session_id, success, success_only, no_queue, Some(brain), model).await
         }
-        Some(Command::SpawnOrchestrator { name, prompt, user_requested, no_queue, brains, model }) => {
+        Some(Command::SpawnOrchestrator { name, prompt, user_requested, no_queue, brains, model, workspace }) => {
             let config = AppConfig::load_or_default();
             let brain = brains.resolve(&store, verified_caller_session_id(&store).await.as_deref(), &config)?;
-            run_spawn_orchestrator(store, config, name, prompt, user_requested, no_queue, brain, model).await
+            run_spawn_orchestrator(store, config, name, prompt, user_requested, no_queue, brain, model, workspace).await
         }
         Some(Command::SpawnSubOrchestrator { name, prompt, orchestrator_id, no_queue, brains, model }) => {
             let config = AppConfig::load_or_default();
@@ -1775,10 +1886,10 @@ pub async fn dispatch(install_nx_alias: bool) -> anyhow::Result<ControlFlow<UiRe
             };
             run_spawn_sub_orchestrator(store, config, name, prompt, orchestrator_id, caller_session_id, caller, no_queue, brain, model).await
         }
-        Some(Command::Orchestrate { name, prompt, no_attach }) => {
+        Some(Command::Orchestrate { name, prompt, no_attach, model, workspace }) => {
             let config = AppConfig::load_or_default();
             let port = args.port.unwrap_or(config.port);
-            run_orchestrate(store, config, port, db_path, name, prompt, no_attach).await
+            run_orchestrate(store, config, port, db_path, name, prompt, no_attach, model, workspace).await
         }
         Some(Command::Tui) => unreachable!("Tui short-circuits and returns earlier in dispatch()"),
         Some(Command::Reap { session_ids, all, force, orchestrator_id }) => {
@@ -1857,6 +1968,9 @@ pub async fn dispatch(install_nx_alias: bool) -> anyhow::Result<ControlFlow<UiRe
             let config = AppConfig::load_or_default();
             restart::run_cli(args, store, config, db_path).await
         }
+        Some(Command::ResetFromPlan(args)) => {
+            reset_from_plan::run_cli(args, store, AppConfig::load_or_default()).await
+        }
         Some(Command::Service { .. }) | Some(Command::Server { .. }) => {
             unreachable!("Service and Server short-circuit and return earlier in main()")
         }
@@ -1904,6 +2018,9 @@ pub async fn dispatch(install_nx_alias: bool) -> anyhow::Result<ControlFlow<UiRe
         }
         Some(Command::UserRequest { .. }) => {
             unreachable!("UserRequest short-circuits and returns earlier in dispatch()")
+        }
+        Some(Command::SessionSetup) => {
+            unreachable!("SessionSetup short-circuits and returns earlier in main()")
         }
         Some(Command::IdentityHook { .. }) => {
             unreachable!("IdentityHook short-circuits and returns earlier in main()")
@@ -2979,8 +3096,12 @@ pub(crate) async fn launch_cli_worker(
     // Append worker context so every agent knows its session ID, its
     // orchestrator's ID, and how to communicate back when done or stuck.
     let task_brief = prompt.clone();
+    // The hook serves only workers with an orchestrator, so a parentless
+    // worker keeps the prompt footer and Definition of done.
+    let hooked = !orch_id_env.is_empty()
+        && ninox_core::session_setup::delivered_by_hook(config, &agent.harness, std::path::Path::new(&effective_workspace));
     let effective_prompt = compose_effective_prompt(
-        prompt, &id, &orch_id_env, config.pr_watch.enabled, &resolved_criteria,
+        prompt, &id, &orch_id_env, config.pr_watch.enabled, &resolved_criteria, hooked,
     );
 
     let claude_session_id = ninox_core::harness::new_claude_session_id();
@@ -3060,55 +3181,26 @@ pub(crate) async fn launch_cli_worker(
 /// `pr_watch_enabled` (mirrors `AppConfig.pr_watch.enabled`), also tells the
 /// worker to register PR watches instead of polling `gh` directly.
 fn worker_context_footer(id: &str, orch_id: &str, pr_watch_enabled: bool) -> String {
-    let mut footer = format!(
-        "\n\n---\n\
-         Ninox session `{id}` · orchestrator `{orch_id}`\n\n\
-         **Goal:** complete the task and open a pull request.\n\n\
-         **Scope:** one worker, one task, one pull request. If you discover \
-         additional work outside this task, do not do it and do not open \
-         another PR — hand it to the orchestrator instead:\n\
-         ```bash\n\
-         ninox request-work \"<description of the additional work>\"\n\
-         ```\n\
-         To message the orchestrator (e.g. when stuck or when the PR is open):\n\
-         ```bash\n\
-         ninox send {orch_id} \"<your message>\"\n\
-         ```\n\
-         Text you write in your own pane never reaches the orchestrator: \
-         every read-back, question and report must go through `ninox send`. \
-         It prints a receipt; `queued, target unreachable` (exit 75) means \
-         Ninox will retry, so do not resend.\n\
-         Report back with `ninox send` when (a) you are blocked and need \
-         a decision, or (b) the PR is open. You finish yourself with \
-         `ninox complete`, as described in the Definition of done.",
-    );
-    if pr_watch_enabled {
-        footer.push_str(
-            "\n\nInstead of polling gh for PR/CI status, register watches: \
-             `ninox open --pr <url>` (notifications are delivered to you), \
-             `ninox close --pr <url>` when done.",
-        );
-    }
-    // `--worker`: unfiltered output would also list the orchestrator-only
-    // skills, including spawn-worker telling the reader to delegate work
-    // instead of doing it — exactly the wrong instruction for a worker.
-    footer.push_str(
-        "\n\nRun `ninox capabilities --worker` to list what ninox can currently do.",
-    );
-    footer
+    ninox_core::session_setup::worker_footer(id, orch_id, pr_watch_enabled)
 }
 
 /// The full prompt sent to a spawned worker's harness: the task prompt (or
 /// worker-type-composed prompt), plus the orchestrator-context footer (only
 /// when this worker has an orchestrator), plus the Definition-of-done block
 /// (always — even a standalone worker needs to know how to finish itself).
+/// With `hook_delivered` the session-setup hook carries both, and the prompt
+/// is the task alone.
 fn compose_effective_prompt(
     prompt: String,
     id: &str,
     orch_id_env: &str,
     pr_watch_enabled: bool,
     criteria: &[ninox_core::worker_type::SuccessCriterion],
+    hook_delivered: bool,
 ) -> String {
+    if hook_delivered {
+        return prompt;
+    }
     let mut effective_prompt = prompt;
     if !orch_id_env.is_empty() {
         effective_prompt.push_str(&worker_context_footer(id, orch_id_env, pr_watch_enabled));
@@ -3163,7 +3255,7 @@ mod compose_effective_prompt_tests {
     #[test]
     fn includes_the_definition_of_done_block() {
         let prompt = compose_effective_prompt(
-            "do the task".into(), "w1", "", false, &[SuccessCriterion::PrMerged],
+            "do the task".into(), "w1", "", false, &[SuccessCriterion::PrMerged], false,
         );
         assert!(prompt.contains("Definition of done"));
         assert!(prompt.to_lowercase().contains("merged"));
@@ -3172,17 +3264,37 @@ mod compose_effective_prompt_tests {
 
     #[test]
     fn includes_the_definition_of_done_block_even_without_an_orchestrator() {
-        let prompt = compose_effective_prompt("do the task".into(), "w1", "", false, &[]);
+        let prompt = compose_effective_prompt("do the task".into(), "w1", "", false, &[], false);
         assert!(prompt.contains("Definition of done"));
     }
 
     #[test]
     fn appends_the_orchestrator_footer_only_when_present() {
-        let without = compose_effective_prompt("do the task".into(), "w1", "", false, &[]);
+        let without = compose_effective_prompt("do the task".into(), "w1", "", false, &[], false);
         assert!(!without.contains("Ninox session"));
 
-        let with = compose_effective_prompt("do the task".into(), "w1", "orch1", false, &[]);
+        let with = compose_effective_prompt("do the task".into(), "w1", "orch1", false, &[], false);
         assert!(with.contains("Ninox session `w1` · orchestrator `orch1`"));
+    }
+
+    #[test]
+    fn launch_prompts_carry_nothing_rule_related() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let config = ninox_core::config::AppConfig::default();
+        let worker = compose_effective_prompt("do the task".into(), "w1", "orch1", true, &[], false);
+        let (_, standalone) = crate::cli::standalone_initial_prompt(&config, "solo", "Implementor", "do x".into()).unwrap();
+        let orch = crate::cli::orchestrator_initial_brief("o1", "ship it", None, false);
+        for text in [worker, standalone.unwrap(), orch] {
+            let lower = text.to_lowercase();
+            assert!(!lower.contains("write rules") && !lower.contains("_rules") && !lower.contains("--catalogue"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_hook_delivered_worker_prompt_is_the_task_alone() {
+        let criteria = [ninox_core::worker_type::SuccessCriterion::ReportSent];
+        let prompt = compose_effective_prompt("do the task".into(), "w1", "orch1", true, &criteria, true);
+        assert_eq!(prompt, "do the task");
     }
 }
 
@@ -3910,6 +4022,7 @@ async fn run_spawn_orchestrator(
     no_queue:       bool,
     brain:          ninox_core::brain_set::BrainSet,
     model:          Option<String>,
+    workspace:      Option<PathBuf>,
 ) -> anyhow::Result<()> {
     if !user_requested {
         anyhow::bail!(
@@ -3922,7 +4035,9 @@ async fn run_spawn_orchestrator(
 
     let want_brief = prompt.is_some();
     let agent = model.as_deref().map(|m| resolve_orchestrator_agent(&config, Some(m)));
-    let spawned = spawn_orchestrator_common_opts(&store, &config, &name, prompt, None, agent, Some(brain), no_queue).await?;
+    let spawned = spawn_orchestrator_common_opts(
+        &store, &config, &name, prompt, None, agent, Some(brain), no_queue, workspace.as_deref(),
+    ).await?;
     print_spawn_warnings(&spawned);
     if let Some(queued) = spawned.queued {
         println!("{queued}");
@@ -4010,6 +4125,7 @@ async fn run_spawn_sub_orchestrator(
     let spawned = spawn_orchestrator_common_opts(
         &store, &config, &name, prompt, Some(&parent_id),
         model.as_deref().map(|m| resolve_orchestrator_agent(&config, Some(m))), Some(brain), no_queue,
+        None,
     ).await?;
     print_spawn_warnings(&spawned);
     if let Some(queued) = spawned.queued {
@@ -4020,6 +4136,7 @@ async fn run_spawn_sub_orchestrator(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_orchestrate(
     store:     Arc<Store>,
     config:    AppConfig,
@@ -4028,7 +4145,13 @@ async fn run_orchestrate(
     name:      String,
     prompt:    Option<String>,
     no_attach: bool,
+    model:     Option<String>,
+    workspace: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    // Fail on a bad --workspace before starting a daemon for it.
+    if let Some(dir) = &workspace {
+        ninox_core::custom_workspace::resolve(&dir.to_string_lossy(), &config.resolved_orchestrator_root())?;
+    }
     // Sessions outlive this command; make sure the poller/services do too.
     if let Ok(exe) = std::env::current_exe() {
         match ninox_core::daemon::ensure_daemon(port, &exe, &db_path).await {
@@ -4044,7 +4167,10 @@ async fn run_orchestrate(
         }
     }
     let brain = BrainArgs::default().resolve(&store, verified_caller_session_id(&store).await.as_deref(), &config)?;
-    let spawned = spawn_orchestrator_common(&store, &config, &name, prompt, None, None, Some(brain)).await?;
+    let agent = model.as_deref().map(|m| resolve_orchestrator_agent(&config, Some(m)));
+    let spawned = spawn_orchestrator_common_opts(
+        &store, &config, &name, prompt, None, agent, Some(brain), false, workspace.as_deref(),
+    ).await?;
     print_spawn_warnings(&spawned);
     if let Some(queued) = spawned.queued {
         println!("{queued}");
@@ -4069,10 +4195,11 @@ pub async fn spawn_orchestrator_common(
     parent_orchestrator_id: Option<&str>,
     agent_override: Option<ninox_core::config::AgentConfig>,
     brain_override: Option<ninox_core::brain_set::BrainSet>,
+    workspace: Option<&Path>,
 ) -> anyhow::Result<SpawnedSession> {
     spawn_orchestrator_common_opts(
         store, config, name, prompt, parent_orchestrator_id, agent_override,
-        brain_override, false,
+        brain_override, false, workspace,
     )
     .await
 }
@@ -4106,6 +4233,8 @@ pub async fn spawn_orchestrator_common_opts(
     agent_override: Option<ninox_core::config::AgentConfig>,
     brain_override: Option<ninox_core::brain_set::BrainSet>,
     no_queue: bool,
+    // A user-chosen folder to run in instead of `<orchestrator root>/<id>`.
+    workspace: Option<&Path>,
 ) -> anyhow::Result<SpawnedSession> {
     let id = slugify(name);
     if id.is_empty() {
@@ -4124,7 +4253,38 @@ pub async fn spawn_orchestrator_common_opts(
         anyhow::bail!("a session named {id} already exists — pick another name");
     }
 
+    let workspace = workspace
+        .map(|dir| ninox_core::custom_workspace::resolve(&dir.to_string_lossy(), &config.resolved_orchestrator_root()))
+        .transpose()?;
+    if let Some(dir) = &workspace {
+        let dir = dir.to_string_lossy();
+        // Identity falls back to the cwd's session, so two sessions in one
+        // folder would be indistinguishable.
+        // Any status: a finished worker's worktree is still reaped later.
+        // Compared canonically too: a session may have recorded a symlinked or
+        // otherwise equivalent spelling of the same folder.
+        if let Some(other) = store.list_sessions()?.iter().find(|s| {
+            s.workspace_path.as_deref().is_some_and(|p| {
+                p == dir.as_ref() || std::fs::canonicalize(p).is_ok_and(|c| c.to_string_lossy() == dir)
+            })
+        })
+        {
+            anyhow::bail!("{dir} is already the workspace of session {} — pick another folder", other.id);
+        }
+    }
     let agent = agent_override.unwrap_or_else(|| resolve_orchestrator_agent(config, None));
+    // Without AGENTS.md the role text rides on the session-setup hook, or for
+    // a harness with no hooks on the launch command, and every relaunch needs
+    // it again.
+    if workspace.is_some()
+        && !config.registry().supports_session_hooks(&agent.harness)
+        && config.registry().spec(&agent.harness).append_system_prompt_flag.is_none()
+    {
+        anyhow::bail!(
+            "--workspace needs a harness that can append to its system prompt, and '{}' has none; use claude-code",
+            agent.harness
+        );
+    }
     // CLI callers pass the set already narrowed from their own (see
     // `brain_set::resolve_child`); `None` is an out-of-session caller.
     let brain = brain_override.unwrap_or_else(|| ninox_core::brain_set::BrainSet::default_for(config));
@@ -4138,6 +4298,7 @@ pub async fn spawn_orchestrator_common_opts(
         brain: Some(brain),
         spawner: std::env::var("NINOX_ORCHESTRATOR_ID").ok().filter(|s| !s.is_empty()),
         started_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64,
+        workspace: workspace.map(|d| d.to_string_lossy().into_owned()),
     };
     // A queued orchestrator's brief is held as a message, attested now
     // while the spawner's own pane can still vouch for it; the payload
@@ -4149,7 +4310,8 @@ pub async fn spawn_orchestrator_common_opts(
     match crate::session_queue::admit(store, ninox_core::store::QueueKind::Spawn, &plan.skeleton(), &payload, no_queue)? {
         crate::session_queue::Admit::Queued { message, .. } => {
             if let Some(brief) = &plan.prompt {
-                let text = format!("{brief}{}", orchestrator_context_footer(&id, plan.spawner.as_deref()));
+                let hooked = config.registry().supports_session_hooks(&plan.agent.harness);
+                let text = orchestrator_initial_brief(&id, brief, plan.spawner.as_deref(), hooked);
                 let sender_pane = ninox_core::runtime::current_private_pane_identity().await.ok().flatten();
                 ninox_core::messaging::deliver_message(
                     store, &AppConfig::sessions_dir(), &id, &text, config.send_mechanism(),
@@ -4177,7 +4339,7 @@ pub(crate) async fn launch_orchestrator(
     let permission_mode = fresh_permission_mode(config, LaunchKind::Interactive, &skeleton);
     let brain = plan.brain_set();
     let crate::session_queue::OrchestratorLaunch {
-        id, name, prompt, agent, spawner, started_at: ts, ..
+        id, name, prompt, agent, spawner, started_at: ts, workspace: custom_workspace, ..
     } = plan;
     let name = name.as_str();
     let ninox_bin = ninox_core::hooks::canonical_exe()
@@ -4195,14 +4357,35 @@ pub(crate) async fn launch_orchestrator(
     {
         tracing::warn!("orchestrator root setup failed: {e}");
     }
-    let ws = root.join(&id);
-    tokio::fs::create_dir_all(&ws).await?;
+    let ws = match &custom_workspace {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => root.join(&id),
+    };
+    let mut warnings: Vec<String> = Vec::new();
+    if custom_workspace.is_some() {
+        anyhow::ensure!(ws.is_dir(), "workspace folder {} no longer exists", ws.display());
+        // The user's folder: ninox adds only its settings.local.json entries
+        // and namespaced skills, and the role text goes in on the command line.
+        let shim = ninox_core::hooks::self_shim_path().display().to_string();
+        warnings.extend(
+            ninox_core::custom_workspace::install(&ws, &root, config, &agent.harness, &shim, &config_path).await.warnings,
+        );
+    } else {
+        tokio::fs::create_dir_all(&ws).await?;
+    }
     // Without a trust entry the headless session blocks forever on Claude
     // Code's "do you trust this folder?" dialog instead of taking the brief.
     if let Err(e) = ninox_core::trust::seed_workspace_trust(&ws) {
         tracing::warn!("failed to seed claude workspace trust for {}: {e}", ws.display());
     }
-    crate::spawn_util::seed_permissions_for_type_name(&ws, &agent.harness, skeleton.worker_type.as_deref(), config)?;
+    if custom_workspace.is_none() {
+        crate::spawn_util::seed_permissions_for_type_name(&ws, &agent.harness, skeleton.worker_type.as_deref(), config)?;
+        crate::spawn_util::seed_orchestrator_workspace_settings(&ws, config);
+    } else if config.worker_type_registry().get("Orchestrator").is_some_and(|t| t.permissions.enabled) {
+        // Applying them would replace the permission rules the user keeps in
+        // their own settings.local.json.
+        warnings.push("the Orchestrator worker type's permission rules are not applied in a custom workspace".into());
+    }
     let ws_str = ws.to_string_lossy().to_string();
     let claude_session_id = ninox_core::harness::new_claude_session_id();
 
@@ -4223,14 +4406,33 @@ pub(crate) async fn launch_orchestrator(
     std::fs::create_dir_all(&sessions_dir).ok();
     let sessions_dir_str = sessions_dir.to_string_lossy().to_string();
 
-    let cmd = ninox_core::hooks::with_bin_dir_on_path(
-        &config.registry().interactive_cmd(&agent, permission_mode, &claude_session_id),
-    );
+    let mut cmd = config.registry().interactive_cmd(&agent, permission_mode, &claude_session_id);
+    // No AGENTS.md in a custom workspace: the role text rides on the
+    // session-setup hook, or when the harness has no hooks or the hook could
+    // not be installed (a git-tracked settings.local.json) on the launch
+    // command (checked to be possible when the spawn was validated).
+    let hooked = ninox_core::session_setup::delivered_by_hook(config, &agent.harness, &ws);
+    if custom_workspace.is_some() && !hooked {
+        let role = ninox_core::custom_workspace::role_prompt(config);
+        cmd = config.registry().with_system_prompt(&agent, &cmd, &role)
+            .ok_or_else(|| anyhow::anyhow!("harness '{}' cannot append to its system prompt", agent.harness))?;
+    }
+    let cmd = ninox_core::hooks::with_bin_dir_on_path(&cmd);
     let (brain_write, brain_reads) = (brain.write_str(), brain.reads_env_value());
     let env = orchestrator_env_vars(
         &ninox_bin, &config_path, &brain_write, &brain_reads, &id, &sessions_dir_str,
     );
 
+    // Recorded before anything runs: the cleanup guard and the orphan sweep
+    // rely on it, so a failure to record is a failure to launch.
+    if custom_workspace.is_some() {
+        if let Err(e) = store.set_custom_workspace(&id, &ws_str) {
+            let _ = store.delete_session(&id);
+            let _ = store.delete_orchestrator(&id);
+            let _ = ninox_core::custom_workspace::uninstall(&ws);
+            return Err(e.context("recording the custom workspace"));
+        }
+    }
     if let Err(e) = ninox_core::runtime::create_session(config.runtime.backend, &id, &ws_str, &cmd, &env).await {
         // Roll BOTH rows back rather than marking the session Terminated the
         // way `run_spawn` does for a worker. A worker's Terminated row is a
@@ -4242,13 +4444,17 @@ pub(crate) async fn launch_orchestrator(
         // so there is nothing worth recording.
         let _ = store.delete_session(&id);
         let _ = store.delete_orchestrator(&id);
+        if custom_workspace.is_some() {
+            let _ = store.forget_custom_workspace(&id);
+            let _ = ninox_core::custom_workspace::uninstall(&ws);
+        }
         return Err(e);
     }
     ninox_core::lifecycle::pane_pid::record_pane_pid(store, &id).await;
 
-    let mut warnings: Vec<String> = config.registry().cross_session_warning(&agent).into_iter().collect();
+    warnings.extend(config.registry().cross_session_warning(&agent));
     if let Some(brief) = prompt {
-        let message = orchestrator_initial_brief(&id, &brief, spawner.as_deref());
+        let message = orchestrator_initial_brief(&id, &brief, spawner.as_deref(), hooked);
         note_initial_prompt(deliver_initial_prompt(store, config, &id, &message, spawner.as_deref()).await, &mut warnings);
     }
 
@@ -4486,8 +4692,12 @@ fn orchestrator_env_vars<'a>(
 }
 
 /// An orchestrator's initial brief as delivered: the human's text plus the
-/// orchestrator context footer.
-pub fn orchestrator_initial_brief(id: &str, brief: &str, spawner: Option<&str>) -> String {
+/// orchestrator context footer, unless the session-setup hook already
+/// carries that context (`hook_delivered`).
+pub fn orchestrator_initial_brief(id: &str, brief: &str, spawner: Option<&str>, hook_delivered: bool) -> String {
+    if hook_delivered {
+        return brief.to_string();
+    }
     format!("{brief}{}", orchestrator_context_footer(id, spawner))
 }
 
@@ -4514,7 +4724,7 @@ fn standalone_prompt_for(
 ) -> (Vec<ninox_core::worker_type::SuccessCriterion>, Option<String>) {
     let criteria = resolve_success_criteria(&spec.success, &[], false);
     let message = (!prompt.trim().is_empty() || !criteria.is_empty())
-        .then(|| compose_effective_prompt(prompt, id, "", config.pr_watch.enabled, &criteria));
+        .then(|| compose_effective_prompt(prompt, id, "", config.pr_watch.enabled, &criteria, false));
     (criteria, message)
 }
 
@@ -4576,22 +4786,7 @@ fn print_spawn_warnings(spawned: &SpawnedSession) {
 /// who it is, that it coordinates rather than implements, and (when spawned
 /// by another orchestrator) the channel back to whoever asked for it.
 fn orchestrator_context_footer(id: &str, spawner: Option<&str>) -> String {
-    let mut footer = format!(
-        "\n\n---\n\
-         Ninox orchestrator `{id}`\n\n\
-         **Role:** you are an orchestrator, not a worker. Spawn workers \
-         (`ninox spawn`) for the brief above — never implement it yourself.\n",
-    );
-    if let Some(spawner) = spawner {
-        footer.push_str(&format!(
-            "\nSpawned by orchestrator `{spawner}`. Report back when the work is \
-             done or you need a decision:\n\
-             ```bash\n\
-             ninox send {spawner} \"<your message>\"\n\
-             ```\n",
-        ));
-    }
-    footer
+    format!("\n{}", ninox_core::session_setup::orchestrator_footer(id, spawner))
 }
 
 /// `ninox request-work` — record a work request in this worker's session
@@ -5530,6 +5725,41 @@ async fn run_identity_hook(action: IdentityHookAction, db_path: PathBuf) {
     }));
 }
 
+/// Handler for `ninox session-setup`. Never fails and never blocks the
+/// session: any problem degrades to printing nothing.
+async fn run_session_setup(db_path: PathBuf) {
+    use std::io::Read;
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let session_id = std::env::var("NINOX_SESSION").ok().filter(|s| !s.is_empty());
+    let ninox_bin = std::env::var("NINOX_BIN").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "ninox".to_string());
+    let config = AppConfig::load_or_default();
+    if let Some(line) = session_setup_output(&input, &db_path, session_id.as_deref(), &ninox_bin, &config, &AppConfig::sessions_dir()).await {
+        println!("{line}");
+    }
+}
+
+/// What `ninox session-setup` prints for the hook payload `input` (Claude
+/// Code's JSON on stdin; a missing or unreadable `source` counts as
+/// `startup`), or `None` when the session needs nothing.
+pub async fn session_setup_output(
+    input: &str,
+    db_path: &std::path::Path,
+    session_id: Option<&str>,
+    ninox_bin: &str,
+    config: &AppConfig,
+    sessions_dir: &std::path::Path,
+) -> Option<String> {
+    let source = serde_json::from_str::<serde_json::Value>(input)
+        .ok()
+        .and_then(|v| v.get("source").and_then(|s| s.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "startup".to_string());
+    let store = Store::open(db_path).ok()?;
+    let context =
+        ninox_core::session_setup::session_context(&store, config, session_id?, &source, ninox_bin, sessions_dir).await?;
+    Some(ninox_core::session_setup::hook_output(&context).to_string())
+}
+
 /// Which hook invoked `run_worker_status_hook` — the `ActivityEvent` is
 /// built inside the handler because Stop's meaning depends on per-session
 /// state (pending inbox messages), and NeedsInput/Permission's depend on the
@@ -6171,18 +6401,55 @@ async fn run_brain(action: BrainAction, store: Arc<Store>) -> anyhow::Result<()>
         BrainAction::Add { path, content, catalogue } => {
             let content = match content {
                 Some(c) => c,
-                None => {
-                    let mut buf = String::new();
-                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
-                    buf
-                }
+                None => read_stdin_string()?,
             };
-            let (member, stats) = run_brain_add_in_set(&set, &config, catalogue.as_deref(), &path, &content)?;
-            let to = if set.reads.len() > 1 { format!(" to {}", member.name()) } else { String::new() };
-            println!(
-                "wrote {path}{to} and indexed {} entries ({} embedded, {} cached)",
-                stats.indexed, stats.embedded, stats.cached
-            );
+            let outcomes = run_brain_add_multi(&set, &config, &catalogue, &path, &content)?;
+            let mut failed = 0;
+            for (member, result) in &outcomes {
+                match result {
+                    Ok(stats) => println!(
+                        "wrote {path} to {} and indexed {} entries ({} embedded, {} cached)",
+                        member.name(), stats.indexed, stats.embedded, stats.cached
+                    ),
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("FAILED to write {path} to {}: {e:#}", member.name());
+                    }
+                }
+            }
+            let written: Vec<_> = outcomes.iter().filter(|(_, r)| r.is_ok()).map(|(m, _)| m.clone()).collect();
+            // `brain copy` reads from the local brain, so the hint only makes
+            // sense once that write succeeded.
+            let local_written = outcomes.first().is_some_and(|(_, r)| r.is_ok());
+            if local_written {
+                print!("{}", brain_add_followup(&set, &config, &written, &path));
+            }
+            if failed > 0 {
+                anyhow::bail!("{failed} of {} brain write(s) failed; the others were written. Brains with a remote push on their next `ninox brain sync`", outcomes.len());
+            }
+        }
+        BrainAction::Limit { session, clear, set: limit_to, write } => {
+            let msg = run_brain_limit(&store, &config, caller_session.as_deref(), &session, clear, &limit_to, write.as_deref())?;
+            println!("{msg}");
+        }
+        BrainAction::Copy { path, to } => {
+            let (source, outcomes) = run_brain_copy(&set, &config, &path, &to)?;
+            let mut failed = 0;
+            for (member, result) in &outcomes {
+                match result {
+                    Ok(stats) => println!("copied {path} from {} to {} and indexed {} entries", source.name(), member.name(), stats.indexed),
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("FAILED to copy {path} to {}: {e:#}", member.name());
+                    }
+                }
+            }
+            if failed > 0 {
+                anyhow::bail!("{failed} of {} copies failed; the others were written", outcomes.len());
+            }
+        }
+        BrainAction::Rules { catalogue, json, action } => {
+            run_brain_rules(&set, &config, catalogue.as_deref(), json, action)?;
         }
         BrainAction::Export { output } => {
             let stats = ninox_core::brain_archive::export(&brain_path, &output)?;
@@ -6414,18 +6681,256 @@ async fn open_brain_reader(
     Ok(BrainReader::Merged(ninox_core::MergedBrainIndex::from_sources(sources)))
 }
 
-/// `ninox brain add` against a brain set: `catalogue` (or the set's write
-/// catalogue) must be a writable member — see `BrainSet::authorize_write`.
-fn run_brain_add_in_set(
+fn read_stdin_string() -> anyhow::Result<String> {
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+    Ok(buf)
+}
+
+fn read_text_arg(file: Option<&std::path::Path>) -> anyhow::Result<String> {
+    match file {
+        Some(f) => Ok(std::fs::read_to_string(f)?),
+        None => read_stdin_string(),
+    }
+}
+
+/// `ninox brain add` fan-out: the local (write) brain plus every
+/// named other brain. Every target is authorized before anything is
+/// written; then each is written and indexed independently so one failure
+/// leaves the others intact.
+fn run_brain_add_multi(
+    set: &ninox_core::brain_set::BrainSet,
+    config: &AppConfig,
+    targets: &[String],
+    path: &str,
+    content: &str,
+) -> anyhow::Result<Vec<(ninox_core::brain_set::Member, anyhow::Result<ninox_core::brain::RebuildStats>)>> {
+    ninox_core::brain_rules::ensure_not_reserved(path)?;
+    // The session's local (write) brain always gets the entry; named
+    // targets are other brains that get a copy as well.
+    let mut members: Vec<ninox_core::brain_set::Member> = vec![set.authorize_write(config, None)?];
+    for t in targets.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        let m = set.authorize_write(config, Some(t))?;
+        if !members.iter().any(|x| x.catalogue.path == m.catalogue.path) {
+            members.push(m);
+        }
+    }
+    let stamped;
+    let content = match std::env::var(ninox_core::brain_rules::HARVEST_SESSION_ENV).ok().filter(|v| !v.is_empty()) {
+        Some(session) => {
+            stamped = ninox_core::brain_rules::stamp_harvest(content, &session);
+            stamped.as_str()
+        }
+        None => content,
+    };
+    Ok(members
+        .into_iter()
+        .map(|m| {
+            let r = run_brain_add(&m.catalogue.path, path, content);
+            (m, r)
+        })
+        .collect())
+}
+
+/// What `ninox brain add` prints after writing: every other brain the session
+/// can write to, with its combined rules, as an instruction to the agent to
+/// copy the entry there when it fits. Empty when there is none; read-only
+/// brains and brains outside the session's set never appear.
+fn brain_add_followup(
+    set: &ninox_core::brain_set::BrainSet,
+    config: &AppConfig,
+    written: &[ninox_core::brain_set::Member],
+    path: &str,
+) -> String {
+    let local = set.write_member(config).catalogue.path;
+    let others: Vec<_> = set
+        .members(config)
+        .into_iter()
+        .filter(|m| m.writable && m.catalogue.path != local && !written.iter().any(|w| w.catalogue.path == m.catalogue.path))
+        .collect();
+    if others.is_empty() {
+        return String::new();
+    }
+    let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::from("\nOther brains you can write to. Copy this entry to one only if it fits that brain's rules:\n");
+    for m in &others {
+        let r = ninox_core::brain_rules::CombinedRules::load(&m.catalogue.path, m.catalogue.write_rules_override.as_deref());
+        out.push_str(&format!("- {}:", m.name()));
+        match (&r.brain, &r.local_override) {
+            (None, None) => out.push_str(" no rules set, so entries aren't copied here unless the user asks\n"),
+            (brain, over) => {
+                if let Some(t) = brain {
+                    out.push_str(&format!(" brain rules: {}", flat(t)));
+                }
+                if let Some(o) = over {
+                    out.push_str(&format!(" | local override (wins on conflict): {}", flat(o)));
+                }
+                out.push('\n');
+            }
+        }
+    }
+    let with_rules = others.iter().find(|m| {
+        !ninox_core::brain_rules::CombinedRules::load(&m.catalogue.path, m.catalogue.write_rules_override.as_deref()).is_empty()
+    });
+    match with_rules {
+        Some(m) => out.push_str(&format!(
+            "To copy: ninox brain copy {path} --to {} (several: --to a,b). Only to brains whose rules fit; a brain with no rules is not a target. If none fit, you're done.\n",
+            m.name()
+        )),
+        None => out.push_str("None of these have rules, so don't copy the entry anywhere unless the user asks.\n"),
+    }
+    out
+}
+
+/// `ninox brain limit`: changes the stored brain limit of `target`. A session
+/// can never change its own limit; the user (no caller session) may set any
+/// limit, and an orchestrator may only narrow within its own, or clear a
+/// child's limit when it has none itself.
+fn run_brain_limit(
+    store: &Store,
+    config: &AppConfig,
+    caller: Option<&str>,
+    target: &str,
+    clear: bool,
+    set: &[String],
+    write: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut row = store
+        .get_session(target)?
+        .ok_or_else(|| anyhow::anyhow!("no session named '{target}'"))?;
+    let parent_set = match caller {
+        None => None,
+        Some(c) if row.orchestrator_id.as_deref() == Some(c) => {
+            let parent = store.get_session(c)?.ok_or_else(|| anyhow::anyhow!("caller session '{c}' not found"))?;
+            Some(ninox_core::brain_set::BrainSet::from_session(&parent, config))
+        }
+        Some(_) => anyhow::bail!("only the user or '{target}''s own orchestrator can change its brain limit"),
+    };
+    let new = if clear {
+        if parent_set.as_ref().is_some_and(|p| p.limited) {
+            anyhow::bail!("you are limited yourself, so you can't lift a child's limit past yours");
+        }
+        ninox_core::brain_set::BrainSet::default_for(config)
+    } else {
+        let write = write.or_else(|| set.first().map(String::as_str));
+        match &parent_set {
+            Some(p) => p.narrow(config, set, write)?,
+            None => ninox_core::brain_set::BrainSet::select(config, set, write)?,
+        }
+    };
+    new.apply_to(&mut row);
+    store.upsert_session(&row)?;
+    Ok(format!("{target}: {}", ninox_core::brain_set::session_brains_line(&row, config)))
+}
+
+/// One write target and what happened to it.
+type TargetOutcome = (ninox_core::brain_set::Member, anyhow::Result<ninox_core::brain::RebuildStats>);
+
+/// `ninox brain copy`: the entry as it sits in the write brain, copied
+/// verbatim into each target. Every target is authorized before anything is
+/// written; the write brain itself is refused as a target.
+fn run_brain_copy(
+    set: &ninox_core::brain_set::BrainSet,
+    config: &AppConfig,
+    path: &str,
+    targets: &[String],
+) -> anyhow::Result<(ninox_core::brain_set::Member, Vec<TargetOutcome>)> {
+    ninox_core::brain_rules::ensure_not_reserved(path)?;
+    let rel = std::path::Path::new(path);
+    if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        anyhow::bail!("'{path}' must be a relative path inside the brain");
+    }
+    let source = set.authorize_write(config, None)?;
+    let content = std::fs::read_to_string(source.catalogue.path.join(rel))
+        .map_err(|e| anyhow::anyhow!("no entry '{path}' in {} to copy ({e}); write it with `ninox brain add` first", source.name()))?;
+    let mut members: Vec<ninox_core::brain_set::Member> = Vec::new();
+    for t in targets.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        let m = set.authorize_write(config, Some(t))?;
+        if m.catalogue.path == source.catalogue.path {
+            anyhow::bail!("'{}' already holds the entry (it is the write brain)", m.name());
+        }
+        if !members.iter().any(|x| x.catalogue.path == m.catalogue.path) {
+            members.push(m);
+        }
+    }
+    let results = members
+        .into_iter()
+        .map(|m| {
+            let r = run_brain_add(&m.catalogue.path, path, &content);
+            (m, r)
+        })
+        .collect();
+    Ok((source, results))
+}
+
+fn run_brain_rules(
     set: &ninox_core::brain_set::BrainSet,
     config: &AppConfig,
     catalogue: Option<&str>,
-    path: &str,
-    content: &str,
-) -> anyhow::Result<(ninox_core::brain_set::Member, ninox_core::brain::RebuildStats)> {
-    let member = set.authorize_write(config, catalogue)?;
-    let stats = run_brain_add(&member.catalogue.path, path, content)?;
-    Ok((member, stats))
+    json: bool,
+    action: Option<RulesAction>,
+) -> anyhow::Result<()> {
+    use ninox_core::brain_rules::CombinedRules;
+    match action {
+        Some(RulesAction::Set { file }) => {
+            let name = catalogue.ok_or_else(|| anyhow::anyhow!("`rules set` needs --catalogue <name>"))?;
+            let member = set.authorize_write(config, Some(name))?;
+            let text = read_text_arg(file.as_deref())?;
+            ninox_core::brain_rules::write_brain_rules(&member.catalogue.path, &text)?;
+            println!("saved brain rules for {} (shared; reaches others on the next `ninox brain sync`)", member.name());
+        }
+        Some(RulesAction::SetOverride { file }) => {
+            let name = catalogue.ok_or_else(|| anyhow::anyhow!("`rules set-override` needs --catalogue <name>"))?;
+            let member = set.authorize_read(config, Some(name))?.remove(0);
+            let text = read_text_arg(file.as_deref())?;
+            let member_name = member.name().to_string();
+            let (_, saved) = AppConfig::update(|c| ninox_core::brain_rules::set_override(c, &member_name, &text))?;
+            if !saved {
+                anyhow::bail!("no configured brain named '{member_name}' to hold a local override");
+            }
+            println!("saved local override for {member_name} (this machine only, never synced)");
+        }
+        None => {
+            let members: Vec<_> = set.authorize_read(config, catalogue)?;
+            let local = set.write_member(config).catalogue.path;
+            let role = |m: &ninox_core::brain_set::Member| {
+                if !m.writable {
+                    "read-only"
+                } else if m.catalogue.path == local {
+                    "local"
+                } else {
+                    "other"
+                }
+            };
+            if json {
+                let rows: Vec<_> = members
+                    .iter()
+                    .map(|m| {
+                        let r = CombinedRules::load(&m.catalogue.path, m.catalogue.write_rules_override.as_deref());
+                        serde_json::json!({ "catalogue": m.name(), "role": role(m), "brain": r.brain, "override": r.local_override })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(());
+            }
+            for m in &members {
+                if !m.writable {
+                    println!("== {} (read-only) ==\nNot a write target.\n", m.name());
+                    continue;
+                }
+                let r = CombinedRules::load(&m.catalogue.path, m.catalogue.write_rules_override.as_deref());
+                let hint = if role(m) == "local" { "every entry you write lands here" } else { "copy an entry here with `brain copy --to` when its rules fit" };
+                let rendered = if role(m) == "other" && r.is_empty() {
+                    "No rules set, so entries aren't copied here unless the user asks.\n".to_string()
+                } else {
+                    r.render()
+                };
+                println!("== {} ({}: {hint}) ==\n{}", m.name(), role(m), rendered);
+            }
+            println!("`ninox brain add <path>` writes to your local brain, then lists the other brains' rules; copy the entry with `ninox brain copy <path> --to <brain>[,<brain>]` when it fits.");
+        }
+    }
+    Ok(())
 }
 
 fn print_sync_report(report: &ninox_core::brain_sync::SyncReport) {
@@ -6561,8 +7066,10 @@ fn discover_repos_into_catalogue(catalogue_path: &std::path::Path, candidates: &
 }
 
 /// Write a brain entry's Markdown content to `brain_path/id`, creating its
-/// parent section directory (e.g. `repos/`) if needed.
+/// parent section directory (e.g. `repos/`) if needed. Refuses the reserved
+/// write-rules file.
 pub fn write_brain_entry(brain_path: &std::path::Path, id: &str, content: &str) -> anyhow::Result<()> {
+    ninox_core::brain_rules::ensure_not_reserved(id)?;
     let path = brain_path.join(id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -6616,7 +7123,7 @@ mod discover_repos_tests {
             workspace_path: Some(workspace.to_string_lossy().to_string()),
             pid: None,
             model: None,
-            context_tokens: None,
+            observed_model: None, context_tokens: None,
             brain_reads: Vec::new(),
             brain_write: catalogue_path.map(|p| p.to_string_lossy().to_string()),
             context_used_pct: None,
@@ -6833,6 +7340,7 @@ pub async fn bootstrap(
     {
         tracing::warn!("orchestrator root setup failed: {e}");
     }
+    crate::spawn_util::reseed_all_custom_workspaces(&store, &config).await;
 
     let brain = Arc::new(BrainIndex::open(&brain_path)?);
     let engine = match resolve_token(config.github_token.clone()) {
@@ -6892,6 +7400,11 @@ pub async fn bootstrap(
                 .with_plan_advancer(crate::ghost_accept::plan_advancer(Arc::clone(&store)));
             if already_running {
                 poller = poller.with_external_github_daemon(port);
+            }
+            // The automatic reset-from-plan trigger runs in whichever process
+            // owns the port, so exactly one process evaluates it.
+            if !already_running {
+                crate::orchestrator_auto_reset::spawn(engine.clone(), token.clone());
             }
             let poller_task = tokio::spawn(async move { poller.start(token).await });
 
@@ -7194,7 +7707,7 @@ mod brain_add_tests {
 
 #[cfg(test)]
 mod brain_set_cli_tests {
-    use super::{open_brain_reader, run_brain_add, run_brain_add_in_set, BrainReader};
+    use super::{open_brain_reader, run_brain_add, run_brain_add_multi, run_brain_rules, BrainReader, RulesAction};
     use ninox_core::brain_set::BrainSet;
     use ninox_core::config::{AppConfig, CatalogueRef};
     use ninox_core::QueryFilters;
@@ -7216,6 +7729,7 @@ mod brain_set_cli_tests {
         let cat = |name: &str, access: &str| CatalogueRef {
             name: name.into(), path: dir.path().join(name), remote: None, endpoint: None, region: None,
             cache_ttl_secs: None, enabled: true, cadence: "manual".into(), access: access.into(),
+            write_rules_override: None,
         };
         let mut config = AppConfig::default();
         config.brain.path = Some(dir.path().join("default"));
@@ -7260,22 +7774,250 @@ mod brain_set_cli_tests {
     }
 
     #[test]
-    fn add_goes_to_the_write_catalogue_and_refuses_read_only_and_out_of_set() {
+    fn add_with_no_flag_writes_only_the_write_catalogue_and_refuses_read_only_and_out_of_set() {
         let _iso = ninox_core::test_isolation::isolate();
         let b = brains();
         let set = BrainSet::select(&b.config, &["a".into(), "b".into()], Some("a")).unwrap();
 
-        let (member, _) = run_brain_add_in_set(&set, &b.config, None, "concepts/x.md", &entry("x")).unwrap();
-        assert_eq!(member.name(), "a");
+        let out = run_brain_add_multi(&set, &b.config, &[], "concepts/x.md", &entry("x")).unwrap();
+        assert_eq!(out.len(), 1, "no other brain's rules fit: only the local brain gets it");
+        assert_eq!(out[0].0.name(), "a");
         assert!(b.path("a").join("concepts/x.md").exists());
 
-        let err = run_brain_add_in_set(&set, &b.config, Some("b"), "concepts/y.md", &entry("y")).unwrap_err();
+        let err = run_brain_add_multi(&set, &b.config, &["b".into()], "concepts/y.md", &entry("y")).err().unwrap();
         assert!(err.to_string().contains("read-only"), "{err}");
         assert!(!b.path("b").join("concepts/y.md").exists());
+        assert!(!b.path("a").join("concepts/y.md").exists(), "nothing written when a target is refused");
 
-        let err = run_brain_add_in_set(&set, &b.config, Some("c"), "concepts/z.md", &entry("z")).unwrap_err();
+        let err = run_brain_add_multi(&set, &b.config, &["c".into()], "concepts/z.md", &entry("z")).err().unwrap();
         assert!(err.to_string().contains("not in this session's brain set"), "{err}");
         assert!(!b.path("c").join("concepts/z.md").exists());
+    }
+
+    #[test]
+    fn multi_write_copies_the_entry_to_every_target() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let b = brains();
+        let set = BrainSet::select(&b.config, &["a".into(), "c".into()], Some("a")).unwrap();
+        let out = run_brain_add_multi(&set, &b.config, &["c".into()], "concepts/x.md", &entry("x")).unwrap();
+        assert_eq!(out.len(), 2, "local brain plus the fitting other brain");
+        assert!(out.iter().all(|(_, r)| r.is_ok()));
+        assert!(b.path("a").join("concepts/x.md").exists());
+        assert!(b.path("c").join("concepts/x.md").exists());
+        std::fs::write(b.path("a").join("concepts/x.md"), "edited").unwrap();
+        assert_ne!(std::fs::read_to_string(b.path("c").join("concepts/x.md")).unwrap(), "edited", "copies are independent");
+    }
+
+    #[test]
+    fn multi_write_failure_on_one_target_does_not_block_the_others() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let b = brains();
+        std::fs::write(b.path("c"), "not a directory").unwrap();
+        let set = BrainSet::select(&b.config, &["a".into(), "c".into()], Some("a")).unwrap();
+        let out = run_brain_add_multi(&set, &b.config, &["c".into()], "concepts/y.md", &entry("y")).unwrap();
+        assert!(out[0].1.is_ok() && out[1].1.is_err());
+        assert!(b.path("a").join("concepts/y.md").exists());
+    }
+
+    #[test]
+    fn multi_write_refuses_everything_when_any_target_is_not_writable() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let b = brains();
+        let set = BrainSet::select(&b.config, &["a".into(), "b".into()], Some("a")).unwrap();
+        assert!(run_brain_add_multi(&set, &b.config, &["b".into()], "concepts/z.md", &entry("z")).is_err());
+        assert!(!b.path("a").join("concepts/z.md").exists(), "nothing written before authorization passes");
+    }
+
+    #[test]
+    fn add_refuses_the_reserved_rules_path() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let b = brains();
+        let set = BrainSet::select(&b.config, &["a".into()], Some("a")).unwrap();
+        assert!(run_brain_add_multi(&set, &b.config, &[], "_rules.md", "x").is_err());
+        assert!(!b.path("a").join("_rules.md").exists());
+    }
+
+    #[test]
+    fn rules_set_is_hidden_from_the_index_and_read_back_combined() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let mut b = brains();
+        b.config.brain.catalogues[0].write_rules_override = Some("no raw logs".into());
+        let set = BrainSet::select(&b.config, &["a".into()], Some("a")).unwrap();
+        run_brain_add(&b.path("a"), "concepts/k.md", &entry("k")).unwrap();
+        ninox_core::brain_rules::write_brain_rules(&b.path("a"), "brain knowledge only").unwrap();
+        let idx = ninox_core::BrainIndex::open(b.path("a")).unwrap();
+        assert_eq!(idx.rebuild(None).unwrap().indexed, 1, "_rules.md is not an entry");
+        let member = set.authorize_write(&b.config, Some("a")).unwrap();
+        let r = ninox_core::brain_rules::CombinedRules::load(&member.catalogue.path, member.catalogue.write_rules_override.as_deref());
+        assert_eq!(r.brain.as_deref(), Some("brain knowledge only"));
+        assert_eq!(r.local_override.as_deref(), Some("no raw logs"));
+        run_brain_rules(&set, &b.config, None, false, None).unwrap();
+        assert!(run_brain_rules(&set, &b.config, None, false, Some(RulesAction::Set { file: None })).is_err(), "set needs --catalogue");
+    }
+
+    #[test]
+    fn add_followup_lists_other_writable_brains_with_rules_and_never_read_only_ones() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let mut b = brains();
+        b.config.brain.catalogues[2].write_rules_override = Some("only verified things".into());
+        ninox_core::brain_rules::write_brain_rules(&b.path("c"), "MLOps knowledge\nno secrets").unwrap();
+        let set = BrainSet::select(&b.config, &["a".into(), "b".into(), "c".into()], Some("a")).unwrap();
+        let out = run_brain_add_multi(&set, &b.config, &[], "concepts/x.md", &entry("x")).unwrap();
+        let written: Vec<_> = out.iter().map(|(m, _)| m.clone()).collect();
+        assert!(b.path("a").join("concepts/x.md").exists());
+        let text = super::brain_add_followup(&set, &b.config, &written, "concepts/x.md");
+        assert!(text.contains("- c: brain rules: MLOps knowledge no secrets | local override (wins on conflict): only verified things"), "{text}");
+        assert!(text.contains("ninox brain copy concepts/x.md --to c"), "{text}");
+        assert!(!text.contains("- b:") && !text.contains("- a:"), "read-only and already-written brains are not targets: {text}");
+    }
+
+    #[test]
+    fn add_followup_respects_a_limited_session_and_is_silent_when_nothing_else_is_writable() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let b = brains();
+        let limited = BrainSet::select(&b.config, &["a".into(), "b".into()], Some("a")).unwrap();
+        let out = run_brain_add_multi(&limited, &b.config, &[], "concepts/x.md", &entry("x")).unwrap();
+        let written: Vec<_> = out.iter().map(|(m, _)| m.clone()).collect();
+        assert_eq!(super::brain_add_followup(&limited, &b.config, &written, "concepts/x.md"), "", "c is outside the limit and b is read-only");
+        let wider = BrainSet::select(&b.config, &["a".into(), "c".into()], Some("a")).unwrap();
+        let text = super::brain_add_followup(&wider, &b.config, &written, "concepts/x.md");
+        assert!(text.contains("- c: no rules set, so entries aren't copied here unless the user asks"), "{text}");
+        assert!(!text.contains("To copy:") && text.contains("None of these have rules"), "a brain with no rules is never the hinted target: {text}");
+    }
+
+    #[test]
+    fn following_the_printed_copy_hint_verbatim_lands_an_identical_copy() {
+        use clap::Parser;
+        let _iso = ninox_core::test_isolation::isolate();
+        let b = brains();
+        ninox_core::brain_rules::write_brain_rules(&b.path("c"), "concept notes only").unwrap();
+        let set = BrainSet::select(&b.config, &["a".into(), "b".into(), "c".into()], Some("a")).unwrap();
+        let body = entry("hint");
+        let out = run_brain_add_multi(&set, &b.config, &[], "concepts/hint.md", &body).unwrap();
+        let written: Vec<_> = out.iter().map(|(m, _)| m.clone()).collect();
+        let text = super::brain_add_followup(&set, &b.config, &written, "concepts/hint.md");
+        let line = text.lines().find(|l| l.starts_with("To copy: ")).expect("a copy hint is printed");
+        let command = line.trim_start_matches("To copy: ").split(" (").next().unwrap();
+        let argv: Vec<&str> = command.split_whitespace().collect();
+        assert_eq!(&argv[..3], ["ninox", "brain", "copy"], "{command}");
+        let cli = super::Args::try_parse_from(argv).expect("the printed command parses as given");
+        let Some(super::Command::Brain { action: super::BrainAction::Copy { path, to } }) = cli.command else { panic!("not a copy command") };
+        let (source, results) = super::run_brain_copy(&set, &b.config, &path, &to).unwrap();
+        assert_eq!(source.name(), "a");
+        assert!(results.iter().all(|(_, r)| r.is_ok()));
+        assert_eq!(std::fs::read(b.path("c").join("concepts/hint.md")).unwrap(), std::fs::read(b.path("a").join("concepts/hint.md")).unwrap());
+        assert_eq!(std::fs::read_to_string(b.path("c").join("concepts/hint.md")).unwrap(), body);
+    }
+
+    #[test]
+    fn copy_refuses_read_only_the_write_brain_a_missing_entry_and_unsafe_paths() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let b = brains();
+        let set = BrainSet::select(&b.config, &["a".into(), "b".into(), "c".into()], Some("a")).unwrap();
+        run_brain_add_multi(&set, &b.config, &[], "concepts/k.md", &entry("k")).unwrap();
+        let ro = super::run_brain_copy(&set, &b.config, "concepts/k.md", &["b".into()]).err().unwrap();
+        assert!(ro.to_string().contains("read-only"), "{ro}");
+        assert!(!b.path("b").join("concepts/k.md").exists());
+        assert!(super::run_brain_copy(&set, &b.config, "concepts/k.md", &["a".into()]).is_err(), "the write brain is not a target");
+        assert!(super::run_brain_copy(&set, &b.config, "concepts/nope.md", &["c".into()]).is_err());
+        assert!(super::run_brain_copy(&set, &b.config, "../escape.md", &["c".into()]).is_err());
+        assert!(super::run_brain_copy(&set, &b.config, "_rules.md", &["c".into()]).is_err());
+    }
+
+    #[test]
+    fn copy_reports_each_target_and_one_failure_does_not_block_the_other() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let mut b = brains();
+        b.config.brain.catalogues.push(ninox_core::config::CatalogueRef {
+            name: "d".into(), path: b.path("d"), remote: None, endpoint: None, region: None, cache_ttl_secs: None,
+            enabled: true, cadence: "manual".into(), access: "read_write".into(), write_rules_override: None,
+        });
+        std::fs::write(b.path("d"), "not a directory").unwrap();
+        let set = BrainSet::select(&b.config, &["a".into(), "c".into(), "d".into()], Some("a")).unwrap();
+        run_brain_add_multi(&set, &b.config, &[], "concepts/m.md", &entry("m")).unwrap();
+        let (_, results) = super::run_brain_copy(&set, &b.config, "concepts/m.md", &["d".into(), "c".into()]).unwrap();
+        assert!(results[0].1.is_err() && results[1].1.is_ok());
+        assert!(b.path("c").join("concepts/m.md").exists());
+    }
+
+    #[test]
+    fn a_failed_target_stays_listed_as_somewhere_the_entry_can_still_go() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let b = brains();
+        std::fs::write(b.path("c"), "not a directory").unwrap();
+        let set = BrainSet::select(&b.config, &["a".into(), "c".into()], Some("a")).unwrap();
+        let out = run_brain_add_multi(&set, &b.config, &["c".into()], "concepts/f.md", &entry("f")).unwrap();
+        let written: Vec<_> = out.iter().filter(|(_, r)| r.is_ok()).map(|(m, _)| m.clone()).collect();
+        assert_eq!(written.len(), 1);
+        let text = super::brain_add_followup(&set, &b.config, &written, "concepts/f.md");
+        assert!(text.contains("- c:"), "{text}");
+    }
+
+    #[test]
+    fn the_local_brain_is_never_a_copy_target_even_when_its_write_failed() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let b = brains();
+        std::fs::write(b.path("a"), "not a directory").unwrap();
+        ninox_core::brain_rules::write_brain_rules(&b.path("c"), "notes only").unwrap();
+        let set = BrainSet::select(&b.config, &["a".into(), "c".into()], Some("a")).unwrap();
+        let out = run_brain_add_multi(&set, &b.config, &[], "concepts/l.md", &entry("l")).unwrap();
+        assert!(out[0].1.is_err(), "the local write failed");
+        let written: Vec<_> = out.iter().filter(|(_, r)| r.is_ok()).map(|(m, _)| m.clone()).collect();
+        let text = super::brain_add_followup(&set, &b.config, &written, "concepts/l.md");
+        assert!(!text.contains("- a:"), "the local brain is not another brain to copy to: {text}");
+    }
+
+    fn row(id: &str, orchestrator: Option<&str>, limit: Option<(&[std::path::PathBuf], &std::path::Path)>) -> ninox_core::types::Session {
+        let mut s: ninox_core::types::Session = serde_json::from_value(serde_json::json!({
+            "id": id, "orchestrator_id": orchestrator, "name": id, "repo": "r", "status": "working",
+            "agent_type": "claude-code", "cost_usd": 0.0, "started_at": 0, "pr_number": null,
+            "pr_id": null, "workspace_path": null, "pid": null,
+        }))
+        .unwrap();
+        if let Some((reads, write)) = limit {
+            s.brain_reads = reads.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            s.brain_write = Some(write.to_string_lossy().into_owned());
+        }
+        s
+    }
+
+    fn store_with(rows: &[ninox_core::types::Session]) -> ninox_core::store::Store {
+        let store = ninox_core::store::Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap();
+        for r in rows {
+            store.upsert_session(r).unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn the_user_can_lift_or_set_a_sessions_limit_without_a_respawn() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let b = brains();
+        let store = store_with(&[row("w1", None, Some((&[b.path("a")], &b.path("a"))))]);
+        let msg = super::run_brain_limit(&store, &b.config, None, "w1", true, &[], None).unwrap();
+        assert!(msg.ends_with("Brains: all"), "{msg}");
+        let after = store.get_session("w1").unwrap().unwrap();
+        assert!(after.brain_reads.is_empty() && after.brain_write.is_none());
+
+        let msg = super::run_brain_limit(&store, &b.config, None, "w1", false, &["a".into(), "c".into()], Some("c")).unwrap();
+        assert!(msg.contains("limited to a, c · writes c"), "{msg}");
+        assert!(super::run_brain_limit(&store, &b.config, None, "w1", false, &["b".into()], Some("b")).is_err(), "read-only can't be the write brain");
+        assert!(super::run_brain_limit(&store, &b.config, None, "nope", true, &[], None).is_err());
+    }
+
+    #[test]
+    fn only_the_user_or_the_sessions_own_orchestrator_may_change_a_limit_and_never_past_its_own() {
+        let _iso = ninox_core::test_isolation::isolate();
+        let b = brains();
+        let limited_parent = row("o1", None, Some((&[b.path("a"), b.path("c")], &b.path("a"))));
+        let store = store_with(&[limited_parent, row("w1", Some("o1"), Some((&[b.path("a")], &b.path("a")))), row("w2", Some("other"), None)]);
+        let own = super::run_brain_limit(&store, &b.config, Some("w1"), "w1", true, &[], None).err().unwrap();
+        assert!(own.to_string().contains("only the user or"), "a session can't lift its own limit: {own}");
+        assert!(super::run_brain_limit(&store, &b.config, Some("o1"), "w2", true, &[], None).is_err(), "not its worker");
+        assert!(super::run_brain_limit(&store, &b.config, Some("o1"), "w1", true, &[], None).is_err(), "a limited parent can't lift a child past its own limit");
+        let ok = super::run_brain_limit(&store, &b.config, Some("o1"), "w1", false, &["a".into(), "c".into()], Some("c")).unwrap();
+        assert!(ok.contains("limited to a, c"), "{ok}");
+        assert!(super::run_brain_limit(&store, &b.config, Some("o1"), "w1", false, &["default".into()], None).is_err(), "can't widen past the parent's set");
     }
 }
 
@@ -7310,7 +8052,7 @@ mod permission_mode_agreement_tests {
     fn orchestrator() -> OrchestratorLaunch {
         OrchestratorLaunch {
             id: "o".into(), name: "o".into(), prompt: None, parent_orchestrator_id: None, agent: agent(),
-            catalogue_path: "/b".into(), brain: None, spawner: None, started_at: 0,
+            catalogue_path: "/b".into(), brain: None, spawner: None, started_at: 0, workspace: None,
         }
     }
 
@@ -7382,7 +8124,7 @@ mod brain_set_queue_tests {
 
     #[test]
     fn queued_worker_keeps_its_brain_set_through_the_payload() {
-        let set = BrainSet { reads: vec!["/b/a".into(), "/b/wiki".into()], write: "/b/a".into() };
+        let set = BrainSet { reads: vec!["/b/a".into(), "/b/wiki".into()], write: "/b/a".into(), limited: true };
         let payload = serde_json::to_string(&QueuedLaunch::CliWorker(worker(Some(set.clone()), Some("/b/a")))).unwrap();
         let QueuedLaunch::CliWorker(back) = serde_json::from_str(&payload).unwrap() else { panic!("kind") };
         let s = back.skeleton();
@@ -7402,12 +8144,12 @@ mod brain_set_queue_tests {
 
     #[test]
     fn queued_orchestrator_dual_carries_catalogue_path_for_older_binaries() {
-        let set = BrainSet { reads: vec!["/b/a".into(), "/b/wiki".into()], write: "/b/a".into() };
+        let set = BrainSet { reads: vec!["/b/a".into(), "/b/wiki".into()], write: "/b/a".into(), limited: true };
         let o = OrchestratorLaunch {
             id: "o".into(), name: "o".into(), prompt: None, parent_orchestrator_id: None,
             agent: ninox_core::config::AgentConfig { harness: "claude-code".into(), model: None },
             catalogue_path: set.write_str(), brain: Some(set.clone()),
-            spawner: None, started_at: 0,
+            spawner: None, started_at: 0, workspace: None,
         };
         let v = serde_json::to_value(QueuedLaunch::Orchestrator(o)).unwrap();
         assert_eq!(v["catalogue_path"], "/b/a");
@@ -7608,6 +8350,7 @@ mod session_limit_spawn_tests {
             brain: None,
             spawner: None,
             started_at: 1,
+            workspace: None,
         };
         let skeleton = launch.skeleton();
         let admitted = admit(&store, ninox_core::store::QueueKind::Spawn, &skeleton, &QueuedLaunch::Orchestrator(launch), true).unwrap();
@@ -7896,7 +8639,7 @@ mod worker_env_tests {
             id: "ath-123".into(), orchestrator_id: Some("orch1".into()), name: "ath-123".into(),
             repo: "o/r".into(), status: SessionStatus::Mergeable, agent_type: "claude-code".into(),
             cost_usd: 0.0, started_at: 0, pr_number: Some(9), pr_id: Some(9),
-            workspace_path: Some("/ws".into()), pid: None, model: None, context_tokens: None,
+            workspace_path: Some("/ws".into()), pid: None, model: None, observed_model: None, context_tokens: None,
             brain_reads: Vec::new(), brain_write: None, context_used_pct: None, context_total_tokens: None,
             context_window_size: None, claude_session_id: None, summary: None,
             terminal_at: None, gate_status: None,
@@ -8032,7 +8775,7 @@ mod worker_env_tests {
             repo: String::new(), status: ninox_core::SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None,
-            pid: Some(std::process::id()), model: None, context_tokens: None,
+            pid: Some(std::process::id()), model: None, observed_model: None, context_tokens: None,
             brain_reads: Vec::new(), brain_write: None, context_used_pct: None, context_total_tokens: None,
             context_window_size: None, claude_session_id: None, summary: None,
             terminal_at: None, gate_status: None, merged_at: None,
@@ -8244,7 +8987,7 @@ mod worker_env_tests {
             id: "impl-1".into(), orchestrator_id: Some("grandparent-orch".into()), name: "impl-1".into(),
             repo: String::new(), status: SessionStatus::Working, agent_type: "claude-code".into(),
             cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None, workspace_path: None,
-            pid: None, model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            pid: None, model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None, machine_id: None,
@@ -8289,7 +9032,7 @@ mod worker_env_tests {
             id: "impl-2".into(), orchestrator_id: None, name: "impl-2".into(),
             repo: String::new(), status: SessionStatus::Working, agent_type: "claude-code".into(),
             cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None, workspace_path: None,
-            pid: None, model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            pid: None, model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None, machine_id: None,
@@ -8324,7 +9067,7 @@ mod worker_env_tests {
             id: "researcher-1".into(), orchestrator_id: None, name: "researcher-1".into(),
             repo: String::new(), status: SessionStatus::Working, agent_type: "claude-code".into(),
             cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None, workspace_path: None,
-            pid: None, model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            pid: None, model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None, machine_id: None,
@@ -8663,7 +9406,7 @@ mod whoami_cli_tests {
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None,
             workspace_path: Some(format!("/work/{id}")), pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
@@ -8980,7 +9723,7 @@ mod orchestrator_cli_tests {
             name: id.to_string(), repo: String::new(), status: ninox_core::SessionStatus::Working,
             agent_type: "claude-code".to_string(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: Some(std::process::id()),
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
@@ -9045,7 +9788,7 @@ mod orchestrator_cli_tests {
         let store = store();
 
         let result = spawn_orchestrator_common(
-            &store, &scratch_config(), "nspawn-test-records-parent", None, Some("parent-orch"), None, None,
+            &store, &scratch_config(), "nspawn-test-records-parent", None, Some("parent-orch"), None, None, None,
         ).await;
 
         if let Ok(spawned) = &result {
@@ -9063,7 +9806,7 @@ mod orchestrator_cli_tests {
         let store = store();
 
         let result = spawn_orchestrator_common(
-            &store, &scratch_config(), "nspawn-test-defaults-no-parent", None, None, None, None,
+            &store, &scratch_config(), "nspawn-test-defaults-no-parent", None, None, None, None, None,
         ).await;
 
         if let Ok(spawned) = &result {
@@ -9083,7 +9826,7 @@ mod orchestrator_cli_tests {
 
         let result = spawn_orchestrator_common(
             &store, &scratch_config(), "nspawn-test-overrides", None, None,
-            Some(agent), Some(ninox_core::brain_set::BrainSet::single("/tmp/other-brain")),
+            Some(agent), Some(ninox_core::brain_set::BrainSet::single("/tmp/other-brain")), None,
         ).await;
 
         if let Ok(spawned) = &result {
@@ -9217,15 +9960,8 @@ mod orchestrator_cli_tests {
         // caller's explicit agent argument must be what lands on the
         // session — the dialog's Agent/Model fields, not the type.
         let agent = ninox_core::config::AgentConfig { harness: "codex".to_string(), model: Some("o3".to_string()) };
-        let mut config = scratch_config();
-        config.harnesses.insert("codex".into(), ninox_core::harness::HarnessSpec {
-            enabled: true,
-            binary: Some("sh".into()),
-            interactive_args: vec!["-c".into(), "'printf \"❯ \\n\"; exec cat'".into()],
-            ..Default::default()
-        });
         let result = spawn_standalone_worker(
-            &store, &config, "standalone-explicit-agent".into(), existing_workspace(),
+            &store, &scratch_config(), "standalone-explicit-agent".into(), existing_workspace(),
             Some("Researcher".into()), agent, ninox_core::brain_set::BrainSet::single("/brain"), String::new(),
         ).await;
         if result.is_ok() {
@@ -9247,7 +9983,7 @@ mod orchestrator_cli_tests {
             "unrequested".into(),
             None,
             false, false,
-            ninox_core::brain_set::BrainSet::single("/brain"), None,
+            ninox_core::brain_set::BrainSet::single("/brain"), None, None,
         )
         .await;
 
@@ -9268,7 +10004,7 @@ mod orchestrator_cli_tests {
             "!!!".into(),
             None,
             true, false,
-            ninox_core::brain_set::BrainSet::single("/brain"), None,
+            ninox_core::brain_set::BrainSet::single("/brain"), None, None,
         )
         .await;
         assert!(result.is_err(), "a nameless orchestrator has no addressable session id");
@@ -9285,7 +10021,7 @@ mod orchestrator_cli_tests {
             "ninox-user".into(),
             None,
             true, false,
-            ninox_core::brain_set::BrainSet::single("/brain"), None,
+            ninox_core::brain_set::BrainSet::single("/brain"), None, None,
         )
         .await;
 
@@ -9305,7 +10041,7 @@ mod orchestrator_cli_tests {
             repo: String::new(), status: ninox_core::SessionStatus::Working,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None,
@@ -9323,7 +10059,7 @@ mod orchestrator_cli_tests {
             "Taken".into(),
             None,
             true, false,
-            ninox_core::brain_set::BrainSet::single("/brain"), None,
+            ninox_core::brain_set::BrainSet::single("/brain"), None, None,
         )
         .await;
 
@@ -9359,7 +10095,7 @@ mod orchestrator_cli_tests {
         ).await.unwrap();
 
         let result = run_spawn_orchestrator(
-            store.clone(), config, "ghost orch".into(), None, true, false, ninox_core::brain_set::BrainSet::single("/brain"), None,
+            store.clone(), config, "ghost orch".into(), None, true, false, ninox_core::brain_set::BrainSet::single("/brain"), None, None,
         ).await;
 
         ninox_core::tmux::kill_session("ghost-orch").await.ok();
@@ -9426,8 +10162,13 @@ mod orchestrator_cli_tests {
 
     #[test]
     fn orchestrator_initial_brief_keeps_the_brief_first() {
-        let brief = crate::cli::orchestrator_initial_brief("solo", "ship it", None);
+        let brief = crate::cli::orchestrator_initial_brief("solo", "ship it", None, false);
         assert!(brief.starts_with("ship it") && brief.contains("`solo`"), "{brief}");
+    }
+
+    #[test]
+    fn a_hook_delivered_brief_is_the_brief_alone() {
+        assert_eq!(crate::cli::orchestrator_initial_brief("solo", "ship it", Some("up"), true), "ship it");
     }
 
     // ── reap guard ──────────────────────────────────────────────────────────
@@ -9546,8 +10287,7 @@ mod orchestrator_cli_tests {
         let result = run_spawn_sub_orchestrator(
             store.clone(), ninox_core::config::AppConfig::default(),
             "forged-sub".into(), None, Some("some-real-orchestrator".into()), None,
-            CallerRuntime { caller_type: Some("orchestrator".into()), pane: None }, false, ninox_core::brain_set::BrainSet::single("/brain"), None,
-        ).await;
+            CallerRuntime { caller_type: Some("orchestrator".into()), pane: None }, false, ninox_core::brain_set::BrainSet::single("/brain"), None,).await;
 
         let err = result.expect_err("an unverified orchestrator-id claim must be refused").to_string();
         assert!(err.contains("some-real-orchestrator"), "{err}");
@@ -9567,8 +10307,7 @@ mod orchestrator_cli_tests {
         let result = run_spawn_sub_orchestrator(
             store.clone(), ninox_core::config::AppConfig::default(),
             "sub3".into(), None, Some("sub2".into()), None,
-            CallerRuntime { caller_type: Some("orchestrator".into()), pane: Some(pane_for("sub2")) }, false, ninox_core::brain_set::BrainSet::single("/brain"), None,
-        ).await;
+            CallerRuntime { caller_type: Some("orchestrator".into()), pane: Some(pane_for("sub2")) }, false, ninox_core::brain_set::BrainSet::single("/brain"), None,).await;
 
         let err = result.expect_err("spawning at exactly the cap must be rejected").to_string();
         assert!(err.to_lowercase().contains("cap"), "{err}");
@@ -9587,8 +10326,7 @@ mod orchestrator_cli_tests {
         let result = run_spawn_sub_orchestrator(
             store.clone(), scratch_config(),
             "nspawn-test-one-level-ok".into(), None, Some("sub1".into()), None,
-            CallerRuntime { caller_type: Some("orchestrator".into()), pane: Some(pane_for("sub1")) }, false, ninox_core::brain_set::BrainSet::single("/brain"), None,
-        ).await;
+            CallerRuntime { caller_type: Some("orchestrator".into()), pane: Some(pane_for("sub1")) }, false, ninox_core::brain_set::BrainSet::single("/brain"), None,).await;
 
         ninox_core::tmux::kill_session("nspawn-test-one-level-ok").await.ok();
         let err = result.expect_err("tmux create must fail for a duplicate session id").to_string();
@@ -9607,8 +10345,7 @@ mod orchestrator_cli_tests {
         let result = run_spawn_sub_orchestrator(
             store.clone(), ninox_core::config::AppConfig::default(),
             "sub-by-worker".into(), None, None, Some("worker-a".into()),
-            CallerRuntime { caller_type: Some("worker".into()), pane: Some(pane_for("worker-a")) }, false, ninox_core::brain_set::BrainSet::single("/brain"), None,
-        ).await;
+            CallerRuntime { caller_type: Some("worker".into()), pane: Some(pane_for("worker-a")) }, false, ninox_core::brain_set::BrainSet::single("/brain"), None,).await;
 
         let err = result.expect_err("a worker type with no nested-spawn grant must be refused").to_string();
         assert!(err.contains("does not grant"), "{err}");
@@ -9633,8 +10370,7 @@ mod orchestrator_cli_tests {
         let result = run_spawn_sub_orchestrator(
             store.clone(), ninox_core::config::AppConfig::default(),
             "sub-by-worker-2".into(), None, Some("root".into()), Some("worker-a".into()),
-            CallerRuntime { caller_type: Some("worker".into()), pane: Some(pane_for("worker-a")) }, false, ninox_core::brain_set::BrainSet::single("/brain"), None,
-        ).await;
+            CallerRuntime { caller_type: Some("worker".into()), pane: Some(pane_for("worker-a")) }, false, ninox_core::brain_set::BrainSet::single("/brain"), None,).await;
 
         let err = result.expect_err("a worker type with no nested-spawn grant must be refused").to_string();
         assert!(err.contains("does not grant"), "{err}");
@@ -9666,8 +10402,7 @@ mod orchestrator_cli_tests {
         let result = run_spawn_sub_orchestrator(
             store.clone(), config,
             "nspawn-test-permitted-worker-sub".into(), None, None, Some("worker-a".into()),
-            CallerRuntime { caller_type: Some("worker".into()), pane: Some(pane_for("worker-a")) }, false, ninox_core::brain_set::BrainSet::single("/brain"), None,
-        ).await;
+            CallerRuntime { caller_type: Some("worker".into()), pane: Some(pane_for("worker-a")) }, false, ninox_core::brain_set::BrainSet::single("/brain"), None,).await;
 
         ninox_core::tmux::kill_session("nspawn-test-permitted-worker-sub").await.ok();
         // the point is the error must NOT be a permission or depth-cap rejection.
@@ -9696,7 +10431,7 @@ mod worker_status_cli_tests {
             repo: "o/r".into(), status,
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None,
             gate_status: None, merged_at: None,
@@ -10012,7 +10747,7 @@ pub mod test_fixtures {
             workspace_path: None,
             pid: None,
             model: None,
-            context_tokens: None,
+            observed_model: None, context_tokens: None,
             brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None,
             context_total_tokens: None,
@@ -10251,7 +10986,7 @@ mod model_resolution_spawn_tests {
         c.worker.model = Some("worker-m".into());
         let store = store(&iso);
         let id = format!("mr-orch-{}", std::process::id());
-        spawn_orchestrator_common(&store, &c, &id, None, None, None, None).await.expect("spawn");
+        spawn_orchestrator_common(&store, &c, &id, None, None, None, None, None).await.expect("spawn");
         assert!(argv_line(&id).await.contains("--model orch-m"));
     }
 
@@ -10263,7 +10998,7 @@ mod model_resolution_spawn_tests {
         let store = store(&iso);
         let id = format!("mr-orch-flag-{}", std::process::id());
         let agent = super::resolve_orchestrator_agent(&c, Some("flag-m"));
-        spawn_orchestrator_common(&store, &c, &id, None, None, Some(agent), None).await.expect("spawn");
+        spawn_orchestrator_common(&store, &c, &id, None, None, Some(agent), None, None).await.expect("spawn");
         assert!(argv_line(&id).await.contains("--model flag-m"));
     }
 
@@ -10292,7 +11027,7 @@ mod model_resolution_spawn_tests {
         let store = store(&iso);
         let id = format!("mr-dialog-orch-{}", std::process::id());
         let agent = resolve_spawn_agent(&c, SpawnKind::Orchestrator, DEFAULT_WORKER_TYPE, None, None).agent;
-        spawn_orchestrator_common(&store, &c, &id, None, None, Some(agent), None).await.expect("spawn");
+        spawn_orchestrator_common(&store, &c, &id, None, None, Some(agent), None, None).await.expect("spawn");
         assert!(argv_line(&id).await.contains("--model orch-m"));
     }
 
@@ -10332,6 +11067,43 @@ mod model_resolution_spawn_tests {
         session.workspace_path = Some("/tmp".into());
         let plan = crate::restart::refile_plan(&st, &session, false, &c, "fresh").expect("plan");
         assert!(plan.base_cmd.contains("--model 'started-m'"), "{}", plan.base_cmd);
+    }
+
+    fn relaunch_cmds(model: Option<&str>, observed: Option<&str>, is_orch: bool) -> (String, String) {
+        let iso = ninox_core::test_isolation::isolate();
+        let st = store(&iso);
+        let c = AppConfig::default();
+        let id = if is_orch { "mr-orch" } else { "mr-worker" };
+        let mut session = crate::session_queue::base_session(id, id, &ninox_core::config::AgentConfig {
+            harness: "claude-code".into(), model: model.map(Into::into),
+        }, 1);
+        session.workspace_path = Some("/tmp".into());
+        session.claude_session_id = Some("conv-1".into());
+        session.observed_model = observed.map(Into::into);
+        st.upsert_session(&session).unwrap();
+        let resume = crate::restart::resume_plan(&st, &session, is_orch, &c).expect("resume plan").base_cmd;
+        let refile = crate::restart::refile_plan(&st, &session, is_orch, &c, "fresh").expect("refile plan").base_cmd;
+        (resume, refile)
+    }
+
+    #[test]
+    fn relaunch_of_a_no_model_session_uses_the_role_default_not_the_observed_model() {
+        for (is_orch, want) in [(true, "claude-opus-5-5"), (false, "claude-sonnet-5-5")] {
+            let (resume, refile) = relaunch_cmds(None, Some("claude-fable-5-1"), is_orch);
+            for cmd in [&resume, &refile] {
+                assert!(cmd.contains(&format!("--model '{want}'")), "{cmd}");
+                assert!(!cmd.contains("fable"), "{cmd}");
+            }
+            assert!(resume.contains("--resume"), "{resume}");
+        }
+    }
+
+    #[test]
+    fn relaunch_with_a_recorded_model_keeps_it() {
+        let (resume, refile) = relaunch_cmds(Some("claude-haiku-5-5"), Some("claude-fable-5-1"), true);
+        for cmd in [&resume, &refile] {
+            assert!(cmd.contains("--model 'claude-haiku-5-5'"), "{cmd}");
+        }
     }
 }
 

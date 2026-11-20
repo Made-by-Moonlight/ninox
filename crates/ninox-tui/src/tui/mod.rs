@@ -133,6 +133,7 @@ pub async fn run(store: Arc<Store>, port: u16, db_path: PathBuf) -> anyhow::Resu
         st.human_console_error = Some(e.to_string());
     }
     st.restore_policy = backend::restore_policy(&config);
+    st.reset_cfg = config.orchestrator_reset.clone();
     st.offer_restore(backend::pending_restore(&store));
     // Off the loop: the host may need spawning, and a panic in it (or a
     // slow socket) must not take the UI down with it.
@@ -320,6 +321,20 @@ struct Loop {
     /// Deliveries, polls and clears for the Ninox prompt, drained into
     /// `FleetState::reply`.
     prompt_agent_tx: tokio::sync::mpsc::UnboundedSender<PromptAgentEvent>,
+    /// The running reset-from-plan flow for the open `P` dialog. In memory
+    /// only; dropping it (cancel, TUI exit) leaves nothing that could fire.
+    reset_flow: Option<ninox_ui_shared::reset_from_plan::ResetFlow>,
+    reset_tx: tokio::sync::mpsc::UnboundedSender<ResetEvent>,
+    /// Tags the running flow's background results.
+    reset_gen: u64,
+    /// The open flow came from the automatic trigger's notification.
+    reset_auto_started: bool,
+}
+
+/// Results of the reset-from-plan flow's background steps.
+enum ResetEvent {
+    Sent(u64, Result<(), String>),
+    Done(u64, Result<String, String>),
 }
 
 /// A finished background op (kill/remove/reap/re-file, or a message send):
@@ -383,6 +398,7 @@ async fn event_loop(
     let (delete_plan_tx, mut delete_plan_rx) = tokio::sync::mpsc::unbounded_channel();
     let (diff_tx, mut diff_rx) = tokio::sync::mpsc::unbounded_channel();
     let (prompt_agent_tx, mut prompt_agent_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reset_tx, mut reset_rx) = tokio::sync::mpsc::unbounded_channel::<ResetEvent>();
     let mut lp = Loop {
         hub,
         pending_spawns: Vec::new(),
@@ -412,6 +428,10 @@ async fn event_loop(
         caller: None,
         diff_tx,
         prompt_agent_tx,
+        reset_flow: None,
+        reset_tx,
+        reset_gen: 0,
+        reset_auto_started: false,
     };
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     // `None` while a `tmux attach` child owns the terminal; see `perform`.
@@ -457,6 +477,8 @@ async fn event_loop(
             _ = frame_due, if dirty == Redraw::Paced => {}
             _ = tick.tick() => {
                 refresh(st, store);
+                st.reset_cfg = AppConfig::load_or_default().orchestrator_reset;
+                sync_reset_flow(st, &mut lp);
                 st.sync_notifications(store);
                 st.offer_restore(backend::pending_restore(store));
                 lp.hub.refresh_list();
@@ -512,6 +534,11 @@ async fn event_loop(
                 }
                 refresh(st, store);
                 lp.hub.refresh_list();
+                dirty = Redraw::Now;
+            }
+            Some(event) = reset_rx.recv() => {
+                reset_event(st, &mut lp, event);
+                refresh(st, store);
                 dirty = Redraw::Now;
             }
             Some((root, plan)) = delete_plan_rx.recv() => {
@@ -958,6 +985,7 @@ async fn perform(
                     SpawnKind::Orchestrator => {
                         ninox_ui_shared::cli::spawn_orchestrator_common(
                             &store, &config, &sub.name, sub.prompt, None, Some(agent), Some(brain),
+                            sub.workspace.as_deref().map(std::path::Path::new),
                         ).await
                     }
                     SpawnKind::Standalone => {
@@ -1138,6 +1166,73 @@ async fn perform(
                 }
             }
         }),
+        Action::ResetFromPlanStart(id) => {
+            use ninox_ui_shared::reset_from_plan::{send_request, ResetFlow, UiPhase};
+            if lp.reset_flow.is_some() {
+                st.notify(Level::Info, "a reset from plan is already in progress");
+                return Ok(false);
+            }
+            match ResetFlow::prepare(Arc::clone(store), &id) {
+                Err(e) => st.notify(Level::Warn, format!("can't reset {id}: {e:#}")),
+                Ok((flow, request)) => {
+                    let name = st.rows.iter().find(|r| r.id() == id).map(|r| r.session.name.clone()).unwrap_or_else(|| id.clone());
+                    lp.reset_flow = Some(flow);
+                    lp.reset_auto_started = false;
+                    lp.reset_gen = ninox_ui_shared::reset_from_plan::next_generation();
+                    let generation = lp.reset_gen;
+                    st.modal = Some(state::Modal::ResetFromPlan(state::ResetModal {
+                        id: id.clone(), name, phase: UiPhase::Sending, preview: None, error: None, scroll: 0,
+                    }));
+                    let (store, tx) = (Arc::clone(store), lp.reset_tx.clone());
+                    tokio::spawn(async move {
+                        let config = AppConfig::load_or_default();
+                        let r = send_request(&store, &config, &id, &request).await.map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(ResetEvent::Sent(generation, r));
+                    });
+                }
+            }
+        }
+        Action::ResetFromPlanCancel => {
+            if let Some(flow) = lp.reset_flow.take() {
+                if lp.reset_auto_started {
+                    flow.cancel();
+                }
+            }
+            lp.reset_auto_started = false;
+            st.modal = None;
+        }
+        Action::ResetFromPlanOpenReady(id) => {
+            use ninox_ui_shared::reset_from_plan::{ResetFlow, UiPhase};
+            if lp.reset_flow.is_some() {
+                st.notify(Level::Info, "a reset from plan is already in progress");
+                return Ok(false);
+            }
+            match ninox_ui_shared::reset_from_plan::auto_flow_row(store, &id).ok_or(()) {
+                Ok(row) => {
+                    let name = st.rows.iter().find(|r| r.id() == id).map(|r| r.session.name.clone()).unwrap_or_else(|| id.clone());
+                    lp.reset_flow = Some(ResetFlow::from_auto_row(Arc::clone(store), &row));
+                    lp.reset_gen = ninox_ui_shared::reset_from_plan::next_generation();
+                    lp.reset_auto_started = true;
+                    st.modal = Some(state::Modal::ResetFromPlan(state::ResetModal {
+                        id, name, phase: UiPhase::Waiting, preview: None, error: None, scroll: 0,
+                    }));
+                }
+                _ => st.notify(Level::Info, format!("{id} has no automatic reset in progress")),
+            }
+        }
+        Action::ResetFromPlanConfirm => {
+            if let (Some(flow), Some(state::Modal::ResetFromPlan(m))) = (lp.reset_flow.take(), st.modal.as_mut()) {
+                m.phase = ninox_ui_shared::reset_from_plan::UiPhase::Resetting;
+                m.error = None;
+                let generation = lp.reset_gen;
+                let tx = lp.reset_tx.clone();
+                tokio::spawn(async move {
+                    let config = AppConfig::load_or_default();
+                    let r = flow.confirm(&config).await.map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(ResetEvent::Done(generation, r.map(|r| format!("{}: reset onto a fresh conversation from {}", r.orchestrator_id, r.plan_path))));
+                });
+            }
+        }
         Action::RestartServer => {
             st.server_restarting = true;
             let port = lp.port;
@@ -1578,6 +1673,57 @@ fn sync_inspector(st: &mut TuiState, lp: &mut Loop) {
     });
 }
 
+/// Polls the running reset-from-plan flow into the open dialog (once a second: a file read
+/// and two store reads, and drops a flow
+/// whose dialog is gone.
+fn sync_reset_flow(st: &mut TuiState, lp: &mut Loop) {
+    let Some(state::Modal::ResetFromPlan(m)) = st.modal.as_mut() else {
+        lp.reset_flow = None;
+        return;
+    };
+    if !m.phase.pollable() {
+        return;
+    }
+    if let Some(flow) = lp.reset_flow.as_mut() {
+        m.phase = m.phase.after_poll(flow.poll());
+        m.preview = flow.preview().map(|p| (p.path, p.content));
+    }
+}
+
+fn reset_event(st: &mut TuiState, lp: &mut Loop, event: ResetEvent) {
+    use ninox_ui_shared::reset_from_plan::UiPhase;
+    let (ResetEvent::Sent(generation, _) | ResetEvent::Done(generation, _)) = &event;
+    if *generation != lp.reset_gen {
+        return;
+    }
+    let Some(state::Modal::ResetFromPlan(m)) = st.modal.as_mut() else {
+        if let ResetEvent::Done(_, r) = event {
+            match r {
+                Ok(msg) => st.notify(Level::Info, msg),
+                Err(e) => st.notify(Level::Error, e),
+            }
+        }
+        return;
+    };
+    match event {
+        ResetEvent::Sent(_, Ok(())) if m.phase == UiPhase::Sending => m.phase = UiPhase::Waiting,
+        ResetEvent::Sent(_, Ok(())) => {}
+        ResetEvent::Sent(_, Err(e)) => {
+            m.error = Some(e);
+            m.phase = UiPhase::SendFailed;
+        }
+        ResetEvent::Done(_, Ok(msg)) => {
+            st.modal = None;
+            lp.reset_flow = None;
+            st.notify(Level::Info, msg);
+        }
+        ResetEvent::Done(_, Err(e)) => {
+            m.error = Some(e);
+            m.phase = UiPhase::ResetFailed;
+        }
+    }
+}
+
 /// Reads the plan for an open `D` confirm off the loop, once per opening.
 fn sync_delete_plan(st: &TuiState, lp: &mut Loop, engine: &Arc<Engine>) {
     let open = match &st.modal {
@@ -1824,6 +1970,10 @@ fn apply_live_setting(st: &mut TuiState, lp: &mut Loop, id: &settings::FieldId, 
         }
         FieldId::RestorePolicy => {
             st.restore_policy = backend::restore_policy(cfg);
+            ""
+        }
+        FieldId::OrchestratorResetMode | FieldId::OrchestratorResetPct => {
+            st.reset_cfg = cfg.orchestrator_reset.clone();
             ""
         }
         FieldId::RuntimeBackend => {
@@ -2155,7 +2305,7 @@ mod tests {
             id: "w1".into(), orchestrator_id: None, name: "w1".into(), repo: "r".into(),
             status: ninox_core::types::SessionStatus::Working, agent_type: "claude-code".into(),
             cost_usd: 0.0, started_at: 0, pr_number: None, pr_id: None, workspace_path: None, pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None, summary: None, terminal_at: None, gate_status: None, merged_at: None,
             activity: Default::default(), activity_note: None, activity_since: None, machine_id: None,
@@ -2370,6 +2520,7 @@ mod tests {
             enabled: true,
             cadence: "manual".to_string(),
             access: "read_write".to_string(),
+            write_rules_override: None,
         }
     }
 

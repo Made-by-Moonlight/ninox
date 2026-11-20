@@ -14,7 +14,7 @@
 
 - `rataflow` requires `ratatui = "0.30"`; the workspace currently pins `"0.29"`. Task 1 bumps the workspace-wide `ratatui`/`crossterm` pins (only `ninox-app` depends on `ratatui`, confirmed via `grep -rl ratatui crates/*/Cargo.toml`) before any feature code is written, and verifies the existing suite is still green on the bumped versions in isolation.
 - Do not run `cargo fmt` on the whole tree — it is not rustfmt-clean and will bury real changes in churn.
-- No changes to the `public` git remote; this PR targets `Synthesia-Technologies/ninox` only.
+- No changes to the `public` git remote; this PR targets the private mirror only.
 - Any store/session-store write spanning an `.await` must use read→apply→write — not applicable to this feature (no new store writes; everything here is TUI-local state plus an existing-file read).
 - `cargo build`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets` must stay clean after every task.
 

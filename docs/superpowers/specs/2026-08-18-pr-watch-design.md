@@ -26,7 +26,7 @@ Solution: one batched GraphQL query per tick for the whole machine
 plus an explicit PR watch registry agents manage via `ninox open --pr` /
 `ninox close --pr`.
 
-## Decisions (settled with Ethan, 2026-08-18)
+## Decisions (settled with the maintainer, 2026-08-18)
 
 - **Registry is additive**: the `gh pr create` wrapper shim and branch
   reconciliation keep attaching PRs to sessions; those are implicit

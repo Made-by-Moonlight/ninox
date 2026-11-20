@@ -1008,7 +1008,8 @@ impl Poller {
     /// message, and an expired SSO session is a prompt, not an error.
     async fn poll_update_check(&self) {
         let current_version = env!("CARGO_PKG_VERSION");
-        let channel = crate::config::AppConfig::load_or_default().update.channel;
+        let config = crate::config::AppConfig::load_or_default();
+        let channel = config.update.channel;
         if !binary_update::platform_supported(std::env::consts::OS, std::env::consts::ARCH) {
             return;
         }
@@ -1018,7 +1019,7 @@ impl Poller {
         let source: Arc<dyn UpdateSource> = self
             .update_source
             .clone()
-            .unwrap_or_else(|| Arc::new(GenericPackageUpdateSource { channel }));
+            .unwrap_or_else(|| Arc::new(GenericPackageUpdateSource::from_config(&config)));
         let latest = match update_check::check_for_update(source.as_ref(), package, current_version).await {
             Ok(latest) => {
                 *self.last_update_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1026,11 +1027,8 @@ impl Poller {
                 latest
             }
             Err(e) => {
-                let (msg, expected) = if binary_update::is_session_error(&e) {
-                    ("update check skipped: `aws sso login` needed".to_string(), true)
-                } else {
-                    (format!("update check against {package} failed: {e}"), false)
-                };
+                let expected = binary_update::classify_check_error(&e) != binary_update::CheckProblem::Other;
+                let msg = binary_update::explain_check_error(&e, binary_update::known_aws_profile().as_deref());
                 let repeated = {
                     let mut last = self.last_update_error.lock().unwrap_or_else(|e| e.into_inner());
                     let repeated = last.as_deref() == Some(msg.as_str());
@@ -1619,21 +1617,51 @@ impl Poller {
         }
         let Some(workspace) = session.workspace_path.clone() else { return };
         let workspace_path: PathBuf = workspace.into();
-        // The session's write catalogue, so the harvest lands where the
-        // worker itself writes, never a read-only source.
-        let brain_path: PathBuf = match crate::brain_set::BrainSet::from_session(session, &config)
-            .authorize_write(&config, None)
-        {
+        // Every brain the session can write to, so the harvest — which
+        // picks destinations by each brain's write rules — reaches exactly
+        // what the session itself could.
+        let set = crate::brain_set::BrainSet::from_session(session, &config);
+        let writable: Vec<_> = set.members(&config).into_iter().filter(|m| m.writable).collect();
+        if writable.is_empty() {
+            tracing::warn!("brain harvest skipped for {}: session has no writable brain", session.id);
+            return;
+        }
+        // The local brain is the session's own write brain; if that isn't
+        // writable the harvest has nowhere guaranteed to land, so skip.
+        let brain_path: PathBuf = match set.authorize_write(&config, None) {
             Ok(member) => member.catalogue.path,
             Err(e) => {
                 tracing::warn!("brain harvest skipped for {}: {e}", session.id);
                 return;
             }
         };
+        let brains: Vec<brain_harvest::HarvestBrain> = writable
+            .iter()
+            .map(|m| brain_harvest::HarvestBrain {
+                name:  m.name().to_string(),
+                is_local: m.catalogue.path == brain_path,
+                rules: crate::brain_rules::CombinedRules::load(&m.catalogue.path, m.catalogue.write_rules_override.as_deref()),
+            })
+            .collect();
+        let scope = brain_harvest::HarvestScope {
+            // Everything the session reads (so `ninox brain query` in the
+            // harvest sees read-only brains too); writes are still limited
+            // to the writable members by `brain add`'s own checks.
+            reads: set.members(&config).into_iter().map(|m| m.catalogue.path).collect(),
+            session_id: session.id.clone(),
+        };
         let runner       = self.harvest_runner.clone();
         let session_id    = session.id.clone();
         let panic_session_id = session_id.clone();
-        let vault_lock   = self.vault_lock(&brain_path);
+        // Locks are taken in canonical-path order so two harvests sharing
+        // several vaults can never wait on each other in opposite orders.
+        let mut lock_keys: Vec<PathBuf> = writable
+            .iter()
+            .map(|m| m.catalogue.path.canonicalize().unwrap_or_else(|_| m.catalogue.path.clone()))
+            .collect();
+        lock_keys.sort();
+        lock_keys.dedup();
+        let vault_locks: Vec<_> = lock_keys.iter().map(|p| self.vault_lock(p)).collect();
 
         let harvest_store = Arc::clone(&self.engine.store);
         let handle = tokio::spawn(async move {
@@ -1641,13 +1669,16 @@ impl Poller {
                 tracing::info!("brain harvest skipped for {session_id}: no non-trivial diff");
                 return;
             };
-            let prompt = brain_harvest::build_harvest_prompt(&session_id, &diff);
+            let prompt = brain_harvest::build_harvest_prompt(&session_id, &diff, &brains);
 
             // Serialize concurrent harvests that share a vault — two
             // `claude -p` subprocesses running `ninox brain index` against
             // the same vault at once can race on the index write.
-            let _guard = vault_lock.lock().await;
-            match runner.run(prompt, workspace_path, brain_path).await {
+            let mut _guards = Vec::new();
+            for l in &vault_locks {
+                _guards.push(l.lock().await);
+            }
+            match runner.run(prompt, workspace_path, brain_path, scope).await {
                 Ok(()) => {
                     let _ = harvest_store.clear_harness_auth("harvest:claude-code");
                 }
@@ -1771,8 +1802,8 @@ impl Poller {
             let Some(row) = self.update_live_session_row(&session, |row| {
                 row.cost_usd = snapshot.cost_usd;
                 row.context_tokens = Some(snapshot.context_tokens);
-                if row.model.is_none() {
-                    row.model = snapshot.model.clone();
+                if row.model.is_none() && row.observed_model.is_none() {
+                    row.observed_model = snapshot.model.clone();
                 }
             }) else {
                 continue;
@@ -1811,7 +1842,7 @@ impl Poller {
         }
         for session in changed {
             self.engine.emit(Event::SessionUpdated(
-                session, SessionFields::COST | SessionFields::CONTEXT,
+                session, SessionFields::COST | SessionFields::CONTEXT | SessionFields::MODEL,
             ));
         }
     }
@@ -4077,7 +4108,7 @@ mod tests {
             agent_type: "claude-code".into(), cost_usd: 0.0, started_at: 0,
             pr_number: None, pr_id: None,
             workspace_path: Some(workspace.into()), pid: None,
-            model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
+            model: None, observed_model: None, context_tokens: None, brain_reads: Vec::new(), brain_write: None,
             context_used_pct: None, context_total_tokens: None, context_window_size: None,
             claude_session_id: None,
             summary: None,
@@ -4710,7 +4741,8 @@ mod tests {
         let updated = store.get_session("s1").unwrap().unwrap();
         assert!(updated.cost_usd > 0.0, "cost_usd should be ingested, not 0.0000");
         assert_eq!(updated.context_tokens, Some(2 + 500 + 45000));
-        assert_eq!(updated.model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(updated.model, None, "an observed model is not a recorded choice");
+        assert_eq!(updated.observed_model.as_deref(), Some("claude-fable-5"));
 
         let evt = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
@@ -8442,7 +8474,9 @@ done
         )));
         sso.poll_update_check().await;
         let msg = sso.last_update_error.lock().unwrap().clone().unwrap();
-        assert_eq!(msg, "update check skipped: `aws sso login` needed");
+        assert!(msg.starts_with("update check can't run: the AWS SSO session expired") && msg.contains("aws sso login --profile"), "{msg}");
+        let reported = crate::server_control::current_issues().into_iter().find(|i| i.source == "update_check");
+        assert_eq!(reported.map(|i| i.message), Some(msg), "the fix reaches the server alerts");
 
         let ok = poller.with_update_source(Arc::new(FakeUpdateSource(std::sync::Mutex::new(None))));
         ok.poll_update_check().await;
@@ -8726,6 +8760,7 @@ enabled = true
             prompt:     String,
             workspace:  PathBuf,
             brain_path: PathBuf,
+            _scope:     brain_harvest::HarvestScope,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
             let _ = self.calls.send((prompt, workspace, brain_path));
             let outcome = self.outcome.clone();
@@ -8843,6 +8878,114 @@ enabled = true
             brain_path, PathBuf::from("/custom/brain-catalogue"),
             "harvest must target the session's own catalogue, not the global default",
         );
+    }
+
+    struct ScopeRecordingRunner {
+        calls: tokio::sync::mpsc::UnboundedSender<(String, brain_harvest::HarvestScope)>,
+    }
+
+    impl HarvestRunner for ScopeRecordingRunner {
+        fn run(
+            &self,
+            prompt:     String,
+            _workspace: PathBuf,
+            _brain:     PathBuf,
+            scope:      brain_harvest::HarvestScope,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+            let _ = self.calls.send((prompt, scope));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// The harvest acts for the session's whole brain set: the prompt carries
+    /// every writable brain's combined rules (team + local override), marks
+    /// the write brain as the local brain, never lists a read-only brain, and
+    /// the subprocess scope excludes it too.
+    #[tokio::test]
+    async fn metadata_sync_brain_harvest_prompt_carries_each_writable_brains_rules() {
+        use crate::store::Store;
+
+        let brains = tempfile::tempdir().unwrap();
+        let p = |n: &str| brains.path().join(n);
+        for n in ["local", "mlops", "notes", "archive"] {
+            std::fs::create_dir_all(p(n)).unwrap();
+        }
+        crate::brain_rules::write_brain_rules(&p("mlops"), "MLOps knowledge only").unwrap();
+        crate::brain_rules::write_brain_rules(&p("archive"), "ARCHIVE-RULES-MUST-NOT-APPEAR").unwrap();
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.brain.path = Some(p("local"));
+        cfg.brain.write_rules_override = Some("no transcripts".into());
+        let cat = |name: &str, access: &str, over: Option<&str>| crate::config::CatalogueRef {
+            name: name.into(), path: p(name), remote: None, endpoint: None, region: None, cache_ttl_secs: None,
+            enabled: true, cadence: "manual".into(), access: access.into(), write_rules_override: over.map(str::to_string),
+        };
+        cfg.brain.catalogues = vec![cat("mlops", "read_write", Some("only things I verified")), cat("notes", "read_write", None), cat("archive", "read_only", None)];
+        std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();
+        let _iso = crate::test_isolation::isolate_with_config(&config_path);
+
+        let repo = init_diff_repo("feature-rules", Some(("src.rs", "fn main() {}\n")));
+        let sessions_dir = tempfile::tempdir().unwrap();
+        let meta = serde_json::json!({"agentReportedPrNumber": "21"});
+        std::fs::write(sessions_dir.path().join("s1.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", repo.to_str().unwrap());
+        session.brain_reads = [p("local"), p("mlops"), p("notes"), p("archive")].iter().map(|x| x.to_string_lossy().into_owned()).collect();
+        session.brain_write = Some(p("local").to_string_lossy().into_owned());
+        store.upsert_session(&session).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let poller = Poller::new_with_harvest_runner(Engine::new(store.clone()), Arc::new(ScopeRecordingRunner { calls: tx }));
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+
+        let (prompt, scope) = next_harvest(&mut rx, "harvest should be attempted").await;
+        for want in ["brain `default` (your local brain", "no transcripts", "brain `mlops` (other brain", "MLOps knowledge only", "only things I verified", "source: harvest, harvest_session: s1"] {
+            assert!(prompt.contains(want), "missing {want:?} in:\n{prompt}");
+        }
+        assert!(!prompt.contains("ARCHIVE-RULES-MUST-NOT-APPEAR") && !prompt.contains("brain `archive`"), "a read-only brain is never a target");
+        assert_eq!(scope.reads, vec![p("local"), p("mlops"), p("notes"), p("archive")], "the harvest can still query read-only brains");
+        assert!(prompt.contains("brain `notes` (other brain with NO rules: never copy entries here)"), "a brain with no rules is never a target:\n{prompt}");
+        assert_eq!(scope.session_id, "s1");
+    }
+
+    /// A session whose write brain is read-only has no guaranteed catch-all:
+    /// the harvest is skipped rather than landing in some other brain.
+    #[tokio::test]
+    async fn metadata_sync_skips_brain_harvest_when_the_write_brain_is_read_only() {
+        use crate::store::Store;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir_all(&ro).unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.brain.path = Some(dir.path().join("local"));
+        cfg.brain.catalogues = vec![crate::config::CatalogueRef {
+            name: "ro".into(), path: ro.clone(), remote: None, endpoint: None, region: None, cache_ttl_secs: None,
+            enabled: true, cadence: "manual".into(), access: "read_only".into(), write_rules_override: None,
+        }];
+        std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();
+        let _iso = crate::test_isolation::isolate_with_config(&config_path);
+
+        let repo = init_diff_repo("feature-ro", Some(("src.rs", "fn main() {}\n")));
+        let sessions_dir = tempfile::tempdir().unwrap();
+        let meta = serde_json::json!({"agentReportedPrNumber": "22"});
+        std::fs::write(sessions_dir.path().join("s1.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+        let store = std::sync::Arc::new(Store::open(tempfile::tempdir().unwrap().keep().join("t.db")).unwrap());
+        let mut session = test_session("s1", repo.to_str().unwrap());
+        session.brain_reads = vec![ro.to_string_lossy().into_owned()];
+        session.brain_write = Some(ro.to_string_lossy().into_owned());
+        store.upsert_session(&session).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let poller = Poller::new_with_harvest_runner(Engine::new(store), Arc::new(ScopeRecordingRunner { calls: tx }));
+        poller.sync_sessions_metadata(sessions_dir.path()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(rx.try_recv().is_err(), "no harvest when the write brain is read-only");
     }
 
     /// `brain_harvest.enabled = false` must suppress the harvest entirely —
@@ -8983,6 +9126,7 @@ enabled = true
             _prompt: String,
             _workspace: PathBuf,
             _brain_path: PathBuf,
+            _scope:     brain_harvest::HarvestScope,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
             Box::pin(async move { panic!("simulated harvest panic") })
         }
@@ -9042,6 +9186,7 @@ enabled = true
             _prompt: String,
             _workspace: PathBuf,
             _brain_path: PathBuf,
+            _scope:     brain_harvest::HarvestScope,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
             let calls = self.calls.clone();
             let active = self.active.clone();
@@ -10543,7 +10688,7 @@ enabled = true
         {
             let mut m = fake.pr_status_ok.lock().unwrap();
             m.insert(("Org".into(), "bellhop".into(), 674), merged_status(674, "mlops-4234-userns-sysctl-dev"));
-            m.insert(("Org".into(), "Radisson".into(), 674), merged_status(674, "ethanbrodie/mlops-5607-shared-home-lease-contender"));
+            m.insert(("Org".into(), "Radisson".into(), 674), merged_status(674, "alice/mlops-5607-shared-home-lease-contender"));
         }
         let poller = Poller::new(github_engine(store.clone(), fake));
 
@@ -10557,7 +10702,7 @@ enabled = true
         assert_eq!((adopted.repo.as_str(), adopted.pr_number), ("Org/Radisson", Some(674)));
 
         assert_eq!(
-            poller.merge_attribution(&adopted, "ethanbrodie/mlops-5607-shared-home-lease-contender"),
+            poller.merge_attribution(&adopted, "alice/mlops-5607-shared-home-lease-contender"),
             Attribution::Verified,
         );
         poller.poll_github(false).await;

@@ -241,8 +241,8 @@ mod display_path_tests {
 
     #[test]
     fn home_prefix_matches_whole_components_only() {
-        let home = Some(OsStr::new("/Users/ethan"));
-        assert_eq!(shorten_path("/Users/ethan/plan.md", home), "~/plan.md");
-        assert_eq!(shorten_path("/Users/ethan.brodie/plan.md", home), "/Users/ethan.brodie/plan.md");
+        let home = Some(OsStr::new("/Users/alice"));
+        assert_eq!(shorten_path("/Users/alice/plan.md", home), "~/plan.md");
+        assert_eq!(shorten_path("/Users/dev/plan.md", home), "/Users/dev/plan.md");
     }
 }

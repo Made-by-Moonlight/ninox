@@ -203,6 +203,32 @@ fn text_field<'a>(value: &str, placeholder: &'a str, on_change: impl Fn(String) 
         .into()
 }
 
+/// Multi-line rules editor: ~7 visible lines, scrolling past that.
+fn rules_editor<'a>(
+    content: &'a iced::widget::text_editor::Content,
+    placeholder: &'a str,
+    on_action: impl Fn(iced::widget::text_editor::Action) -> Message + 'a,
+) -> Element<'a, Message> {
+    iced::widget::text_editor(content)
+        .placeholder(placeholder)
+        .on_action(on_action)
+        .height(Length::Fixed(124.0))
+        .size(12)
+        .padding([6, 8])
+        .style(|_t, status| {
+            let focused = matches!(status, iced::widget::text_editor::Status::Focused);
+            iced::widget::text_editor::Style {
+                background: Background::Color(tokens::PANEL2),
+                border: Border { color: if focused { tokens::TEAL } else { tokens::BORDER }, width: 1.0, radius: 6.0.into() },
+                icon: tokens::DIM,
+                placeholder: tokens::DIM,
+                value: tokens::TEXT,
+                selection: tokens::TEAL,
+            }
+        })
+        .into()
+}
+
 fn activity_log(app: &App) -> Element<'_, Message> {
     let mut rows: Vec<Element<Message>> = vec![panel_title("Recent sync activity"), Space::new(0, 6).into()];
     if app.source_sync_log.is_empty() {
@@ -218,7 +244,7 @@ fn activity_log(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-fn edit_panel(form: &SourceEditForm) -> Element<'_, Message> {
+fn edit_panel<'a>(app: &'a App, form: &'a SourceEditForm) -> Element<'a, Message> {
     let is_editing = form.editing.is_some();
     let mut rows: Vec<Element<Message>> = vec![
         text(if is_editing { "Edit source" } else { "Add source" }).size(14).font(crate::style::SANS).color(tokens::TEXT).into(),
@@ -272,6 +298,13 @@ fn edit_panel(form: &SourceEditForm) -> Element<'_, Message> {
         .spacing(10)
         .into(),
     );
+
+    rows.push(Space::new(0, 16).into());
+    rows.push(labeled_field(shared::BRAIN_RULES_LABEL, rules_editor(&app.sources_brain_rules_editor, "what belongs in this brain, what doesn't", Message::SourcesFormBrainRules)));
+    rows.push(text(shared::BRAIN_RULES_HINT).size(10).font(crate::style::SANS).color(tokens::DIM2).into());
+    rows.push(Space::new(0, 10).into());
+    rows.push(labeled_field(shared::OVERRIDE_LABEL, rules_editor(&app.sources_rules_override_editor, "e.g. no transcripts, no raw logs", Message::SourcesFormRulesOverride)));
+    rows.push(text(shared::OVERRIDE_HINT).size(10).font(crate::style::SANS).color(tokens::DIM2).into());
 
     if !matches!(form.source_type, SourceType::Local) {
         rows.push(Space::new(0, 8).into());
@@ -351,7 +384,7 @@ pub fn sources_view(app: &App) -> Element<'_, Message> {
     .height(Length::Fill);
 
     let main: Element<Message> = if let Some(form) = &app.sources_edit {
-        row![body, edit_panel(form)].width(Length::Fill).height(Length::Fill).into()
+        row![body, edit_panel(app, form)].width(Length::Fill).height(Length::Fill).into()
     } else {
         row![body].width(Length::Fill).height(Length::Fill).into()
     };

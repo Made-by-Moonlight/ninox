@@ -160,6 +160,9 @@ impl Engine {
 
     fn worktree_state(&self, session: &Session) -> Option<WorktreeState> {
         let path = session.workspace_path.as_deref()?;
+        if matches!(self.store.custom_workspace(&session.id), Ok(Some(_))) {
+            return None;
+        }
         crate::workspace::ninox_repo_root(path, &session.id)?;
         let dir = std::path::Path::new(path);
         if !dir.is_dir() {
@@ -225,6 +228,7 @@ impl Engine {
             return Ok(DeleteOutcome::KeptWorktree(reason));
         }
         if target.is_orchestrator {
+            self.release_custom_workspace(&target.id);
             self.store.delete_orchestrator(&target.id)?;
             self.emit(Event::OrchestratorRemoved(target.id.clone()));
         }

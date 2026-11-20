@@ -180,6 +180,32 @@ pub fn restart_commands(platform: ServicePlatform, uid: u32) -> Vec<Vec<String>>
     }
 }
 
+/// Starts the service only if it is not already running. After a graceful
+/// stop launchd (`KeepAlive` on crash only) and systemd (`Restart=on-failure`)
+/// leave the job down; if either already relaunched it (a signal-killed
+/// stop) this is a no-op, so a manual relaunch can never leave two servers
+/// fighting over the port.
+pub fn start_commands(platform: ServicePlatform, uid: u32) -> Vec<Vec<String>> {
+    match platform {
+        ServicePlatform::Launchd => {
+            vec![vec!["launchctl".into(), "kickstart".into(), format!("gui/{uid}/{LAUNCHD_LABEL}")]]
+        }
+        ServicePlatform::Systemd => {
+            vec![vec!["systemctl".into(), "--user".into(), "start".into(), SYSTEMD_UNIT_NAME.into()]]
+        }
+    }
+}
+
+/// Command whose success means the service is installed and will be
+/// supervised, even while stopped (a gracefully stopped systemd unit is
+/// inactive but still enabled; launchd keeps a stopped job loaded).
+pub fn managed_command(platform: ServicePlatform, uid: u32) -> Vec<String> {
+    match platform {
+        ServicePlatform::Launchd => status_command(platform, uid),
+        ServicePlatform::Systemd => vec!["systemctl".into(), "--user".into(), "is-enabled".into(), SYSTEMD_UNIT_NAME.into()],
+    }
+}
+
 /// Command whose success means the service is loaded/active.
 pub fn status_command(platform: ServicePlatform, uid: u32) -> Vec<String> {
     match platform {
@@ -198,6 +224,13 @@ mod tests {
             log_path:  PathBuf::from("/Users/me/Library/Application Support/ninox/daemon.log"),
             path_env:  Some("/opt/homebrew/bin:/usr/bin:/bin".into()),
         }
+    }
+
+    #[test]
+    fn start_never_forces_a_running_service_to_restart() {
+        let l = start_commands(ServicePlatform::Launchd, 501);
+        assert_eq!(l, vec![vec!["launchctl", "kickstart", "gui/501/io.ninox.engine"]]);
+        assert!(!l[0].iter().any(|a| a == "-k"), "-k would kill a server launchd already relaunched");
     }
 
     #[test]

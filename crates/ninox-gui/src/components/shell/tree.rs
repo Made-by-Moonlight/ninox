@@ -135,24 +135,17 @@ const SIDEBAR_LABEL_CHARS: usize = 14;
 /// How many PR chips a sidebar row can carry (2, then 1, then 0) without
 /// truncating the name. 0 means the row folds to a count chip.
 fn pr_chip_budget(row_px: f32, name: &str, prs: &[ninox_core::session_prs::SessionPr]) -> usize {
-    use pr_chip::width_estimate;
+    if prs.is_empty() {
+        return 0;
+    }
     let name_px = name.chars().count() as f32 * NAME_CHAR_PX;
-    [2usize, 1]
-        .into_iter()
-        .filter(|_| !prs.is_empty())
-        .find(|&max| name_px + width_estimate(prs, max, SIDEBAR_LABEL_CHARS) + 6.0 <= row_px)
-        .unwrap_or(0)
+    pr_chip::plan(prs, name_px, row_px, 2, SIDEBAR_LABEL_CHARS, None).max_chips()
 }
 
 /// Truncates to `max_chars` including the ellipsis, so the result never
 /// exceeds the budget.
 fn name_for_budget(name: &str, max_chars: usize) -> String {
-    if name.chars().count() <= max_chars {
-        name.to_string()
-    } else {
-        let keep = max_chars.saturating_sub(1).max(1);
-        format!("{}…", name.chars().take(keep).collect::<String>())
-    }
+    pr_chip::ellipsize(name, max_chars)
 }
 
 /// A worker row inside its orchestrator's tree skips a repo label that only
@@ -503,7 +496,7 @@ fn expanded<'a>(app: &'a App, fleet_islands: Option<&[ninox_overview::islands::I
         .into()
 }
 
-fn hover_tip<'a>(content: Element<'a, Message>, label: String) -> Element<'a, Message> {
+pub(crate) fn hover_tip<'a>(content: Element<'a, Message>, label: String) -> Element<'a, Message> {
     let tip = container(text(label).size(11).font(crate::style::SANS).color(tokens::TEXT))
         .padding([5, 8])
         .style(|_| container::Style {

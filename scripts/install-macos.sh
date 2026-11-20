@@ -15,8 +15,11 @@
 # Usage: scripts/install-macos.sh [--channel stable|alpha] [--version X.Y.Z] [--app | --no-app] [--user-apps]
 #
 #   --channel   stable (default) installs the newest release; alpha installs the
-#               newest alpha. Also persist the choice for `ninox update` with
-#               `ninox update --channel alpha`.
+#               newest alpha. The choice is saved to config.toml ([update]
+#               channel), so `ninox update` and the app's update notice follow
+#               the same channel. AWS_PROFILE, when set, is saved too
+#               ([update] aws_profile) so the background server can check for
+#               updates without your shell's environment.
 #
 # Environment:
 #   NINOX_INSTALL_DIR               binary install dir (default ~/.local/bin)
@@ -63,6 +66,8 @@ while [ $# -gt 0 ]; do
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
+
+pinned_version="$version"
 
 case "$channel" in
   stable) ;;
@@ -185,6 +190,23 @@ link_alias() {
 link_alias ninox ninox-gui "bare \`ninox\` won't open the desktop app"
 link_alias nx ninox-tui "bare \`nx\` won't open the ninox TUI"
 
+# Save the channel (and AWS profile) with the binary just installed, which
+# merges them into config.toml rather than overwriting it. Builds from before
+# --save-only existed fall back to `ninox update --channel`, which persists
+# the channel (it finds nothing newer to install, so it is skipped for a
+# --version pin, which it would otherwise move to the newest) but has no AWS
+# profile field.
+save_args=(update --save-only --channel "$channel")
+[ -z "${AWS_PROFILE:-}" ] || save_args+=(--aws-profile "$AWS_PROFILE")
+if "$INSTALL_DIR/ninox-tui" "${save_args[@]}" 2>/dev/null; then
+  info "Saved update settings to config.toml (channel: $channel${AWS_PROFILE:+, aws profile: $AWS_PROFILE})"
+elif [ "$channel" != stable ] && [ -z "$pinned_version" ] && "$INSTALL_DIR/ninox-tui" update --channel "$channel" </dev/null >/dev/null 2>&1; then
+  info "Saved update channel $channel to config.toml"
+  warn "this build can't save an AWS profile; run \`ninox update --check --aws-profile <profile>\` after the next release"
+else
+  warn "could not save the update channel; run: ninox update --channel $channel --check"
+fi
+
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *) warn "$INSTALL_DIR is not on your PATH. Add it, e.g.:
@@ -248,4 +270,4 @@ if [ "$want_app" = yes ]; then
   info "Installed $dest"
 fi
 
-info "Done: ninox-gui + ninox-tui $version. Update later with \`ninox update\` (add --app to refresh Ninox.app)."
+info "Done: ninox-gui + ninox-tui $version. Update later with \`ninox update\` (replaces every installed ninox binary and Ninox.app, then offers to restart the server)."

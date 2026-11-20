@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn plain_text_keeps_a_links_visible_text_and_drops_its_url() {
-        let out = plain_text("See [MLOPS-1234 Fix the thing](https://linear.app/synthesia/issue/MLOPS-1234/x) for context.");
+        let out = plain_text("See [MLOPS-1234 Fix the thing](https://linear.app/example/issue/MLOPS-1234/x) for context.");
         assert_eq!(out, "See MLOPS-1234 Fix the thing for context.");
     }
 
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn the_regression_example_collapses_details_and_keeps_the_heading() {
         let out = clean_comment_markdown(
-            "<!-- linear-linkback -->\n<details><summary><a href=\"https://linear.app/synthesia/issue/MLOPS-1234/x\">MLOPS-1234 Fix the thing</a></summary>\n\nlinked body\n</details>\n\n## Why\nThe actual review comment.",
+            "<!-- linear-linkback -->\n<details><summary><a href=\"https://linear.app/example/issue/MLOPS-1234/x\">MLOPS-1234 Fix the thing</a></summary>\n\nlinked body\n</details>\n\n## Why\nThe actual review comment.",
         );
         // The leading HTML comment is deliberately left alone here — it's a
         // single-line HTML block that the downstream markdown renderer

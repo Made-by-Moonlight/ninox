@@ -28,14 +28,14 @@
 
 ## Execution Setup (before Task 1)
 
-Work in an isolated worktree per `superpowers:using-git-worktrees` (ALREADY CREATED at `/Users/ethan.brodie/slievr/ninox/.claude/worktrees/field-notes-design`, branch `feat/field-notes-design` off `origin/main`). All commands in this plan run from that worktree root.
+Work in an isolated worktree per `superpowers:using-git-worktrees` (ALREADY CREATED at `/Users/dev/ninox/.claude/worktrees/field-notes-design`, branch `feat/field-notes-design` off `origin/main`). All commands in this plan run from that worktree root.
 
 The design docs are currently UNTRACKED in the main checkout. First commit in the worktree:
 
 ```bash
-cp -R /Users/ethan.brodie/slievr/ninox/docs/design-brief.md docs/
-cp -R /Users/ethan.brodie/slievr/ninox/docs/design-concepts docs/
-cp /Users/ethan.brodie/slievr/ninox/docs/superpowers/plans/2026-07-03-field-notes-design.md docs/superpowers/plans/
+cp -R /Users/dev/ninox/docs/design-brief.md docs/
+cp -R /Users/dev/ninox/docs/design-concepts docs/
+cp /Users/dev/ninox/docs/superpowers/plans/2026-07-03-field-notes-design.md docs/superpowers/plans/
 git add docs/ && git commit -m "docs(design): field notes design spec, concepts, and implementation plan"
 ```
 
