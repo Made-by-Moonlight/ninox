@@ -1,6 +1,51 @@
-# Ninox
+<div align="center">
+  <img src="docs/assets/marketing/ninox-icon.png" alt="Ninox owl" width="112">
+  <h1>Ninox</h1>
+  <p><strong>Your coding agents. One clear view.</strong></p>
+  <p>A native desktop and terminal cockpit for coordinating AI coding-agent sessions.</p>
+  <p>
+    <a href="#install">Install</a> ·
+    <a href="#meet-ninox">Explore</a> ·
+    <a href="https://made-by-moonlight.github.io/ninox/">Project site</a> ·
+    <a href="https://github.com/Made-by-Moonlight/ninox/releases">Releases</a>
+  </p>
+  <p><sub>Linux & macOS · Rust · Open source under MIT</sub></p>
+</div>
 
-Ninox is a native desktop agent orchestrator — built in Rust with [Iced](https://github.com/iced-rs/iced). It embeds its own orchestrator engine directly and runs a GPU-accelerated UI: no Electron, no bundled browser. Running Ninox starts the engine with its own SQLite store and an HTTP/WebSocket API server.
+---
+
+## Meet Ninox
+
+Give an orchestrator a goal and let it coordinate workers, each with its own
+session and workspace. Ninox brings their progress, pull requests, plans and
+shared knowledge into one place, so you can see where work stands and step in
+when it needs you.
+
+<img src="docs/assets/marketing/board-demo.png" alt="Ninox board showing example release tasks" width="100%">
+<p align="center"><sub>The Ninox board with example data.</sub></p>
+
+<details>
+<summary>See the fleet view</summary>
+<br>
+<img src="docs/assets/marketing/fleet-demo.png" alt="Ninox fleet view showing an example orchestrator and its workers" width="100%">
+</details>
+
+| Coordinate the work | Keep the context | Stay in control |
+| :--- | :--- | :--- |
+| Organize orchestrators and workers in the fleet and board views. | Keep plans and a searchable shared brain close to the work. | See session and pull-request state, communicate with agents, and reconnect to running work. |
+
+**Pick your view.** Run the GPU-accelerated native desktop app, or use the
+terminal UI for SSH and keyboard-driven workflows. Both share the same engine.
+
+```bash
+brew tap made-by-moonlight/tap
+brew trust --formula made-by-moonlight/tap/ninox-gui
+brew install made-by-moonlight/tap/ninox-gui
+```
+
+Prefer the terminal? Trust and install `made-by-moonlight/tap/ninox-tui`
+instead. See [Install](#install) for platform support, the macOS app bundle,
+updates and other installation methods.
 
 ## Prerequisites
 
