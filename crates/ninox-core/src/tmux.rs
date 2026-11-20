@@ -42,7 +42,7 @@ fn socket_for(test_binary: bool, override_name: Option<String>) -> String {
 /// would (see `lifecycle::usage::ENV_TEST_GUARD` for a case where that
 /// exact hazard already had to be worked around once in this codebase).
 pub(crate) fn is_test_binary() -> bool {
-    std::env::current_exe()
+    cfg!(test) || std::env::current_exe()
         .ok()
         .is_some_and(|p| p.components().any(|c| c.as_os_str() == "deps"))
 }
@@ -372,7 +372,10 @@ async fn create_session_with_shell(
         // Harness commands use POSIX quoting. Let fish load the user's
         // login environment, then pass the command to a POSIX shell as an
         // argument rather than asking fish to parse it.
-        base.extend_from_slice(&[shell, "-l", "-c", "exec /bin/sh -c \"$argv[1]\"", cmd]);
+        // Fish users commonly initialize version managers only in interactive
+        // shells. Load that environment before starting the agent so its
+        // subprocesses (including hooks) can find tools such as Node.
+        base.extend_from_slice(&[shell, "-il", "-c", "exec /bin/sh -c \"$argv[1]\"", cmd]);
     } else {
         base.extend_from_slice(&[shell, "-l", "-c", cmd]);
     }
@@ -1246,10 +1249,14 @@ mod tests {
         if !tmux_available() || std::process::Command::new("fish").arg("--version").output().is_err() {
             return;
         }
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".config/fish");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.fish"), "if status is-interactive; set -gx NINOX_FISH_TEST ready; end\n").unwrap();
         let id = unique_id();
-        create_session_with_shell(&id, "/tmp", "printf '%s\\n' \"can't stop\"; exec cat", &[], "fish")
+        create_session_with_shell(&id, "/tmp", "printf '%s %s\\n' \"can't stop\" \"$NINOX_FISH_TEST\"; exec cat", &[("HOME", home.path().to_str().unwrap())], "fish")
             .await.unwrap();
-        wait_for_pane_contains(&id, "can't stop").await;
+        wait_for_pane_contains(&id, "can't stop ready").await;
         kill_session(&id).await.unwrap();
     }
 
